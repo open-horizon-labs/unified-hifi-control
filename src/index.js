@@ -1,4 +1,5 @@
 const { createRoonClient } = require('./roon/client');
+const { HQPClient } = require('./hqplayer/client');
 const { createApp } = require('./server/app');
 const { createLogger } = require('./lib/logger');
 
@@ -12,9 +13,26 @@ const roon = createRoonClient({
   logger: createLogger('Roon'),
 });
 
+// Create HQPlayer client (unconfigured initially, configured via API or env vars)
+const hqp = new HQPClient({
+  logger: createLogger('HQP'),
+});
+
+// Pre-configure HQPlayer if env vars set
+if (process.env.HQP_HOST) {
+  hqp.configure({
+    host: process.env.HQP_HOST,
+    port: process.env.HQP_PORT || 8088,
+    username: process.env.HQP_USER,
+    password: process.env.HQP_PASS,
+  });
+  log.info('HQPlayer pre-configured from environment', { host: process.env.HQP_HOST });
+}
+
 // Create HTTP server
 const app = createApp({
   roon,
+  hqp,
   logger: createLogger('Server'),
 });
 

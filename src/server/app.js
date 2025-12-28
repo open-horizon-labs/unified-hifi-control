@@ -4,7 +4,7 @@ const morgan = require('morgan');
 const path = require('path');
 
 function createApp(opts = {}) {
-  const { roon, logger } = opts;
+  const { roon, hqp, logger } = opts;
   const log = logger || console;
   const app = express();
 
@@ -81,16 +81,97 @@ function createApp(opts = {}) {
     }
   });
 
-  // Placeholder for HQPlayer routes (Phase 3)
-  app.get('/hqp/status', (req, res) => {
-    res.json({ enabled: false, message: 'HQPlayer integration not configured' });
+  // HQPlayer routes
+  app.get('/hqp/status', async (req, res) => {
+    try {
+      const status = await hqp.getStatus();
+      res.json(status);
+    } catch (err) {
+      log.warn('HQP status failed', { error: err.message });
+      res.json({ enabled: false, error: err.message });
+    }
+  });
+
+  app.get('/hqp/profiles', async (req, res) => {
+    if (!hqp.isConfigured()) {
+      return res.json({ enabled: false, profiles: [] });
+    }
+    try {
+      const profiles = await hqp.fetchProfiles();
+      res.json({ enabled: true, profiles });
+    } catch (err) {
+      log.warn('HQP profiles failed', { error: err.message });
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/hqp/profiles/load', async (req, res) => {
+    const { profile } = req.body;
+    if (!profile) {
+      return res.status(400).json({ error: 'profile required' });
+    }
+    if (!hqp.isConfigured()) {
+      return res.status(400).json({ error: 'HQPlayer not configured' });
+    }
+    try {
+      await hqp.loadProfile(profile);
+      res.json({ ok: true, message: 'Profile loading, HQPlayer will restart' });
+    } catch (err) {
+      log.warn('HQP load profile failed', { error: err.message, profile });
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/hqp/pipeline', async (req, res) => {
+    if (!hqp.isConfigured()) {
+      return res.json({ enabled: false });
+    }
+    try {
+      const pipeline = await hqp.fetchPipeline();
+      res.json({ enabled: true, ...pipeline });
+    } catch (err) {
+      log.warn('HQP pipeline failed', { error: err.message });
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/hqp/pipeline', async (req, res) => {
+    const { setting, value } = req.body;
+    if (!setting || value === undefined) {
+      return res.status(400).json({ error: 'setting and value required' });
+    }
+    const validSettings = ['mode', 'samplerate', 'filter1x', 'filterNx', 'shaper'];
+    if (!validSettings.includes(setting)) {
+      return res.status(400).json({ error: `Invalid setting. Valid: ${validSettings.join(', ')}` });
+    }
+    if (!hqp.isConfigured()) {
+      return res.status(400).json({ error: 'HQPlayer not configured' });
+    }
+    try {
+      await hqp.setPipelineSetting(setting, value);
+      res.json({ ok: true });
+    } catch (err) {
+      log.warn('HQP set pipeline failed', { error: err.message, setting, value });
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/hqp/configure', (req, res) => {
+    const { host, port, username, password } = req.body;
+    if (!host) {
+      return res.status(400).json({ error: 'host required' });
+    }
+    hqp.configure({ host, port, username, password });
+    log.info('HQPlayer configured', { host, port });
+    res.json({ ok: true });
   });
 
   // Combined status for dashboard
-  app.get('/api/status', (req, res) => {
+  app.get('/api/status', async (req, res) => {
+    const hqpStatus = await hqp.getStatus().catch(() => ({ enabled: false }));
     res.json({
       roon: roon.getStatus(),
-      hqplayer: { enabled: false },
+      hqplayer: hqpStatus,
     });
   });
 
