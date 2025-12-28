@@ -1,7 +1,7 @@
 {
   "name": "hifi-control",
   "version": "0.1.0",
-  "description": "Unified Hi-Fi Control - Control Roon playback and HQPlayer audio pipeline from Claude",
+  "description": "Unified Hi-Fi Control - Control Roon playback and HQPlayer audio pipeline",
   "author": {
     "name": "Cloud Atlas AI",
     "email": "hello@cloudatlas.ai",

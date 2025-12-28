@@ -1,6 +1,6 @@
 # Setup Hi-Fi Control MCP
 
-Set up the Unified Hi-Fi Control MCP server to control your music system from Claude.
+Set up the Unified Hi-Fi Control MCP server to control your music system.
 
 **Prerequisites:** You need the unified-hifi-control bridge running somewhere on your network. This MCP server connects to the bridge via HTTP.
 
@@ -9,8 +9,8 @@ Set up the Unified Hi-Fi Control MCP server to control your music system from Cl
 ## Step 1: Determine bridge URL
 
 Ask the user where their unified-hifi-control bridge is running:
-- **Local (default):** `http://localhost:3000`
-- **Docker:** Check their Docker host IP
+- **Local (default):** `http://localhost:8088`
+- **Docker:** Check their Docker host IP, port 8088
 - **Remote:** Ask for the URL
 
 Store this as `HIFI_BRIDGE_URL`.
@@ -24,16 +24,11 @@ curl -s ${HIFI_BRIDGE_URL}/status
 
 If this fails, help the user:
 - Start the bridge: `cd /path/to/unified-hifi-control && npm start`
-- Or via Docker: `docker run -p 3000:3000 cloud-atlas-ai/unified-hifi-control`
+- Or via Docker: `docker run -p 8088:8088 ghcr.io/cloud-atlas-ai/unified-hifi-control`
 
 ## Step 3: Add MCP server to Claude Code
 
 Use the `claude mcp add` command:
-```bash
-claude mcp add hifi-control --scope user -e HIFI_BRIDGE_URL=${HIFI_BRIDGE_URL} -- npx -y @cloud-atlas-ai/unified-hifi-control-mcp
-```
-
-Or for a local install:
 ```bash
 claude mcp add hifi-control --scope user -e HIFI_BRIDGE_URL=${HIFI_BRIDGE_URL} -- node /path/to/unified-hifi-control/src/mcp/index.js
 ```

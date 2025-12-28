@@ -5,14 +5,14 @@
     "email": "hello@cloudatlas.ai"
   },
   "metadata": {
-    "description": "Unified Hi-Fi Control - Control Roon and HQPlayer from Claude",
+    "description": "Unified Hi-Fi Control - Control Roon and HQPlayer",
     "version": "1.0.0"
   },
   "plugins": [
     {
       "name": "hifi-control",
       "source": "./plugin",
-      "description": "Control your hi-fi system from Claude - Roon playback, HQPlayer pipeline settings, volume control, and more.",
+      "description": "Control your hi-fi system - Roon playback, HQPlayer pipeline settings, volume control, and more.",
       "version": "0.1.0",
       "author": {
         "name": "Cloud Atlas AI"
