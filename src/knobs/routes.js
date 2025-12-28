@@ -264,6 +264,102 @@ fetch('/admin/status.json').then(r => r.json()).then(d => {
 </html>`);
   });
 
+  // OTA Firmware endpoints
+  const fs = require('fs');
+  const path = require('path');
+  const FIRMWARE_DIR = process.env.FIRMWARE_DIR || path.join(__dirname, '..', '..', 'firmware');
+
+  router.get('/firmware/version', (req, res) => {
+    const knob = extractKnob(req);
+    log.info('Firmware version check', { knob, ip: req.ip });
+
+    if (!fs.existsSync(FIRMWARE_DIR)) {
+      return res.status(404).json({ error: 'No firmware available' });
+    }
+
+    const files = fs.readdirSync(FIRMWARE_DIR).filter(f => f.endsWith('.bin'));
+    if (files.length === 0) {
+      return res.status(404).json({ error: 'No firmware available' });
+    }
+
+    const versionFile = path.join(FIRMWARE_DIR, 'version.json');
+    let version = null;
+    let firmwareFile = null;
+
+    if (fs.existsSync(versionFile)) {
+      try {
+        const versionData = JSON.parse(fs.readFileSync(versionFile, 'utf8'));
+        version = versionData.version;
+        firmwareFile = versionData.file || 'roon_knob.bin';
+      } catch (e) {
+        log.warn('Failed to parse version.json', { error: e.message });
+      }
+    }
+
+    if (!firmwareFile) {
+      firmwareFile = files[0];
+      const match = firmwareFile.match(/roon_knob[_-]?v?(\d+\.\d+\.\d+)\.bin/i);
+      if (match) {
+        version = match[1];
+      }
+    }
+
+    if (!version) {
+      return res.status(404).json({ error: 'No firmware version available' });
+    }
+
+    const firmwarePath = path.join(FIRMWARE_DIR, firmwareFile);
+    if (!fs.existsSync(firmwarePath)) {
+      return res.status(404).json({ error: 'Firmware file not found' });
+    }
+
+    const stats = fs.statSync(firmwarePath);
+    log.info('Firmware available', { version, size: stats.size, file: firmwareFile });
+
+    res.json({ version, size: stats.size, file: firmwareFile });
+  });
+
+  router.get('/firmware/download', (req, res) => {
+    const knob = extractKnob(req);
+    log.info('Firmware download requested', { knob, ip: req.ip });
+
+    if (!fs.existsSync(FIRMWARE_DIR)) {
+      return res.status(404).json({ error: 'No firmware available' });
+    }
+
+    let firmwareFile = 'roon_knob.bin';
+    const versionFile = path.join(FIRMWARE_DIR, 'version.json');
+
+    if (fs.existsSync(versionFile)) {
+      try {
+        const versionData = JSON.parse(fs.readFileSync(versionFile, 'utf8'));
+        firmwareFile = versionData.file || firmwareFile;
+      } catch (e) {
+        log.warn('Failed to parse version.json', { error: e.message });
+      }
+    }
+
+    let firmwarePath = path.join(FIRMWARE_DIR, firmwareFile);
+    if (!fs.existsSync(firmwarePath)) {
+      const files = fs.readdirSync(FIRMWARE_DIR).filter(f => f.endsWith('.bin'));
+      if (files.length > 0) {
+        firmwareFile = files[0];
+        firmwarePath = path.join(FIRMWARE_DIR, firmwareFile);
+      } else {
+        return res.status(404).json({ error: 'Firmware file not found' });
+      }
+    }
+
+    const stats = fs.statSync(firmwarePath);
+    log.info('Serving firmware', { file: firmwareFile, size: stats.size });
+
+    res.set('Content-Type', 'application/octet-stream');
+    res.set('Content-Length', stats.size);
+    res.set('Content-Disposition', `attachment; filename="${firmwareFile}"`);
+
+    fs.createReadStream(firmwarePath).pipe(res);
+  });
+
   return router;
 }
 
