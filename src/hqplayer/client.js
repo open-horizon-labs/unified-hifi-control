@@ -402,6 +402,35 @@ class HQPClient {
     return true;
   }
 
+  async setVolume(value) {
+    const pipeline = await this.fetchPipeline();
+    if (pipeline.volume?.isFixed) {
+      throw new Error('Volume is fixed in current profile');
+    }
+
+    const settings = pipeline.settings || {};
+    const formData = {
+      mode: settings.mode?.selected?.value || '0',
+      samplerate: settings.samplerate?.selected?.value || '0',
+      filter1x: settings.filter1x?.selected?.value || '0',
+      filterNx: settings.filterNx?.selected?.value || '0',
+      shaper: settings.shaper?.selected?.value || '0',
+      dither: settings.dither?.selected?.value || '0',
+      volume: String(value),
+    };
+
+    const payload = new URLSearchParams(formData).toString();
+    const response = await this.request('/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: payload,
+    });
+    if (response.statusCode >= 400) {
+      throw new Error(`Failed to set volume (${response.statusCode}).`);
+    }
+    return true;
+  }
+
   async loadProfile(profileValue) {
     if (!profileValue || String(profileValue).trim().toLowerCase() === 'default') {
       throw new Error('Profile value is required');

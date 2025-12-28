@@ -48,6 +48,7 @@ function createMqttService({ hqp, logger } = {}) {
         `${topicPrefix}/hqplayer/shaper/set`,
         `${topicPrefix}/hqplayer/samplerate/set`,
         `${topicPrefix}/hqplayer/profile/set`,
+        `${topicPrefix}/hqplayer/volume/set`,
       ];
 
       commandTopics.forEach(topic => {
@@ -137,6 +138,13 @@ function createMqttService({ hqp, logger } = {}) {
       await hqp.loadProfile(payload);
       // HQPlayer restarts when loading profile - wait longer
       setTimeout(() => publishHqpState(), 10000);
+    } else if (topic === `${topicPrefix}/hqplayer/volume/set`) {
+      const value = parseFloat(payload);
+      if (!isNaN(value)) {
+        log.info('Setting HQPlayer volume via MQTT', { value });
+        await hqp.setVolume(value);
+        setTimeout(() => publishHqpState(), 500);
+      }
     }
   }
 
@@ -198,6 +206,15 @@ function createMqttService({ hqp, logger } = {}) {
             { retain: true }
           );
         }
+
+        // Sync volume state
+        if (status.pipeline.volume?.value !== undefined) {
+          client.publish(
+            `${topicPrefix}/hqplayer/volume/state`,
+            String(status.pipeline.volume.value),
+            { retain: true }
+          );
+        }
       }
 
       // Sync profile state using configName as best available proxy
@@ -231,11 +248,13 @@ function createMqttService({ hqp, logger } = {}) {
 
     // Fetch pipeline and profiles to get available options for selects
     let pipelineSettings = {};
+    let pipelineVolume = null;
     let profiles = [];
     if (hqp.isConfigured()) {
       try {
         const pipeline = await hqp.fetchPipeline();
         pipelineSettings = pipeline.settings || {};
+        pipelineVolume = pipeline.volume || null;
       } catch (err) {
         log.warn('Failed to fetch pipeline for discovery', { error: err.message });
       }
@@ -297,6 +316,35 @@ function createMqttService({ hqp, logger } = {}) {
       JSON.stringify(volumeSensor),
       { retain: true }
     );
+
+    // HQPlayer volume control (number entity) - only if volume is variable
+    if (pipelineVolume && !pipelineVolume.isFixed) {
+      const volumeNumber = {
+        name: 'HQPlayer Volume Control',
+        unique_id: 'unified_hifi_hqp_volume_control',
+        state_topic: `${topicPrefix}/hqplayer/volume/state`,
+        command_topic: `${topicPrefix}/hqplayer/volume/set`,
+        min: pipelineVolume.min,
+        max: pipelineVolume.max,
+        step: 1,
+        unit_of_measurement: 'dB',
+        availability_topic: `${topicPrefix}/hqplayer/status`,
+        availability_template: '{{ "online" if value_json.connected else "offline" }}',
+        icon: 'mdi:volume-high',
+      };
+      client.publish(
+        'homeassistant/number/unified_hifi_hqp_volume/config',
+        JSON.stringify(volumeNumber),
+        { retain: true }
+      );
+
+      // Publish current volume state
+      client.publish(
+        `${topicPrefix}/hqplayer/volume/state`,
+        String(pipelineVolume.value),
+        { retain: true }
+      );
+    }
 
     // HQPlayer filter sensor
     const filterSensor = {
