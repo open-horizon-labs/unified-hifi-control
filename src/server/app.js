@@ -2,9 +2,10 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
+const { createKnobRoutes } = require('../knobs/routes');
 
 function createApp(opts = {}) {
-  const { roon, hqp, logger } = opts;
+  const { roon, hqp, knobs, logger } = opts;
   const log = logger || console;
   const app = express();
 
@@ -174,6 +175,12 @@ function createApp(opts = {}) {
       hqplayer: hqpStatus,
     });
   });
+
+  // Knob-compatible routes (mounted at root for firmware compatibility)
+  if (knobs) {
+    const knobRoutes = createKnobRoutes({ roon, knobs, logger: log });
+    app.use('/', knobRoutes);
+  }
 
   // Error handler
   app.use((err, req, res, _next) => {

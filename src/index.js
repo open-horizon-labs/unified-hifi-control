@@ -5,6 +5,7 @@ const { createMqttService } = require('./mqtt');
 const { createApp } = require('./server/app');
 const { createLogger } = require('./lib/logger');
 const { advertise } = require('./lib/mdns');
+const { createKnobsStore } = require('./knobs/store');
 
 const PORT = process.env.PORT || 8088;
 const log = createLogger('Main');
@@ -19,6 +20,11 @@ const roon = createRoonClient({
 // Create HQPlayer client (unconfigured initially, configured via API or env vars)
 const hqp = new HQPClient({
   logger: createLogger('HQP'),
+});
+
+// Create knobs store for ESP32 knob configuration
+const knobs = createKnobsStore({
+  logger: createLogger('Knobs'),
 });
 
 // Pre-configure HQPlayer if env vars set
@@ -42,6 +48,7 @@ const mqttService = createMqttService({
 const app = createApp({
   roon,
   hqp,
+  knobs,
   logger: createLogger('Server'),
 });
 
