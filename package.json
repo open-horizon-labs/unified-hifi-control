@@ -15,7 +15,17 @@
   },
   "author": "Muness Castle",
   "license": "ISC",
-  "dependencies": {},
+  "dependencies": {
+    "bonjour": "^3.5.0",
+    "cors": "^2.8.5",
+    "express": "^5.2.1",
+    "morgan": "^1.10.1",
+    "node-roon-api": "github:roonlabs/node-roon-api",
+    "node-roon-api-image": "github:roonlabs/node-roon-api-image",
+    "node-roon-api-status": "github:roonlabs/node-roon-api-status",
+    "node-roon-api-transport": "github:roonlabs/node-roon-api-transport",
+    "sharp": "^0.34.5"
+  },
   "devDependencies": {
     "jest": "^29.7.0",
     "nodemon": "^3.1.0"
