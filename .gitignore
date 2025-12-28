@@ -3,3 +3,7 @@ data/
 *.log
 .DS_Store
 .env
+
+# Downloaded firmware (fetched at runtime)
+firmware/*.bin
+firmware/version.json
