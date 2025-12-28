@@ -249,26 +249,167 @@ function createKnobRoutes({ roon, knobs, logger }) {
   router.get(['/admin', '/dashboard'], (req, res) => {
     res.send(`<!DOCTYPE html>
 <html>
-<head><title>Unified Hi-Fi Control</title></head>
+<head><title>Unified Hi-Fi Control</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2em auto; padding: 0 1em; }
+  button { padding: 0.5em 1em; cursor: pointer; }
+  .section { margin: 1.5em 0; padding: 1em; border: 1px solid #ddd; border-radius: 4px; }
+  #firmware-status { margin-top: 0.5em; }
+  .success { color: green; }
+  .error { color: red; }
+</style>
+</head>
 <body>
 <h1>Unified Hi-Fi Control</h1>
-<p>Admin dashboard coming soon.</p>
-<h2>Status</h2>
-<pre id="status"></pre>
+
+<div class="section">
+  <h2>Firmware</h2>
+  <p>Current: <span id="fw-version">checking...</span></p>
+  <button id="fetch-btn" onclick="fetchFirmware()">Fetch Latest from GitHub</button>
+  <div id="firmware-status"></div>
+</div>
+
+<div class="section">
+  <h2>Status</h2>
+  <pre id="status"></pre>
+</div>
+
 <script>
+// Load current firmware version
+fetch('/firmware/version')
+  .then(r => r.ok ? r.json() : Promise.reject('No firmware'))
+  .then(d => document.getElementById('fw-version').textContent = 'v' + d.version)
+  .catch(() => document.getElementById('fw-version').textContent = 'Not installed');
+
+// Load bridge status
 fetch('/admin/status.json').then(r => r.json()).then(d => {
   document.getElementById('status').textContent = JSON.stringify(d, null, 2);
 });
+
+// Fetch latest firmware
+function fetchFirmware() {
+  const btn = document.getElementById('fetch-btn');
+  const status = document.getElementById('firmware-status');
+  btn.disabled = true;
+  status.textContent = 'Fetching...';
+  status.className = '';
+
+  fetch('/admin/fetch-firmware', { method: 'POST' })
+    .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+    .then(({ ok, data }) => {
+      if (ok) {
+        status.textContent = 'Downloaded v' + data.version;
+        status.className = 'success';
+        document.getElementById('fw-version').textContent = 'v' + data.version;
+      } else {
+        status.textContent = 'Error: ' + data.error;
+        status.className = 'error';
+      }
+    })
+    .catch(e => {
+      status.textContent = 'Error: ' + e.message;
+      status.className = 'error';
+    })
+    .finally(() => btn.disabled = false);
+}
 </script>
 </body>
 </html>`);
   });
 
-  // OTA Firmware endpoints
+  // Shared requires for firmware handling
   const fs = require('fs');
   const path = require('path');
+  const https = require('https');
   const FIRMWARE_DIR = process.env.FIRMWARE_DIR || path.join(__dirname, '..', '..', 'firmware');
+  const GITHUB_REPO = process.env.FIRMWARE_REPO || 'muness/roon-knob';
 
+  // POST /admin/fetch-firmware - Download latest firmware from GitHub releases
+  router.post('/admin/fetch-firmware', async (req, res) => {
+
+    log.info('Fetching latest firmware from GitHub', { repo: GITHUB_REPO });
+
+    try {
+      // Get latest release info from GitHub API
+      const releaseData = await new Promise((resolve, reject) => {
+        const options = {
+          hostname: 'api.github.com',
+          path: `/repos/${GITHUB_REPO}/releases/latest`,
+          headers: { 'User-Agent': 'unified-hifi-control' }
+        };
+        https.get(options, (response) => {
+          let data = '';
+          response.on('data', chunk => data += chunk);
+          response.on('end', () => {
+            if (response.statusCode === 200) {
+              resolve(JSON.parse(data));
+            } else {
+              reject(new Error(`GitHub API error: ${response.statusCode}`));
+            }
+          });
+        }).on('error', reject);
+      });
+
+      const version = releaseData.tag_name.replace(/^v/, '');
+      const asset = releaseData.assets.find(a => a.name === 'roon_knob.bin');
+
+      if (!asset) {
+        return res.status(404).json({ error: 'No roon_knob.bin in release' });
+      }
+
+      // Download the firmware binary
+      const downloadUrl = asset.browser_download_url;
+      log.info('Downloading firmware', { version, url: downloadUrl });
+
+      // Ensure firmware directory exists
+      if (!fs.existsSync(FIRMWARE_DIR)) {
+        fs.mkdirSync(FIRMWARE_DIR, { recursive: true });
+      }
+
+      const firmwarePath = path.join(FIRMWARE_DIR, 'roon_knob.bin');
+      const file = fs.createWriteStream(firmwarePath);
+
+      await new Promise((resolve, reject) => {
+        const download = (url) => {
+          https.get(url, (response) => {
+            if (response.statusCode === 302 || response.statusCode === 301) {
+              download(response.headers.location);
+              return;
+            }
+            if (response.statusCode !== 200) {
+              reject(new Error(`Download failed: ${response.statusCode}`));
+              return;
+            }
+            response.pipe(file);
+            file.on('finish', () => {
+              file.close();
+              resolve();
+            });
+          }).on('error', reject);
+        };
+        download(downloadUrl);
+      });
+
+      // Write version.json
+      const versionPath = path.join(FIRMWARE_DIR, 'version.json');
+      fs.writeFileSync(versionPath, JSON.stringify({
+        version,
+        file: 'roon_knob.bin',
+        fetched_at: new Date().toISOString(),
+        release_url: releaseData.html_url
+      }, null, 2));
+
+      const stats = fs.statSync(firmwarePath);
+      log.info('Firmware downloaded successfully', { version, size: stats.size });
+
+      res.json({ version, size: stats.size, file: 'roon_knob.bin' });
+    } catch (err) {
+      log.error('Failed to fetch firmware', { error: err.message });
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // OTA Firmware endpoints
   router.get('/firmware/version', (req, res) => {
     const knob = extractKnob(req);
     log.info('Firmware version check', { knob, ip: req.ip });
