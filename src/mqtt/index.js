@@ -327,6 +327,7 @@ function createMqttService({ hqp, logger } = {}) {
         min: pipelineVolume.min,
         max: pipelineVolume.max,
         step: 1,
+        mode: 'slider',
         unit_of_measurement: 'dB',
         availability_topic: `${topicPrefix}/hqplayer/status`,
         availability_template: '{{ "online" if value_json.connected else "offline" }}',
