@@ -3,19 +3,24 @@
   "version": "0.1.0",
   "description": "Source-agnostic hi-fi control bridge for hardware surfaces and Home Assistant",
   "main": "src/index.js",
+  "bin": {
+    "unified-hifi-control-mcp": "src/mcp/index.js"
+  },
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
+    "mcp": "node src/mcp/index.js",
     "test": "jest",
     "test:watch": "jest --watch"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/muness/unified-hifi-control.git"
+    "url": "git+https://github.com/cloud-atlas-ai/unified-hifi-control.git"
   },
   "author": "Muness Castle",
   "license": "ISC",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
     "bonjour": "^3.5.0",
     "cors": "^2.8.5",
     "express": "^5.2.1",

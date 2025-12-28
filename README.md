@@ -8,7 +8,7 @@ Hi-fi software assumes you're at a computer or using vendor-specific apps. This 
 
 - **Music Sources:** Roon (now), Music Assistant, Tidal Connect, Qobuz Connect (future)
 - **Audio Pipeline:** HQPlayer Embedded (web UI control), receiver control (future)
-- **Surfaces:** ESP32 hardware (roon-knob), Web UI, Home Assistant via MQTT
+- **Surfaces:** Anything that speaks HTTP or MQTT — ESP32 hardware, web UIs, Home Assistant, Claude (via MCP), etc.
 
 ## Status
 
@@ -32,6 +32,46 @@ Hi-fi software assumes you're at a computer or using vendor-specific apps. This 
   ESP32     Web UI    Home Assistant
   Knob
 ```
+
+## MCP Server (Claude Integration)
+
+The bridge includes an MCP server that lets Claude control your hi-fi system directly.
+
+### Setup
+
+1. Start the bridge: `npm start`
+2. Add to your Claude Code MCP config:
+
+```json
+{
+  "mcpServers": {
+    "hifi": {
+      "command": "node",
+      "args": ["/path/to/unified-hifi-control/src/mcp/index.js"],
+      "env": {
+        "HIFI_BRIDGE_URL": "http://localhost:3000"
+      }
+    }
+  }
+}
+```
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `hifi_zones` | List available Roon zones |
+| `hifi_now_playing` | Get current track, artist, album, play state |
+| `hifi_control` | Play, pause, next, previous, volume control |
+| `hifi_hqplayer_status` | HQPlayer Embedded status and pipeline |
+| `hifi_hqplayer_profiles` | List saved HQPlayer profiles |
+| `hifi_hqplayer_load_profile` | Switch HQPlayer profile |
+| `hifi_hqplayer_set_pipeline` | Change filter, shaper, dither settings |
+| `hifi_status` | Overall bridge status |
+
+### Example Usage
+
+Ask Claude: "What's playing right now?" or "Turn the volume down a bit" or "Switch to my DSD profile in HQPlayer"
 
 ## Related
 
