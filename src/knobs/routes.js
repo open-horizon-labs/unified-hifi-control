@@ -349,7 +349,7 @@ async function loadZones() {
       const album = esc(np.line3 || '');
       const vc = zone.volume_control;
       const volUnit = vc?.type === 'db' ? ' dB' : '';
-      const vol = typeof np.volume === 'number' ? np.volume + volUnit : (vc ? '—' : 'no vol');
+      const vol = typeof np.volume === 'number' ? np.volume + volUnit : (vc ? '—' : 'fixed');
       const step = np.volume_step || 2;
       const hasVol = !!vc;
       const playIcon = np.is_playing ? '⏸' : '▶';
