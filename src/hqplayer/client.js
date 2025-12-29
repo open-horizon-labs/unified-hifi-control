@@ -1,7 +1,11 @@
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const PROFILE_PATH = '/config/profile/load';
+const CONFIG_DIR = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+const HQP_CONFIG_FILE = path.join(CONFIG_DIR, 'hqp-config.json');
 
 class HQPClient {
   constructor({ host, port = 8088, username, password, logger } = {}) {
@@ -14,6 +18,41 @@ class HQPClient {
     this.digest = null;
     this.lastHiddenFields = {};
     this.lastProfiles = [];
+
+    // Load saved config on startup
+    this._loadConfig();
+  }
+
+  _loadConfig() {
+    try {
+      if (fs.existsSync(HQP_CONFIG_FILE)) {
+        const saved = JSON.parse(fs.readFileSync(HQP_CONFIG_FILE, 'utf8'));
+        if (saved.host) this.host = saved.host;
+        if (saved.port) this.port = Number(saved.port);
+        if (saved.username) this.username = saved.username;
+        if (saved.password) this.password = saved.password;
+        this.log.info('Loaded HQPlayer config from disk', { host: this.host, port: this.port });
+      }
+    } catch (e) {
+      this.log.warn('Failed to load HQPlayer config', { error: e.message });
+    }
+  }
+
+  _saveConfig() {
+    try {
+      if (!fs.existsSync(CONFIG_DIR)) {
+        fs.mkdirSync(CONFIG_DIR, { recursive: true });
+      }
+      fs.writeFileSync(HQP_CONFIG_FILE, JSON.stringify({
+        host: this.host,
+        port: this.port,
+        username: this.username,
+        password: this.password,
+      }, null, 2));
+      this.log.info('Saved HQPlayer config to disk');
+    } catch (e) {
+      this.log.error('Failed to save HQPlayer config', { error: e.message });
+    }
   }
 
   isConfigured() {
@@ -28,6 +67,8 @@ class HQPClient {
     // Reset auth state when reconfiguring
     this.cookies = {};
     this.digest = null;
+    // Persist config to disk
+    this._saveConfig();
   }
 
   baseHeaders() {

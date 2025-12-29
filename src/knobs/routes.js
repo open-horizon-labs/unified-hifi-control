@@ -283,6 +283,7 @@ function createKnobRoutes({ roon, knobs, logger }) {
       <select id="hqp-profile" onchange="loadProfile(this.value)">
         <option value="">Loading...</option>
       </select>
+      <div class="muted" style="font-size: 0.85em; margin-top: 0.3em;">Current profile detected by matching config title to profile name</div>
     </div>
 
     <div class="form-row">
@@ -382,6 +383,11 @@ async function loadHqpStatus() {
 
 async function loadHqpProfiles() {
   try {
+    // Get current config name from status
+    const statusRes = await fetch('/hqp/status');
+    const statusData = await statusRes.json();
+    const currentConfigName = statusData.configName || '';
+
     const res = await fetch('/hqp/profiles');
     const data = await res.json();
     const select = document.getElementById('hqp-profile');
@@ -390,7 +396,13 @@ async function loadHqpProfiles() {
       data.profiles.forEach(p => {
         const opt = document.createElement('option');
         opt.value = p.value || p;
-        opt.textContent = p.title || p.value || p;
+        const title = p.title || p.value || p;
+        opt.textContent = title;
+        // Auto-select if title matches current config name
+        // Note: This only works if your HQPlayer config title matches the profile name exactly
+        if (currentConfigName && title.toLowerCase() === currentConfigName.toLowerCase()) {
+          opt.selected = true;
+        }
         select.appendChild(opt);
       });
     }
