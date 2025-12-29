@@ -348,6 +348,7 @@ function createRoonClient(opts = {}) {
       core: state.coreInfo,
       zone_count: state.zones.length,
       zones: getZones(),
+      now_playing: Array.from(state.nowPlayingByZone.entries()).map(([zone_id, np]) => ({ zone_id, ...np })),
     }),
   };
 }

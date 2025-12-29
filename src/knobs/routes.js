@@ -340,10 +340,11 @@ async function loadZones() {
       const vol = typeof np.volume === 'number' ? np.volume : '—';
       const step = np.volume_step || 2;
       const playIcon = np.is_playing ? '⏸' : '▶';
+      const deviceInfo = zone.device_name ? \` <span class="muted">(\${zone.device_name})</span>\` : '';
       return \`<div class="zone-card">
         <img class="art-lg" src="/now_playing/image?zone_id=\${encodeURIComponent(zone.zone_id)}&width=120&height=120" alt="">
         <div class="zone-info">
-          <h3>\${zone.zone_name}</h3>
+          <h3>\${zone.zone_name}\${deviceInfo}</h3>
           <p><strong>\${track}</strong></p>
           <p>\${artist}\${album ? ' • ' + album : ''}</p>
           <p class="muted">Volume: \${vol}</p>
@@ -457,7 +458,8 @@ function selectZone(zoneId) {
 function updateZoneDisplay(np) {
   if (!np) np = {};
   const zone = zonesData.find(z => z.zone_id === selectedZone);
-  document.getElementById('zone-name').textContent = zone?.zone_name || '';
+  const deviceInfo = zone?.device_name ? ' (' + zone.device_name + ')' : '';
+  document.getElementById('zone-name').textContent = (zone?.zone_name || '') + deviceInfo;
   const track = np.line1 || 'Stopped';
   const artist = np.line2 || '';
   const album = np.line3 || '';
