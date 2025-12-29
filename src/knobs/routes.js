@@ -245,6 +245,9 @@ function createKnobRoutes({ roon, knobs, logger }) {
     });
   });
 
+  // Root redirect to Control page (normal listening)
+  router.get('/', (req, res) => res.redirect('/control'));
+
   // ========== JTBD-Organized Admin Pages ==========
   // Jobs: Control (normal listening), Critical (DSP tweaks), Knobs (setup), Settings (admin)
 
@@ -297,18 +300,18 @@ function createKnobRoutes({ roon, knobs, logger }) {
   const navHtml = (active) => `
     <nav>
       <h1>Hi-Fi Control</h1>
-      <a href="/admin/control" class="${active === 'control' ? 'active' : ''}">Control</a>
-      <a href="/admin/critical" class="${active === 'critical' ? 'active' : ''}">Critical</a>
-      <a href="/admin/knobs" class="${active === 'knobs' ? 'active' : ''}">Knobs</a>
-      <a href="/admin/settings" class="${active === 'settings' ? 'active' : ''}">Settings</a>
+      <a href="/control" class="${active === 'control' ? 'active' : ''}">Control</a>
+      <a href="/critical" class="${active === 'critical' ? 'active' : ''}">Critical</a>
+      <a href="/knobs" class="${active === 'knobs' ? 'active' : ''}">Knobs</a>
+      <a href="/settings" class="${active === 'settings' ? 'active' : ''}">Settings</a>
       <span class="version" id="app-version"></span>
     </nav>
   `;
 
   const versionScript = `fetch('/status').then(r=>r.json()).then(d=>{document.getElementById('app-version').textContent='v'+d.version;});`;
 
-  // GET /admin/control - Normal listening: all zones, basic controls
-  router.get('/admin/control', (req, res) => {
+  // GET /control - Normal listening: all zones, basic controls
+  router.get(['/control', '/admin/control'], (req, res) => {
     res.send(`<!DOCTYPE html><html><head><title>Control - Hi-Fi</title><style>${baseStyles}</style></head><body>
 ${navHtml('control')}
 <h2>All Zones</h2>
@@ -370,8 +373,8 @@ setInterval(loadZones, 4000);
 </script></body></html>`);
   });
 
-  // GET /admin/critical - Critical listening: single zone + HQPlayer DSP
-  router.get('/admin/critical', (req, res) => {
+  // GET /critical - Critical listening: single zone + HQPlayer DSP
+  router.get(['/critical', '/admin/critical'], (req, res) => {
     res.send(`<!DOCTYPE html><html><head><title>Critical Listening - Hi-Fi</title><style>${baseStyles}</style></head><body>
 ${navHtml('critical')}
 <h2>Critical Listening</h2>
@@ -481,7 +484,7 @@ async function loadHqpStatus() {
       loadHqpProfiles(data.configName);
       loadHqpPipeline();
     }
-  } catch (e) {}
+  } catch (e) { console.error('HQPlayer status error:', e); }
 }
 
 async function loadHqpProfiles(configName) {
@@ -541,8 +544,8 @@ setInterval(loadZones, 4000);
 </script></body></html>`);
   });
 
-  // GET /admin/knobs - Knob device management
-  router.get('/admin/knobs', (req, res) => {
+  // GET /knobs - Knob device management
+  router.get(['/knobs', '/admin/knobs'], (req, res) => {
     res.send(`<!DOCTYPE html><html><head><title>Knobs - Hi-Fi</title><style>${baseStyles}</style></head><body>
 ${navHtml('knobs')}
 <h2>Knob Devices</h2>
@@ -651,8 +654,8 @@ setInterval(loadKnobs, 5000);
 </script></body></html>`);
   });
 
-  // GET /admin or /admin/settings - Settings page (HQPlayer config, firmware, status)
-  router.get(['/admin', '/admin/settings', '/dashboard'], (req, res) => {
+  // GET /settings - Settings page (HQPlayer config, firmware, status)
+  router.get(['/settings', '/admin', '/admin/settings', '/dashboard'], (req, res) => {
     res.send(`<!DOCTYPE html><html><head><title>Settings - Hi-Fi</title><style>${baseStyles}</style></head><body>
 ${navHtml('settings')}
 <h2>Settings</h2>

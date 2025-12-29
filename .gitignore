@@ -7,3 +7,6 @@ data/
 # Downloaded firmware (fetched at runtime)
 firmware/*.bin
 firmware/version.json
+
+# Superego
+.superego/
