@@ -898,7 +898,8 @@ loadStatus();
   const fs = require('fs');
   const path = require('path');
   const https = require('https');
-  const FIRMWARE_DIR = process.env.FIRMWARE_DIR || path.join(__dirname, '..', '..', 'firmware');
+  const CONFIG_DIR = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+  const FIRMWARE_DIR = process.env.FIRMWARE_DIR || path.join(CONFIG_DIR, 'firmware');
   const GITHUB_REPO = process.env.FIRMWARE_REPO || 'muness/roon-knob';
 
   // POST /admin/fetch-firmware - Download latest firmware from GitHub releases

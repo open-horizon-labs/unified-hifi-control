@@ -6,11 +6,10 @@
 ```yaml
 services:
   unified-hifi-control:
-    image: ghcr.io/cloud-atlas-ai/unified-hifi-control:{{VERSION}}
+    image: muness/unified-hifi-control:{{VERSION}}
     network_mode: host  # Required for Roon mDNS discovery
     volumes:
-      - ./data:/data
-      - ./firmware:/app/firmware
+      - ./data:/data  # Config + firmware stored here
     environment:
       - PORT=8088
       - CONFIG_DIR=/data
