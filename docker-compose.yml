@@ -1,0 +1,19 @@
+services:
+  unified-hifi-control:
+    build: .
+    # Host network required for Roon mDNS discovery
+    network_mode: host
+    volumes:
+      - ./data:/data
+      - ./firmware:/app/firmware
+    environment:
+      - PORT=3000
+      - CONFIG_DIR=/data
+      # Optional: pre-configure HQPlayer
+      # - HQP_HOST=192.168.1.x
+      # - HQP_PORT=8088
+      # - HQP_USER=admin
+      # - HQP_PASS=password
+      # Optional: MQTT for Home Assistant
+      # - MQTT_BROKER=mqtt://192.168.1.x:1883
+    restart: unless-stopped
