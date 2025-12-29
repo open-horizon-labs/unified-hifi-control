@@ -174,11 +174,14 @@ function createRoonClient(opts = {}) {
   function updateZone(zone) {
     if (!zone || !zone.zone_id) return;
     const vol = zone.outputs?.[0]?.volume;
+    const three = zone.now_playing?.three_line || {};
     const summary = {
-      line1: zone.now_playing?.three_line?.line1 || zone.display_name || 'Unknown zone',
-      line2: zone.now_playing?.three_line?.line2 || '',
+      line1: three.line1 || zone.display_name || 'Unknown zone',
+      line2: three.line2 || '',
+      line3: three.line3 || '',
       is_playing: zone.state === 'playing',
       volume: vol?.value ?? null,
+      volume_type: vol?.type || null,
       volume_min: vol?.min ?? -80,
       volume_max: vol?.max ?? 0,
       volume_step: vol?.step ?? 2,
@@ -201,6 +204,7 @@ function createRoonClient(opts = {}) {
     return state.zones.map((zone) => {
       const output = zone.outputs?.[0];
       const sourceControl = output?.source_controls?.[0];
+      const vol = output?.volume;
       const canGroup = output?.can_group_with_output_ids || [];
       const result = {
         zone_id: zone.zone_id,
@@ -210,6 +214,17 @@ function createRoonClient(opts = {}) {
         output_count: zone.outputs?.length || 0,
         output_name: output?.display_name || null,
         device_name: sourceControl?.display_name || null,
+        source_control: sourceControl ? {
+          status: sourceControl.status,
+          supports_standby: sourceControl.supports_standby || false,
+          control_key: sourceControl.control_key,
+        } : null,
+        volume_control: vol ? {
+          type: vol.type,
+          min: vol.min,
+          max: vol.max,
+          is_muted: vol.is_muted || false,
+        } : null,
         supports_grouping: canGroup.length > 1,
       };
       if (opts.debug) {
@@ -346,6 +361,7 @@ function createRoonClient(opts = {}) {
       core: state.coreInfo,
       zone_count: state.zones.length,
       zones: getZones(),
+      now_playing: Array.from(state.nowPlayingByZone.entries()).map(([zone_id, np]) => ({ zone_id, ...np })),
     }),
   };
 }

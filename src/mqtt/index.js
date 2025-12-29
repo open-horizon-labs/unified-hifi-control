@@ -49,6 +49,7 @@ function createMqttService({ hqp, logger } = {}) {
         `${topicPrefix}/hqplayer/filter1x/set`,
         `${topicPrefix}/hqplayer/shaper/set`,
         `${topicPrefix}/hqplayer/samplerate/set`,
+        `${topicPrefix}/hqplayer/mode/set`,
         `${topicPrefix}/hqplayer/profile/set`,
         `${topicPrefix}/hqplayer/volume/set`,
       ];
@@ -135,6 +136,13 @@ function createMqttService({ hqp, logger } = {}) {
       log.info('Setting HQPlayer samplerate via MQTT select', { label: payload, value });
       await hqp.setPipelineSetting('samplerate', value);
       setTimeout(() => publishHqpState(), 1000);
+    } else if (topic === `${topicPrefix}/hqplayer/mode/set`) {
+      const pipeline = await hqp.fetchPipeline();
+      const opt = pipeline.settings?.mode?.options?.find(o => o.label === payload);
+      const value = opt?.value || payload;
+      log.info('Setting HQPlayer mode via MQTT select', { label: payload, value });
+      await hqp.setPipelineSetting('mode', value);
+      setTimeout(() => publishHqpState(), 1000);
     } else if (topic === `${topicPrefix}/hqplayer/profile/set`) {
       log.info('Loading HQPlayer profile via MQTT select', { profile: payload });
       await hqp.loadProfile(payload);
@@ -205,6 +213,13 @@ function createMqttService({ hqp, logger } = {}) {
           client.publish(
             `${topicPrefix}/hqplayer/samplerate/state`,
             settings.samplerate.selected.label,
+            { retain: true }
+          );
+        }
+        if (settings.mode?.selected?.label) {
+          client.publish(
+            `${topicPrefix}/hqplayer/mode/state`,
+            settings.mode.selected.label,
             { retain: true }
           );
         }
@@ -400,6 +415,23 @@ function createMqttService({ hqp, logger } = {}) {
       { retain: true }
     );
 
+    // HQPlayer mode sensor (PCM/SDM)
+    const modeSensor = {
+      name: 'HQPlayer Mode',
+      unique_id: 'unified_hifi_hqp_mode',
+      state_topic: `${topicPrefix}/hqplayer/status`,
+      value_template: '{{ value_json.pipeline.settings.mode.selected.label | default("Unknown", true) }}',
+      availability_topic: `${topicPrefix}/hqplayer/status`,
+      availability_template: '{{ "online" if value_json.connected else "offline" }}',
+      icon: 'mdi:swap-horizontal',
+    };
+
+    client.publish(
+      'homeassistant/sensor/unified_hifi_hqp_mode/config',
+      JSON.stringify(modeSensor),
+      { retain: true }
+    );
+
     // Select entities for control (only if we have options)
     if (pipelineSettings.filter1x && pipelineSettings.filter1x.options.length > 0) {
       const filterSelect = {
@@ -470,6 +502,30 @@ function createMqttService({ hqp, logger } = {}) {
       client.publish(
         `${topicPrefix}/hqplayer/samplerate/state`,
         pipelineSettings.samplerate.selected?.label || '',
+        { retain: true }
+      );
+    }
+
+    if (pipelineSettings.mode && pipelineSettings.mode.options.length > 0) {
+      const modeSelect = {
+        name: 'HQPlayer Mode Select',
+        unique_id: 'unified_hifi_hqp_mode_select',
+        state_topic: `${topicPrefix}/hqplayer/mode/state`,
+        command_topic: `${topicPrefix}/hqplayer/mode/set`,
+        options: pipelineSettings.mode.options.map(o => o.label),
+        availability_topic: `${topicPrefix}/hqplayer/status`,
+        availability_template: '{{ "online" if value_json.connected else "offline" }}',
+        icon: 'mdi:swap-horizontal',
+      };
+      client.publish(
+        'homeassistant/select/unified_hifi_hqp_mode/config',
+        JSON.stringify(modeSelect),
+        { retain: true }
+      );
+
+      client.publish(
+        `${topicPrefix}/hqplayer/mode/state`,
+        pipelineSettings.mode.selected?.label || '',
         { retain: true }
       );
     }

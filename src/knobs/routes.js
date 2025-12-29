@@ -231,8 +231,8 @@ function createKnobRoutes({ roon, knobs, logger }) {
     });
   });
 
-  // GET /knobs - List all known knobs
-  router.get('/knobs', (req, res) => {
+  // GET /api/knobs - List all known knobs (JSON API)
+  router.get('/api/knobs', (req, res) => {
     log.debug('Knobs list requested', { ip: req.ip });
     res.json({ knobs: knobs.listKnobs() });
   });
@@ -245,241 +245,581 @@ function createKnobRoutes({ roon, knobs, logger }) {
     });
   });
 
-  // GET /admin or /dashboard - Admin HTML placeholder
-  router.get(['/admin', '/dashboard'], (req, res) => {
-    res.send(`<!DOCTYPE html>
-<html>
-<head><title>Unified Hi-Fi Control</title>
-<style>
-  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2em auto; padding: 0 1em; }
-  button { padding: 0.5em 1em; cursor: pointer; margin-right: 0.5em; }
-  .section { margin: 1.5em 0; padding: 1em; border: 1px solid #ddd; border-radius: 4px; }
-  .status-msg { margin-top: 0.5em; }
-  .success { color: green; }
-  .error { color: red; }
-  .muted { color: #666; }
-  select { padding: 0.4em; min-width: 200px; }
-  label { display: inline-block; min-width: 100px; margin-right: 0.5em; }
-  .form-row { margin: 0.8em 0; }
-  input[type="text"] { padding: 0.4em; width: 200px; }
-  .hidden { display: none; }
-  .config-form { margin-top: 1em; padding-top: 1em; border-top: 1px solid #eee; }
-</style>
-</head>
-<body>
-<h1>Unified Hi-Fi Control <span id="app-version" class="muted" style="font-size: 0.5em;"></span></h1>
+  // Root redirect to Control page (normal listening)
+  router.get('/', (req, res) => res.redirect('/control'));
 
-<div class="section">
-  <h2>HQPlayer</h2>
+  // ========== JTBD-Organized Admin Pages ==========
+  // Jobs: Control (normal listening), Critical (DSP tweaks), Knobs (setup), Settings (admin)
+
+  const baseStyles = `
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 0 1em 2em; }
+    nav { background: #f5f5f5; margin: 0 -1em; padding: 0.8em 1em; border-bottom: 1px solid #ddd; display: flex; align-items: center; gap: 1.5em; flex-wrap: wrap; }
+    nav h1 { margin: 0; font-size: 1.1em; }
+    nav a { text-decoration: none; color: #666; padding: 0.4em 0.8em; border-radius: 4px; }
+    nav a:hover { background: #e5e5e5; }
+    nav a.active { background: #4CAF50; color: white; }
+    .version { margin-left: auto; color: #999; font-size: 0.85em; }
+    h2 { margin-top: 1.5em; }
+    button { padding: 0.5em 1em; cursor: pointer; margin-right: 0.5em; }
+    .section { margin: 1.5em 0; padding: 1em; border: 1px solid #ddd; border-radius: 4px; }
+    .status-msg { margin-top: 0.5em; }
+    .success { color: green; }
+    .error { color: red; }
+    .muted { color: #666; }
+    select { padding: 0.4em; min-width: 150px; }
+    label { display: inline-block; min-width: 100px; margin-right: 0.5em; }
+    .form-row { margin: 0.8em 0; }
+    input[type="text"], input[type="number"], input[type="password"] { padding: 0.4em; }
+    .hidden { display: none; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.5em; border-bottom: 1px solid #eee; }
+    img.art { width: 80px; height: 80px; border-radius: 4px; object-fit: cover; background: #f0f0f0; }
+    .ctrl { padding: 0.4em 0.7em; margin: 0 0.15em; background: #f5f5f5; border: 1px solid #ddd; cursor: pointer; border-radius: 4px; font-size: 1em; }
+    .ctrl:hover { background: #e5e5e5; }
+    .config-btn { padding: 0.3em 0.8em; background: #4CAF50; border: none; color: #fff; border-radius: 4px; cursor: pointer; }
+    code { background: #f5f5f5; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.85em; }
+    .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; }
+    .modal-overlay.open { display: flex; }
+    .modal { background: #fff; border-radius: 8px; padding: 1.5em; max-width: 550px; width: 90%; max-height: 85vh; overflow-y: auto; }
+    .modal h2 { margin-top: 0; }
+    .modal-close { float: right; background: none; border: none; font-size: 1.5em; cursor: pointer; color: #666; }
+    .form-section { border-top: 1px solid #eee; padding-top: 1em; margin-top: 1em; }
+    .form-section h3 { margin: 0 0 0.8em 0; font-size: 1em; }
+    .form-actions { display: flex; gap: 0.5em; justify-content: flex-end; margin-top: 1.5em; }
+    .btn-primary { background: #4CAF50; border: none; color: #fff; padding: 0.5em 1em; border-radius: 4px; cursor: pointer; }
+    .btn-secondary { background: #f5f5f5; border: 1px solid #ddd; padding: 0.5em 1em; border-radius: 4px; cursor: pointer; }
+    .config-form { margin-top: 1em; padding-top: 1em; border-top: 1px solid #eee; }
+    .zone-card { border: 1px solid #ddd; border-radius: 8px; padding: 1em; margin-bottom: 1em; display: flex; gap: 1em; align-items: center; }
+    .zone-card.selected { border-color: #4CAF50; background: #f8fff8; }
+    img.art-lg { width: 120px; height: 120px; border-radius: 6px; object-fit: cover; }
+    .zone-info { flex: 1; }
+    .zone-info h3 { margin: 0 0 0.3em 0; }
+    .zone-controls { display: flex; gap: 0.3em; margin-top: 0.8em; }
+  `;
+
+  const navHtml = (active) => `
+    <nav>
+      <h1>Hi-Fi Control</h1>
+      <a href="/control" class="${active === 'control' ? 'active' : ''}">Control</a>
+      <a href="/critical" class="${active === 'critical' ? 'active' : ''}">Critical</a>
+      <a href="/knobs" class="${active === 'knobs' ? 'active' : ''}">Knobs</a>
+      <a href="/settings" class="${active === 'settings' ? 'active' : ''}">Settings</a>
+      <span class="version" id="app-version"></span>
+    </nav>
+  `;
+
+  const versionScript = `fetch('/status').then(r=>r.json()).then(d=>{document.getElementById('app-version').textContent='v'+d.version;});`;
+
+  // HTML escape helper to prevent XSS
+  const escapeScript = `
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function escAttr(s) { return esc(s); }
+`;
+
+  // GET /control - Normal listening: all zones, basic controls
+  router.get(['/control', '/admin/control'], (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>Control - Hi-Fi</title><style>${baseStyles}</style></head><body>
+${navHtml('control')}
+<h2>All Zones</h2>
+<div id="zones">Loading...</div>
+<script>
+${versionScript}
+${escapeScript}
+
+let hqpProfiles = [];
+let hqpCurrentProfile = null;
+
+async function loadHqpProfiles() {
+  try {
+    const [statusRes, profilesRes] = await Promise.all([
+      fetch('/hqp/status'),
+      fetch('/hqp/profiles')
+    ]);
+    const status = await statusRes.json();
+    const profiles = await profilesRes.json();
+    hqpProfiles = profiles.profiles || [];
+    hqpCurrentProfile = status.configName || null;
+  } catch (e) { /* HQPlayer not configured */ }
+}
+
+async function loadZones() {
+  try {
+    const res = await fetch('/admin/status.json');
+    const data = await res.json();
+    const zones = data.bridge?.zones || [];
+    const nowPlaying = {};
+    (data.bridge?.now_playing || []).forEach(np => nowPlaying[np.zone_id] = np);
+
+    if (zones.length === 0) {
+      document.getElementById('zones').innerHTML = '<p class="muted">No zones found. Is Roon connected?</p>';
+      return;
+    }
+
+    document.getElementById('zones').innerHTML = zones.map(zone => {
+      const np = nowPlaying[zone.zone_id] || {};
+      const track = esc(np.line1 || 'Stopped');
+      const artist = esc(np.line2 || '');
+      const album = esc(np.line3 || '');
+      const volUnit = np.volume_type === 'db' ? ' dB' : '';
+      const vol = typeof np.volume === 'number' ? np.volume + volUnit : '—';
+      const step = np.volume_step || 2;
+      const playIcon = np.is_playing ? '⏸' : '▶';
+      const deviceInfo = zone.device_name ? ' <span class="muted">(' + esc(zone.device_name) + ')</span>' : '';
+      const isHqp = (zone.output_name || '').toLowerCase().includes('hqplayer');
+      const profileSelect = isHqp && hqpProfiles.length > 0 ?
+        '<p class="muted" style="margin-top:0.5em;">Profile: <select class="hqp-profile-select" style="padding:0.2em;">' +
+        hqpProfiles.map(p => '<option value="' + escAttr(p.value) + '"' +
+          ((hqpCurrentProfile && p.title.toLowerCase() === hqpCurrentProfile.toLowerCase()) ? ' selected' : '') + '>' +
+          esc(p.title) + '</option>').join('') +
+        '</select></p>' : '';
+      return '<div class="zone-card" data-zone-id="' + escAttr(zone.zone_id) + '" data-step="' + step + '">' +
+        '<img class="art-lg" src="/now_playing/image?zone_id=' + encodeURIComponent(zone.zone_id) + '&width=120&height=120" alt="">' +
+        '<div class="zone-info">' +
+          '<h3>' + esc(zone.zone_name) + deviceInfo + '</h3>' +
+          '<p><strong>' + track + '</strong></p>' +
+          '<p>' + artist + (album ? ' • ' + album : '') + '</p>' +
+          '<p class="muted">Volume: ' + vol + '</p>' +
+          profileSelect +
+          '<div style="display:flex;gap:1em;align-items:center;">' +
+            '<div class="zone-controls">' +
+              '<button class="ctrl" data-action="previous">⏮</button>' +
+              '<button class="ctrl" data-action="play_pause">' + playIcon + '</button>' +
+              '<button class="ctrl" data-action="next">⏭</button>' +
+            '</div>' +
+            '<div style="display:flex;flex-direction:column;gap:0.2em;">' +
+              '<button class="ctrl" data-action="vol_rel" data-value="1">+</button>' +
+              '<button class="ctrl" data-action="vol_rel" data-value="-1">−</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch (e) {
+    document.getElementById('zones').innerHTML = '<p class="error">Error: ' + esc(e.message) + '</p>';
+  }
+}
+
+async function ctrl(zoneId, action, value) {
+  await fetch('/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ zone_id: zoneId, action, value })
+  });
+  setTimeout(loadZones, 300);
+}
+
+async function loadProfile(profile) {
+  await fetch('/hqp/profiles/load', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profile })
+  });
+  await loadHqpProfiles();
+  loadZones();
+}
+
+// Event delegation for zone control buttons
+document.getElementById('zones').addEventListener('click', function(e) {
+  const btn = e.target.closest('.ctrl');
+  if (!btn) return;
+  const card = btn.closest('.zone-card');
+  const zoneId = card.dataset.zoneId;
+  const action = btn.dataset.action;
+  const step = parseInt(card.dataset.step) || 2;
+  let value = btn.dataset.value ? parseInt(btn.dataset.value) * step : undefined;
+  ctrl(zoneId, action, value);
+});
+
+// Event delegation for HQPlayer profile selection
+document.getElementById('zones').addEventListener('change', function(e) {
+  const sel = e.target.closest('.hqp-profile-select');
+  if (!sel || !sel.value) return;
+  loadProfile(sel.value);
+});
+
+// Initialize
+loadHqpProfiles().then(loadZones);
+setInterval(loadZones, 4000);
+</script></body></html>`);
+  });
+
+  // GET /critical - Critical listening: single zone + HQPlayer DSP
+  router.get(['/critical', '/admin/critical'], (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>Critical Listening - Hi-Fi</title><style>${baseStyles}</style></head><body>
+${navHtml('critical')}
+<h2>Critical Listening</h2>
+<p class="muted">Select a zone and tweak DSP settings for focused listening.</p>
+
+<div class="form-row">
+  <label>Zone:</label>
+  <select id="zone-select" onchange="selectZone(this.value)">
+    <option value="">Loading zones...</option>
+  </select>
+</div>
+
+<div id="zone-display" class="section hidden">
+  <div style="display:flex;gap:1em;align-items:center;">
+    <img id="zone-art" class="art-lg" src="" alt="">
+    <div style="flex:1;">
+      <h3 id="zone-name"></h3>
+      <p id="zone-status"></p>
+      <p class="muted">Volume: <span id="zone-vol">—</span></p>
+      <div style="display:flex;gap:1em;align-items:center;">
+        <div class="zone-controls">
+          <button class="ctrl" onclick="ctrl('previous')">⏮</button>
+          <button class="ctrl" id="play-btn" onclick="ctrl('play_pause')">▶</button>
+          <button class="ctrl" onclick="ctrl('next')">⏭</button>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:0.2em;">
+          <button class="ctrl" onclick="ctrl('vol_rel',2)">+</button>
+          <button class="ctrl" onclick="ctrl('vol_rel',-2)">−</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="hqp-section" class="section hidden">
+  <h3>HQPlayer DSP</h3>
   <div id="hqp-not-configured">
-    <p class="muted">Not configured</p>
-    <button onclick="toggleHqpConfig()">Configure HQPlayer</button>
+    <p class="muted">HQPlayer not configured. <a href="/admin/settings">Configure in Settings</a></p>
   </div>
   <div id="hqp-configured" class="hidden">
     <p>Status: <span id="hqp-status">checking...</span></p>
-
-    <div class="form-row">
-      <label>Profile:</label>
-      <select id="hqp-profile" onchange="loadProfile(this.value)">
-        <option value="">Loading...</option>
-      </select>
-      <div class="muted" style="font-size: 0.85em; margin-top: 0.3em;">Current profile detected by matching config title to profile name</div>
-    </div>
-
-    <div class="form-row">
-      <label>Filter (1x):</label>
-      <select id="hqp-filter1x" onchange="setPipeline('filter1x', this.value)"></select>
-    </div>
-
-    <div class="form-row">
-      <label>Filter (Nx):</label>
-      <select id="hqp-filterNx" onchange="setPipeline('filterNx', this.value)"></select>
-    </div>
-
-    <div class="form-row">
-      <label>Shaper:</label>
-      <select id="hqp-shaper" onchange="setPipeline('shaper', this.value)"></select>
-    </div>
-
-    <div id="hqp-status-msg" class="status-msg"></div>
-    <button onclick="toggleHqpConfig()">Reconfigure</button>
+    <div class="form-row"><label>Profile:</label><select id="hqp-profile" onchange="loadProfile(this.value)"></select></div>
+    <div class="form-row"><label>Mode:</label><select id="hqp-mode" onchange="setPipeline('mode',this.value)"></select></div>
+    <div class="form-row"><label>Sample Rate:</label><select id="hqp-samplerate" onchange="setPipeline('samplerate',this.value)"></select></div>
+    <div class="form-row"><label>Filter (1x):</label><select id="hqp-filter1x" onchange="setPipeline('filter1x',this.value)"></select></div>
+    <div class="form-row"><label>Filter (Nx):</label><select id="hqp-filterNx" onchange="setPipeline('filterNx',this.value)"></select></div>
+    <div class="form-row"><label>Shaper:</label><select id="hqp-shaper" onchange="setPipeline('shaper',this.value)"></select></div>
+    <div id="hqp-msg" class="status-msg"></div>
   </div>
-
-  <div id="hqp-config-form" class="config-form hidden">
-    <h3>HQPlayer Configuration</h3>
-    <div class="form-row">
-      <label>Host:</label>
-      <input type="text" id="hqp-host" placeholder="">
-    </div>
-    <div class="form-row">
-      <label>Port (Web UI):</label>
-      <input type="text" id="hqp-port" value="8088" placeholder="8088">
-    </div>
-    <div class="form-row">
-      <label>Username:</label>
-      <input type="text" id="hqp-username" placeholder="(required for profiles)">
-    </div>
-    <div class="form-row">
-      <label>Password:</label>
-      <input type="password" id="hqp-password" placeholder="(required for profiles)">
-    </div>
-    <button onclick="saveHqpConfig()">Save</button>
-    <button onclick="toggleHqpConfig()">Cancel</button>
-    <div id="hqp-config-status" class="status-msg"></div>
-  </div>
-</div>
-
-<div class="section">
-  <h2>S3 Knob Firmware</h2>
-  <p>Current: <span id="fw-version">checking...</span></p>
-  <button id="fetch-btn" onclick="fetchFirmware()">Fetch Latest from GitHub</button>
-  <div id="firmware-status" class="status-msg"></div>
-</div>
-
-<div class="section">
-  <h2>Status</h2>
-  <pre id="status"></pre>
 </div>
 
 <script>
-// ===== HQPlayer Functions =====
-let hqpConfigured = false;
+${versionScript}
+${escapeScript}
+let selectedZone = localStorage.getItem('criticalZone') || null;
+let zonesData = [];
+let initialLoad = true;
 
+async function loadZones() {
+  const res = await fetch('/admin/status.json');
+  const data = await res.json();
+  zonesData = data.bridge?.zones || [];
+  const nowPlaying = {};
+  (data.bridge?.now_playing || []).forEach(np => nowPlaying[np.zone_id] = np);
+
+  const sel = document.getElementById('zone-select');
+  sel.innerHTML = '<option value="">-- Select Zone --</option>' + zonesData.map(z =>
+    '<option value="' + escAttr(z.zone_id) + '"' + (z.zone_id === selectedZone ? ' selected' : '') + '>' + esc(z.zone_name) + '</option>'
+  ).join('');
+
+  // Auto-restore saved zone on first load
+  if (initialLoad && selectedZone) {
+    initialLoad = false;
+    const exists = zonesData.some(z => z.zone_id === selectedZone);
+    if (exists) {
+      document.getElementById('zone-display').classList.remove('hidden');
+    } else {
+      selectedZone = null;
+      localStorage.removeItem('criticalZone');
+    }
+  }
+  initialLoad = false;
+
+  if (selectedZone) updateZoneDisplay(nowPlaying[selectedZone]);
+}
+
+function selectZone(zoneId) {
+  selectedZone = zoneId;
+  if (zoneId) {
+    localStorage.setItem('criticalZone', zoneId);
+  } else {
+    localStorage.removeItem('criticalZone');
+  }
+  if (!zoneId) {
+    document.getElementById('zone-display').classList.add('hidden');
+    return;
+  }
+  document.getElementById('zone-display').classList.remove('hidden');
+  loadZones();
+}
+
+function updateZoneDisplay(np) {
+  if (!np) np = {};
+  const zone = zonesData.find(z => z.zone_id === selectedZone);
+  const deviceInfo = zone?.device_name ? ' (' + zone.device_name + ')' : '';
+  document.getElementById('zone-name').textContent = (zone?.zone_name || '') + deviceInfo;
+  const track = esc(np.line1 || 'Stopped');
+  const artist = esc(np.line2 || '');
+  const album = esc(np.line3 || '');
+  document.getElementById('zone-status').innerHTML = '<strong>' + track + '</strong>' + (artist ? '<br>' + artist + (album ? ' • ' + album : '') : '');
+  const volUnit = np.volume_type === 'db' ? ' dB' : '';
+  document.getElementById('zone-vol').textContent = typeof np.volume === 'number' ? np.volume + volUnit : '—';
+  document.getElementById('zone-art').src = '/now_playing/image?zone_id=' + encodeURIComponent(selectedZone) + '&width=120&height=120&t=' + Date.now();
+  document.getElementById('play-btn').textContent = np.is_playing ? '⏸' : '▶';
+
+  // Show/hide HQPlayer section based on zone (check if output contains HQPlayer)
+  const isHqpZone = zone && (zone.output_name || '').toLowerCase().includes('hqplayer');
+  document.getElementById('hqp-section').classList.toggle('hidden', !isHqpZone);
+}
+
+async function ctrl(action, value) {
+  if (!selectedZone) return;
+  await fetch('/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ zone_id: selectedZone, action, value })
+  });
+  setTimeout(loadZones, 300);
+}
+
+// HQPlayer
 async function loadHqpStatus() {
   try {
     const res = await fetch('/hqp/status');
     const data = await res.json();
-
     if (data.enabled) {
-      hqpConfigured = true;
       document.getElementById('hqp-not-configured').classList.add('hidden');
       document.getElementById('hqp-configured').classList.remove('hidden');
       document.getElementById('hqp-status').textContent = data.connected ? 'Connected' : 'Disconnected';
       document.getElementById('hqp-status').className = data.connected ? 'success' : 'error';
-
-      // Load profiles and pipeline
-      loadHqpProfiles();
+      loadHqpProfiles(data.configName);
       loadHqpPipeline();
-    } else {
-      hqpConfigured = false;
-      document.getElementById('hqp-not-configured').classList.remove('hidden');
-      document.getElementById('hqp-configured').classList.add('hidden');
     }
-  } catch (e) {
-    document.getElementById('hqp-status').textContent = 'Error: ' + e.message;
-  }
+  } catch (e) { console.error('HQPlayer status error:', e); }
 }
 
-async function loadHqpProfiles() {
-  try {
-    // Get current config name from status
-    const statusRes = await fetch('/hqp/status');
-    const statusData = await statusRes.json();
-    const currentConfigName = statusData.configName || '';
-
-    const res = await fetch('/hqp/profiles');
-    const data = await res.json();
-    const select = document.getElementById('hqp-profile');
-    select.innerHTML = '<option value="">-- Select Profile --</option>';
-    if (data.profiles) {
-      data.profiles.forEach(p => {
-        const opt = document.createElement('option');
-        opt.value = p.value || p;
-        const title = p.title || p.value || p;
-        opt.textContent = title;
-        // Auto-select if title matches current config name
-        // Note: This only works if your HQPlayer config title matches the profile name exactly
-        if (currentConfigName && title.toLowerCase() === currentConfigName.toLowerCase()) {
-          opt.selected = true;
-        }
-        select.appendChild(opt);
-      });
-    }
-  } catch (e) {
-    console.error('Failed to load profiles', e);
-  }
+async function loadHqpProfiles(configName) {
+  const res = await fetch('/hqp/profiles');
+  const data = await res.json();
+  const sel = document.getElementById('hqp-profile');
+  sel.innerHTML = '';
+  (data.profiles || []).forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.value || p;
+    opt.textContent = p.title || p.value || p;
+    if (configName && (p.title || '').toLowerCase() === configName.toLowerCase()) opt.selected = true;
+    sel.appendChild(opt);
+  });
 }
 
 async function loadHqpPipeline() {
-  try {
-    const res = await fetch('/hqp/pipeline');
-    const data = await res.json();
-    if (!data.enabled || !data.settings) return;
-
-    // Populate filter/shaper dropdowns from settings object
-    const s = data.settings;
-    populateSelect('hqp-filter1x', s.filter1x?.options || [], s.filter1x?.selected?.value);
-    populateSelect('hqp-filterNx', s.filterNx?.options || [], s.filterNx?.selected?.value);
-    populateSelect('hqp-shaper', s.shaper?.options || [], s.shaper?.selected?.value);
-  } catch (e) {
-    console.error('Failed to load pipeline', e);
-  }
+  const res = await fetch('/hqp/pipeline');
+  const data = await res.json();
+  if (!data.settings) return;
+  const s = data.settings;
+  popSel('hqp-mode', s.mode?.options, s.mode?.selected?.value);
+  popSel('hqp-samplerate', s.samplerate?.options, s.samplerate?.selected?.value);
+  popSel('hqp-filter1x', s.filter1x?.options, s.filter1x?.selected?.value);
+  popSel('hqp-filterNx', s.filterNx?.options, s.filterNx?.selected?.value);
+  popSel('hqp-shaper', s.shaper?.options, s.shaper?.selected?.value);
 }
 
-function populateSelect(id, options, currentValue) {
-  const select = document.getElementById(id);
-  select.innerHTML = '';
-  options.forEach(opt => {
-    const o = document.createElement('option');
-    o.value = opt.value || opt;
-    o.textContent = opt.label || opt.value || opt;
-    if ((opt.value || opt) === currentValue) o.selected = true;
-    select.appendChild(o);
+function popSel(id, opts, cur) {
+  const sel = document.getElementById(id);
+  sel.innerHTML = '';
+  (opts || []).forEach(o => {
+    const opt = document.createElement('option');
+    opt.value = o.value || o;
+    opt.textContent = o.label || o.value || o;
+    if ((o.value || o) === cur) opt.selected = true;
+    sel.appendChild(opt);
   });
 }
 
 async function loadProfile(profile) {
   if (!profile) return;
-  const status = document.getElementById('hqp-status-msg');
-  status.textContent = 'Loading profile...';
-  status.className = 'status-msg';
-
-  try {
-    const res = await fetch('/hqp/profiles/load', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ profile })
-    });
-    const data = await res.json();
-    if (res.ok) {
-      status.textContent = 'Profile loaded (HQPlayer restarting)';
-      status.className = 'status-msg success';
-      setTimeout(loadHqpPipeline, 3000);
-    } else {
-      status.textContent = 'Error: ' + data.error;
-      status.className = 'status-msg error';
-    }
-  } catch (e) {
-    status.textContent = 'Error: ' + e.message;
-    status.className = 'status-msg error';
-  }
+  document.getElementById('hqp-msg').textContent = 'Loading...';
+  const res = await fetch('/hqp/profiles/load', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ profile }) });
+  document.getElementById('hqp-msg').textContent = res.ok ? 'Profile loaded' : 'Error';
+  document.getElementById('hqp-msg').className = 'status-msg ' + (res.ok ? 'success' : 'error');
+  setTimeout(loadHqpPipeline, 2000);
 }
 
 async function setPipeline(setting, value) {
-  const status = document.getElementById('hqp-status-msg');
-  try {
-    const res = await fetch('/hqp/pipeline', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ setting, value })
-    });
-    if (res.ok) {
-      status.textContent = setting + ' updated';
-      status.className = 'status-msg success';
-    } else {
-      const data = await res.json();
-      status.textContent = 'Error: ' + data.error;
-      status.className = 'status-msg error';
-    }
-  } catch (e) {
-    status.textContent = 'Error: ' + e.message;
-    status.className = 'status-msg error';
-  }
+  const res = await fetch('/hqp/pipeline', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ setting, value }) });
+  document.getElementById('hqp-msg').textContent = res.ok ? setting + ' updated' : 'Error';
+  document.getElementById('hqp-msg').className = 'status-msg ' + (res.ok ? 'success' : 'error');
 }
 
-function toggleHqpConfig() {
-  const form = document.getElementById('hqp-config-form');
-  form.classList.toggle('hidden');
+loadZones();
+loadHqpStatus();
+setInterval(loadZones, 4000);
+</script></body></html>`);
+  });
+
+  // GET /knobs - Knob device management
+  router.get(['/knobs', '/admin/knobs'], (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>Knobs - Hi-Fi</title><style>${baseStyles}</style></head><body>
+${navHtml('knobs')}
+<h2>Knob Devices</h2>
+<table>
+  <thead><tr><th>ID</th><th>Name</th><th>Version</th><th>Zone</th><th>Battery</th><th>Last Seen</th><th></th></tr></thead>
+  <tbody id="knobs-body"><tr><td colspan="7" class="muted">Loading...</td></tr></tbody>
+</table>
+
+<div id="configModal" class="modal-overlay">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal()">&times;</button>
+    <h2>Knob Configuration</h2>
+    <div id="configForm">Loading...</div>
+  </div>
+</div>
+
+<script>
+${versionScript}
+${escapeScript}
+let zonesData = [];
+
+function ago(ts) {
+  if (!ts) return 'never';
+  const diff = Date.now() - new Date(ts).getTime();
+  const s = Math.floor(diff / 1000);
+  if (s < 60) return s + 's ago';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
+}
+
+async function loadKnobs() {
+  const res = await fetch('/admin/status.json');
+  const data = await res.json();
+  const knobs = data.knobs || [];
+  zonesData = data.bridge?.zones || [];
+
+  const tbody = document.getElementById('knobs-body');
+  if (knobs.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="muted">No knobs registered. Connect a knob to see it here.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = knobs.map(k => {
+    const st = k.status || {};
+    const bat = st.battery_level != null ? st.battery_level + '%' + (st.battery_charging ? ' ⚡' : '') : '—';
+    const zone = st.zone_id ? esc(zonesData.find(z => z.zone_id === st.zone_id)?.zone_name || st.zone_id) : '—';
+    return '<tr><td><code>' + esc(k.knob_id || '') + '</code></td><td>' + (k.name ? esc(k.name) : '<span class="muted">unnamed</span>') + '</td><td>' + esc(k.version || '—') + '</td><td>' + zone + '</td><td>' + bat + '</td><td>' + ago(k.last_seen) + '</td><td><button class="config-btn" data-knob-id="' + escAttr(k.knob_id) + '">Config</button></td></tr>';
+  }).join('');
+}
+
+// Event delegation for config buttons
+document.getElementById('knobs-body').addEventListener('click', function(e) {
+  const btn = e.target.closest('.config-btn');
+  if (btn) openConfig(btn.dataset.knobId);
+});
+
+function openModal() { document.getElementById('configModal').classList.add('open'); }
+function closeModal() { document.getElementById('configModal').classList.remove('open'); }
+
+let currentKnobId = null;
+
+async function openConfig(knobId) {
+  currentKnobId = knobId;
+  openModal();
+  document.getElementById('configForm').innerHTML = 'Loading...';
+
+  const res = await fetch('/config/' + encodeURIComponent(knobId));
+  const data = await res.json();
+  const c = data.config || {};
+
+  const rotSel = (n, v) => '<select name="' + n + '"><option value="0"' + (v === 0 ? ' selected' : '') + '>0°</option><option value="180"' + (v === 180 ? ' selected' : '') + '>180°</option></select>';
+  const artChg = c.art_mode_charging || { enabled: true, timeout_sec: 60 };
+  const artBat = c.art_mode_battery || { enabled: true, timeout_sec: 30 };
+  const dimChg = c.dim_charging || { enabled: true, timeout_sec: 120 };
+  const dimBat = c.dim_battery || { enabled: true, timeout_sec: 30 };
+  const slpChg = c.sleep_charging || { enabled: false, timeout_sec: 0 };
+  const slpBat = c.sleep_battery || { enabled: true, timeout_sec: 60 };
+
+  document.getElementById('configForm').innerHTML = '<form id="knobConfigForm"><div class="form-row"><label>Name:</label><input type="text" name="name" value="' + escAttr(c.name || '') + '" placeholder="Living Room Knob"></div><div class="form-section"><h3>Display Rotation</h3><div class="form-row"><label>Charging:</label>' + rotSel('rotation_charging', c.rotation_charging ?? 180) + ' <label style="margin-left:1em;">Battery:</label>' + rotSel('rotation_not_charging', c.rotation_not_charging ?? 0) + '</div></div><div class="form-section"><h3>Power Timers (sec, 0=skip)</h3><table style="font-size:0.9em;"><tr><th></th><th>Charging</th><th>Battery</th></tr><tr><td>Art Mode</td><td><input type="number" name="art_chg_sec" value="' + artChg.timeout_sec + '" style="width:50px;"> <label><input type="checkbox" name="art_chg_on"' + (artChg.enabled ? ' checked' : '') + '> On</label></td><td><input type="number" name="art_bat_sec" value="' + artBat.timeout_sec + '" style="width:50px;"> <label><input type="checkbox" name="art_bat_on"' + (artBat.enabled ? ' checked' : '') + '> On</label></td></tr><tr><td>Dim</td><td><input type="number" name="dim_chg_sec" value="' + dimChg.timeout_sec + '" style="width:50px;"> <label><input type="checkbox" name="dim_chg_on"' + (dimChg.enabled ? ' checked' : '') + '> On</label></td><td><input type="number" name="dim_bat_sec" value="' + dimBat.timeout_sec + '" style="width:50px;"> <label><input type="checkbox" name="dim_bat_on"' + (dimBat.enabled ? ' checked' : '') + '> On</label></td></tr><tr><td>Sleep</td><td><input type="number" name="slp_chg_sec" value="' + slpChg.timeout_sec + '" style="width:50px;"> <label><input type="checkbox" name="slp_chg_on"' + (slpChg.enabled ? ' checked' : '') + '> On</label></td><td><input type="number" name="slp_bat_sec" value="' + slpBat.timeout_sec + '" style="width:50px;"> <label><input type="checkbox" name="slp_bat_on"' + (slpBat.enabled ? ' checked' : '') + '> On</label></td></tr></table></div><div class="form-section"><h3>Power Mgmt</h3><div class="form-row"><label><input type="checkbox" name="wifi_ps"' + (c.wifi_power_save_enabled ? ' checked' : '') + '> WiFi Sleep</label> <label style="margin-left:1em;"><input type="checkbox" name="cpu_scale"' + (c.cpu_freq_scaling_enabled ? ' checked' : '') + '> CPU Scaling</label></div><div class="form-row"><label>Sleep poll (stopped):</label><input type="number" name="sleep_poll_stopped" value="' + (c.sleep_poll_stopped_sec ?? 60) + '" style="width:50px;"> sec</div></div><div class="form-actions"><button type="button" class="btn-secondary" onclick="closeModal()">Cancel</button><button type="submit" class="btn-primary">Save</button></div></form>';
+
+  document.getElementById('knobConfigForm').addEventListener('submit', saveConfig);
+}
+
+async function saveConfig(e) {
+  e.preventDefault();
+  const f = e.target;
+  const knobId = currentKnobId;
+  const v = n => f.querySelector('[name="' + n + '"]')?.value || '';
+  const num = n => parseInt(v(n)) || 0;
+  const chk = n => f.querySelector('[name="' + n + '"]')?.checked || false;
+
+  const cfg = {
+    name: v('name'),
+    rotation_charging: num('rotation_charging'),
+    rotation_not_charging: num('rotation_not_charging'),
+    art_mode_charging: { enabled: chk('art_chg_on'), timeout_sec: num('art_chg_sec') },
+    art_mode_battery: { enabled: chk('art_bat_on'), timeout_sec: num('art_bat_sec') },
+    dim_charging: { enabled: chk('dim_chg_on'), timeout_sec: num('dim_chg_sec') },
+    dim_battery: { enabled: chk('dim_bat_on'), timeout_sec: num('dim_bat_sec') },
+    sleep_charging: { enabled: chk('slp_chg_on'), timeout_sec: num('slp_chg_sec') },
+    sleep_battery: { enabled: chk('slp_bat_on'), timeout_sec: num('slp_bat_sec') },
+    wifi_power_save_enabled: chk('wifi_ps'),
+    cpu_freq_scaling_enabled: chk('cpu_scale'),
+    sleep_poll_stopped_sec: num('sleep_poll_stopped'),
+  };
+
+  const res = await fetch('/config/' + encodeURIComponent(knobId), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+  if (res.ok) { closeModal(); loadKnobs(); } else { alert('Save failed'); }
+}
+
+document.getElementById('configModal').addEventListener('click', e => { if (e.target.id === 'configModal') closeModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+loadKnobs();
+setInterval(loadKnobs, 5000);
+</script></body></html>`);
+  });
+
+  // GET /settings - Settings page (HQPlayer config, firmware, status)
+  router.get(['/settings', '/admin', '/admin/settings', '/dashboard'], (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>Settings - Hi-Fi</title><style>${baseStyles}</style></head><body>
+${navHtml('settings')}
+<h2>Settings</h2>
+
+<div class="section">
+  <h3>HQPlayer Configuration</h3>
+  <div id="hqp-status-line" class="muted">Checking...</div>
+  <div id="hqp-config-form">
+    <div class="form-row"><label>Host:</label><input type="text" id="hqp-host" placeholder="192.168.1.x"></div>
+    <div class="form-row"><label>Port (Web UI):</label><input type="text" id="hqp-port" value="8088"></div>
+    <div class="form-row"><label>Username:</label><input type="text" id="hqp-username" placeholder="(required for profiles)"></div>
+    <div class="form-row"><label>Password:</label><input type="password" id="hqp-password"></div>
+    <button onclick="saveHqpConfig()">Save</button>
+    <span id="hqp-save-msg" class="status-msg"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h3>S3 Knob Firmware</h3>
+  <p>Current: <span id="fw-version">checking...</span></p>
+  <button id="fetch-btn" onclick="fetchFirmware()">Fetch Latest from GitHub</button>
+  <span id="fw-msg" class="status-msg"></span>
+</div>
+
+<div class="section">
+  <h3>Status</h3>
+  <pre id="status" style="font-size:0.85em;overflow-x:auto;"></pre>
+</div>
+
+<script>
+${versionScript}
+
+// HQPlayer config
+async function loadHqpConfig() {
+  try {
+    const res = await fetch('/hqp/status');
+    const data = await res.json();
+    document.getElementById('hqp-status-line').textContent = data.enabled
+      ? 'Connected to ' + (data.host || 'HQPlayer') + (data.connected ? ' ✓' : ' (disconnected)')
+      : 'Not configured';
+    document.getElementById('hqp-status-line').className = data.connected ? 'success' : 'muted';
+  } catch (e) {}
 }
 
 async function saveHqpConfig() {
@@ -487,98 +827,71 @@ async function saveHqpConfig() {
   const port = document.getElementById('hqp-port').value || '8088';
   const username = document.getElementById('hqp-username').value;
   const password = document.getElementById('hqp-password').value;
-  const status = document.getElementById('hqp-config-status');
+  const msg = document.getElementById('hqp-save-msg');
 
-  if (!host) {
-    status.textContent = 'Host is required';
-    status.className = 'status-msg error';
-    return;
-  }
+  if (!host) { msg.textContent = 'Host required'; msg.className = 'status-msg error'; return; }
 
-  const config = { host, port: parseInt(port) };
-  if (username) config.username = username;
-  if (password) config.password = password;
+  const cfg = { host, port: parseInt(port) };
+  if (username) cfg.username = username;
+  if (password) cfg.password = password;
 
+  const res = await fetch('/hqp/configure', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+  msg.textContent = res.ok ? 'Saved!' : 'Error';
+  msg.className = 'status-msg ' + (res.ok ? 'success' : 'error');
+  loadHqpConfig();
+}
+
+// Firmware
+async function loadFirmwareVersion() {
   try {
-    const res = await fetch('/hqp/configure', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config)
-    });
+    const res = await fetch('/firmware/version');
     if (res.ok) {
-      status.textContent = 'Configured!';
-      status.className = 'status-msg success';
-      document.getElementById('hqp-config-form').classList.add('hidden');
-      loadHqpStatus();
-    } else {
       const data = await res.json();
-      status.textContent = 'Error: ' + data.error;
-      status.className = 'status-msg error';
+      document.getElementById('fw-version').textContent = 'v' + data.version;
+    } else {
+      document.getElementById('fw-version').textContent = 'Not installed';
     }
   } catch (e) {
-    status.textContent = 'Error: ' + e.message;
-    status.className = 'status-msg error';
+    document.getElementById('fw-version').textContent = 'Not installed';
   }
 }
 
-// ===== Firmware Functions =====
-function fetchFirmware() {
+async function fetchFirmware() {
   const btn = document.getElementById('fetch-btn');
-  const status = document.getElementById('firmware-status');
+  const msg = document.getElementById('fw-msg');
   btn.disabled = true;
-  status.textContent = 'Fetching...';
-  status.className = 'status-msg';
+  msg.textContent = 'Fetching...';
+  msg.className = 'status-msg';
 
-  fetch('/admin/fetch-firmware', { method: 'POST' })
-    .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
-    .then(({ ok, data }) => {
-      if (ok) {
-        status.textContent = 'Downloaded v' + data.version;
-        status.className = 'status-msg success';
-        document.getElementById('fw-version').textContent = 'v' + data.version;
-      } else {
-        status.textContent = 'Error: ' + data.error;
-        status.className = 'status-msg error';
-      }
-    })
-    .catch(e => {
-      status.textContent = 'Error: ' + e.message;
-      status.className = 'status-msg error';
-    })
-    .finally(() => btn.disabled = false);
+  try {
+    const res = await fetch('/admin/fetch-firmware', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      msg.textContent = 'Downloaded v' + data.version;
+      msg.className = 'status-msg success';
+      document.getElementById('fw-version').textContent = 'v' + data.version;
+    } else {
+      msg.textContent = 'Error: ' + data.error;
+      msg.className = 'status-msg error';
+    }
+  } catch (e) {
+    msg.textContent = 'Error: ' + e.message;
+    msg.className = 'status-msg error';
+  }
+  btn.disabled = false;
 }
 
-// ===== Init =====
-// Set subnet placeholder for HQPlayer host
-(function setSubnetPlaceholder() {
-  const host = window.location.hostname;
-  const match = host.match(/^(\\d+\\.\\d+\\.\\d+)\\./);
-  if (match) {
-    document.getElementById('hqp-host').placeholder = match[1] + '.x';
-  } else {
-    document.getElementById('hqp-host').placeholder = '192.168.1.x';
-  }
-})();
+// Status
+async function loadStatus() {
+  const res = await fetch('/admin/status.json');
+  const data = await res.json();
+  document.getElementById('status').textContent = JSON.stringify(data, null, 2);
+}
 
-// Load HQPlayer status
-loadHqpStatus();
-
-// Load current firmware version
-fetch('/firmware/version')
-  .then(r => r.ok ? r.json() : Promise.reject('No firmware'))
-  .then(d => document.getElementById('fw-version').textContent = 'v' + d.version)
-  .catch(() => document.getElementById('fw-version').textContent = 'Not installed');
-
-// Load bridge status and version
-fetch('/status').then(r => r.json()).then(d => {
-  document.getElementById('app-version').textContent = 'v' + d.version;
-});
-fetch('/admin/status.json').then(r => r.json()).then(d => {
-  document.getElementById('status').textContent = JSON.stringify(d, null, 2);
-});
-</script>
-</body>
-</html>`);
+loadHqpConfig();
+loadFirmwareVersion();
+loadStatus();
+</script></body></html>`);
   });
 
   // Shared requires for firmware handling
