@@ -21,6 +21,10 @@ COPY src/ ./src/
 # Create data directory for config persistence
 RUN mkdir -p /data
 
+# Version from build arg
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
+
 # Environment
 ENV NODE_ENV=production
 ENV PORT=8088
