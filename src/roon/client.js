@@ -204,6 +204,7 @@ function createRoonClient(opts = {}) {
     return state.zones.map((zone) => {
       const output = zone.outputs?.[0];
       const sourceControl = output?.source_controls?.[0];
+      const vol = output?.volume;
       const canGroup = output?.can_group_with_output_ids || [];
       const result = {
         zone_id: zone.zone_id,
@@ -213,6 +214,12 @@ function createRoonClient(opts = {}) {
         output_count: zone.outputs?.length || 0,
         output_name: output?.display_name || null,
         device_name: sourceControl?.display_name || null,
+        volume_control: vol ? {
+          type: vol.type,
+          min: vol.min,
+          max: vol.max,
+          is_muted: vol.is_muted || false,
+        } : null,
         supports_grouping: canGroup.length > 1,
       };
       if (opts.debug) {
