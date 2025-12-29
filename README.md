@@ -14,6 +14,30 @@ Hi-fi software assumes you're at a computer or using vendor-specific apps. This 
 
 🚧 **In Development** — Consolidating [roon-knob](https://github.com/muness/roon-knob) bridge and [hqp-profile-switcher](https://github.com/muness/roon-extension-hqp-profile-switcher) into a unified platform.
 
+## Quick Start (Docker)
+
+```yaml
+# docker-compose.yml
+services:
+  unified-hifi-control:
+    image: ghcr.io/cloud-atlas-ai/unified-hifi-control:latest
+    network_mode: host  # Required for Roon mDNS discovery
+    volumes:
+      - ./data:/data
+      - ./firmware:/app/firmware
+    environment:
+      - PORT=8088
+      - CONFIG_DIR=/data
+    restart: unless-stopped
+```
+
+```bash
+docker compose up -d
+# Access http://localhost:8088/admin
+```
+
+**Note:** Port 8088 is also HQPlayer's default. If running both on the same host, change one.
+
 ## Architecture
 
 ```
@@ -39,17 +63,17 @@ The bridge includes an MCP server that lets Claude control your hi-fi system dir
 
 ### Setup
 
-1. Start the bridge: `npm start`
+1. Start the bridge: `docker compose up -d` or `npm start`
 2. Add to your Claude Code MCP config:
 
 ```json
 {
   "mcpServers": {
     "hifi": {
-      "command": "node",
-      "args": ["/path/to/unified-hifi-control/src/mcp/index.js"],
+      "command": "npx",
+      "args": ["unified-hifi-control-mcp"],
       "env": {
-        "HIFI_BRIDGE_URL": "http://localhost:3000"
+        "HIFI_BRIDGE_URL": "http://localhost:8088"
       }
     }
   }

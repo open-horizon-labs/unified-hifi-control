@@ -267,7 +267,7 @@ function createKnobRoutes({ roon, knobs, logger }) {
 </style>
 </head>
 <body>
-<h1>Unified Hi-Fi Control</h1>
+<h1>Unified Hi-Fi Control <span id="app-version" class="muted" style="font-size: 0.5em;"></span></h1>
 
 <div class="section">
   <h2>HQPlayer</h2>
@@ -569,7 +569,10 @@ fetch('/firmware/version')
   .then(d => document.getElementById('fw-version').textContent = 'v' + d.version)
   .catch(() => document.getElementById('fw-version').textContent = 'Not installed');
 
-// Load bridge status
+// Load bridge status and version
+fetch('/status').then(r => r.json()).then(d => {
+  document.getElementById('app-version').textContent = 'v' + d.version;
+});
 fetch('/admin/status.json').then(r => r.json()).then(d => {
   document.getElementById('status').textContent = JSON.stringify(d, null, 2);
 });
