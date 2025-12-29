@@ -3,6 +3,7 @@ const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
 const { createKnobRoutes } = require('../knobs/routes');
+const { discover } = require('../lib/mdns');
 
 function createApp(opts = {}) {
   const { roon, hqp, knobs, logger } = opts;
@@ -166,6 +167,26 @@ function createApp(opts = {}) {
     hqp.configure({ host, port, username, password });
     log.info('HQPlayer configured', { host, port });
     res.json({ ok: true });
+  });
+
+  // HQPlayer mDNS discovery
+  app.get('/hqp/discover', async (req, res) => {
+    const timeout = parseInt(req.query.timeout) || 5000;
+    log.info('HQPlayer discovery requested', { timeout });
+    try {
+      const services = await discover('hqplayer', { timeout, log });
+      res.json({
+        services: services.map(s => ({
+          name: s.name,
+          host: s.host,
+          port: s.port,
+          addresses: s.addresses
+        }))
+      });
+    } catch (err) {
+      log.error('HQPlayer discovery failed', { error: err.message });
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // Combined status for dashboard

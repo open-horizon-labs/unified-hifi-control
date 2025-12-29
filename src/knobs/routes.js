@@ -307,12 +307,23 @@ function createKnobRoutes({ roon, knobs, logger }) {
   <div id="hqp-config-form" class="config-form hidden">
     <h3>HQPlayer Configuration</h3>
     <div class="form-row">
+      <label></label>
+      <button onclick="discoverHqp()">Discover on Network</button>
+      <span id="hqp-discover-status" class="muted"></span>
+    </div>
+    <div id="hqp-discovered" class="form-row hidden">
+      <label>Found:</label>
+      <select id="hqp-discovered-select" onchange="selectDiscovered(this.value)">
+        <option value="">-- Select --</option>
+      </select>
+    </div>
+    <div class="form-row">
       <label>Host:</label>
       <input type="text" id="hqp-host" placeholder="">
     </div>
     <div class="form-row">
       <label>Port:</label>
-      <input type="text" id="hqp-port" value="8088" placeholder="8088">
+      <input type="text" id="hqp-port" value="8088" placeholder="8088 (Web UI)">
     </div>
     <div class="form-row">
       <label>Username:</label>
@@ -506,6 +517,52 @@ async function saveHqpConfig() {
     status.textContent = 'Error: ' + e.message;
     status.className = 'status-msg error';
   }
+}
+
+let discoveredHqp = [];
+
+async function discoverHqp() {
+  const status = document.getElementById('hqp-discover-status');
+  const select = document.getElementById('hqp-discovered-select');
+  const container = document.getElementById('hqp-discovered');
+
+  status.textContent = 'Scanning...';
+  container.classList.add('hidden');
+
+  try {
+    const res = await fetch('/hqp/discover?timeout=5000');
+    const data = await res.json();
+
+    if (data.services && data.services.length > 0) {
+      discoveredHqp = data.services;
+      select.innerHTML = '<option value="">-- Select --</option>';
+      data.services.forEach((s, i) => {
+        const opt = document.createElement('option');
+        opt.value = i;
+        const addr = s.addresses?.[0] || s.host;
+        opt.textContent = s.name + ' (' + addr + ':' + s.port + ')';
+        select.appendChild(opt);
+      });
+      container.classList.remove('hidden');
+      status.textContent = 'Found ' + data.services.length;
+      status.className = 'muted success';
+    } else {
+      status.textContent = 'No HQPlayer found';
+      status.className = 'muted';
+      container.classList.add('hidden');
+    }
+  } catch (e) {
+    status.textContent = 'Error: ' + e.message;
+    status.className = 'muted error';
+  }
+}
+
+function selectDiscovered(index) {
+  if (index === '' || !discoveredHqp[index]) return;
+  const s = discoveredHqp[index];
+  const addr = s.addresses?.[0] || s.host;
+  document.getElementById('hqp-host').value = addr;
+  document.getElementById('hqp-port').value = s.port || 8088;
 }
 
 // ===== Firmware Functions =====

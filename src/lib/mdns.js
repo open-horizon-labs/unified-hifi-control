@@ -1,4 +1,4 @@
-const bonjour = require('bonjour')();
+const bonjourInstance = require('bonjour')();
 
 function advertise(port, props = {}, log = console) {
   const serviceConfig = {
@@ -20,7 +20,7 @@ function advertise(port, props = {}, log = console) {
     txt: serviceConfig.txt
   });
 
-  const service = bonjour.publish(serviceConfig);
+  const service = bonjourInstance.publish(serviceConfig);
 
   service.on('up', () => {
     log.info('mDNS: Service published successfully', { name: serviceConfig.name });
@@ -34,4 +34,50 @@ function advertise(port, props = {}, log = console) {
   return service;
 }
 
-module.exports = { advertise };
+/**
+ * Discover services on the network via mDNS
+ * @param {string} serviceType - Service type to discover (e.g., 'hqplayer' for _hqplayer._tcp)
+ * @param {object} opts - Options: timeout (ms, default 5000), log (logger)
+ * @returns {Promise<Array>} Array of discovered services
+ */
+function discover(serviceType, opts = {}) {
+  const log = opts.log || console;
+  const timeout = opts.timeout || 5000;
+
+  return new Promise((resolve) => {
+    const services = [];
+
+    log.info('mDNS: Starting discovery', {
+      type: `_${serviceType}._tcp`,
+      timeout
+    });
+
+    const browser = bonjourInstance.find({ type: serviceType });
+
+    browser.on('up', (service) => {
+      log.info('mDNS: Service found', {
+        name: service.name,
+        host: service.host,
+        port: service.port,
+        addresses: service.addresses
+      });
+
+      services.push({
+        name: service.name,
+        host: service.host,
+        port: service.port,
+        addresses: service.addresses || [],
+        txt: service.txt || {}
+      });
+    });
+
+    // Stop after timeout and return results
+    setTimeout(() => {
+      browser.stop();
+      log.info('mDNS: Discovery complete', { found: services.length });
+      resolve(services);
+    }, timeout);
+  });
+}
+
+module.exports = { advertise, discover };
