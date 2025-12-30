@@ -887,21 +887,19 @@ ${navHtml('settings')}
 <div class="section">
   <h3>HQPlayer Configuration</h3>
   <div id="hqp-status-line" class="muted">Checking...</div>
-  <details id="hqp-config-details">
-    <summary style="cursor:pointer;margin:1em 0 0.5em 0;">Configuration</summary>
+  <button id="hqp-reconfig-btn" onclick="showHqpConfig()" style="display:none;margin-top:0.5em;">Reconfigure</button>
+  <div id="hqp-config-form" style="display:none;">
     <p class="muted" style="margin:0.5em 0;">Filter/shaper/rate control uses native protocol (port 4321).</p>
-    <div id="hqp-config-form">
-      <div class="form-row"><label>Host:</label><input type="text" id="hqp-host" placeholder="192.168.1.x"></div>
-      <div id="hqp-embedded-fields" style="display:none;">
-        <p class="muted" style="margin:0.5em 0;">Profile switching requires web UI credentials (Embedded only):</p>
-        <div class="form-row"><label>Port (Web UI):</label><input type="text" id="hqp-port" value="8088"></div>
-        <div class="form-row"><label>Username:</label><input type="text" id="hqp-username" placeholder="(optional)"></div>
-        <div class="form-row"><label>Password:</label><input type="password" id="hqp-password"></div>
-      </div>
-      <button onclick="saveHqpConfig()">Save</button>
-      <span id="hqp-save-msg" class="status-msg"></span>
+    <div class="form-row"><label>Host:</label><input type="text" id="hqp-host" placeholder="192.168.1.x"></div>
+    <div id="hqp-embedded-fields" style="display:none;">
+      <p class="muted" style="margin:0.5em 0;">Configuration switching requires web UI credentials (Embedded only):</p>
+      <div class="form-row"><label>Port (Web UI):</label><input type="text" id="hqp-port" value="8088"></div>
+      <div class="form-row"><label>Username:</label><input type="text" id="hqp-username" placeholder="(optional)"></div>
+      <div class="form-row"><label>Password:</label><input type="password" id="hqp-password"></div>
     </div>
-  </details>
+    <button onclick="saveHqpConfig()">Save</button>
+    <span id="hqp-save-msg" class="status-msg"></span>
+  </div>
 </div>
 
 <div class="section">
@@ -922,42 +920,45 @@ ${navHtml('settings')}
 ${versionScript}
 
 // HQPlayer config
+function showHqpConfig() {
+  document.getElementById('hqp-config-form').style.display = 'block';
+  document.getElementById('hqp-reconfig-btn').style.display = 'none';
+}
+
 async function loadHqpConfig() {
   try {
     const res = await fetch('/hqp/status');
     const data = await res.json();
     const statusLine = document.getElementById('hqp-status-line');
     const embeddedFields = document.getElementById('hqp-embedded-fields');
-    const details = document.getElementById('hqp-config-details');
+    const configForm = document.getElementById('hqp-config-form');
+    const reconfigBtn = document.getElementById('hqp-reconfig-btn');
 
-    if (data.enabled) {
+    if (data.enabled && data.connected) {
       const product = data.product || 'HQPlayer';
       const version = data.version ? ' v' + data.version : '';
-      const connStatus = data.connected ? ' ✓' : ' (disconnected)';
-      statusLine.textContent = product + version + ' at ' + (data.host || 'unknown') + connStatus;
-      statusLine.className = data.connected ? 'success' : 'muted';
+      statusLine.textContent = product + version + ' at ' + (data.host || 'unknown') + ' ✓';
+      statusLine.className = 'success';
 
-      // Collapse configuration if already connected
-      if (data.connected && details) {
-        details.open = false;
-      }
+      // Hide form, show reconfigure button
+      configForm.style.display = 'none';
+      reconfigBtn.style.display = 'inline-block';
 
       // Show embedded fields only for HQPlayer Embedded
       if (data.isEmbedded) {
         embeddedFields.style.display = 'block';
       }
     } else {
-      statusLine.textContent = 'Not configured';
+      statusLine.textContent = data.enabled ? 'Configured but disconnected' : 'Not configured';
       statusLine.className = 'muted';
-      // Expand configuration if not configured
-      if (details) {
-        details.open = true;
-      }
+      // Show form, hide reconfigure button
+      configForm.style.display = 'block';
+      reconfigBtn.style.display = 'none';
     }
   } catch (e) {
-    // Expand on error
-    const details = document.getElementById('hqp-config-details');
-    if (details) details.open = true;
+    // Show form on error
+    document.getElementById('hqp-config-form').style.display = 'block';
+    document.getElementById('hqp-reconfig-btn').style.display = 'none';
   }
 }
 
