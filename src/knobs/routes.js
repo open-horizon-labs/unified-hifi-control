@@ -866,14 +866,17 @@ ${navHtml('settings')}
 <h2>Settings</h2>
 
 <div class="section">
-  <h3>HQPlayer Embedded Configuration</h3>
-  <p class="muted" style="margin:0.5em 0;">Filter/shaper/rate control uses native protocol (port 4321). Profile switching requires web UI auth below.</p>
+  <h3>HQPlayer Configuration</h3>
+  <p class="muted" style="margin:0.5em 0;">Filter/shaper/rate control uses native protocol (port 4321).</p>
   <div id="hqp-status-line" class="muted">Checking...</div>
   <div id="hqp-config-form">
     <div class="form-row"><label>Host:</label><input type="text" id="hqp-host" placeholder="192.168.1.x"></div>
-    <div class="form-row"><label>Port (Web UI):</label><input type="text" id="hqp-port" value="8088"></div>
-    <div class="form-row"><label>Username:</label><input type="text" id="hqp-username" placeholder="(optional, for profile switching)"></div>
-    <div class="form-row"><label>Password:</label><input type="password" id="hqp-password"></div>
+    <div id="hqp-embedded-fields" style="display:none;">
+      <p class="muted" style="margin:0.5em 0;">Profile switching requires web UI credentials (Embedded only):</p>
+      <div class="form-row"><label>Port (Web UI):</label><input type="text" id="hqp-port" value="8088"></div>
+      <div class="form-row"><label>Username:</label><input type="text" id="hqp-username" placeholder="(optional)"></div>
+      <div class="form-row"><label>Password:</label><input type="password" id="hqp-password"></div>
+    </div>
     <button onclick="saveHqpConfig()">Save</button>
     <span id="hqp-save-msg" class="status-msg"></span>
   </div>
@@ -901,10 +904,22 @@ async function loadHqpConfig() {
   try {
     const res = await fetch('/hqp/status');
     const data = await res.json();
-    document.getElementById('hqp-status-line').textContent = data.enabled
-      ? 'Connected to ' + (data.host || 'HQPlayer') + (data.connected ? ' ✓' : ' (disconnected)')
-      : 'Not configured';
-    document.getElementById('hqp-status-line').className = data.connected ? 'success' : 'muted';
+    const statusLine = document.getElementById('hqp-status-line');
+    const embeddedFields = document.getElementById('hqp-embedded-fields');
+
+    if (data.enabled) {
+      const productInfo = data.product ? ' (' + data.product + ')' : '';
+      statusLine.textContent = 'Connected to ' + (data.host || 'HQPlayer') + productInfo + (data.connected ? ' ✓' : ' (disconnected)');
+      statusLine.className = data.connected ? 'success' : 'muted';
+
+      // Show embedded fields only for HQPlayer Embedded
+      if (data.isEmbedded) {
+        embeddedFields.style.display = 'block';
+      }
+    } else {
+      statusLine.textContent = 'Not configured';
+      statusLine.className = 'muted';
+    }
   } catch (e) {}
 }
 
