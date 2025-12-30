@@ -20,7 +20,7 @@ Hi-fi software assumes you're at a computer or using vendor-specific apps. This 
 # docker-compose.yml
 services:
   unified-hifi-control:
-    image: ghcr.io/cloud-atlas-ai/unified-hifi-control:latest
+    image: muness/unified-hifi-control:latest
     network_mode: host  # Required for Roon mDNS discovery
     volumes:
       - ./data:/data
