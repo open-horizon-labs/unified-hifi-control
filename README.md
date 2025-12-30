@@ -6,7 +6,7 @@ A source-agnostic hi-fi control bridge that connects music sources and audio pip
 
 Hi-fi software assumes you're at a computer or using vendor-specific apps. This bridge fills the gap:
 
-- **Music Sources:** Roon (now), Music Assistant, Tidal Connect, Qobuz Connect (future)
+- **Music Sources:** Roon (now)
 - **Audio Pipeline:** HQPlayer Embedded (web UI control), receiver control (future)
 - **Surfaces:** Anything that speaks HTTP or MQTT — ESP32 hardware, web UIs, Home Assistant, Claude (via MCP), etc.
 
