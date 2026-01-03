@@ -6,9 +6,9 @@ const { createApp } = require('./server/app');
 const { createLogger } = require('./lib/logger');
 const { advertise } = require('./lib/mdns');
 const { createKnobsStore } = require('./knobs/store');
-const { createBus } = require('./bus');
+const { initBus } = require('./bus');
 const { RoonAdapter } = require('./bus/adapters/roon');
-const { createBusDebug } = require('./bus/debug');
+const { initDebug } = require('./bus/debug');
 
 const PORT = process.env.PORT || 8088;
 const log = createLogger('Main');
@@ -42,16 +42,16 @@ const hqp = new HQPClient({
   logger: createLogger('HQP'),
 });
 
-// Create bus and register backends
-const bus = createBus({
+// Initialize bus and register backends
+const bus = initBus({
   logger: createLogger('Bus'),
 });
 
 const roonAdapter = new RoonAdapter(roon);
 bus.registerBackend('roon', roonAdapter);
 
-// Create debug consumer
-const busDebug = createBusDebug(bus, { logger: createLogger('BusDebug') });
+// Initialize debug consumer
+initDebug({ logger: createLogger('BusDebug') });
 
 // Create knobs store for ESP32 knob configuration
 const knobs = createKnobsStore({
@@ -77,11 +77,9 @@ const mqttService = createMqttService({
 
 // Create HTTP server
 const app = createApp({
-  roon,       // Keep for backward compat during Phase 2 testing
+  roon,    // Keep for backward compat during Phase 2 testing
   hqp,
   knobs,
-  bus,        // Add bus for new routes
-  busDebug,   // Debug consumer
   logger: createLogger('Server'),
 });
 

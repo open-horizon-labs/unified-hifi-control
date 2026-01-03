@@ -177,4 +177,22 @@ function createBus({ logger } = {}) {
   };
 }
 
-module.exports = { createBus };
+// Singleton instance
+let busInstance = null;
+
+function getBus() {
+  if (!busInstance) {
+    throw new Error('Bus not initialized - call initBus() first');
+  }
+  return busInstance;
+}
+
+function initBus({ logger } = {}) {
+  if (busInstance) {
+    throw new Error('Bus already initialized');
+  }
+  busInstance = createBus({ logger });
+  return busInstance;
+}
+
+module.exports = { createBus, initBus, getBus };

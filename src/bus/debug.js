@@ -25,7 +25,8 @@ function createBusDebug(bus, { logger } = {}) {
     messageLog.length = 0;
   }
 
-  return { getDebugInfo, stop };
+  debugInstance = { getDebugInfo, stop };
+  return debugInstance;
 }
 
-module.exports = { createBusDebug };
+module.exports = { initDebug, getDebug };

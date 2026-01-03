@@ -2,6 +2,8 @@ const express = require('express');
 const sharp = require('sharp');
 const fs = require('fs');
 const path = require('path');
+const { getBus } = require('../bus');
+const { getDebug } = require('../bus/debug');
 
 function extractKnob(req) {
   const headerId = req.get('x-knob-id') || req.get('x-device-id');
@@ -13,9 +15,18 @@ function extractKnob(req) {
   return { id, version };
 }
 
-function createKnobRoutes({ roon, knobs, bus, busDebug, logger }) {
+function createKnobRoutes({ roon, knobs, logger }) {
   const router = express.Router();
   const log = logger || console;
+
+  // Access bus singleton (if initialized)
+  let bus, busDebug;
+  try {
+    bus = getBus();
+    busDebug = getDebug();
+  } catch (err) {
+    // Bus not initialized - routes will fallback to roon
+  }
 
   // GET /zones - List all zones from bus (multi-backend)
   router.get('/zones', (req, res) => {

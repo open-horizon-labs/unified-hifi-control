@@ -5,7 +5,7 @@ const path = require('path');
 const { createKnobRoutes } = require('../knobs/routes');
 
 function createApp(opts = {}) {
-  const { roon, hqp, knobs, bus, busDebug, logger } = opts;
+  const { roon, hqp, knobs, logger } = opts;
   const log = logger || console;
   const app = express();
 
@@ -179,7 +179,7 @@ function createApp(opts = {}) {
 
   // Knob-compatible routes (mounted at root for firmware compatibility)
   if (knobs) {
-    const knobRoutes = createKnobRoutes({ roon, knobs, bus, busDebug, logger: log });
+    const knobRoutes = createKnobRoutes({ roon, knobs, logger: log });
     app.use('/', knobRoutes);
   }
 
