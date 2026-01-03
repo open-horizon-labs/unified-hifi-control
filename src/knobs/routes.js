@@ -2,6 +2,7 @@ const express = require('express');
 const sharp = require('sharp');
 const fs = require('fs');
 const path = require('path');
+const busDebug = require('../bus/debug');
 
 function extractKnob(req) {
   const headerId = req.get('x-knob-id') || req.get('x-device-id');
@@ -13,16 +14,17 @@ function extractKnob(req) {
   return { id, version };
 }
 
-function createKnobRoutes({ roon, knobs, logger }) {
+function createKnobRoutes({ bus, roon, knobs, logger }) {
   const router = express.Router();
   const log = logger || console;
 
-  // GET /zones - List all Roon zones
+  // GET /zones - List all zones from bus (multi-backend)
   router.get('/zones', (req, res) => {
     const knob = extractKnob(req);
     log.debug('Zones requested', { ip: req.ip, knob_id: knob?.id });
 
-    const zones = roon.getZones();
+    // TODO(Phase 3): Remove roon fallback after HQP migration to bus
+    const zones = bus.getZones();
     res.json({ zones });
   });
 
@@ -32,7 +34,7 @@ function createKnobRoutes({ roon, knobs, logger }) {
     const knob = extractKnob(req);
 
     if (!zoneId) {
-      const zones = roon.getZones();
+      const zones = bus ? bus.getZones() : roon.getZones();
       return res.status(400).json({ error: 'zone_id required', zones });
     }
 
@@ -53,9 +55,10 @@ function createKnobRoutes({ roon, knobs, logger }) {
       knobs.updateKnobStatus(knob.id, statusUpdates);
     }
 
-    const data = roon.getNowPlaying(zoneId);
+    const sender = { ip: req.ip, knob_id: knob?.id, user_agent: req.get('user-agent') };
+    const data = bus ? bus.getNowPlaying(zoneId, { sender }) : roon.getNowPlaying(zoneId);
     if (!data) {
-      const zones = roon.getZones();
+      const zones = bus ? bus.getZones() : roon.getZones();
       log.warn('now_playing miss', { zoneId, ip: req.ip });
       return res.status(404).json({ error: 'zone not found', zones });
     }
@@ -64,7 +67,7 @@ function createKnobRoutes({ roon, knobs, logger }) {
 
     const image_url = `/now_playing/image?zone_id=${encodeURIComponent(zoneId)}`;
     const config_sha = knob?.id ? knobs.getConfigSha(knob.id) : null;
-    const zones = roon.getZones();
+    const zones = bus ? bus.getZones() : roon.getZones();
 
     res.json({ ...data, image_url, zones, config_sha });
   });
@@ -72,11 +75,13 @@ function createKnobRoutes({ roon, knobs, logger }) {
   // GET /now_playing/image - Get album artwork
   router.get('/now_playing/image', async (req, res) => {
     const zoneId = req.query.zone_id;
+
     if (!zoneId) {
       return res.status(400).json({ error: 'zone_id required' });
     }
 
-    const data = roon.getNowPlaying(zoneId);
+    const sender = { ip: req.ip, user_agent: req.get('user-agent') };
+    const data = bus ? bus.getNowPlaying(zoneId, { sender }) : roon.getNowPlaying(zoneId);
     if (!data) {
       return res.status(404).json({ error: 'zone not found' });
     }
@@ -85,14 +90,16 @@ function createKnobRoutes({ roon, knobs, logger }) {
     const { width, height, format } = req.query || {};
 
     try {
-      if (data.image_key && roon.getImage) {
+      if (data.image_key) {
         // RGB565 format for ESP32 display
         if (format === 'rgb565') {
-          const { body } = await roon.getImage(data.image_key, {
+          const imageOpts = {
             width: width || 360,
             height: height || 360,
             format: 'image/jpeg',
-          });
+            zone_id: zoneId,  // Add for bus routing
+          };
+          const { body } = bus ? await bus.getImage(data.image_key, imageOpts) : await roon.getImage(data.image_key, imageOpts);
 
           const targetWidth = parseInt(width) || 360;
           const targetHeight = parseInt(height) || 360;
@@ -130,11 +137,13 @@ function createKnobRoutes({ roon, knobs, logger }) {
           return res.send(rgb565);
         } else {
           // Return JPEG (optionally resized)
-          const { contentType, body } = await roon.getImage(data.image_key, {
+          const imageOpts = {
             width: width || 360,
             height: height || 360,
             format: 'image/jpeg',
-          });
+            zone_id: zoneId,  // Add for bus routing
+          };
+          const { contentType, body } = bus ? await bus.getImage(data.image_key, imageOpts) : await roon.getImage(data.image_key, imageOpts);
 
           if ((width || height) && contentType && contentType.startsWith('image/')) {
             const targetWidth = parseInt(width) || parseInt(height) || 360;
@@ -176,6 +185,7 @@ function createKnobRoutes({ roon, knobs, logger }) {
   // POST /control - Send control commands
   router.post('/control', async (req, res) => {
     const { zone_id, action, value } = req.body || {};
+
     if (!zone_id || !action) {
       log.warn('control missing params', { zone_id, action, ip: req.ip });
       return res.status(400).json({ error: 'zone_id and action required' });
@@ -183,7 +193,8 @@ function createKnobRoutes({ roon, knobs, logger }) {
 
     try {
       log.info('control', { zone_id, action, value, ip: req.ip });
-      await roon.control(zone_id, action, value);
+      const sender = { ip: req.ip, user_agent: req.get('user-agent') };
+      await (bus ? bus.control(zone_id, action, value, { sender }) : roon.control(zone_id, action, value));
       res.json({ status: 'ok' });
     } catch (error) {
       log.error('control failed', { zone_id, action, value, ip: req.ip, error: error.message });
@@ -241,10 +252,23 @@ function createKnobRoutes({ roon, knobs, logger }) {
 
   // GET /admin/status.json - Admin diagnostics
   router.get('/admin/status.json', (req, res) => {
+    // Use bus status (with prefixed zone IDs) instead of raw roon status
+    const busStatus = bus.getStatus();
+    const roonStatus = busStatus.roon || roon.getStatus();
+
     res.json({
-      bridge: roon.getStatus(),
+      bridge: roonStatus,
       knobs: knobs.listKnobs(),
+      debug: busDebug.getDebugInfo(),
+      bus: { backends: Object.keys(busStatus), zone_count: bus.getZones().length },
     });
+  });
+
+  // GET /admin/bus - Bus debug panel
+  router.get('/admin/bus', (req, res) => {
+    if (!bus) return res.status(404).send('Bus not available');
+    const debug = busDebug.getDebugInfo();
+    res.send(`<!DOCTYPE html><html><head><title>Bus Debug</title><meta http-equiv="refresh" content="5"><style>body{font-family:monospace;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left}.error{color:red}.sender{color:#666;font-size:10px}</style></head><body><h1>Bus (${debug.message_count} msgs, 5m)</h1><table><tr><th>Time</th><th>Type</th><th>Zone</th><th>Details</th><th>Sender</th></tr>${debug.messages.slice(-50).reverse().map(m=>{const t=new Date(m.timestamp).toLocaleTimeString();const c=m.error?'class="error"':'';const d=m.action?m.action+(m.value!==undefined?' ('+m.value+')':''):m.has_data!==undefined?'data:'+m.has_data:m.error||'';const s=m.sender?(m.sender.knob_id?'knob:'+m.sender.knob_id:m.sender.ip||''):'';return`<tr ${c}><td>${t}</td><td>${m.type}</td><td>${m.zone_id||m.backend||'-'}</td><td>${d}</td><td class="sender">${s}</td></tr>`;}).join('')}</table></body></html>`);
   });
 
   // App settings (UI preferences)
@@ -940,6 +964,10 @@ ${navHtml('settings')}
 <div class="section">
   <h3>Status</h3>
   <pre id="status" style="font-size:0.85em;overflow-x:auto;"></pre>
+  <details style="margin-top:1em;">
+    <summary style="cursor:pointer;color:#888;">Debug Info (Bus Activity)</summary>
+    <pre id="debug-status" style="font-size:0.75em;overflow-x:auto;margin-top:0.5em;"></pre>
+  </details>
 </div>
 
 <script>
@@ -1011,7 +1039,15 @@ async function saveHqpConfig() {
 async function loadStatus() {
   const res = await fetch('/admin/status.json');
   const data = await res.json();
+
+  // Separate debug from main status
+  const debug = data.debug;
+  delete data.debug;
+
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
+  if (debug) {
+    document.getElementById('debug-status').textContent = JSON.stringify(debug, null, 2);
+  }
 }
 
 // UI Settings

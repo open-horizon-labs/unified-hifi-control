@@ -6,6 +6,9 @@ const { createApp } = require('./server/app');
 const { createLogger } = require('./lib/logger');
 const { advertise } = require('./lib/mdns');
 const { createKnobsStore } = require('./knobs/store');
+const { createBus } = require('./bus');
+const { RoonAdapter } = require('./bus/adapters/roon');
+const busDebug = require('./bus/debug');
 
 const PORT = process.env.PORT || 8088;
 const log = createLogger('Main');
@@ -39,6 +42,15 @@ const hqp = new HQPClient({
   logger: createLogger('HQP'),
 });
 
+// Create and configure bus
+const bus = createBus({ logger: createLogger('Bus') });
+
+const roonAdapter = new RoonAdapter(roon);
+bus.registerBackend('roon', roonAdapter);
+
+// Initialize debug consumer
+busDebug.init(bus);
+
 // Create knobs store for ESP32 knob configuration
 const knobs = createKnobsStore({
   logger: createLogger('Knobs'),
@@ -63,14 +75,15 @@ const mqttService = createMqttService({
 
 // Create HTTP server
 const app = createApp({
-  roon,
+  bus,     // Pass bus to app
+  roon,    // Keep for backward compat during Phase 2 testing
   hqp,
   knobs,
   logger: createLogger('Server'),
 });
 
 // Start services
-roon.start();
+bus.start();  // Starts all registered backends (including roon)
 mqttService.connect();
 
 let mdnsService;
@@ -87,13 +100,17 @@ app.listen(PORT, () => {
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   log.info('Shutting down...');
   if (mdnsService) mdnsService.stop();
   mqttService.disconnect();
+  await bus.stop();
   process.exit(0);
 });
 
 process.on('unhandledRejection', (err) => {
   log.error('Unhandled rejection', { error: err.message, stack: err.stack });
 });
+
+// Export bus for other modules
+// Don't export bus - causes circular dependency with routes

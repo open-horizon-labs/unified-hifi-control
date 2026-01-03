@@ -484,6 +484,9 @@ class HQPClient {
 
   async setVolume(value) {
     const pipeline = await this.fetchPipeline();
+    if (!pipeline) {
+      throw new Error('Pipeline unavailable');
+    }
     if (pipeline.volume?.isFixed) {
       throw new Error('Volume is fixed in current profile');
     }
