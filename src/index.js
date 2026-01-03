@@ -75,6 +75,7 @@ const mqttService = createMqttService({
 
 // Create HTTP server
 const app = createApp({
+  bus,     // Pass bus to app
   roon,    // Keep for backward compat during Phase 2 testing
   hqp,
   knobs,
@@ -112,4 +113,4 @@ process.on('unhandledRejection', (err) => {
 });
 
 // Export bus for other modules
-module.exports = { bus };
+// Don't export bus - causes circular dependency with routes
