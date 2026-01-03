@@ -8,7 +8,7 @@ const { advertise } = require('./lib/mdns');
 const { createKnobsStore } = require('./knobs/store');
 const { initBus } = require('./bus');
 const { RoonAdapter } = require('./bus/adapters/roon');
-const { initDebug } = require('./bus/debug');
+const busDebug = require('./bus/debug');
 
 const PORT = process.env.PORT || 8088;
 const log = createLogger('Main');
@@ -51,7 +51,7 @@ const roonAdapter = new RoonAdapter(roon);
 bus.registerBackend('roon', roonAdapter);
 
 // Initialize debug consumer
-initDebug({ logger: createLogger('BusDebug') });
+busDebug.init();
 
 // Create knobs store for ESP32 knob configuration
 const knobs = createKnobsStore({

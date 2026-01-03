@@ -3,7 +3,7 @@ const sharp = require('sharp');
 const fs = require('fs');
 const path = require('path');
 const { getBus } = require('../bus');
-const { getDebug } = require('../bus/debug');
+const busDebug = require('../bus/debug');
 
 function extractKnob(req) {
   const headerId = req.get('x-knob-id') || req.get('x-device-id');
@@ -19,13 +19,12 @@ function createKnobRoutes({ roon, knobs, logger }) {
   const router = express.Router();
   const log = logger || console;
 
-  // Access bus singleton (if initialized)
-  let bus, busDebug;
+  // Access bus singleton
+  let bus;
   try {
     bus = getBus();
-    busDebug = getDebug();
   } catch (err) {
-    // Bus not initialized - routes will fallback to roon
+    bus = null;  // Not initialized yet
   }
 
   // GET /zones - List all zones from bus (multi-backend)
@@ -262,13 +261,13 @@ function createKnobRoutes({ roon, knobs, logger }) {
     res.json({
       bridge: roon.getStatus(),
       knobs: knobs.listKnobs(),
-      debug: busDebug ? busDebug.getDebugInfo() : null,
+      debug: bus ? busDebug.getDebugInfo() : null,
     });
   });
 
   // GET /admin/bus - Bus debug panel
   router.get('/admin/bus', (req, res) => {
-    if (!busDebug) return res.status(404).send('Not available');
+    if (!bus) return res.status(404).send('Bus not available');
     const debug = busDebug.getDebugInfo();
     res.send(`<!DOCTYPE html><html><head><title>Bus Debug</title><meta http-equiv="refresh" content="5"><style>body{font-family:monospace;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left}.error{color:red}</style></head><body><h1>Bus (${debug.message_count} msgs, 5m)</h1><table><tr><th>Time</th><th>Type</th><th>Zone</th><th>Details</th></tr>${debug.messages.slice(-50).reverse().map(m=>{const t=new Date(m.timestamp).toLocaleTimeString();const c=m.error?'class="error"':'';const d=m.action?m.action+(m.value!==undefined?' ('+m.value+')':''):m.has_data!==undefined?'data:'+m.has_data:m.error||'';return`<tr ${c}><td>${t}</td><td>${m.type}</td><td>${m.zone_id||m.backend||'-'}</td><td>${d}</td></tr>`;}).join('')}</table></body></html>`);
   });
