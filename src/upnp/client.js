@@ -46,8 +46,12 @@ function createUPnPClient(opts = {}) {
 
     const uuid = uuidMatch[1];
 
-    // Skip if we already have this renderer
+    // Update lastSeen for existing renderers
     if (state.renderers.has(uuid)) {
+      const renderer = state.renderers.get(uuid);
+      if (renderer) {
+        renderer.lastSeen = Date.now();
+      }
       return;
     }
 
