@@ -249,10 +249,15 @@ function createKnobRoutes({ bus, roon, knobs, logger }) {
 
   // GET /admin/status.json - Admin diagnostics
   router.get('/admin/status.json', (req, res) => {
+    // Use bus status (with prefixed zone IDs) instead of raw roon status
+    const busStatus = bus.getStatus();
+    const roonStatus = busStatus.roon || roon.getStatus();
+
     res.json({
-      bridge: roon.getStatus(),
+      bridge: roonStatus,
       knobs: knobs.listKnobs(),
-      debug: bus ? busDebug.getDebugInfo() : null,
+      debug: busDebug.getDebugInfo(),
+      bus: { backends: Object.keys(busStatus), zone_count: bus.getZones().length },
     });
   });
 
