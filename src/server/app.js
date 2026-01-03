@@ -5,7 +5,7 @@ const path = require('path');
 const { createKnobRoutes } = require('../knobs/routes');
 
 function createApp(opts = {}) {
-  const { bus, roon, hqp, knobs, logger } = opts;
+  const { bus, roon, hqp, hqpInstances, knobs, logger } = opts;
   const log = logger || console;
   const app = express();
 
@@ -83,62 +83,125 @@ function createApp(opts = {}) {
     }
   });
 
-  // HQPlayer routes
+  // HQPlayer routes - support both single instance (backward compat) and multi-instance
+
+  // List all HQP instances
+  app.get('/hqp/instances', (req, res) => {
+    if (!hqpInstances || hqpInstances.size === 0) {
+      return res.json({ instances: [] });
+    }
+    const instances = Array.from(hqpInstances.entries()).map(([name, { client }]) => ({
+      name,
+      host: client.host,
+      port: client.port,
+      configured: client.isConfigured(),
+    }));
+    res.json({ instances });
+  });
+
+  // Get status for a specific instance (or first instance if no instance specified)
   app.get('/hqp/status', async (req, res) => {
+    const instanceName = req.query.instance;
+    let client = hqp; // Default to first instance for backward compat
+
+    if (instanceName && hqpInstances) {
+      const instance = hqpInstances.get(instanceName);
+      if (!instance) {
+        return res.status(404).json({ error: `Instance not found: ${instanceName}` });
+      }
+      client = instance.client;
+    }
+
+    if (!client) {
+      return res.json({ enabled: false, message: 'No HQP instances configured' });
+    }
+
     try {
-      const status = await hqp.getStatus();
-      res.json(status);
+      const status = await client.getStatus();
+      res.json({ ...status, instance: instanceName || 'default' });
     } catch (err) {
-      log.warn('HQP status failed', { error: err.message });
+      log.warn('HQP status failed', { error: err.message, instance: instanceName });
       res.json({ enabled: false, error: err.message });
     }
   });
 
   app.get('/hqp/profiles', async (req, res) => {
-    if (!hqp.hasWebCredentials()) {
+    const instanceName = req.query.instance;
+    let client = hqp;
+
+    if (instanceName && hqpInstances) {
+      const instance = hqpInstances.get(instanceName);
+      if (!instance) {
+        return res.status(404).json({ error: `Instance not found: ${instanceName}` });
+      }
+      client = instance.client;
+    }
+
+    if (!client || !client.hasWebCredentials()) {
       return res.json({ enabled: false, profiles: [], message: 'Web credentials required for profiles' });
     }
     try {
-      const profiles = await hqp.fetchProfiles();
+      const profiles = await client.fetchProfiles();
       res.json({ enabled: true, profiles });
     } catch (err) {
-      log.warn('HQP profiles failed', { error: err.message });
+      log.warn('HQP profiles failed', { error: err.message, instance: instanceName });
       res.status(500).json({ error: err.message });
     }
   });
 
   app.post('/hqp/profiles/load', async (req, res) => {
-    const { profile } = req.body;
+    const { profile, instance: instanceName } = req.body;
     if (!profile) {
       return res.status(400).json({ error: 'profile required' });
     }
-    if (!hqp.hasWebCredentials()) {
+
+    let client = hqp;
+    if (instanceName && hqpInstances) {
+      const instance = hqpInstances.get(instanceName);
+      if (!instance) {
+        return res.status(404).json({ error: `Instance not found: ${instanceName}` });
+      }
+      client = instance.client;
+    }
+
+    if (!client || !client.hasWebCredentials()) {
       return res.status(400).json({ error: 'Web credentials required for profile loading' });
     }
     try {
-      await hqp.loadProfile(profile);
+      await client.loadProfile(profile);
       res.json({ ok: true, message: 'Profile loading, HQPlayer will restart' });
     } catch (err) {
-      log.warn('HQP load profile failed', { error: err.message, profile });
+      log.warn('HQP load profile failed', { error: err.message, profile, instance: instanceName });
       res.status(500).json({ error: err.message });
     }
   });
 
   app.get('/hqp/pipeline', async (req, res) => {
-    if (!hqp.isConfigured()) {
+    const instanceName = req.query.instance;
+    let client = hqp;
+
+    if (instanceName && hqpInstances) {
+      const instance = hqpInstances.get(instanceName);
+      if (!instance) {
+        return res.status(404).json({ error: `Instance not found: ${instanceName}` });
+      }
+      client = instance.client;
+    }
+
+    if (!client || !client.isConfigured()) {
       return res.json({ enabled: false });
     }
     try {
-      const pipeline = await hqp.fetchPipeline();
+      const pipeline = await client.fetchPipeline();
       res.json({ enabled: true, ...pipeline });
     } catch (err) {
-      log.warn('HQP pipeline failed', { error: err.message });
+      log.warn('HQP pipeline failed', { error: err.message, instance: instanceName });
       res.status(500).json({ error: err.message });
     }
   });
 
   app.post('/hqp/pipeline', async (req, res) => {
-    const { setting, value } = req.body;
+    const { setting, value, instance: instanceName } = req.body;
     if (!setting || value === undefined) {
       return res.status(400).json({ error: 'setting and value required' });
     }
@@ -146,25 +209,49 @@ function createApp(opts = {}) {
     if (!validSettings.includes(setting)) {
       return res.status(400).json({ error: `Invalid setting. Valid: ${validSettings.join(', ')}` });
     }
-    if (!hqp.isConfigured()) {
+
+    let client = hqp;
+    if (instanceName && hqpInstances) {
+      const instance = hqpInstances.get(instanceName);
+      if (!instance) {
+        return res.status(404).json({ error: `Instance not found: ${instanceName}` });
+      }
+      client = instance.client;
+    }
+
+    if (!client || !client.isConfigured()) {
       return res.status(400).json({ error: 'HQPlayer not configured' });
     }
     try {
-      await hqp.setPipelineSetting(setting, value);
+      await client.setPipelineSetting(setting, value);
       res.json({ ok: true });
     } catch (err) {
-      log.warn('HQP set pipeline failed', { error: err.message, setting, value });
+      log.warn('HQP set pipeline failed', { error: err.message, setting, value, instance: instanceName });
       res.status(500).json({ error: err.message });
     }
   });
 
   app.post('/hqp/configure', (req, res) => {
-    const { host, port, username, password } = req.body;
+    const { host, port, username, password, instance: instanceName } = req.body;
     if (!host) {
       return res.status(400).json({ error: 'host required' });
     }
-    hqp.configure({ host, port, username, password });
-    log.info('HQPlayer configured', { host, port });
+
+    let client = hqp;
+    if (instanceName && hqpInstances) {
+      const instance = hqpInstances.get(instanceName);
+      if (!instance) {
+        return res.status(404).json({ error: `Instance not found: ${instanceName}` });
+      }
+      client = instance.client;
+    }
+
+    if (!client) {
+      return res.status(400).json({ error: 'No HQP instances configured' });
+    }
+
+    client.configure({ host, port, username, password });
+    log.info('HQPlayer configured', { host, port, instance: instanceName });
     res.json({ ok: true });
   });
 
