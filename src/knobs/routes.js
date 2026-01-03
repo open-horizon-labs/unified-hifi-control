@@ -55,7 +55,8 @@ function createKnobRoutes({ bus, roon, knobs, logger }) {
       knobs.updateKnobStatus(knob.id, statusUpdates);
     }
 
-    const data = bus ? bus.getNowPlaying(zoneId) : roon.getNowPlaying(zoneId);
+    const sender = { ip: req.ip, knob_id: knob?.id, user_agent: req.get('user-agent') };
+    const data = bus ? bus.getNowPlaying(zoneId, { sender }) : roon.getNowPlaying(zoneId);
     if (!data) {
       const zones = bus ? bus.getZones() : roon.getZones();
       log.warn('now_playing miss', { zoneId, ip: req.ip });
@@ -79,7 +80,8 @@ function createKnobRoutes({ bus, roon, knobs, logger }) {
       return res.status(400).json({ error: 'zone_id required' });
     }
 
-    const data = bus ? bus.getNowPlaying(zoneId) : roon.getNowPlaying(zoneId);
+    const sender = { ip: req.ip, user_agent: req.get('user-agent') };
+    const data = bus ? bus.getNowPlaying(zoneId, { sender }) : roon.getNowPlaying(zoneId);
     if (!data) {
       return res.status(404).json({ error: 'zone not found' });
     }
