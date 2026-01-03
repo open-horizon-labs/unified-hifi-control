@@ -3,6 +3,7 @@ const { createRoonClient } = require('./roon/client');
 const { createUPnPClient } = require('./upnp/client');
 const { createOpenHomeClient } = require('./openhome/client');
 const { HQPClient } = require('./hqplayer/client');
+const { LMSClient } = require('./lms/client');
 const { createMqttService } = require('./mqtt');
 const { createApp } = require('./server/app');
 const { createLogger } = require('./lib/logger');
@@ -13,6 +14,7 @@ const { createBus } = require('./bus');
 const { RoonAdapter } = require('./bus/adapters/roon');
 const { UPnPAdapter } = require('./bus/adapters/upnp');
 const { OpenHomeAdapter } = require('./bus/adapters/openhome');
+const { LMSAdapter } = require('./bus/adapters/lms');
 const busDebug = require('./bus/debug');
 
 const PORT = process.env.PORT || 8088;
@@ -38,7 +40,7 @@ const baseUrl = `http://${localIp}:${PORT}`;
 
 // Load settings for adapter configuration
 const appSettings = loadAppSettings();
-const adapterConfig = appSettings.adapters || { roon: true, upnp: false, openhome: false };
+const adapterConfig = appSettings.adapters || { roon: true, upnp: false, openhome: false, lms: false };
 
 log.info('Adapter configuration', adapterConfig);
 
@@ -72,6 +74,19 @@ const adapterFactory = {
       onZonesChanged: () => bus.refreshZones('openhome'),
     });
   },
+  createLMS() {
+    const client = new LMSClient({
+      host: process.env.LMS_HOST,
+      port: process.env.LMS_PORT || 9000,
+      username: process.env.LMS_USERNAME,
+      password: process.env.LMS_PASSWORD,
+      logger: createLogger('Lyrion'),
+      onZonesChanged: () => bus.refreshZones('lms'),
+    });
+    return new LMSAdapter(client, {
+      onZonesChanged: () => bus.refreshZones('lms'),
+    });
+  },
 };
 
 // Conditionally create and register adapters based on settings
@@ -90,6 +105,12 @@ if (adapterConfig.upnp) {
 if (adapterConfig.openhome) {
   bus.registerBackend('openhome', adapterFactory.createOpenHome());
   log.info('OpenHome adapter enabled');
+}
+
+// Enable Lyrion if configured via settings or env var
+if (adapterConfig.lms || process.env.LMS_HOST) {
+  bus.registerBackend('lms', adapterFactory.createLMS());
+  log.info('Lyrion adapter enabled', { host: process.env.LMS_HOST || 'via settings' });
 }
 
 // Create HQPlayer client (unconfigured initially, configured via API or env vars)
