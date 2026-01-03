@@ -2,7 +2,7 @@ const express = require('express');
 const sharp = require('sharp');
 const fs = require('fs');
 const path = require('path');
-const { getBus } = require('../bus');
+const { bus } = require('../bus');
 const busDebug = require('../bus/debug');
 
 function extractKnob(req) {
@@ -18,14 +18,6 @@ function extractKnob(req) {
 function createKnobRoutes({ roon, knobs, logger }) {
   const router = express.Router();
   const log = logger || console;
-
-  // Access bus singleton
-  let bus;
-  try {
-    bus = getBus();
-  } catch (err) {
-    bus = null;  // Not initialized yet
-  }
 
   // GET /zones - List all zones from bus (multi-backend)
   router.get('/zones', (req, res) => {
