@@ -266,6 +266,46 @@ function createUPnPClient(opts = {}) {
       }
 
       try {
+        // Query OpenHome Transport state first
+        const transportState = await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Timeout')), 3000);
+          renderer.deviceClient.callAction(
+            'urn:av-openhome-org:serviceId:Transport',
+            'TransportState',
+            {},
+            (err, result) => {
+              clearTimeout(timeout);
+              if (err) return reject(err);
+              resolve(result);
+            }
+          );
+        });
+
+        const newState = (transportState.State || '').toLowerCase();
+        if (newState !== renderer.info.state) {
+          renderer.info.state = newState;
+          onZonesChanged();
+        }
+
+        // Query OpenHome Volume
+        const volumeInfo = await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Timeout')), 3000);
+          renderer.deviceClient.callAction(
+            'urn:av-openhome-org:serviceId:Volume',
+            'Volume',
+            {},
+            (err, result) => {
+              clearTimeout(timeout);
+              if (err) return reject(err);
+              resolve(result);
+            }
+          );
+        });
+
+        if (volumeInfo.Value !== undefined) {
+          renderer.info.volume = volumeInfo.Value;
+        }
+
         // Query OpenHome Info:Track service
         const trackInfo = await new Promise((resolve, reject) => {
           const timeout = setTimeout(() => reject(new Error('Timeout')), 3000);
