@@ -391,7 +391,7 @@ function createUPnPClient(opts = {}) {
       device_name: renderer.info.manufacturer && renderer.info.model
         ? `${renderer.info.manufacturer} ${renderer.info.model}`
         : null,
-      volume_control: renderer.info.volume !== null ? {
+      volume_control: (renderer.info.volume !== null || renderer.hasOpenHome) ? {
         type: 'number',
         min: 0,
         max: 100,
