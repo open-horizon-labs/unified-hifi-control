@@ -449,7 +449,7 @@ async function loadZones() {
       groupedZones[prefix].push(zone);
     });
 
-    const protocolLabels = { openhome: 'OpenHome', upnp: 'UPnP/DLNA', roon: 'Roon' };
+    const protocolLabels = { openhome: 'OpenHome', upnp: 'UPnP/DLNA', roon: 'Roon', lms: 'Lyrion' };
     let html = '';
     
     Object.keys(groupedZones).sort().forEach(protocol => {

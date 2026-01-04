@@ -50,7 +50,7 @@ const bus = createBus({ logger: createLogger('Bus') });
 // Create Lyrion client (shared for config API and adapter)
 const lms = new LMSClient({
   host: process.env.LMS_HOST,
-  port: process.env.LMS_PORT || 9000,
+  port: parseInt(process.env.LMS_PORT, 10) || 9000,
   username: process.env.LMS_USERNAME,
   password: process.env.LMS_PASSWORD,
   logger: createLogger('Lyrion'),

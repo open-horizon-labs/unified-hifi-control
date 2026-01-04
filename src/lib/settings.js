@@ -13,7 +13,8 @@ const DEFAULTS = {
   adapters: {
     roon: true,      // enabled by default
     upnp: false,     // disabled by default
-    openhome: false  // disabled by default
+    openhome: false, // disabled by default
+    lms: false       // disabled by default
   }
 };
 
