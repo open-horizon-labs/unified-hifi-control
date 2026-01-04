@@ -13,7 +13,7 @@
       "name": "hifi-control",
       "source": "./plugin",
       "description": "Control your hi-fi system - Roon playback, HQPlayer pipeline settings, volume control, and more.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "author": {
         "name": "Cloud Atlas AI"
       }
