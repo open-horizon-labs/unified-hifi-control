@@ -9,8 +9,9 @@
  */
 
 class LMSAdapter {
-  constructor(lmsClient) {
+  constructor(lmsClient, { onZonesChanged } = {}) {
     this.lms = lmsClient;
+    this.onZonesChanged = onZonesChanged;
   }
 
   async start() {
@@ -26,7 +27,6 @@ class LMSAdapter {
     return players.map(player => ({
       zone_id: `lms:${player.playerid}`,
       zone_name: player.name,
-      source: 'lms',
       state: player.state || 'stopped',
       output_count: 1,
       output_name: player.model,

@@ -5,7 +5,7 @@ const path = require('path');
 const { createKnobRoutes } = require('../knobs/routes');
 
 function createApp(opts = {}) {
-  const { bus, roon, hqp, knobs, adapterFactory, logger } = opts;
+  const { bus, roon, hqp, lms, knobs, adapterFactory, logger } = opts;
   const log = logger || console;
   const app = express();
 
@@ -165,6 +165,38 @@ function createApp(opts = {}) {
     }
     hqp.configure({ host, port, username, password });
     log.info('HQPlayer configured', { host, port });
+    res.json({ ok: true });
+  });
+
+  // Lyrion routes
+  app.get('/lms/status', (req, res) => {
+    if (!lms) {
+      return res.json({ enabled: false, error: 'Lyrion not available' });
+    }
+    res.json({
+      enabled: true,
+      ...lms.getStatus(),
+    });
+  });
+
+  app.post('/lms/configure', (req, res) => {
+    const { host, port, username, password } = req.body;
+    if (!host) {
+      return res.status(400).json({ error: 'host required' });
+    }
+    if (!lms) {
+      return res.status(400).json({ error: 'Lyrion not available' });
+    }
+    lms.configure({ host, port, username, password });
+    log.info('Lyrion configured', { host, port, hasAuth: !!username });
+
+    // Start Lyrion if not already started
+    if (!lms.connected && lms.isConfigured()) {
+      lms.start().catch(err => {
+        log.warn('Failed to start Lyrion after configure', { error: err.message });
+      });
+    }
+
     res.json({ ok: true });
   });
 

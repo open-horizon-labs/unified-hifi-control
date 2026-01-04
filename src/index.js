@@ -47,6 +47,16 @@ log.info('Adapter configuration', adapterConfig);
 // Create bus first so we can reference it in callbacks
 const bus = createBus({ logger: createLogger('Bus') });
 
+// Create Lyrion client (shared for config API and adapter)
+const lms = new LMSClient({
+  host: process.env.LMS_HOST,
+  port: process.env.LMS_PORT || 9000,
+  username: process.env.LMS_USERNAME,
+  password: process.env.LMS_PASSWORD,
+  logger: createLogger('Lyrion'),
+  onZonesChanged: () => bus.refreshZones('lms'),
+});
+
 // Adapter factory - creates adapters on demand for dynamic enable/disable
 const adapterFactory = {
   createRoon() {
@@ -75,15 +85,8 @@ const adapterFactory = {
     });
   },
   createLMS() {
-    const client = new LMSClient({
-      host: process.env.LMS_HOST,
-      port: process.env.LMS_PORT || 9000,
-      username: process.env.LMS_USERNAME,
-      password: process.env.LMS_PASSWORD,
-      logger: createLogger('Lyrion'),
-      onZonesChanged: () => bus.refreshZones('lms'),
-    });
-    return new LMSAdapter(client, {
+    // Use shared lms client so config API works
+    return new LMSAdapter(lms, {
       onZonesChanged: () => bus.refreshZones('lms'),
     });
   },
@@ -148,6 +151,7 @@ const app = createApp({
   bus,
   roon,    // Keep for backward compat during Phase 2 testing
   hqp,
+  lms,     // Lyrion client for configuration API
   knobs,
   adapterFactory,
   logger: createLogger('Server'),

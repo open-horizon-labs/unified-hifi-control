@@ -6,7 +6,7 @@ A source-agnostic hi-fi control bridge that connects music sources and audio pip
 
 Hi-fi software assumes you're at a computer or using vendor-specific apps. This bridge fills the gap:
 
-- **Music Sources:** Roon (now)
+- **Music Sources:** Roon, Lyrion (formerly LMS/Squeezebox); OpenHome and UPnP/DLNA planned
 - **Audio Pipeline:** HQPlayer, receiver control (future)
 - **Surfaces:** Anything that speaks HTTP or MQTT — ESP32 hardware, web UIs, Home Assistant, Claude (via MCP), etc.
 
@@ -28,6 +28,11 @@ services:
     environment:
       - PORT=8088
       - CONFIG_DIR=/data
+      # Optional: Lyrion configuration (or configure via web UI at /settings)
+      # - LMS_HOST=192.168.1.x
+      # - LMS_PORT=9000
+      # - LMS_USERNAME=admin
+      # - LMS_PASSWORD=secret
     restart: unless-stopped
 ```
 
@@ -41,15 +46,15 @@ docker compose up -d
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│            Unified Hi-Fi Control Bridge              │
-│  ┌──────────┐  ┌──────────────┐                     │
-│  │   Roon   │  │  HQPlayer    │   (+ future sources)│
-│  │          │  │              │                     │
-│  └──────────┘  └──────────────┘                     │
-│                                                      │
-│  HTTP API + optional MQTT                            │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│              Unified Hi-Fi Control Bridge                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐             │
+│  │   Roon   │  │  Lyrion  │  │  HQPlayer    │             │
+│  │          │  │          │  │              │             │
+│  └──────────┘  └──────────┘  └──────────────┘             │
+│                                                            │
+│  HTTP API + optional MQTT                                  │
+└───────────────────────────────────────────────────────────┘
               │
     ┌─────────┼─────────┐
     ▼         ▼         ▼
@@ -84,7 +89,7 @@ The bridge includes an MCP server that lets Claude control your hi-fi system dir
 
 | Tool | Description |
 |------|-------------|
-| `hifi_zones` | List available Roon zones |
+| `hifi_zones` | List available zones (Roon, Lyrion) |
 | `hifi_now_playing` | Get current track, artist, album, play state |
 | `hifi_control` | Play, pause, next, previous, volume control |
 | `hifi_hqplayer_status` | HQPlayer Embedded status and pipeline |

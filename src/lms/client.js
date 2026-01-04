@@ -15,11 +15,14 @@ class LMSClient {
   constructor(opts = {}) {
     this.host = opts.host || null;
     this.port = opts.port || 9000;
+    this.username = opts.username || null;
+    this.password = opts.password || null;
     this.logger = opts.logger || console;
     this.players = new Map();
     this.pollInterval = opts.pollInterval || 2000;
     this.pollTimer = null;
     this.connected = false;
+    this.onZonesChanged = opts.onZonesChanged || null;
 
     // Load saved config on startup
     this._loadConfig();
@@ -36,10 +39,12 @@ class LMSClient {
         const saved = JSON.parse(fs.readFileSync(LMS_CONFIG_FILE, 'utf8'));
         if (saved.host) this.host = saved.host;
         if (saved.port) this.port = Number(saved.port);
-        this.logger.info('Loaded LMS config from disk', { host: this.host, port: this.port });
+        if (saved.username) this.username = saved.username;
+        if (saved.password) this.password = saved.password;
+        this.logger.info('Loaded Lyrion config from disk', { host: this.host, port: this.port, hasAuth: !!this.username });
       }
     } catch (e) {
-      this.logger.warn('Failed to load LMS config', { error: e.message });
+      this.logger.warn('Failed to load Lyrion config', { error: e.message });
     }
   }
 
@@ -48,13 +53,16 @@ class LMSClient {
       if (!fs.existsSync(CONFIG_DIR)) {
         fs.mkdirSync(CONFIG_DIR, { recursive: true });
       }
-      fs.writeFileSync(LMS_CONFIG_FILE, JSON.stringify({
+      const config = {
         host: this.host,
         port: this.port,
-      }, null, 2));
-      this.logger.info('Saved LMS config to disk');
+      };
+      if (this.username) config.username = this.username;
+      if (this.password) config.password = this.password;
+      fs.writeFileSync(LMS_CONFIG_FILE, JSON.stringify(config, null, 2));
+      this.logger.info('Saved Lyrion config to disk');
     } catch (e) {
-      this.logger.error('Failed to save LMS config', { error: e.message });
+      this.logger.error('Failed to save Lyrion config', { error: e.message });
     }
   }
 
@@ -62,9 +70,12 @@ class LMSClient {
     return !!this.host;
   }
 
-  configure({ host, port }) {
+  configure({ host, port, username, password }) {
     this.host = host || this.host;
     this.port = Number(port) || this.port;
+    // Allow clearing auth by passing empty string
+    if (username !== undefined) this.username = username || null;
+    if (password !== undefined) this.password = password || null;
     if (this.host) {
       this.baseUrl = `http://${this.host}:${this.port}`;
     }
@@ -125,14 +136,20 @@ class LMSClient {
       params: playerId ? [playerId, params] : ['', params],
     };
 
+    const headers = { 'Content-Type': 'application/json' };
+    if (this.username && this.password) {
+      const auth = Buffer.from(`${this.username}:${this.password}`).toString('base64');
+      headers['Authorization'] = `Basic ${auth}`;
+    }
+
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify(body),
     });
 
     if (!response.ok) {
-      throw new Error(`LMS request failed: ${response.status}`);
+      throw new Error(`Lyrion request failed: ${response.status}`);
     }
 
     const data = await response.json();
@@ -225,6 +242,11 @@ class LMSClient {
           this.players.delete(id);
         }
       }
+
+      // Notify bus of zone changes
+      if (this.onZonesChanged) {
+        this.onZonesChanged();
+      }
     } catch (err) {
       this.logger.error('Failed to update players', { error: err.message });
       throw err;
@@ -283,8 +305,10 @@ class LMSClient {
 
   /**
    * Get artwork URL for a track
+   * @param {string} coverid - The cover ID from player status
+   * @param {object} opts - Options (width, height)
    */
-  getArtworkUrl(playerId, coverid, opts = {}) {
+  getArtworkUrl(coverid, opts = {}) {
     if (!coverid) return null;
 
     const params = new URLSearchParams();
@@ -299,14 +323,22 @@ class LMSClient {
 
   /**
    * Fetch artwork image
+   * @param {string} coverid - The cover ID from player status
+   * @param {object} opts - Options (width, height)
    */
-  async getArtwork(playerId, coverid, opts = {}) {
-    const url = this.getArtworkUrl(playerId, coverid, opts);
+  async getArtwork(coverid, opts = {}) {
+    const url = this.getArtworkUrl(coverid, opts);
     if (!url) {
       throw new Error('No artwork available');
     }
 
-    const response = await fetch(url);
+    const fetchOpts = {};
+    if (this.username && this.password) {
+      const auth = Buffer.from(`${this.username}:${this.password}`).toString('base64');
+      fetchOpts.headers = { 'Authorization': `Basic ${auth}` };
+    }
+
+    const response = await fetch(url, fetchOpts);
     if (!response.ok) {
       throw new Error(`Failed to fetch artwork: ${response.status}`);
     }

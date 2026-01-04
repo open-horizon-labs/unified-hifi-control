@@ -998,6 +998,22 @@ ${navHtml('settings')}
 </div>
 
 <div class="section">
+  <h3>Lyrion Music Server Configuration</h3>
+  <div id="lms-status-line" class="muted">Checking...</div>
+  <button id="lms-reconfig-btn" onclick="showLmsConfig()" style="display:none;margin-top:0.5em;">Reconfigure</button>
+  <div id="lms-config-form" style="display:none;">
+    <p class="muted" style="margin:0.5em 0;">Connect to Lyrion Music Server (formerly LMS/Squeezebox) for playback control.</p>
+    <div class="form-row"><label>Host:</label><input type="text" id="lms-host" placeholder="192.168.1.x"></div>
+    <div class="form-row"><label>Port:</label><input type="number" id="lms-port" value="9000" placeholder="9000"></div>
+    <p class="muted" style="margin:0.5em 0;">Authentication (optional, if Lyrion has password protection enabled):</p>
+    <div class="form-row"><label>Username:</label><input type="text" id="lms-username" placeholder="(optional)"></div>
+    <div class="form-row"><label>Password:</label><input type="password" id="lms-password"></div>
+    <button onclick="saveLmsConfig()">Save</button>
+    <span id="lms-save-msg" class="status-msg"></span>
+  </div>
+</div>
+
+<div class="section">
   <h3>UI Settings</h3>
   <div class="form-row">
     <label><input type="checkbox" id="hide-knobs-page"> Hide Knobs page (if you don't have a knob)</label>
@@ -1096,6 +1112,65 @@ async function saveHqpConfig() {
   loadHqpConfig();
 }
 
+// LMS config
+function showLmsConfig() {
+  document.getElementById('lms-config-form').style.display = 'block';
+  document.getElementById('lms-reconfig-btn').style.display = 'none';
+}
+
+async function loadLmsConfig() {
+  try {
+    const res = await fetch('/lms/status');
+    const data = await res.json();
+    const statusLine = document.getElementById('lms-status-line');
+    const configForm = document.getElementById('lms-config-form');
+    const reconfigBtn = document.getElementById('lms-reconfig-btn');
+
+    if (data.enabled && data.connected) {
+      statusLine.textContent = 'Lyrion at ' + (data.host || 'unknown') + ':' + (data.port || 9000) + ' ✓ (' + data.player_count + ' players)';
+      statusLine.className = 'success';
+      configForm.style.display = 'none';
+      reconfigBtn.style.display = 'inline-block';
+    } else if (data.enabled && data.host) {
+      statusLine.textContent = 'Configured (' + data.host + ') but disconnected';
+      statusLine.className = 'muted';
+      configForm.style.display = 'block';
+      reconfigBtn.style.display = 'none';
+      document.getElementById('lms-host').value = data.host || '';
+      document.getElementById('lms-port').value = data.port || 9000;
+    } else {
+      statusLine.textContent = 'Not configured';
+      statusLine.className = 'muted';
+      configForm.style.display = 'block';
+      reconfigBtn.style.display = 'none';
+    }
+  } catch (e) {
+    document.getElementById('lms-config-form').style.display = 'block';
+    document.getElementById('lms-reconfig-btn').style.display = 'none';
+  }
+}
+
+async function saveLmsConfig() {
+  const host = document.getElementById('lms-host').value;
+  const port = document.getElementById('lms-port').value || '9000';
+  const username = document.getElementById('lms-username').value;
+  const password = document.getElementById('lms-password').value;
+  const msg = document.getElementById('lms-save-msg');
+
+  if (!host) { msg.textContent = 'Host required'; msg.className = 'status-msg error'; return; }
+
+  const cfg = { host, port: parseInt(port) };
+  if (username) cfg.username = username;
+  if (password) cfg.password = password;
+
+  const res = await fetch('/lms/configure', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+  msg.textContent = res.ok ? 'Saved!' : 'Error';
+  msg.className = 'status-msg ' + (res.ok ? 'success' : 'error');
+  if (res.ok) {
+    setTimeout(loadLmsConfig, 1000);
+  }
+}
+
 // Status
 async function loadStatus() {
   const res = await fetch('/admin/status.json');
@@ -1171,6 +1246,7 @@ async function saveAdapterSettings() {
 }
 
 loadHqpConfig();
+loadLmsConfig();
 loadStatus();
 loadUiSettings();
 loadAdapterSettings();
