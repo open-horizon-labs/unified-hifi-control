@@ -329,7 +329,7 @@ function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
   router.get('/', (req, res) => res.redirect('/control'));
 
   // ========== JTBD-Organized Admin Pages ==========
-  // Jobs: Control (normal listening), Critical (DSP tweaks), Knobs (setup), Settings (admin)
+  // Jobs: Control (normal listening), Zone (single zone + DSP), Knobs (setup), Settings (admin)
 
   const baseStyles = `
     /* Theme variables */
@@ -457,7 +457,7 @@ function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
     <nav>
       <h1>Hi-Fi Control</h1>
       <a href="/control" class="${active === 'control' ? 'active' : ''}">Control</a>
-      <a href="/critical" class="${active === 'critical' ? 'active' : ''}">Critical</a>
+      <a href="/zone" class="${active === 'zone' ? 'active' : ''}">Zone</a>
       <a href="/knobs" class="${active === 'knobs' ? 'active' : ''}">Knobs</a>
       <a href="/settings" class="${active === 'settings' ? 'active' : ''}">Settings</a>
       <div class="nav-right">
@@ -664,11 +664,11 @@ setInterval(loadZones, 4000);
 </script></body></html>`);
   });
 
-  // GET /critical - Critical listening: single zone + HQPlayer DSP
-  router.get(['/critical', '/admin/critical'], (req, res) => {
-    res.send(`<!DOCTYPE html><html><head><title>Critical Listening - Hi-Fi</title><style>${baseStyles}</style></head><body>
-${navHtml('critical')}
-<h2>Critical Listening</h2>
+  // GET /zone - Single zone focus + HQPlayer DSP controls
+  router.get(['/zone', '/critical', '/admin/critical'], (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>Zone - Hi-Fi</title><style>${baseStyles}</style></head><body>
+${navHtml('zone')}
+<h2>Zone</h2>
 <p class="muted">Select a zone and tweak DSP settings for focused listening.</p>
 
 <div class="form-row">
@@ -720,7 +720,7 @@ ${navHtml('critical')}
 <script>
 ${versionScript}
 ${escapeScript}
-let selectedZone = localStorage.getItem('criticalZone') || null;
+let selectedZone = localStorage.getItem('hifi-zone') || null;
 let zonesData = [];
 let initialLoad = true;
 
@@ -744,7 +744,7 @@ async function loadZones() {
       document.getElementById('zone-display').classList.remove('hidden');
     } else {
       selectedZone = null;
-      localStorage.removeItem('criticalZone');
+      localStorage.removeItem('hifi-zone');
     }
   }
   initialLoad = false;
@@ -755,9 +755,9 @@ async function loadZones() {
 function selectZone(zoneId) {
   selectedZone = zoneId;
   if (zoneId) {
-    localStorage.setItem('criticalZone', zoneId);
+    localStorage.setItem('hifi-zone', zoneId);
   } else {
-    localStorage.removeItem('criticalZone');
+    localStorage.removeItem('hifi-zone');
   }
   if (!zoneId) {
     document.getElementById('zone-display').classList.add('hidden');
