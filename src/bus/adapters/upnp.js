@@ -52,8 +52,60 @@ class UPnPAdapter {
   }
 
   async getImage(image_key, opts = {}) {
-    // UPnP doesn't support album art through this interface
-    throw new Error('Image retrieval not supported for UPnP renderers');
+    // For OpenHome devices, image_key is a direct URL
+    if (image_key && (image_key.startsWith('http://') || image_key.startsWith('https://'))) {
+      const https = require('https');
+      const http = require('http');
+      const protocol = image_key.startsWith('https') ? https : http;
+
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          req.destroy();
+          reject(new Error('Image fetch timeout'));
+        }, 5000);
+
+        const req = protocol.get(image_key, (res) => {
+          clearTimeout(timeout);
+
+          // Handle redirects
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            return this.getImage(res.headers.location, opts).then(resolve).catch(reject);
+          }
+
+          // Check status
+          if (res.statusCode !== 200) {
+            return reject(new Error(`HTTP ${res.statusCode}`));
+          }
+
+          const chunks = [];
+          let size = 0;
+          const maxSize = 10 * 1024 * 1024;
+
+          res.on('data', chunk => {
+            size += chunk.length;
+            if (size > maxSize) {
+              req.destroy();
+              return reject(new Error('Image too large'));
+            }
+            chunks.push(chunk);
+          });
+
+          res.on('end', () => {
+            resolve({
+              contentType: res.headers['content-type'] || 'image/jpeg',
+              body: Buffer.concat(chunks),
+            });
+          });
+        });
+
+        req.on('error', (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+      });
+    }
+
+    throw new Error('Image retrieval not supported for basic UPnP renderers');
   }
 
   getStatus() {
