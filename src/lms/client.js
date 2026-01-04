@@ -98,7 +98,12 @@ class LMSClient {
     try {
       await this.updatePlayers();
       this.connected = true;
-      this.logger.info('LMS client connected', { host: this.host, port: this.port });
+      this.logger.info('LMS client connected', { host: this.host, port: this.port, players: this.players.size });
+
+      // Force initial zone notification after successful connection
+      if (this.onZonesChanged) {
+        this.onZonesChanged();
+      }
 
       // Start polling
       this.pollTimer = setInterval(() => {
