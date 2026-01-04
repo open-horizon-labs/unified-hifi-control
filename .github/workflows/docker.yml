@@ -62,6 +62,7 @@ jobs:
           images: |
             ghcr.io/cloud-atlas-ai/unified-hifi-control
             muness/unified-hifi-control
+            muness/roon-extension-knob
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

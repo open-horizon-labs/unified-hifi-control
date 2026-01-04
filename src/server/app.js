@@ -9,6 +9,9 @@ function createApp(opts = {}) {
   const log = logger || console;
   const app = express();
 
+  // Trust proxy for correct req.ip behind reverse proxy (Docker, nginx, traefik)
+  app.set('trust proxy', true);
+
   app.use(cors());
   app.use(express.json());
   app.use(morgan('combined'));

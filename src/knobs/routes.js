@@ -461,7 +461,7 @@ function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
       <a href="/knobs" class="${active === 'knobs' ? 'active' : ''}">Knobs</a>
       <a href="/settings" class="${active === 'settings' ? 'active' : ''}">Settings</a>
       <div class="nav-right">
-        <button class="theme-toggle" onclick="cycleTheme()" title="Toggle theme">
+        <button class="theme-toggle" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle theme">
           <span id="theme-icon">☀</span>
         </button>
         <span class="version" id="app-version"></span>
@@ -1133,12 +1133,16 @@ ${navHtml('knobs')}
   <h3>ESP32-S3 Controller</h3>
   <p class="muted">The main Roon Knob controller - handles display, rotary encoder, touch, WiFi, and music source communication.</p>
   <div class="flash-section">
-    <esp-web-install-button manifest="/manifest-s3.json">
+    <esp-web-install-button id="flash-btn" manifest="/manifest-s3.json">
       <button slot="activate">Flash ESP32-S3</button>
       <span slot="unsupported">Not supported</span>
       <span slot="not-allowed">HTTPS required</span>
     </esp-web-install-button>
     <span class="version-info" id="fw-version">Loading...</span>
+  </div>
+  <div id="no-firmware-msg" class="warning-box" style="display:none;">
+    <strong>No firmware available</strong><br>
+    Go to <a href="/knobs">Knobs page</a> and click "Fetch Latest from GitHub" first.
   </div>
   <div class="steps">
     <strong>Steps:</strong>
@@ -1172,9 +1176,18 @@ if (!('serial' in navigator)) {
   document.getElementById('unsupported').style.display = 'block';
 }
 fetch('/firmware/version')
-  .then(r => r.json())
-  .then(data => { document.getElementById('fw-version').textContent = 'v' + data.version; })
-  .catch(() => { document.getElementById('fw-version').textContent = 'Not available - fetch firmware first'; });
+  .then(r => {
+    if (!r.ok) throw new Error('No firmware');
+    return r.json();
+  })
+  .then(data => {
+    document.getElementById('fw-version').textContent = 'v' + data.version;
+  })
+  .catch(() => {
+    document.getElementById('fw-version').textContent = '';
+    document.getElementById('flash-btn').style.display = 'none';
+    document.getElementById('no-firmware-msg').style.display = 'block';
+  });
 </script>
 </body></html>`);
   });
