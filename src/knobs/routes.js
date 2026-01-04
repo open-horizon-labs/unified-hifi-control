@@ -14,7 +14,7 @@ function extractKnob(req) {
   return { id, version };
 }
 
-function createKnobRoutes({ bus, roon, knobs, logger }) {
+function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
   const router = express.Router();
   const log = logger || console;
 
@@ -252,15 +252,20 @@ function createKnobRoutes({ bus, roon, knobs, logger }) {
 
   // GET /admin/status.json - Admin diagnostics
   router.get('/admin/status.json', (req, res) => {
-    // Use bus status (with prefixed zone IDs) instead of raw roon status
     const busStatus = bus.getStatus();
-    const roonStatus = busStatus.roon || roon.getStatus();
+    const zones = bus.getZones();
+    const nowPlaying = zones.map(z => bus.getNowPlaying(z.zone_id)).filter(np => np);
 
     res.json({
-      bridge: roonStatus,
+      zones,
+      now_playing: nowPlaying,
+      backends: busStatus,
+      bus: {
+        backends: Object.keys(busStatus),
+        zone_count: zones.length,
+      },
       knobs: knobs.listKnobs(),
       debug: busDebug.getDebugInfo(),
-      bus: { backends: Object.keys(busStatus), zone_count: bus.getZones().length },
     });
   });
 
@@ -271,30 +276,45 @@ function createKnobRoutes({ bus, roon, knobs, logger }) {
     res.send(`<!DOCTYPE html><html><head><title>Bus Debug</title><meta http-equiv="refresh" content="5"><style>body{font-family:monospace;margin:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left}.error{color:red}.sender{color:#666;font-size:10px}</style></head><body><h1>Bus (${debug.message_count} msgs, 5m)</h1><table><tr><th>Time</th><th>Type</th><th>Zone</th><th>Details</th><th>Sender</th></tr>${debug.messages.slice(-50).reverse().map(m=>{const t=new Date(m.timestamp).toLocaleTimeString();const c=m.error?'class="error"':'';const d=m.action?m.action+(m.value!==undefined?' ('+m.value+')':''):m.has_data!==undefined?'data:'+m.has_data:m.error||'';const s=m.sender?(m.sender.knob_id?'knob:'+m.sender.knob_id:m.sender.ip||''):'';return`<tr ${c}><td>${t}</td><td>${m.type}</td><td>${m.zone_id||m.backend||'-'}</td><td>${d}</td><td class="sender">${s}</td></tr>`;}).join('')}</table></body></html>`);
   });
 
-  // App settings (UI preferences)
-  const APP_SETTINGS_FILE = path.join(process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data'), 'app-settings.json');
-
-  function loadAppSettings() {
-    try {
-      return JSON.parse(fs.readFileSync(APP_SETTINGS_FILE, 'utf8'));
-    } catch (e) {
-      return {};
-    }
-  }
-
-  function saveAppSettings(settings) {
-    const dir = path.dirname(APP_SETTINGS_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(APP_SETTINGS_FILE, JSON.stringify(settings, null, 2));
-  }
+  // App settings (UI preferences) - use shared module
+  const { loadAppSettings, saveAppSettings } = require('../lib/settings');
 
   router.get('/api/settings', (req, res) => {
     res.json(loadAppSettings());
   });
 
-  router.post('/api/settings', express.json(), (req, res) => {
+  router.post('/api/settings', express.json(), async (req, res) => {
     const current = loadAppSettings();
     const updated = { ...current, ...req.body };
+
+    // Handle dynamic adapter enable/disable
+    if (req.body.adapters && adapterFactory) {
+      const currentAdapters = current.adapters || {};
+      const newAdapters = req.body.adapters;
+
+      // Check each adapter for changes
+      const adapterMap = {
+        roon: adapterFactory.createRoon,
+        upnp: adapterFactory.createUPnP,
+        openhome: adapterFactory.createOpenHome,
+      };
+
+      for (const [name, createFn] of Object.entries(adapterMap)) {
+        const wasEnabled = name === 'roon' ? currentAdapters[name] !== false : !!currentAdapters[name];
+        const nowEnabled = name === 'roon' ? newAdapters[name] !== false : !!newAdapters[name];
+
+        if (wasEnabled && !nowEnabled) {
+          // Disable: unregister the backend
+          log.info(`Disabling ${name} adapter`);
+          await bus.unregisterBackend(name);
+        } else if (!wasEnabled && nowEnabled) {
+          // Enable: create and register the backend
+          log.info(`Enabling ${name} adapter`);
+          await bus.enableBackend(name, createFn());
+        }
+      }
+    }
+
     saveAppSettings(updated);
     res.json(updated);
   });
@@ -411,16 +431,35 @@ async function loadZones() {
   try {
     const res = await fetch('/admin/status.json');
     const data = await res.json();
-    const zones = data.bridge?.zones || [];
+    const zones = data.zones || [];
     const nowPlaying = {};
-    (data.bridge?.now_playing || []).forEach(np => nowPlaying[np.zone_id] = np);
+    (data.now_playing || []).forEach(np => nowPlaying[np.zone_id] = np);
 
     if (zones.length === 0) {
-      document.getElementById('zones').innerHTML = '<p class="muted">No zones found. Is Roon connected?</p>';
+      document.getElementById('zones').innerHTML = '<p class="muted">No zones found. Check that your audio sources are connected.</p>';
       return;
     }
 
-    document.getElementById('zones').innerHTML = zones.map(zone => {
+    // Group zones by prefix (roon:, upnp:, openhome:)
+    const groupedZones = {};
+    zones.forEach(zone => {
+      const prefix = zone.zone_id.split(':')[0] || 'unknown';
+      if (!groupedZones[prefix]) groupedZones[prefix] = [];
+      groupedZones[prefix].push(zone);
+    });
+
+    const protocolLabels = { openhome: 'OpenHome', upnp: 'UPnP/DLNA', roon: 'Roon' };
+    let html = '';
+    
+    Object.keys(groupedZones).sort().forEach(protocol => {
+      const protocolZones = groupedZones[protocol];
+      html += '<h2 style="margin-top:1.5em;margin-bottom:0.5em;color:#666;font-size:1.1em;">' + (protocolLabels[protocol] || protocol) + '</h2>';
+      
+      html += protocolZones.map(zone => {
+        const unsupported = zone.unsupported || [];
+        const supportsNextPrev = !unsupported.includes('next');
+        const supportsAlbumArt = !unsupported.includes('album_art');
+        const supportsTrackInfo = !unsupported.includes('track_metadata');
       const np = nowPlaying[zone.zone_id] || {};
       const track = esc(np.line1 || 'Stopped');
       const artist = esc(np.line2 || '');
@@ -438,18 +477,21 @@ async function loadZones() {
           esc(p.title) + '</option>').join('') +
         '</select></p>' : '';
       return '<div class="zone-card" data-zone-id="' + escAttr(zone.zone_id) + '" data-step="' + step + '">' +
-        '<img class="art-lg" src="/now_playing/image?zone_id=' + encodeURIComponent(zone.zone_id) + '&width=120&height=120" alt="">' +
+        (supportsAlbumArt 
+          ? '<img class="art-lg" src="/now_playing/image?zone_id=' + encodeURIComponent(zone.zone_id) + '&width=120&height=120" alt="">'
+          : '<div class="art-lg" style="background:#f5f5f5;display:flex;align-items:center;justify-content:center;color:#999;border:1px solid #ddd;border-radius:6px;">No Art</div>') +
         '<div class="zone-info">' +
           '<h3>' + esc(zone.zone_name) + deviceInfo + '</h3>' +
-          '<p><strong>' + track + '</strong></p>' +
-          '<p>' + artist + (album ? ' • ' + album : '') + '</p>' +
+          (supportsTrackInfo 
+            ? '<p><strong>' + track + '</strong></p><p>' + artist + (album ? ' • ' + album : '') + '</p>'
+            : '<p class="muted">Basic UPnP device - transport controls only</p>') +
           '<p class="muted">Volume: ' + vol + '</p>' +
           profileSelect +
           '<div style="display:flex;gap:1em;align-items:center;">' +
             '<div class="zone-controls">' +
-              '<button class="ctrl" data-action="previous">⏮</button>' +
+              (supportsNextPrev ? '<button class="ctrl" data-action="previous">⏮</button>' : '') +
               '<button class="ctrl" data-action="play_pause">' + playIcon + '</button>' +
-              '<button class="ctrl" data-action="next">⏭</button>' +
+              (supportsNextPrev ? '<button class="ctrl" data-action="next">⏭</button>' : '') +
             '</div>' +
             '<div style="display:flex;flex-direction:column;gap:0.2em;">' +
               '<button class="ctrl" data-action="vol_rel" data-value="1">+</button>' +
@@ -459,6 +501,9 @@ async function loadZones() {
         '</div>' +
       '</div>';
     }).join('');
+    });
+
+    document.getElementById('zones').innerHTML = html;
   } catch (e) {
     document.getElementById('zones').innerHTML = '<p class="error">Error: ' + esc(e.message) + '</p>';
   }
@@ -579,9 +624,9 @@ let initialLoad = true;
 async function loadZones() {
   const res = await fetch('/admin/status.json');
   const data = await res.json();
-  zonesData = data.bridge?.zones || [];
+  zonesData = data.zones || [];
   const nowPlaying = {};
-  (data.bridge?.now_playing || []).forEach(np => nowPlaying[np.zone_id] = np);
+  (data.now_playing || []).forEach(np => nowPlaying[np.zone_id] = np);
 
   const sel = document.getElementById('zone-select');
   sel.innerHTML = '<option value="">-- Select Zone --</option>' + zonesData.map(z =>
@@ -803,7 +848,7 @@ async function loadKnobs() {
   const res = await fetch('/admin/status.json');
   const data = await res.json();
   const knobs = data.knobs || [];
-  zonesData = data.bridge?.zones || [];
+  zonesData = data.zones || [];
 
   const tbody = document.getElementById('knobs-body');
   if (knobs.length === 0) {
@@ -962,6 +1007,22 @@ ${navHtml('settings')}
 </div>
 
 <div class="section">
+  <h3>Audio Backends</h3>
+  <p class="muted" style="margin:0 0 1em;">Select which audio backends to enable. Changes apply immediately.</p>
+  <div class="form-row">
+    <label><input type="checkbox" id="adapter-roon"> Roon</label>
+  </div>
+  <div class="form-row">
+    <label><input type="checkbox" id="adapter-upnp"> UPnP/DLNA (basic renderers)</label>
+  </div>
+  <div class="form-row">
+    <label><input type="checkbox" id="adapter-openhome"> OpenHome (BubbleUPnP, Linn, etc.)</label>
+  </div>
+  <button onclick="saveAdapterSettings()">Save</button>
+  <span id="adapter-save-msg" class="status-msg"></span>
+</div>
+
+<div class="section">
   <h3>Status</h3>
   <pre id="status" style="font-size:0.85em;overflow-x:auto;"></pre>
   <details style="margin-top:1em;">
@@ -1076,9 +1137,43 @@ async function saveUiSettings() {
   }
 }
 
+// Adapter Settings
+async function loadAdapterSettings() {
+  try {
+    const res = await fetch('/api/settings');
+    const data = await res.json();
+    const adapters = data.adapters || { roon: true, upnp: false, openhome: false };
+    document.getElementById('adapter-roon').checked = adapters.roon !== false;
+    document.getElementById('adapter-upnp').checked = adapters.upnp || false;
+    document.getElementById('adapter-openhome').checked = adapters.openhome || false;
+  } catch (e) {}
+}
+
+async function saveAdapterSettings() {
+  const msg = document.getElementById('adapter-save-msg');
+  const adapters = {
+    roon: document.getElementById('adapter-roon').checked,
+    upnp: document.getElementById('adapter-upnp').checked,
+    openhome: document.getElementById('adapter-openhome').checked
+  };
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ adapters })
+    });
+    msg.textContent = 'Saved!';
+    msg.className = 'status-msg success';
+  } catch (e) {
+    msg.textContent = 'Error saving';
+    msg.className = 'status-msg error';
+  }
+}
+
 loadHqpConfig();
 loadStatus();
 loadUiSettings();
+loadAdapterSettings();
 </script></body></html>`);
   });
 

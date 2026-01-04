@@ -45,6 +45,52 @@ function createBus({ logger } = {}) {
     // Zones will be refreshed after bus.start() (see start() method)
   }
 
+  async function unregisterBackend(source) {
+    const adapter = backends.get(source);
+    if (!adapter) {
+      log.warn(`Cannot unregister: ${source} not found`);
+      return;
+    }
+
+    // Stop the adapter
+    try {
+      await adapter.stop();
+      log.info(`${source} stopped`);
+    } catch (err) {
+      log.error(`${source} stop failed:`, err);
+    }
+
+    // Remove from backends
+    backends.delete(source);
+
+    // Clear zones for this source
+    for (const [zid] of zones) {
+      if (zid.startsWith(`${source}:`)) zones.delete(zid);
+    }
+
+    log.info(`Unregistered ${source} backend`);
+  }
+
+  async function enableBackend(source, adapter) {
+    if (backends.has(source)) {
+      log.warn(`Backend ${source} already registered`);
+      return;
+    }
+
+    registerBackend(source, adapter);
+
+    // Start immediately
+    try {
+      await adapter.start();
+      log.info(`${source} started`);
+    } catch (err) {
+      log.error(`${source} start failed:`, err);
+    }
+
+    // Refresh zones for this backend
+    refreshZones(source);
+  }
+
   function refreshZones(source = null) {
     if (source) {
       for (const [zid] of zones) {
@@ -172,6 +218,8 @@ function createBus({ logger } = {}) {
 
   return {
     registerBackend,
+    unregisterBackend,
+    enableBackend,
     refreshZones,
     getZones,
     getZone,
@@ -182,6 +230,7 @@ function createBus({ logger } = {}) {
     start,
     stop,
     subscribe,
+    hasBackend: (source) => backends.has(source),
   };
 }
 

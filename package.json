@@ -32,7 +32,11 @@
     "node-roon-api-image": "github:roonlabs/node-roon-api-image",
     "node-roon-api-status": "github:roonlabs/node-roon-api-status",
     "node-roon-api-transport": "github:roonlabs/node-roon-api-transport",
+    "node-soap": "^1.0.0",
+    "node-ssdp": "^4.0.1",
     "sharp": "^0.34.5",
+    "upnp-mediarenderer-client": "^1.4.0",
+    "xml2js": "^0.6.2",
     "xpath": "^0.0.34"
   },
   "devDependencies": {

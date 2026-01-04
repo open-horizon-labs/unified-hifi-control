@@ -1,13 +1,18 @@
 const os = require('os');
 const { createRoonClient } = require('./roon/client');
+const { createUPnPClient } = require('./upnp/client');
+const { createOpenHomeClient } = require('./openhome/client');
 const { HQPClient } = require('./hqplayer/client');
 const { createMqttService } = require('./mqtt');
 const { createApp } = require('./server/app');
 const { createLogger } = require('./lib/logger');
+const { loadAppSettings } = require('./lib/settings');
 const { advertise } = require('./lib/mdns');
 const { createKnobsStore } = require('./knobs/store');
 const { createBus } = require('./bus');
 const { RoonAdapter } = require('./bus/adapters/roon');
+const { UPnPAdapter } = require('./bus/adapters/upnp');
+const { OpenHomeAdapter } = require('./bus/adapters/openhome');
 const busDebug = require('./bus/debug');
 
 const PORT = process.env.PORT || 8088;
@@ -31,22 +36,66 @@ function getLocalIp() {
 const localIp = getLocalIp();
 const baseUrl = `http://${localIp}:${PORT}`;
 
-// Create Roon client
-const roon = createRoonClient({
-  logger: createLogger('Roon'),
-  base_url: baseUrl,
-});
+// Load settings for adapter configuration
+const appSettings = loadAppSettings();
+const adapterConfig = appSettings.adapters || { roon: true, upnp: false, openhome: false };
+
+log.info('Adapter configuration', adapterConfig);
+
+// Create bus first so we can reference it in callbacks
+const bus = createBus({ logger: createLogger('Bus') });
+
+// Adapter factory - creates adapters on demand for dynamic enable/disable
+const adapterFactory = {
+  createRoon() {
+    const client = createRoonClient({
+      logger: createLogger('Roon'),
+      base_url: baseUrl,
+      onZonesChanged: () => bus.refreshZones('roon'),
+    });
+    return new RoonAdapter(client);
+  },
+  createUPnP() {
+    const client = createUPnPClient({
+      logger: createLogger('UPnP'),
+    });
+    return new UPnPAdapter(client, {
+      onZonesChanged: () => bus.refreshZones('upnp'),
+    });
+  },
+  createOpenHome() {
+    const client = createOpenHomeClient({
+      logger: createLogger('OpenHome'),
+      onZonesChanged: () => bus.refreshZones('openhome'),
+    });
+    return new OpenHomeAdapter(client, {
+      onZonesChanged: () => bus.refreshZones('openhome'),
+    });
+  },
+};
+
+// Conditionally create and register adapters based on settings
+let roon = null;
+if (adapterConfig.roon !== false) {
+  roon = adapterFactory.createRoon();
+  bus.registerBackend('roon', roon);
+  log.info('Roon adapter enabled');
+}
+
+if (adapterConfig.upnp) {
+  bus.registerBackend('upnp', adapterFactory.createUPnP());
+  log.info('UPnP adapter enabled');
+}
+
+if (adapterConfig.openhome) {
+  bus.registerBackend('openhome', adapterFactory.createOpenHome());
+  log.info('OpenHome adapter enabled');
+}
 
 // Create HQPlayer client (unconfigured initially, configured via API or env vars)
 const hqp = new HQPClient({
   logger: createLogger('HQP'),
 });
-
-// Create and configure bus
-const bus = createBus({ logger: createLogger('Bus') });
-
-const roonAdapter = new RoonAdapter(roon);
-bus.registerBackend('roon', roonAdapter);
 
 // Initialize debug consumer
 busDebug.init(bus);
@@ -75,10 +124,11 @@ const mqttService = createMqttService({
 
 // Create HTTP server
 const app = createApp({
-  bus,     // Pass bus to app
+  bus,
   roon,    // Keep for backward compat during Phase 2 testing
   hqp,
   knobs,
+  adapterFactory,
   logger: createLogger('Server'),
 });
 
@@ -90,7 +140,9 @@ let mdnsService;
 
 app.listen(PORT, () => {
   log.info(`HTTP server listening on port ${PORT}`);
-  log.info('Waiting for Roon Core authorization...');
+  if (adapterConfig.roon !== false) {
+    log.info('Waiting for Roon Core authorization...');
+  }
 
   // Advertise via mDNS for knob discovery
   mdnsService = advertise(PORT, {

@@ -28,7 +28,6 @@ class RoonAdapter {
     return zones.map(zone => ({
       ...zone,
       zone_id: `roon:${zone.zone_id}`,  // Prefix for routing
-      source: 'roon',
     }));
   }
 
