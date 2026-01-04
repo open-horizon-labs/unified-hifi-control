@@ -147,18 +147,18 @@ function createRoonClient(opts = {}) {
       if (msg === 'Subscribed' && data?.zones) {
         state.zones = data.zones;
         data.zones.forEach(updateZone);
-        onZonesChanged();
+        try { onZonesChanged(); } catch (e) { log.warn('onZonesChanged error:', e); }
       } else if (msg === 'Changed') {
         if (Array.isArray(data?.zones_removed)) {
           data.zones_removed.forEach((zone_id) => {
             state.nowPlayingByZone.delete(zone_id);
             state.zones = state.zones.filter((z) => z.zone_id !== zone_id);
           });
-          onZonesChanged();
+          try { onZonesChanged(); } catch (e) { log.warn('onZonesChanged error:', e); }
         }
         if (Array.isArray(data?.zones_changed)) {
           data.zones_changed.forEach(updateZone);
-          onZonesChanged();
+          try { onZonesChanged(); } catch (e) { log.warn('onZonesChanged error:', e); }
         }
         if (Array.isArray(data?.zones_seek_changed)) {
           data.zones_seek_changed.forEach((e) => {
