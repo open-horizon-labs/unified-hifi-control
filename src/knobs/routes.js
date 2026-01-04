@@ -419,9 +419,9 @@ async function loadZones() {
   try {
     const res = await fetch('/admin/status.json');
     const data = await res.json();
-    const zones = data.bridge?.zones || [];
+    const zones = data.zones || [];
     const nowPlaying = {};
-    (data.bridge?.now_playing || []).forEach(np => nowPlaying[np.zone_id] = np);
+    (data.now_playing || []).forEach(np => nowPlaying[np.zone_id] = np);
 
     if (zones.length === 0) {
       document.getElementById('zones').innerHTML = '<p class="muted">No zones found. Check that your audio sources are connected.</p>';
@@ -612,9 +612,9 @@ let initialLoad = true;
 async function loadZones() {
   const res = await fetch('/admin/status.json');
   const data = await res.json();
-  zonesData = data.bridge?.zones || [];
+  zonesData = data.zones || [];
   const nowPlaying = {};
-  (data.bridge?.now_playing || []).forEach(np => nowPlaying[np.zone_id] = np);
+  (data.now_playing || []).forEach(np => nowPlaying[np.zone_id] = np);
 
   const sel = document.getElementById('zone-select');
   sel.innerHTML = '<option value="">-- Select Zone --</option>' + zonesData.map(z =>
@@ -836,7 +836,7 @@ async function loadKnobs() {
   const res = await fetch('/admin/status.json');
   const data = await res.json();
   const knobs = data.knobs || [];
-  zonesData = data.bridge?.zones || [];
+  zonesData = data.zones || [];
 
   const tbody = document.getElementById('knobs-body');
   if (knobs.length === 0) {
