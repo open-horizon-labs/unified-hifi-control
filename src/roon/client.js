@@ -86,6 +86,10 @@ function createRoonClient(opts = {}) {
       state.transport = null;
       state.image = null;
       state.coreInfo = null;
+      // Start grace period so cached data is still returned during brief disconnects
+      if (!state.transportDisconnectedAt) {
+        state.transportDisconnectedAt = Date.now();
+      }
       svc_status.set_status('Waiting for Roon core', true);
       if (state.coreLossTimer) {
         clearTimeout(state.coreLossTimer);
