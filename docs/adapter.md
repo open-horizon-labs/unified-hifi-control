@@ -212,3 +212,41 @@ Standard actions all adapters should handle:
 - Minimal transport controls only
 - Lazy client creation
 - unsupported: ["next", "previous", "track_metadata", "album_art"]
+
+## Splitting UPnP and OpenHome Adapters
+
+### Current State
+Single unified adapter in `src/bus/adapters/upnp.js` handles both protocols with capability detection.
+
+### Split Architecture (Option A: Client-side detection)
+
+**Discovery Client** (`src/upnp/client.js`):
+- Single SSDP discovery for all UPnP/OpenHome devices
+- Detects OpenHome capability via device service list  
+- Stores devices with `hasOpenHome` flag
+- Prefixes zones: `openhome:uuid` or `upnp:uuid` based on capability
+
+**OpenHome Adapter** (`src/bus/adapters/openhome.js`):
+- Filters zones with `openhome:` prefix
+- No unsupported field (full features)
+- Uses OpenHome services (Info, Transport, Volume)
+
+**UPnP Adapter** (`src/bus/adapters/upnp.js`):
+- Filters zones with `upnp:` prefix
+- Includes unsupported: ['next', 'previous', 'track_metadata', 'album_art']
+- Uses basic UPnP services (AVTransport, RenderingControl)
+
+**Registration**:
+```javascript
+const upnpClient = createUPnPClient({...});
+
+bus.registerBackend('openhome', new OpenHomeAdapter(upnpClient, {
+  onZonesChanged: () => bus.refreshZones('openhome')
+}));
+
+bus.registerBackend('upnp', new UPnPAdapter(upnpClient, {
+  onZonesChanged: () => bus.refreshZones('upnp')
+}));
+```
+
+**Result**: 3 backends (roon, openhome, upnp), each with single-purpose adapters.
