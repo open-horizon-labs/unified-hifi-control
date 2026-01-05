@@ -1,4 +1,5 @@
 const { validateAdapter } = require('./adapter');
+const crypto = require('crypto');
 
 /**
  * Bus - Routes commands to backend adapters
@@ -8,6 +9,7 @@ function createBus({ logger } = {}) {
   const backends = new Map();
   const zones = new Map();
   const observers = [];
+  let zonesSha = null; // Cached SHA of zone IDs
 
   function subscribe(callback) {
     if (typeof callback !== 'function') {
@@ -68,6 +70,9 @@ function createBus({ logger } = {}) {
       if (zid.startsWith(`${source}:`)) zones.delete(zid);
     }
 
+    // Invalidate cached SHA when zones change
+    zonesSha = null;
+
     log.info(`Unregistered ${source} backend`);
   }
 
@@ -91,6 +96,13 @@ function createBus({ logger } = {}) {
     refreshZones(source);
   }
 
+  function computeZonesSha() {
+    // Compute SHA from sorted zone IDs for stable hash
+    const zoneIds = Array.from(zones.keys()).sort();
+    const hash = crypto.createHash('sha256').update(JSON.stringify(zoneIds)).digest('hex');
+    return hash.substring(0, 8);
+  }
+
   function refreshZones(source = null) {
     if (source) {
       for (const [zid] of zones) {
@@ -111,6 +123,8 @@ function createBus({ logger } = {}) {
         });
       }
     }
+    // Invalidate cached SHA when zones change
+    zonesSha = null;
   }
 
   function getZones() {
@@ -119,6 +133,14 @@ function createBus({ logger } = {}) {
       refreshZones();
     }
     return Array.from(zones.values()).map(({ zone }) => zone);
+  }
+
+  function getZonesSha() {
+    // Lazy compute and cache
+    if (zonesSha === null) {
+      zonesSha = computeZonesSha();
+    }
+    return zonesSha;
   }
 
   function getZone(zone_id) {
@@ -222,6 +244,7 @@ function createBus({ logger } = {}) {
     enableBackend,
     refreshZones,
     getZones,
+    getZonesSha,
     getZone,
     getNowPlaying,
     control,

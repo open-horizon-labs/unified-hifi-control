@@ -73,8 +73,9 @@ function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
     const image_url = `/now_playing/image?zone_id=${encodeURIComponent(zoneId)}`;
     const config_sha = knob?.id ? knobs.getConfigSha(knob.id) : null;
     const zones = bus ? bus.getZones() : roon.getZones();
+    const zones_sha = bus ? bus.getZonesSha() : null;
 
-    res.json({ ...data, image_url, zones, config_sha });
+    res.json({ ...data, image_url, zones, config_sha, zones_sha });
   });
 
   // GET /now_playing/image - Get album artwork
