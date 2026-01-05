@@ -1113,7 +1113,7 @@ ${navHtml('knobs')}
   Browser-based flashing requires HTTPS. Use the official web flasher hosted on GitHub Pages:
 </div>
 
-<a href="https://roon-knob.muness.com/flash.html" target="_blank" class="flash-link">Open Web Flasher →</a>
+<a href="https://roon-knob.muness.com/" target="_blank" class="flash-link">Open Web Flasher →</a>
 
 <p class="muted" style="margin-top: 2em;">
   The web flasher uses <a href="https://esphome.github.io/esp-web-tools/" target="_blank">ESP Web Tools</a> to flash firmware directly from Chrome or Edge.
