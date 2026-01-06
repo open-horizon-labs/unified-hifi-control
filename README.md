@@ -33,6 +33,8 @@ services:
       # - LMS_PORT=9000
       # - LMS_USERNAME=admin
       # - LMS_PASSWORD=secret
+      # Optional: Firmware polling interval (default: 6 hours)
+      # - FIRMWARE_POLL_INTERVAL_MS=21600000
     restart: unless-stopped
 ```
 
@@ -101,6 +103,14 @@ The bridge includes an MCP server that lets Claude control your hi-fi system dir
 ### Example Usage
 
 Ask Claude: "What's playing right now?" or "Turn the volume down a bit" or "Switch to my DSD profile in HQPlayer"
+
+## Firmware Updates
+
+The bridge automatically polls GitHub for new [roon-knob](https://github.com/muness/roon-knob) firmware releases every 6 hours and downloads updates when available. Knobs check `/firmware/version` on startup and can OTA update from the bridge.
+
+Configure the poll interval via `FIRMWARE_POLL_INTERVAL_MS` environment variable (milliseconds).
+
+If MQTT is enabled, firmware version is published to `unified-hifi/firmware/version` for Home Assistant monitoring.
 
 ## Related
 
