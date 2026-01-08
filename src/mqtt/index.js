@@ -192,6 +192,10 @@ function createMqttService({ hqp, firmware, logger } = {}) {
 
   async function publishHqpState() {
     if (!client || !client.connected) return;
+    if (!hqp) {
+      log.debug('HQPlayer not configured, skipping MQTT publish');
+      return;
+    }
 
     try {
       const status = await hqp.getStatus();

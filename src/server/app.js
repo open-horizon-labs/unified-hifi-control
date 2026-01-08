@@ -99,11 +99,17 @@ function createApp(opts = {}) {
   });
 
   app.get('/hqp/profiles', async (req, res) => {
-    if (!hqp.hasWebCredentials()) {
+    // Get first instance (backward compat)
+    const firstInstance = hqpInstances.size > 0 ? Array.from(hqpInstances.values())[0] : null;
+    if (!firstInstance || !firstInstance.client) {
+      return res.json({ enabled: false, profiles: [], message: 'HQPlayer not configured' });
+    }
+
+    if (!firstInstance.client.hasWebCredentials()) {
       return res.json({ enabled: false, profiles: [], message: 'Web credentials required for profiles' });
     }
     try {
-      const profiles = await hqp.fetchProfiles();
+      const profiles = await firstInstance.client.fetchProfiles();
       res.json({ enabled: true, profiles });
     } catch (err) {
       log.warn('HQP profiles failed', { error: err.message });
@@ -116,11 +122,18 @@ function createApp(opts = {}) {
     if (!profile) {
       return res.status(400).json({ error: 'profile required' });
     }
-    if (!hqp.hasWebCredentials()) {
+
+    // Get first instance (backward compat)
+    const firstInstance = hqpInstances.size > 0 ? Array.from(hqpInstances.values())[0] : null;
+    if (!firstInstance || !firstInstance.client) {
+      return res.status(400).json({ error: 'HQPlayer not configured' });
+    }
+
+    if (!firstInstance.client.hasWebCredentials()) {
       return res.status(400).json({ error: 'Web credentials required for profile loading' });
     }
     try {
-      await hqp.loadProfile(profile);
+      await firstInstance.client.loadProfile(profile);
       res.json({ ok: true, message: 'Profile loading, HQPlayer will restart' });
     } catch (err) {
       log.warn('HQP load profile failed', { error: err.message, profile });
@@ -129,11 +142,13 @@ function createApp(opts = {}) {
   });
 
   app.get('/hqp/pipeline', async (req, res) => {
-    if (!hqp.isConfigured()) {
+    // Get first instance (backward compat)
+    const firstInstance = hqpInstances.size > 0 ? Array.from(hqpInstances.values())[0] : null;
+    if (!firstInstance || !firstInstance.client || !firstInstance.client.isConfigured()) {
       return res.json({ enabled: false });
     }
     try {
-      const pipeline = await hqp.fetchPipeline();
+      const pipeline = await firstInstance.client.fetchPipeline();
       res.json({ enabled: true, ...pipeline });
     } catch (err) {
       log.warn('HQP pipeline failed', { error: err.message });
@@ -150,11 +165,15 @@ function createApp(opts = {}) {
     if (!validSettings.includes(setting)) {
       return res.status(400).json({ error: `Invalid setting. Valid: ${validSettings.join(', ')}` });
     }
-    if (!hqp.isConfigured()) {
+
+    // Get first instance (backward compat)
+    const firstInstance = hqpInstances.size > 0 ? Array.from(hqpInstances.values())[0] : null;
+    if (!firstInstance || !firstInstance.client || !firstInstance.client.isConfigured()) {
       return res.status(400).json({ error: 'HQPlayer not configured' });
     }
+
     try {
-      await hqp.setPipelineSetting(setting, value);
+      await firstInstance.client.setPipelineSetting(setting, value);
       res.json({ ok: true });
     } catch (err) {
       log.warn('HQP set pipeline failed', { error: err.message, setting, value });
@@ -162,14 +181,92 @@ function createApp(opts = {}) {
     }
   });
 
-  app.post('/hqp/configure', (req, res) => {
+  app.post('/hqp/configure', async (req, res) => {
     const { host, port, username, password } = req.body;
     if (!host) {
       return res.status(400).json({ error: 'host required' });
     }
-    hqp.configure({ host, port, username, password });
-    log.info('HQPlayer configured', { host, port });
-    res.json({ ok: true });
+
+    const fs = require('fs');
+    const path = require('path');
+    const { HQPClient } = require('../hqplayer/client');
+    const configDir = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+    const configFile = path.join(configDir, 'hqp-config.json');
+
+    // Use host as instance name
+    const instanceName = host;
+
+    // Create and validate the client BEFORE persisting
+    const client = new HQPClient({
+      host,
+      port: port || 8088,
+      username: username || '',
+      password: password || '',
+      logger: log,
+    });
+
+    try {
+      // Validate connection by checking status
+      const status = await client.getStatus();
+      if (!status.enabled && status.error) {
+        return res.status(400).json({
+          error: `Cannot reach HQPlayer at ${host}:${port || 8088}`,
+          details: status.error
+        });
+      }
+    } catch (err) {
+      return res.status(400).json({
+        error: `Cannot reach HQPlayer at ${host}:${port || 8088}. Check host/port.`,
+        details: err.message
+      });
+    }
+
+    // Load existing config
+    let configs = [];
+    try {
+      if (fs.existsSync(configFile)) {
+        const data = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+        configs = Array.isArray(data) ? data : [data];
+      }
+    } catch (err) {
+      log.warn('Failed to load HQP config', { error: err.message });
+    }
+
+    // Update or add instance config
+    const instanceConfig = {
+      name: instanceName,
+      host,
+      port: port || 8088,
+      username: username || '',
+      password: password || '',
+    };
+
+    const existingIndex = configs.findIndex(c => c.name === instanceName || c.host === host);
+    if (existingIndex >= 0) {
+      configs[existingIndex] = instanceConfig;
+    } else {
+      configs.push(instanceConfig);
+    }
+
+    // Write config file for persistence
+    try {
+      if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
+      }
+      fs.writeFileSync(configFile, JSON.stringify(configs, null, 2));
+    } catch (err) {
+      log.error('Failed to save HQP config', { error: err.message });
+      return res.status(500).json({ error: 'Failed to save configuration: ' + err.message });
+    }
+
+    // Hot reload: Update runtime state
+    hqpInstances.set(instanceName, { client });
+
+    // If HQP service exists, it will automatically see the new instance
+    // (hqpInstances Map is passed by reference)
+
+    log.info('HQPlayer configured (hot-reload)', { host, port, instance: instanceName });
+    res.json({ ok: true, instance: instanceName });
   });
 
   // HQP zone linking routes - DSP service enrichment
