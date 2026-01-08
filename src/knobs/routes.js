@@ -1315,6 +1315,9 @@ async function loadHqpConfig() {
       reconfigBtn.style.display = 'none';
     }
   } catch (e) {
+    const statusLine = document.getElementById('hqp-status-line');
+    statusLine.textContent = 'Error loading status: ' + e.message;
+    statusLine.className = 'error';
     document.getElementById('hqp-config-form').style.display = 'block';
     document.getElementById('hqp-reconfig-btn').style.display = 'none';
   }
