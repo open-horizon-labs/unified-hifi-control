@@ -13,6 +13,16 @@ Each adapter implements a single protocol with a unique zone_id prefix:
 
 The prefix is the ONLY identifier needed - no separate `source` or `protocol` fields.
 
+## Service Pattern (Enrichment Only)
+
+**For backends that enhance existing zones rather than expose standalone zones:**
+
+Example: HQPlayer as DSP service (implemented)
+- `HQPService` manages zone→instance mappings
+- `bus.getNowPlaying()` enriches zones with `backend_data.hqp`
+- No adapter registration (or adapter.getZones() returns [])
+- See `src/hqplayer/service.js` and `src/bus/index.js` enrichment layer
+
 ## Zone Schema
 
 ```javascript

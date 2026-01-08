@@ -303,9 +303,15 @@ function createRoonClient(opts = {}) {
       case 'vol_rel':
         await enqueueRelativeVolume(output.output_id, Number(value) || 0);
         break;
-      case 'vol_abs':
-        await callTransport('change_volume', output.output_id, 'absolute', clamp(Number(value), MIN_VOLUME, MAX_VOLUME));
+      case 'vol_abs': {
+        // SAFETY: Use zone's actual volume range, not hardcoded 0-100.
+        // dB zones (like HQPlayer) use -64 to 0; clamping -12 to 0 would
+        // result in maximum volume, potentially damaging equipment.
+        // See: client.test.js for regression protection.
+        const { min, max } = getVolumeRange(output);
+        await callTransport('change_volume', output.output_id, 'absolute', clamp(Number(value), min, max));
         break;
+      }
       default:
         throw new Error('Unknown action');
     }
@@ -345,6 +351,14 @@ function createRoonClient(opts = {}) {
     return Math.max(min, Math.min(max, value));
   }
 
+  function getVolumeRange(output) {
+    const vol = output?.volume;
+    return {
+      min: vol?.min ?? MIN_VOLUME,
+      max: vol?.max ?? MAX_VOLUME,
+    };
+  }
+
   function callTransport(method, ...args) {
     return new Promise((resolve, reject) => {
       state.transport[method](...args, (err) => {
@@ -378,4 +392,20 @@ function createRoonClient(opts = {}) {
   };
 }
 
-module.exports = { createRoonClient };
+module.exports = {
+  createRoonClient,
+  // Export for testing
+  _test: {
+    clamp: (value, min, max) => {
+      if (Number.isNaN(value)) return min;
+      return Math.max(min, Math.min(max, value));
+    },
+    getVolumeRange: (output) => {
+      const vol = output?.volume;
+      return {
+        min: vol?.min ?? MIN_VOLUME,
+        max: vol?.max ?? MAX_VOLUME,
+      };
+    },
+  },
+};

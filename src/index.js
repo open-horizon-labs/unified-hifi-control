@@ -1,4 +1,6 @@
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
 const { createRoonClient } = require('./roon/client');
 const { createUPnPClient } = require('./upnp/client');
 const { createOpenHomeClient } = require('./openhome/client');
@@ -16,6 +18,7 @@ const { RoonAdapter } = require('./bus/adapters/roon');
 const { UPnPAdapter } = require('./bus/adapters/upnp');
 const { OpenHomeAdapter } = require('./bus/adapters/openhome');
 const { LMSAdapter } = require('./bus/adapters/lms');
+const { HQPService } = require('./hqplayer/service');
 const busDebug = require('./bus/debug');
 
 const PORT = process.env.PORT || 8088;
@@ -117,11 +120,6 @@ if (adapterConfig.lms || process.env.LMS_HOST) {
   log.info('Lyrion adapter enabled', { host: process.env.LMS_HOST || 'via settings' });
 }
 
-// Create HQPlayer client (unconfigured initially, configured via API or env vars)
-const hqp = new HQPClient({
-  logger: createLogger('HQP'),
-});
-
 // Initialize debug consumer
 busDebug.init(bus);
 
@@ -130,16 +128,120 @@ const knobs = createKnobsStore({
   logger: createLogger('Knobs'),
 });
 
-// Pre-configure HQPlayer if env vars set
-if (process.env.HQP_HOST) {
-  hqp.configure({
-    host: process.env.HQP_HOST,
-    port: process.env.HQP_PORT || 8088,
-    username: process.env.HQP_USER,
-    password: process.env.HQP_PASS,
+// Load HQPlayer instances from config file or env vars
+// Supports multiple instances (e.g., embedded + desktop simultaneously)
+const hqpInstances = new Map(); // instanceName -> { client, adapter }
+
+function loadHQPInstances() {
+  const CONFIG_DIR = process.env.CONFIG_DIR || path.join(__dirname, '..', 'data');
+  const HQP_CONFIG_FILE = path.join(CONFIG_DIR, 'hqp-config.json');
+
+  let configs = [];
+
+  // Try loading from file
+  try {
+    if (fs.existsSync(HQP_CONFIG_FILE)) {
+      const data = JSON.parse(fs.readFileSync(HQP_CONFIG_FILE, 'utf8'));
+
+      // Support both old single-instance and new multi-instance format
+      if (Array.isArray(data)) {
+        configs = data;
+      } else if (data.host) {
+        // Old format: single instance object
+        // Use host as default name for predictability (e.g., "192.168.1.61")
+        configs = [{
+          name: data.name || data.host,
+          host: data.host,
+          port: data.port,
+          username: data.username,
+          password: data.password,
+        }];
+      }
+    }
+  } catch (e) {
+    log.warn('Failed to load HQP config file', { error: e.message });
+  }
+
+  // Fallback to env vars if no config file
+  if (configs.length === 0 && process.env.HQP_HOST) {
+    // Use host as default name for predictability
+    configs = [{
+      name: process.env.HQP_NAME || process.env.HQP_HOST,
+      host: process.env.HQP_HOST,
+      port: process.env.HQP_PORT || 8088,
+      username: process.env.HQP_USER,
+      password: process.env.HQP_PASS,
+    }];
+  }
+
+  // Create instances
+  configs.forEach(config => {
+    const instanceName = config.name || config.host || 'unknown';
+
+    // Validate instance name
+    if (!instanceName || typeof instanceName !== 'string') {
+      log.error('Invalid instance name - skipping', { config });
+      return;
+    }
+    if (hqpInstances.has(instanceName)) {
+      log.error('Duplicate instance name - skipping', { name: instanceName });
+      return;
+    }
+    if (instanceName.includes(':')) {
+      log.error('Instance name cannot contain colons - skipping', { name: instanceName });
+      return;
+    }
+
+    const client = new HQPClient({
+      host: config.host,
+      port: config.port,
+      username: config.username,
+      password: config.password,
+      logger: createLogger(`HQP:${instanceName}`),
+    });
+
+    hqpInstances.set(instanceName, { client });
+
+    log.info('HQPlayer instance configured (DSP service, not zone backend)', {
+      instance: instanceName,
+      host: config.host,
+      port: config.port
+    });
   });
-  log.info('HQPlayer pre-configured from environment', { host: process.env.HQP_HOST });
+
+  return hqpInstances;
 }
+
+loadHQPInstances();
+
+// Create HQP service for zone linking and enrichment
+const hqpService = new HQPService({
+  instances: hqpInstances,
+  logger: createLogger('HQP:Service'),
+});
+
+// Load existing zone links from settings
+if (appSettings.hqp?.zoneLinks) {
+  const beforeCount = Object.keys(appSettings.hqp.zoneLinks).length;
+  hqpService.loadLinks(appSettings.hqp.zoneLinks);
+  const afterCount = hqpService.getLinks().length;
+
+  log.info('Loaded HQP zone links from settings', { count: afterCount });
+
+  if (beforeCount !== afterCount) {
+    log.warn('Some zone links skipped due to missing HQP instances', {
+      expected: beforeCount,
+      loaded: afterCount,
+    });
+  }
+}
+
+// Register HQP service with bus for zone enrichment
+bus.setHQPService(hqpService);
+
+// For backward compatibility, expose first instance as 'hqp'
+const firstHQP = Array.from(hqpInstances.values())[0];
+const hqp = firstHQP ? firstHQP.client : null;
 
 // Create firmware service for automatic update polling
 const firmwareService = createFirmwareService({
@@ -158,6 +260,8 @@ const app = createApp({
   bus,
   roon,    // Keep for backward compat during Phase 2 testing
   hqp,
+  hqpInstances, // All HQP instances for multi-instance support
+  hqpService,   // HQP service for zone linking
   lms,     // Lyrion client for configuration API
   knobs,
   adapterFactory,

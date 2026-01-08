@@ -7,7 +7,7 @@ A source-agnostic hi-fi control bridge that connects music sources and audio pip
 Hi-fi software assumes you're at a computer or using vendor-specific apps. This bridge fills the gap:
 
 - **Music Sources:** Roon, Lyrion (formerly LMS/Squeezebox); OpenHome and UPnP/DLNA planned
-- **Audio Pipeline:** HQPlayer, receiver control (future)
+- **Audio Pipeline:** HQPlayer DSP enrichment (link any zone to HQPlayer for upsampling/filtering)
 - **Surfaces:** Anything that speaks HTTP or MQTT — ESP32 hardware, web UIs, Home Assistant, Claude (via MCP), etc.
 
 ## Status
@@ -44,6 +44,60 @@ docker compose up -d
 ```
 
 **Note:** Port 8088 is also HQPlayer's default. If running both on the same host, change one.
+
+## HQPlayer DSP Integration
+
+**For users who already route audio through HQPlayer:** Expose HQPlayer's DSP controls (profile switching, filter selection) directly from your zones, without managing HQPlayer as a separate playback zone.
+
+### Prerequisites
+
+Zone linking assumes you've already configured audio routing through HQPlayer using one of these methods:
+
+- **Roon:** Native HQPlayer integration (Settings → Audio → select HQPlayer as output)
+- **LMS/BubbleUPnP:** Route to HQPlayer's UPnP renderer (HQPlayer Embedded exposes this)
+- **OpenHome:** Use BubbleUPnP Server to expose HQPlayer's UPnP renderer as OpenHome
+
+This bridge doesn't handle audio routing - it exposes DSP controls for HQPlayer instances you've already integrated.
+
+### Setup
+
+Edit `data/hqp-config.json`:
+```json
+[
+  {
+    "name": "embedded",
+    "host": "192.168.1.100",
+    "port": 8088,
+    "username": "admin",
+    "password": "secret"
+  },
+  {
+    "name": "desktop",
+    "host": "192.168.1.101",
+    "port": 8088,
+    "username": "",
+    "password": ""
+  }
+]
+```
+
+Restart server after editing config file.
+
+### Zone Linking
+
+Use web UI at `/hqp` to link your zones:
+1. Select a zone (e.g., "Living Room" Roon zone that outputs to HQPlayer)
+2. Choose which HQPlayer instance handles its DSP
+3. Zone's now-playing data now includes HQPlayer pipeline info
+
+### Features
+
+- **Multi-instance support:** Run multiple HQPlayer instances, link different zones to each
+- **Zone enrichment:** Primary zones show HQPlayer DSP status in `backend_data.hqp`
+- **Profile switching:** Load HQPlayer Embedded profiles via web UI or MCP tools
+- **Pipeline control:** Adjust filter, shaper, and dither settings
+
+See [HQPLAYER-MULTI-INSTANCE.md](HQPLAYER-MULTI-INSTANCE.md) for advanced configuration.
 
 ## Architecture
 

@@ -1,5 +1,6 @@
 node_modules/
 data/
+!data/*.example*.json
 *.log
 .DS_Store
 .env
