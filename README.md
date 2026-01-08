@@ -118,4 +118,8 @@ If MQTT is enabled, firmware version is published to `unified-hifi/firmware/vers
 
 ## License
 
-ISC
+As of v2.5.0, this project is licensed under the [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) license.
+
+Versions up to and including v2.4.1-prior-license were released under a custom source-available license (see LICENSE-PRIOR).
+
+For commercial licensing inquiries, see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).

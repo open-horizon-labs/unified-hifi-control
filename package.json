@@ -22,7 +22,7 @@
     "url": "git+https://github.com/cloud-atlas-ai/unified-hifi-control.git"
   },
   "author": "Muness Castle",
-  "license": "ISC",
+  "license": "SEE LICENSE IN LICENSE",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@xmldom/xmldom": "^0.9.8",
