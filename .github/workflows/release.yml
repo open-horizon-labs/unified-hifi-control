@@ -129,11 +129,29 @@ jobs:
       - name: Build deb and rpm packages
         run: node scripts/build-installers.js
 
+      - name: Generate Arch PKGBUILD
+        run: |
+          mkdir -p dist/binaries
+          cp dist/bin/unified-hifi-linux-x64 dist/binaries/
+          cp dist/bin/unified-hifi-linux-arm64 dist/binaries/ || true
+          npm run build:arch
+
       - name: Upload Linux packages
         uses: actions/upload-artifact@v4
         with:
           name: linux-packages
-          path: dist/installers/*.{deb,rpm}
+          path: |
+            dist/installers/*.deb
+            dist/installers/*.rpm
+          retention-days: 5
+
+      - name: Upload Arch PKGBUILD
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-pkgbuild
+          path: |
+            dist/PKGBUILD
+            build/arch/unified-hifi-control.service
           retention-days: 5
 
   build-lms-plugin:
@@ -237,6 +255,8 @@ jobs:
             artifacts/windows-msi/*.msi
             artifacts/linux-packages/*.deb
             artifacts/linux-packages/*.rpm
+            artifacts/arch-pkgbuild/PKGBUILD
+            artifacts/arch-pkgbuild/unified-hifi-control.service
             artifacts/lms-plugin/*.zip
             artifacts/synology-packages/*.spk
             artifacts/qnap-packages/*.qpkg

@@ -23,7 +23,8 @@
     "build:binaries": "node scripts/build-binaries.js",
     "build:lms-plugin": "node scripts/build-lms-plugin.js",
     "build:installers": "node scripts/build-installers.js",
-    "build:nas": "node scripts/build-nas-packages.js"
+    "build:nas": "node scripts/build-nas-packages.js",
+    "build:arch": "node scripts/build-arch-package.js"
   },
   "pkg": {
     "scripts": [

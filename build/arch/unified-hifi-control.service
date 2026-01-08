@@ -1,0 +1,23 @@
+[Unit]
+Description=Unified Hi-Fi Control Bridge
+Documentation=https://github.com/cloud-atlas-ai/unified-hifi-control
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/unified-hifi-control
+Environment=CONFIG_DIR=/etc/unified-hifi-control
+Environment=DATA_DIR=/var/lib/unified-hifi-control
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/unified-hifi-control
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

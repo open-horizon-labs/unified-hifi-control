@@ -1,0 +1,47 @@
+# Maintainer: Cloud Atlas AI <support@cloudatlas.ai>
+pkgname=unified-hifi-control
+pkgver=${VERSION}
+pkgrel=1
+pkgdesc="Source-agnostic hi-fi control bridge for Roon, LMS, and hardware knobs"
+arch=('x86_64' 'aarch64')
+url="https://github.com/cloud-atlas-ai/unified-hifi-control"
+license=('MIT')
+depends=('glibc')
+backup=('etc/unified-hifi-control/config.json')
+source_x86_64=("unified-hifi-linux-x86_64")
+source_aarch64=("unified-hifi-linux-aarch64")
+sha256sums_x86_64=('${SHA256_X86_64}')
+sha256sums_aarch64=('${SHA256_AARCH64}')
+
+package() {
+    cd "$srcdir"
+
+    # Determine binary name based on architecture
+    if [[ "$CARCH" == "x86_64" ]]; then
+        _binary="unified-hifi-linux-x86_64"
+    else
+        _binary="unified-hifi-linux-aarch64"
+    fi
+
+    # Install binary
+    install -Dm755 "$_binary" "$pkgdir/usr/bin/unified-hifi-control"
+
+    # Install systemd service
+    install -Dm644 "$srcdir/../unified-hifi-control.service" \
+        "$pkgdir/usr/lib/systemd/system/unified-hifi-control.service"
+
+    # Create config directory
+    install -dm755 "$pkgdir/etc/unified-hifi-control"
+
+    # Install default config
+    cat > "$pkgdir/etc/unified-hifi-control/config.json" << 'EOF'
+{
+  "port": 8088,
+  "logLevel": "info"
+}
+EOF
+    chmod 644 "$pkgdir/etc/unified-hifi-control/config.json"
+
+    # Create data directory for runtime files
+    install -dm755 "$pkgdir/var/lib/unified-hifi-control"
+}
