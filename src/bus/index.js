@@ -165,7 +165,7 @@ function createBus({ logger, hqpService } = {}) {
       notifyObservers({ type: 'getNowPlaying', zone_id, error: 'No adapter found', sender, timestamp: Date.now() });
       return null;
     }
-    const result = adapter.getNowPlaying(zone_id);
+    const result = await adapter.getNowPlaying(zone_id);
 
     // Enrichment layer: add HQP pipeline data if zone is linked
     if (result && hqp) {

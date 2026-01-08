@@ -460,6 +460,7 @@ function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
       <a href="/control" class="${active === 'control' ? 'active' : ''}">Control</a>
       <a href="/zone" class="${active === 'zone' ? 'active' : ''}">Zone</a>
       <a href="/knobs" class="${active === 'knobs' ? 'active' : ''}">Knobs</a>
+      <a href="/hqp" class="${active === 'hqp' ? 'active' : ''}">HQPlayer</a>
       <a href="/settings" class="${active === 'settings' ? 'active' : ''}">Settings</a>
       <div class="nav-right">
         <button class="theme-toggle" onclick="cycleTheme()" title="Toggle theme" aria-label="Toggle theme">
@@ -472,7 +473,7 @@ function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
 
   const versionScript = `
     fetch('/status').then(r=>r.json()).then(d=>{document.getElementById('app-version').textContent='v'+d.version;});
-    fetch('/api/settings').then(r=>r.json()).then(s=>{if(s.hideKnobsPage){const k=document.querySelector('nav a[href="/knobs"]');if(k)k.style.display='none';}}).catch(()=>{});
+    fetch('/api/settings').then(r=>r.json()).then(s=>{if(s.hideKnobsPage){const k=document.querySelector('nav a[href="/knobs"]');if(k)k.style.display='none';}if(s.hideHqpPage){const h=document.querySelector('nav a[href="/hqp"]');if(h)h.style.display='none';}}).catch(()=>{});
     // Theme handling
     const themes = ['light', 'dark', 'black'];
     const themeIcons = { light: '☀', dark: '🌙', black: '●' };
@@ -1104,6 +1105,256 @@ setInterval(loadKnobs, 5000);
 </script></body></html>`);
   });
 
+  // GET /hqp - HQPlayer DSP service management
+  router.get(['/hqp', '/admin/hqp'], (req, res) => {
+    res.send(`<!DOCTYPE html><html><head><title>HQPlayer - Hi-Fi</title><style>${baseStyles}</style></head><body>
+${navHtml('hqp')}
+<h2>HQPlayer DSP Service</h2>
+<p class="muted">HQPlayer enriches audio zones with high-quality upsampling and filtering. Configure an instance and link it to your zones.</p>
+
+<div class="section">
+  <h3>Configuration</h3>
+  <div id="hqp-status-line" class="muted">Checking...</div>
+  <button id="hqp-reconfig-btn" onclick="showHqpConfig()" style="display:none;margin-top:0.5em;">Reconfigure</button>
+  <div id="hqp-config-form" style="display:none;">
+    <p class="muted" style="margin:0.5em 0;">Filter/shaper/rate control uses native protocol (port 4321).</p>
+    <div class="form-row"><label>Host:</label><input type="text" id="hqp-host" placeholder="192.168.1.x"></div>
+    <div id="hqp-embedded-fields" style="display:none;">
+      <p class="muted" style="margin:0.5em 0;">Configuration switching requires web UI credentials (Embedded only):</p>
+      <div class="form-row"><label>Port (Web UI):</label><input type="text" id="hqp-port" value="8088"></div>
+      <div class="form-row"><label>Username:</label><input type="text" id="hqp-username" placeholder="(optional)"></div>
+      <div class="form-row"><label>Password:</label><input type="password" id="hqp-password"></div>
+    </div>
+    <button onclick="saveHqpConfig()">Save</button>
+    <button onclick="cancelHqpConfig()">Cancel</button>
+    <span id="hqp-save-msg" class="status-msg"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Instances</h3>
+  <p class="muted">Configured HQPlayer instances available for zone linking.</p>
+  <div id="instances-list">Loading...</div>
+  <details style="margin-top:1em;">
+    <summary style="cursor:pointer;color:var(--text-muted);font-size:0.9em;">Advanced: Multiple Instances</summary>
+    <p class="muted" style="margin:0.5em 0;font-size:0.85em;">
+      To run multiple HQPlayer instances simultaneously (e.g., Embedded + Desktop),
+      edit <code>data/hqp-config.json</code> and restart the server.
+      See <a href="https://github.com/muness/unified-hifi-control-hqp/blob/master/HQPLAYER-MULTI-INSTANCE.md" target="_blank">documentation</a> for details.
+    </p>
+  </details>
+</div>
+
+<div class="section">
+  <h3>Zone Links</h3>
+  <p class="muted">Link zones to HQPlayer instances for DSP processing. Each zone can be linked to one instance.</p>
+  <div id="zone-links">Loading...</div>
+</div>
+
+<script>
+${versionScript}
+${escapeScript}
+
+async function loadInstances() {
+  try {
+    const res = await fetch('/hqp/instances');
+    const data = await res.json();
+    const instances = data.instances || [];
+
+    const div = document.getElementById('instances-list');
+    if (instances.length === 0) {
+      div.innerHTML = '<p class="muted">No HQPlayer instances configured. Configure one above.</p>';
+      return;
+    }
+
+    div.innerHTML = '<table><thead><tr><th>Name</th><th>Host</th><th>Status</th></tr></thead><tbody>' +
+      instances.map(i =>
+        '<tr><td><strong>' + esc(i.name) + '</strong></td>' +
+        '<td>' + esc(i.host) + ':' + i.port + '</td>' +
+        '<td>' + (i.configured ? '<span class="success">✓ Configured</span>' : '<span class="muted">Not configured</span>') + '</td></tr>'
+      ).join('') + '</tbody></table>';
+  } catch (e) {
+    document.getElementById('instances-list').innerHTML = '<p class="error">Error loading instances: ' + esc(e.message) + '</p>';
+  }
+}
+
+async function loadZoneLinks() {
+  try {
+    const [zonesRes, linksRes, instancesRes] = await Promise.all([
+      fetch('/admin/status.json'),
+      fetch('/hqp/zones/links'),
+      fetch('/hqp/instances')
+    ]);
+
+    const zonesData = await zonesRes.json();
+    const linksData = await linksRes.json();
+    const instancesData = await instancesRes.json();
+
+    const zones = zonesData.zones || [];
+    const linksArray = linksData.links || [];
+    const instances = instancesData.instances || [];
+
+    // Convert array to object for lookup
+    const links = Object.fromEntries(linksArray.map(l => [l.zone_id, l.instance]));
+
+    const div = document.getElementById('zone-links');
+    if (zones.length === 0) {
+      div.innerHTML = '<p class="muted">No zones available. Check that your audio sources are connected.</p>';
+      return;
+    }
+
+    if (instances.length === 0) {
+      div.innerHTML = '<p class="muted">No HQPlayer instances configured. Configure one above to enable zone linking.</p>';
+      return;
+    }
+
+    div.innerHTML = '<table><thead><tr><th>Zone</th><th>HQPlayer Instance</th><th></th></tr></thead><tbody>' +
+      zones.map(z => {
+        const linked = links[z.zone_id];
+        const instanceOptions = instances.map(i =>
+          '<option value="' + escAttr(i.name) + '"' + (linked === i.name ? ' selected' : '') + '>' + esc(i.name) + '</option>'
+        ).join('');
+
+        return '<tr><td>' + esc(z.zone_name) + '<br><span class="muted" style="font-size:0.85em;">' + esc(z.zone_id) + '</span></td>' +
+          '<td>' + (linked
+            ? '<span class="success">' + esc(linked) + '</span>'
+            : '<select data-zone-id="' + escAttr(z.zone_id) + '" style="min-width:150px;">' +
+              '<option value="">-- Select Instance --</option>' + instanceOptions + '</select>') + '</td>' +
+          '<td>' + (linked
+            ? '<button onclick="unlinkZone(\'' + escAttr(z.zone_id) + '\')">Unlink</button>'
+            : '<button onclick="linkZone(\'' + escAttr(z.zone_id) + '\')">Link</button>') + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  } catch (e) {
+    document.getElementById('zone-links').innerHTML = '<p class="error">Error loading zone links: ' + esc(e.message) + '</p>';
+  }
+}
+
+async function linkZone(zoneId) {
+  const select = document.querySelector('select[data-zone-id="' + zoneId + '"]');
+  if (!select || !select.value) {
+    alert('Please select an instance');
+    return;
+  }
+
+  try {
+    const res = await fetch('/hqp/zones/link', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ zone_id: zoneId, instance: select.value })
+    });
+
+    if (res.ok) {
+      loadZoneLinks();
+    } else {
+      const data = await res.json();
+      alert('Error: ' + (data.error || 'Unknown error'));
+    }
+  } catch (e) {
+    alert('Error linking zone: ' + e.message);
+  }
+}
+
+async function unlinkZone(zoneId) {
+  try {
+    const res = await fetch('/hqp/zones/unlink', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ zone_id: zoneId })
+    });
+
+    if (res.ok) {
+      loadZoneLinks();
+    } else {
+      alert('Error unlinking zone');
+    }
+  } catch (e) {
+    alert('Error unlinking zone: ' + e.message);
+  }
+}
+
+function showHqpConfig() {
+  document.getElementById('hqp-config-form').style.display = 'block';
+  document.getElementById('hqp-reconfig-btn').style.display = 'none';
+}
+
+function cancelHqpConfig() {
+  document.getElementById('hqp-config-form').style.display = 'none';
+  loadHqpConfig();
+}
+
+async function loadHqpConfig() {
+  try {
+    const res = await fetch('/hqp/status');
+    const data = await res.json();
+    const statusLine = document.getElementById('hqp-status-line');
+    const embeddedFields = document.getElementById('hqp-embedded-fields');
+    const configForm = document.getElementById('hqp-config-form');
+    const reconfigBtn = document.getElementById('hqp-reconfig-btn');
+
+    if (data.enabled && data.connected) {
+      const product = data.product || 'HQPlayer';
+      const version = data.version ? ' v' + data.version : '';
+      statusLine.textContent = product + version + ' at ' + (data.host || 'unknown') + ' ✓';
+      statusLine.className = 'success';
+
+      configForm.style.display = 'none';
+      reconfigBtn.style.display = 'inline-block';
+
+      if (data.isEmbedded) {
+        embeddedFields.style.display = 'block';
+      }
+    } else if (data.enabled) {
+      statusLine.textContent = 'Configured but disconnected';
+      statusLine.className = 'muted';
+      configForm.style.display = 'none';
+      reconfigBtn.style.display = 'inline-block';
+    } else {
+      statusLine.textContent = 'Not configured';
+      statusLine.className = 'muted';
+      configForm.style.display = 'block';
+      reconfigBtn.style.display = 'none';
+    }
+  } catch (e) {
+    document.getElementById('hqp-config-form').style.display = 'block';
+    document.getElementById('hqp-reconfig-btn').style.display = 'none';
+  }
+}
+
+async function saveHqpConfig() {
+  const host = document.getElementById('hqp-host').value;
+  const port = document.getElementById('hqp-port').value || '8088';
+  const username = document.getElementById('hqp-username').value;
+  const password = document.getElementById('hqp-password').value;
+  const msg = document.getElementById('hqp-save-msg');
+
+  if (!host) { msg.textContent = 'Host required'; msg.className = 'status-msg error'; return; }
+
+  const cfg = { host, port: parseInt(port) };
+  if (username) cfg.username = username;
+  if (password) cfg.password = password;
+
+  const res = await fetch('/hqp/configure', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
+  if (res.ok) {
+    msg.textContent = 'Saved!';
+    msg.className = 'status-msg success';
+    setTimeout(() => {
+      cancelHqpConfig();
+      loadHqpConfig();
+      loadInstances();
+    }, 1500);
+  } else {
+    msg.textContent = 'Error';
+    msg.className = 'status-msg error';
+  }
+}
+
+loadInstances();
+loadZoneLinks();
+loadHqpConfig();
+setInterval(() => { loadInstances(); loadZoneLinks(); }, 5000);
+</script></body></html>`);
+  });
+
   // GET /knobs/flash - Redirect to HTTPS web flasher (Web Serial requires HTTPS)
   router.get('/knobs/flash', (req, res) => {
     res.send(`<!DOCTYPE html><html><head>
@@ -1141,24 +1392,6 @@ ${navHtml('settings')}
 <h2>Settings</h2>
 
 <div class="section">
-  <h3>HQPlayer Configuration</h3>
-  <div id="hqp-status-line" class="muted">Checking...</div>
-  <button id="hqp-reconfig-btn" onclick="showHqpConfig()" style="display:none;margin-top:0.5em;">Reconfigure</button>
-  <div id="hqp-config-form" style="display:none;">
-    <p class="muted" style="margin:0.5em 0;">Filter/shaper/rate control uses native protocol (port 4321).</p>
-    <div class="form-row"><label>Host:</label><input type="text" id="hqp-host" placeholder="192.168.1.x"></div>
-    <div id="hqp-embedded-fields" style="display:none;">
-      <p class="muted" style="margin:0.5em 0;">Configuration switching requires web UI credentials (Embedded only):</p>
-      <div class="form-row"><label>Port (Web UI):</label><input type="text" id="hqp-port" value="8088"></div>
-      <div class="form-row"><label>Username:</label><input type="text" id="hqp-username" placeholder="(optional)"></div>
-      <div class="form-row"><label>Password:</label><input type="password" id="hqp-password"></div>
-    </div>
-    <button onclick="saveHqpConfig()">Save</button>
-    <span id="hqp-save-msg" class="status-msg"></span>
-  </div>
-</div>
-
-<div class="section">
   <h3>Lyrion Music Server Configuration</h3>
   <div id="lms-status-line" class="muted">Checking...</div>
   <button id="lms-reconfig-btn" onclick="showLmsConfig()" style="display:none;margin-top:0.5em;">Reconfigure</button>
@@ -1178,6 +1411,9 @@ ${navHtml('settings')}
   <h3>UI Settings</h3>
   <div class="form-row">
     <label><input type="checkbox" id="hide-knobs-page"> Hide Knobs page (if you don't have a knob)</label>
+  </div>
+  <div class="form-row">
+    <label><input type="checkbox" id="hide-hqp-page"> Hide HQPlayer page (if you don't use HQPlayer)</label>
   </div>
   <button onclick="saveUiSettings()">Save</button>
   <span id="ui-save-msg" class="status-msg"></span>
@@ -1213,68 +1449,6 @@ ${navHtml('settings')}
 
 <script>
 ${versionScript}
-
-// HQPlayer config
-function showHqpConfig() {
-  document.getElementById('hqp-config-form').style.display = 'block';
-  document.getElementById('hqp-reconfig-btn').style.display = 'none';
-}
-
-async function loadHqpConfig() {
-  try {
-    const res = await fetch('/hqp/status');
-    const data = await res.json();
-    const statusLine = document.getElementById('hqp-status-line');
-    const embeddedFields = document.getElementById('hqp-embedded-fields');
-    const configForm = document.getElementById('hqp-config-form');
-    const reconfigBtn = document.getElementById('hqp-reconfig-btn');
-
-    if (data.enabled && data.connected) {
-      const product = data.product || 'HQPlayer';
-      const version = data.version ? ' v' + data.version : '';
-      statusLine.textContent = product + version + ' at ' + (data.host || 'unknown') + ' ✓';
-      statusLine.className = 'success';
-
-      // Hide form, show reconfigure button
-      configForm.style.display = 'none';
-      reconfigBtn.style.display = 'inline-block';
-
-      // Show embedded fields only for HQPlayer Embedded
-      if (data.isEmbedded) {
-        embeddedFields.style.display = 'block';
-      }
-    } else {
-      statusLine.textContent = data.enabled ? 'Configured but disconnected' : 'Not configured';
-      statusLine.className = 'muted';
-      // Show form, hide reconfigure button
-      configForm.style.display = 'block';
-      reconfigBtn.style.display = 'none';
-    }
-  } catch (e) {
-    // Show form on error
-    document.getElementById('hqp-config-form').style.display = 'block';
-    document.getElementById('hqp-reconfig-btn').style.display = 'none';
-  }
-}
-
-async function saveHqpConfig() {
-  const host = document.getElementById('hqp-host').value;
-  const port = document.getElementById('hqp-port').value || '8088';
-  const username = document.getElementById('hqp-username').value;
-  const password = document.getElementById('hqp-password').value;
-  const msg = document.getElementById('hqp-save-msg');
-
-  if (!host) { msg.textContent = 'Host required'; msg.className = 'status-msg error'; return; }
-
-  const cfg = { host, port: parseInt(port) };
-  if (username) cfg.username = username;
-  if (password) cfg.password = password;
-
-  const res = await fetch('/hqp/configure', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
-  msg.textContent = res.ok ? 'Saved!' : 'Error';
-  msg.className = 'status-msg ' + (res.ok ? 'success' : 'error');
-  loadHqpConfig();
-}
 
 // LMS config
 function showLmsConfig() {
@@ -1356,17 +1530,19 @@ async function loadUiSettings() {
     const res = await fetch('/api/settings');
     const data = await res.json();
     document.getElementById('hide-knobs-page').checked = data.hideKnobsPage || false;
+    document.getElementById('hide-hqp-page').checked = data.hideHqpPage || false;
   } catch (e) {}
 }
 
 async function saveUiSettings() {
   const msg = document.getElementById('ui-save-msg');
   const hideKnobsPage = document.getElementById('hide-knobs-page').checked;
+  const hideHqpPage = document.getElementById('hide-hqp-page').checked;
   try {
     await fetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hideKnobsPage })
+      body: JSON.stringify({ hideKnobsPage, hideHqpPage })
     });
     msg.textContent = 'Saved! Refresh to see nav changes.';
     msg.className = 'status-msg success';
@@ -1411,7 +1587,6 @@ async function saveAdapterSettings() {
   }
 }
 
-loadHqpConfig();
 loadLmsConfig();
 loadStatus();
 loadUiSettings();
