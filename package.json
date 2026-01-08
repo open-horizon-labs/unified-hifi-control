@@ -12,6 +12,8 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
+    "dev:ui": "cd src/ui && npm run dev",
+    "build:ui": "cd src/ui && npm run build",
     "mcp": "node mcp/index.js",
     "test": "jest",
     "test:watch": "jest --watch",

@@ -1,3 +1,21 @@
+FROM node:20-slim AS ui-builder
+
+WORKDIR /app/src/ui
+
+# Copy UI package files
+COPY src/ui/package*.json ./
+
+# Install UI dependencies
+RUN npm ci
+
+# Copy UI source
+COPY src/ui/ ./
+
+# Build UI
+RUN npm run build
+
+# ----
+
 FROM node:20-slim
 
 WORKDIR /app
@@ -17,6 +35,9 @@ RUN npm ci --omit=dev
 
 # Copy source
 COPY src/ ./src/
+
+# Copy built UI from builder stage
+COPY --from=ui-builder /app/dist/ui ./dist/ui
 
 # Create data directory for config persistence
 RUN mkdir -p /data

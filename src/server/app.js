@@ -16,8 +16,9 @@ function createApp(opts = {}) {
   app.use(express.json());
   app.use(morgan('combined'));
 
-  // Static files
-  app.use('/ui', express.static(path.join(__dirname, '..', 'ui')));
+  // Static files - serve built React UI from dist/ui
+  const uiDistPath = path.join(__dirname, '..', '..', 'dist', 'ui');
+  app.use(express.static(uiDistPath));
 
   // Health check
   app.get('/status', (req, res) => {
@@ -217,6 +218,19 @@ function createApp(opts = {}) {
     const knobRoutes = createKnobRoutes({ bus, roon, knobs, adapterFactory, logger: log });
     app.use('/', knobRoutes);
   }
+
+  // Serve React app for client-side routing (SPA catch-all)
+  // This must come after all API routes
+  const fs = require('fs');
+  app.get(['/', '/control', '/zone', '/knobs', '/settings'], (req, res) => {
+    const indexPath = path.join(uiDistPath, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      res.sendFile(indexPath);
+    } else {
+      // Fallback if UI not built yet
+      res.status(404).json({ error: 'UI not built. Run: cd src/ui && npm run build' });
+    }
+  });
 
   // Error handler
   app.use((err, req, res, _next) => {
