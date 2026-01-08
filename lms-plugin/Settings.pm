@@ -68,9 +68,9 @@ sub handler {
         $prefs->set('loglevel', $params->{'pref_loglevel'} || 'info');
 
         # Save knob config
-        $prefs->set('knob_name',              $params->{'pref_knob_name'} || '');
-        $prefs->set('knob_rotation_charging', int($params->{'pref_knob_rotation_charging'} || 180));
-        $prefs->set('knob_rotation_battery',  int($params->{'pref_knob_rotation_battery'} || 0));
+        $prefs->set('knob_name',              $params->{'pref_knob_name'} // '');
+        $prefs->set('knob_rotation_charging', int($params->{'pref_knob_rotation_charging'} // 180));
+        $prefs->set('knob_rotation_battery',  int($params->{'pref_knob_rotation_battery'} // 0));
         $prefs->set('knob_art_mode_charging', int($params->{'pref_knob_art_mode_charging'} // 60));
         $prefs->set('knob_dim_charging',      int($params->{'pref_knob_dim_charging'} // 120));
         $prefs->set('knob_sleep_charging',    int($params->{'pref_knob_sleep_charging'} // 0));

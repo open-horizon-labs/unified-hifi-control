@@ -12,12 +12,19 @@ Environment=DATA_DIR=/var/lib/unified-hifi-control
 Restart=on-failure
 RestartSec=5
 
+# Run as dedicated user (created dynamically)
+DynamicUser=yes
+StateDirectory=unified-hifi-control
+ConfigurationDirectory=unified-hifi-control
+
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/unified-hifi-control
 PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
 
 [Install]
 WantedBy=multi-user.target

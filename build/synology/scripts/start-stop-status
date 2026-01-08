@@ -7,22 +7,32 @@ PID_FILE="/var/run/${PACKAGE_NAME}.pid"
 LOG_FILE="/var/log/${PACKAGE_NAME}.log"
 
 start_daemon() {
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        echo "${PACKAGE_NAME} is already running"
-        return 0
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE")
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            echo "${PACKAGE_NAME} is already running"
+            return 0
+        fi
+        # Stale PID file
+        rm -f "$PID_FILE"
     fi
 
     echo "Starting ${PACKAGE_NAME}..."
 
-    cd "${TARGET_DIR}" || exit 1
+    if ! cd "${TARGET_DIR}"; then
+        echo "Failed to change to ${TARGET_DIR}"
+        return 1
+    fi
 
     # Start the binary
     nohup "${TARGET_DIR}/unified-hifi-control" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
-    sleep 2
+    # Wait for process to start (configurable via STARTUP_WAIT)
+    sleep "${STARTUP_WAIT:-2}"
 
-    if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    PID=$(cat "$PID_FILE" 2>/dev/null)
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
         echo "${PACKAGE_NAME} started successfully"
         return 0
     else
@@ -56,8 +66,11 @@ stop_daemon() {
 }
 
 daemon_status() {
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        return 0  # Running
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+            return 0  # Running
+        fi
     fi
     return 1  # Not running
 }

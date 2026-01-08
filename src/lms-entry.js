@@ -298,10 +298,11 @@ const server = http.createServer(async (req, res) => {
         case 'volume':
           await lms.command(playerId, ['mixer', 'volume', String(value)]);
           break;
-        case 'vol_rel':
+        case 'vol_rel': {
           const delta = value > 0 ? `+${value}` : String(value);
           await lms.command(playerId, ['mixer', 'volume', delta]);
           break;
+        }
         case 'mute':
           await lms.command(playerId, ['mixer', 'muting', value ? '1' : '0']);
           break;

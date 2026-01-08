@@ -14,7 +14,7 @@ const crypto = require('crypto');
 const ROOT = path.join(__dirname, '..');
 const BUILD_DIR = path.join(ROOT, 'build', 'arch');
 const DIST_DIR = path.join(ROOT, 'dist');
-const BINARIES_DIR = path.join(ROOT, 'dist', 'binaries');
+const BINARIES_DIR = path.join(ROOT, 'dist', 'bin');
 
 // Read version from package.json
 const packageJson = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
