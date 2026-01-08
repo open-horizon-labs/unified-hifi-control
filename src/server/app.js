@@ -3,9 +3,10 @@ const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
 const { createKnobRoutes } = require('../knobs/routes');
+const { loadAppSettings, saveAppSettings } = require('../lib/settings');
 
 function createApp(opts = {}) {
-  const { bus, roon, hqp, lms, knobs, adapterFactory, logger } = opts;
+  const { bus, roon, hqp, hqpInstances, hqpService, lms, knobs, adapterFactory, logger } = opts;
   const log = logger || console;
   const app = express();
 
@@ -169,6 +170,78 @@ function createApp(opts = {}) {
     hqp.configure({ host, port, username, password });
     log.info('HQPlayer configured', { host, port });
     res.json({ ok: true });
+  });
+
+  // HQP zone linking routes - DSP service enrichment
+  app.get('/hqp/zones/links', (req, res) => {
+    if (!hqpService) {
+      return res.status(503).json({ error: 'HQP service not available' });
+    }
+    res.json({ links: hqpService.getLinks() });
+  });
+
+  app.post('/hqp/zones/link', (req, res) => {
+    if (!hqpService) {
+      return res.status(503).json({ error: 'HQP service not available' });
+    }
+
+    const { zone_id, instance } = req.body;
+    if (!zone_id || !instance) {
+      return res.status(400).json({ error: 'zone_id and instance required' });
+    }
+
+    try {
+      hqpService.linkZone(zone_id, instance);
+
+      // Save to settings
+      const settings = loadAppSettings();
+      settings.hqp = settings.hqp || {};
+      settings.hqp.zoneLinks = hqpService.saveLinks();
+      saveAppSettings(settings);
+
+      log.info('Zone linked to HQP', { zone_id, instance });
+      res.json({ ok: true, zone_id, instance });
+    } catch (err) {
+      log.warn('Zone link failed', { error: err.message, zone_id, instance });
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post('/hqp/zones/unlink', (req, res) => {
+    if (!hqpService) {
+      return res.status(503).json({ error: 'HQP service not available' });
+    }
+
+    const { zone_id } = req.body;
+    if (!zone_id) {
+      return res.status(400).json({ error: 'zone_id required' });
+    }
+
+    const wasLinked = hqpService.unlinkZone(zone_id);
+    if (wasLinked) {
+      // Save to settings
+      const settings = loadAppSettings();
+      settings.hqp = settings.hqp || {};
+      settings.hqp.zoneLinks = hqpService.saveLinks();
+      saveAppSettings(settings);
+
+      log.info('Zone unlinked from HQP', { zone_id });
+    }
+    res.json({ ok: true, zone_id, was_linked: wasLinked });
+  });
+
+  // HQP instances route
+  app.get('/hqp/instances', (req, res) => {
+    if (!hqpInstances || hqpInstances.size === 0) {
+      return res.json({ instances: [] });
+    }
+    const instances = Array.from(hqpInstances.entries()).map(([name, { client }]) => ({
+      name,
+      host: client.host,
+      port: client.port,
+      configured: client.isConfigured(),
+    }));
+    res.json({ instances });
   });
 
   // Lyrion routes

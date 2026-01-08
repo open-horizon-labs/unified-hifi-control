@@ -29,7 +29,7 @@ function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
   });
 
   // GET /now_playing - Get current playback state for a zone
-  router.get('/now_playing', (req, res) => {
+  router.get('/now_playing', async (req, res) => {
     const zoneId = req.query.zone_id;
     const knob = extractKnob(req);
 
@@ -61,7 +61,7 @@ function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
     }
 
     const sender = { ip: req.ip, knob_id: knob?.id, user_agent: req.get('user-agent') };
-    const data = bus ? bus.getNowPlaying(zoneId, { sender }) : roon.getNowPlaying(zoneId);
+    const data = bus ? await bus.getNowPlaying(zoneId, { sender }) : roon.getNowPlaying(zoneId);
     if (!data) {
       const zones = bus ? bus.getZones() : roon.getZones();
       log.warn('now_playing miss', { zoneId, ip: req.ip });

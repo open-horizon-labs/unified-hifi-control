@@ -10,3 +10,4 @@ firmware/version.json
 
 # Superego
 .superego/
+data/

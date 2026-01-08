@@ -4,12 +4,13 @@ const crypto = require('crypto');
 /**
  * Bus - Routes commands to backend adapters
  */
-function createBus({ logger } = {}) {
+function createBus({ logger, hqpService } = {}) {
   const log = logger || console;
   const backends = new Map();
   const zones = new Map();
   const observers = [];
   let zonesSha = null; // Cached SHA of zone IDs
+  let hqp = hqpService; // HQPService for zone enrichment (can be set later)
 
   function subscribe(callback) {
     if (typeof callback !== 'function') {
@@ -155,7 +156,7 @@ function createBus({ logger } = {}) {
     return backends.get(backend) || null;
   }
 
-  function getNowPlaying(zone_id, opts = {}) {
+  async function getNowPlaying(zone_id, opts = {}) {
     const adapter = getAdapterForZone(zone_id);
     const sender = opts.sender || {};
 
@@ -165,6 +166,22 @@ function createBus({ logger } = {}) {
       return null;
     }
     const result = adapter.getNowPlaying(zone_id);
+
+    // Enrichment layer: add HQP pipeline data if zone is linked
+    if (result && hqp) {
+      try {
+        const pipeline = await hqp.getPipelineForZone(zone_id);
+        if (pipeline) {
+          result.backend_data = result.backend_data || {};
+          result.backend_data.hqp = pipeline;
+          result.capabilities = result.capabilities || {};
+          result.capabilities.has_dsp = true;
+        }
+      } catch (err) {
+        log.error('Failed to enrich zone with HQP data', { zone_id, error: err.message });
+      }
+    }
+
     notifyObservers({ type: 'getNowPlaying', zone_id, backend: zone_id.split(':')[0], has_data: !!result, sender, timestamp: Date.now() });
     return result;
   }
@@ -238,6 +255,11 @@ function createBus({ logger } = {}) {
     zones.clear();
   }
 
+  function setHQPService(hqpService) {
+    hqp = hqpService;
+    log.info('HQP service registered with bus');
+  }
+
   return {
     registerBackend,
     unregisterBackend,
@@ -253,6 +275,7 @@ function createBus({ logger } = {}) {
     start,
     stop,
     subscribe,
+    setHQPService,
     hasBackend: (source) => backends.has(source),
   };
 }
