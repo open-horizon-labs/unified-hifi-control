@@ -2,8 +2,10 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Install dependencies for sharp and mDNS
+# Install build tools and dependencies for sharp and mDNS
 RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3 \
     libvips-dev \
     avahi-daemon \
     libnss-mdns \
@@ -14,6 +16,9 @@ COPY package*.json ./
 
 # Install production dependencies
 RUN npm ci --omit=dev
+
+# Remove build tools to reduce image size
+RUN apt-get update && apt-get remove -y build-essential python3 && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 # Copy source
 COPY src/ ./src/
