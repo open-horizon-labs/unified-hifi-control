@@ -179,6 +179,9 @@ function createBus({ logger, hqpService } = {}) {
         }
       } catch (err) {
         log.error('Failed to enrich zone with HQP data', { zone_id, error: err.message });
+        // Indicate enrichment failure to client
+        result.backend_data = result.backend_data || {};
+        result.backend_data.hqp = { error: err.message };
       }
     }
 

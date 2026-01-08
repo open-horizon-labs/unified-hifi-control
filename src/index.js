@@ -175,6 +175,21 @@ function loadHQPInstances() {
   // Create instances
   configs.forEach(config => {
     const instanceName = config.name || 'default';
+
+    // Validate instance name
+    if (!instanceName || typeof instanceName !== 'string') {
+      log.error('Invalid instance name - skipping', { config });
+      return;
+    }
+    if (hqpInstances.has(instanceName)) {
+      log.error('Duplicate instance name - skipping', { name: instanceName });
+      return;
+    }
+    if (instanceName.includes(':')) {
+      log.error('Instance name cannot contain colons - skipping', { name: instanceName });
+      return;
+    }
+
     const client = new HQPClient({
       host: config.host,
       port: config.port,
@@ -205,8 +220,18 @@ const hqpService = new HQPService({
 
 // Load existing zone links from settings
 if (appSettings.hqp?.zoneLinks) {
+  const beforeCount = Object.keys(appSettings.hqp.zoneLinks).length;
   hqpService.loadLinks(appSettings.hqp.zoneLinks);
-  log.info('Loaded HQP zone links from settings', { count: Object.keys(appSettings.hqp.zoneLinks).length });
+  const afterCount = hqpService.getLinks().length;
+
+  log.info('Loaded HQP zone links from settings', { count: afterCount });
+
+  if (beforeCount !== afterCount) {
+    log.warn('Some zone links skipped due to missing HQP instances', {
+      expected: beforeCount,
+      loaded: afterCount,
+    });
+  }
 }
 
 // Register HQP service with bus for zone enrichment
