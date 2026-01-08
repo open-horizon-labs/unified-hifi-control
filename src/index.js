@@ -148,8 +148,9 @@ function loadHQPInstances() {
         configs = data;
       } else if (data.host) {
         // Old format: single instance object
+        // Use host as default name for predictability (e.g., "192.168.1.61")
         configs = [{
-          name: data.name || 'default',
+          name: data.name || data.host,
           host: data.host,
           port: data.port,
           username: data.username,
@@ -163,8 +164,9 @@ function loadHQPInstances() {
 
   // Fallback to env vars if no config file
   if (configs.length === 0 && process.env.HQP_HOST) {
+    // Use host as default name for predictability
     configs = [{
-      name: process.env.HQP_NAME || 'default',
+      name: process.env.HQP_NAME || process.env.HQP_HOST,
       host: process.env.HQP_HOST,
       port: process.env.HQP_PORT || 8088,
       username: process.env.HQP_USER,
@@ -174,7 +176,7 @@ function loadHQPInstances() {
 
   // Create instances
   configs.forEach(config => {
-    const instanceName = config.name || 'default';
+    const instanceName = config.name || config.host || 'unknown';
 
     // Validate instance name
     if (!instanceName || typeof instanceName !== 'string') {
