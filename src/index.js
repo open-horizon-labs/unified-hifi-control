@@ -9,7 +9,7 @@ const { LMSClient } = require('./lms/client');
 const { createMqttService } = require('./mqtt');
 const { createApp } = require('./server/app');
 const { createLogger } = require('./lib/logger');
-const { loadAppSettings } = require('./lib/settings');
+const { loadAppSettings, saveAppSettings } = require('./lib/settings');
 const { advertise } = require('./lib/mdns');
 const { createKnobsStore } = require('./knobs/store');
 const { createBus } = require('./bus');
@@ -222,17 +222,19 @@ const hqpService = new HQPService({
 
 // Load existing zone links from settings
 if (appSettings.hqp?.zoneLinks) {
-  const beforeCount = Object.keys(appSettings.hqp.zoneLinks).length;
-  hqpService.loadLinks(appSettings.hqp.zoneLinks);
-  const afterCount = hqpService.getLinks().length;
+  const loadResult = hqpService.loadLinks(appSettings.hqp.zoneLinks);
 
-  log.info('Loaded HQP zone links from settings', { count: afterCount });
+  log.info('Loaded HQP zone links from settings', { count: hqpService.getLinks().length });
 
-  if (beforeCount !== afterCount) {
-    log.warn('Some zone links skipped due to missing HQP instances', {
-      expected: beforeCount,
-      loaded: afterCount,
-    });
+  // Persist auto-corrections
+  if (loadResult.corrected) {
+    appSettings.hqp.zoneLinks = loadResult.links;
+    try {
+      saveAppSettings(appSettings);
+      log.warn('Auto-corrected zone links persisted to app-settings.json');
+    } catch (err) {
+      log.error('Failed to persist auto-corrected zone links', { error: err.message });
+    }
   }
 }
 

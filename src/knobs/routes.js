@@ -1181,11 +1181,12 @@ async function loadInstances() {
       return;
     }
 
-    div.innerHTML = '<table><thead><tr><th>Name</th><th>Host</th><th>Status</th></tr></thead><tbody>' +
+    div.innerHTML = '<table><thead><tr><th>Name</th><th>Host</th><th>Status</th><th>Actions</th></tr></thead><tbody>' +
       instances.map(i =>
         '<tr><td><strong>' + esc(i.name) + '</strong></td>' +
         '<td>' + esc(i.host) + ':' + i.port + '</td>' +
-        '<td>' + (i.configured ? '<span class="success">✓ Configured</span>' : '<span class="muted">Not configured</span>') + '</td></tr>'
+        '<td>' + (i.configured ? '<span class="success">✓ Configured</span>' : '<span class="muted">Not configured</span>') + '</td>' +
+        '<td><button class="delete-instance-btn" data-instance-name="' + esc(i.name) + '" style="background:var(--error);color:white;border:none;padding:0.3em 0.8em;border-radius:4px;cursor:pointer;">Delete</button></td></tr>'
       ).join('') + '</tbody></table>';
   } catch (e) {
     document.getElementById('instances-list').innerHTML = '<p class="error">Error loading instances: ' + esc(e.message) + '</p>';
@@ -1399,7 +1400,6 @@ async function loadHqpConfig() {
     const res = await fetch('/hqp/status');
     const data = await res.json();
     const statusLine = document.getElementById('hqp-status-line');
-    const embeddedFields = document.getElementById('hqp-embedded-fields');
     const configForm = document.getElementById('hqp-config-form');
     const reconfigBtn = document.getElementById('hqp-reconfig-btn');
 
@@ -1411,10 +1411,6 @@ async function loadHqpConfig() {
 
       configForm.style.display = 'none';
       reconfigBtn.style.display = 'inline-block';
-
-      if (data.isEmbedded) {
-        embeddedFields.style.display = 'block';
-      }
     } else if (data.enabled) {
       statusLine.textContent = 'Configured but disconnected';
       statusLine.className = 'muted';
@@ -1467,6 +1463,29 @@ loadInstances();
 loadZoneLinks();
 loadHqpConfig();
 setInterval(() => { loadInstances(); loadZoneLinks(); }, 5000);
+
+// Event delegation for delete instance buttons
+document.addEventListener('click', async (e) => {
+  if (!e.target.classList.contains('delete-instance-btn')) return;
+
+  const name = e.target.dataset.instanceName;
+  if (!confirm('Delete HQPlayer instance "' + name + '"?\\n\\nThis will also remove any zone links to this instance.')) {
+    return;
+  }
+
+  try {
+    const res = await fetch('/hqp/instances/' + encodeURIComponent(name), { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok) {
+      alert('Error: ' + (data.error || 'Failed to delete instance'));
+      return;
+    }
+    await loadInstances();
+    await loadZoneLinks();
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+});
 </script></body></html>`);
   });
 

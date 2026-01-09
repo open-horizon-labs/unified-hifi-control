@@ -341,6 +341,74 @@ function createApp(opts = {}) {
     res.json({ instances });
   });
 
+  app.delete('/hqp/instances/:name', (req, res) => {
+    const { name } = req.params;
+
+    // 1. Validate
+    if (!name) {
+      return res.status(400).json({ error: 'instance name required' });
+    }
+    if (!hqpInstances.has(name)) {
+      return res.status(404).json({ error: 'instance not found' });
+    }
+
+    const fs = require('fs');
+    const path = require('path');
+    const configDir = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+    const configFile = path.join(configDir, 'hqp-config.json');
+
+    // 2. Prepare all changes (read files, compute new state)
+    let configs = [];
+    try {
+      if (fs.existsSync(configFile)) {
+        const data = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+        configs = Array.isArray(data) ? data : [data];
+      }
+    } catch (err) {
+      log.error('Failed to load HQP config', { error: err.message });
+      return res.status(500).json({ error: 'Failed to load configuration: ' + err.message });
+    }
+
+    const updatedConfigs = configs.filter(c => c.name !== name);
+    if (updatedConfigs.length === configs.length) {
+      return res.status(404).json({ error: 'instance not found in config' });
+    }
+
+    // Store runtime state for rollback
+    const instanceToDelete = hqpInstances.get(name);
+    const linksToRemove = hqpService ? hqpService.getLinks().filter(l => l.instance === name) : [];
+
+    // 3. Apply runtime changes
+    hqpInstances.delete(name);
+    linksToRemove.forEach(l => hqpService.unlinkZone(l.zone_id));
+
+    // 4. Apply file changes (with rollback on error)
+    try {
+      // Write HQP config
+      fs.writeFileSync(configFile, JSON.stringify(updatedConfigs, null, 2));
+
+      // Write zone links if any were removed
+      if (linksToRemove.length > 0) {
+        const settings = loadAppSettings();
+        settings.hqp = settings.hqp || {};
+        settings.hqp.zoneLinks = hqpService.saveLinks();
+        saveAppSettings(settings);
+        log.info('Removed zone links for deleted HQP instance', { instance: name, count: linksToRemove.length });
+      }
+    } catch (err) {
+      // ROLLBACK: Restore runtime state
+      hqpInstances.set(name, instanceToDelete);
+      linksToRemove.forEach(l => hqpService.linkZone(l.zone_id, l.instance));
+
+      log.error('Failed to persist instance deletion, rolled back', { name, error: err.message });
+      return res.status(500).json({ error: 'Failed to save changes: ' + err.message });
+    }
+
+    // 5. Success
+    log.info('HQP instance deleted', { name, zone_links_removed: linksToRemove.length });
+    res.json({ ok: true, instance: name });
+  });
+
   // Lyrion routes
   app.get('/lms/status', (req, res) => {
     if (!lms) {
