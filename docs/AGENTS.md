@@ -4,6 +4,21 @@ This document defines hard constraints and best practices for AI agents working 
 
 ## Hard Constraints
 
+### 0. NEVER Ship Without User Testing
+
+**Constraint:** Any user-facing change (UI, API, config format) MUST be tested by the user before shipping/tagging a release.
+
+**Requirements:**
+1. **Ask user to test** - "Ready for testing. Please verify X works before I ship."
+2. **Wait for confirmation** - Don't commit/push/tag until user confirms it works
+3. **Test in target environment** - If user reports Docker issue, test the Docker scenario
+4. **Complete the feature** - If UI is missing fields, it's not ready to ship
+
+**Why:** Shipping broken features wastes user time, erodes trust, and creates support burden. The 10 minutes to test saves hours of debugging in production.
+
+**Historical Context:**
+- **2026-01-08 v2.5.1:** Shipped HQP configuration fix without testing. UI was missing username/password fields. Had to immediately hotfix.
+
 ### 1. Safety-Critical Code MUST Have Regression Tests
 
 **Constraint:** Any code that can cause physical harm or equipment damage MUST have explicit regression tests in CI before shipping.

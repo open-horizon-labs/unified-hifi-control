@@ -97,19 +97,44 @@ class HQPService {
 
   /**
    * Load zone links from object (for settings integration)
+   * Auto-corrects links when unambiguous (single instance configured)
+   * Returns: { corrected: boolean, links: Object }
    */
   loadLinks(links) {
     this.zoneLinks.clear();
-    if (!links) return;
+    if (!links) return { corrected: false, links: {} };
+
+    let correctionsMade = false;
+    const correctedLinks = {};
 
     Object.entries(links).forEach(([zone_id, instanceName]) => {
       if (this.instances.has(instanceName)) {
+        // Instance exists - link normally
         this.zoneLinks.set(zone_id, instanceName);
+        correctedLinks[zone_id] = instanceName;
+      } else if (this.instances.size === 1) {
+        // Only one instance configured - safe to auto-correct
+        const [newName] = Array.from(this.instances.keys());
+        this.zoneLinks.set(zone_id, newName);
+        correctedLinks[zone_id] = newName;
+        correctionsMade = true;
+        this.log.warn('Auto-corrected zone link (likely renamed instance)', {
+          zone_id,
+          old_instance: instanceName,
+          new_instance: newName,
+        });
       } else {
-        this.log.warn('Skipping link to unknown HQP instance', { zone_id, instance: instanceName });
+        // Multiple instances - cannot determine correct mapping
+        this.log.warn('Cannot auto-correct zone link (ambiguous)', {
+          zone_id,
+          instance: instanceName,
+          available_instances: Array.from(this.instances.keys()),
+        });
       }
     });
+
     this.log.info('Loaded zone links', { count: this.zoneLinks.size });
+    return { corrected: correctionsMade, links: correctedLinks };
   }
 
   /**

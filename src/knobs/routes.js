@@ -706,7 +706,7 @@ ${navHtml('zone')}
 <div id="hqp-section" class="section hidden">
   <h3>HQPlayer DSP</h3>
   <div id="hqp-not-configured">
-    <p class="muted">HQPlayer not configured. <a href="/admin/settings">Configure in Settings</a></p>
+    <p class="muted">HQPlayer not configured. <a href="/admin/hqp">Configure HQPlayer</a></p>
   </div>
   <div id="hqp-configured" class="hidden">
     <p>Status: <span id="hqp-status">checking...</span></p>
@@ -726,6 +726,7 @@ ${escapeScript}
 let selectedZone = localStorage.getItem('hifi-zone') || null;
 let zonesData = [];
 let initialLoad = true;
+let hqpEnabled = false;
 
 async function loadZones() {
   const res = await fetch('/admin/status.json');
@@ -784,9 +785,10 @@ function updateZoneDisplay(np) {
   document.getElementById('zone-art').src = '/now_playing/image?zone_id=' + encodeURIComponent(selectedZone) + '&width=120&height=120&t=' + Date.now();
   document.getElementById('play-btn').textContent = np.is_playing ? '⏸' : '▶';
 
-  // Show/hide HQPlayer section based on zone (check if output contains HQPlayer)
+  // Show/hide HQPlayer section: only show if zone uses HQPlayer AND HQP is configured
   const isHqpZone = zone && (zone.output_name || '').toLowerCase().includes('hqplayer');
-  document.getElementById('hqp-section').classList.toggle('hidden', !isHqpZone);
+  const shouldShowHqp = isHqpZone && hqpEnabled;
+  document.getElementById('hqp-section').classList.toggle('hidden', !shouldShowHqp);
 }
 
 async function ctrl(action, value) {
@@ -804,6 +806,7 @@ async function loadHqpStatus() {
   try {
     const res = await fetch('/hqp/status');
     const data = await res.json();
+    hqpEnabled = data.enabled;  // Cache for zone display visibility
     if (data.enabled) {
       document.getElementById('hqp-not-configured').classList.add('hidden');
       document.getElementById('hqp-configured').classList.remove('hidden');
@@ -812,7 +815,10 @@ async function loadHqpStatus() {
       loadHqpProfiles(data.configName);
       loadHqpPipeline();
     }
-  } catch (e) { console.error('HQPlayer status error:', e); }
+  } catch (e) {
+    hqpEnabled = false;
+    console.error('HQPlayer status error:', e);
+  }
 }
 
 async function loadHqpProfiles(configName) {
@@ -1123,36 +1129,29 @@ ${navHtml('hqp')}
 <p class="muted">HQPlayer enriches audio zones with high-quality upsampling and filtering. Configure an instance and link it to your zones.</p>
 
 <div class="section">
-  <h3>Configuration</h3>
-  <div id="hqp-status-line" class="muted">Checking...</div>
-  <button id="hqp-reconfig-btn" onclick="showHqpConfig()" style="display:none;margin-top:0.5em;">Reconfigure</button>
-  <div id="hqp-config-form" style="display:none;">
-    <p class="muted" style="margin:0.5em 0;">Filter/shaper/rate control uses native protocol (port 4321).</p>
-    <div class="form-row"><label>Host:</label><input type="text" id="hqp-host" placeholder="192.168.1.x"></div>
-    <div id="hqp-embedded-fields" style="display:none;">
-      <p class="muted" style="margin:0.5em 0;">Configuration switching requires web UI credentials (Embedded only):</p>
-      <div class="form-row"><label>Port (Web UI):</label><input type="text" id="hqp-port" value="8088"></div>
-      <div class="form-row"><label>Username:</label><input type="text" id="hqp-username" placeholder="(optional)"></div>
-      <div class="form-row"><label>Password:</label><input type="password" id="hqp-password"></div>
-    </div>
-    <button onclick="saveHqpConfig()">Save</button>
-    <button onclick="cancelHqpConfig()">Cancel</button>
-    <span id="hqp-save-msg" class="status-msg"></span>
-  </div>
-</div>
-
-<div class="section">
   <h3>Instances</h3>
-  <p class="muted">Configured HQPlayer instances available for zone linking.</p>
+  <p class="muted">Add and manage HQPlayer instances. You can run multiple instances simultaneously (e.g., Embedded + Desktop).</p>
+  <button id="hqp-add-btn" onclick="showAddInstance()" style="margin-bottom:1em;">Add Instance</button>
+  <div id="hqp-add-form" style="display:none;margin-bottom:1em;padding:1em;border:1px solid var(--border);border-radius:4px;background:var(--bg-elevated);">
+    <h4 style="margin-top:0;">Add HQPlayer Instance</h4>
+    <p class="muted" style="margin:0.5em 0;font-size:0.9em;">Filter/shaper/rate control uses native protocol (port 4321).</p>
+    <div class="form-row">
+      <label>Host:</label>
+      <input type="text" id="hqp-add-host" placeholder="192.168.1.x" onblur="detectHqpType()">
+      <button type="button" onclick="detectHqpType()" style="margin-left:0.5em;padding:0.3em 0.6em;">Test</button>
+    </div>
+    <div id="hqp-add-type-msg" class="muted" style="margin:0.5em 0;font-size:0.9em;"></div>
+    <div id="hqp-add-credentials" style="display:none;">
+      <p class="muted" style="margin:0.5em 0;font-size:0.9em;">Web UI credentials (required for Embedded profile switching):</p>
+      <div class="form-row"><label>Port (Web UI):</label><input type="text" id="hqp-add-port" value="8088"></div>
+      <div class="form-row"><label>Username:</label><input type="text" id="hqp-add-username"></div>
+      <div class="form-row"><label>Password:</label><input type="password" id="hqp-add-password"></div>
+    </div>
+    <button onclick="saveHqpInstance()">Add</button>
+    <button onclick="cancelAddInstance()">Cancel</button>
+    <span id="hqp-add-msg" class="status-msg"></span>
+  </div>
   <div id="instances-list">Loading...</div>
-  <details style="margin-top:1em;">
-    <summary style="cursor:pointer;color:var(--text-muted);font-size:0.9em;">Advanced: Multiple Instances</summary>
-    <p class="muted" style="margin:0.5em 0;font-size:0.85em;">
-      To run multiple HQPlayer instances simultaneously (e.g., Embedded + Desktop),
-      edit <code>data/hqp-config.json</code> and restart the server.
-      See <a href="https://github.com/muness/unified-hifi-control-hqp/blob/master/HQPLAYER-MULTI-INSTANCE.md" target="_blank">documentation</a> for details.
-    </p>
-  </details>
 </div>
 
 <div class="section">
@@ -1177,11 +1176,12 @@ async function loadInstances() {
       return;
     }
 
-    div.innerHTML = '<table><thead><tr><th>Name</th><th>Host</th><th>Status</th></tr></thead><tbody>' +
+    div.innerHTML = '<table><thead><tr><th>Name</th><th>Host</th><th>Status</th><th>Actions</th></tr></thead><tbody>' +
       instances.map(i =>
         '<tr><td><strong>' + esc(i.name) + '</strong></td>' +
         '<td>' + esc(i.host) + ':' + i.port + '</td>' +
-        '<td>' + (i.configured ? '<span class="success">✓ Configured</span>' : '<span class="muted">Not configured</span>') + '</td></tr>'
+        '<td>' + (i.configured ? '<span class="success">✓ Configured</span>' : '<span class="muted">Not configured</span>') + '</td>' +
+        '<td><button class="delete-instance-btn" data-instance-name="' + esc(i.name) + '" style="background:var(--error);color:white;border:none;padding:0.3em 0.8em;border-radius:4px;cursor:pointer;">Delete</button></td></tr>'
       ).join('') + '</tbody></table>';
   } catch (e) {
     document.getElementById('instances-list').innerHTML = '<p class="error">Error loading instances: ' + esc(e.message) + '</p>';
@@ -1380,89 +1380,140 @@ async function unlinkByInstance(instanceName) {
   }
 }
 
-function showHqpConfig() {
-  document.getElementById('hqp-config-form').style.display = 'block';
-  document.getElementById('hqp-reconfig-btn').style.display = 'none';
+function showAddInstance() {
+  document.getElementById('hqp-add-form').style.display = 'block';
+  document.getElementById('hqp-add-btn').style.display = 'none';
+  // Clear form
+  document.getElementById('hqp-add-host').value = '';
+  document.getElementById('hqp-add-port').value = '8088';
+  document.getElementById('hqp-add-username').value = '';
+  document.getElementById('hqp-add-password').value = '';
+  document.getElementById('hqp-add-msg').textContent = '';
+  document.getElementById('hqp-add-type-msg').textContent = '';
+  document.getElementById('hqp-add-credentials').style.display = 'none';
 }
 
-function cancelHqpConfig() {
-  document.getElementById('hqp-config-form').style.display = 'none';
-  loadHqpConfig();
+function cancelAddInstance() {
+  document.getElementById('hqp-add-form').style.display = 'none';
+  document.getElementById('hqp-add-btn').style.display = 'block';
+  document.getElementById('hqp-add-msg').textContent = '';
 }
 
-async function loadHqpConfig() {
+async function detectHqpType() {
+  const host = document.getElementById('hqp-add-host').value;
+  const typeMsg = document.getElementById('hqp-add-type-msg');
+  const credentialsDiv = document.getElementById('hqp-add-credentials');
+
+  if (!host) {
+    typeMsg.textContent = '';
+    credentialsDiv.style.display = 'none';
+    return;
+  }
+
+  typeMsg.textContent = 'Detecting...';
+  typeMsg.className = 'muted';
+
   try {
-    const res = await fetch('/hqp/status');
+    const res = await fetch('/hqp/detect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ host })
+    });
+
     const data = await res.json();
-    const statusLine = document.getElementById('hqp-status-line');
-    const embeddedFields = document.getElementById('hqp-embedded-fields');
-    const configForm = document.getElementById('hqp-config-form');
-    const reconfigBtn = document.getElementById('hqp-reconfig-btn');
 
-    if (data.enabled && data.connected) {
-      const product = data.product || 'HQPlayer';
-      const version = data.version ? ' v' + data.version : '';
-      statusLine.textContent = product + version + ' at ' + (data.host || 'unknown') + ' ✓';
-      statusLine.className = 'success';
+    if (!data.reachable) {
+      typeMsg.textContent = '❌ Cannot reach HQPlayer at this address. Check host/network.';
+      typeMsg.className = 'status-msg error';
+      credentialsDiv.style.display = 'none';
+      return;
+    }
 
-      configForm.style.display = 'none';
-      reconfigBtn.style.display = 'inline-block';
+    const productName = data.product || 'Unknown';
+    typeMsg.textContent = '✓ Detected: ' + productName;
+    typeMsg.className = 'status-msg success';
 
-      if (data.isEmbedded) {
-        embeddedFields.style.display = 'block';
-      }
-    } else if (data.enabled) {
-      statusLine.textContent = 'Configured but disconnected';
-      statusLine.className = 'muted';
-      configForm.style.display = 'none';
-      reconfigBtn.style.display = 'inline-block';
+    if (data.isEmbedded) {
+      credentialsDiv.style.display = 'block';
     } else {
-      statusLine.textContent = 'Not configured';
-      statusLine.className = 'muted';
-      configForm.style.display = 'block';
-      reconfigBtn.style.display = 'none';
+      credentialsDiv.style.display = 'none';
     }
   } catch (e) {
-    const statusLine = document.getElementById('hqp-status-line');
-    statusLine.textContent = 'Error loading status: ' + e.message;
-    statusLine.className = 'error';
-    document.getElementById('hqp-config-form').style.display = 'block';
-    document.getElementById('hqp-reconfig-btn').style.display = 'none';
+    typeMsg.textContent = '❌ Detection failed: ' + e.message;
+    typeMsg.className = 'status-msg error';
+    credentialsDiv.style.display = 'none';
   }
 }
 
-async function saveHqpConfig() {
-  const host = document.getElementById('hqp-host').value;
-  const port = document.getElementById('hqp-port').value || '8088';
-  const username = document.getElementById('hqp-username').value;
-  const password = document.getElementById('hqp-password').value;
-  const msg = document.getElementById('hqp-save-msg');
+async function saveHqpInstance() {
+  const host = document.getElementById('hqp-add-host').value;
+  const port = document.getElementById('hqp-add-port').value || '8088';
+  const username = document.getElementById('hqp-add-username').value;
+  const password = document.getElementById('hqp-add-password').value;
+  const msg = document.getElementById('hqp-add-msg');
 
-  if (!host) { msg.textContent = 'Host required'; msg.className = 'status-msg error'; return; }
+  if (!host) {
+    msg.textContent = 'Host required';
+    msg.className = 'status-msg error';
+    return;
+  }
 
   const cfg = { host, port: parseInt(port) };
   if (username) cfg.username = username;
   if (password) cfg.password = password;
 
-  const res = await fetch('/hqp/configure', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cfg) });
-  if (res.ok) {
-    msg.textContent = 'Saved!';
-    msg.className = 'status-msg success';
-    setTimeout(() => {
-      cancelHqpConfig();
-      loadHqpConfig();
-      loadInstances();
-    }, 1500);
-  } else {
-    msg.textContent = 'Error';
+  try {
+    const res = await fetch('/hqp/configure', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cfg)
+    });
+
+    if (res.ok) {
+      msg.textContent = 'Instance added!';
+      msg.className = 'status-msg success';
+      setTimeout(() => {
+        cancelAddInstance();
+        loadInstances();
+        loadZoneLinks();
+      }, 1500);
+    } else {
+      const data = await res.json();
+      msg.textContent = 'Error: ' + (data.error || 'Failed to add instance');
+      msg.className = 'status-msg error';
+    }
+  } catch (e) {
+    msg.textContent = 'Error: ' + e.message;
     msg.className = 'status-msg error';
   }
 }
 
 loadInstances();
 loadZoneLinks();
-loadHqpConfig();
 setInterval(() => { loadInstances(); loadZoneLinks(); }, 5000);
+
+// Event delegation for delete instance buttons
+document.addEventListener('click', async (e) => {
+  if (!e.target.classList.contains('delete-instance-btn')) return;
+
+  const name = e.target.dataset.instanceName;
+  if (!confirm('Delete HQPlayer instance "' + name + '"?\\n\\nThis will also remove any zone links to this instance.')) {
+    return;
+  }
+
+  try {
+    const res = await fetch('/hqp/instances/' + encodeURIComponent(name), { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok) {
+      alert('Error: ' + (data.error || 'Failed to delete instance'));
+      return;
+    }
+    await loadInstances();
+    await loadZoneLinks();
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+});
 </script></body></html>`);
   });
 
