@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 const morgan = require('morgan');
 const compression = require('compression');
 const path = require('path');
@@ -16,6 +17,8 @@ function createApp(opts = {}) {
 
   app.use(cors());
   app.use(express.json());
+  const compressionLevel = parseInt(process.env.COMPRESSION_LEVEL) || 6;
+  app.use(compression({ level: compressionLevel }));  // Gzip compression for all responses
   app.use(morgan('combined'));
   app.use(compression());
 
