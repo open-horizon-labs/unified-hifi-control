@@ -29,6 +29,7 @@
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@xmldom/xmldom": "^0.9.8",
     "bonjour": "^3.5.0",
+    "compression": "^1.8.1",
     "cors": "^2.8.5",
     "express": "^5.2.1",
     "morgan": "^1.10.1",

@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
+const compression = require('compression');
 const path = require('path');
 const { createKnobRoutes } = require('../knobs/routes');
 const { loadAppSettings, saveAppSettings } = require('../lib/settings');
@@ -16,6 +17,7 @@ function createApp(opts = {}) {
   app.use(cors());
   app.use(express.json());
   app.use(morgan('combined'));
+  app.use(compression());
 
   // Static files
   app.use('/ui', express.static(path.join(__dirname, '..', 'ui')));
