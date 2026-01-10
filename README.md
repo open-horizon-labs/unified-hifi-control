@@ -23,8 +23,7 @@ services:
     image: muness/unified-hifi-control:latest
     network_mode: host  # Required for Roon mDNS discovery
     volumes:
-      - ./data:/data
-      - ./firmware:/app/firmware
+      - ./data:/data  # Config, settings, and firmware stored here
     environment:
       - PORT=8088
       - CONFIG_DIR=/data

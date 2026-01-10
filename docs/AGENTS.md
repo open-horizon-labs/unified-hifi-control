@@ -102,6 +102,41 @@ if (Array.isArray(data)) {
 - Keep CHANGELOG.md current
 - Document breaking changes prominently
 
+## Code Review
+
+### Automated Reviewers
+
+All PRs should be reviewed by both automated reviewers:
+
+1. **CodeRabbit** (`@coderabbitai`) - AI code review bot on GitHub
+   - Comment `@coderabbitai review` on the PR
+   - Provides line-by-line feedback, security checks, best practices
+   - Address feedback or explain why you're not
+
+2. **Superego** (`sg review pr`) - Local metacognitive review
+   - Run before creating PR or after significant changes
+   - Evaluates proportionality, scope creep, architectural fit
+   - Paste non-trivial feedback as PR comment for transparency
+
+### Review Workflow
+
+```bash
+# Before PR: run superego locally
+sg review pr
+
+# After PR created: request coderabbit
+gh pr comment <number> --body "@coderabbitai review"
+
+# If superego has substantive feedback, paste it to PR
+gh pr comment <number> --body "**Superego Review:**
+<paste feedback here>"
+```
+
+### When to Paste Superego Reviews
+
+- **Always paste:** Observations about architectural decisions, timing concerns, error handling gaps
+- **Skip pasting:** Simple "ship it" approvals with no substantive observations
+
 ## CI Pipeline
 
 All PRs must pass:
