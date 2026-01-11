@@ -32,8 +32,9 @@ const log = createLogger('LMS-Plugin');
 log.info('Starting Unified Hi-Fi Control (LMS Plugin Mode)');
 
 // Create LMS client (connects to parent LMS instance)
+// Always use 127.0.0.1 in LMS plugin mode - we're always on the same host
 const lms = new LMSClient({
-  host: process.env.LMS_HOST || 'localhost',
+  host: '127.0.0.1',
   port: parseInt(process.env.LMS_PORT, 10) || 9000,
   logger: createLogger('LMS'),
 });
