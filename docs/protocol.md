@@ -16,6 +16,7 @@ Zones are returned by `/zones`, `/admin/status.json`, and other endpoints.
     "type": "hqplayer",
     "instance": "HQP-Main",
     "pipeline": "/hqp/pipeline?zone_id=roon%3A1234",
+    "matrix": "/hqp/matrix/profiles",
     "profiles": "/hqp/profiles"
   }
 }
@@ -30,7 +31,8 @@ The `dsp` field is **only present** when the zone is linked to a DSP processor (
 | `type` | string | DSP type, currently always `"hqplayer"` |
 | `instance` | string | Name of the HQPlayer instance |
 | `pipeline` | string | URL to fetch/set pipeline settings |
-| `profiles` | string? | URL to fetch profiles. **Only present** for instances that support profile switching. |
+| `matrix` | string | URL to fetch/set matrix profiles (convolution/PEQ for room correction) |
+| `profiles` | string? | URL to fetch configuration profiles. **Only present** for instances that support profile switching. |
 
 ### Checking for DSP
 
@@ -38,12 +40,14 @@ The `dsp` field is **only present** when the zone is linked to a DSP processor (
 // JavaScript
 const hasDsp = !!zone.dsp;
 const hasProfiles = !!zone.dsp?.profiles;
+const hasMatrix = !!zone.dsp?.matrix;
 ```
 
 ```swift
 // Swift
 let hasDsp = zone.dsp != nil
 let hasProfiles = zone.dsp?.profiles != nil
+let hasMatrix = zone.dsp?.matrix != nil
 ```
 
 ## Changelog
