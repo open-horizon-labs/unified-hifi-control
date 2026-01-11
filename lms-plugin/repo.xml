@@ -2,13 +2,13 @@
 <extensions>
   <plugins>
     <plugin name="UnifiedHiFi"
-            version="2.5.1-rc.1"
+            version="2.5.1-rc.2"
             minTarget="8.0"
             maxTarget="*">
       <title lang="EN">Unified Hi-Fi Control</title>
       <desc lang="EN">Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer, and hardware knobs. Provides HTTP APIs, MQTT integration, and web UI for controlling your audio system from anywhere.</desc>
-      <url>https://github.com/open-horizon-labs/unified-hifi-control/releases/download/v2.5.1-rc.1/lms-unified-hifi-control-2.5.1-rc.1.zip</url>
-      <sha>33245c75d42f92cd3d15647ddcc231576093501f</sha>
+      <url>https://github.com/open-horizon-labs/unified-hifi-control/releases/download/v2.5.1-rc.2/lms-unified-hifi-control-2.5.1-rc.2.zip</url>
+      <sha>08552b389a355d2d5009dbc166996894d5e52605</sha>
       <creator>Muness Castle</creator>
       <link>https://forums.lyrion.org/forum/user-forums/3rd-party-hardware/1804977-roon-knob-includes-lms-support</link>
     </plugin>
