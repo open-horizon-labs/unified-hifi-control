@@ -68,6 +68,7 @@ async function main() {
   }
 
   // Create output zip
+  fs.mkdirSync(DIST, { recursive: true });
   const zipName = `lms-unified-hifi-control-${VERSION}.zip`;
   const zipPath = path.join(DIST, zipName);
 
