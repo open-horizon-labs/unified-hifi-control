@@ -582,7 +582,7 @@ async function loadZones() {
       const step = np.volume_step || 2;
       const playIcon = np.is_playing ? '⏸' : '▶';
       const deviceInfo = zone.device_name ? ' <span class="muted">(' + esc(zone.device_name) + ')</span>' : '';
-      const isHqp = !!zone.dsp;
+      const isHqp = zone.dsp?.type === 'hqplayer';
       const dspBadge = isHqp ? ' <span style="font-size:0.7em;background:#6366f1;color:white;padding:0.15em 0.4em;border-radius:3px;vertical-align:middle;">DSP</span>' : '';
       const profileSelect = isHqp && hqpProfiles.length > 0 ?
         '<p class="muted" style="margin-top:0.5em;">Configuration: <select class="hqp-profile-select" style="padding:0.2em;">' +
@@ -798,7 +798,7 @@ function updateZoneDisplay(np) {
   document.getElementById('play-btn').textContent = np.is_playing ? '⏸' : '▶';
 
   // Show/hide HQPlayer section: only show if zone is linked to HQPlayer AND HQP is configured
-  const isHqpZone = zone && !!zone.dsp;
+  const isHqpZone = zone?.dsp?.type === 'hqplayer';
   const shouldShowHqp = isHqpZone && hqpEnabled;
   const hqpSection = document.getElementById('hqp-section');
   const wasHidden = hqpSection.classList.contains('hidden');
@@ -826,6 +826,7 @@ async function ctrl(action, value) {
 async function loadHqpStatus() {
   try {
     const res = await fetch('/hqp/status');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     hqpEnabled = data.enabled;  // Cache for zone display visibility
     if (data.enabled) {
@@ -835,9 +836,14 @@ async function loadHqpStatus() {
       document.getElementById('hqp-status').className = data.connected ? 'success' : 'error';
       loadHqpProfiles(data.configName);
       loadHqpPipeline();
+    } else {
+      document.getElementById('hqp-not-configured').classList.remove('hidden');
+      document.getElementById('hqp-configured').classList.add('hidden');
     }
   } catch (e) {
     hqpEnabled = false;
+    document.getElementById('hqp-not-configured').classList.remove('hidden');
+    document.getElementById('hqp-configured').classList.add('hidden');
     console.error('HQPlayer status error:', e);
   }
 }
@@ -867,6 +873,7 @@ async function loadHqpProfiles(configName) {
 
 async function loadHqpPipeline() {
   const res = await fetch('/hqp/pipeline');
+  if (!res.ok) throw new Error('HTTP ' + res.status);
   const data = await res.json();
   if (!data.settings) return;
   const s = data.settings;
