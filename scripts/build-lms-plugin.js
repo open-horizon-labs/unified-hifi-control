@@ -40,6 +40,9 @@ const BUNDLE_BINARIES = process.env.LMS_BUNDLE_BINARIES === 'true';
 async function main() {
   console.log(`\nBuilding LMS plugin v${VERSION}\n`);
 
+  // Update install.xml version before archiving (it gets included in the zip)
+  updateInstallXml(VERSION);
+
   if (BUNDLE_BINARIES) {
     // Verify binaries exist (only when bundling)
     console.log('Checking binaries (bundle mode)...');
@@ -122,6 +125,26 @@ function generateSha1(filePath) {
   return crypto.createHash('sha1').update(fileBuffer).digest('hex');
 }
 
+function updateInstallXml(version) {
+  const installPath = path.join(LMS_PLUGIN_SRC, 'install.xml');
+
+  if (!fs.existsSync(installPath)) {
+    console.log('Note: install.xml not found, skipping version update');
+    return;
+  }
+
+  let content = fs.readFileSync(installPath, 'utf8');
+
+  // Update version element
+  content = content.replace(
+    /<version>[^<]+<\/version>/,
+    `<version>${version}</version>`
+  );
+
+  fs.writeFileSync(installPath, content);
+  console.log('  ✓ Updated install.xml version');
+}
+
 function updateRepoXml(version, sha1) {
   const repoPath = path.join(LMS_PLUGIN_SRC, 'repo.xml');
 
@@ -132,10 +155,10 @@ function updateRepoXml(version, sha1) {
 
   let content = fs.readFileSync(repoPath, 'utf8');
 
-  // Update version
+  // Update plugin version (not XML declaration version)
   content = content.replace(
-    /version="[^"]+"/,
-    `version="${version}"`
+    /(<plugin[^>]*\s)version="[^"]+"/,
+    `$1version="${version}"`
   );
 
   // Update SHA
