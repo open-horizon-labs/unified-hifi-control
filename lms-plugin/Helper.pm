@@ -180,6 +180,15 @@ sub ensureBinary {
         my ($success, $error) = @_;
         if ($success) {
             chmod 0755, $binaryPath;
+
+            # macOS requires ad-hoc signing for downloaded binaries
+            my $os = Slim::Utils::OSDetect::OS();
+            if ($os eq 'mac') {
+                $log->info("Ad-hoc signing binary for macOS...");
+                system("xattr -cr '$binaryPath' 2>/dev/null");
+                system("codesign -s - '$binaryPath' 2>/dev/null");
+            }
+
             $log->info("Binary downloaded successfully: $binaryPath");
             $callback->($binaryPath) if $callback;
         } else {
