@@ -148,12 +148,14 @@
     <div class="prefDesc">
         [% "PLUGIN_UNIFIED_HIFI_KNOB_ROTATION_DESC" | string %]
     </div>
+    [% SET rot_charging = prefs.knob_rotation_charging.defined ? prefs.knob_rotation_charging : 180 %]
+    [% SET rot_battery = prefs.knob_rotation_battery.defined ? prefs.knob_rotation_battery : 0 %]
     <div class="prefValue">
         <label style="display: inline-block; width: 120px;">When charging:</label>
         <select name="pref_knob_rotation_charging" id="pref_knob_rotation_charging">
             [% FOREACH rot IN rotations %]
                 <option value="[% rot %]"
-                        [% IF (prefs.knob_rotation_charging || 180) == rot %]selected[% END %]>
+                        [% IF rot_charging == rot %]selected[% END %]>
                     [% rot %]&deg;
                 </option>
             [% END %]
@@ -163,7 +165,7 @@
         <select name="pref_knob_rotation_battery" id="pref_knob_rotation_battery">
             [% FOREACH rot IN rotations %]
                 <option value="[% rot %]"
-                        [% IF (prefs.knob_rotation_battery || 0) == rot %]selected[% END %]>
+                        [% IF rot_battery == rot %]selected[% END %]>
                     [% rot %]&deg;
                 </option>
             [% END %]

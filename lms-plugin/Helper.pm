@@ -120,19 +120,24 @@ sub start {
     # Build command line
     my @cmd = ($binary);
 
-    # Set environment variables (the Node.js app reads these)
-    $ENV{PORT} = $port;
-    $ENV{LOG_LEVEL} = $loglevel;
-    $ENV{CONFIG_DIR} = Slim::Utils::OSDetect::dirsFor('prefs');
+    # Build environment for subprocess (avoid polluting global %ENV)
+    my $configDir = Slim::Utils::OSDetect::dirsFor('prefs');
+    my $lmsPort = $Slim::Web::HTTP::localPort // 9000;
 
-    # Pass LMS connection info so bridge can auto-discover
-    my $lmsPort = $Slim::Web::HTTP::localPort || 9000;
-    $ENV{LMS_HOST} = 'localhost';
-    $ENV{LMS_PORT} = $lmsPort;
+    my %childEnv = (
+        %ENV,  # Inherit parent environment
+        PORT       => $port,
+        LOG_LEVEL  => $loglevel,
+        CONFIG_DIR => $configDir,
+        LMS_HOST   => 'localhost',
+        LMS_PORT   => $lmsPort,
+    );
 
     $log->info("Starting Unified Hi-Fi Control: $binary on port $port");
 
     eval {
+        # Use local %ENV for subprocess only
+        local %ENV = %childEnv;
         $helper = Proc::Background->new({'die_upon_destroy' => 1}, @cmd);
     };
 
@@ -188,8 +193,9 @@ sub _healthCheck {
                 $log->info("Restarting helper (attempt $restarts/" . MAX_RESTARTS . ")");
                 $class->start();
             } else {
-                $log->error("Max restarts exceeded, giving up");
-                return;
+                $log->error("Max restarts exceeded, auto-restart disabled until manual intervention");
+                # Continue health checks but don't auto-restart
+                # User can manually start via settings, which resets $restarts
             }
         } else {
             # Process is healthy, schedule restart counter reset
@@ -203,7 +209,8 @@ sub _healthCheck {
             }
         }
 
-        # Schedule next health check
+        # Always schedule next health check (even after max restarts)
+        # This allows monitoring to resume if user manually restarts
         Slim::Utils::Timers::setTimer(
             $class,
             time() + HEALTH_CHECK_INTERVAL,

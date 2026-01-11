@@ -49,15 +49,19 @@ sub handler {
     if ($params->{'saveSettings'}) {
         my $needsRestart = 0;
 
-        # Check if port changed
+        # Check if port changed (with server-side validation)
         my $newPort = $params->{'pref_port'} // 8088;
+        # Validate port range
+        $newPort = int($newPort);
+        $newPort = 8088 if $newPort < 1024 || $newPort > 65535;
+
         if ($newPort != ($prefs->get('port') // 8088)) {
             $needsRestart = 1;
         }
 
         # Check if binary changed
         my $newBin = $params->{'pref_bin'};
-        if ($newBin && $newBin ne ($prefs->get('bin') || '')) {
+        if ($newBin && $newBin ne ($prefs->get('bin') // '')) {
             $needsRestart = 1;
         }
 
@@ -85,7 +89,11 @@ sub handler {
         if ($needsRestart && Plugins::UnifiedHiFi::Helper->running()) {
             $log->info("Settings changed, restarting helper");
             Plugins::UnifiedHiFi::Helper->stop();
-            Plugins::UnifiedHiFi::Helper->start();
+            # Always attempt start after stop to ensure service is running
+            # Small delay to allow process to fully terminate
+            Slim::Utils::Timers::setTimer(undef, time() + 1, sub {
+                Plugins::UnifiedHiFi::Helper->start();
+            });
         }
     }
 

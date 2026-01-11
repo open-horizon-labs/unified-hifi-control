@@ -57,7 +57,7 @@
                         DisplayName="Unified Hi-Fi Control"
                         Description="Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer"
                         Start="auto"
-                        Account="LocalSystem"
+                        Account="NT AUTHORITY\NetworkService"
                         ErrorControl="normal"
                         Arguments="--service">
           <util:ServiceConfig FirstFailureActionType="restart"
@@ -105,7 +105,7 @@
                   Arguments="/x [ProductCode]" />
 
         <RemoveFolder Id="CleanupShortcuts" On="uninstall" />
-        <RegistryValue Root="HKCU"
+        <RegistryValue Root="HKLM"
                        Key="Software\CloudAtlas\UnifiedHiFiControl"
                        Name="installed"
                        Type="integer"

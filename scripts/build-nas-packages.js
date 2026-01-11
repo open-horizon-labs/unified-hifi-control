@@ -11,7 +11,6 @@
 const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const archiver = require('archiver');
 
 const ROOT = path.resolve(__dirname, '..');
 const DIST = path.join(ROOT, 'dist');
