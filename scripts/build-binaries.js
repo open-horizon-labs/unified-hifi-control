@@ -100,17 +100,22 @@ async function buildTarget(target, output, entryPoint, excludeSharp = false) {
 
   const outputPath = path.join(DIST, output);
 
-  // LMS builds exclude sharp (uses jpeg-js instead for pkg compatibility)
-  const ignoreFlag = excludeSharp ? '--ignore sharp' : '';
+  // LMS builds: minimal config, exclude sharp and mcp
+  // Full builds: use package.json config for all assets
+  let pkgArgs;
+  if (excludeSharp) {
+    // LMS build - minimal, just include src/**/*.js
+    pkgArgs = `"${entryPoint}" --target ${target} --output "${outputPath}" --ignore sharp --ignore mcp`;
+  } else {
+    // Full build - use package.json config for assets
+    pkgArgs = `"${entryPoint}" --target ${target} --output "${outputPath}" --config package.json`;
+  }
 
   try {
-    execSync(
-      `npx pkg "${entryPoint}" --target ${target} --output "${outputPath}" --config package.json ${ignoreFlag}`,
-      {
-        cwd: ROOT,
-        stdio: 'inherit',
-      }
-    );
+    execSync(`npx pkg ${pkgArgs}`, {
+      cwd: ROOT,
+      stdio: 'inherit',
+    });
     console.log(`  ✓ ${output}\n`);
   } catch (error) {
     console.error(`  ✗ Failed to build ${output}\n`);
