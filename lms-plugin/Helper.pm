@@ -8,8 +8,8 @@ use warnings;
 
 use File::Spec::Functions qw(catfile catdir);
 use File::Path qw(make_path);
-use Proc::Background;
-use JSON;
+use JSON::XS;
+use POSIX qw(:sys_wait_h);
 
 use Slim::Utils::Log;
 use Slim::Utils::Prefs;
@@ -20,7 +20,7 @@ use Slim::Utils::Timers;
 my $log = logger('plugin.unifiedhifi');
 my $prefs = preferences('plugin.unifiedhifi');
 
-my $helper;       # Proc::Background instance
+my $helper_pid;   # PID of helper process
 my $binary;       # Path to selected binary
 my $restarts = 0; # Restart counter
 my $downloadInProgress = 0;  # Download state flag
@@ -114,6 +114,11 @@ sub pluginVersion {
         open my $fh, '<', $installXml or return '0.0.0';
         my $content = do { local $/; <$fh> };
         close $fh;
+        # Try element-based format first: <version>X.Y.Z</version>
+        if ($content =~ /<version>([^<]+)<\/version>/) {
+            return $1;
+        }
+        # Fallback to attribute-based: version="X.Y.Z"
         if ($content =~ /version="([^"]+)"/) {
             return $1;
         }
@@ -271,11 +276,24 @@ sub bin {
     return catfile($bindir, $selected);
 }
 
+# Check if helper process is alive
+sub _isAlive {
+    return 0 unless $helper_pid;
+    # Check if process exists and we can signal it
+    my $result = kill(0, $helper_pid);
+    # Also reap zombie if it died
+    if (!$result) {
+        waitpid($helper_pid, WNOHANG);
+        $helper_pid = undef;
+    }
+    return $result;
+}
+
 # Start the helper process
 sub start {
     my $class = shift;
 
-    return if $helper && $helper->alive;
+    return if _isAlive();
     return if $downloadInProgress;  # Don't start while downloading
 
     $binary = $class->bin();
@@ -306,7 +324,7 @@ sub start {
 sub _doStart {
     my ($class, $binaryPath) = @_;
 
-    return if $helper && $helper->alive;
+    return if _isAlive();
 
     my $port = $prefs->get('port') || 8088;
     my $loglevel = $prefs->get('loglevel') || 'info';
@@ -316,36 +334,49 @@ sub _doStart {
         chmod 0755, $binaryPath;
     }
 
-    # Build command line
-    my @cmd = ($binaryPath);
-
-    # Build environment for subprocess (avoid polluting global %ENV)
+    # Build environment for subprocess
     my $configDir = Slim::Utils::OSDetect::dirsFor('prefs');
     my $lmsPort = $Slim::Web::HTTP::localPort // 9000;
 
-    my %childEnv = (
-        %ENV,  # Inherit parent environment
-        PORT       => $port,
-        LOG_LEVEL  => $loglevel,
-        CONFIG_DIR => $configDir,
-        LMS_HOST   => 'localhost',
-        LMS_PORT   => $lmsPort,
-    );
-
     $log->info("Starting Unified Hi-Fi Control: $binaryPath on port $port");
 
-    eval {
-        # Use local %ENV for subprocess only
-        local %ENV = %childEnv;
-        $helper = Proc::Background->new({'die_upon_destroy' => 1}, @cmd);
-    };
+    # Fork and exec the helper process
+    my $pid = fork();
 
-    if ($@ || !$helper) {
-        $log->error("Failed to start helper: $@");
+    if (!defined $pid) {
+        $log->error("Failed to fork: $!");
         return;
     }
 
-    $binary = $binaryPath;  # Update module-level binary path
+    if ($pid == 0) {
+        # Child process
+        # Set environment variables
+        $ENV{PORT} = $port;
+        $ENV{LOG_LEVEL} = $loglevel;
+        $ENV{CONFIG_DIR} = $configDir;
+        $ENV{LMS_HOST} = 'localhost';
+        $ENV{LMS_PORT} = $lmsPort;
+
+        # Detach from parent's file handles
+        close(STDIN);
+        close(STDOUT);
+        close(STDERR);
+
+        # Start new session to fully detach
+        POSIX::setsid();
+
+        # Exec the binary
+        exec($binaryPath) or do {
+            # If exec fails, exit child
+            POSIX::_exit(1);
+        };
+    }
+
+    # Parent process
+    $helper_pid = $pid;
+    $binary = $binaryPath;
+
+    $log->info("Helper started with PID $helper_pid");
 
     # Schedule health checks
     Slim::Utils::Timers::setTimer($class, time() + HEALTH_CHECK_INTERVAL, \&_healthCheck);
@@ -360,10 +391,22 @@ sub stop {
     Slim::Utils::Timers::killTimers($class, \&_healthCheck);
     Slim::Utils::Timers::killTimers($class, \&_resetRestarts);
 
-    if ($helper && $helper->alive) {
-        $log->info("Stopping Unified Hi-Fi Control");
-        $helper->die;
-        $helper = undef;
+    if (_isAlive()) {
+        $log->info("Stopping Unified Hi-Fi Control (PID $helper_pid)");
+        kill('TERM', $helper_pid);
+        # Give it a moment to terminate gracefully
+        my $waited = 0;
+        while (_isAlive() && $waited < 5) {
+            sleep(1);
+            $waited++;
+        }
+        # Force kill if still running
+        if (_isAlive()) {
+            $log->warn("Helper did not terminate gracefully, forcing kill");
+            kill('KILL', $helper_pid);
+        }
+        waitpid($helper_pid, 0);
+        $helper_pid = undef;
     }
 
     $restarts = 0;
@@ -371,7 +414,7 @@ sub stop {
 
 # Check if running
 sub running {
-    return $helper && $helper->alive;
+    return _isAlive();
 }
 
 # Get the web UI URL
@@ -386,7 +429,7 @@ sub _healthCheck {
     my $class = shift;
 
     if ($prefs->get('autorun')) {
-        if (!$helper || !$helper->alive) {
+        if (!_isAlive()) {
             $log->warn("Helper process died unexpectedly");
 
             if ($restarts < MAX_RESTARTS) {
@@ -426,7 +469,8 @@ sub _resetRestarts {
 
 sub _pluginDataFor {
     my $key = shift;
-    return Slim::Utils::PluginManager->dataForPlugin(__PACKAGE__)->{$key};
+    my $data = Slim::Utils::PluginManager->dataForPlugin(__PACKAGE__);
+    return $data ? $data->{$key} : undef;
 }
 
 # Write knob configuration to JSON file for binary to read

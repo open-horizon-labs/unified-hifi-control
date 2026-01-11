@@ -5,7 +5,7 @@
   <version>2.5.0</version>
   <description>PLUGIN_UNIFIED_HIFI_DESC</description>
   <creator>Muness Castle</creator>
-  <email>muness@alrubaie.net</email>
+  <link>https://forums.lyrion.org/forum/user-forums/3rd-party-hardware/1804977-roon-knob-includes-lms-support</link>
   <defaultState>enabled</defaultState>
   <optionsURL>plugins/UnifiedHiFi/settings/basic.html</optionsURL>
   <targetApplication>
