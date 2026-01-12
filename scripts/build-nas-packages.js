@@ -168,56 +168,44 @@ async function buildQnapPackage(binary) {
 
   try {
     const tempDir = fs.mkdtempSync(path.join(DIST, 'qnap-'));
-    const sharedDir = path.join(tempDir, 'shared');
+    const payloadDir = path.join(tempDir, 'payload');
 
-    // Create shared directory
-    fs.mkdirSync(sharedDir, { recursive: true });
+    // Create payload directory (contents that will be installed)
+    fs.mkdirSync(payloadDir, { recursive: true });
 
     // Copy binary
-    fs.copyFileSync(binary.path, path.join(sharedDir, 'unified-hifi-control'));
-    fs.chmodSync(path.join(sharedDir, 'unified-hifi-control'), 0o755);
+    fs.copyFileSync(binary.path, path.join(payloadDir, 'unified-hifi-control'));
+    fs.chmodSync(path.join(payloadDir, 'unified-hifi-control'), 0o755);
 
     // Copy scripts from build/qnap/shared
     const qnapSharedSrc = path.join(BUILD, 'qnap', 'shared');
     const sharedFiles = fs.readdirSync(qnapSharedSrc);
     for (const file of sharedFiles) {
-      fs.copyFileSync(path.join(qnapSharedSrc, file), path.join(sharedDir, file));
-      fs.chmodSync(path.join(sharedDir, file), 0o755);
+      fs.copyFileSync(path.join(qnapSharedSrc, file), path.join(payloadDir, file));
+      fs.chmodSync(path.join(payloadDir, file), 0o755);
     }
 
-    // Copy and process qpkg.cfg
-    let cfgContent = fs.readFileSync(path.join(BUILD, 'qnap', 'qpkg.cfg'), 'utf8');
-    cfgContent = cfgContent.replace(/\{\{VERSION\}\}/g, VERSION);
-    fs.writeFileSync(path.join(tempDir, 'qpkg.cfg'), cfgContent);
+    // Create payload.tar.gz
+    const payloadTar = path.join(tempDir, 'payload.tar.gz');
+    execSync(`tar -czf "${payloadTar}" -C "${payloadDir}" .`, { stdio: 'pipe' });
 
-    // Create data.tar.gz from shared
-    const dataTar = path.join(tempDir, 'data.tar.gz');
-    execSync(`tar -czf "${dataTar}" -C "${sharedDir}" .`, { stdio: 'pipe' });
+    // Read and process header template
+    let headerContent = fs.readFileSync(path.join(BUILD, 'qnap', 'qpkg_header.sh'), 'utf8');
+    headerContent = headerContent.replace(/\{\{VERSION\}\}/g, VERSION);
+    const headerPath = path.join(tempDir, 'header.sh');
+    fs.writeFileSync(headerPath, headerContent);
 
-    // Create control.tar.gz (empty for basic packages)
-    const controlDir = path.join(tempDir, 'control');
-    fs.mkdirSync(controlDir, { recursive: true });
-    fs.writeFileSync(path.join(controlDir, 'control'), `Package: unified-hifi-control
-Version: ${VERSION}
-Architecture: ${arch}
-Maintainer: Muness Castle
-Description: Source-agnostic hi-fi control bridge
-`);
-    const controlTar = path.join(tempDir, 'control.tar.gz');
-    execSync(`tar -czf "${controlTar}" -C "${controlDir}" .`, { stdio: 'pipe' });
-
-    // Create placeholder icon
-    createPlaceholderIcon(path.join(tempDir, 'unified-hifi-control.png'), 64);
-
-    // Build QPKG
+    // Build QPKG: concatenate header + payload
+    // QPKG is a self-extracting shell script with embedded tar.gz
     const qpkgName = `unified-hifi-control_${VERSION}_${arch}.qpkg`;
     const qpkgPath = path.join(INSTALLERS, qpkgName);
 
-    // QPKG is essentially a shell script with embedded tar
-    // For simplicity, we'll create a tar archive (real QPKG needs qbuild tool)
-    execSync(`tar -cf "${qpkgPath}" -C "${tempDir}" qpkg.cfg data.tar.gz control.tar.gz unified-hifi-control.png`, {
-      stdio: 'pipe'
-    });
+    // Concatenate: header.sh + payload.tar.gz
+    const headerData = fs.readFileSync(headerPath);
+    const payloadData = fs.readFileSync(payloadTar);
+    const qpkgData = Buffer.concat([headerData, payloadData]);
+    fs.writeFileSync(qpkgPath, qpkgData);
+    fs.chmodSync(qpkgPath, 0o755);
 
     // Cleanup
     fs.rmSync(tempDir, { recursive: true });
