@@ -197,11 +197,10 @@ async function buildQnapPackage(binary) {
     // Create package_routines (empty but required by qbuild)
     fs.writeFileSync(path.join(tempDir, 'package_routines'), '#!/bin/sh\n');
 
-    // Build QPKG using Docker with qbuild
-    // qbuild is at /usr/share/qdk2/QDK/bin/qbuild in the image
+    // Build QPKG using Docker with qbuild (owncloudci/qnap-qpkg-builder - proven in production)
     // Run qbuild, copy result to /src/output, and fix permissions so host can delete
     const qpkgName = `unified-hifi-control_${VERSION}_${arch}.qpkg`;
-    const dockerCmd = `docker run --rm --platform linux/amd64 -v "${tempDir}:/src" -w /src dorowu/qdk2-build sh -c "/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build --xz ${qdkArch} && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg && rm -rf /src/build"`;
+    const dockerCmd = `docker run --rm --platform linux/amd64 -v "${tempDir}:/src" -w /src owncloudci/qnap-qpkg-builder:latest sh -c "/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build ${qdkArch} && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg && rm -rf /src/build"`;
     console.log(`  Running qbuild...`);
     execSync(dockerCmd, { stdio: 'inherit' });
 
