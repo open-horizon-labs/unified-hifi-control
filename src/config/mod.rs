@@ -71,10 +71,80 @@ fn default_mqtt_port() -> u16 {
     1883
 }
 
+/// Get config directory (XDG_CONFIG_HOME or platform default)
+pub fn get_config_dir() -> std::path::PathBuf {
+    // Check environment variable first
+    if let Ok(dir) = std::env::var("UHC_CONFIG_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home)
+                .join("Library/Application Support/unified-hifi-control");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            return std::path::PathBuf::from(xdg).join("unified-hifi-control");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(".config/unified-hifi-control");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return std::path::PathBuf::from(appdata).join("unified-hifi-control");
+        }
+    }
+
+    // Fallback to current directory
+    std::path::PathBuf::from(".")
+}
+
+/// Get data directory (XDG_DATA_HOME or platform default)
+pub fn get_data_dir() -> std::path::PathBuf {
+    // Check environment variable first
+    if let Ok(dir) = std::env::var("UHC_DATA_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home)
+                .join("Library/Application Support/unified-hifi-control");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            return std::path::PathBuf::from(xdg).join("unified-hifi-control");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home).join(".local/share/unified-hifi-control");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            return std::path::PathBuf::from(appdata).join("unified-hifi-control");
+        }
+    }
+
+    // Fallback to ./data
+    std::path::PathBuf::from("./data")
+}
+
 pub fn load_config() -> Result<Config> {
-    let config_dir = directories::ProjectDirs::from("com", "open-horizon-labs", "unified-hifi-control")
-        .map(|dirs| dirs.config_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let config_dir = get_config_dir();
 
     let config = ::config::Config::builder()
         // Start with defaults

@@ -104,9 +104,7 @@ async fn main() -> Result<()> {
     }
 
     // Initialize Knob device store
-    let data_dir = directories::ProjectDirs::from("com", "open-horizon-labs", "unified-hifi-control")
-        .map(|dirs| dirs.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    let data_dir = config::get_data_dir();
     let knob_store = knobs::KnobStore::new(data_dir);
     tracing::info!("Knob store initialized");
 
