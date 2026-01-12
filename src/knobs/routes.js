@@ -1,8 +1,8 @@
 const express = require('express');
-const sharp = require('sharp');
 const fs = require('fs');
 const path = require('path');
 const busDebug = require('../bus/debug');
+const { Jimp } = require('jimp');
 
 function extractKnob(req) {
   const headerId = req.get('x-knob-id') || req.get('x-device-id');
@@ -112,22 +112,22 @@ function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
           const targetWidth = parseInt(width) || 360;
           const targetHeight = parseInt(height) || 360;
 
-          const rgb565Buffer = await sharp(body)
-            .resize(targetWidth, targetHeight, { fit: 'cover' })
-            .removeAlpha()
-            .raw()
-            .toBuffer({ resolveWithObject: true });
+          // Use jimp (pure JS) for image processing
+          const image = await Jimp.read(body);
+          image.resize({ w: targetWidth, h: targetHeight });
 
-          const rgb888 = rgb565Buffer.data;
+          // Jimp bitmap.data is RGBA (4 bytes per pixel)
+          const rgba = image.bitmap.data;
           const rgb565 = Buffer.alloc(targetWidth * targetHeight * 2);
 
-          for (let i = 0; i < rgb888.length; i += 3) {
-            const r = rgb888[i] >> 3;
-            const g = rgb888[i + 1] >> 2;
-            const b = rgb888[i + 2] >> 3;
+          for (let i = 0; i < rgba.length; i += 4) {
+            const r = rgba[i] >> 3;
+            const g = rgba[i + 1] >> 2;
+            const b = rgba[i + 2] >> 3;
+            // Skip alpha at rgba[i + 3]
 
             const rgb565Pixel = (r << 11) | (g << 5) | b;
-            const pixelIndex = (i / 3) * 2;
+            const pixelIndex = (i / 4) * 2;
 
             rgb565[pixelIndex] = rgb565Pixel & 0xFF;
             rgb565[pixelIndex + 1] = (rgb565Pixel >> 8) & 0xFF;
@@ -158,10 +158,10 @@ function createKnobRoutes({ bus, roon, knobs, adapterFactory, logger }) {
             const targetWidth = parseInt(width) || parseInt(height) || 360;
             const targetHeight = parseInt(height) || parseInt(width) || 360;
 
-            const resizedBody = await sharp(body)
-              .resize(targetWidth, targetHeight, { fit: 'cover' })
-              .jpeg({ quality: 80, progressive: false, mozjpeg: false })
-              .toBuffer();
+            // Use jimp (pure JS) for image processing
+            const image = await Jimp.read(body);
+            image.resize({ w: targetWidth, h: targetHeight });
+            const resizedBody = await image.getBuffer('image/jpeg', { quality: 80 });
 
             log.info('Resized JPEG image', {
               originalSize: body.length,

@@ -36,8 +36,8 @@
       "package.json"
     ],
     "targets": [
-      "node18-linux-x64",
-      "node18-linux-arm64",
+      "node18-linuxstatic-x64",
+      "node18-linuxstatic-arm64",
       "node18-macos-x64",
       "node18-macos-arm64",
       "node18-win-x64"
@@ -57,6 +57,7 @@
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "express": "^5.2.1",
+    "jimp": "^1.6.0",
     "jpeg-js": "^0.4.4",
     "morgan": "^1.10.1",
     "mqtt": "^5.14.1",
@@ -67,7 +68,6 @@
     "node-roon-api-transport": "github:roonlabs/node-roon-api-transport",
     "node-soap": "^1.0.0",
     "node-ssdp": "^4.0.1",
-    "sharp": "^0.34.5",
     "upnp-mediarenderer-client": "^1.4.0",
     "xml2js": "^0.6.2",
     "xpath": "^0.0.34"

@@ -58,11 +58,13 @@ async function main() {
     process.exit(1);
   }
 
-  // Build packages for each architecture
+  // Build Synology packages for each architecture (uses binaries)
   for (const binary of binaries) {
     results.push(await buildSynologyPackage(binary));
-    results.push(await buildQnapPackage(binary));
   }
+
+  // Build single QNAP package (uses Node.js QPKG, architecture-independent)
+  results.push(await buildQnapPackage());
 
   // Summary
   console.log(`\n${'='.repeat(50)}`);
@@ -160,34 +162,37 @@ async function buildSynologyPackage(binary) {
   return result;
 }
 
-async function buildQnapPackage(binary) {
-  const arch = QNAP_ARCHS[binary.platform];
-  const qdkArch = arch === 'x86_64' ? 'x86_64' : 'arm_64';
-  const result = { name: `QNAP QPKG (${arch})`, success: false };
+async function buildQnapPackage() {
+  const result = { name: 'QNAP QPKG', success: false };
   let tempDir = null;
 
-  console.log(`Building QNAP package for ${arch} using qbuild...`);
+  // Use static binary (musl-linked, no glibc dependency)
+  const x64Binary = path.join(BINARIES, 'unified-hifi-linux-x64');
+  if (!fs.existsSync(x64Binary)) {
+    result.error = 'Linux x64 binary not found. Run npm run build:binaries first.';
+    console.error(`  ✗ QNAP: ${result.error}`);
+    return result;
+  }
+
+  console.log('Building QNAP package (static binary, x86_64)...');
 
   try {
     tempDir = fs.mkdtempSync(path.join(DIST, 'qnap-'));
 
-    // Create QDK2 directory structure
+    // Create QDK2 directory structure - shared only
     const sharedDir = path.join(tempDir, 'shared');
-    const archDir = path.join(tempDir, qdkArch);
     fs.mkdirSync(sharedDir, { recursive: true });
-    fs.mkdirSync(archDir, { recursive: true });
 
-    // Copy shared scripts
-    const qnapSharedSrc = path.join(BUILD, 'qnap', 'shared');
-    const sharedFiles = fs.readdirSync(qnapSharedSrc);
-    for (const file of sharedFiles) {
-      fs.copyFileSync(path.join(qnapSharedSrc, file), path.join(sharedDir, file));
-      fs.chmodSync(path.join(sharedDir, file), 0o755);
-    }
+    // Copy static binary
+    fs.copyFileSync(x64Binary, path.join(sharedDir, 'unified-hifi-control'));
+    fs.chmodSync(path.join(sharedDir, 'unified-hifi-control'), 0o755);
 
-    // Copy binary to arch-specific directory
-    fs.copyFileSync(binary.path, path.join(archDir, 'unified-hifi-control'));
-    fs.chmodSync(path.join(archDir, 'unified-hifi-control'), 0o755);
+    // Copy service script
+    fs.copyFileSync(
+      path.join(BUILD, 'qnap', 'shared', 'unified-hifi-control.sh'),
+      path.join(sharedDir, 'unified-hifi-control.sh')
+    );
+    fs.chmodSync(path.join(sharedDir, 'unified-hifi-control.sh'), 0o755);
 
     // Copy and process qpkg.cfg
     let cfgContent = fs.readFileSync(path.join(BUILD, 'qnap', 'qpkg.cfg'), 'utf8');
@@ -197,20 +202,19 @@ async function buildQnapPackage(binary) {
     // Create package_routines (empty but required by qbuild)
     fs.writeFileSync(path.join(tempDir, 'package_routines'), '#!/bin/sh\n');
 
-    // Build QPKG using Docker with qbuild (owncloudci/qnap-qpkg-builder - proven in production)
-    // Run qbuild, copy result to /src/output, and fix permissions so host can delete
-    const qpkgName = `unified-hifi-control_${VERSION}_${arch}.qpkg`;
-    const dockerCmd = `docker run --rm --platform linux/amd64 -v "${tempDir}:/src" -w /src owncloudci/qnap-qpkg-builder:latest sh -c "/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build ${qdkArch} && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg && rm -rf /src/build"`;
-    console.log(`  Running qbuild...`);
+    // Build QPKG using Docker with qbuild
+    const qpkgName = `unified-hifi-control_${VERSION}.qpkg`;
+    const dockerCmd = `docker run --rm --platform linux/amd64 -v "${tempDir}:/src" -w /src owncloudci/qnap-qpkg-builder:latest sh -c "/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg && rm -rf /src/build"`;
+    console.log('  Running qbuild...');
     execSync(dockerCmd, { stdio: 'inherit' });
 
-    // Find the generated QPKG file in temp dir (copied there by docker command)
+    // Find the generated QPKG file
     const qpkgFiles = fs.readdirSync(tempDir).filter(f => f.endsWith('.qpkg'));
     if (qpkgFiles.length === 0) {
       throw new Error('qbuild did not produce a QPKG file');
     }
 
-    // Copy to installers directory with our naming convention
+    // Copy to installers directory
     const qpkgPath = path.join(INSTALLERS, qpkgName);
     fs.copyFileSync(path.join(tempDir, qpkgFiles[0]), qpkgPath);
 
@@ -223,7 +227,7 @@ async function buildQnapPackage(binary) {
 
   } catch (err) {
     result.error = err.message;
-    console.error(`  ✗ QNAP (${arch}): ${err.message}`);
+    console.error(`  ✗ QNAP: ${err.message}`);
   } finally {
     // Always cleanup temp directory - use Docker to remove root-owned files
     if (tempDir && fs.existsSync(tempDir)) {

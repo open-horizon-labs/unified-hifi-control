@@ -35,9 +35,10 @@ const lmsOnly = process.argv.includes('--lms-only');
 const buildBoth = process.argv.includes('--all') || !process.argv.slice(2).length;
 
 // Platform targets and output names
+// Use linuxstatic (musl) for universal Linux compatibility (works on any glibc version)
 const FULL_TARGETS = [
-  { target: 'node18-linux-x64', output: 'unified-hifi-linux-x64' },
-  { target: 'node18-linux-arm64', output: 'unified-hifi-linux-arm64' },
+  { target: 'node18-linuxstatic-x64', output: 'unified-hifi-linux-x64' },
+  { target: 'node18-linuxstatic-arm64', output: 'unified-hifi-linux-arm64' },
   { target: 'node18-macos-x64', output: 'unified-hifi-macos-x64' },
   { target: 'node18-macos-arm64', output: 'unified-hifi-macos-arm64' },
   { target: 'node18-win-x64', output: 'unified-hifi-win-x64.exe' },
@@ -45,8 +46,8 @@ const FULL_TARGETS = [
 
 // LMS builds use same naming as GitHub releases (for on-demand download)
 const LMS_TARGETS = [
-  { target: 'node18-linux-x64', output: 'unified-hifi-linux-x86_64' },
-  { target: 'node18-linux-arm64', output: 'unified-hifi-linux-aarch64' },
+  { target: 'node18-linuxstatic-x64', output: 'unified-hifi-linux-x86_64' },
+  { target: 'node18-linuxstatic-arm64', output: 'unified-hifi-linux-aarch64' },
   { target: 'node18-macos-x64', output: 'unified-hifi-darwin-x86_64' },
   { target: 'node18-macos-arm64', output: 'unified-hifi-darwin-arm64' },
   { target: 'node18-win-x64', output: 'unified-hifi-win64.exe' },
@@ -124,11 +125,10 @@ async function buildTarget(target, output, entryPoint, excludeSharp = false) {
 }
 
 function checkNativeModules() {
-  // sharp is a native module - pkg bundles it but we need platform-specific builds
-  // The @yao-pkg/pkg handles this automatically for common native modules
-  // LMS builds don't need sharp (no image processing)
-  console.log('Note: Native modules (sharp) will be bundled for full builds.\n');
-  console.log('LMS plugin builds are minimal (no sharp, no web UI).\n');
+  // No native modules - jimp (image processing) is pure JS
+  // linuxstatic targets produce fully static binaries that work on any Linux
+  console.log('Note: Using linuxstatic targets for universal Linux compatibility.\n');
+  console.log('      Image processing uses jimp (pure JS) - no native modules.\n');
 }
 
 main().catch((err) => {

@@ -29,11 +29,11 @@ jobs:
           const path = require('path');
           fs.mkdirSync('dist/bin', { recursive: true });
           const targets = [
-            { target: 'node18-linux-x64', output: 'unified-hifi-linux-x64' },
-            { target: 'node18-linux-arm64', output: 'unified-hifi-linux-arm64' },
+            { target: 'node18-linuxstatic-x64', output: 'unified-hifi-linux-x64' },
+            { target: 'node18-linuxstatic-arm64', output: 'unified-hifi-linux-arm64' },
             { target: 'node18-win-x64', output: 'unified-hifi-win-x64.exe' },
-            { target: 'node18-linux-x64', output: 'unified-hifi-linux-x86_64', lms: true },
-            { target: 'node18-linux-arm64', output: 'unified-hifi-linux-aarch64', lms: true },
+            { target: 'node18-linuxstatic-x64', output: 'unified-hifi-linux-x86_64', lms: true },
+            { target: 'node18-linuxstatic-arm64', output: 'unified-hifi-linux-aarch64', lms: true },
             { target: 'node18-win-x64', output: 'unified-hifi-win64.exe', lms: true },
           ];
           for (const { target, output, lms } of targets) {
