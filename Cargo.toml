@@ -22,7 +22,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # HTTP client (for HQPlayer)
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "cookies"] }
+
+# Crypto/hashing
+md5 = "0.7"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+
+# Regex for HTML parsing
+regex = "1"
+
+# URL encoding/parsing
+urlencoding = "2"
+url = "2"
 
 # XML parsing (for HQPlayer protocol)
 quick-xml = { version = "0.37", features = ["serialize"] }
@@ -42,8 +55,26 @@ directories = "6"
 thiserror = "2"
 anyhow = "1"
 
+# Image processing (for knobs LCD)
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
 # Async utilities
 futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# SSDP/UPnP discovery
+ssdp-client = "2"
+
+[[bin]]
+name = "unified-hifi-control"
+path = "src/main.rs"
+
+[[bin]]
+name = "protocol-checker"
+path = "src/bin/protocol_checker.rs"
 
 [dev-dependencies]
 tokio-test = "0.4"
