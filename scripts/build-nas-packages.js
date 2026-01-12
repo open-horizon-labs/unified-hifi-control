@@ -198,7 +198,8 @@ async function buildQnapPackage(binary) {
     fs.writeFileSync(path.join(tempDir, 'package_routines'), '#!/bin/sh\n');
 
     // Build QPKG using Docker with qbuild
-    const dockerCmd = `docker run --rm -v "${tempDir}:/src" dorowu/qdk2-build qbuild --build-dir /src/build --xz ${qdkArch}`;
+    // qbuild is at /usr/share/qdk2/QDK/bin/qbuild in the image
+    const dockerCmd = `docker run --rm --platform linux/amd64 -v "${tempDir}:/src" -w /src dorowu/qdk2-build /usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build --xz ${qdkArch}`;
     console.log(`  Running: ${dockerCmd}`);
     execSync(dockerCmd, { stdio: 'inherit' });
 

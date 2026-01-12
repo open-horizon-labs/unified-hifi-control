@@ -117,7 +117,13 @@ jobs:
       - name: Verify QPKG format
         run: |
           echo "Checking QPKG format..."
-          for qpkg in dist/installers/*.qpkg; do
+          shopt -s nullglob
+          qpkg_files=(dist/installers/*.qpkg)
+          if [ ${#qpkg_files[@]} -eq 0 ]; then
+            echo "ERROR: No QPKG files found"
+            exit 1
+          fi
+          for qpkg in "${qpkg_files[@]}"; do
             echo "Verifying $qpkg..."
             # Check it starts with shebang (qbuild produces proper format)
             if ! head -c 2 "$qpkg" | grep -q '#!'; then
