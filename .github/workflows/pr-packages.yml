@@ -1,0 +1,189 @@
+name: PR Package Build
+
+on:
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux-binaries:
+    name: Build Linux/Windows Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Linux and Windows binaries
+        run: |
+          node -e "
+          const { execSync } = require('child_process');
+          const fs = require('fs');
+          fs.mkdirSync('dist/bin', { recursive: true });
+          const targets = [
+            { target: 'node18-linux-x64', output: 'unified-hifi-linux-x64' },
+            { target: 'node18-linux-arm64', output: 'unified-hifi-linux-arm64' },
+            { target: 'node18-win-x64', output: 'unified-hifi-win-x64.exe' },
+          ];
+          for (const { target, output } of targets) {
+            console.log('Building ' + output + '...');
+            execSync('npx pkg src/index.js --target ' + target + ' --output dist/bin/' + output + ' --config package.json', { stdio: 'inherit' });
+          }
+          "
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-win
+          path: dist/bin/
+          retention-days: 1
+
+  build-macos-binaries:
+    name: Build macOS Binaries
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build macOS binaries
+        run: |
+          node -e "
+          const { execSync } = require('child_process');
+          const fs = require('fs');
+          fs.mkdirSync('dist/bin', { recursive: true });
+          const targets = [
+            { target: 'node18-macos-x64', output: 'unified-hifi-macos-x64' },
+            { target: 'node18-macos-arm64', output: 'unified-hifi-macos-arm64' },
+          ];
+          for (const { target, output } of targets) {
+            console.log('Building ' + output + '...');
+            execSync('npx pkg src/index.js --target ' + target + ' --output dist/bin/' + output + ' --config package.json', { stdio: 'inherit' });
+          }
+          "
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-macos
+          path: dist/bin/
+          retention-days: 1
+
+  build-nas-packages:
+    name: Build NAS Packages
+    needs: [build-linux-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-linux-win
+          path: dist/bin/
+
+      - name: Make binaries executable
+        run: chmod +x dist/bin/*
+
+      - name: Build NAS packages
+        run: npm run build:nas
+
+      - name: Verify QPKG format
+        run: |
+          echo "Checking QPKG format..."
+          for qpkg in dist/installers/*.qpkg; do
+            echo "Verifying $qpkg..."
+            # Check it starts with shebang
+            if ! head -c 2 "$qpkg" | grep -q '#!'; then
+              echo "ERROR: $qpkg does not start with shebang"
+              exit 1
+            fi
+            # Check file type
+            file "$qpkg"
+            # Check for exit 1 marker
+            if ! grep -q "^exit 1$" "$qpkg"; then
+              echo "ERROR: $qpkg missing 'exit 1' marker"
+              exit 1
+            fi
+            echo "OK: $qpkg is valid self-extracting format"
+          done
+
+      - name: Upload NAS packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nas-packages
+          path: dist/installers/
+          retention-days: 5
+
+  build-lms-plugin:
+    name: Build LMS Plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build LMS plugin
+        run: npm run build:lms-plugin
+
+      - name: Upload LMS plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: lms-plugin
+          path: dist/lms-unified-hifi-control-*.zip
+          retention-days: 5
+
+  summary:
+    name: Build Summary
+    needs: [build-linux-binaries, build-macos-binaries, build-nas-packages, build-lms-plugin]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Display build summary
+        run: |
+          echo "## Package Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|------|" >> $GITHUB_STEP_SUMMARY
+          find artifacts -type f \( -name "*.spk" -o -name "*.qpkg" -o -name "*.zip" \) | while read f; do
+            size=$(du -h "$f" | cut -f1)
+            name=$(basename "$f")
+            echo "| $name | $size |" >> $GITHUB_STEP_SUMMARY
+          done
