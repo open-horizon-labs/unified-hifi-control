@@ -5,8 +5,10 @@ const RoonApiImage = require('node-roon-api-image');
 const fs = require('fs');
 const path = require('path');
 
+const { getDataDir } = require('../lib/paths');
+
 const VERSION = process.env.APP_VERSION || 'dev';
-const CONFIG_DIR = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+const CONFIG_DIR = getDataDir();
 const CONFIG_FILE = path.join(CONFIG_DIR, 'roon-config.json');
 
 if (!fs.existsSync(CONFIG_DIR)) {

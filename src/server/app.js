@@ -5,6 +5,7 @@ const morgan = require('morgan');
 const path = require('path');
 const { createKnobRoutes } = require('../knobs/routes');
 const { loadAppSettings, saveAppSettings } = require('../lib/settings');
+const { getDataDir } = require('../lib/paths');
 
 function createApp(opts = {}) {
   const { bus, roon, hqp, hqpInstances, hqpService, lms, knobs, adapterFactory, logger } = opts;
@@ -285,7 +286,7 @@ function createApp(opts = {}) {
     const fs = require('fs');
     const path = require('path');
     const { HQPClient } = require('../hqplayer/client');
-    const configDir = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+    const configDir = getDataDir();
     const configFile = path.join(configDir, 'hqp-config.json');
 
     // Use host as instance name
@@ -449,7 +450,7 @@ function createApp(opts = {}) {
 
     const fs = require('fs');
     const path = require('path');
-    const configDir = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+    const configDir = getDataDir();
     const configFile = path.join(configDir, 'hqp-config.json');
 
     // 2. Prepare all changes (read files, compute new state)

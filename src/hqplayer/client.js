@@ -3,9 +3,10 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { HQPNativeClient, discoverHQPlayers } = require('./native-client');
+const { getDataDir } = require('../lib/paths');
 
 const PROFILE_PATH = '/config/profile/load';
-const CONFIG_DIR = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+const CONFIG_DIR = getDataDir();
 const HQP_CONFIG_FILE = path.join(CONFIG_DIR, 'hqp-config.json');
 
 class HQPClient {

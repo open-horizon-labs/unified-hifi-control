@@ -2,6 +2,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { MAX_REDIRECTS } = require('../lib/constants');
+const { getDataDir } = require('../lib/paths');
 
 const DEFAULT_POLL_INTERVAL_MINUTES = 360; // 6 hours
 const DEFAULT_POLL_INTERVAL_MS = DEFAULT_POLL_INTERVAL_MINUTES * 60 * 1000;
@@ -19,7 +20,7 @@ function createFirmwareService({ logger, pollIntervalMs } = {}) {
   const eventListeners = [];
 
   // Config from environment
-  const CONFIG_DIR = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+  const CONFIG_DIR = getDataDir();
   const FIRMWARE_DIR = process.env.FIRMWARE_DIR || path.join(CONFIG_DIR, 'firmware');
   const GITHUB_REPO = process.env.FIRMWARE_REPO || 'muness/roon-knob';
 

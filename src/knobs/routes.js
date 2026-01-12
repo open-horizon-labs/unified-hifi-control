@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const busDebug = require('../bus/debug');
 const { Jimp } = require('jimp');
+const { getDataDir } = require('../lib/paths');
 
 function extractKnob(req) {
   const headerId = req.get('x-knob-id') || req.get('x-device-id');
@@ -1854,7 +1855,7 @@ loadAdapterSettings();
 
   // Firmware download config
   const https = require('https');
-  const CONFIG_DIR = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+  const CONFIG_DIR = getDataDir();
   const FIRMWARE_DIR = process.env.FIRMWARE_DIR || path.join(CONFIG_DIR, 'firmware');
   const GITHUB_REPO = process.env.FIRMWARE_REPO || 'muness/roon-knob';
 

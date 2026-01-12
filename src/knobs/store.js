@@ -1,10 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { getDataDir } = require('../lib/paths');
 
-// Config file path - use data directory for persistence in Docker
+// Config file path - use data directory for persistence
 function getConfigDir() {
-  return process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+  return getDataDir();
 }
 
 function getKnobsFile() {

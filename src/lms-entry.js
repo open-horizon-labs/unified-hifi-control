@@ -22,9 +22,10 @@ const { LMSClient } = require('./lms/client');
 const { createLogger } = require('./lib/logger');
 const { convertToRgb565 } = require('./knobs/rgb565');
 const { advertise } = require('./lib/mdns');
+const { getDataDir } = require('./lib/paths');
 
 const PORT = parseInt(process.env.PORT, 10) || 9199;
-const CONFIG_DIR = process.env.CONFIG_DIR || path.join(__dirname, '..', 'data');
+const CONFIG_DIR = getDataDir();
 const FIRMWARE_DIR = process.env.FIRMWARE_DIR || path.join(CONFIG_DIR, 'firmware');
 const KNOB_CONFIG_FILE = path.join(CONFIG_DIR, 'knob_config.json');
 const log = createLogger('LMS-Plugin');

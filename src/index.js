@@ -1,6 +1,7 @@
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const { getDataDir } = require('./lib/paths');
 const { createRoonClient } = require('./roon/client');
 const { createUPnPClient } = require('./upnp/client');
 const { createOpenHomeClient } = require('./openhome/client');
@@ -133,7 +134,7 @@ const knobs = createKnobsStore({
 const hqpInstances = new Map(); // instanceName -> { client, adapter }
 
 function loadHQPInstances() {
-  const CONFIG_DIR = process.env.CONFIG_DIR || path.join(__dirname, '..', 'data');
+  const CONFIG_DIR = getDataDir();
   const HQP_CONFIG_FILE = path.join(CONFIG_DIR, 'hqp-config.json');
 
   let configs = [];

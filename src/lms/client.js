@@ -10,8 +10,9 @@ const path = require('path');
 
 // Use node-fetch for pkg compatibility (native fetch doesn't work in pkg bundles)
 const fetch = require('node-fetch');
+const { getDataDir } = require('../lib/paths');
 
-const CONFIG_DIR = process.env.CONFIG_DIR || path.join(__dirname, '..', '..', 'data');
+const CONFIG_DIR = getDataDir();
 const LMS_CONFIG_FILE = path.join(CONFIG_DIR, 'lms-config.json');
 
 class LMSClient {
