@@ -89,13 +89,15 @@ mod hqplayer_integration {
         let adapter = HqpAdapter::new(bus);
 
         // Test that known actions don't error out with invalid action error
-        // (They will fail with "Not connected" but that's expected)
+        // (They will fail with "Not connected" or "not configured" but that's expected)
         let result = adapter.control("play").await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("Not connected") || err.contains("connection"),
-            "Expected connection error, got: {}",
+            err.contains("Not connected")
+                || err.contains("connection")
+                || err.contains("not configured"),
+            "Expected connection/config error, got: {}",
             err
         );
 

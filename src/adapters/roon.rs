@@ -137,6 +137,13 @@ pub struct RoonAdapter {
     bus: SharedBus,
 }
 
+/// Initial reconnection delay
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Maximum reconnection delay
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+use std::time::Duration;
+
 impl RoonAdapter {
     /// Create and start Roon adapter
     pub async fn new(bus: SharedBus) -> Result<Self> {
@@ -144,10 +151,35 @@ impl RoonAdapter {
         let state_clone = state.clone();
         let bus_clone = bus.clone();
 
-        // Spawn Roon event loop
+        // Spawn Roon event loop with reconnection logic
         tokio::spawn(async move {
-            if let Err(e) = run_roon_loop(state_clone, bus_clone).await {
-                tracing::error!("Roon event loop error: {}", e);
+            let mut retry_delay = INITIAL_RETRY_DELAY;
+
+            loop {
+                tracing::info!("Starting Roon discovery loop...");
+
+                match run_roon_loop(state_clone.clone(), bus_clone.clone()).await {
+                    Ok(()) => {
+                        tracing::info!("Roon event loop ended normally");
+                    }
+                    Err(e) => {
+                        tracing::error!("Roon event loop error: {}", e);
+                    }
+                }
+
+                // Clear state on exit
+                {
+                    let mut s = state_clone.write().await;
+                    s.connected = false;
+                    s.transport = None;
+                    s.zones.clear();
+                }
+
+                tracing::info!("Roon loop exited, reconnecting in {:?}...", retry_delay);
+                tokio::time::sleep(retry_delay).await;
+
+                // Exponential backoff up to max
+                retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
             }
         });
 

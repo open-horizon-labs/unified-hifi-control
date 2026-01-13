@@ -26,6 +26,10 @@ const DEFAULT_WEB_PORT: u16 = 8088;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROFILE_PATH: &str = "/config/profile/load";
+/// Maximum reconnection attempts before giving up
+const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+/// Delay between reconnection attempts
+const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
 /// HQPlayer state information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -190,6 +194,13 @@ pub struct HqpProfile {
     pub title: String,
 }
 
+/// Matrix profile info
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatrixProfile {
+    pub index: u32,
+    pub name: String,
+}
+
 /// Internal adapter state
 struct HqpAdapterState {
     host: Option<String>,
@@ -352,12 +363,12 @@ impl HqpAdapter {
             state.connected = true;
         }
 
-        // Get info and cache lists
-        let info = self.get_info().await?;
-        let modes = self.get_modes().await?;
-        let filters = self.get_filters().await?;
-        let shapers = self.get_shapers().await?;
-        let rates = self.get_rates().await?;
+        // Get info and cache lists (use inner methods to avoid reconnection loop)
+        let info = self.get_info_inner().await?;
+        let modes = self.get_modes_inner().await?;
+        let filters = self.get_filters_inner().await?;
+        let shapers = self.get_shapers_inner().await?;
+        let rates = self.get_rates_inner().await?;
 
         {
             let mut state = self.state.write().await;
@@ -393,8 +404,80 @@ impl HqpAdapter {
         }
     }
 
-    /// Send command and get response
+    /// Ensure connection is established, reconnecting if needed
+    pub async fn ensure_connected(&self) -> Result<()> {
+        // Check if already connected
+        {
+            let conn = self.connection.lock().await;
+            if conn.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Not connected, try to connect
+        self.connect().await
+    }
+
+    /// Mark connection as broken (called on communication errors)
+    async fn mark_disconnected(&self) {
+        let host = {
+            let mut state = self.state.write().await;
+            state.connected = false;
+            state.host.clone()
+        };
+
+        {
+            let mut conn = self.connection.lock().await;
+            *conn = None;
+        }
+
+        if let Some(ref host) = host {
+            tracing::warn!("HQPlayer connection lost to {}", host);
+        }
+    }
+
+    /// Send command and get response with auto-reconnection
     async fn send_command(&self, xml: &str) -> Result<String> {
+        let mut last_error = None;
+
+        for attempt in 0..MAX_RECONNECT_ATTEMPTS {
+            // Ensure we're connected
+            if let Err(e) = self.ensure_connected().await {
+                last_error = Some(e);
+                if attempt < MAX_RECONNECT_ATTEMPTS - 1 {
+                    tracing::debug!(
+                        "HQPlayer connection attempt {} failed, retrying...",
+                        attempt + 1
+                    );
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                }
+                continue;
+            }
+
+            // Try to send command
+            match self.send_command_inner(xml).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    // Mark as disconnected so next attempt will reconnect
+                    self.mark_disconnected().await;
+                    last_error = Some(e);
+
+                    if attempt < MAX_RECONNECT_ATTEMPTS - 1 {
+                        tracing::debug!(
+                            "HQPlayer command failed, reconnecting (attempt {})...",
+                            attempt + 1
+                        );
+                        tokio::time::sleep(RECONNECT_DELAY).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("Failed to send command after retries")))
+    }
+
+    /// Inner send command (without retry logic)
+    async fn send_command_inner(&self, xml: &str) -> Result<String> {
         let mut conn_guard = self.connection.lock().await;
         let conn = conn_guard
             .as_mut()
@@ -413,6 +496,76 @@ impl HqpAdapter {
             .map_err(|e| anyhow!("Read error: {}", e))?;
 
         Ok(response.trim().to_string())
+    }
+
+    // =========================================================================
+    // Inner methods (used during connect, no auto-reconnect to avoid recursion)
+    // =========================================================================
+
+    /// Get HQPlayer info (no reconnection)
+    async fn get_info_inner(&self) -> Result<HqpInfo> {
+        let xml = Self::build_request("GetInfo", &[]);
+        let response = self.send_command_inner(&xml).await?;
+
+        Ok(HqpInfo {
+            name: Self::parse_attr(&response, "name").unwrap_or_default(),
+            product: Self::parse_attr(&response, "product").unwrap_or_default(),
+            version: Self::parse_attr(&response, "version").unwrap_or_default(),
+            platform: Self::parse_attr(&response, "platform").unwrap_or_default(),
+            engine: Self::parse_attr(&response, "engine").unwrap_or_default(),
+        })
+    }
+
+    /// Get available modes (no reconnection)
+    async fn get_modes_inner(&self) -> Result<Vec<ListItem>> {
+        let xml = Self::build_request("GetModes", &[]);
+        let response = self.send_command_inner(&xml).await?;
+
+        Ok(Self::parse_items(&response, "ModesItem", |item| ListItem {
+            index: Self::parse_attr_u32(item, "index"),
+            name: Self::parse_attr(item, "name").unwrap_or_default(),
+            value: Self::parse_attr_u32(item, "value"),
+        }))
+    }
+
+    /// Get available filters (no reconnection)
+    async fn get_filters_inner(&self) -> Result<Vec<FilterItem>> {
+        let xml = Self::build_request("GetFilters", &[]);
+        let response = self.send_command_inner(&xml).await?;
+
+        Ok(Self::parse_items(&response, "FiltersItem", |item| {
+            FilterItem {
+                index: Self::parse_attr_u32(item, "index"),
+                name: Self::parse_attr(item, "name").unwrap_or_default(),
+                value: Self::parse_attr_u32(item, "value"),
+                arg: Self::parse_attr_u32(item, "arg"),
+            }
+        }))
+    }
+
+    /// Get available shapers (no reconnection)
+    async fn get_shapers_inner(&self) -> Result<Vec<ListItem>> {
+        let xml = Self::build_request("GetShapers", &[]);
+        let response = self.send_command_inner(&xml).await?;
+
+        Ok(Self::parse_items(&response, "ShapersItem", |item| {
+            ListItem {
+                index: Self::parse_attr_u32(item, "index"),
+                name: Self::parse_attr(item, "name").unwrap_or_default(),
+                value: Self::parse_attr_u32(item, "value"),
+            }
+        }))
+    }
+
+    /// Get available sample rates (no reconnection)
+    async fn get_rates_inner(&self) -> Result<Vec<RateItem>> {
+        let xml = Self::build_request("GetRates", &[]);
+        let response = self.send_command_inner(&xml).await?;
+
+        Ok(Self::parse_items(&response, "RatesItem", |item| RateItem {
+            index: Self::parse_attr_u32(item, "index"),
+            rate: Self::parse_attr_u32(item, "rate"),
+        }))
     }
 
     /// Build XML request
@@ -616,7 +769,9 @@ impl HqpAdapter {
         Ok(())
     }
 
-    /// Set filter
+    /// Set filter (low-level)
+    /// - value: sets the Nx (non-1x) filter
+    /// - value1x: if provided, also sets the 1x filter
     pub async fn set_filter(&self, value: u32, value1x: Option<u32>) -> Result<()> {
         let value_str = value.to_string();
         let mut attrs = vec![("value", value_str.as_str())];
@@ -628,6 +783,22 @@ impl HqpAdapter {
         let xml = Self::build_request("SetFilter", &attrs);
         self.send_command(&xml).await?;
         Ok(())
+    }
+
+    /// Set only the 1x filter, preserving current Nx filter value
+    pub async fn set_filter_1x(&self, value: u32) -> Result<()> {
+        // Get current state to preserve Nx filter
+        let state = self.get_state().await?;
+        let current_nx = state.filter_nx.unwrap_or(state.filter);
+        self.set_filter(current_nx, Some(value)).await
+    }
+
+    /// Set only the Nx filter, preserving current 1x filter value
+    pub async fn set_filter_nx(&self, value: u32) -> Result<()> {
+        // Get current state to preserve 1x filter
+        let state = self.get_state().await?;
+        let current_1x = state.filter1x.unwrap_or(state.filter);
+        self.set_filter(value, Some(current_1x)).await
     }
 
     /// Set shaper
@@ -1262,5 +1433,46 @@ impl HqpAdapter {
     /// Check if profiles are supported (Embedded + web creds)
     pub async fn supports_profiles(&self) -> bool {
         self.is_embedded().await && self.has_web_credentials().await
+    }
+
+    // =========================================================================
+    // Matrix profile methods (native TCP protocol)
+    // =========================================================================
+
+    /// Get available matrix profiles
+    pub async fn get_matrix_profiles(&self) -> Result<Vec<MatrixProfile>> {
+        let xml = Self::build_request("MatrixListProfiles", &[]);
+        let response = self.send_command(&xml).await?;
+
+        Ok(Self::parse_items(&response, "MatrixProfile", |item| {
+            MatrixProfile {
+                index: Self::parse_attr_u32(item, "index"),
+                name: Self::parse_attr(item, "name").unwrap_or_default(),
+            }
+        }))
+    }
+
+    /// Get current matrix profile
+    pub async fn get_matrix_profile(&self) -> Result<Option<MatrixProfile>> {
+        let xml = Self::build_request("MatrixGetProfile", &[]);
+        let response = self.send_command(&xml).await?;
+
+        // HQPlayer returns current profile - try both 'value' (as per Node.js reference)
+        // and 'name' attribute for compatibility
+        let index = Self::parse_attr_u32(&response, "index");
+        let name = Self::parse_attr(&response, "value")
+            .or_else(|| Self::parse_attr(&response, "name"));
+
+        match name {
+            Some(n) if !n.is_empty() => Ok(Some(MatrixProfile { index, name: n })),
+            _ => Ok(None),
+        }
+    }
+
+    /// Set matrix profile by index
+    pub async fn set_matrix_profile(&self, value: u32) -> Result<()> {
+        let xml = Self::build_request("MatrixSetProfile", &[("value", &value.to_string())]);
+        self.send_command(&xml).await?;
+        Ok(())
     }
 }

@@ -7,6 +7,7 @@
 use crate::bus::{BusEvent, SharedBus};
 use futures::StreamExt;
 use quick_xml::de::from_str as xml_from_str;
+use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use ssdp_client::{SearchTarget, URN};
@@ -541,14 +542,20 @@ impl UPnPAdapter {
         Ok(response.text().await?)
     }
 
+    /// Extract XML value, handling optional namespace prefixes (e.g., <u:Volume> or <Volume>)
     fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
-        let start_tag = format!("<{}>", tag);
-        let end_tag = format!("</{}>", tag);
+        // Build regex pattern to match tag with optional namespace prefix and attributes
+        // Matches: <prefix:tag attr="...">value</prefix:tag> or <tag attr="...">value</tag>
+        let pattern = format!(
+            r"<(?:[^:>]+:)?{}\b[^>]*>([^<]*)</(?:[^:>]+:)?{}>",
+            regex::escape(tag),
+            regex::escape(tag)
+        );
 
-        let start = xml.find(&start_tag)? + start_tag.len();
-        let end = xml[start..].find(&end_tag)? + start;
-
-        Some(xml[start..end].to_string())
+        let re = Regex::new(&pattern).ok()?;
+        re.captures(xml)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
     }
 
     /// Stop discovery

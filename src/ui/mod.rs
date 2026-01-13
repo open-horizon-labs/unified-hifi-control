@@ -455,14 +455,6 @@ async function loadLmsPlayers() {
                 </footer>
             </article>
         `).join('') + '</div>';
-        // Attach click handlers via event delegation
-        document.getElementById('lms-grid').addEventListener('click', e => {
-            const btn = e.target.closest('button[data-action]');
-            if (!btn) return;
-            const container = btn.closest('[data-player-id]');
-            if (!container) return;
-            lmsControl(container.dataset.playerId, btn.dataset.action);
-        });
     } catch (e) {
         section.removeAttribute('aria-busy');
         section.innerHTML = `<p class="status-err">Error: ${esc(e.message)}</p>`;
@@ -479,6 +471,15 @@ async function lmsControl(playerId, action) {
         setTimeout(loadLmsPlayers, 300);
     } catch (e) { console.error(e); }
 }
+
+// Event delegation for LMS player controls (runs once, not per-refresh)
+document.querySelector('#lms-players').addEventListener('click', e => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const container = btn.closest('[data-player-id]');
+    if (!container) return;
+    lmsControl(container.dataset.playerId, btn.dataset.action);
+});
 
 loadLmsStatus();
 loadLmsPlayers();

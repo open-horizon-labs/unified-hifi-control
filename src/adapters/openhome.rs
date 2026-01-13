@@ -32,6 +32,7 @@ pub struct OpenHomeDevice {
     pub location: String,
     pub state: String,
     pub volume: Option<i32>,
+    pub muted: bool,
     pub track_info: Option<TrackInfo>,
     #[serde(skip)]
     pub last_seen: std::time::Instant,
@@ -235,6 +236,7 @@ impl OpenHomeAdapter {
                 location: location.clone(),
                 state: "stopped".to_string(),
                 volume: None,
+                muted: false,
                 track_info: None,
                 last_seen: std::time::Instant::now(),
                 last_track_uri: None,
@@ -421,6 +423,26 @@ impl OpenHomeAdapter {
             }
         }
 
+        // Poll mute state
+        let mute = Self::soap_call(
+            http,
+            &format!("{}/Volume", base_url),
+            "urn:av-openhome-org:service:Volume:1",
+            "Mute",
+            "",
+        )
+        .await;
+
+        if let Ok(response) = mute {
+            if let Some(mute_str) = Self::extract_xml_value(&response, "Value") {
+                let is_muted = mute_str == "true" || mute_str == "1";
+                let mut s = state.write().await;
+                if let Some(device) = s.devices.get_mut(uuid) {
+                    device.muted = is_muted;
+                }
+            }
+        }
+
         // Poll track info
         let track = Self::soap_call(
             http,
@@ -592,7 +614,7 @@ impl OpenHomeAdapter {
                         vol_type: "number".to_string(),
                         min: 0,
                         max: 100,
-                        is_muted: false,
+                        is_muted: d.muted,
                     }),
                 }
             })

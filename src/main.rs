@@ -11,6 +11,7 @@ use axum::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::signal;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -117,14 +118,14 @@ async fn main() -> Result<()> {
     let knob_store = knobs::KnobStore::new(data_dir);
     tracing::info!("Knob store initialized");
 
-    // Build application state
+    // Build application state (clone Arcs so we can access adapters for shutdown)
     let state = api::AppState::new(
         roon,
         hqplayer,
-        lms,
-        mqtt,
-        openhome,
-        upnp,
+        lms.clone(),
+        mqtt.clone(),
+        openhome.clone(),
+        upnp.clone(),
         knob_store,
         bus.clone(),
     );
@@ -147,6 +148,15 @@ async fn main() -> Result<()> {
         .route("/hqplayer/setting", post(api::hqp_setting_handler))
         .route("/hqplayer/profiles", get(api::hqp_profiles_handler))
         .route("/hqplayer/profile", post(api::hqp_load_profile_handler))
+        // HQPlayer Matrix profile routes
+        .route(
+            "/hqplayer/matrix/profiles",
+            get(api::hqp_matrix_profiles_handler),
+        )
+        .route(
+            "/hqplayer/matrix/profile",
+            post(api::hqp_set_matrix_profile_handler),
+        )
         // LMS routes
         .route("/lms/status", get(api::lms_status_handler))
         .route("/lms/players", get(api::lms_players_handler))
@@ -193,12 +203,47 @@ async fn main() -> Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    // Start server
+    // Start server with graceful shutdown
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     tracing::info!("Listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Cleanup: stop adapters
+    tracing::info!("Shutting down adapters...");
+    lms.stop().await;
+    mqtt.stop().await;
+    openhome.stop().await;
+    upnp.stop().await;
+    tracing::info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Wait for shutdown signal (Ctrl+C or SIGTERM)
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("Received Ctrl+C, shutting down..."),
+        _ = terminate => tracing::info!("Received SIGTERM, shutting down..."),
+    }
 }

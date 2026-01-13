@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::bus::{BusEvent, SharedBus};
 
@@ -52,6 +53,7 @@ pub struct MqttAdapter {
     state: Arc<RwLock<MqttState>>,
     client: Arc<RwLock<Option<AsyncClient>>>,
     bus: SharedBus,
+    shutdown: CancellationToken,
 }
 
 impl MqttAdapter {
@@ -60,6 +62,7 @@ impl MqttAdapter {
             state: Arc::new(RwLock::new(MqttState::default())),
             client: Arc::new(RwLock::new(None)),
             bus,
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -144,56 +147,69 @@ impl MqttAdapter {
         let state = self.state.clone();
         let bus = self.bus.clone();
         let prefix = topic_prefix.clone();
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             loop {
-                match eventloop.poll().await {
-                    Ok(Event::Incoming(Incoming::Publish(publish))) => {
-                        // Handle incoming control messages
-                        let topic = publish.topic.clone();
-                        let payload = String::from_utf8_lossy(&publish.payload).to_string();
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("MQTT event loop shutting down");
+                        break;
+                    }
+                    result = eventloop.poll() => {
+                        match result {
+                            Ok(Event::Incoming(Incoming::Publish(publish))) => {
+                                // Handle incoming control messages
+                                let topic = publish.topic.clone();
+                                let payload = String::from_utf8_lossy(&publish.payload).to_string();
 
-                        if topic.ends_with("/control") {
-                            // Parse zone_id from topic: prefix/zone_id/control
-                            let parts: Vec<&str> = topic.split('/').collect();
-                            if parts.len() >= 2 {
-                                let zone_id = parts[parts.len() - 2].to_string();
+                                if topic.ends_with("/control") {
+                                    // Parse zone_id from topic: prefix/zone_id/control
+                                    let parts: Vec<&str> = topic.split('/').collect();
+                                    if parts.len() >= 2 {
+                                        let zone_id = parts[parts.len() - 2].to_string();
 
-                                // Try to parse as JSON
-                                if let Ok(cmd) = serde_json::from_str::<Value>(&payload) {
-                                    let action = cmd
-                                        .get("action")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("play_pause")
-                                        .to_string();
-                                    let value = cmd.get("value").cloned();
+                                        // Try to parse as JSON
+                                        if let Ok(cmd) = serde_json::from_str::<Value>(&payload) {
+                                            let action = cmd
+                                                .get("action")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("play_pause")
+                                                .to_string();
+                                            let value = cmd.get("value").cloned();
 
-                                    bus.publish(BusEvent::ControlCommand {
-                                        zone_id,
-                                        action,
-                                        value,
-                                    });
+                                            bus.publish(BusEvent::ControlCommand {
+                                                zone_id,
+                                                action,
+                                                value,
+                                            });
+                                        }
+                                    }
                                 }
                             }
+                            Ok(Event::Incoming(Incoming::ConnAck(ack))) => {
+                                tracing::info!("MQTT connected (code: {:?})", ack.code);
+                                let mut state = state.write().await;
+                                state.connected = true;
+                            }
+                            Ok(Event::Incoming(Incoming::Disconnect)) => {
+                                tracing::warn!("MQTT disconnected");
+                                let mut state = state.write().await;
+                                state.connected = false;
+                            }
+                            Err(e) => {
+                                tracing::error!("MQTT error: {}", e);
+                                let mut state = state.write().await;
+                                state.connected = false;
+                                // Check shutdown before sleeping
+                                tokio::select! {
+                                    _ = shutdown.cancelled() => break,
+                                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    Ok(Event::Incoming(Incoming::ConnAck(ack))) => {
-                        tracing::info!("MQTT connected (code: {:?})", ack.code);
-                        let mut state = state.write().await;
-                        state.connected = true;
-                    }
-                    Ok(Event::Incoming(Incoming::Disconnect)) => {
-                        tracing::warn!("MQTT disconnected");
-                        let mut state = state.write().await;
-                        state.connected = false;
-                    }
-                    Err(e) => {
-                        tracing::error!("MQTT error: {}", e);
-                        let mut state = state.write().await;
-                        state.connected = false;
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
-                    _ => {}
                 }
             }
         });
@@ -202,19 +218,29 @@ impl MqttAdapter {
         let client_clone = self.client.clone();
         let bus_clone = self.bus.clone();
         let prefix_clone = topic_prefix.clone();
+        let shutdown2 = self.shutdown.clone();
 
         tokio::spawn(async move {
             let mut rx = bus_clone.subscribe();
 
             loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        if let Some(client) = client_clone.read().await.as_ref() {
-                            let _ = Self::publish_event(client, &prefix_clone, &event).await;
-                        }
+                tokio::select! {
+                    _ = shutdown2.cancelled() => {
+                        tracing::info!("MQTT bus forwarder shutting down");
+                        break;
                     }
-                    Err(_) => {
-                        // Channel lagged, skip
+                    result = rx.recv() => {
+                        match result {
+                            Ok(event) => {
+                                // Check if client is still connected before publishing
+                                if let Some(client) = client_clone.read().await.as_ref() {
+                                    let _ = Self::publish_event(client, &prefix_clone, &event).await;
+                                }
+                            }
+                            Err(_) => {
+                                // Channel lagged or closed, continue
+                            }
+                        }
                     }
                 }
             }
@@ -368,6 +394,10 @@ impl MqttAdapter {
 
     /// Stop MQTT connection
     pub async fn stop(&self) {
+        // Cancel background tasks first
+        self.shutdown.cancel();
+
+        // Then disconnect client
         let mut client = self.client.write().await;
         if let Some(c) = client.take() {
             let _ = c.disconnect().await;
@@ -375,6 +405,8 @@ impl MqttAdapter {
 
         let mut state = self.state.write().await;
         state.connected = false;
+
+        tracing::info!("MQTT adapter stopped");
     }
 
     /// Publish a message

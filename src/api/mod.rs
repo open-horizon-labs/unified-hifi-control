@@ -280,9 +280,9 @@ pub async fn hqp_setting_handler(
 ) -> impl IntoResponse {
     let result = match req.name.as_str() {
         "mode" => state.hqplayer.set_mode(req.value).await,
-        "filter" => state.hqplayer.set_filter(req.value, None).await,
-        "filter1x" => state.hqplayer.set_filter(req.value, Some(req.value)).await, // Sets both, value1x specifically
-        "filterNx" => state.hqplayer.set_filter(req.value, None).await, // Sets only Nx filter
+        "filter" => state.hqplayer.set_filter(req.value, Some(req.value)).await, // Sets both 1x and Nx
+        "filter1x" => state.hqplayer.set_filter_1x(req.value).await, // Sets only 1x, preserves Nx
+        "filterNx" | "filternx" => state.hqplayer.set_filter_nx(req.value).await, // Sets only Nx, preserves 1x
         "shaper" => state.hqplayer.set_shaper(req.value).await,
         "samplerate" | "rate" => state.hqplayer.set_rate(req.value).await,
         _ => Err(anyhow::anyhow!("Unknown setting: {}", req.name)),
@@ -326,6 +326,53 @@ pub async fn hqp_load_profile_handler(
     Json(req): Json<HqpProfileRequest>,
 ) -> impl IntoResponse {
     match state.hqplayer.load_profile(&req.profile).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /hqplayer/matrix/profiles - Get matrix profiles and current selection
+pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let profiles = state.hqplayer.get_matrix_profiles().await;
+    let current = state.hqplayer.get_matrix_profile().await;
+
+    match (profiles, current) {
+        (Ok(profiles), Ok(current)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "profiles": profiles,
+                "current": current
+            })),
+        )
+            .into_response(),
+        (Err(e), _) | (_, Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Matrix profile request
+#[derive(Deserialize)]
+pub struct HqpMatrixProfileRequest {
+    pub profile: u32,
+}
+
+/// POST /hqplayer/matrix/profile - Set matrix profile
+pub async fn hqp_set_matrix_profile_handler(
+    State(state): State<AppState>,
+    Json(req): Json<HqpMatrixProfileRequest>,
+) -> impl IntoResponse {
+    match state.hqplayer.set_matrix_profile(req.profile).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

@@ -515,6 +515,120 @@ fn generate_example(schema_type: &str) {
             );
             return;
         }
+        "hqp-status" => serde_json::json!({
+            "connected": true,
+            "host": "192.168.1.100",
+            "port": 4321,
+            "info": {
+                "name": "HQPlayer",
+                "product": "HQPlayer Embedded",
+                "version": "5.0.0",
+                "platform": "Linux",
+                "engine": "CUDA"
+            }
+        }),
+        "hqp-pipeline" => serde_json::json!({
+            "status": {
+                "state": "Playing",
+                "mode": "PCM",
+                "active_mode": "PCM",
+                "active_filter": "poly-sinc-gauss-hires-lp",
+                "active_shaper": "NS5",
+                "active_rate": 705600,
+                "convolution": false,
+                "invert": false
+            },
+            "volume": {
+                "value": -12,
+                "min": -60,
+                "max": 0,
+                "is_fixed": false
+            },
+            "settings": {
+                "mode": {
+                    "selected": { "value": "0", "label": "PCM" },
+                    "options": [
+                        { "value": "0", "label": "PCM" },
+                        { "value": "1", "label": "SDM" }
+                    ]
+                },
+                "filter1x": {
+                    "selected": { "value": "5", "label": "poly-sinc-gauss-hires-lp" },
+                    "options": []
+                },
+                "filter_nx": {
+                    "selected": { "value": "5", "label": "poly-sinc-gauss-hires-lp" },
+                    "options": []
+                },
+                "shaper": {
+                    "selected": { "value": "3", "label": "NS5" },
+                    "options": []
+                },
+                "samplerate": {
+                    "selected": { "value": "0", "label": "Auto" },
+                    "options": []
+                }
+            }
+        }),
+        "hqp-profiles" => serde_json::json!([
+            { "value": "DSD_512", "title": "DSD 512" },
+            { "value": "PCM_768", "title": "PCM 768kHz" },
+            { "value": "Default", "title": "Default Settings" }
+        ]),
+        "lms-status" => serde_json::json!({
+            "connected": true,
+            "host": "192.168.1.50",
+            "port": 9000,
+            "server_version": "8.3.0",
+            "player_count": 2
+        }),
+        "lms-player" => serde_json::json!({
+            "player_id": "aa:bb:cc:dd:ee:ff",
+            "name": "Kitchen Squeezebox",
+            "state": "playing",
+            "mode": "play",
+            "power": true,
+            "volume": 65,
+            "muted": false,
+            "current_title": "Autumn Leaves",
+            "artist": "Bill Evans",
+            "album": "Portrait in Jazz",
+            "duration": 291.0,
+            "time": 45.5,
+            "artwork_url": "http://192.168.1.50:9000/music/12345/cover.jpg"
+        }),
+        "lms-players" => serde_json::json!([
+            {
+                "player_id": "aa:bb:cc:dd:ee:ff",
+                "name": "Kitchen Squeezebox",
+                "state": "playing",
+                "mode": "play",
+                "power": true,
+                "volume": 65,
+                "muted": false,
+                "current_title": "Autumn Leaves",
+                "artist": "Bill Evans",
+                "album": null,
+                "duration": null,
+                "time": null,
+                "artwork_url": null
+            },
+            {
+                "player_id": "11:22:33:44:55:66",
+                "name": "Bedroom Radio",
+                "state": "stopped",
+                "mode": "stop",
+                "power": false,
+                "volume": 40,
+                "muted": false,
+                "current_title": null,
+                "artist": null,
+                "album": null,
+                "duration": null,
+                "time": null,
+                "artwork_url": null
+            }
+        ]),
         _ => {
             eprintln!("Unknown schema type: {}", schema_type);
             eprintln!("Run 'protocol_checker list-types' to see supported types");

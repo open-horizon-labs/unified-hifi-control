@@ -623,6 +623,160 @@ mod bus_event_schema {
 // Contract Tests - Ensure JSON matches what clients expect
 // ============================================================================
 
+// ============================================================================
+// HQPlayer Schema Types
+// ============================================================================
+
+/// MatrixProfile schema - returned by GET /hqplayer/matrix/profiles
+#[derive(Debug, Deserialize)]
+struct MatrixProfile {
+    index: u32,
+    name: String,
+}
+
+/// MatrixProfilesResponse schema - GET /hqplayer/matrix/profiles
+#[derive(Debug, Deserialize)]
+struct MatrixProfilesResponse {
+    profiles: Vec<MatrixProfile>,
+    current: Option<MatrixProfile>,
+}
+
+/// HqpMatrixProfileRequest schema - POST /hqplayer/matrix/profile body
+#[derive(Debug, Serialize, Deserialize)]
+struct HqpMatrixProfileRequest {
+    profile: u32,
+}
+
+mod hqp_matrix_schema {
+    use super::*;
+
+    #[test]
+    fn validates_matrix_profile() {
+        let json = json!({
+            "index": 0,
+            "name": "Default"
+        });
+
+        let result: Result<MatrixProfile, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "MatrixProfile should deserialize: {:?}",
+            result.err()
+        );
+
+        let profile = result.unwrap();
+        assert_eq!(profile.index, 0);
+        assert_eq!(profile.name, "Default");
+    }
+
+    #[test]
+    fn validates_matrix_profiles_response_with_current() {
+        let json = json!({
+            "profiles": [
+                {"index": 0, "name": "Default"},
+                {"index": 1, "name": "Night Mode"},
+                {"index": 2, "name": "Movies"}
+            ],
+            "current": {"index": 1, "name": "Night Mode"}
+        });
+
+        let result: Result<MatrixProfilesResponse, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "MatrixProfilesResponse should deserialize: {:?}",
+            result.err()
+        );
+
+        let response = result.unwrap();
+        assert_eq!(response.profiles.len(), 3);
+        assert!(response.current.is_some());
+        assert_eq!(response.current.unwrap().index, 1);
+    }
+
+    #[test]
+    fn validates_matrix_profiles_response_no_current() {
+        let json = json!({
+            "profiles": [
+                {"index": 0, "name": "Default"}
+            ],
+            "current": null
+        });
+
+        let result: Result<MatrixProfilesResponse, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "MatrixProfilesResponse with null current should deserialize: {:?}",
+            result.err()
+        );
+
+        let response = result.unwrap();
+        assert_eq!(response.profiles.len(), 1);
+        assert!(response.current.is_none());
+    }
+
+    #[test]
+    fn validates_matrix_profiles_response_empty() {
+        let json = json!({
+            "profiles": [],
+            "current": null
+        });
+
+        let result: Result<MatrixProfilesResponse, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "Empty MatrixProfilesResponse should deserialize: {:?}",
+            result.err()
+        );
+
+        let response = result.unwrap();
+        assert!(response.profiles.is_empty());
+    }
+
+    #[test]
+    fn validates_set_matrix_profile_request() {
+        let json = json!({
+            "profile": 2
+        });
+
+        let result: Result<HqpMatrixProfileRequest, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "HqpMatrixProfileRequest should deserialize: {:?}",
+            result.err()
+        );
+
+        let req = result.unwrap();
+        assert_eq!(req.profile, 2);
+    }
+
+    #[test]
+    fn serializes_set_matrix_profile_request() {
+        let request = HqpMatrixProfileRequest { profile: 5 };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["profile"], 5);
+    }
+
+    #[test]
+    fn rejects_invalid_matrix_profile_request() {
+        // Missing required field
+        let json = json!({});
+
+        let result: Result<HqpMatrixProfileRequest, _> = serde_json::from_value(json);
+        assert!(result.is_err(), "Should reject missing profile field");
+    }
+
+    #[test]
+    fn rejects_string_profile_index() {
+        let json = json!({
+            "profile": "invalid"
+        });
+
+        let result: Result<HqpMatrixProfileRequest, _> = serde_json::from_value(json);
+        assert!(result.is_err(), "Should reject string profile index");
+    }
+}
+
 mod contract_tests {
     use super::*;
 

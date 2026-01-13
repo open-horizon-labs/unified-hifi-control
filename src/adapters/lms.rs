@@ -304,13 +304,11 @@ impl LmsAdapter {
             .get("coverid")
             .or_else(|| playlist_loop.get("artwork_track_id"))
             .or_else(|| playlist_loop.get("id"))
-            .and_then(|v| v.as_str().or_else(|| v.as_i64().map(|_| "")))
-            .map(|s| s.to_string())
-            .or_else(|| {
-                playlist_loop
-                    .get("coverid")
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n.to_string())
+            .and_then(|v| {
+                // Try string first, then try numeric conversion
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
             });
 
         Ok(LmsPlayer {
