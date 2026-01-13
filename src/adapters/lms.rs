@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 
 use crate::bus::{BusEvent, SharedBus};
 
@@ -115,6 +116,7 @@ pub struct LmsAdapter {
     state: Arc<RwLock<LmsState>>,
     client: Client,
     bus: SharedBus,
+    shutdown: CancellationToken,
 }
 
 impl LmsAdapter {
@@ -126,6 +128,7 @@ impl LmsAdapter {
                 .build()
                 .expect("Failed to create HTTP client"),
             bus,
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -382,24 +385,26 @@ impl LmsAdapter {
         let state = self.state.clone();
         let bus = self.bus.clone();
         let adapter = self.clone_for_polling();
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             let mut poll_interval = interval(POLL_INTERVAL);
 
             loop {
-                poll_interval.tick().await;
-
-                // Check if we should stop
-                let connected = { state.read().await.connected };
-                if !connected {
-                    tracing::info!("LMS polling stopped");
-                    break;
-                }
-
-                if let Err(e) = adapter.update_players().await {
-                    tracing::error!("Failed to update LMS players: {}", e);
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("LMS polling shutting down");
+                        break;
+                    }
+                    _ = poll_interval.tick() => {
+                        if let Err(e) = adapter.update_players().await {
+                            tracing::error!("Failed to update LMS players: {}", e);
+                        }
+                    }
                 }
             }
+
+            tracing::info!("LMS polling stopped");
         });
 
         Ok(())
@@ -453,14 +458,27 @@ impl LmsAdapter {
             { self.state.read().await.players.keys().cloned().collect() };
 
         if previous_ids != current_ids {
-            // Log zone changes for debugging (events emitted via bus on player state change)
-            let added: Vec<_> = current_ids.difference(&previous_ids).collect();
-            let removed: Vec<_> = previous_ids.difference(&current_ids).collect();
-            if !added.is_empty() {
-                tracing::debug!("LMS players added: {:?}", added);
+            let added: Vec<_> = current_ids.difference(&previous_ids).cloned().collect();
+            let removed: Vec<_> = previous_ids.difference(&current_ids).cloned().collect();
+
+            // Emit zone added events
+            for player_id in &added {
+                if let Some(player) = self.state.read().await.players.get(player_id) {
+                    tracing::debug!("LMS player added: {}", player_id);
+                    self.bus.publish(BusEvent::ZoneUpdated {
+                        zone_id: format!("lms:{}", player_id),
+                        display_name: player.name.clone(),
+                        state: player.state.clone(),
+                    });
+                }
             }
-            if !removed.is_empty() {
-                tracing::debug!("LMS players removed: {:?}", removed);
+
+            // Emit zone removed events
+            for player_id in &removed {
+                tracing::debug!("LMS player removed: {}", player_id);
+                self.bus.publish(BusEvent::ZoneRemoved {
+                    zone_id: format!("lms:{}", player_id),
+                });
             }
         }
 
@@ -469,6 +487,9 @@ impl LmsAdapter {
 
     /// Stop polling
     pub async fn stop(&self) {
+        // Cancel background tasks first
+        self.shutdown.cancel();
+
         let host = {
             let mut state = self.state.write().await;
             state.connected = false;

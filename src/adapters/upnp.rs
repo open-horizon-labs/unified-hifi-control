@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 
 const MEDIA_RENDERER_URN: &str = "urn:schemas-upnp-org:device:MediaRenderer:1";
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
@@ -109,6 +110,7 @@ pub struct UPnPAdapter {
     state: Arc<RwLock<UPnPState>>,
     bus: SharedBus,
     http: Client,
+    shutdown: CancellationToken,
 }
 
 impl UPnPAdapter {
@@ -124,6 +126,7 @@ impl UPnPAdapter {
                 .timeout(SOAP_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -141,44 +144,50 @@ impl UPnPAdapter {
         let state = self.state.clone();
         let bus = self.bus.clone();
         let http = self.http.clone();
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
-            Self::discovery_loop(state.clone(), bus.clone(), http.clone()).await;
+            Self::discovery_loop(state.clone(), bus.clone(), http.clone(), shutdown).await;
         });
 
         // Spawn polling task
         let state = self.state.clone();
         let bus = self.bus.clone();
         let http = self.http.clone();
+        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
-            Self::poll_loop(state, bus, http).await;
+            Self::poll_loop(state, bus, http, shutdown).await;
         });
 
         tracing::info!("UPnP adapter started");
         Ok(())
     }
 
-    async fn discovery_loop(state: Arc<RwLock<UPnPState>>, bus: SharedBus, http: Client) {
+    async fn discovery_loop(
+        state: Arc<RwLock<UPnPState>>,
+        bus: SharedBus,
+        http: Client,
+        shutdown: CancellationToken,
+    ) {
         let mut search_interval = interval(SSDP_SEARCH_INTERVAL);
 
         loop {
-            search_interval.tick().await;
-
-            {
-                let s = state.read().await;
-                if !s.running {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::info!("UPnP discovery loop shutting down");
                     break;
                 }
-            }
+                _ = search_interval.tick() => {
+                    // Perform SSDP search
+                    if let Err(e) = Self::perform_search(&state, &bus, &http).await {
+                        tracing::warn!("SSDP search failed: {}", e);
+                    }
 
-            // Perform SSDP search
-            if let Err(e) = Self::perform_search(&state, &bus, &http).await {
-                tracing::warn!("SSDP search failed: {}", e);
+                    // Cleanup stale renderers
+                    Self::cleanup_stale(&state, &bus).await;
+                }
             }
-
-            // Cleanup stale renderers
-            Self::cleanup_stale(&state, &bus).await;
         }
 
         tracing::info!("UPnP discovery loop stopped");
@@ -363,46 +372,50 @@ impl UPnPAdapter {
         }
     }
 
-    async fn poll_loop(state: Arc<RwLock<UPnPState>>, bus: SharedBus, http: Client) {
+    async fn poll_loop(
+        state: Arc<RwLock<UPnPState>>,
+        bus: SharedBus,
+        http: Client,
+        shutdown: CancellationToken,
+    ) {
         let mut poll_interval = interval(POLL_INTERVAL);
 
         loop {
-            poll_interval.tick().await;
-
-            {
-                let s = state.read().await;
-                if !s.running {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::info!("UPnP poll loop shutting down");
                     break;
                 }
-            }
+                _ = poll_interval.tick() => {
+                    // Get list of renderers to poll
+                    let renderers: Vec<(String, Option<String>, Option<String>)> = {
+                        let s = state.read().await;
+                        s.renderers
+                            .iter()
+                            .map(|(uuid, r)| {
+                                (
+                                    uuid.clone(),
+                                    r.av_transport_url.clone(),
+                                    r.rendering_control_url.clone(),
+                                )
+                            })
+                            .collect()
+                    };
 
-            // Get list of renderers to poll
-            let renderers: Vec<(String, Option<String>, Option<String>)> = {
-                let s = state.read().await;
-                s.renderers
-                    .iter()
-                    .map(|(uuid, r)| {
-                        (
-                            uuid.clone(),
-                            r.av_transport_url.clone(),
-                            r.rendering_control_url.clone(),
+                    for (uuid, av_url, rc_url) in renderers {
+                        if let Err(e) = Self::poll_renderer(
+                            &state,
+                            &bus,
+                            &http,
+                            &uuid,
+                            av_url.as_deref(),
+                            rc_url.as_deref(),
                         )
-                    })
-                    .collect()
-            };
-
-            for (uuid, av_url, rc_url) in renderers {
-                if let Err(e) = Self::poll_renderer(
-                    &state,
-                    &bus,
-                    &http,
-                    &uuid,
-                    av_url.as_deref(),
-                    rc_url.as_deref(),
-                )
-                .await
-                {
-                    tracing::debug!("Failed to poll {}: {}", uuid, e);
+                        .await
+                        {
+                            tracing::debug!("Failed to poll {}: {}", uuid, e);
+                        }
+                    }
                 }
             }
         }
@@ -560,6 +573,9 @@ impl UPnPAdapter {
 
     /// Stop discovery
     pub async fn stop(&self) {
+        // Cancel background tasks first
+        self.shutdown.cancel();
+
         let mut state = self.state.write().await;
         state.running = false;
         state.renderers.clear();

@@ -97,6 +97,8 @@ pub async fn dashboard_page(State(_state): State<AppState>) -> impl IntoResponse
 </section>
 
 <script>
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }
+
 async function loadStatus() {
     const section = document.querySelector('#status article');
     try {
@@ -109,7 +111,7 @@ async function loadStatus() {
 
         section.removeAttribute('aria-busy');
         section.innerHTML = `
-            <p><strong>Version:</strong> ${status.version}</p>
+            <p><strong>Version:</strong> ${esc(status.version)}</p>
             <p><strong>Uptime:</strong> ${status.uptime_secs}s</p>
             <p><strong>Event Bus Subscribers:</strong> ${status.bus_subscribers}</p>
             <hr>
@@ -119,17 +121,17 @@ async function loadStatus() {
                     <tr>
                         <td>Roon</td>
                         <td class="${roon.connected ? 'status-ok' : 'status-err'}">${roon.connected ? '✓ Connected' : '✗ Disconnected'}</td>
-                        <td><small>${roon.core_name || ''} ${roon.core_version ? 'v' + roon.core_version : ''}</small></td>
+                        <td><small>${esc(roon.core_name || '')} ${roon.core_version ? 'v' + esc(roon.core_version) : ''}</small></td>
                     </tr>
                     <tr>
                         <td>HQPlayer</td>
                         <td class="${hqp.connected ? 'status-ok' : 'status-err'}">${hqp.connected ? '✓ Connected' : '✗ Disconnected'}</td>
-                        <td><small>${hqp.host || ''}</small></td>
+                        <td><small>${esc(hqp.host || '')}</small></td>
                     </tr>
                     <tr>
                         <td>LMS</td>
                         <td class="${lms.connected ? 'status-ok' : 'status-err'}">${lms.connected ? '✓ Connected' : '✗ Disconnected'}</td>
-                        <td><small>${lms.host ? lms.host + ':' + lms.port : ''}</small></td>
+                        <td><small>${lms.host ? esc(lms.host) + ':' + lms.port : ''}</small></td>
                     </tr>
                     <tr>
                         <td>MQTT</td>
@@ -141,7 +143,7 @@ async function loadStatus() {
         `;
     } catch (e) {
         section.removeAttribute('aria-busy');
-        section.innerHTML = `<p class="status-err">Error loading status: ${e.message}</p>`;
+        section.innerHTML = `<p class="status-err">Error loading status: ${esc(e.message)}</p>`;
     }
 }
 loadStatus();
@@ -182,11 +184,11 @@ async function loadZones() {
                 <article>
                     <header>
                         <strong>${esc(zone.display_name)}</strong>
-                        <small> (${zone.state})</small>
+                        <small> (${esc(zone.state)})</small>
                     </header>
                     <p>${nowPlaying}</p>
                     <footer>
-                        <div class="controls" data-zone-id="${zone.zone_id}">
+                        <div class="controls" data-zone-id="${esc(zone.zone_id)}">
                             <button data-action="previous" ${zone.is_previous_allowed ? '' : 'disabled'}>⏮</button>
                             <button data-action="play_pause">⏯</button>
                             <button data-action="next" ${zone.is_next_allowed ? '' : 'disabled'}>⏭</button>
@@ -439,14 +441,14 @@ async function loadLmsPlayers() {
             <article>
                 <header>
                     <strong>${esc(player.name)}</strong>
-                    <small> (${player.mode})</small>
+                    <small> (${esc(player.mode)})</small>
                 </header>
                 <p>
                     ${player.current_title ? esc(player.current_title) : '<small>Nothing playing</small>'}
                     ${player.artist ? `<br><small>${esc(player.artist)}</small>` : ''}
                 </p>
                 <footer>
-                    <div class="controls" data-player-id="${player.player_id}">
+                    <div class="controls" data-player-id="${esc(player.player_id)}">
                         <button data-action="previous">⏮</button>
                         <button data-action="play_pause">⏯</button>
                         <button data-action="next">⏭</button>
