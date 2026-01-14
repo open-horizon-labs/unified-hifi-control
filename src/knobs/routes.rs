@@ -41,11 +41,12 @@ fn extract_knob_version(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Zone info for knob response
+/// Zone info for knob response - matches Node.js bus adapter format
 #[derive(Serialize)]
 pub struct ZoneInfo {
     pub zone_id: String,
-    pub display_name: String,
+    pub zone_name: String,
+    pub source: String,
     pub state: String,
 }
 
@@ -72,12 +73,13 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
     let adapters = settings.adapters;
     let mut zones = Vec::new();
 
-    // Roon zones (no prefix for backward compatibility)
+    // Roon zones (prefixed with roon: for routing)
     if adapters.roon {
         for z in state.roon.get_zones().await {
             zones.push(ZoneInfo {
-                zone_id: z.zone_id.clone(),
-                display_name: z.display_name,
+                zone_id: format!("roon:{}", z.zone_id),
+                zone_name: z.display_name,
+                source: "roon".to_string(),
                 state: z.state,
             });
         }
@@ -88,7 +90,8 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
         for p in state.lms.get_cached_players().await {
             zones.push(ZoneInfo {
                 zone_id: format!("lms:{}", p.playerid),
-                display_name: p.name,
+                zone_name: p.name,
+                source: "lms".to_string(),
                 state: if p.mode == "play" {
                     "playing".to_string()
                 } else if p.mode == "pause" {
@@ -105,7 +108,8 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
         for z in state.openhome.get_zones().await {
             zones.push(ZoneInfo {
                 zone_id: format!("openhome:{}", z.zone_id),
-                display_name: z.zone_name,
+                zone_name: z.zone_name,
+                source: "openhome".to_string(),
                 state: z.state.clone(),
             });
         }
@@ -116,7 +120,8 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
         for z in state.upnp.get_zones().await {
             zones.push(ZoneInfo {
                 zone_id: format!("upnp:{}", z.zone_id),
-                display_name: z.zone_name,
+                zone_name: z.zone_name,
+                source: "upnp".to_string(),
                 state: z.state.clone(),
             });
         }
@@ -134,14 +139,20 @@ pub struct NowPlayingQuery {
     pub battery_charging: Option<String>,
 }
 
-/// Now playing response for knob
+/// Now playing response for knob - matches Node.js format
+/// Node.js uses line1/line2/line3/is_playing (see src/roon/client.js:200-203)
 #[derive(Serialize)]
 pub struct NowPlayingResponse {
     pub zone_id: String,
-    pub state: String,
-    pub title: Option<String>,
-    pub artist: Option<String>,
-    pub album: Option<String>,
+    pub line1: String,
+    pub line2: String,
+    pub line3: Option<String>,
+    pub is_playing: bool,
+    pub volume: Option<f64>,
+    pub volume_type: Option<String>,
+    pub volume_min: Option<f64>,
+    pub volume_max: Option<f64>,
+    pub volume_step: Option<f64>,
     pub image_url: Option<String>,
     pub image_key: Option<String>,
     pub seek_position: Option<i64>,
@@ -235,29 +246,20 @@ pub async fn knob_now_playing_handler(
             "stopped"
         };
 
-        // For title/artist/album, empty strings become None
-        let title = if player.title.is_empty() {
-            None
-        } else {
-            Some(player.title)
-        };
-        let artist = if player.artist.is_empty() {
-            None
-        } else {
-            Some(player.artist)
-        };
-        let album = if player.album.is_empty() {
-            None
-        } else {
-            Some(player.album)
-        };
+        // Node.js format: line1/line2/line3/is_playing with volume info
+        let is_playing = state_str == "playing";
 
         Ok(Json(NowPlayingResponse {
             zone_id: zone_id.clone(),
-            state: state_str.to_string(),
-            title,
-            artist,
-            album,
+            line1: if player.title.is_empty() { "Idle".to_string() } else { player.title },
+            line2: player.artist,
+            line3: if player.album.is_empty() { None } else { Some(player.album) },
+            is_playing,
+            volume: Some(player.volume as f64),
+            volume_type: Some("number".to_string()),
+            volume_min: Some(0.0),
+            volume_max: Some(100.0),
+            volume_step: Some(1.0),
             image_url: Some(image_url),
             image_key: player
                 .artwork_url
@@ -265,8 +267,8 @@ pub async fn knob_now_playing_handler(
                 .or(player.artwork_track_id),
             seek_position: Some(player.time as i64),
             length: Some(player.duration as u32),
-            is_play_allowed: state_str != "playing",
-            is_pause_allowed: state_str == "playing",
+            is_play_allowed: !is_playing,
+            is_pause_allowed: is_playing,
             is_next_allowed: true,
             is_previous_allowed: true,
             zones: zone_infos,
@@ -290,43 +292,25 @@ pub async fn knob_now_playing_handler(
         };
 
         let np = state.openhome.get_now_playing(uuid).await;
-        let state_str = device.state.clone();
-
-        // Map line1/line2/line3 to title/artist/album
-        let title = np.as_ref().and_then(|n| {
-            if n.line1.is_empty() {
-                None
-            } else {
-                Some(n.line1.clone())
-            }
-        });
-        let artist = np.as_ref().and_then(|n| {
-            if n.line2.is_empty() {
-                None
-            } else {
-                Some(n.line2.clone())
-            }
-        });
-        let album = np.as_ref().and_then(|n| {
-            if n.line3.is_empty() {
-                None
-            } else {
-                Some(n.line3.clone())
-            }
-        });
+        let is_playing = device.state == "playing";
 
         Ok(Json(NowPlayingResponse {
             zone_id: zone_id.clone(),
-            state: state_str.clone(),
-            title,
-            artist,
-            album,
+            line1: np.as_ref().map(|n| n.line1.clone()).unwrap_or_else(|| "Idle".to_string()),
+            line2: np.as_ref().map(|n| n.line2.clone()).unwrap_or_default(),
+            line3: np.as_ref().and_then(|n| if n.line3.is_empty() { None } else { Some(n.line3.clone()) }),
+            is_playing,
+            volume: np.as_ref().and_then(|n| n.volume.map(|v| v as f64)),
+            volume_type: Some("number".to_string()),
+            volume_min: np.as_ref().map(|n| n.volume_min as f64),
+            volume_max: np.as_ref().map(|n| n.volume_max as f64),
+            volume_step: Some(1.0),
             image_url: Some(image_url),
             image_key: np.as_ref().and_then(|n| n.image_key.clone()),
             seek_position: np.as_ref().and_then(|n| n.seek_position),
             length: np.as_ref().and_then(|n| n.length),
-            is_play_allowed: state_str != "playing",
-            is_pause_allowed: state_str == "playing",
+            is_play_allowed: !is_playing,
+            is_pause_allowed: is_playing,
             is_next_allowed: true,
             is_previous_allowed: true,
             zones: zone_infos,
@@ -351,43 +335,25 @@ pub async fn knob_now_playing_handler(
         };
 
         let np = state.upnp.get_now_playing(zone_id_part).await;
-        let state_str = zone.state.clone();
-
-        // Map line1/line2/line3 to title/artist/album
-        let title = np.as_ref().and_then(|n| {
-            if n.line1.is_empty() {
-                None
-            } else {
-                Some(n.line1.clone())
-            }
-        });
-        let artist = np.as_ref().and_then(|n| {
-            if n.line2.is_empty() {
-                None
-            } else {
-                Some(n.line2.clone())
-            }
-        });
-        let album = np.as_ref().and_then(|n| {
-            if n.line3.is_empty() {
-                None
-            } else {
-                Some(n.line3.clone())
-            }
-        });
+        let is_playing = zone.state == "playing";
 
         Ok(Json(NowPlayingResponse {
             zone_id: zone_id.clone(),
-            state: state_str.clone(),
-            title,
-            artist,
-            album,
+            line1: np.as_ref().map(|n| n.line1.clone()).unwrap_or_else(|| "Idle".to_string()),
+            line2: np.as_ref().map(|n| n.line2.clone()).unwrap_or_default(),
+            line3: np.as_ref().and_then(|n| if n.line3.is_empty() { None } else { Some(n.line3.clone()) }),
+            is_playing,
+            volume: np.as_ref().and_then(|n| n.volume.map(|v| v as f64)),
+            volume_type: Some("number".to_string()),
+            volume_min: np.as_ref().map(|n| n.volume_min as f64),
+            volume_max: np.as_ref().map(|n| n.volume_max as f64),
+            volume_step: Some(1.0),
             image_url: Some(image_url),
             image_key: np.as_ref().and_then(|n| n.image_key.clone()),
             seek_position: np.as_ref().and_then(|n| n.seek_position),
             length: np.as_ref().and_then(|n| n.length),
-            is_play_allowed: state_str != "playing",
-            is_pause_allowed: state_str == "playing",
+            is_play_allowed: !is_playing,
+            is_pause_allowed: is_playing,
             is_next_allowed: true,
             is_previous_allowed: true,
             zones: zone_infos,
@@ -416,12 +382,27 @@ pub async fn knob_now_playing_handler(
         };
 
         let np = zone.now_playing;
+        let is_playing = zone.state == "playing";
+
+        // Node.js format: line1 = title, line2 = artist, line3 = album
+        let line1 = np.as_ref().map(|n| n.title.clone()).unwrap_or_else(|| "Idle".to_string());
+        let line2 = np.as_ref().map(|n| n.artist.clone()).unwrap_or_default();
+        let line3 = np.as_ref().and_then(|n| if n.album.is_empty() { None } else { Some(n.album.clone()) });
+
+        // Extract volume from first output (Roon zones have volume per-output)
+        let vol = zone.outputs.first().and_then(|o| o.volume.as_ref());
+
         Ok(Json(NowPlayingResponse {
             zone_id: zone.zone_id,
-            state: zone.state,
-            title: np.as_ref().map(|n| n.title.clone()),
-            artist: np.as_ref().map(|n| n.artist.clone()),
-            album: np.as_ref().map(|n| n.album.clone()),
+            line1,
+            line2,
+            line3,
+            is_playing,
+            volume: vol.and_then(|v| v.value.map(|x| x as f64)),
+            volume_type: vol.map(|_| "db".to_string()),
+            volume_min: vol.and_then(|v| v.min.map(|x| x as f64)),
+            volume_max: vol.and_then(|v| v.max.map(|x| x as f64)),
+            volume_step: Some(1.0),
             image_url: Some(image_url),
             image_key: np.as_ref().and_then(|n| n.image_key.clone()),
             seek_position: np.as_ref().and_then(|n| n.seek_position),
@@ -656,7 +637,8 @@ async fn control_roon(
                     Json(serde_json::json!({"error": "no outputs in zone"})),
                 )
             })?;
-            let step = value.and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+            // Use as_f64() which handles both JSON integers and floats
+            let step = value.and_then(|v| v.as_f64()).unwrap_or(1.0) as i32;
             state
                 .roon
                 .change_volume(&output, step, true)
@@ -676,7 +658,8 @@ async fn control_roon(
                     Json(serde_json::json!({"error": "no outputs in zone"})),
                 )
             })?;
-            let step = value.and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+            // Use as_f64() which handles both JSON integers and floats
+            let step = value.and_then(|v| v.as_f64()).unwrap_or(1.0) as i32;
             state
                 .roon
                 .change_volume(&output, -step, true)
@@ -696,7 +679,11 @@ async fn control_roon(
                     Json(serde_json::json!({"error": "no outputs in zone"})),
                 )
             })?;
-            let vol = value.and_then(|v| v.as_i64()).unwrap_or(50) as i32;
+            // Log raw value for debugging - knob sends floats like 75.0
+            tracing::debug!("vol_abs raw value: {:?}", value);
+            // Use as_f64() which handles both JSON integers and floats
+            // (as_i64() returns None for floats like 75.0, causing fallback to 50)
+            let vol = value.and_then(|v| v.as_f64()).unwrap_or(50.0) as i32;
             state
                 .roon
                 .change_volume(&output, vol, false)
@@ -741,7 +728,8 @@ async fn control_lms(
         "previous" | "prev" => "prev",
         "stop" => "stop",
         "vol_up" | "volume_up" => {
-            let step = value.and_then(|v| v.as_i64()).unwrap_or(5) as i32;
+            // Use as_f64() which handles both JSON integers and floats
+            let step = value.and_then(|v| v.as_f64()).unwrap_or(5.0) as i32;
             state
                 .lms
                 .change_volume(player_id, step, true)
@@ -755,7 +743,8 @@ async fn control_lms(
             return Ok(Json(serde_json::json!({"ok": true})));
         }
         "vol_down" | "volume_down" => {
-            let step = value.and_then(|v| v.as_i64()).unwrap_or(5) as i32;
+            // Use as_f64() which handles both JSON integers and floats
+            let step = value.and_then(|v| v.as_f64()).unwrap_or(5.0) as i32;
             state
                 .lms
                 .change_volume(player_id, -step, true)
@@ -769,7 +758,8 @@ async fn control_lms(
             return Ok(Json(serde_json::json!({"ok": true})));
         }
         "vol_abs" | "volume" => {
-            let vol = value.and_then(|v| v.as_i64()).unwrap_or(50) as i32;
+            // Use as_f64() which handles both JSON integers and floats
+            let vol = value.and_then(|v| v.as_f64()).unwrap_or(50.0) as i32;
             state
                 .lms
                 .change_volume(player_id, vol, false)

@@ -75,6 +75,24 @@ struct ErrorResponse {
     error: String,
 }
 
+/// Generic zones response wrapper - clients expect {zones: [...]}
+#[derive(Serialize)]
+pub struct ZonesWrapper<T: Serialize> {
+    pub zones: Vec<T>,
+}
+
+/// HQPlayer instances response wrapper - clients expect {instances: [...]}
+#[derive(Serialize)]
+pub struct InstancesWrapper<T: Serialize> {
+    pub instances: Vec<T>,
+}
+
+/// LMS players response wrapper - clients expect {players: [...]}
+#[derive(Serialize)]
+pub struct PlayersWrapper<T: Serialize> {
+    pub players: Vec<T>,
+}
+
 /// General status response
 #[derive(Serialize)]
 pub struct StatusResponse {
@@ -127,8 +145,10 @@ pub async fn roon_status_handler(
 /// GET /roon/zones - List all Roon zones
 pub async fn roon_zones_handler(
     State(state): State<AppState>,
-) -> Json<Vec<crate::adapters::roon::Zone>> {
-    Json(state.roon.get_zones().await)
+) -> Json<ZonesWrapper<crate::adapters::roon::Zone>> {
+    Json(ZonesWrapper {
+        zones: state.roon.get_zones().await,
+    })
 }
 
 /// GET /roon/zone/:zone_id - Get specific zone
@@ -328,14 +348,14 @@ pub async fn hqp_volume_handler(
     }
 }
 
-/// HQPlayer setting request
+/// HQPlayer setting request (legacy - uses name/value with u32)
 #[derive(Deserialize)]
 pub struct HqpSettingRequest {
     pub name: String,
     pub value: u32,
 }
 
-/// POST /hqplayer/setting - Change HQPlayer pipeline setting
+/// POST /hqplayer/setting - Change HQPlayer pipeline setting (legacy endpoint)
 pub async fn hqp_setting_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpSettingRequest>,
@@ -354,6 +374,58 @@ pub async fn hqp_setting_handler(
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// HQPlayer pipeline setting request - iOS/Node.js compatible format
+#[derive(Deserialize)]
+pub struct HqpPipelineRequest {
+    pub setting: String,
+    pub value: serde_json::Value, // Can be string or number
+}
+
+/// POST /hqp/pipeline - Change HQPlayer pipeline setting (iOS compatible)
+pub async fn hqp_pipeline_update_handler(
+    State(state): State<AppState>,
+    Json(req): Json<HqpPipelineRequest>,
+) -> impl IntoResponse {
+    // Convert value to u32 - accept both numeric and string representations
+    let value: u32 = match &req.value {
+        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as u32,
+        serde_json::Value::String(s) => s.parse().unwrap_or(0),
+        _ => 0,
+    };
+
+    let valid_settings = ["mode", "samplerate", "filter1x", "filterNx", "shaper", "dither"];
+    if !valid_settings.contains(&req.setting.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid setting. Valid: {}", valid_settings.join(", ")),
+            }),
+        )
+            .into_response();
+    }
+
+    let result = match req.setting.as_str() {
+        "mode" => state.hqplayer.set_mode(value).await,
+        "filter1x" => state.hqplayer.set_filter_1x(value).await,
+        "filterNx" | "filternx" => state.hqplayer.set_filter_nx(value).await,
+        "shaper" => state.hqplayer.set_shaper(value).await,
+        "samplerate" => state.hqplayer.set_rate(value).await,
+        "dither" => state.hqplayer.set_shaper(value).await, // dither uses same API
+        _ => Err(anyhow::anyhow!("Unknown setting: {}", req.setting)),
+    };
+
+    match result {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
@@ -473,8 +545,10 @@ pub async fn lms_status_handler(
 /// GET /lms/players - Get all players
 pub async fn lms_players_handler(
     State(state): State<AppState>,
-) -> Json<Vec<crate::adapters::lms::LmsPlayer>> {
-    Json(state.lms.get_cached_players().await)
+) -> Json<PlayersWrapper<crate::adapters::lms::LmsPlayer>> {
+    Json(PlayersWrapper {
+        players: state.lms.get_cached_players().await,
+    })
 }
 
 /// GET /lms/player/:player_id - Get specific player
@@ -598,8 +672,10 @@ pub async fn openhome_status_handler(
 /// GET /openhome/zones - List all discovered OpenHome devices
 pub async fn openhome_zones_handler(
     State(state): State<AppState>,
-) -> Json<Vec<crate::adapters::openhome::OpenHomeZone>> {
-    Json(state.openhome.get_zones().await)
+) -> Json<ZonesWrapper<crate::adapters::openhome::OpenHomeZone>> {
+    Json(ZonesWrapper {
+        zones: state.openhome.get_zones().await,
+    })
 }
 
 /// GET /openhome/zone/:zone_id/now_playing - Get now playing for zone
@@ -663,8 +739,10 @@ pub async fn upnp_status_handler(
 /// GET /upnp/zones - List all discovered UPnP renderers
 pub async fn upnp_zones_handler(
     State(state): State<AppState>,
-) -> Json<Vec<crate::adapters::upnp::UPnPZone>> {
-    Json(state.upnp.get_zones().await)
+) -> Json<ZonesWrapper<crate::adapters::upnp::UPnPZone>> {
+    Json(ZonesWrapper {
+        zones: state.upnp.get_zones().await,
+    })
 }
 
 /// GET /upnp/zone/:zone_id/now_playing - Get now playing for renderer
@@ -951,7 +1029,7 @@ fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
 /// GET /hqp/instances - List all HQPlayer instances
 pub async fn hqp_instances_handler(State(state): State<AppState>) -> impl IntoResponse {
     let instances = state.hqp_instances.list_instances().await;
-    Json(instances)
+    Json(InstancesWrapper { instances })
 }
 
 /// HQPlayer add instance request
