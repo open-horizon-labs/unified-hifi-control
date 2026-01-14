@@ -3,34 +3,37 @@ FROM rust:1.84-slim AS builder
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies (minimal - using rustls, no OpenSSL needed)
 RUN apt-get update && apt-get install -y \
     pkg-config \
-    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock ./
 
-# Create dummy src to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release && rm -rf src target/release/unified-hifi-control*
+# Create dummy source for dependency caching
+RUN mkdir -p src && \
+    echo "fn main() {}" > src/main.rs && \
+    echo "// lib stub" > src/lib.rs
+
+# Build dependencies only (cached layer)
+RUN cargo build --release --bin unified-hifi-control 2>/dev/null || true
+RUN rm -rf src
 
 # Copy actual source
 COPY src/ ./src/
 
-# Build the real binary
-RUN cargo build --release
+# Build only the main binary (skip protocol-checker dev tool)
+RUN cargo build --release --bin unified-hifi-control
 
 # Runtime stage
 FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies (minimal - using rustls, no OpenSSL needed)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder
