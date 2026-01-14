@@ -276,7 +276,6 @@ jobs:
           name: qnap-packages
           path: dist/installers/*.qpkg
           retention-days: 5
-          if-no-files-found: warn
 
   summary:
     name: Build Summary
