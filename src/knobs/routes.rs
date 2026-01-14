@@ -251,9 +251,17 @@ pub async fn knob_now_playing_handler(
 
         Ok(Json(NowPlayingResponse {
             zone_id: zone_id.clone(),
-            line1: if player.title.is_empty() { "Idle".to_string() } else { player.title },
+            line1: if player.title.is_empty() {
+                "Idle".to_string()
+            } else {
+                player.title
+            },
             line2: player.artist,
-            line3: if player.album.is_empty() { None } else { Some(player.album) },
+            line3: if player.album.is_empty() {
+                None
+            } else {
+                Some(player.album)
+            },
             is_playing,
             volume: Some(player.volume as f64),
             volume_type: Some("number".to_string()),
@@ -296,9 +304,18 @@ pub async fn knob_now_playing_handler(
 
         Ok(Json(NowPlayingResponse {
             zone_id: zone_id.clone(),
-            line1: np.as_ref().map(|n| n.line1.clone()).unwrap_or_else(|| "Idle".to_string()),
+            line1: np
+                .as_ref()
+                .map(|n| n.line1.clone())
+                .unwrap_or_else(|| "Idle".to_string()),
             line2: np.as_ref().map(|n| n.line2.clone()).unwrap_or_default(),
-            line3: np.as_ref().and_then(|n| if n.line3.is_empty() { None } else { Some(n.line3.clone()) }),
+            line3: np.as_ref().and_then(|n| {
+                if n.line3.is_empty() {
+                    None
+                } else {
+                    Some(n.line3.clone())
+                }
+            }),
             is_playing,
             volume: np.as_ref().and_then(|n| n.volume.map(|v| v as f64)),
             volume_type: Some("number".to_string()),
@@ -339,9 +356,18 @@ pub async fn knob_now_playing_handler(
 
         Ok(Json(NowPlayingResponse {
             zone_id: zone_id.clone(),
-            line1: np.as_ref().map(|n| n.line1.clone()).unwrap_or_else(|| "Idle".to_string()),
+            line1: np
+                .as_ref()
+                .map(|n| n.line1.clone())
+                .unwrap_or_else(|| "Idle".to_string()),
             line2: np.as_ref().map(|n| n.line2.clone()).unwrap_or_default(),
-            line3: np.as_ref().and_then(|n| if n.line3.is_empty() { None } else { Some(n.line3.clone()) }),
+            line3: np.as_ref().and_then(|n| {
+                if n.line3.is_empty() {
+                    None
+                } else {
+                    Some(n.line3.clone())
+                }
+            }),
             is_playing,
             volume: np.as_ref().and_then(|n| n.volume.map(|v| v as f64)),
             volume_type: Some("number".to_string()),
@@ -385,9 +411,18 @@ pub async fn knob_now_playing_handler(
         let is_playing = zone.state == "playing";
 
         // Node.js format: line1 = title, line2 = artist, line3 = album
-        let line1 = np.as_ref().map(|n| n.title.clone()).unwrap_or_else(|| "Idle".to_string());
+        let line1 = np
+            .as_ref()
+            .map(|n| n.title.clone())
+            .unwrap_or_else(|| "Idle".to_string());
         let line2 = np.as_ref().map(|n| n.artist.clone()).unwrap_or_default();
-        let line3 = np.as_ref().and_then(|n| if n.album.is_empty() { None } else { Some(n.album.clone()) });
+        let line3 = np.as_ref().and_then(|n| {
+            if n.album.is_empty() {
+                None
+            } else {
+                Some(n.album.clone())
+            }
+        });
 
         // Extract volume from first output (Roon zones have volume per-output)
         let vol = zone.outputs.first().and_then(|o| o.volume.as_ref());

@@ -473,7 +473,9 @@ mod knob_client {
 
         // With an invalid zone, we expect 400 or error response
         assert!(
-            status == StatusCode::BAD_REQUEST || json.get("error").is_some() || json.get("line1").is_some(),
+            status == StatusCode::BAD_REQUEST
+                || json.get("error").is_some()
+                || json.get("line1").is_some(),
             "Expected error or now_playing response, got status {} and: {:?}",
             status,
             json
@@ -603,8 +605,7 @@ mod knob_client {
     #[tokio::test]
     async fn get_image_rgb565_format() {
         let app = create_test_app().await;
-        let path =
-            "/now_playing/image?zone_id=test-zone&width=240&height=240&format=rgb565";
+        let path = "/now_playing/image?zone_id=test-zone&width=240&height=240&format=rgb565";
 
         let response = app
             .clone()
@@ -919,8 +920,14 @@ mod shared_endpoints {
         let json = assert_json("GET /status", &body);
 
         // Should have service and version
-        assert!(json.get("service").is_some(), "Status must have service field");
-        assert!(json.get("version").is_some(), "Status must have version field");
+        assert!(
+            json.get("service").is_some(),
+            "Status must have service field"
+        );
+        assert!(
+            json.get("version").is_some(),
+            "Status must have version field"
+        );
     }
 
     /// Test: GET /roon/status - Roon adapter status
@@ -1233,13 +1240,8 @@ mod integration {
         println!("Boot: Found {} zones", zones.zones.len());
 
         // 2. Get knob config (to restore last selected zone)
-        let (status, body) = get_with_headers(
-            &app,
-            &format!("/config/{}", knob_id),
-            knob_id,
-            knob_version,
-        )
-        .await;
+        let (status, body) =
+            get_with_headers(&app, &format!("/config/{}", knob_id), knob_id, knob_version).await;
         assert_eq!(status, StatusCode::OK);
         let _config: Value = serde_json::from_str(&body).unwrap();
         println!("Boot: Got config");

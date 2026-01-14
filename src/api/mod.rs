@@ -401,7 +401,14 @@ pub async fn hqp_pipeline_update_handler(
         _ => 0,
     };
 
-    let valid_settings = ["mode", "samplerate", "filter1x", "filterNx", "shaper", "dither"];
+    let valid_settings = [
+        "mode",
+        "samplerate",
+        "filter1x",
+        "filterNx",
+        "shaper",
+        "dither",
+    ];
     if !valid_settings.contains(&req.setting.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
