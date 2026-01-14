@@ -17,12 +17,21 @@ pub fn advertise(port: u16, name: &str, base_url: &str) -> anyhow::Result<Servic
     // Create service info
     // Type is "_roonknob._tcp.local."
     let service_type = "_roonknob._tcp.local.";
-    let _service_name = format!("{}.{}", name.replace(' ', "-"), service_type);
+
+    // Get hostname and ensure it ends with ".local." for mdns_sd
+    let raw_hostname = gethostname::gethostname().to_string_lossy().to_string();
+    let hostname = if raw_hostname.ends_with(".local.") {
+        raw_hostname
+    } else if raw_hostname.ends_with(".local") {
+        format!("{}.", raw_hostname)
+    } else {
+        format!("{}.local.", raw_hostname)
+    };
 
     let service_info = ServiceInfo::new(
         service_type,
         name,
-        &gethostname::gethostname().to_string_lossy(),
+        &hostname,
         (), // All local addresses
         port,
         Some(txt),
