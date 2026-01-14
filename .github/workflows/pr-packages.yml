@@ -206,24 +206,104 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+  build-lms-plugin:
+    name: Build LMS Plugin
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install build dependencies
+        run: npm install archiver
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*-linux-musl
+          path: dist/bin/
+          merge-multiple: true
+
+      - name: Build LMS plugin
+        run: node scripts/build-lms-plugin.js
+
+      - name: Upload LMS plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: lms-plugin
+          path: dist/lms-unified-hifi-control-*.zip
+          retention-days: 5
+
+  build-nas-packages:
+    name: Build NAS Packages (Synology/QNAP)
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*-linux-musl
+          path: dist/bin/
+          merge-multiple: true
+
+      - name: Make binaries executable
+        run: chmod +x dist/bin/*
+
+      - name: Build NAS packages
+        run: node scripts/build-nas-packages.js
+
+      - name: Upload Synology packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: synology-packages
+          path: dist/installers/*.spk
+          retention-days: 5
+
+      - name: Upload QNAP packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: qnap-packages
+          path: dist/installers/*.qpkg
+          retention-days: 5
+
   summary:
     name: Build Summary
-    needs: [build-linux, build-macos, build-windows, docker]
+    needs: [build-linux, build-macos, build-windows, docker, build-lms-plugin, build-nas-packages]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
-          pattern: binary-*
 
       - name: Display build summary
         run: |
           echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Binaries" >> $GITHUB_STEP_SUMMARY
           echo "| Binary | Size |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
-          find artifacts -type f | while read f; do
+          find artifacts -name 'unified-hifi-*' -type f | while read f; do
+            size=$(du -h "$f" | cut -f1)
+            name=$(basename "$f")
+            echo "| $name | $size |" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Packages" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|------|" >> $GITHUB_STEP_SUMMARY
+          find artifacts -name '*.zip' -o -name '*.spk' -o -name '*.qpkg' | while read f; do
             size=$(du -h "$f" | cut -f1)
             name=$(basename "$f")
             echo "| $name | $size |" >> $GITHUB_STEP_SUMMARY
