@@ -57,7 +57,10 @@ async fn main() -> Result<()> {
             adapter
         }
         Err(e) => {
-            tracing::warn!("Failed to initialize Roon adapter: {}. Continuing without Roon.", e);
+            tracing::warn!(
+                "Failed to initialize Roon adapter: {}. Continuing without Roon.",
+                e
+            );
             adapters::roon::RoonAdapter::new_disconnected(bus.clone())
         }
     };
@@ -67,7 +70,10 @@ async fn main() -> Result<()> {
     hqp_instances.load_from_config().await;
     let instance_count = hqp_instances.instance_count().await;
     if instance_count > 0 {
-        tracing::info!("HQPlayer: {} instance(s) loaded from config", instance_count);
+        tracing::info!(
+            "HQPlayer: {} instance(s) loaded from config",
+            instance_count
+        );
     }
 
     // Create default HQPlayer adapter for backward compatibility
@@ -84,7 +90,10 @@ async fn main() -> Result<()> {
             )
             .await;
         hqp_instances.save_to_config().await;
-        tracing::info!("HQPlayer default instance configured for {}", hqp_config.host);
+        tracing::info!(
+            "HQPlayer default instance configured for {}",
+            hqp_config.host
+        );
     } else if hqplayer.is_configured().await {
         let status = hqplayer.get_status().await;
         if let Some(host) = status.host {
@@ -93,7 +102,9 @@ async fn main() -> Result<()> {
     }
 
     // Initialize HQP zone link service
-    let hqp_zone_links = Arc::new(adapters::hqplayer::HqpZoneLinkService::new(hqp_instances.clone()));
+    let hqp_zone_links = Arc::new(adapters::hqplayer::HqpZoneLinkService::new(
+        hqp_instances.clone(),
+    ));
     hqp_zone_links.auto_correct_links().await;
     let link_count = hqp_zone_links.get_links().await.len();
     if link_count > 0 {
@@ -213,18 +224,36 @@ async fn main() -> Result<()> {
         // HQPlayer multi-instance routes
         .route("/hqp/instances", get(api::hqp_instances_handler))
         .route("/hqp/instances", post(api::hqp_add_instance_handler))
-        .route("/hqp/instances/{name}", delete(api::hqp_remove_instance_handler))
+        .route(
+            "/hqp/instances/{name}",
+            delete(api::hqp_remove_instance_handler),
+        )
         // HQPlayer instance-specific profile routes (web UI profiles via HTTP)
-        .route("/hqp/instances/{name}/profiles", get(api::hqp_instance_profiles_handler))
-        .route("/hqp/instances/{name}/profile", post(api::hqp_instance_load_profile_handler))
+        .route(
+            "/hqp/instances/{name}/profiles",
+            get(api::hqp_instance_profiles_handler),
+        )
+        .route(
+            "/hqp/instances/{name}/profile",
+            post(api::hqp_instance_load_profile_handler),
+        )
         // HQPlayer instance-specific matrix profile routes (native TCP protocol)
-        .route("/hqp/instances/{name}/matrix/profiles", get(api::hqp_instance_matrix_profiles_handler))
-        .route("/hqp/instances/{name}/matrix/profile", post(api::hqp_instance_set_matrix_profile_handler))
+        .route(
+            "/hqp/instances/{name}/matrix/profiles",
+            get(api::hqp_instance_matrix_profiles_handler),
+        )
+        .route(
+            "/hqp/instances/{name}/matrix/profile",
+            post(api::hqp_instance_set_matrix_profile_handler),
+        )
         // HQPlayer zone linking routes
         .route("/hqp/zones/links", get(api::hqp_zone_links_handler))
         .route("/hqp/zones/link", post(api::hqp_zone_link_handler))
         .route("/hqp/zones/unlink", post(api::hqp_zone_unlink_handler))
-        .route("/hqp/zones/{zone_id}/pipeline", get(api::hqp_zone_pipeline_handler))
+        .route(
+            "/hqp/zones/{zone_id}/pipeline",
+            get(api::hqp_zone_pipeline_handler),
+        )
         // HQPlayer network discovery
         .route("/hqp/discover", get(api::hqp_discover_handler))
         // LMS routes
@@ -269,12 +298,18 @@ async fn main() -> Result<()> {
         .route("/now_playing/image", get(knobs::knob_image_handler))
         .route("/control", post(knobs::knob_control_handler))
         .route("/config/{knob_id}", get(knobs::knob_config_by_path_handler))
-        .route("/config/{knob_id}", put(knobs::knob_config_update_by_path_handler))
+        .route(
+            "/config/{knob_id}",
+            put(knobs::knob_config_update_by_path_handler),
+        )
         // Firmware OTA routes
         .route("/firmware/version", get(knobs::firmware_version_handler))
         .route("/firmware/download", get(knobs::firmware_download_handler))
         .route("/manifest-s3.json", get(knobs::manifest_handler))
-        .route("/admin/fetch-firmware", post(knobs::admin_fetch_firmware_handler))
+        .route(
+            "/admin/fetch-firmware",
+            post(knobs::admin_fetch_firmware_handler),
+        )
         // Protocol route: /zones returns JSON (for knob, iOS, etc.)
         .route("/zones", get(knobs::knob_zones_handler))
         // Web UI routes
@@ -324,7 +359,10 @@ async fn main() -> Result<()> {
             .unwrap_or(60);
         let firmware_service = std::sync::Arc::new(firmware::FirmwareService::new());
         firmware_service.start_polling(poll_interval);
-        tracing::info!("Firmware auto-update enabled (poll interval: {} min)", poll_interval);
+        tracing::info!(
+            "Firmware auto-update enabled (poll interval: {} min)",
+            poll_interval
+        );
     } else {
         tracing::info!("Firmware auto-update disabled");
     }

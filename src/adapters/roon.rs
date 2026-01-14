@@ -190,7 +190,8 @@ impl RoonAdapter {
             loop {
                 tracing::info!("Starting Roon discovery loop...");
 
-                match run_roon_loop(state_clone.clone(), bus_clone.clone(), base_url.clone()).await {
+                match run_roon_loop(state_clone.clone(), bus_clone.clone(), base_url.clone()).await
+                {
                     Ok(()) => {
                         tracing::info!("Roon event loop ended normally");
                     }
@@ -429,7 +430,11 @@ fn convert_zone(roon_zone: &RoonZone) -> Zone {
 }
 
 /// Main Roon event loop
-async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus, base_url: String) -> Result<()> {
+async fn run_roon_loop(
+    state: Arc<RwLock<RoonState>>,
+    bus: SharedBus,
+    base_url: String,
+) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
 
     // Ensure data directory exists for state persistence
@@ -476,7 +481,9 @@ async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus, base_url: 
         .await
         .ok_or_else(|| anyhow::anyhow!("Failed to start Roon discovery"))?;
 
-    tracing::info!("Roon discovery started, waiting for core (authorize in Roon → Settings → Extensions)...");
+    tracing::info!(
+        "Roon discovery started, waiting for core (authorize in Roon → Settings → Extensions)..."
+    );
 
     // Event processing task
     let state_for_events = state.clone();
@@ -491,11 +498,7 @@ async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus, base_url: 
                         let core_name = core.display_name.clone();
                         let core_version = core.display_version.clone();
 
-                        tracing::info!(
-                            "Roon Core found: {} (version {})",
-                            core_name,
-                            core_version
-                        );
+                        tracing::info!("Roon Core found: {} (version {})", core_name, core_version);
 
                         // Update status shown in Roon Settings → Extensions
                         if let Some(status) = core.get_status() {
@@ -538,7 +541,9 @@ async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus, base_url: 
 
                         // Update status shown in Roon Settings → Extensions
                         if let Some(status) = core.get_status() {
-                            status.set_status("Disconnected - searching...".to_string(), true).await;
+                            status
+                                .set_status("Disconnected - searching...".to_string(), true)
+                                .await;
                         }
 
                         let mut s = state_for_events.write().await;
@@ -559,7 +564,9 @@ async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus, base_url: 
                     match parsed {
                         Parsed::RoonState(roon_state) => {
                             // Persist pairing state to data directory
-                            if let Err(e) = RoonApi::save_roon_state(&state_path_for_events, roon_state) {
+                            if let Err(e) =
+                                RoonApi::save_roon_state(&state_path_for_events, roon_state)
+                            {
                                 tracing::warn!("Failed to save Roon state: {}", e);
                             } else {
                                 tracing::debug!("Roon state saved to {}", state_path_for_events);
@@ -627,12 +634,18 @@ async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus, base_url: 
                             }
                         }
                         Parsed::Jpeg((image_key, data)) => {
-                            tracing::debug!("Received JPEG image: {} ({} bytes)", image_key, data.len());
+                            tracing::debug!(
+                                "Received JPEG image: {} ({} bytes)",
+                                image_key,
+                                data.len()
+                            );
                             let mut s = state_for_events.write().await;
                             // Find pending request by image_key (req_id may be stored differently)
                             // For now, we'll use a simpler approach - store by image_key
-                            if let Some((_req_id, sender)) = s.pending_images.iter()
-                                .find(|(_, _)| true)  // Take any pending request
+                            if let Some((_req_id, sender)) = s
+                                .pending_images
+                                .iter()
+                                .find(|(_, _)| true) // Take any pending request
                                 .map(|(k, _)| (*k, ()))
                                 .and_then(|(k, _)| s.pending_images.remove(&k).map(|s| (k, s)))
                             {
@@ -643,9 +656,15 @@ async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus, base_url: 
                             }
                         }
                         Parsed::Png((image_key, data)) => {
-                            tracing::debug!("Received PNG image: {} ({} bytes)", image_key, data.len());
+                            tracing::debug!(
+                                "Received PNG image: {} ({} bytes)",
+                                image_key,
+                                data.len()
+                            );
                             let mut s = state_for_events.write().await;
-                            if let Some((_req_id, sender)) = s.pending_images.iter()
+                            if let Some((_req_id, sender)) = s
+                                .pending_images
+                                .iter()
                                 .find(|(_, _)| true)
                                 .map(|(k, _)| (*k, ()))
                                 .and_then(|(k, _)| s.pending_images.remove(&k).map(|s| (k, s)))

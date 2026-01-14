@@ -235,9 +235,21 @@ pub async fn knob_now_playing_handler(
         };
 
         // For title/artist/album, empty strings become None
-        let title = if player.title.is_empty() { None } else { Some(player.title) };
-        let artist = if player.artist.is_empty() { None } else { Some(player.artist) };
-        let album = if player.album.is_empty() { None } else { Some(player.album) };
+        let title = if player.title.is_empty() {
+            None
+        } else {
+            Some(player.title)
+        };
+        let artist = if player.artist.is_empty() {
+            None
+        } else {
+            Some(player.artist)
+        };
+        let album = if player.album.is_empty() {
+            None
+        } else {
+            Some(player.album)
+        };
 
         Ok(Json(NowPlayingResponse {
             zone_id: zone_id.clone(),
@@ -246,7 +258,10 @@ pub async fn knob_now_playing_handler(
             artist,
             album,
             image_url: Some(image_url),
-            image_key: player.artwork_url.or(player.coverid).or(player.artwork_track_id),
+            image_key: player
+                .artwork_url
+                .or(player.coverid)
+                .or(player.artwork_track_id),
             seek_position: Some(player.time as i64),
             length: Some(player.duration as u32),
             is_play_allowed: state_str != "playing",
@@ -277,9 +292,36 @@ pub async fn knob_now_playing_handler(
         let state_str = device.state.clone();
 
         // Map line1/line2/line3 to title/artist/album
-        let title = np.as_ref().map(|n| if n.line1.is_empty() { None } else { Some(n.line1.clone()) }).flatten();
-        let artist = np.as_ref().map(|n| if n.line2.is_empty() { None } else { Some(n.line2.clone()) }).flatten();
-        let album = np.as_ref().map(|n| if n.line3.is_empty() { None } else { Some(n.line3.clone()) }).flatten();
+        let title = np
+            .as_ref()
+            .map(|n| {
+                if n.line1.is_empty() {
+                    None
+                } else {
+                    Some(n.line1.clone())
+                }
+            })
+            .flatten();
+        let artist = np
+            .as_ref()
+            .map(|n| {
+                if n.line2.is_empty() {
+                    None
+                } else {
+                    Some(n.line2.clone())
+                }
+            })
+            .flatten();
+        let album = np
+            .as_ref()
+            .map(|n| {
+                if n.line3.is_empty() {
+                    None
+                } else {
+                    Some(n.line3.clone())
+                }
+            })
+            .flatten();
 
         Ok(Json(NowPlayingResponse {
             zone_id: zone_id.clone(),
@@ -320,9 +362,36 @@ pub async fn knob_now_playing_handler(
         let state_str = zone.state.clone();
 
         // Map line1/line2/line3 to title/artist/album
-        let title = np.as_ref().map(|n| if n.line1.is_empty() { None } else { Some(n.line1.clone()) }).flatten();
-        let artist = np.as_ref().map(|n| if n.line2.is_empty() { None } else { Some(n.line2.clone()) }).flatten();
-        let album = np.as_ref().map(|n| if n.line3.is_empty() { None } else { Some(n.line3.clone()) }).flatten();
+        let title = np
+            .as_ref()
+            .map(|n| {
+                if n.line1.is_empty() {
+                    None
+                } else {
+                    Some(n.line1.clone())
+                }
+            })
+            .flatten();
+        let artist = np
+            .as_ref()
+            .map(|n| {
+                if n.line2.is_empty() {
+                    None
+                } else {
+                    Some(n.line2.clone())
+                }
+            })
+            .flatten();
+        let album = np
+            .as_ref()
+            .map(|n| {
+                if n.line3.is_empty() {
+                    None
+                } else {
+                    Some(n.line3.clone())
+                }
+            })
+            .flatten();
 
         Ok(Json(NowPlayingResponse {
             zone_id: zone_id.clone(),
@@ -605,9 +674,16 @@ async fn control_roon(
                 )
             })?;
             let step = value.and_then(|v| v.as_i64()).unwrap_or(1) as i32;
-            state.roon.change_volume(&output, step, true).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
-            })?;
+            state
+                .roon
+                .change_volume(&output, step, true)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
             return Ok(Json(serde_json::json!({"ok": true})));
         }
         "vol_down" | "volume_down" => {
@@ -618,9 +694,16 @@ async fn control_roon(
                 )
             })?;
             let step = value.and_then(|v| v.as_i64()).unwrap_or(1) as i32;
-            state.roon.change_volume(&output, -step, true).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
-            })?;
+            state
+                .roon
+                .change_volume(&output, -step, true)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
             return Ok(Json(serde_json::json!({"ok": true})));
         }
         "vol_abs" | "volume" => {
@@ -631,9 +714,16 @@ async fn control_roon(
                 )
             })?;
             let vol = value.and_then(|v| v.as_i64()).unwrap_or(50) as i32;
-            state.roon.change_volume(&output, vol, false).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
-            })?;
+            state
+                .roon
+                .change_volume(&output, vol, false)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
             return Ok(Json(serde_json::json!({"ok": true})));
         }
         _ => {
@@ -646,7 +736,10 @@ async fn control_roon(
 
     match state.roon.control(zone_id, roon_action).await {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
     }
 }
 
@@ -666,23 +759,44 @@ async fn control_lms(
         "stop" => "stop",
         "vol_up" | "volume_up" => {
             let step = value.and_then(|v| v.as_i64()).unwrap_or(5) as i32;
-            state.lms.change_volume(player_id, step, true).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
-            })?;
+            state
+                .lms
+                .change_volume(player_id, step, true)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
             return Ok(Json(serde_json::json!({"ok": true})));
         }
         "vol_down" | "volume_down" => {
             let step = value.and_then(|v| v.as_i64()).unwrap_or(5) as i32;
-            state.lms.change_volume(player_id, -step, true).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
-            })?;
+            state
+                .lms
+                .change_volume(player_id, -step, true)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
             return Ok(Json(serde_json::json!({"ok": true})));
         }
         "vol_abs" | "volume" => {
             let vol = value.and_then(|v| v.as_i64()).unwrap_or(50) as i32;
-            state.lms.change_volume(player_id, vol, false).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
-            })?;
+            state
+                .lms
+                .change_volume(player_id, vol, false)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
             return Ok(Json(serde_json::json!({"ok": true})));
         }
         _ => {
@@ -695,7 +809,10 @@ async fn control_lms(
 
     match state.lms.control(player_id, lms_action, None).await {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
     }
 }
 
@@ -722,7 +839,10 @@ async fn control_openhome(
 
     match state.openhome.control(zone_id, oh_action, None).await {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
     }
 }
 
@@ -749,7 +869,10 @@ async fn control_upnp(
 
     match state.upnp.control(zone_id, upnp_action, None).await {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
     }
 }
 
@@ -838,7 +961,10 @@ pub async fn knob_config_by_path_handler(
     let version = extract_knob_version(&headers);
 
     // Get or create knob (ensures it exists for newly connected devices)
-    let knob = state.knobs.get_or_create(&knob_id, version.as_deref()).await;
+    let knob = state
+        .knobs
+        .get_or_create(&knob_id, version.as_deref())
+        .await;
 
     // Build config response matching Node.js format
     let mut config = serde_json::to_value(&knob.config).unwrap_or_default();
@@ -907,7 +1033,9 @@ pub async fn firmware_version_handler() -> Response {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#))
+            .body(Body::from(
+                r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#,
+            ))
             .unwrap();
     }
 
@@ -916,14 +1044,21 @@ pub async fn firmware_version_handler() -> Response {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.path().extension().map(|ext| ext == "bin").unwrap_or(false))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "bin")
+                .unwrap_or(false)
+        })
         .collect();
 
     if bin_files.is_empty() {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#))
+            .body(Body::from(
+                r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#,
+            ))
             .unwrap();
     }
 
@@ -938,7 +1073,9 @@ pub async fn firmware_version_handler() -> Response {
         FirmwareVersionInfo::default()
     };
 
-    let firmware_file = version_info.file.unwrap_or_else(|| "roon_knob.bin".to_string());
+    let firmware_file = version_info
+        .file
+        .unwrap_or_else(|| "roon_knob.bin".to_string());
     let version = version_info.version.or_else(|| {
         // Try to extract version from filename
         let re = regex::Regex::new(r"roon_knob[_-]?v?(\d+\.\d+\.\d+)\.bin").ok()?;
@@ -966,11 +1103,14 @@ pub async fn firmware_version_handler() -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::json!({
-            "version": version,
-            "size": size,
-            "file": firmware_file
-        }).to_string()))
+        .body(Body::from(
+            serde_json::json!({
+                "version": version,
+                "size": size,
+                "file": firmware_file
+            })
+            .to_string(),
+        ))
         .unwrap()
 }
 
@@ -982,7 +1122,9 @@ pub async fn firmware_download_handler() -> Response {
         return Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#))
+            .body(Body::from(
+                r#"{"error":"No firmware available","error_code":"FIRMWARE_NOT_FOUND"}"#,
+            ))
             .unwrap();
     }
 
@@ -1008,7 +1150,12 @@ pub async fn firmware_download_handler() -> Response {
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| e.path().extension().map(|ext| ext == "bin").unwrap_or(false))
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "bin")
+                    .unwrap_or(false)
+            })
             .map(|e| e.path())
             .collect();
 
@@ -1016,7 +1163,9 @@ pub async fn firmware_download_handler() -> Response {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"error":"Firmware file not found","error_code":"FIRMWARE_NOT_FOUND"}"#))
+                .body(Body::from(
+                    r#"{"error":"Firmware file not found","error_code":"FIRMWARE_NOT_FOUND"}"#,
+                ))
                 .unwrap();
         }
         bin_files[0].clone()
@@ -1087,14 +1236,16 @@ pub async fn manifest_handler() -> Response {
 }
 
 /// POST /admin/fetch-firmware - Manually trigger firmware download from GitHub
-pub async fn admin_fetch_firmware_handler() -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+pub async fn admin_fetch_firmware_handler(
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use crate::firmware::FirmwareService;
 
     let service = FirmwareService::new();
     match service.check_for_updates().await {
         Ok(downloaded) => {
             if downloaded {
-                let version = FirmwareService::get_current_version().unwrap_or_else(|| "unknown".to_string());
+                let version =
+                    FirmwareService::get_current_version().unwrap_or_else(|| "unknown".to_string());
                 Ok(Json(serde_json::json!({
                     "ok": true,
                     "version": version,
@@ -1113,7 +1264,7 @@ pub async fn admin_fetch_firmware_handler() -> Result<Json<serde_json::Value>, (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": format!("Failed to fetch firmware: {}", e)
-            }))
-        ))
+            })),
+        )),
     }
 }

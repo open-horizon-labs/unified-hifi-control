@@ -127,10 +127,9 @@ impl MockRoonCore {
     /// Add a zone
     pub async fn add_zone(&self, zone_id: &str, display_name: &str) {
         let mut state = self.state.write().await;
-        state.zones.insert(
-            zone_id.to_string(),
-            MockZone::new(zone_id, display_name),
-        );
+        state
+            .zones
+            .insert(zone_id.to_string(), MockZone::new(zone_id, display_name));
     }
 
     /// Get all zones
@@ -178,13 +177,7 @@ impl MockRoonCore {
     }
 
     /// Set zone now playing
-    pub async fn set_now_playing(
-        &self,
-        zone_id: &str,
-        title: &str,
-        artist: &str,
-        album: &str,
-    ) {
+    pub async fn set_now_playing(&self, zone_id: &str, title: &str, artist: &str, album: &str) {
         let mut state = self.state.write().await;
         if let Some(zone) = state.zones.get_mut(zone_id) {
             zone.now_playing = Some(MockNowPlaying {
@@ -264,7 +257,8 @@ mod tests {
     async fn mock_roon_sets_now_playing() {
         let mock = MockRoonCore::new();
         mock.add_zone("zone-1", "Living Room").await;
-        mock.set_now_playing("zone-1", "Test Song", "Test Artist", "Test Album").await;
+        mock.set_now_playing("zone-1", "Test Song", "Test Artist", "Test Album")
+            .await;
 
         let zone = mock.get_zone("zone-1").await.unwrap();
         let np = zone.now_playing.as_ref().unwrap();
@@ -277,7 +271,8 @@ mod tests {
     async fn mock_roon_clears_now_playing() {
         let mock = MockRoonCore::new();
         mock.add_zone("zone-1", "Living Room").await;
-        mock.set_now_playing("zone-1", "Test Song", "Test Artist", "Test Album").await;
+        mock.set_now_playing("zone-1", "Test Song", "Test Artist", "Test Album")
+            .await;
         mock.clear_now_playing("zone-1").await;
 
         let zone = mock.get_zone("zone-1").await.unwrap();

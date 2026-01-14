@@ -375,7 +375,7 @@ mod error_handling {
 
 mod mock_server_tests {
     use super::*;
-    use crate::mock_servers::{MockLmsServer, MockHqpServer, MockUpnpRenderer, MockOpenHomeDevice};
+    use crate::mock_servers::{MockHqpServer, MockLmsServer, MockOpenHomeDevice, MockUpnpRenderer};
 
     #[tokio::test]
     async fn lms_connects_to_mock_server() {
@@ -420,7 +420,13 @@ mod mock_server_tests {
         mock.add_player("aa:bb:cc:dd:ee:ff", "Test Player").await;
         mock.set_mode("aa:bb:cc:dd:ee:ff", "play").await;
         mock.set_volume("aa:bb:cc:dd:ee:ff", 75).await;
-        mock.set_now_playing("aa:bb:cc:dd:ee:ff", "Test Song", "Test Artist", "Test Album").await;
+        mock.set_now_playing(
+            "aa:bb:cc:dd:ee:ff",
+            "Test Song",
+            "Test Artist",
+            "Test Album",
+        )
+        .await;
 
         let (bus, _rx) = test_bus();
         let adapter = LmsAdapter::new(bus);
@@ -456,8 +462,11 @@ mod mock_server_tests {
         // because HQP adapter uses a complex TCP protocol
         let mut stream = tokio::net::TcpStream::connect(mock.addr()).await.unwrap();
 
-        use tokio::io::{AsyncWriteExt, AsyncReadExt};
-        stream.write_all(b"<?xml version=\"1.0\"?>\n").await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream
+            .write_all(b"<?xml version=\"1.0\"?>\n")
+            .await
+            .unwrap();
         stream.write_all(b"<GetInfo/>\n").await.unwrap();
 
         let mut response = vec![0u8; 1024];
@@ -496,7 +505,13 @@ mod mock_server_tests {
         let mock = MockOpenHomeDevice::start().await;
         mock.set_state("Playing").await;
         mock.set_volume(65).await;
-        mock.set_track("Test Track", "Test Artist", "Test Album", "http://example.com/art.jpg").await;
+        mock.set_track(
+            "Test Track",
+            "Test Artist",
+            "Test Album",
+            "http://example.com/art.jpg",
+        )
+        .await;
 
         let client = reqwest::Client::new();
         let response = client

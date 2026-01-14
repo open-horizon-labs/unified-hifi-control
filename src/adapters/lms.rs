@@ -364,7 +364,11 @@ impl LmsAdapter {
                             state.port = saved.port;
                             state.username = saved.username;
                             state.password = saved.password;
-                            tracing::info!("Loaded LMS config from disk: {}:{}", saved.host, saved.port);
+                            tracing::info!(
+                                "Loaded LMS config from disk: {}:{}",
+                                saved.host,
+                                saved.port
+                            );
                         }
                     }
                     Err(e) => tracing::warn!("Failed to parse LMS config: {}", e),
@@ -623,7 +627,8 @@ impl LmsAdapter {
         // Add basic auth if configured
         if let (Some(ref user), Some(ref pass)) = (username, password) {
             use base64::Engine;
-            let auth = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
+            let auth =
+                base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
             req = req.header("Authorization", format!("Basic {}", auth));
         }
 

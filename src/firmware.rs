@@ -89,7 +89,10 @@ impl FirmwareService {
 
     /// Fetch latest release info from GitHub
     async fn fetch_latest_release(&self) -> Result<Option<GitHubRelease>> {
-        let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+        let url = format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            GITHUB_REPO
+        );
         let response = self.client.get(&url).send().await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -109,19 +112,31 @@ impl FirmwareService {
     }
 
     /// Download firmware from GitHub release
-    async fn download_firmware(&self, asset: &GitHubAsset, version: &str, release_url: &str) -> Result<()> {
+    async fn download_firmware(
+        &self,
+        asset: &GitHubAsset,
+        version: &str,
+        release_url: &str,
+    ) -> Result<()> {
         let fw_dir = Self::firmware_dir();
         std::fs::create_dir_all(&fw_dir)?;
 
         let firmware_path = fw_dir.join(FIRMWARE_FILENAME);
         let temp_path = fw_dir.join(format!("{}.tmp", FIRMWARE_FILENAME));
 
-        tracing::info!("Downloading firmware v{} from {}", version, asset.browser_download_url);
+        tracing::info!(
+            "Downloading firmware v{} from {}",
+            version,
+            asset.browser_download_url
+        );
 
         // Download to temp file
         let response = self.client.get(&asset.browser_download_url).send().await?;
         if !response.status().is_success() {
-            return Err(anyhow!("Failed to download firmware: {}", response.status()));
+            return Err(anyhow!(
+                "Failed to download firmware: {}",
+                response.status()
+            ));
         }
 
         let bytes = response.bytes().await?;
@@ -142,7 +157,11 @@ impl FirmwareService {
         std::fs::write(&version_path, serde_json::to_string_pretty(&version_info)?)?;
 
         let size = std::fs::metadata(&firmware_path)?.len();
-        tracing::info!("Firmware v{} downloaded successfully ({} bytes)", version, size);
+        tracing::info!(
+            "Firmware v{} downloaded successfully ({} bytes)",
+            version,
+            size
+        );
 
         Ok(())
     }
@@ -165,8 +184,12 @@ impl FirmwareService {
         for i in 0..3 {
             let r = remote_parts.get(i).unwrap_or(&0);
             let l = local_parts.get(i).unwrap_or(&0);
-            if r > l { return true; }
-            if r < l { return false; }
+            if r > l {
+                return true;
+            }
+            if r < l {
+                return false;
+            }
         }
         false
     }
@@ -205,12 +228,17 @@ impl FirmwareService {
             }
 
             if !needs_update {
-                tracing::debug!("Firmware is up to date (v{})", current_version.unwrap_or_default());
+                tracing::debug!(
+                    "Firmware is up to date (v{})",
+                    current_version.unwrap_or_default()
+                );
                 return Ok(false);
             }
 
             // Find firmware asset
-            let asset = release.assets.iter()
+            let asset = release
+                .assets
+                .iter()
                 .find(|a| a.name == FIRMWARE_FILENAME)
                 .ok_or_else(|| anyhow!("Firmware asset not found in release"))?;
 
@@ -220,9 +248,11 @@ impl FirmwareService {
                 current_version.as_deref().unwrap_or("none")
             );
 
-            self.download_firmware(asset, &latest_version, &release.html_url).await?;
+            self.download_firmware(asset, &latest_version, &release.html_url)
+                .await?;
             Ok(true)
-        }.await;
+        }
+        .await;
 
         {
             let mut state = self.state.write().await;

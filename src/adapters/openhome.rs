@@ -241,7 +241,9 @@ impl OpenHomeAdapter {
 
                         // Extract UUID from USN
                         let uuid = match usn.split("::").next() {
-                            Some(s) if s.starts_with("uuid:") => s.trim_start_matches("uuid:").to_string(),
+                            Some(s) if s.starts_with("uuid:") => {
+                                s.trim_start_matches("uuid:").to_string()
+                            }
                             _ => continue,
                         };
 
@@ -252,7 +254,12 @@ impl OpenHomeAdapter {
                             continue;
                         }
 
-                        tracing::info!("Discovered OpenHome device: {} at {} (via {})", uuid, location, urn_str);
+                        tracing::info!(
+                            "Discovered OpenHome device: {} at {} (via {})",
+                            uuid,
+                            location,
+                            urn_str
+                        );
 
                         // New device
                         let device = OpenHomeDevice {
@@ -279,10 +286,19 @@ impl OpenHomeAdapter {
                         let uuid_clone = uuid.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                Self::fetch_device_info(&state_clone, &http_clone, &uuid_clone, &location).await
+                            if let Err(e) = Self::fetch_device_info(
+                                &state_clone,
+                                &http_clone,
+                                &uuid_clone,
+                                &location,
+                            )
+                            .await
                             {
-                                tracing::warn!("Failed to fetch device info for {}: {}", uuid_clone, e);
+                                tracing::warn!(
+                                    "Failed to fetch device info for {}: {}",
+                                    uuid_clone,
+                                    e
+                                );
                             }
                             bus_clone.publish(BusEvent::ZoneUpdated {
                                 zone_id: format!("openhome:{}", uuid_clone),

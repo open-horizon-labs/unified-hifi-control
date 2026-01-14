@@ -23,7 +23,7 @@ pub fn advertise(port: u16, name: &str, base_url: &str) -> anyhow::Result<Servic
         service_type,
         name,
         &gethostname::gethostname().to_string_lossy(),
-        (),  // All local addresses
+        (), // All local addresses
         port,
         Some(txt),
     )?;

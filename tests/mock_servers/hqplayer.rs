@@ -73,7 +73,11 @@ impl MockHqpServer {
             }
         });
 
-        Self { addr, state, handle }
+        Self {
+            addr,
+            state,
+            handle,
+        }
     }
 
     /// Get the server address

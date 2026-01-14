@@ -70,18 +70,33 @@ async fn create_test_app() -> Router {
         .route("/hqplayer/pipeline", get(api::hqp_pipeline_handler))
         .route("/hqplayer/config", get(api::hqp_config_handler))
         .route("/hqplayer/profiles", get(api::hqp_profiles_handler))
-        .route("/hqplayer/matrix/profiles", get(api::hqp_matrix_profiles_handler))
+        .route(
+            "/hqplayer/matrix/profiles",
+            get(api::hqp_matrix_profiles_handler),
+        )
         // HQPlayer multi-instance routes
         .route("/hqp/instances", get(api::hqp_instances_handler))
         .route("/hqp/instances", post(api::hqp_add_instance_handler))
-        .route("/hqp/instances/{name}", delete(api::hqp_remove_instance_handler))
-        .route("/hqp/instances/{name}/profiles", get(api::hqp_instance_profiles_handler))
-        .route("/hqp/instances/{name}/matrix/profiles", get(api::hqp_instance_matrix_profiles_handler))
+        .route(
+            "/hqp/instances/{name}",
+            delete(api::hqp_remove_instance_handler),
+        )
+        .route(
+            "/hqp/instances/{name}/profiles",
+            get(api::hqp_instance_profiles_handler),
+        )
+        .route(
+            "/hqp/instances/{name}/matrix/profiles",
+            get(api::hqp_instance_matrix_profiles_handler),
+        )
         // HQPlayer zone linking routes
         .route("/hqp/zones/links", get(api::hqp_zone_links_handler))
         .route("/hqp/zones/link", post(api::hqp_zone_link_handler))
         .route("/hqp/zones/unlink", post(api::hqp_zone_unlink_handler))
-        .route("/hqp/zones/{zone_id}/pipeline", get(api::hqp_zone_pipeline_handler))
+        .route(
+            "/hqp/zones/{zone_id}/pipeline",
+            get(api::hqp_zone_pipeline_handler),
+        )
         .route("/hqp/discover", get(api::hqp_discover_handler))
         // LMS routes
         .route("/lms/status", get(api::lms_status_handler))
@@ -91,11 +106,17 @@ async fn create_test_app() -> Router {
         // OpenHome routes
         .route("/openhome/status", get(api::openhome_status_handler))
         .route("/openhome/zones", get(api::openhome_zones_handler))
-        .route("/openhome/zone/{zone_id}/now_playing", get(api::openhome_now_playing_handler))
+        .route(
+            "/openhome/zone/{zone_id}/now_playing",
+            get(api::openhome_now_playing_handler),
+        )
         // UPnP routes
         .route("/upnp/status", get(api::upnp_status_handler))
         .route("/upnp/zones", get(api::upnp_zones_handler))
-        .route("/upnp/zone/{zone_id}/now_playing", get(api::upnp_now_playing_handler))
+        .route(
+            "/upnp/zone/{zone_id}/now_playing",
+            get(api::upnp_now_playing_handler),
+        )
         // App settings API
         .route("/api/settings", get(api::api_settings_get_handler))
         // Knob protocol routes (MUST return JSON)
@@ -104,7 +125,10 @@ async fn create_test_app() -> Router {
         .route("/now_playing/image", get(knobs::knob_image_handler))
         .route("/control", post(knobs::knob_control_handler))
         .route("/config/{knob_id}", get(knobs::knob_config_by_path_handler))
-        .route("/config/{knob_id}", put(knobs::knob_config_update_by_path_handler))
+        .route(
+            "/config/{knob_id}",
+            put(knobs::knob_config_update_by_path_handler),
+        )
         .route("/knob/zones", get(knobs::knob_zones_handler))
         .route("/knob/now_playing", get(knobs::knob_now_playing_handler))
         .route("/knob/config", get(knobs::knob_config_handler))
@@ -124,12 +148,7 @@ async fn create_test_app() -> Router {
 async fn get_body(app: &Router, path: &str) -> (StatusCode, String) {
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .uri(path)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
         .await
         .unwrap();
 
@@ -187,7 +206,10 @@ mod protocol_endpoints {
 
         // Verify structure
         let json: Value = serde_json::from_str(&body).unwrap();
-        assert!(json.get("zones").is_some(), "/zones must have 'zones' field");
+        assert!(
+            json.get("zones").is_some(),
+            "/zones must have 'zones' field"
+        );
     }
 
     #[tokio::test]
@@ -477,8 +499,7 @@ mod protocol_ui_separation {
         );
 
         // Must be valid JSON
-        let json: Value = serde_json::from_str(&body)
-            .expect("/zones must return valid JSON");
+        let json: Value = serde_json::from_str(&body).expect("/zones must return valid JSON");
 
         // Must have zones array
         assert!(

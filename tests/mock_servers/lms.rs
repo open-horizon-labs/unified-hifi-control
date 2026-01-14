@@ -2,12 +2,7 @@
 //!
 //! Simulates the JSON-RPC interface at /jsonrpc.js
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::post,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -83,7 +78,11 @@ impl MockLmsServer {
             axum::serve(listener, app).await.unwrap();
         });
 
-        Self { addr, state, handle }
+        Self {
+            addr,
+            state,
+            handle,
+        }
     }
 
     /// Get the server address
@@ -94,10 +93,9 @@ impl MockLmsServer {
     /// Add a player to the mock server
     pub async fn add_player(&self, playerid: &str, name: &str) {
         let mut state = self.state.write().await;
-        state.players.insert(
-            playerid.to_string(),
-            MockPlayer::new(playerid, name),
-        );
+        state
+            .players
+            .insert(playerid.to_string(), MockPlayer::new(playerid, name));
     }
 
     /// Set player state (play/pause/stop)

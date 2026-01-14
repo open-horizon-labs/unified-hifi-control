@@ -82,7 +82,11 @@ impl MockOpenHomeDevice {
             axum::serve(listener, app).await.unwrap();
         });
 
-        Self { addr, state, handle }
+        Self {
+            addr,
+            state,
+            handle,
+        }
     }
 
     /// Get the server address
@@ -131,7 +135,9 @@ impl MockOpenHomeDevice {
 }
 
 /// Handle device description request
-async fn handle_description(State(state): State<Arc<RwLock<MockOpenHomeState>>>) -> impl IntoResponse {
+async fn handle_description(
+    State(state): State<Arc<RwLock<MockOpenHomeState>>>,
+) -> impl IntoResponse {
     let state = state.read().await;
 
     let xml = format!(
@@ -203,8 +209,11 @@ async fn handle_transport(
 </s:Envelope>"#,
             state_guard.state
         )
-    } else if action.contains("Play") || action.contains("Pause") || action.contains("Stop")
-        || action.contains("SkipNext") || action.contains("SkipPrevious")
+    } else if action.contains("Play")
+        || action.contains("Pause")
+        || action.contains("Stop")
+        || action.contains("SkipNext")
+        || action.contains("SkipPrevious")
     {
         let action_name = if action.contains("Play") {
             "Play"

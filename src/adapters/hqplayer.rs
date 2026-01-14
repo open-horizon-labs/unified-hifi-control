@@ -404,7 +404,11 @@ impl HqpAdapter {
                             state.web_port = saved.web_port;
                             state.web_username = saved.username;
                             state.web_password = saved.password;
-                            tracing::info!("Loaded HQPlayer config from disk: {}:{}", saved.host, saved.port);
+                            tracing::info!(
+                                "Loaded HQPlayer config from disk: {}:{}",
+                                saved.host,
+                                saved.port
+                            );
                         }
                     }
                     Err(e) => tracing::warn!("Failed to parse HQPlayer config: {}", e),
@@ -677,8 +681,7 @@ impl HqpAdapter {
                     response.push_str(&line);
                     // Check if response is complete (has closing XML tag or is self-closing)
                     let trimmed = response.trim();
-                    if trimmed.ends_with("/>")
-                        || (trimmed.contains("</") && trimmed.ends_with(">"))
+                    if trimmed.ends_with("/>") || (trimmed.contains("</") && trimmed.ends_with(">"))
                     {
                         complete = true;
                     }
@@ -1653,8 +1656,8 @@ impl HqpAdapter {
         // HQPlayer returns current profile - try both 'value' (as per Node.js reference)
         // and 'name' attribute for compatibility
         let index = Self::parse_attr_u32(&response, "index");
-        let name = Self::parse_attr(&response, "value")
-            .or_else(|| Self::parse_attr(&response, "name"));
+        let name =
+            Self::parse_attr(&response, "value").or_else(|| Self::parse_attr(&response, "name"));
 
         match name {
             Some(n) if !n.is_empty() => Ok(Some(MatrixProfile { index, name: n })),
@@ -1888,17 +1891,15 @@ impl HqpZoneLinkService {
         }
 
         match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                match serde_json::from_str::<HashMap<String, String>>(&content) {
-                    Ok(saved_links) => {
-                        if let Ok(mut links) = self.links.try_write() {
-                            *links = saved_links;
-                            tracing::info!("Loaded {} HQP zone links from disk", links.len());
-                        }
+            Ok(content) => match serde_json::from_str::<HashMap<String, String>>(&content) {
+                Ok(saved_links) => {
+                    if let Ok(mut links) = self.links.try_write() {
+                        *links = saved_links;
+                        tracing::info!("Loaded {} HQP zone links from disk", links.len());
                     }
-                    Err(e) => tracing::warn!("Failed to parse zone links: {}", e),
                 }
-            }
+                Err(e) => tracing::warn!("Failed to parse zone links: {}", e),
+            },
             Err(e) => tracing::warn!("Failed to read zone links: {}", e),
         }
     }
@@ -1986,11 +1987,7 @@ impl HqpZoneLinkService {
         match adapter.get_pipeline_status().await {
             Ok(pipeline) => Some(pipeline),
             Err(e) => {
-                tracing::error!(
-                    "Failed to fetch HQP pipeline for zone {}: {}",
-                    zone_id,
-                    e
-                );
+                tracing::error!("Failed to fetch HQP pipeline for zone {}: {}", zone_id, e);
                 None
             }
         }
@@ -2094,7 +2091,11 @@ pub async fn discover_hqplayers(timeout_ms: Option<u64>) -> Result<Vec<Discovere
     let dest = SocketAddrV4::new(HQP_MULTICAST_ADDR, HQP_DISCOVERY_PORT);
     socket.send_to(message, dest).await?;
 
-    tracing::debug!("Sent HQPlayer discovery multicast to {}:{}", HQP_MULTICAST_ADDR, HQP_DISCOVERY_PORT);
+    tracing::debug!(
+        "Sent HQPlayer discovery multicast to {}:{}",
+        HQP_MULTICAST_ADDR,
+        HQP_DISCOVERY_PORT
+    );
 
     // Receive responses with timeout
     let mut buf = [0u8; 2048];

@@ -73,7 +73,11 @@ impl MockUpnpRenderer {
             axum::serve(listener, app).await.unwrap();
         });
 
-        Self { addr, state, handle }
+        Self {
+            addr,
+            state,
+            handle,
+        }
     }
 
     /// Get the server address

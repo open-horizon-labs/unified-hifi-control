@@ -224,7 +224,10 @@ pub async fn roon_image_handler(
         Ok(image_data) => {
             let headers = [(
                 axum::http::header::CONTENT_TYPE,
-                image_data.content_type.parse().unwrap_or(axum::http::HeaderValue::from_static("image/jpeg")),
+                image_data
+                    .content_type
+                    .parse()
+                    .unwrap_or(axum::http::HeaderValue::from_static("image/jpeg")),
             )];
             (StatusCode::OK, headers, image_data.data).into_response()
         }
@@ -858,7 +861,12 @@ pub async fn hqp_detect_handler(Json(req): Json<HqpDetectRequest>) -> impl IntoR
     // Try to connect to HQPlayer's native protocol port
     let addr = format!("{}:{}", req.host, req.port);
 
-    let stream = match timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&addr)).await {
+    let stream = match timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
         Ok(Ok(stream)) => stream,
         Ok(Err(_)) | Err(_) => {
             return Json(serde_json::json!({
@@ -884,7 +892,11 @@ pub async fn hqp_detect_handler(Json(req): Json<HqpDetectRequest>) -> impl IntoR
     }
 
     // Send INFO command
-    if write_half.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><info/>\n").await.is_err() {
+    if write_half
+        .write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><info/>\n")
+        .await
+        .is_err()
+    {
         return Json(serde_json::json!({
             "reachable": false,
             "error": "Failed to send command to HQPlayer"
@@ -1012,7 +1024,11 @@ pub async fn hqp_remove_instance_handler(
     let _links_removed = state.hqp_zone_links.remove_links_for_instance(&name).await;
 
     if state.hqp_instances.remove_instance(&name).await {
-        (StatusCode::OK, Json(serde_json::json!({"ok": true, "removed": name}))).into_response()
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "removed": name})),
+        )
+            .into_response()
     } else {
         (
             StatusCode::NOT_FOUND,
@@ -1074,7 +1090,11 @@ pub async fn hqp_instance_load_profile_handler(
     };
 
     match adapter.load_profile(&req.profile).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "instance": name, "profile": req.profile}))).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "instance": name, "profile": req.profile})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1152,7 +1172,11 @@ pub async fn hqp_instance_set_matrix_profile_handler(
     };
 
     match adapter.set_matrix_profile(req.value).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "instance": name, "value": req.value}))).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "instance": name, "value": req.value})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1273,7 +1297,10 @@ pub async fn hqp_zone_pipeline_handler(
         None => (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                error: format!("Zone {} not linked to HQPlayer or HQPlayer not configured", zone_id),
+                error: format!(
+                    "Zone {} not linked to HQPlayer or HQPlayer not configured",
+                    zone_id
+                ),
             }),
         )
             .into_response(),
@@ -1292,13 +1319,15 @@ pub struct HqpDiscoverRequest {
 }
 
 /// GET /hqp/discover - Discover HQPlayer instances on the network via UDP multicast
-pub async fn hqp_discover_handler(
-    Query(params): Query<HqpDiscoverRequest>,
-) -> impl IntoResponse {
+pub async fn hqp_discover_handler(Query(params): Query<HqpDiscoverRequest>) -> impl IntoResponse {
     use crate::adapters::hqplayer::discover_hqplayers;
 
     match discover_hqplayers(params.timeout_ms).await {
-        Ok(instances) => (StatusCode::OK, Json(serde_json::json!({ "discovered": instances }))).into_response(),
+        Ok(instances) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "discovered": instances })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1399,9 +1428,7 @@ pub async fn api_settings_get_handler() -> impl IntoResponse {
 }
 
 /// POST /api/settings - Update app settings
-pub async fn api_settings_post_handler(
-    Json(settings): Json<AppSettings>,
-) -> impl IntoResponse {
+pub async fn api_settings_post_handler(Json(settings): Json<AppSettings>) -> impl IntoResponse {
     if save_app_settings(&settings) {
         Json(serde_json::json!({"ok": true}))
     } else {
