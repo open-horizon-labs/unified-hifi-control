@@ -1,7 +1,8 @@
 [package]
 name = "unified-hifi-control"
-version = "0.1.0"
+version = "3.0.0-rc.1"
 edition = "2021"
+authors = ["Muness Castle"]
 description = "Source-agnostic hi-fi control bridge for hardware surfaces and Home Assistant"
 license = "MIT"
 repository = "https://github.com/open-horizon-labs/unified-hifi-control"
@@ -67,6 +68,9 @@ tokio-util = "0.7"
 
 # SSDP/UPnP discovery
 ssdp-client = "2"
+base64 = "0.22.1"
+mdns-sd = "0.17.1"
+gethostname = "1.1.0"
 
 [[bin]]
 name = "unified-hifi-control"

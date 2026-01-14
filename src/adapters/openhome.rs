@@ -17,7 +17,14 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
-const OPENHOME_PRODUCT_URN: &str = "urn:av-openhome-org:service:Product:1";
+/// OpenHome URNs to search for - devices may advertise different services
+const OPENHOME_URNS: &[&str] = &[
+    "urn:av-openhome-org:service:Product:1",
+    "urn:av-openhome-org:service:Product:2",
+    "urn:av-openhome-org:service:Transport:1",
+    "urn:av-openhome-org:service:Volume:1",
+    "urn:av-openhome-org:service:Volume:2",
+];
 const SSDP_SEARCH_INTERVAL: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const STALE_THRESHOLD: Duration = Duration::from_secs(90);
@@ -202,76 +209,93 @@ impl OpenHomeAdapter {
         bus: &SharedBus,
         http: &Client,
     ) -> anyhow::Result<()> {
-        let urn: URN = OPENHOME_PRODUCT_URN.parse()?;
-        let search_target = SearchTarget::URN(urn);
-        let responses =
-            ssdp_client::search(&search_target, Duration::from_secs(3), 2, None).await?;
-
-        futures::pin_mut!(responses);
-
-        while let Some(response) = responses.next().await {
-            let response = match response {
-                Ok(r) => r,
+        // Search for all known OpenHome URNs - devices may advertise different services
+        for urn_str in OPENHOME_URNS {
+            let urn: URN = match urn_str.parse() {
+                Ok(u) => u,
                 Err(e) => {
-                    tracing::debug!("SSDP response error: {}", e);
+                    tracing::warn!("Failed to parse URN {}: {}", urn_str, e);
                     continue;
                 }
             };
+            let search_target = SearchTarget::URN(urn);
 
-            let location = response.location().to_string();
-            let usn = response.usn();
+            match ssdp_client::search(&search_target, Duration::from_secs(2), 2, None).await {
+                Ok(responses) => {
+                    futures::pin_mut!(responses);
 
-            // Extract UUID from USN
-            let uuid = match usn.split("::").next() {
-                Some(s) if s.starts_with("uuid:") => s.trim_start_matches("uuid:").to_string(),
-                _ => continue,
-            };
+                    while let Some(response) = responses.next().await {
+                        let response = match response {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::debug!("SSDP response error: {}", e);
+                                continue;
+                            }
+                        };
 
-            // Update existing or add new
-            let mut s = state.write().await;
-            if let Some(device) = s.devices.get_mut(&uuid) {
-                device.last_seen = std::time::Instant::now();
-                continue;
-            }
+                        let location = response.location().to_string();
+                        let usn = response.usn();
 
-            tracing::info!("Discovered OpenHome device: {} at {}", uuid, location);
+                        // Log what we're finding
+                        tracing::debug!("OpenHome SSDP response: usn={} loc={}", usn, location);
 
-            // New device
-            let device = OpenHomeDevice {
-                uuid: uuid.clone(),
-                name: format!("OpenHome {}", &uuid[..8.min(uuid.len())]),
-                manufacturer: None,
-                model: None,
-                location: location.clone(),
-                state: "stopped".to_string(),
-                volume: None,
-                muted: false,
-                track_info: None,
-                last_seen: std::time::Instant::now(),
-                last_track_uri: None,
-            };
+                        // Extract UUID from USN
+                        let uuid = match usn.split("::").next() {
+                            Some(s) if s.starts_with("uuid:") => s.trim_start_matches("uuid:").to_string(),
+                            _ => continue,
+                        };
 
-            s.devices.insert(uuid.clone(), device);
-            drop(s);
+                        // Update existing or add new
+                        let mut s = state.write().await;
+                        if let Some(device) = s.devices.get_mut(&uuid) {
+                            device.last_seen = std::time::Instant::now();
+                            continue;
+                        }
 
-            // Fetch device description
-            let state_clone = state.clone();
-            let http_clone = http.clone();
-            let bus_clone = bus.clone();
-            let uuid_clone = uuid.clone();
+                        tracing::info!("Discovered OpenHome device: {} at {} (via {})", uuid, location, urn_str);
 
-            tokio::spawn(async move {
-                if let Err(e) =
-                    Self::fetch_device_info(&state_clone, &http_clone, &uuid_clone, &location).await
-                {
-                    tracing::warn!("Failed to fetch device info for {}: {}", uuid_clone, e);
+                        // New device
+                        let device = OpenHomeDevice {
+                            uuid: uuid.clone(),
+                            name: format!("OpenHome {}", &uuid[..8.min(uuid.len())]),
+                            manufacturer: None,
+                            model: None,
+                            location: location.clone(),
+                            state: "stopped".to_string(),
+                            volume: None,
+                            muted: false,
+                            track_info: None,
+                            last_seen: std::time::Instant::now(),
+                            last_track_uri: None,
+                        };
+
+                        s.devices.insert(uuid.clone(), device);
+                        drop(s);
+
+                        // Fetch device description
+                        let state_clone = state.clone();
+                        let http_clone = http.clone();
+                        let bus_clone = bus.clone();
+                        let uuid_clone = uuid.clone();
+
+                        tokio::spawn(async move {
+                            if let Err(e) =
+                                Self::fetch_device_info(&state_clone, &http_clone, &uuid_clone, &location).await
+                            {
+                                tracing::warn!("Failed to fetch device info for {}: {}", uuid_clone, e);
+                            }
+                            bus_clone.publish(BusEvent::ZoneUpdated {
+                                zone_id: format!("openhome:{}", uuid_clone),
+                                display_name: uuid_clone.clone(),
+                                state: "stopped".to_string(),
+                            });
+                        });
+                    }
                 }
-                bus_clone.publish(BusEvent::ZoneUpdated {
-                    zone_id: format!("openhome:{}", uuid_clone),
-                    display_name: uuid_clone.clone(),
-                    state: "stopped".to_string(),
-                });
-            });
+                Err(e) => {
+                    tracing::debug!("SSDP search for {} failed: {}", urn_str, e);
+                }
+            }
         }
 
         Ok(())

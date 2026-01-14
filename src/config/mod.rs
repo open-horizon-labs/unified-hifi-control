@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -73,8 +74,12 @@ fn default_mqtt_port() -> u16 {
 
 /// Get config directory (XDG_CONFIG_HOME or platform default)
 pub fn get_config_dir() -> std::path::PathBuf {
-    // Check environment variable first
+    // Check UHC-specific env var first
     if let Ok(dir) = std::env::var("UHC_CONFIG_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    // Support Node.js CONFIG_DIR for seamless migration
+    if let Ok(dir) = std::env::var("CONFIG_DIR") {
         return std::path::PathBuf::from(dir);
     }
 
@@ -109,8 +114,12 @@ pub fn get_config_dir() -> std::path::PathBuf {
 
 /// Get data directory (XDG_DATA_HOME or platform default)
 pub fn get_data_dir() -> std::path::PathBuf {
-    // Check environment variable first
+    // Check UHC-specific env var first
     if let Ok(dir) = std::env::var("UHC_DATA_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    // Support Node.js CONFIG_DIR for seamless migration (Node.js uses same dir for config and data)
+    if let Ok(dir) = std::env::var("CONFIG_DIR") {
         return std::path::PathBuf::from(dir);
     }
 
@@ -162,4 +171,115 @@ pub fn load_config() -> Result<Config> {
         .build()?;
 
     Ok(config.try_deserialize()?)
+}
+
+/// Migrate Node.js config files to Rust format on startup
+///
+/// This function runs once at startup to seamlessly import Node.js configs:
+/// - roon-config.json → roon_state.json (Roon pairing state)
+/// - hqp-config.json (adjust port → web_port mapping)
+/// - app-settings.json (handled by serde aliases in AppSettings)
+/// - knobs.json (compatible format)
+pub fn migrate_nodejs_configs() {
+    let data_dir = get_data_dir();
+
+    // Ensure data directory exists
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        tracing::warn!("Failed to create data directory: {}", e);
+        return;
+    }
+
+    // Migrate Roon config (roon-config.json → roon_state.json)
+    migrate_roon_config(&data_dir);
+
+    // Migrate HQPlayer config (adjust port mapping)
+    migrate_hqp_config(&data_dir);
+
+    tracing::debug!("Node.js config migration check complete");
+}
+
+/// Migrate Roon config from Node.js format
+fn migrate_roon_config(data_dir: &PathBuf) {
+    let nodejs_path = data_dir.join("roon-config.json");
+    let rust_path = data_dir.join("roon_state.json");
+
+    // Only migrate if Node.js config exists and Rust config doesn't
+    if nodejs_path.exists() && !rust_path.exists() {
+        match std::fs::read_to_string(&nodejs_path) {
+            Ok(content) => {
+                // The format is compatible - both use the same Roon API state structure
+                match std::fs::write(&rust_path, &content) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Migrated Roon config from Node.js: {} → {}",
+                            nodejs_path.display(),
+                            rust_path.display()
+                        );
+                    }
+                    Err(e) => tracing::warn!("Failed to write Roon state file: {}", e),
+                }
+            }
+            Err(e) => tracing::warn!("Failed to read Node.js Roon config: {}", e),
+        }
+    }
+}
+
+/// Migrate HQPlayer config from Node.js format
+fn migrate_hqp_config(data_dir: &PathBuf) {
+    let hqp_path = data_dir.join("hqp-config.json");
+
+    if !hqp_path.exists() {
+        return;
+    }
+
+    // Read the existing config
+    let content = match std::fs::read_to_string(&hqp_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Check if it's Node.js format (single object without web_port field)
+    // Node.js format: {"host":"...", "port":8088, "username":"...", "password":"..."}
+    // Rust format: {"host":"...", "port":4321, "web_port":8088, ...} or array format
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+        // Skip if already migrated (has web_port or is array format)
+        if value.is_array() {
+            return;
+        }
+        if value.get("web_port").is_some() {
+            return;
+        }
+
+        // It's Node.js single-object format - convert it
+        if let Some(obj) = value.as_object() {
+            let host = obj.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            let nodejs_port = obj.get("port").and_then(|v| v.as_u64()).unwrap_or(8088) as u16;
+            let username = obj.get("username").and_then(|v| v.as_str());
+            let password = obj.get("password").and_then(|v| v.as_str());
+
+            // In Node.js, "port" is the web UI port (8088)
+            // In Rust, "port" is the native protocol port (4321), "web_port" is web UI
+            let rust_config = serde_json::json!([{
+                "name": "default",
+                "host": host,
+                "port": 4321,  // Native protocol port
+                "web_port": nodejs_port,  // Node.js port becomes web_port
+                "username": username,
+                "password": password
+            }]);
+
+            if let Ok(json) = serde_json::to_string_pretty(&rust_config) {
+                match std::fs::write(&hqp_path, &json) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Migrated HQPlayer config from Node.js format (port {} → web_port {})",
+                            nodejs_port,
+                            nodejs_port
+                        );
+                    }
+                    Err(e) => tracing::warn!("Failed to write migrated HQP config: {}", e),
+                }
+            }
+        }
+    }
 }

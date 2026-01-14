@@ -12,14 +12,119 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 
 use crate::bus::{BusEvent, SharedBus};
+use crate::config::get_config_dir;
+
+const HQP_CONFIG_FILE: &str = "hqp-config.json";
+
+/// Saved config for persistence (single instance format)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedHqpConfig {
+    host: String,
+    port: u16,
+    web_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+}
+
+/// Named instance config (for multi-instance support)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HqpInstanceConfig {
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default = "default_web_port")]
+    pub web_port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+fn default_port() -> u16 {
+    DEFAULT_PORT
+}
+
+fn default_web_port() -> u16 {
+    DEFAULT_WEB_PORT
+}
+
+fn hqp_config_path() -> PathBuf {
+    get_config_dir().join(HQP_CONFIG_FILE)
+}
+
+/// Load HQP config from disk (supports both single-object and array formats)
+pub fn load_hqp_configs() -> Vec<HqpInstanceConfig> {
+    let path = hqp_config_path();
+    if !path.exists() {
+        return Vec::new();
+    }
+
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            // Try parsing as array first
+            if let Ok(configs) = serde_json::from_str::<Vec<HqpInstanceConfig>>(&content) {
+                return configs;
+            }
+
+            // Fall back to single-object format (legacy)
+            if let Ok(single) = serde_json::from_str::<SavedHqpConfig>(&content) {
+                return vec![HqpInstanceConfig {
+                    name: "default".to_string(),
+                    host: single.host,
+                    port: single.port,
+                    web_port: single.web_port,
+                    username: single.username,
+                    password: single.password,
+                }];
+            }
+
+            tracing::warn!("Failed to parse HQP config file");
+            Vec::new()
+        }
+        Err(e) => {
+            tracing::warn!("Failed to read HQP config: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Save HQP configs to disk (always saves as array)
+pub fn save_hqp_configs(configs: &[HqpInstanceConfig]) -> bool {
+    let path = hqp_config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    match serde_json::to_string_pretty(configs) {
+        Ok(json) => match std::fs::write(&path, json) {
+            Ok(()) => {
+                tracing::info!("Saved HQP config ({} instances)", configs.len());
+                true
+            }
+            Err(e) => {
+                tracing::error!("Failed to save HQP config: {}", e);
+                false
+            }
+        },
+        Err(e) => {
+            tracing::error!("Failed to serialize HQP config: {}", e);
+            false
+        }
+    }
+}
 
 const DEFAULT_PORT: u16 = 4321;
 const DEFAULT_WEB_PORT: u16 = 8088;
@@ -97,7 +202,7 @@ pub struct VolumeRange {
 pub struct ListItem {
     pub index: u32,
     pub name: String,
-    pub value: u32,
+    pub value: i32, // Can be negative (e.g., -1 for PCM mode)
 }
 
 /// Rate item
@@ -112,7 +217,7 @@ pub struct RateItem {
 pub struct FilterItem {
     pub index: u32,
     pub name: String,
-    pub value: u32,
+    pub value: i32, // Filter values can be negative
     pub arg: u32,
 }
 
@@ -164,9 +269,11 @@ pub struct PipelineVolume {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PipelineSettings {
     pub mode: PipelineSetting,
     pub filter1x: PipelineSetting,
+    #[serde(rename = "filterNx")]
     pub filter_nx: PipelineSetting,
     pub shaper: PipelineSetting,
     pub samplerate: PipelineSetting,
@@ -178,6 +285,7 @@ pub struct HqpConnectionStatus {
     pub connected: bool,
     pub host: Option<String>,
     pub port: u16,
+    pub web_port: u16,
     pub info: Option<HqpInfo>,
 }
 
@@ -203,6 +311,7 @@ pub struct MatrixProfile {
 
 /// Internal adapter state
 struct HqpAdapterState {
+    instance_name: Option<String>,
     host: Option<String>,
     port: u16,
     web_port: u16,
@@ -236,6 +345,7 @@ struct DigestAuth {
 impl Default for HqpAdapterState {
     fn default() -> Self {
         Self {
+            instance_name: None,
             host: None,
             port: DEFAULT_PORT,
             web_port: DEFAULT_WEB_PORT,
@@ -267,7 +377,7 @@ pub struct HqpAdapter {
 
 impl HqpAdapter {
     pub fn new(bus: SharedBus) -> Self {
-        Self {
+        let adapter = Self {
             state: Arc::new(RwLock::new(HqpAdapterState::default())),
             connection: Arc::new(Mutex::new(None)),
             http_client: Client::builder()
@@ -275,6 +385,60 @@ impl HqpAdapter {
                 .build()
                 .expect("Failed to create HTTP client"),
             bus,
+        };
+        // Load saved config synchronously at startup
+        adapter.load_config_sync();
+        adapter
+    }
+
+    /// Load config from disk (sync, for startup)
+    fn load_config_sync(&self) {
+        let path = hqp_config_path();
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<SavedHqpConfig>(&content) {
+                    Ok(saved) => {
+                        if let Ok(mut state) = self.state.try_write() {
+                            state.host = Some(saved.host.clone());
+                            state.port = saved.port;
+                            state.web_port = saved.web_port;
+                            state.web_username = saved.username;
+                            state.web_password = saved.password;
+                            tracing::info!("Loaded HQPlayer config from disk: {}:{}", saved.host, saved.port);
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to parse HQPlayer config: {}", e),
+                },
+                Err(e) => tracing::warn!("Failed to read HQPlayer config: {}", e),
+            }
+        }
+    }
+
+    /// Save config to disk
+    async fn save_config(&self) {
+        let state = self.state.read().await;
+        if let Some(ref host) = state.host {
+            let saved = SavedHqpConfig {
+                host: host.clone(),
+                port: state.port,
+                web_port: state.web_port,
+                username: state.web_username.clone(),
+                password: state.web_password.clone(),
+            };
+            let path = hqp_config_path();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match serde_json::to_string_pretty(&saved) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(&path, json) {
+                        tracing::error!("Failed to save HQPlayer config: {}", e);
+                    } else {
+                        tracing::info!("Saved HQPlayer config to disk");
+                    }
+                }
+                Err(e) => tracing::error!("Failed to serialize HQPlayer config: {}", e),
+            }
         }
     }
 
@@ -287,25 +451,34 @@ impl HqpAdapter {
         web_username: Option<String>,
         web_password: Option<String>,
     ) {
-        let mut state = self.state.write().await;
-        let port = port.unwrap_or(DEFAULT_PORT);
+        let changed = {
+            let mut state = self.state.write().await;
+            let port = port.unwrap_or(DEFAULT_PORT);
 
-        let changed = state.host.as_ref() != Some(&host) || state.port != port;
-        state.host = Some(host);
-        state.port = port;
-        state.web_port = web_port.unwrap_or(DEFAULT_WEB_PORT);
-        state.web_username = web_username;
-        state.web_password = web_password;
+            let changed = state.host.as_ref() != Some(&host) || state.port != port;
+            state.host = Some(host);
+            state.port = port;
+            state.web_port = web_port.unwrap_or(DEFAULT_WEB_PORT);
+            state.web_username = web_username;
+            state.web_password = web_password;
 
-        // Reset auth state when reconfiguring
-        state.digest_auth = None;
-        state.cookies.clear();
+            // Reset auth state when reconfiguring
+            state.digest_auth = None;
+            state.cookies.clear();
+
+            if changed {
+                state.connected = false;
+            }
+            changed
+        };
 
         if changed {
-            state.connected = false;
             let mut conn = self.connection.lock().await;
             *conn = None;
         }
+
+        // Persist to disk
+        self.save_config().await;
     }
 
     /// Check if web credentials are configured
@@ -326,6 +499,7 @@ impl HqpAdapter {
             connected: state.connected,
             host: state.host.clone(),
             port: state.port,
+            web_port: state.web_port,
             info: state.info.clone(),
         }
     }
@@ -488,12 +662,31 @@ impl HqpAdapter {
         conn.write_half.write_all(b"\n").await?;
         conn.write_half.flush().await?;
 
-        // Read response (single line)
+        // Read response - handle both single-line and multi-line XML
+        // HQPlayer sends responses that may span multiple lines for complex data
         let mut response = String::new();
-        timeout(RESPONSE_TIMEOUT, conn.stream.read_line(&mut response))
-            .await
-            .map_err(|_| anyhow!("Response timeout"))?
-            .map_err(|e| anyhow!("Read error: {}", e))?;
+        let mut complete = false;
+
+        while !complete {
+            let mut line = String::new();
+            let read_result = timeout(RESPONSE_TIMEOUT, conn.stream.read_line(&mut line)).await;
+
+            match read_result {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Ok(_)) => {
+                    response.push_str(&line);
+                    // Check if response is complete (has closing XML tag or is self-closing)
+                    let trimmed = response.trim();
+                    if trimmed.ends_with("/>")
+                        || (trimmed.contains("</") && trimmed.ends_with(">"))
+                    {
+                        complete = true;
+                    }
+                }
+                Ok(Err(e)) => return Err(anyhow!("Read error: {}", e)),
+                Err(_) => return Err(anyhow!("Response timeout")),
+            }
+        }
 
         Ok(response.trim().to_string())
     }
@@ -524,7 +717,7 @@ impl HqpAdapter {
         Ok(Self::parse_items(&response, "ModesItem", |item| ListItem {
             index: Self::parse_attr_u32(item, "index"),
             name: Self::parse_attr(item, "name").unwrap_or_default(),
-            value: Self::parse_attr_u32(item, "value"),
+            value: Self::parse_attr_i32(item, "value"), // Mode values can be negative (-1 for PCM)
         }))
     }
 
@@ -537,7 +730,7 @@ impl HqpAdapter {
             FilterItem {
                 index: Self::parse_attr_u32(item, "index"),
                 name: Self::parse_attr(item, "name").unwrap_or_default(),
-                value: Self::parse_attr_u32(item, "value"),
+                value: Self::parse_attr_i32(item, "value"),
                 arg: Self::parse_attr_u32(item, "arg"),
             }
         }))
@@ -552,7 +745,7 @@ impl HqpAdapter {
             ListItem {
                 index: Self::parse_attr_u32(item, "index"),
                 name: Self::parse_attr(item, "name").unwrap_or_default(),
-                value: Self::parse_attr_u32(item, "value"),
+                value: Self::parse_attr_i32(item, "value"),
             }
         }))
     }
@@ -718,7 +911,7 @@ impl HqpAdapter {
         Ok(Self::parse_items(&response, "ModesItem", |item| ListItem {
             index: Self::parse_attr_u32(item, "index"),
             name: Self::parse_attr(item, "name").unwrap_or_default(),
-            value: Self::parse_attr_u32(item, "value"),
+            value: Self::parse_attr_i32(item, "value"), // Mode values can be negative (-1 for PCM)
         }))
     }
 
@@ -731,7 +924,7 @@ impl HqpAdapter {
             FilterItem {
                 index: Self::parse_attr_u32(item, "index"),
                 name: Self::parse_attr(item, "name").unwrap_or_default(),
-                value: Self::parse_attr_u32(item, "value"),
+                value: Self::parse_attr_i32(item, "value"),
                 arg: Self::parse_attr_u32(item, "arg"),
             }
         }))
@@ -746,7 +939,7 @@ impl HqpAdapter {
             ListItem {
                 index: Self::parse_attr_u32(item, "index"),
                 name: Self::parse_attr(item, "name").unwrap_or_default(),
-                value: Self::parse_attr_u32(item, "value"),
+                value: Self::parse_attr_i32(item, "value"),
             }
         }))
     }
@@ -927,7 +1120,7 @@ impl HqpAdapter {
         let get_mode_by_value = |val: u8| -> String {
             modes
                 .iter()
-                .find(|m| m.value == val as u32)
+                .find(|m| m.value == val as i32)
                 .map(|m| m.name.clone())
                 .unwrap_or_default()
         };
@@ -1475,4 +1668,509 @@ impl HqpAdapter {
         self.send_command(&xml).await?;
         Ok(())
     }
+
+    /// Get name of this instance (if set)
+    pub async fn get_instance_name(&self) -> Option<String> {
+        let state = self.state.read().await;
+        state.instance_name.clone()
+    }
+
+    /// Set name of this instance
+    pub async fn set_instance_name(&self, name: String) {
+        let mut state = self.state.write().await;
+        state.instance_name = Some(name);
+    }
+}
+
+// =============================================================================
+// Multi-instance manager
+// =============================================================================
+
+/// Instance info for API responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HqpInstanceInfo {
+    pub name: String,
+    pub host: Option<String>,
+    pub port: u16,
+    pub connected: bool,
+    pub info: Option<HqpInfo>,
+}
+
+/// Manager for multiple HQPlayer instances
+pub struct HqpInstanceManager {
+    instances: Arc<RwLock<HashMap<String, Arc<HqpAdapter>>>>,
+    bus: SharedBus,
+}
+
+impl HqpInstanceManager {
+    /// Create a new instance manager
+    pub fn new(bus: SharedBus) -> Self {
+        Self {
+            instances: Arc::new(RwLock::new(HashMap::new())),
+            bus,
+        }
+    }
+
+    /// Load instances from config file
+    pub async fn load_from_config(&self) {
+        let configs = load_hqp_configs();
+        for config in configs {
+            let adapter = Arc::new(HqpAdapter::new(self.bus.clone()));
+            adapter.set_instance_name(config.name.clone()).await;
+            adapter
+                .configure(
+                    config.host,
+                    Some(config.port),
+                    Some(config.web_port),
+                    config.username,
+                    config.password,
+                )
+                .await;
+
+            let mut instances = self.instances.write().await;
+            instances.insert(config.name, adapter);
+        }
+    }
+
+    /// Save all instances to config file
+    pub async fn save_to_config(&self) {
+        let instances = self.instances.read().await;
+        let mut configs = Vec::new();
+
+        for (name, adapter) in instances.iter() {
+            let status = adapter.get_status().await;
+            if let Some(host) = status.host {
+                let state = adapter.state.read().await;
+                configs.push(HqpInstanceConfig {
+                    name: name.clone(),
+                    host,
+                    port: status.port,
+                    web_port: state.web_port,
+                    username: state.web_username.clone(),
+                    password: state.web_password.clone(),
+                });
+            }
+        }
+
+        save_hqp_configs(&configs);
+    }
+
+    /// Get or create an instance by name
+    pub async fn get_or_create(&self, name: &str) -> Arc<HqpAdapter> {
+        {
+            let instances = self.instances.read().await;
+            if let Some(adapter) = instances.get(name) {
+                return adapter.clone();
+            }
+        }
+
+        // Create new instance
+        let adapter = Arc::new(HqpAdapter::new(self.bus.clone()));
+        adapter.set_instance_name(name.to_string()).await;
+
+        let mut instances = self.instances.write().await;
+        instances.insert(name.to_string(), adapter.clone());
+        adapter
+    }
+
+    /// Get an instance by name (if it exists)
+    pub async fn get(&self, name: &str) -> Option<Arc<HqpAdapter>> {
+        let instances = self.instances.read().await;
+        instances.get(name).cloned()
+    }
+
+    /// Get the default instance (creates if not exists)
+    pub async fn get_default(&self) -> Arc<HqpAdapter> {
+        self.get_or_create("default").await
+    }
+
+    /// List all configured instances
+    pub async fn list_instances(&self) -> Vec<HqpInstanceInfo> {
+        let instances = self.instances.read().await;
+        let mut result = Vec::new();
+
+        for (name, adapter) in instances.iter() {
+            let status = adapter.get_status().await;
+            result.push(HqpInstanceInfo {
+                name: name.clone(),
+                host: status.host,
+                port: status.port,
+                connected: status.connected,
+                info: status.info,
+            });
+        }
+
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        result
+    }
+
+    /// Add or update an instance
+    pub async fn add_instance(
+        &self,
+        name: String,
+        host: String,
+        port: Option<u16>,
+        web_port: Option<u16>,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Arc<HqpAdapter> {
+        let adapter = self.get_or_create(&name).await;
+        adapter
+            .configure(host, port, web_port, username, password)
+            .await;
+        self.save_to_config().await;
+        adapter
+    }
+
+    /// Remove an instance by name
+    pub async fn remove_instance(&self, name: &str) -> bool {
+        let mut instances = self.instances.write().await;
+        let removed = instances.remove(name).is_some();
+        if removed {
+            drop(instances);
+            self.save_to_config().await;
+        }
+        removed
+    }
+
+    /// Check if any instance is configured
+    pub async fn has_instances(&self) -> bool {
+        let instances = self.instances.read().await;
+        !instances.is_empty()
+    }
+
+    /// Get instance count
+    pub async fn instance_count(&self) -> usize {
+        let instances = self.instances.read().await;
+        instances.len()
+    }
+}
+
+// =============================================================================
+// Zone linking service
+// =============================================================================
+
+const ZONE_LINKS_FILE: &str = "hqp-zone-links.json";
+
+fn zone_links_path() -> PathBuf {
+    get_config_dir().join(ZONE_LINKS_FILE)
+}
+
+/// Zone link info for API responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoneLink {
+    pub zone_id: String,
+    pub instance: String,
+}
+
+/// Service for managing zone-to-HQPlayer-instance links
+pub struct HqpZoneLinkService {
+    links: Arc<RwLock<HashMap<String, String>>>, // zone_id -> instance_name
+    instances: Arc<HqpInstanceManager>,
+}
+
+impl HqpZoneLinkService {
+    /// Create a new zone link service
+    pub fn new(instances: Arc<HqpInstanceManager>) -> Self {
+        let service = Self {
+            links: Arc::new(RwLock::new(HashMap::new())),
+            instances,
+        };
+        service.load_links_sync();
+        service
+    }
+
+    /// Load links from disk synchronously (at startup)
+    fn load_links_sync(&self) {
+        let path = zone_links_path();
+        if !path.exists() {
+            return;
+        }
+
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                match serde_json::from_str::<HashMap<String, String>>(&content) {
+                    Ok(saved_links) => {
+                        if let Ok(mut links) = self.links.try_write() {
+                            *links = saved_links;
+                            tracing::info!("Loaded {} HQP zone links from disk", links.len());
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to parse zone links: {}", e),
+                }
+            }
+            Err(e) => tracing::warn!("Failed to read zone links: {}", e),
+        }
+    }
+
+    /// Save links to disk
+    async fn save_links(&self) {
+        let links = self.links.read().await;
+        let path = zone_links_path();
+
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        match serde_json::to_string_pretty(&*links) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::error!("Failed to save zone links: {}", e);
+                } else {
+                    tracing::debug!("Saved {} zone links to disk", links.len());
+                }
+            }
+            Err(e) => tracing::error!("Failed to serialize zone links: {}", e),
+        }
+    }
+
+    /// Link a zone to an HQP instance
+    pub async fn link_zone(&self, zone_id: String, instance_name: String) -> Result<()> {
+        // Verify instance exists
+        if self.instances.get(&instance_name).await.is_none() {
+            return Err(anyhow!("Unknown HQP instance: {}", instance_name));
+        }
+
+        {
+            let mut links = self.links.write().await;
+            links.insert(zone_id.clone(), instance_name.clone());
+        }
+
+        self.save_links().await;
+        tracing::info!("Zone {} linked to HQP instance {}", zone_id, instance_name);
+        Ok(())
+    }
+
+    /// Unlink a zone from HQP
+    pub async fn unlink_zone(&self, zone_id: &str) -> bool {
+        let was_linked = {
+            let mut links = self.links.write().await;
+            links.remove(zone_id).is_some()
+        };
+
+        if was_linked {
+            self.save_links().await;
+            tracing::info!("Zone {} unlinked from HQP", zone_id);
+        }
+
+        was_linked
+    }
+
+    /// Get the HQP instance name for a zone
+    pub async fn get_instance_for_zone(&self, zone_id: &str) -> Option<String> {
+        let links = self.links.read().await;
+        links.get(zone_id).cloned()
+    }
+
+    /// Get all zone links
+    pub async fn get_links(&self) -> Vec<ZoneLink> {
+        let links = self.links.read().await;
+        links
+            .iter()
+            .map(|(zone_id, instance)| ZoneLink {
+                zone_id: zone_id.clone(),
+                instance: instance.clone(),
+            })
+            .collect()
+    }
+
+    /// Get HQP pipeline data for a linked zone
+    pub async fn get_pipeline_for_zone(&self, zone_id: &str) -> Option<PipelineStatus> {
+        let instance_name = self.get_instance_for_zone(zone_id).await?;
+
+        let adapter = self.instances.get(&instance_name).await?;
+        if !adapter.is_configured().await {
+            return None;
+        }
+
+        match adapter.get_pipeline_status().await {
+            Ok(pipeline) => Some(pipeline),
+            Err(e) => {
+                tracing::error!(
+                    "Failed to fetch HQP pipeline for zone {}: {}",
+                    zone_id,
+                    e
+                );
+                None
+            }
+        }
+    }
+
+    /// Remove all links pointing to a specific instance
+    pub async fn remove_links_for_instance(&self, instance_name: &str) -> usize {
+        let mut links = self.links.write().await;
+        let zones_to_remove: Vec<String> = links
+            .iter()
+            .filter(|(_, inst)| *inst == instance_name)
+            .map(|(zone_id, _)| zone_id.clone())
+            .collect();
+
+        let count = zones_to_remove.len();
+        for zone_id in zones_to_remove {
+            links.remove(&zone_id);
+        }
+
+        drop(links);
+
+        if count > 0 {
+            self.save_links().await;
+            tracing::info!(
+                "Removed {} zone links for deleted instance {}",
+                count,
+                instance_name
+            );
+        }
+
+        count
+    }
+
+    /// Auto-correct links when instances are renamed (called after loading)
+    pub async fn auto_correct_links(&self) -> bool {
+        let instances = self.instances.list_instances().await;
+        if instances.len() != 1 {
+            return false; // Can only auto-correct with single instance
+        }
+
+        let single_instance = &instances[0].name;
+        let mut corrected = false;
+
+        {
+            let mut links = self.links.write().await;
+            let instance_names: Vec<String> = instances.iter().map(|i| i.name.clone()).collect();
+
+            for (zone_id, instance_name) in links.iter_mut() {
+                if !instance_names.contains(instance_name) {
+                    tracing::warn!(
+                        "Auto-correcting zone link {} from {} to {}",
+                        zone_id,
+                        instance_name,
+                        single_instance
+                    );
+                    *instance_name = single_instance.clone();
+                    corrected = true;
+                }
+            }
+        }
+
+        if corrected {
+            self.save_links().await;
+        }
+
+        corrected
+    }
+}
+
+// =============================================================================
+// HQPlayer UDP multicast discovery
+// =============================================================================
+
+const HQP_MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 192, 0, 199);
+const HQP_DISCOVERY_PORT: u16 = 4321;
+const HQP_DISCOVERY_TIMEOUT_MS: u64 = 3000;
+
+/// Discovered HQPlayer instance
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredHqp {
+    pub host: String,
+    pub port: u16,
+    pub name: String,
+    pub version: String,
+    pub product: Option<String>,
+}
+
+/// Discover HQPlayer instances on the network via UDP multicast
+pub async fn discover_hqplayers(timeout_ms: Option<u64>) -> Result<Vec<DiscoveredHqp>> {
+    let timeout_duration = Duration::from_millis(timeout_ms.unwrap_or(HQP_DISCOVERY_TIMEOUT_MS));
+    let mut discovered: HashMap<String, DiscoveredHqp> = HashMap::new();
+
+    // Create UDP socket
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+
+    // Join multicast group
+    socket.set_broadcast(true)?;
+
+    // Send discovery message
+    let message = b"<?xml version=\"1.0\"?><discover>hqplayer</discover>";
+    let dest = SocketAddrV4::new(HQP_MULTICAST_ADDR, HQP_DISCOVERY_PORT);
+    socket.send_to(message, dest).await?;
+
+    tracing::debug!("Sent HQPlayer discovery multicast to {}:{}", HQP_MULTICAST_ADDR, HQP_DISCOVERY_PORT);
+
+    // Receive responses with timeout
+    let mut buf = [0u8; 2048];
+    let deadline = tokio::time::Instant::now() + timeout_duration;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        match timeout(remaining, socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, addr))) => {
+                let response = String::from_utf8_lossy(&buf[..len]);
+                tracing::debug!("HQP discovery response from {}: {}", addr, response);
+
+                // Parse XML response
+                if let Some(hqp) = parse_discovery_response(&response, addr.ip().to_string()) {
+                    discovered.insert(hqp.host.clone(), hqp);
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("HQP discovery recv error: {}", e);
+                break;
+            }
+            Err(_) => {
+                // Timeout - done receiving
+                break;
+            }
+        }
+    }
+
+    let result: Vec<DiscoveredHqp> = discovered.into_values().collect();
+    tracing::info!("HQPlayer discovery found {} instance(s)", result.len());
+    Ok(result)
+}
+
+/// Parse HQPlayer discovery XML response
+fn parse_discovery_response(xml: &str, host: String) -> Option<DiscoveredHqp> {
+    // Look for <discover result="OK" .../>
+    if !xml.contains("result=\"OK\"") && !xml.contains("result='OK'") {
+        return None;
+    }
+
+    let name = extract_xml_attr(xml, "name").unwrap_or_else(|| "HQPlayer".to_string());
+    let version = extract_xml_attr(xml, "version").unwrap_or_else(|| "unknown".to_string());
+    let product = extract_xml_attr(xml, "product");
+
+    Some(DiscoveredHqp {
+        host,
+        port: HQP_DISCOVERY_PORT,
+        name,
+        version,
+        product,
+    })
+}
+
+/// Extract attribute value from XML string
+fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
+    // Try double quotes
+    let pattern = format!("{}=\"", attr);
+    if let Some(start) = xml.find(&pattern) {
+        let value_start = start + pattern.len();
+        if let Some(end) = xml[value_start..].find('"') {
+            return Some(xml[value_start..value_start + end].to_string());
+        }
+    }
+
+    // Try single quotes
+    let pattern = format!("{}='", attr);
+    if let Some(start) = xml.find(&pattern) {
+        let value_start = start + pattern.len();
+        if let Some(end) = xml[value_start..].find('\'') {
+            return Some(xml[value_start..value_start + end].to_string());
+        }
+    }
+
+    None
 }

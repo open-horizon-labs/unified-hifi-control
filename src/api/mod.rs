@@ -1,6 +1,6 @@
 //! HTTP API handlers
 
-use crate::adapters::hqplayer::HqpAdapter;
+use crate::adapters::hqplayer::{HqpAdapter, HqpInstanceManager, HqpZoneLinkService};
 use crate::adapters::lms::LmsAdapter;
 use crate::adapters::mqtt::MqttAdapter;
 use crate::adapters::openhome::OpenHomeAdapter;
@@ -9,7 +9,7 @@ use crate::adapters::upnp::UPnPAdapter;
 use crate::bus::SharedBus;
 use crate::knobs::KnobStore;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -30,6 +30,8 @@ use tokio_stream::StreamExt;
 pub struct AppState {
     pub roon: Arc<RoonAdapter>,
     pub hqplayer: Arc<HqpAdapter>,
+    pub hqp_instances: Arc<HqpInstanceManager>,
+    pub hqp_zone_links: Arc<HqpZoneLinkService>,
     pub lms: Arc<LmsAdapter>,
     pub mqtt: Arc<MqttAdapter>,
     pub openhome: Arc<OpenHomeAdapter>,
@@ -42,6 +44,8 @@ impl AppState {
     pub fn new(
         roon: RoonAdapter,
         hqplayer: Arc<HqpAdapter>,
+        hqp_instances: Arc<HqpInstanceManager>,
+        hqp_zone_links: Arc<HqpZoneLinkService>,
         lms: Arc<LmsAdapter>,
         mqtt: Arc<MqttAdapter>,
         openhome: Arc<OpenHomeAdapter>,
@@ -52,6 +56,8 @@ impl AppState {
         Self {
             roon: Arc::new(roon),
             hqplayer,
+            hqp_instances,
+            hqp_zone_links,
             lms,
             mqtt,
             openhome,
@@ -192,6 +198,46 @@ pub async fn roon_volume_handler(
             }),
         )
             .into_response(),
+    }
+}
+
+/// Query params for image request
+#[derive(Deserialize)]
+pub struct ImageQuery {
+    pub image_key: String,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+/// GET /roon/image - fetch album art
+pub async fn roon_image_handler(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<ImageQuery>,
+) -> impl IntoResponse {
+    match state
+        .roon
+        .get_image(&params.image_key, params.width, params.height)
+        .await
+    {
+        Ok(image_data) => {
+            let headers = [(
+                axum::http::header::CONTENT_TYPE,
+                image_data.content_type.parse().unwrap_or(axum::http::HeaderValue::from_static("image/jpeg")),
+            )];
+            (StatusCode::OK, headers, image_data.data).into_response()
+        }
+        Err(e) => {
+            tracing::warn!("Image fetch failed: {}", e);
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -694,6 +740,8 @@ pub struct HqpConfigRequest {
     pub host: String,
     #[serde(default)]
     pub port: Option<u16>,
+    #[serde(default)]
+    pub web_port: Option<u16>,
     pub username: Option<String>,
     pub password: Option<String>,
 }
@@ -709,14 +757,23 @@ pub async fn hqp_configure_handler(
         .configure(
             req.host.clone(),
             req.port,
-            None, // web_port - derive from host
+            req.web_port,
             req.username,
             req.password,
         )
         .await;
 
-    // Test connection by getting status
-    let status = state.hqplayer.get_status().await;
+    // Save to instance manager for persistence
+    state.hqp_instances.save_to_config().await;
+
+    // Test connection by attempting to get pipeline status (this establishes connection)
+    let connected = match state.hqplayer.get_pipeline_status().await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("HQPlayer connection test failed: {}", e);
+            false
+        }
+    };
 
     (
         StatusCode::OK,
@@ -724,7 +781,8 @@ pub async fn hqp_configure_handler(
             "ok": true,
             "host": req.host,
             "port": req.port.unwrap_or(4321),
-            "connected": status.connected
+            "web_port": req.web_port.unwrap_or(8088),
+            "connected": connected
         })),
     )
         .into_response()
@@ -744,10 +802,584 @@ pub async fn lms_config_handler(State(state): State<AppState>) -> impl IntoRespo
 /// GET /hqplayer/config - Get current HQPlayer configuration
 pub async fn hqp_config_handler(State(state): State<AppState>) -> impl IntoResponse {
     let status = state.hqplayer.get_status().await;
+    let has_web_creds = state.hqplayer.has_web_credentials().await;
     Json(serde_json::json!({
         "configured": status.host.is_some(),
         "connected": status.connected,
         "host": status.host,
-        "port": status.port
+        "port": status.port,
+        "web_port": status.web_port,
+        "has_web_credentials": has_web_creds
     }))
+}
+
+/// HQPlayer detect request body
+#[derive(Deserialize)]
+pub struct HqpDetectRequest {
+    pub host: String,
+    #[serde(default = "default_hqp_port")]
+    pub port: u16,
+}
+
+fn default_hqp_port() -> u16 {
+    4321
+}
+
+/// POST /hqp/detect - Detect HQPlayer at a given host
+pub async fn hqp_detect_handler(Json(req): Json<HqpDetectRequest>) -> impl IntoResponse {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::time::{timeout, Duration};
+
+    // Try to connect to HQPlayer's native protocol port
+    let addr = format!("{}:{}", req.host, req.port);
+
+    let stream = match timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) | Err(_) => {
+            return Json(serde_json::json!({
+                "reachable": false,
+                "error": "Cannot connect to HQPlayer at this address"
+            }));
+        }
+    };
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // Read initial greeting
+    let mut greeting = String::new();
+    if timeout(Duration::from_secs(2), reader.read_line(&mut greeting))
+        .await
+        .is_err()
+    {
+        return Json(serde_json::json!({
+            "reachable": false,
+            "error": "No response from HQPlayer"
+        }));
+    }
+
+    // Send INFO command
+    if write_half.write_all(b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><info/>\n").await.is_err() {
+        return Json(serde_json::json!({
+            "reachable": false,
+            "error": "Failed to send command to HQPlayer"
+        }));
+    }
+
+    // Read INFO response
+    let mut response = String::new();
+    if timeout(Duration::from_secs(2), reader.read_line(&mut response))
+        .await
+        .is_err()
+    {
+        return Json(serde_json::json!({
+            "reachable": false,
+            "error": "No INFO response from HQPlayer"
+        }));
+    }
+
+    // Parse XML response for product/version
+    let product = extract_xml_attr(&response, "product");
+    let version = extract_xml_attr(&response, "version");
+    let is_embedded = product
+        .as_ref()
+        .map(|p| p.to_lowercase().contains("embedded"))
+        .unwrap_or(false);
+
+    Json(serde_json::json!({
+        "reachable": true,
+        "product": product,
+        "version": version,
+        "isEmbedded": is_embedded
+    }))
+}
+
+/// Extract attribute value from XML string
+fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{}=\"", attr);
+    if let Some(start) = xml.find(&pattern) {
+        let value_start = start + pattern.len();
+        if let Some(end) = xml[value_start..].find('"') {
+            return Some(xml[value_start..value_start + end].to_string());
+        }
+    }
+    None
+}
+
+// =============================================================================
+// HQPlayer multi-instance handlers
+// =============================================================================
+
+/// GET /hqp/instances - List all HQPlayer instances
+pub async fn hqp_instances_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let instances = state.hqp_instances.list_instances().await;
+    Json(instances)
+}
+
+/// HQPlayer add instance request
+#[derive(Deserialize)]
+pub struct HqpAddInstanceRequest {
+    pub name: String,
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub web_port: Option<u16>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+/// POST /hqp/instances - Add or update an HQPlayer instance
+pub async fn hqp_add_instance_handler(
+    State(state): State<AppState>,
+    Json(req): Json<HqpAddInstanceRequest>,
+) -> impl IntoResponse {
+    if req.name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Instance name is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    if req.host.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Host is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let _adapter = state
+        .hqp_instances
+        .add_instance(
+            req.name.clone(),
+            req.host.clone(),
+            req.port,
+            req.web_port,
+            req.username,
+            req.password,
+        )
+        .await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "name": req.name,
+            "host": req.host,
+            "port": req.port.unwrap_or(4321)
+        })),
+    )
+        .into_response()
+}
+
+/// DELETE /hqp/instances/:name - Remove an HQPlayer instance
+pub async fn hqp_remove_instance_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Remove zone links pointing to this instance first
+    let _links_removed = state.hqp_zone_links.remove_links_for_instance(&name).await;
+
+    if state.hqp_instances.remove_instance(&name).await {
+        (StatusCode::OK, Json(serde_json::json!({"ok": true, "removed": name}))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Instance not found: {}", name),
+            }),
+        )
+            .into_response()
+    }
+}
+
+/// GET /hqp/instances/:name/profiles - Get profiles for a specific HQPlayer instance
+pub async fn hqp_instance_profiles_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let adapter = match state.hqp_instances.get(&name).await {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Instance not found: {}", name),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    match adapter.fetch_profiles().await {
+        Ok(profiles) => (StatusCode::OK, Json(profiles)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /hqp/instances/:name/profile - Load a profile on a specific HQPlayer instance
+pub async fn hqp_instance_load_profile_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<HqpProfileRequest>,
+) -> impl IntoResponse {
+    let adapter = match state.hqp_instances.get(&name).await {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Instance not found: {}", name),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    match adapter.load_profile(&req.profile).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "instance": name, "profile": req.profile}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /hqp/instances/:name/matrix/profiles - Get matrix profiles for a specific instance
+pub async fn hqp_instance_matrix_profiles_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let adapter = match state.hqp_instances.get(&name).await {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Instance not found: {}", name),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    let profiles = adapter.get_matrix_profiles().await;
+    let current = adapter.get_matrix_profile().await;
+
+    match (profiles, current) {
+        (Ok(profiles), Ok(current)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "instance": name,
+                "profiles": profiles,
+                "current": current
+            })),
+        )
+            .into_response(),
+        (Err(e), _) | (_, Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Matrix profile request for instance
+#[derive(Deserialize)]
+pub struct HqpInstanceMatrixProfileRequest {
+    pub value: u32,
+}
+
+/// POST /hqp/instances/:name/matrix/profile - Set matrix profile on a specific instance
+pub async fn hqp_instance_set_matrix_profile_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<HqpInstanceMatrixProfileRequest>,
+) -> impl IntoResponse {
+    let adapter = match state.hqp_instances.get(&name).await {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Instance not found: {}", name),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    match adapter.set_matrix_profile(req.value).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true, "instance": name, "value": req.value}))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+// =============================================================================
+// HQPlayer zone linking handlers
+// =============================================================================
+
+/// GET /hqp/zones/links - Get all zone links
+pub async fn hqp_zone_links_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let links = state.hqp_zone_links.get_links().await;
+    Json(serde_json::json!({ "links": links }))
+}
+
+/// Zone link request
+#[derive(Deserialize)]
+pub struct ZoneLinkRequest {
+    pub zone_id: String,
+    pub instance: String,
+}
+
+/// POST /hqp/zones/link - Link a zone to an HQPlayer instance
+pub async fn hqp_zone_link_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ZoneLinkRequest>,
+) -> impl IntoResponse {
+    if req.zone_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "zone_id is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    if req.instance.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "instance is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    match state
+        .hqp_zone_links
+        .link_zone(req.zone_id.clone(), req.instance.clone())
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "zone_id": req.zone_id,
+                "instance": req.instance
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Zone unlink request
+#[derive(Deserialize)]
+pub struct ZoneUnlinkRequest {
+    pub zone_id: String,
+}
+
+/// POST /hqp/zones/unlink - Unlink a zone from HQPlayer
+pub async fn hqp_zone_unlink_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ZoneUnlinkRequest>,
+) -> impl IntoResponse {
+    if req.zone_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "zone_id is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let was_linked = state.hqp_zone_links.unlink_zone(&req.zone_id).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "zone_id": req.zone_id,
+            "was_linked": was_linked
+        })),
+    )
+        .into_response()
+}
+
+/// GET /hqp/zones/:zone_id/pipeline - Get HQP pipeline for a linked zone
+pub async fn hqp_zone_pipeline_handler(
+    State(state): State<AppState>,
+    Path(zone_id): Path<String>,
+) -> impl IntoResponse {
+    match state.hqp_zone_links.get_pipeline_for_zone(&zone_id).await {
+        Some(pipeline) => (StatusCode::OK, Json(pipeline)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Zone {} not linked to HQPlayer or HQPlayer not configured", zone_id),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+// =============================================================================
+// HQPlayer discovery handler
+// =============================================================================
+
+/// HQP discovery request
+#[derive(Deserialize)]
+pub struct HqpDiscoverRequest {
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// GET /hqp/discover - Discover HQPlayer instances on the network via UDP multicast
+pub async fn hqp_discover_handler(
+    Query(params): Query<HqpDiscoverRequest>,
+) -> impl IntoResponse {
+    use crate::adapters::hqplayer::discover_hqplayers;
+
+    match discover_hqplayers(params.timeout_ms).await {
+        Ok(instances) => (StatusCode::OK, Json(serde_json::json!({ "discovered": instances }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Discovery failed: {}", e),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// App settings for UI preferences
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    // Support both snake_case (Rust) and camelCase (Node.js) for seamless migration
+    #[serde(default, alias = "hideKnobsPage")]
+    pub hide_knobs_page: bool,
+    #[serde(default, alias = "hideHqpPage")]
+    pub hide_hqp_page: bool,
+    #[serde(default)]
+    pub adapters: AdapterSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AdapterSettings {
+    #[serde(default = "default_true")]
+    pub roon: bool,
+    #[serde(default)]
+    pub upnp: bool,
+    #[serde(default)]
+    pub openhome: bool,
+    #[serde(default)]
+    pub lms: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            hide_knobs_page: false,
+            hide_hqp_page: false,
+            adapters: AdapterSettings {
+                roon: true,
+                upnp: false,
+                openhome: false,
+                lms: false,
+            },
+        }
+    }
+}
+
+fn settings_path() -> std::path::PathBuf {
+    crate::config::get_config_dir().join("app-settings.json")
+}
+
+pub fn load_app_settings() -> AppSettings {
+    let path = settings_path();
+    if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(settings) => return settings,
+                Err(e) => tracing::warn!("Failed to parse app settings: {}", e),
+            },
+            Err(e) => tracing::warn!("Failed to read app settings: {}", e),
+        }
+    }
+    AppSettings::default()
+}
+
+fn save_app_settings(settings: &AppSettings) -> bool {
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(settings) {
+        Ok(json) => match std::fs::write(&path, json) {
+            Ok(()) => {
+                tracing::info!("Saved app settings");
+                true
+            }
+            Err(e) => {
+                tracing::error!("Failed to save app settings: {}", e);
+                false
+            }
+        },
+        Err(e) => {
+            tracing::error!("Failed to serialize app settings: {}", e);
+            false
+        }
+    }
+}
+
+/// GET /api/settings - Get app settings
+pub async fn api_settings_get_handler() -> impl IntoResponse {
+    Json(load_app_settings())
+}
+
+/// POST /api/settings - Update app settings
+pub async fn api_settings_post_handler(
+    Json(settings): Json<AppSettings>,
+) -> impl IntoResponse {
+    if save_app_settings(&settings) {
+        Json(serde_json::json!({"ok": true}))
+    } else {
+        Json(serde_json::json!({"ok": false, "error": "Failed to save settings"}))
+    }
 }

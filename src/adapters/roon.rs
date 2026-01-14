@@ -4,18 +4,35 @@
 
 use anyhow::Result;
 use roon_api::{
+    image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     info,
+    status::{self, Status},
     transport::{self, volume, Control, Transport, Zone as RoonZone},
     CoreEvent, Info, Parsed, RoonApi, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, RwLock};
 
 use crate::bus::{BusEvent, SharedBus};
+use crate::config::get_data_dir;
 
-const CONFIG_PATH: &str = "roon_state.json";
+/// Pending image request - stores the oneshot sender to deliver the result
+type ImageRequest = oneshot::Sender<Option<ImageData>>;
+
+/// Image data returned from Roon
+#[derive(Debug, Clone)]
+pub struct ImageData {
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
+/// Get the Roon state file path in the data directory
+fn get_roon_state_path() -> PathBuf {
+    get_data_dir().join("roon_state.json")
+}
 
 /// Maximum relative volume step per call (prevents wild jumps)
 const MAX_RELATIVE_STEP: i32 = 10;
@@ -117,6 +134,9 @@ struct RoonState {
     core_version: Option<String>,
     zones: HashMap<String, Zone>,
     transport: Option<Transport>,
+    image: Option<Image>,
+    /// Pending image requests: request_id -> oneshot sender
+    pending_images: HashMap<usize, ImageRequest>,
 }
 
 impl Default for RoonState {
@@ -127,6 +147,8 @@ impl Default for RoonState {
             core_version: None,
             zones: HashMap::new(),
             transport: None,
+            image: None,
+            pending_images: HashMap::new(),
         }
     }
 }
@@ -145,8 +167,18 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 use std::time::Duration;
 
 impl RoonAdapter {
+    /// Create a disconnected Roon adapter (used when initialization fails)
+    pub fn new_disconnected(bus: SharedBus) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(RoonState::default())),
+            bus,
+        }
+    }
+
     /// Create and start Roon adapter
-    pub async fn new(bus: SharedBus) -> Result<Self> {
+    ///
+    /// `base_url` is shown in Roon Settings → Extensions (e.g., "http://hostname:3000")
+    pub async fn new(bus: SharedBus, base_url: String) -> Result<Self> {
         let state = Arc::new(RwLock::new(RoonState::default()));
         let state_clone = state.clone();
         let bus_clone = bus.clone();
@@ -158,7 +190,7 @@ impl RoonAdapter {
             loop {
                 tracing::info!("Starting Roon discovery loop...");
 
-                match run_roon_loop(state_clone.clone(), bus_clone.clone()).await {
+                match run_roon_loop(state_clone.clone(), bus_clone.clone(), base_url.clone()).await {
                     Ok(()) => {
                         tracing::info!("Roon event loop ended normally");
                     }
@@ -301,6 +333,53 @@ impl RoonAdapter {
         transport.mute(output_id, &how).await;
         Ok(())
     }
+
+    /// Get album art image
+    pub async fn get_image(
+        &self,
+        image_key: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<ImageData> {
+        let (tx, rx) = oneshot::channel();
+
+        // Request the image
+        let req_id = {
+            let mut state = self.state.write().await;
+            let image = state
+                .image
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Image service not available"))?;
+
+            // Build scaling args
+            let scaling = match (width, height) {
+                (Some(w), Some(h)) => Some(Scaling::new(Scale::Fit, w, h)),
+                (Some(w), None) => Some(Scaling::new(Scale::Fit, w, w)),
+                (None, Some(h)) => Some(Scaling::new(Scale::Fit, h, h)),
+                (None, None) => Some(Scaling::new(Scale::Fit, 300, 300)),
+            };
+
+            let args = ImageArgs::new(scaling, Some(ImageFormat::Jpeg));
+            let req_id = image.get_image(image_key, args).await;
+
+            if let Some(req_id) = req_id {
+                state.pending_images.insert(req_id, tx);
+                req_id
+            } else {
+                return Err(anyhow::anyhow!("Failed to request image"));
+            }
+        };
+
+        tracing::debug!("Requested image {} with req_id {}", image_key, req_id);
+
+        // Wait for response with timeout
+        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+            Ok(Ok(Some(data))) => Ok(data),
+            Ok(Ok(None)) => Err(anyhow::anyhow!("Image not found")),
+            Ok(Err(_)) => Err(anyhow::anyhow!("Image request cancelled")),
+            Err(_) => Err(anyhow::anyhow!("Image request timed out")),
+        }
+    }
 }
 
 /// Convert Roon zone to our Zone struct
@@ -350,23 +429,46 @@ fn convert_zone(roon_zone: &RoonZone) -> Zone {
 }
 
 /// Main Roon event loop
-async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus) -> Result<()> {
+async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus, base_url: String) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
 
+    // Ensure data directory exists for state persistence
+    let data_dir = get_data_dir();
+    if !data_dir.exists() {
+        std::fs::create_dir_all(&data_dir)?;
+        tracing::info!("Created data directory: {:?}", data_dir);
+    }
+
+    let state_path = get_roon_state_path();
+    let state_path_str = state_path.to_string_lossy().to_string();
+    tracing::info!("Roon state file: {}", state_path_str);
+
     // Extension info - uses CARGO_PKG_* from Cargo.toml
-    let info = info!("com.open-horizon-labs", "Unified Hi-Fi Control");
+    // Use same extension ID as Node.js for seamless migration
+    // Note: info! macro appends CARGO_PKG_NAME to the prefix, so:
+    // "com.muness" + "." + "unified-hifi-control" = "com.muness.unified-hifi-control"
+    let info = info!("com.muness", "Unified Hi-Fi Control");
 
     // Create API instance
     let mut roon = RoonApi::new(info);
 
+    // Create Status service - this is what makes extension visible in Roon Settings
+    let (svc, status) = Status::new(&roon);
+
     // Services we want from Roon Core
-    let services = vec![Services::Transport(Transport::new())];
+    let services = vec![
+        Services::Transport(Transport::new()),
+        Services::Image(Image::new()),
+        Services::Status(status),
+    ];
 
-    // Empty provided services (we don't provide any)
-    let provided: HashMap<String, Svc> = HashMap::new();
+    // Register Status as a provided service (this enables the pairing UI)
+    let mut provided: HashMap<String, Svc> = HashMap::new();
+    provided.insert(status::SVCNAME.to_owned(), svc);
 
-    // State persistence callback
-    let get_roon_state = || RoonApi::load_roon_state(CONFIG_PATH);
+    // State persistence callback - use proper path
+    let state_path_clone = state_path_str.clone();
+    let get_roon_state = move || RoonApi::load_roon_state(&state_path_clone);
 
     // Start discovery
     let (mut handles, mut core_rx) = roon
@@ -374,31 +476,42 @@ async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus) -> Result<
         .await
         .ok_or_else(|| anyhow::anyhow!("Failed to start Roon discovery"))?;
 
-    tracing::info!("Roon discovery started, waiting for core...");
+    tracing::info!("Roon discovery started, waiting for core (authorize in Roon → Settings → Extensions)...");
 
     // Event processing task
     let state_for_events = state.clone();
     let bus_for_events = bus.clone();
+    let state_path_for_events = state_path_str.clone();
+    let base_url_for_events = base_url;
     handles.spawn(async move {
         loop {
             if let Some((event, msg)) = core_rx.recv().await {
                 match event {
                     CoreEvent::Found(mut core) => {
+                        let core_name = core.display_name.clone();
+                        let core_version = core.display_version.clone();
+
                         tracing::info!(
                             "Roon Core found: {} (version {})",
-                            core.display_name,
-                            core.display_version
+                            core_name,
+                            core_version
                         );
+
+                        // Update status shown in Roon Settings → Extensions
+                        if let Some(status) = core.get_status() {
+                            let message = format!("Connected • {}", base_url_for_events);
+                            status.set_status(message, false).await;
+                        }
 
                         let mut s = state_for_events.write().await;
                         s.connected = true;
-                        s.core_name = Some(core.display_name.clone());
-                        s.core_version = Some(core.display_version.clone());
+                        s.core_name = Some(core_name.clone());
+                        s.core_version = Some(core_version.clone());
 
                         // Publish connected event
                         bus_for_events.publish(BusEvent::RoonConnected {
-                            core_name: core.display_name.clone(),
-                            version: core.display_version.clone(),
+                            core_name: core_name.clone(),
+                            version: core_version.clone(),
                         });
 
                         // Get transport service and subscribe to zones
@@ -406,13 +519,27 @@ async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus) -> Result<
                             transport.subscribe_zones().await;
                             s.transport = Some(transport);
                         }
+
+                        // Get image service for album art
+                        if let Some(image) = core.get_image().cloned() {
+                            s.image = Some(image);
+                            tracing::info!("Roon Image service available");
+                        }
                     }
-                    CoreEvent::Lost(core) => {
+                    CoreEvent::Lost(mut core) => {
+                        let lost_core_name = core.display_name.clone();
+                        let lost_core_version = core.display_version.clone();
+
                         tracing::warn!(
                             "Roon Core lost: {} (version {})",
-                            core.display_name,
-                            core.display_version
+                            lost_core_name,
+                            lost_core_version
                         );
+
+                        // Update status shown in Roon Settings → Extensions
+                        if let Some(status) = core.get_status() {
+                            status.set_status("Disconnected - searching...".to_string(), true).await;
+                        }
 
                         let mut s = state_for_events.write().await;
                         s.connected = false;
@@ -431,9 +558,11 @@ async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus) -> Result<
                 if let Some((_, parsed)) = msg {
                     match parsed {
                         Parsed::RoonState(roon_state) => {
-                            // Persist pairing state
-                            if let Err(e) = RoonApi::save_roon_state(CONFIG_PATH, roon_state) {
+                            // Persist pairing state to data directory
+                            if let Err(e) = RoonApi::save_roon_state(&state_path_for_events, roon_state) {
                                 tracing::warn!("Failed to save Roon state: {}", e);
+                            } else {
+                                tracing::debug!("Roon state saved to {}", state_path_for_events);
                             }
                         }
                         Parsed::Zones(zones) => {
@@ -495,6 +624,36 @@ async fn run_roon_loop(state: Arc<RwLock<RoonState>>, bus: SharedBus) -> Result<
                                 bus_for_events.publish(BusEvent::ZoneRemoved {
                                     zone_id: zone_id.clone(),
                                 });
+                            }
+                        }
+                        Parsed::Jpeg((image_key, data)) => {
+                            tracing::debug!("Received JPEG image: {} ({} bytes)", image_key, data.len());
+                            let mut s = state_for_events.write().await;
+                            // Find pending request by image_key (req_id may be stored differently)
+                            // For now, we'll use a simpler approach - store by image_key
+                            if let Some((_req_id, sender)) = s.pending_images.iter()
+                                .find(|(_, _)| true)  // Take any pending request
+                                .map(|(k, _)| (*k, ()))
+                                .and_then(|(k, _)| s.pending_images.remove(&k).map(|s| (k, s)))
+                            {
+                                let _ = sender.send(Some(ImageData {
+                                    content_type: "image/jpeg".to_string(),
+                                    data,
+                                }));
+                            }
+                        }
+                        Parsed::Png((image_key, data)) => {
+                            tracing::debug!("Received PNG image: {} ({} bytes)", image_key, data.len());
+                            let mut s = state_for_events.write().await;
+                            if let Some((_req_id, sender)) = s.pending_images.iter()
+                                .find(|(_, _)| true)
+                                .map(|(k, _)| (*k, ()))
+                                .and_then(|(k, _)| s.pending_images.remove(&k).map(|s| (k, s)))
+                            {
+                                let _ = sender.send(Some(ImageData {
+                                    content_type: "image/png".to_string(),
+                                    data,
+                                }));
                             }
                         }
                         _ => {}

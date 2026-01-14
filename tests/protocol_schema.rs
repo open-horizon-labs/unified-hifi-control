@@ -92,71 +92,8 @@ struct ErrorResponse {
     error: String,
 }
 
-/// BusEvent variants - SSE /events stream
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload")]
-enum BusEvent {
-    RoonConnected {
-        core_name: String,
-        version: String,
-    },
-    RoonDisconnected,
-    ZoneUpdated {
-        zone_id: String,
-        display_name: String,
-        state: String,
-    },
-    ZoneRemoved {
-        zone_id: String,
-    },
-    NowPlayingChanged {
-        zone_id: String,
-        title: Option<String>,
-        artist: Option<String>,
-        album: Option<String>,
-        image_key: Option<String>,
-    },
-    SeekPositionChanged {
-        zone_id: String,
-        position: i64,
-    },
-    VolumeChanged {
-        output_id: String,
-        value: f32,
-        is_muted: bool,
-    },
-    HqpConnected {
-        host: String,
-    },
-    HqpDisconnected {
-        host: String,
-    },
-    HqpStateChanged {
-        host: String,
-        state: String,
-    },
-    HqpPipelineChanged {
-        host: String,
-        filter: Option<String>,
-        shaper: Option<String>,
-        rate: Option<String>,
-    },
-    LmsConnected {
-        host: String,
-    },
-    LmsDisconnected {
-        host: String,
-    },
-    LmsPlayerStateChanged {
-        player_id: String,
-        state: String,
-    },
-    ControlCommand {
-        zone_id: String,
-        action: String,
-        value: Option<Value>,
-    },
-}
+// Use production BusEvent to keep schema in sync
+use unified_hifi_control::bus::BusEvent;
 
 // ============================================================================
 // Schema Validation Tests

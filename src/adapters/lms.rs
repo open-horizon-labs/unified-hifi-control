@@ -8,6 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -15,9 +16,221 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 use crate::bus::{BusEvent, SharedBus};
+use crate::config::get_config_dir;
+
+const LMS_CONFIG_FILE: &str = "lms-config.json";
+
+/// Saved config for persistence
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedLmsConfig {
+    host: String,
+    port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+}
+
+fn config_path() -> PathBuf {
+    get_config_dir().join(LMS_CONFIG_FILE)
+}
 
 const DEFAULT_PORT: u16 = 9000;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Shared JSON-RPC client operations for LMS
+/// Extracted to avoid code duplication between LmsAdapter and the polling task
+#[derive(Clone)]
+struct LmsRpc {
+    state: Arc<RwLock<LmsState>>,
+    client: Client,
+}
+
+impl LmsRpc {
+    fn new(state: Arc<RwLock<LmsState>>, client: Client) -> Self {
+        Self { state, client }
+    }
+
+    async fn base_url(&self) -> Result<String> {
+        let state = self.state.read().await;
+        let host = state
+            .host
+            .as_ref()
+            .ok_or_else(|| anyhow!("LMS host not configured"))?;
+        Ok(format!("http://{}:{}", host, state.port))
+    }
+
+    async fn execute(&self, player_id: Option<&str>, params: Vec<Value>) -> Result<Value> {
+        let base_url = self.base_url().await?;
+        let url = format!("{}/jsonrpc.js", base_url);
+
+        let body = json!({
+            "id": 1,
+            "method": "slim.request",
+            "params": [player_id.unwrap_or(""), params]
+        });
+
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body);
+
+        // Add basic auth if configured
+        {
+            let state = self.state.read().await;
+            if let (Some(username), Some(password)) = (&state.username, &state.password) {
+                request = request.basic_auth(username, Some(password));
+            }
+        }
+
+        let response = request.send().await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!("LMS request failed: {}", response.status()));
+        }
+
+        let data: Value = response.json().await?;
+
+        if let Some(error) = data.get("error") {
+            if !error.is_null() {
+                return Err(anyhow!("LMS error: {}", error));
+            }
+        }
+
+        Ok(data.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    async fn get_player_status(&self, player_id: &str) -> Result<LmsPlayer> {
+        let base_url = self.base_url().await?;
+        let result = self
+            .execute(
+                Some(player_id),
+                vec![json!("status"), json!("-"), json!(1), json!("tags:aAdltKc")],
+            )
+            .await?;
+
+        let playlist_loop = result
+            .get("playlist_loop")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        let mode = result
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("stop");
+        let state = match mode {
+            "play" => "playing",
+            "pause" => "paused",
+            _ => "stopped",
+        };
+
+        // Handle artwork URL
+        let mut artwork_url = playlist_loop
+            .get("artwork_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        if let Some(ref url) = artwork_url {
+            if url.starts_with('/') {
+                artwork_url = Some(format!("{}{}", base_url, url));
+            }
+        }
+
+        let artwork_id = playlist_loop
+            .get("coverid")
+            .or_else(|| playlist_loop.get("artwork_track_id"))
+            .or_else(|| playlist_loop.get("id"))
+            .and_then(|v| {
+                // Try string first, then try numeric conversion
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            });
+
+        Ok(LmsPlayer {
+            playerid: player_id.to_string(),
+            state: state.to_string(),
+            mode: mode.to_string(),
+            power: result.get("power").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
+            volume: result
+                .get("mixer volume")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32,
+            playlist_tracks: result
+                .get("playlist_tracks")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            playlist_cur_index: result
+                .get("playlist_cur_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
+            time: result.get("time").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            duration: playlist_loop
+                .get("duration")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            title: playlist_loop
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            artist: playlist_loop
+                .get("artist")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            album: playlist_loop
+                .get("album")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            artwork_track_id: artwork_id.clone(),
+            coverid: artwork_id,
+            artwork_url,
+            ..Default::default()
+        })
+    }
+
+    async fn get_players(&self) -> Result<Vec<LmsPlayer>> {
+        let result = self
+            .execute(None, vec![json!("players"), json!(0), json!(100)])
+            .await?;
+
+        let players_loop = result
+            .get("players_loop")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        Ok(players_loop
+            .into_iter()
+            .map(|p| LmsPlayer {
+                playerid: p
+                    .get("playerid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                name: p
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                model: p
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
+                    .to_string(),
+                connected: p.get("connected").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
+                power: p.get("power").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
+                ip: p.get("ip").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                ..Default::default()
+            })
+            .collect())
+    }
+}
 
 /// LMS Player information
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,21 +327,78 @@ impl Default for LmsState {
 /// LMS Adapter
 pub struct LmsAdapter {
     state: Arc<RwLock<LmsState>>,
-    client: Client,
+    rpc: LmsRpc,
     bus: SharedBus,
     shutdown: CancellationToken,
 }
 
 impl LmsAdapter {
     pub fn new(bus: SharedBus) -> Self {
-        Self {
-            state: Arc::new(RwLock::new(LmsState::default())),
-            client: Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("Failed to create HTTP client"),
+        let state = Arc::new(RwLock::new(LmsState::default()));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("Failed to create HTTP client");
+        let rpc = LmsRpc::new(state.clone(), client);
+        let adapter = Self {
+            state,
+            rpc,
             bus,
             shutdown: CancellationToken::new(),
+        };
+        // Load saved config synchronously at startup
+        adapter.load_config_sync();
+        adapter
+    }
+
+    /// Load config from disk (sync, for startup)
+    fn load_config_sync(&self) {
+        let path = config_path();
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<SavedLmsConfig>(&content) {
+                    Ok(saved) => {
+                        // Use try_write to avoid async in sync context
+                        if let Ok(mut state) = self.state.try_write() {
+                            state.host = Some(saved.host.clone());
+                            state.port = saved.port;
+                            state.username = saved.username;
+                            state.password = saved.password;
+                            tracing::info!("Loaded LMS config from disk: {}:{}", saved.host, saved.port);
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to parse LMS config: {}", e),
+                },
+                Err(e) => tracing::warn!("Failed to read LMS config: {}", e),
+            }
+        }
+    }
+
+    /// Save config to disk
+    async fn save_config(&self) {
+        let state = self.state.read().await;
+        if let Some(ref host) = state.host {
+            let saved = SavedLmsConfig {
+                host: host.clone(),
+                port: state.port,
+                username: state.username.clone(),
+                password: state.password.clone(),
+            };
+            let path = config_path();
+            // Ensure config directory exists
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match serde_json::to_string_pretty(&saved) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(&path, json) {
+                        tracing::error!("Failed to save LMS config: {}", e);
+                    } else {
+                        tracing::info!("Saved LMS config to disk");
+                    }
+                }
+                Err(e) => tracing::error!("Failed to serialize LMS config: {}", e),
+            }
         }
     }
 
@@ -140,12 +410,16 @@ impl LmsAdapter {
         username: Option<String>,
         password: Option<String>,
     ) {
-        let mut state = self.state.write().await;
-        state.host = Some(host);
-        state.port = port.unwrap_or(DEFAULT_PORT);
-        state.username = username;
-        state.password = password;
-        state.connected = false;
+        {
+            let mut state = self.state.write().await;
+            state.host = Some(host);
+            state.port = port.unwrap_or(DEFAULT_PORT);
+            state.username = username;
+            state.password = password;
+            state.connected = false;
+        }
+        // Persist to disk
+        self.save_config().await;
     }
 
     /// Check if configured
@@ -174,188 +448,14 @@ impl LmsAdapter {
         }
     }
 
-    /// Get base URL
-    async fn base_url(&self) -> Result<String> {
-        let state = self.state.read().await;
-        let host = state
-            .host
-            .as_ref()
-            .ok_or_else(|| anyhow!("LMS host not configured"))?;
-        Ok(format!("http://{}:{}", host, state.port))
-    }
-
-    /// Execute JSON-RPC command
-    async fn execute(&self, player_id: Option<&str>, params: Vec<Value>) -> Result<Value> {
-        let base_url = self.base_url().await?;
-        let url = format!("{}/jsonrpc.js", base_url);
-
-        let body = json!({
-            "id": 1,
-            "method": "slim.request",
-            "params": [player_id.unwrap_or(""), params]
-        });
-
-        let mut request = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body);
-
-        // Add basic auth if configured
-        {
-            let state = self.state.read().await;
-            if let (Some(username), Some(password)) = (&state.username, &state.password) {
-                request = request.basic_auth(username, Some(password));
-            }
-        }
-
-        let response = request.send().await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("LMS request failed: {}", response.status()));
-        }
-
-        let data: Value = response.json().await?;
-
-        if let Some(error) = data.get("error") {
-            if !error.is_null() {
-                return Err(anyhow!("LMS error: {}", error));
-            }
-        }
-
-        Ok(data.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    /// Get list of all players
+    /// Get list of all players (delegates to shared RPC)
     pub async fn get_players(&self) -> Result<Vec<LmsPlayer>> {
-        let result = self
-            .execute(None, vec![json!("players"), json!(0), json!(100)])
-            .await?;
-
-        let players_loop = result
-            .get("players_loop")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        Ok(players_loop
-            .into_iter()
-            .map(|p| LmsPlayer {
-                playerid: p
-                    .get("playerid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                name: p
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                model: p
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown")
-                    .to_string(),
-                connected: p.get("connected").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
-                power: p.get("power").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
-                ip: p.get("ip").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                ..Default::default()
-            })
-            .collect())
+        self.rpc.get_players().await
     }
 
-    /// Get player status
+    /// Get player status (delegates to shared RPC)
     pub async fn get_player_status(&self, player_id: &str) -> Result<LmsPlayer> {
-        let base_url = self.base_url().await?;
-        let result = self
-            .execute(
-                Some(player_id),
-                vec![json!("status"), json!("-"), json!(1), json!("tags:aAdltKc")],
-            )
-            .await?;
-
-        let playlist_loop = result
-            .get("playlist_loop")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .cloned()
-            .unwrap_or(Value::Null);
-
-        let mode = result
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("stop");
-        let state = match mode {
-            "play" => "playing",
-            "pause" => "paused",
-            _ => "stopped",
-        };
-
-        // Handle artwork URL
-        let mut artwork_url = playlist_loop
-            .get("artwork_url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        if let Some(ref url) = artwork_url {
-            if url.starts_with('/') {
-                artwork_url = Some(format!("{}{}", base_url, url));
-            }
-        }
-
-        let artwork_id = playlist_loop
-            .get("coverid")
-            .or_else(|| playlist_loop.get("artwork_track_id"))
-            .or_else(|| playlist_loop.get("id"))
-            .and_then(|v| {
-                // Try string first, then try numeric conversion
-                v.as_str()
-                    .map(|s| s.to_string())
-                    .or_else(|| v.as_i64().map(|n| n.to_string()))
-            });
-
-        Ok(LmsPlayer {
-            playerid: player_id.to_string(),
-            state: state.to_string(),
-            mode: mode.to_string(),
-            power: result.get("power").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
-            volume: result
-                .get("mixer volume")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32,
-            playlist_tracks: result
-                .get("playlist_tracks")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32,
-            playlist_cur_index: result
-                .get("playlist_cur_index")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32),
-            time: result.get("time").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            duration: playlist_loop
-                .get("duration")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
-            title: playlist_loop
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            artist: playlist_loop
-                .get("artist")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            album: playlist_loop
-                .get("album")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            artwork_track_id: artwork_id.clone(),
-            coverid: artwork_id,
-            artwork_url,
-            ..Default::default()
-        })
+        self.rpc.get_player_status(player_id).await
     }
 
     /// Start polling for player updates
@@ -381,10 +481,10 @@ impl LmsAdapter {
         self.bus
             .publish(BusEvent::LmsConnected { host: host.clone() });
 
-        // Spawn polling task
+        // Spawn polling task using shared RPC
         let state = self.state.clone();
         let bus = self.bus.clone();
-        let adapter = self.clone_for_polling();
+        let rpc = self.rpc.clone();
         let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
@@ -397,7 +497,7 @@ impl LmsAdapter {
                         break;
                     }
                     _ = poll_interval.tick() => {
-                        if let Err(e) = adapter.update_players().await {
+                        if let Err(e) = update_players_internal(&rpc, &state, &bus).await {
                             tracing::error!("Failed to update LMS players: {}", e);
                         }
                     }
@@ -410,79 +510,9 @@ impl LmsAdapter {
         Ok(())
     }
 
-    fn clone_for_polling(&self) -> LmsAdapterPoller {
-        LmsAdapterPoller {
-            state: self.state.clone(),
-            client: self.client.clone(),
-            bus: self.bus.clone(),
-        }
-    }
-
-    /// Update cached player information
+    /// Update cached player information (delegates to shared helper)
     pub async fn update_players(&self) -> Result<()> {
-        let base_url = self.base_url().await?;
-        let players = self.get_players().await?;
-
-        let previous_ids: std::collections::HashSet<String> =
-            { self.state.read().await.players.keys().cloned().collect() };
-
-        for mut player in players {
-            match self.get_player_status(&player.playerid).await {
-                Ok(status) => {
-                    player.state = status.state;
-                    player.mode = status.mode;
-                    player.power = status.power;
-                    player.volume = status.volume;
-                    player.playlist_tracks = status.playlist_tracks;
-                    player.playlist_cur_index = status.playlist_cur_index;
-                    player.time = status.time;
-                    player.duration = status.duration;
-                    player.title = status.title;
-                    player.artist = status.artist;
-                    player.album = status.album;
-                    player.artwork_track_id = status.artwork_track_id;
-                    player.coverid = status.coverid;
-                    player.artwork_url = status.artwork_url;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get status for player {}: {}", player.playerid, e);
-                }
-            }
-
-            let mut state = self.state.write().await;
-            state.players.insert(player.playerid.clone(), player);
-        }
-
-        // Emit events for player set changes
-        let current_ids: std::collections::HashSet<String> =
-            { self.state.read().await.players.keys().cloned().collect() };
-
-        if previous_ids != current_ids {
-            let added: Vec<_> = current_ids.difference(&previous_ids).cloned().collect();
-            let removed: Vec<_> = previous_ids.difference(&current_ids).cloned().collect();
-
-            // Emit zone added events
-            for player_id in &added {
-                if let Some(player) = self.state.read().await.players.get(player_id) {
-                    tracing::debug!("LMS player added: {}", player_id);
-                    self.bus.publish(BusEvent::ZoneUpdated {
-                        zone_id: format!("lms:{}", player_id),
-                        display_name: player.name.clone(),
-                        state: player.state.clone(),
-                    });
-                }
-            }
-
-            // Emit zone removed events
-            for player_id in &removed {
-                tracing::debug!("LMS player removed: {}", player_id);
-                self.bus.publish(BusEvent::ZoneRemoved {
-                    zone_id: format!("lms:{}", player_id),
-                });
-            }
-        }
-
-        Ok(())
+        update_players_internal(&self.rpc, &self.state, &self.bus).await
     }
 
     /// Stop polling
@@ -526,16 +556,16 @@ impl LmsAdapter {
             _ => return Err(anyhow!("Unknown command: {}", command)),
         };
 
-        self.execute(Some(player_id), params).await?;
+        self.rpc.execute(Some(player_id), params).await?;
 
         // Update status after command
         let player_id = player_id.to_string();
         let state = self.state.clone();
-        let adapter = self.clone_for_polling();
+        let rpc = self.rpc.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Ok(status) = adapter.get_player_status(&player_id).await {
+            if let Ok(status) = rpc.get_player_status(&player_id).await {
                 let mut state = state.write().await;
                 if let Some(player) = state.players.get_mut(&player_id) {
                     player.state = status.state;
@@ -556,7 +586,7 @@ impl LmsAdapter {
         width: Option<u32>,
         height: Option<u32>,
     ) -> Result<String> {
-        let base_url = self.base_url().await?;
+        let base_url = self.rpc.base_url().await?;
 
         let suffix = match (width, height) {
             (Some(w), Some(h)) => format!("cover_{}x{}.jpg", w, h),
@@ -565,6 +595,52 @@ impl LmsAdapter {
         };
 
         Ok(format!("{}/music/{}/{}", base_url, coverid, suffix))
+    }
+
+    /// Fetch artwork image bytes
+    /// If image_key is a URL, fetches directly. Otherwise treats as coverid.
+    pub async fn get_artwork(
+        &self,
+        image_key: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Result<(String, Vec<u8>)> {
+        let state = self.state.read().await;
+        let username = state.username.clone();
+        let password = state.password.clone();
+        drop(state);
+
+        // If image_key is a URL, fetch directly
+        let url = if image_key.starts_with("http://") || image_key.starts_with("https://") {
+            image_key.to_string()
+        } else {
+            // Otherwise treat as coverid
+            self.get_artwork_url(image_key, width, height).await?
+        };
+
+        let mut req = self.rpc.client.get(&url);
+
+        // Add basic auth if configured
+        if let (Some(ref user), Some(ref pass)) = (username, password) {
+            use base64::Engine;
+            let auth = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
+            req = req.header("Authorization", format!("Basic {}", auth));
+        }
+
+        let response = req.send().await?;
+        if !response.status().is_success() {
+            return Err(anyhow!("Failed to fetch artwork: {}", response.status()));
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/jpeg")
+            .to_string();
+
+        let body = response.bytes().await?.to_vec();
+        Ok((content_type, body))
     }
 
     /// Get cached player
@@ -584,204 +660,73 @@ impl LmsAdapter {
     }
 }
 
-/// Internal polling helper
-struct LmsAdapterPoller {
-    state: Arc<RwLock<LmsState>>,
-    client: Client,
-    bus: SharedBus,
-}
+/// Shared helper function for updating players from the polling task
+/// Uses LmsRpc to avoid code duplication between LmsAdapter and background task
+async fn update_players_internal(
+    rpc: &LmsRpc,
+    state: &Arc<RwLock<LmsState>>,
+    bus: &SharedBus,
+) -> Result<()> {
+    let players = rpc.get_players().await?;
 
-impl LmsAdapterPoller {
-    async fn base_url(&self) -> Result<String> {
-        let state = self.state.read().await;
-        let host = state
-            .host
-            .as_ref()
-            .ok_or_else(|| anyhow!("LMS host not configured"))?;
-        Ok(format!("http://{}:{}", host, state.port))
-    }
+    let previous_ids: std::collections::HashSet<String> =
+        { state.read().await.players.keys().cloned().collect() };
 
-    async fn execute(&self, player_id: Option<&str>, params: Vec<Value>) -> Result<Value> {
-        let base_url = self.base_url().await?;
-        let url = format!("{}/jsonrpc.js", base_url);
-
-        let body = json!({
-            "id": 1,
-            "method": "slim.request",
-            "params": [player_id.unwrap_or(""), params]
-        });
-
-        let mut request = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body);
-
-        {
-            let state = self.state.read().await;
-            if let (Some(username), Some(password)) = (&state.username, &state.password) {
-                request = request.basic_auth(username, Some(password));
-            }
-        }
-
-        let response = request.send().await?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!("LMS request failed: {}", response.status()));
-        }
-
-        let data: Value = response.json().await?;
-        Ok(data.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    async fn get_player_status(&self, player_id: &str) -> Result<LmsPlayer> {
-        let base_url = self.base_url().await?;
-        let result = self
-            .execute(
-                Some(player_id),
-                vec![json!("status"), json!("-"), json!(1), json!("tags:aAdltKc")],
-            )
-            .await?;
-
-        let playlist_loop = result
-            .get("playlist_loop")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .cloned()
-            .unwrap_or(Value::Null);
-
-        let mode = result
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("stop");
-        let state = match mode {
-            "play" => "playing",
-            "pause" => "paused",
-            _ => "stopped",
-        };
-
-        let mut artwork_url = playlist_loop
-            .get("artwork_url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        if let Some(ref url) = artwork_url {
-            if url.starts_with('/') {
-                artwork_url = Some(format!("{}{}", base_url, url));
-            }
-        }
-
-        let artwork_id = playlist_loop
-            .get("coverid")
-            .and_then(|v| v.as_str().or_else(|| v.as_i64().map(|_| "")))
-            .map(|s| s.to_string())
-            .or_else(|| {
-                playlist_loop
-                    .get("coverid")
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n.to_string())
-            });
-
-        Ok(LmsPlayer {
-            playerid: player_id.to_string(),
-            state: state.to_string(),
-            mode: mode.to_string(),
-            power: result.get("power").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
-            volume: result
-                .get("mixer volume")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32,
-            playlist_tracks: result
-                .get("playlist_tracks")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32,
-            playlist_cur_index: result
-                .get("playlist_cur_index")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as u32),
-            time: result.get("time").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            duration: playlist_loop
-                .get("duration")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0),
-            title: playlist_loop
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            artist: playlist_loop
-                .get("artist")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            album: playlist_loop
-                .get("album")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            artwork_track_id: artwork_id.clone(),
-            coverid: artwork_id,
-            artwork_url,
-            ..Default::default()
-        })
-    }
-
-    async fn update_players(&self) -> Result<()> {
-        let result = self
-            .execute(None, vec![json!("players"), json!(0), json!(100)])
-            .await?;
-
-        let players_loop = result
-            .get("players_loop")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        for p in players_loop {
-            let playerid = p
-                .get("playerid")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if playerid.is_empty() {
-                continue;
-            }
-
-            let mut player = LmsPlayer {
-                playerid: playerid.clone(),
-                name: p
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                model: p
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown")
-                    .to_string(),
-                connected: p.get("connected").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
-                power: p.get("power").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
-                ip: p.get("ip").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                ..Default::default()
-            };
-
-            if let Ok(status) = self.get_player_status(&playerid).await {
+    for mut player in players {
+        match rpc.get_player_status(&player.playerid).await {
+            Ok(status) => {
                 player.state = status.state;
                 player.mode = status.mode;
+                player.power = status.power;
                 player.volume = status.volume;
+                player.playlist_tracks = status.playlist_tracks;
+                player.playlist_cur_index = status.playlist_cur_index;
                 player.time = status.time;
                 player.duration = status.duration;
                 player.title = status.title;
                 player.artist = status.artist;
                 player.album = status.album;
-                player.artwork_url = status.artwork_url;
+                player.artwork_track_id = status.artwork_track_id;
                 player.coverid = status.coverid;
+                player.artwork_url = status.artwork_url;
             }
-
-            let mut state = self.state.write().await;
-            state.players.insert(playerid, player);
+            Err(e) => {
+                tracing::warn!("Failed to get status for player {}: {}", player.playerid, e);
+            }
         }
 
-        Ok(())
+        let mut state = state.write().await;
+        state.players.insert(player.playerid.clone(), player);
     }
+
+    // Emit events for player set changes
+    let current_ids: std::collections::HashSet<String> =
+        { state.read().await.players.keys().cloned().collect() };
+
+    if previous_ids != current_ids {
+        let added: Vec<_> = current_ids.difference(&previous_ids).cloned().collect();
+        let removed: Vec<_> = previous_ids.difference(&current_ids).cloned().collect();
+
+        // Emit zone added events
+        for player_id in &added {
+            if let Some(player) = state.read().await.players.get(player_id) {
+                tracing::debug!("LMS player added: {}", player_id);
+                bus.publish(BusEvent::ZoneUpdated {
+                    zone_id: format!("lms:{}", player_id),
+                    display_name: player.name.clone(),
+                    state: player.state.clone(),
+                });
+            }
+        }
+
+        // Emit zone removed events
+        for player_id in &removed {
+            tracing::debug!("LMS player removed: {}", player_id);
+            bus.publish(BusEvent::ZoneRemoved {
+                zone_id: format!("lms:{}", player_id),
+            });
+        }
+    }
+
+    Ok(())
 }
