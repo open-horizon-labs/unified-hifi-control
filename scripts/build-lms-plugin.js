@@ -26,12 +26,13 @@ const VERSION = PKG_JSON.version;
 // Binary mappings for LMS plugin
 // NOTE: Binaries are now downloaded on-demand, not bundled in the plugin ZIP
 // This reduces plugin size from ~125 MB to ~50 KB
+// Rust builds produce unified binaries (no separate LMS entry point)
 const BINARY_MAP = [
-  { src: 'unified-hifi-lms-linux-x64', dest: 'unified-hifi-linux-x86_64' },
-  { src: 'unified-hifi-lms-linux-arm64', dest: 'unified-hifi-linux-aarch64' },
-  { src: 'unified-hifi-lms-macos-x64', dest: 'unified-hifi-darwin-x86_64' },
-  { src: 'unified-hifi-lms-macos-arm64', dest: 'unified-hifi-darwin-arm64' },
-  { src: 'unified-hifi-lms-win-x64.exe', dest: 'unified-hifi-win64.exe' },
+  { src: 'unified-hifi-linux-x64', dest: 'unified-hifi-linux-x86_64' },
+  { src: 'unified-hifi-linux-arm64', dest: 'unified-hifi-linux-aarch64' },
+  { src: 'unified-hifi-macos-x64', dest: 'unified-hifi-darwin-x86_64' },
+  { src: 'unified-hifi-macos-arm64', dest: 'unified-hifi-darwin-arm64' },
+  { src: 'unified-hifi-win-x64.exe', dest: 'unified-hifi-win64.exe' },
 ];
 
 // Set to true to bundle binaries (for testing), false for production (on-demand download)
