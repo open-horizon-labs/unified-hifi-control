@@ -154,7 +154,7 @@ pub fn get_data_dir() -> std::path::PathBuf {
 pub fn load_config() -> Result<Config> {
     let config_dir = get_config_dir();
 
-    let config = ::config::Config::builder()
+    let mut builder = ::config::Config::builder()
         // Start with defaults
         .set_default("port", 8088)?
         // Load from config file if it exists
@@ -166,8 +166,19 @@ pub fn load_config() -> Result<Config> {
             ::config::Environment::with_prefix("UHC")
                 .separator("__")
                 .try_parsing(true),
-        )
-        .build()?;
+        );
+
+    // Support legacy LMS_HOST/LMS_PORT env vars (used by LMS plugin Helper.pm)
+    if let Ok(host) = std::env::var("LMS_HOST") {
+        builder = builder.set_override("lms.host", host)?;
+    }
+    if let Ok(port) = std::env::var("LMS_PORT") {
+        if let Ok(port_num) = port.parse::<u16>() {
+            builder = builder.set_override("lms.port", port_num as i64)?;
+        }
+    }
+
+    let config = builder.build()?;
 
     Ok(config.try_deserialize()?)
 }
