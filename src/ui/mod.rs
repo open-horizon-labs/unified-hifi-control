@@ -1056,7 +1056,9 @@ function updateZoneDisplay(zone, np) {
         document.getElementById('zone-artist').innerHTML = '<small>' + esc(np.line2 || '') + '</small>';
         document.getElementById('zone-album').innerHTML = '<small>' + esc(np.line3 || '') + '</small>';
         if (np.image_url) {
-            document.getElementById('zone-art').src = np.image_url + '&width=200&height=200&t=' + Date.now();
+            const url = np.image_url;
+            const sep = url.includes('?') ? (url.endsWith('?') || url.endsWith('&') ? '' : '&') : '?';
+            document.getElementById('zone-art').src = url + sep + 'width=200&height=200&t=' + Date.now();
         } else {
             document.getElementById('zone-art').src = '';
         }
