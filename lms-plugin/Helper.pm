@@ -6,6 +6,7 @@ package Plugins::UnifiedHiFi::Helper;
 use strict;
 use warnings;
 
+use File::Slurp qw(write_file);
 use File::Spec::Functions qw(catfile catdir);
 use File::Path qw(make_path);
 use JSON::XS;
@@ -15,13 +16,14 @@ use Slim::Utils::Log;
 use Slim::Utils::Prefs;
 use Slim::Utils::OSDetect;
 use Slim::Utils::Misc;
+use Slim::Networking::SimpleAsyncHTTP;
 use Slim::Utils::Timers;
 
 my $log = logger('plugin.unifiedhifi');
 my $prefs = preferences('plugin.unifiedhifi');
+my $serverPrefs = preferences('server');
 
-my $helper_pid;   # PID of helper process
-my $binary;       # Path to selected binary
+my $helperProc;
 my $restarts = 0; # Restart counter
 my $downloadInProgress = 0;  # Download state flag
 
@@ -39,6 +41,12 @@ use constant BINARY_MAP => {
     'win64'          => 'unified-hifi-win64.exe',
 };
 
+sub binDir {
+	my $binDir = catdir(Plugins::UnifiedHiFi::Plugin->_pluginDataFor('basedir'), 'Bin');
+    make_path($binDir) unless (-d $binDir);
+    return $binDir;
+}
+
 # Detect OS and return available binaries
 sub binaries {
     my $class = shift;
@@ -47,13 +55,13 @@ sub binaries {
     my $details = Slim::Utils::OSDetect::details();
     my $arch = $details->{'osArch'} || $details->{'binArch'} || 'x86_64';
 
-    my $bindir = catdir(_pluginDataFor('basedir'), 'Bin');
+    my $bindir = binDir();
     my @binaries;
 
-    if ($os eq 'win') {
+    if (main::ISWINDOWS) {
         push @binaries, 'unified-hifi-win64.exe';
     }
-    elsif ($os eq 'mac') {
+    elsif (main::ISMAC) {
         if ($arch =~ /arm|aarch64/i) {
             push @binaries, 'unified-hifi-darwin-arm64';
         } else {
@@ -92,13 +100,12 @@ sub binaries {
 sub detectPlatform {
     my $class = shift;
 
-    my $os = Slim::Utils::OSDetect::OS();
     my $details = Slim::Utils::OSDetect::details();
     my $arch = $details->{'osArch'} || $details->{'binArch'} || 'x86_64';
 
-    if ($os eq 'mac') {
+    if (main::ISMAC) {
         return $arch =~ /arm|aarch64/i ? 'darwin-arm64' : 'darwin-x86_64';
-    } elsif ($os eq 'win') {
+    } elsif (main::ISWINDOWS) {
         return 'win64';
     } else {
         return $arch =~ /aarch64|arm64/i ? 'linux-aarch64' : 'linux-x86_64';
@@ -107,23 +114,7 @@ sub detectPlatform {
 
 # Get plugin version from install.xml
 sub pluginVersion {
-    my $class = shift;
-
-    my $installXml = catfile(_pluginDataFor('basedir'), 'install.xml');
-    if (-e $installXml) {
-        open my $fh, '<', $installXml or return '0.0.0';
-        my $content = do { local $/; <$fh> };
-        close $fh;
-        # Try element-based format first: <version>X.Y.Z</version>
-        if ($content =~ /<version>([^<]+)<\/version>/) {
-            return $1;
-        }
-        # Fallback to attribute-based: version="X.Y.Z"
-        if ($content =~ /version="([^"]+)"/) {
-            return $1;
-        }
-    }
-    return '0.0.0';
+    return Plugins::UnifiedHiFi::Plugin->_pluginDataFor('version') || '0.0.0';
 }
 
 # Check if binary needs download
@@ -132,9 +123,12 @@ sub needsBinaryDownload {
 
     my $platform = $class->detectPlatform();
     my $binaryName = BINARY_MAP->{$platform};
-    return 0 unless $binaryName;  # Unknown platform
+    if (!$binaryName) {
+        $log->error("Unsupported platform: $platform");
+        return 0;
+    }
 
-    my $bindir = catdir(_pluginDataFor('basedir'), 'Bin');
+    my $bindir = binDir();
     my $binaryPath = catfile($bindir, $binaryName);
 
     return !(-e $binaryPath && -x $binaryPath);
@@ -161,7 +155,7 @@ sub ensureBinary {
         return;
     }
 
-    my $bindir = catdir(_pluginDataFor('basedir'), 'Bin');
+    my $bindir = binDir();
     my $binaryPath = catfile($bindir, $binaryName);
 
     # Already exists and executable
@@ -206,14 +200,12 @@ sub downloadBinary {
     $downloadInProgress = 1 if $redirectCount == 0;
 
     # Ensure Bin directory exists
-    my $bindir = catdir(_pluginDataFor('basedir'), 'Bin');
+    my $bindir = binDir();
     make_path($bindir) unless -d $bindir;
 
     $log->info("Downloading binary from $url" . ($redirectCount ? " (redirect $redirectCount)" : ""));
 
     eval {
-        require Slim::Networking::SimpleAsyncHTTP;
-
         my $http = Slim::Networking::SimpleAsyncHTTP->new(
             sub {
                 my $response = shift;
@@ -271,7 +263,7 @@ sub downloadBinary {
 sub bin {
     my $class = shift;
 
-    my $bindir = catdir(_pluginDataFor('basedir'), 'Bin');
+    my $bindir = binDir();
     my @available = $class->binaries();
 
     # If no binaries available, check if we can use platform-specific one
@@ -294,30 +286,20 @@ sub bin {
         $prefs->set('bin', $selected);
     }
 
-    return catfile($bindir, $selected);
-}
+    my $binaryPath = catfile($bindir, $selected);
+    chmod 0755, $binaryPath unless main::ISWINDOWS && -e $binaryPath;
 
-# Check if helper process is alive
-sub _isAlive {
-    return 0 unless $helper_pid;
-    # Check if process exists and we can signal it
-    my $result = kill(0, $helper_pid);
-    # Also reap zombie if it died
-    if (!$result) {
-        waitpid($helper_pid, WNOHANG);
-        $helper_pid = undef;
-    }
-    return $result;
+    return $binaryPath;
 }
 
 # Start the helper process
 sub start {
     my $class = shift;
 
-    return if _isAlive();
+    return if running();
     return if $downloadInProgress;  # Don't start while downloading
 
-    $binary = $class->bin();
+    my $binary = $class->bin();
 
     # If no binary, try to download it
     unless ($binary && -e $binary) {
@@ -345,53 +327,37 @@ sub start {
 sub _doStart {
     my ($class, $binaryPath) = @_;
 
-    return if _isAlive();
+    return if running();
 
     my $port = $prefs->get('port') || 8088;
     my $loglevel = $prefs->get('loglevel') || 'info';
 
-    # Make executable on Unix
-    my $os = Slim::Utils::OSDetect::OS();
-    if ($os ne 'win') {
-        chmod 0755, $binaryPath;
-    }
-
     # Build environment for subprocess
     my $configDir = Slim::Utils::OSDetect::dirsFor('prefs');
-    my $lmsPort = $Slim::Web::HTTP::localPort // 9000;
+    my $lmsPort = $serverPrefs->get('httpport');
 
     $log->info("Starting Unified Hi-Fi Control: $binaryPath on port $port");
 
     # Build command with environment variables
     my $cmd;
-    if ($os eq 'win') {
+    if (main::ISWINDOWS) {
         # Windows: use start /B
-        $cmd = "set PORT=$port && set LOG_LEVEL=$loglevel && set CONFIG_DIR=$configDir && set LMS_HOST=127.0.0.1 && set LMS_PORT=$lmsPort && start /B \"\" \"$binaryPath\"";
+        $cmd = "set PORT=$port && set LOG_LEVEL=$loglevel && set CONFIG_DIR=$configDir && set LMS_HOST=127.0.0.1 && set LMS_PORT=$lmsPort && \"$binaryPath\"";
     } else {
         # Unix: use env and nohup with background
-        $cmd = "PORT=$port LOG_LEVEL=$loglevel CONFIG_DIR='$configDir' LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort nohup '$binaryPath' > /dev/null 2>&1 &";
+        $cmd = "PORT=$port LOG_LEVEL=$loglevel CONFIG_DIR='$configDir' LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort nohup '$binaryPath' > /dev/null 2>&1";
     }
 
     $log->debug("Running: $cmd");
 
     # Run the command
-    system($cmd);
+    $helperProc = Proc::Background->new(
+        { 'die_upon_destroy' => 1 },
+        $cmd
+    );
 
-    # Give it a moment to start
-    Slim::Utils::Timers::setTimer($class, time() + 2, sub {
-        # Try to find the PID
-        if ($os ne 'win') {
-            my $pgrep = `pgrep -f '$binaryPath' 2>/dev/null`;
-            if ($pgrep =~ /(\d+)/) {
-                $helper_pid = $1;
-                $log->info("Helper started with PID $helper_pid");
-            }
-        }
-        $binary = $binaryPath;
-
-        # Schedule health checks
-        Slim::Utils::Timers::setTimer($class, time() + HEALTH_CHECK_INTERVAL, \&_healthCheck);
-    });
+    # Schedule health checks
+    Slim::Utils::Timers::setTimer($class, time() + HEALTH_CHECK_INTERVAL, \&_healthCheck);
 
     return 1;
 }
@@ -403,30 +369,13 @@ sub stop {
     Slim::Utils::Timers::killTimers($class, \&_healthCheck);
     Slim::Utils::Timers::killTimers($class, \&_resetRestarts);
 
-    my $os = Slim::Utils::OSDetect::OS();
-
-    # Send SIGTERM if we have a PID
-    if ($helper_pid) {
-        $log->info("Stopping Unified Hi-Fi Control (PID $helper_pid)");
-        kill('TERM', $helper_pid);
-        # Non-blocking reap
-        waitpid($helper_pid, WNOHANG);
-        $helper_pid = undef;
-    }
-
-    # Also kill by process name (non-blocking, runs in background)
-    if ($os eq 'win') {
-        system('start /B taskkill /F /IM unified-hifi-win64.exe 2>nul');
-    } else {
-        system("pkill -TERM -f 'unified-hifi-darwin\\|unified-hifi-linux' 2>/dev/null &");
-    }
-
+    $helperProc && $helperProc->die;
     $restarts = 0;
 }
 
-# Check if running
+# Check if helper process is alive
 sub running {
-    return _isAlive();
+    return $helperProc && $helperProc->alive;
 }
 
 # Get the web UI URL
@@ -441,7 +390,8 @@ sub _healthCheck {
     my $class = shift;
 
     if ($prefs->get('autorun')) {
-        if (!_isAlive()) {
+        if (!running()) {
+            warn Data::Dump::dump($helperProc);
             $log->warn("Helper process died unexpectedly");
 
             if ($restarts < MAX_RESTARTS) {
@@ -454,6 +404,8 @@ sub _healthCheck {
                 # User can manually start via settings, which resets $restarts
             }
         } else {
+            $log->info("Helper running with PID " . $helperProc->pid);
+
             # Process is healthy, schedule restart counter reset
             if ($restarts > 0) {
                 Slim::Utils::Timers::killTimers($class, \&_resetRestarts);
@@ -477,13 +429,6 @@ sub _healthCheck {
 
 sub _resetRestarts {
     $restarts = 0;
-}
-
-sub _pluginDataFor {
-    my $key = shift;
-    # Use the main Plugin module for dataForPlugin, not Helper
-    my $data = Slim::Utils::PluginManager->dataForPlugin('Plugins::UnifiedHiFi::Plugin');
-    return $data ? $data->{$key} : undef;
 }
 
 # Write knob configuration to JSON file for binary to read
@@ -524,9 +469,7 @@ sub writeKnobConfig {
     };
 
     eval {
-        open my $fh, '>', $configFile or die "Cannot write $configFile: $!";
-        print $fh encode_json($config);
-        close $fh;
+        write_file($configFile . '.json', encode_json($config));
         $log->debug("Wrote knob config to $configFile");
     };
     if ($@) {
