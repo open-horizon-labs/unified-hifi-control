@@ -44,7 +44,7 @@ fn html_doc(title: &str, nav_active: &str, content: &str) -> String {
         .controls button {{ margin: 0; padding: 0.5rem 1rem; }}
         small {{ color: var(--pico-muted-color); }}
         /* Black theme (OLED) - extends dark theme */
-        [data-theme="black"] {{
+        [data-theme="dark"][data-variant="black"] {{
             --pico-background-color: #000;
             --pico-card-background-color: #0a0a0a;
             --pico-card-sectioning-background-color: #0a0a0a;
@@ -55,7 +55,6 @@ fn html_doc(title: &str, nav_active: &str, content: &str) -> String {
             --pico-muted-border-color: #1a1a1a;
             --pico-form-element-background-color: #0a0a0a;
             --pico-table-border-color: #1a1a1a;
-            color-scheme: dark;
         }}
         /* Theme switcher */
         .theme-switcher {{ display: flex; gap: 0.25rem; }}
@@ -65,7 +64,9 @@ fn html_doc(title: &str, nav_active: &str, content: &str) -> String {
     <script>
         (function(){{
             const t = localStorage.getItem('hifi-theme') || 'dark';
-            document.documentElement.setAttribute('data-theme', t);
+            // Pico CSS only recognizes 'light' and 'dark'; black is dark + variant
+            document.documentElement.setAttribute('data-theme', t === 'black' ? 'dark' : t);
+            if (t === 'black') document.documentElement.setAttribute('data-variant', 'black');
         }})();
     </script>
 </head>
@@ -86,15 +87,22 @@ fn html_doc(title: &str, nav_active: &str, content: &str) -> String {
     </footer>
     <script>
         function setTheme(t) {{
-            document.documentElement.setAttribute('data-theme', t);
+            // Pico CSS only recognizes 'light' and 'dark'; black is dark + variant
+            document.documentElement.setAttribute('data-theme', t === 'black' ? 'dark' : t);
+            if (t === 'black') {{
+                document.documentElement.setAttribute('data-variant', 'black');
+            }} else {{
+                document.documentElement.removeAttribute('data-variant');
+            }}
             localStorage.setItem('hifi-theme', t);
             updateThemeButtons();
         }}
         function updateThemeButtons() {{
-            const t = document.documentElement.getAttribute('data-theme') || 'dark';
+            const variant = document.documentElement.getAttribute('data-variant');
+            const theme = variant === 'black' ? 'black' : (document.documentElement.getAttribute('data-theme') || 'dark');
             ['light','dark','black'].forEach(x => {{
                 const btn = document.getElementById('theme-' + x);
-                if (btn) btn.classList.toggle('active', x === t);
+                if (btn) btn.classList.toggle('active', x === theme);
             }});
         }}
         function applyNavVisibility() {{
@@ -107,9 +115,10 @@ fn html_doc(title: &str, nav_active: &str, content: &str) -> String {
             hide('/lms', s.showLms);
             hide('/knobs', s.showKnobs);
         }}
-        // Auto-hide LMS if not configured (check once on page load)
+        // Auto-hide LMS if not configured (only if user hasn't explicitly enabled it)
         fetch('/lms/status').then(r => r.json()).then(st => {{
-            if (!st.host) {{
+            const s = JSON.parse(localStorage.getItem('hifi-ui-settings') || '{{}}');
+            if (!st.host && s.showLms !== true) {{
                 const el = document.querySelector('nav a[href*="/lms"]');
                 if (el) el.style.display = 'none';
             }}
@@ -283,7 +292,7 @@ async function loadZones() {
                         <strong>${esc(zone.zone_name)}</strong>${hqpBadge}${sourceBadge}
                         <small> (${esc(zone.state)})</small>
                     </header>
-                    <div style="min-height:40px;overflow:hidden;"><small>Select zone for playback info</small></div>
+                    <div id="zone-info-${esc(zone.zone_id)}" style="min-height:40px;overflow:hidden;"><small>Loading...</small></div>
                     <footer>
                         <div class="controls" data-zone-id="${esc(zone.zone_id)}">
                             <button data-action="previous">◀◀</button>
@@ -294,6 +303,22 @@ async function loadZones() {
                 </article>
             `;
         }).join('') + '</div>';
+
+        // Fetch now playing info for each zone
+        zones.forEach(async zone => {
+            const infoEl = document.getElementById('zone-info-' + zone.zone_id);
+            if (!infoEl) return;
+            try {
+                const np = await fetch('/now_playing?zone_id=' + encodeURIComponent(zone.zone_id)).then(r => r.json());
+                if (np && np.line1 && np.line1 !== 'Idle') {
+                    infoEl.innerHTML = '<strong style="font-size:0.9em;">' + esc(np.line1) + '</strong><br><small>' + esc(np.line2 || '') + '</small>';
+                } else {
+                    infoEl.innerHTML = '<small>Nothing playing</small>';
+                }
+            } catch (e) {
+                infoEl.innerHTML = '<small>—</small>';
+            }
+        });
 
         // Show HQP DSP section if any zone is linked
         const hasHqpLinks = Object.keys(hqpZoneLinks).length > 0;
@@ -791,12 +816,35 @@ pub async fn lms_page(State(_state): State<AppState>) -> impl IntoResponse {
     let content = r#"
 <h1>Logitech Media Server</h1>
 
-<section id="lms-status">
+<section id="lms-config">
     <hgroup>
-        <h2>Connection Status</h2>
-        <p>LMS server connection</p>
+        <h2>Server Configuration</h2>
+        <p>Configure connection to your Squeezebox server</p>
     </hgroup>
-    <article aria-busy="true">Loading...</article>
+    <article id="lms-config-card">
+        <div id="lms-status-line">Checking...</div>
+        <div id="lms-config-form" style="display:none;">
+            <div class="grid">
+                <label>Host
+                    <input type="text" id="lms-host" placeholder="192.168.1.x or hostname">
+                </label>
+                <label>Port
+                    <input type="number" id="lms-port" value="9000" min="1" max="65535">
+                </label>
+            </div>
+            <div class="grid">
+                <label>Username (optional)
+                    <input type="text" id="lms-username" placeholder="Leave blank if not required">
+                </label>
+                <label>Password (optional)
+                    <input type="password" id="lms-password" placeholder="Leave blank if not required">
+                </label>
+            </div>
+            <button onclick="saveLmsConfig()">Save & Connect</button>
+            <span id="lms-save-msg"></span>
+        </div>
+        <button id="lms-reconfig-btn" style="display:none;" onclick="showLmsForm()">Reconfigure</button>
+    </article>
 </section>
 
 <section id="lms-players">
@@ -890,9 +938,77 @@ document.querySelector('#lms-players').addEventListener('click', e => {
     lmsControl(container.dataset.playerId, btn.dataset.action);
 });
 
-loadLmsStatus();
+// LMS Config
+async function loadLmsConfig() {
+    const statusLine = document.getElementById('lms-status-line');
+    const form = document.getElementById('lms-config-form');
+    const reconfigBtn = document.getElementById('lms-reconfig-btn');
+
+    try {
+        const res = await fetch('/lms/config');
+        const data = await res.json();
+
+        if (data.configured && data.connected) {
+            statusLine.innerHTML = `<span class="status-ok">✓ Connected to ${esc(data.host)}:${data.port}</span>`;
+            form.style.display = 'none';
+            reconfigBtn.style.display = 'inline-block';
+            document.getElementById('lms-host').value = data.host || '';
+            document.getElementById('lms-port').value = data.port || 9000;
+        } else if (data.configured) {
+            statusLine.innerHTML = `<span class="status-err">✗ Configured but not connected (${esc(data.host)}:${data.port})</span>`;
+            form.style.display = 'none';
+            reconfigBtn.style.display = 'inline-block';
+        } else {
+            statusLine.textContent = 'Not configured';
+            form.style.display = 'block';
+            reconfigBtn.style.display = 'none';
+        }
+    } catch (e) {
+        statusLine.innerHTML = `<span class="status-err">Error: ${esc(e.message)}</span>`;
+        form.style.display = 'block';
+    }
+}
+
+function showLmsForm() {
+    document.getElementById('lms-config-form').style.display = 'block';
+    document.getElementById('lms-reconfig-btn').style.display = 'none';
+}
+
+async function saveLmsConfig() {
+    const msg = document.getElementById('lms-save-msg');
+    const host = document.getElementById('lms-host').value.trim();
+    const port = parseInt(document.getElementById('lms-port').value) || 9000;
+    const username = document.getElementById('lms-username').value.trim() || null;
+    const password = document.getElementById('lms-password').value || null;
+
+    if (!host) {
+        msg.innerHTML = '<span class="status-err">Host is required</span>';
+        return;
+    }
+
+    msg.textContent = 'Connecting...';
+    try {
+        const res = await fetch('/lms/configure', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host, port, username, password })
+        });
+        const data = await res.json();
+        if (res.ok) {
+            msg.innerHTML = '<span class="status-ok">✓ Connected</span>';
+            setTimeout(loadLmsConfig, 500);
+            setTimeout(loadLmsPlayers, 500);
+        } else {
+            msg.innerHTML = `<span class="status-err">${esc(data.error || 'Connection failed')}</span>`;
+        }
+    } catch (e) {
+        msg.innerHTML = `<span class="status-err">Error: ${esc(e.message)}</span>`;
+    }
+}
+
+loadLmsConfig();
 loadLmsPlayers();
-setInterval(loadLmsStatus, 5000);
+setInterval(loadLmsConfig, 10000);
 setInterval(loadLmsPlayers, 4000);
 </script>
 "#;
@@ -965,7 +1081,7 @@ pub async fn zone_page(State(_state): State<AppState>) -> impl IntoResponse {
                 </label>
             </div>
             <div class="grid">
-                <label id="hqp-shaper-label">Shaper
+                <label><span id="hqp-shaper-label">Shaper</span>
                     <select id="hqp-shaper" onchange="setPipeline('shaper', this.value)"></select>
                 </label>
             </div>
@@ -1524,71 +1640,6 @@ pub async fn settings_page(State(_state): State<AppState>) -> impl IntoResponse 
     let content = r#"
 <h1>Settings</h1>
 
-<section id="lms-config">
-    <hgroup>
-        <h2>Lyrion Music Server (LMS)</h2>
-        <p>Configure connection to your Squeezebox server</p>
-    </hgroup>
-    <article id="lms-config-card">
-        <div id="lms-status-line">Checking...</div>
-        <div id="lms-config-form" style="display:none;">
-            <div class="grid">
-                <label>Host
-                    <input type="text" id="lms-host" placeholder="192.168.1.x or hostname">
-                </label>
-                <label>Port
-                    <input type="number" id="lms-port" value="9000" min="1" max="65535">
-                </label>
-            </div>
-            <div class="grid">
-                <label>Username (optional)
-                    <input type="text" id="lms-username" placeholder="Leave blank if not required">
-                </label>
-                <label>Password (optional)
-                    <input type="password" id="lms-password" placeholder="Leave blank if not required">
-                </label>
-            </div>
-            <button onclick="saveLmsConfig()">Save & Connect</button>
-            <span id="lms-save-msg"></span>
-        </div>
-        <button id="lms-reconfig-btn" style="display:none;" onclick="showLmsForm()">Reconfigure</button>
-    </article>
-</section>
-
-<section id="hqp-config">
-    <hgroup>
-        <h2>HQPlayer</h2>
-        <p>Configure connection to HQPlayer for DSP control</p>
-    </hgroup>
-    <article id="hqp-config-card">
-        <div id="hqp-status-line">Checking...</div>
-        <div id="hqp-config-form" style="display:none;">
-            <div class="grid">
-                <label>Host
-                    <input type="text" id="hqp-host" placeholder="192.168.1.x or hostname">
-                </label>
-                <label>Native Port (TCP)
-                    <input type="number" id="hqp-port" value="4321" min="1" max="65535">
-                </label>
-                <label>Web Port (HTTP)
-                    <input type="number" id="hqp-web-port" value="8088" min="1" max="65535">
-                </label>
-            </div>
-            <div class="grid">
-                <label>Username (optional)
-                    <input type="text" id="hqp-username" placeholder="For web UI profile loading">
-                </label>
-                <label>Password (optional)
-                    <input type="password" id="hqp-password">
-                </label>
-            </div>
-            <button onclick="saveHqpConfig()">Save & Connect</button>
-            <span id="hqp-save-msg"></span>
-        </div>
-        <button id="hqp-reconfig-btn" style="display:none;" onclick="showHqpForm()">Reconfigure</button>
-    </article>
-</section>
-
 <section id="adapter-settings">
     <hgroup>
         <h2>Adapter Settings</h2>
@@ -1637,148 +1688,6 @@ pub async fn settings_page(State(_state): State<AppState>) -> impl IntoResponse 
 
 <script>
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }
-
-// LMS Config
-async function loadLmsConfig() {
-    const statusLine = document.getElementById('lms-status-line');
-    const form = document.getElementById('lms-config-form');
-    const reconfigBtn = document.getElementById('lms-reconfig-btn');
-
-    try {
-        const res = await fetch('/lms/config');
-        const data = await res.json();
-
-        if (data.configured && data.connected) {
-            statusLine.innerHTML = `<span class="status-ok">✓ Connected to ${esc(data.host)}:${data.port}</span>`;
-            statusLine.className = '';
-            form.style.display = 'none';
-            reconfigBtn.style.display = 'inline-block';
-            document.getElementById('lms-host').value = data.host || '';
-            document.getElementById('lms-port').value = data.port || 9000;
-        } else if (data.configured) {
-            statusLine.innerHTML = `<span class="status-err">✗ Configured but not connected (${esc(data.host)}:${data.port})</span>`;
-            form.style.display = 'none';
-            reconfigBtn.style.display = 'inline-block';
-        } else {
-            statusLine.textContent = 'Not configured';
-            statusLine.className = '';
-            form.style.display = 'block';
-            reconfigBtn.style.display = 'none';
-        }
-    } catch (e) {
-        statusLine.innerHTML = `<span class="status-err">Error: ${esc(e.message)}</span>`;
-        form.style.display = 'block';
-    }
-}
-
-function showLmsForm() {
-    document.getElementById('lms-config-form').style.display = 'block';
-    document.getElementById('lms-reconfig-btn').style.display = 'none';
-}
-
-async function saveLmsConfig() {
-    const msg = document.getElementById('lms-save-msg');
-    const host = document.getElementById('lms-host').value.trim();
-    const port = parseInt(document.getElementById('lms-port').value) || 9000;
-    const username = document.getElementById('lms-username').value.trim() || null;
-    const password = document.getElementById('lms-password').value || null;
-
-    if (!host) {
-        msg.innerHTML = '<span class="status-err">Host is required</span>';
-        return;
-    }
-
-    msg.textContent = 'Connecting...';
-    try {
-        const res = await fetch('/lms/configure', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ host, port, username, password })
-        });
-        const data = await res.json();
-        if (res.ok) {
-            msg.innerHTML = '<span class="status-ok">Connected!</span>';
-            setTimeout(loadLmsConfig, 500);
-        } else {
-            msg.innerHTML = `<span class="status-err">${esc(data.error)}</span>`;
-        }
-    } catch (e) {
-        msg.innerHTML = `<span class="status-err">${esc(e.message)}</span>`;
-    }
-}
-
-// HQPlayer Config
-async function loadHqpConfig() {
-    const statusLine = document.getElementById('hqp-status-line');
-    const form = document.getElementById('hqp-config-form');
-    const reconfigBtn = document.getElementById('hqp-reconfig-btn');
-
-    try {
-        const res = await fetch('/hqplayer/config');
-        const data = await res.json();
-
-        if (data.configured && data.connected) {
-            statusLine.innerHTML = `<span class="status-ok">✓ Connected to ${esc(data.host)}:${data.port}</span>`;
-            form.style.display = 'none';
-            reconfigBtn.style.display = 'inline-block';
-            document.getElementById('hqp-host').value = data.host || '';
-            document.getElementById('hqp-port').value = data.port || 4321;
-            document.getElementById('hqp-web-port').value = data.web_port || 8088;
-        } else if (data.configured) {
-            statusLine.innerHTML = `<span class="status-err">✗ Configured but not connected (${esc(data.host)}:${data.port})</span>`;
-            form.style.display = 'none';
-            reconfigBtn.style.display = 'inline-block';
-        } else {
-            statusLine.textContent = 'Not configured';
-            form.style.display = 'block';
-            reconfigBtn.style.display = 'none';
-        }
-    } catch (e) {
-        statusLine.innerHTML = `<span class="status-err">Error: ${esc(e.message)}</span>`;
-        form.style.display = 'block';
-    }
-}
-
-function showHqpForm() {
-    document.getElementById('hqp-config-form').style.display = 'block';
-    document.getElementById('hqp-reconfig-btn').style.display = 'none';
-}
-
-async function saveHqpConfig() {
-    const msg = document.getElementById('hqp-save-msg');
-    const host = document.getElementById('hqp-host').value.trim();
-    const port = parseInt(document.getElementById('hqp-port').value) || 4321;
-    const web_port = parseInt(document.getElementById('hqp-web-port').value) || 8088;
-    const username = document.getElementById('hqp-username').value.trim() || null;
-    const password = document.getElementById('hqp-password').value || null;
-
-    if (!host) {
-        msg.innerHTML = '<span class="status-err">Host is required</span>';
-        return;
-    }
-
-    msg.textContent = 'Connecting...';
-    try {
-        const res = await fetch('/hqplayer/configure', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ host, port, web_port, username, password })
-        });
-        const data = await res.json();
-        if (res.ok) {
-            if (data.connected) {
-                msg.innerHTML = '<span class="status-ok">Connected!</span>';
-            } else {
-                msg.innerHTML = '<span class="status-err">Saved but not connected - check host</span>';
-            }
-            setTimeout(loadHqpConfig, 500);
-        } else {
-            msg.innerHTML = `<span class="status-err">${esc(data.error)}</span>`;
-        }
-    } catch (e) {
-        msg.innerHTML = `<span class="status-err">${esc(e.message)}</span>`;
-    }
-}
 
 // Discovery status
 async function loadDiscoveryStatus() {
@@ -1870,8 +1779,6 @@ function saveUiSettings() {
 }
 
 // Load all on page load
-loadLmsConfig();
-loadHqpConfig();
 loadDiscoveryStatus();
 loadAdapterSettings();
 loadUiSettings();
