@@ -41,6 +41,18 @@ fn extract_knob_version(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// DSP info for zones linked to HQPlayer (iOS compatible)
+#[derive(Serialize, Clone)]
+pub struct DspInfo {
+    pub r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profiles: Option<String>,
+}
+
 /// Zone info for knob response - matches Node.js bus adapter format
 #[derive(Serialize)]
 pub struct ZoneInfo {
@@ -48,6 +60,8 @@ pub struct ZoneInfo {
     pub zone_name: String,
     pub source: String,
     pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsp: Option<DspInfo>,
 }
 
 /// GET /knob/zones response
@@ -68,16 +82,42 @@ pub async fn knob_zones_handler(
 /// Helper to aggregate zones from all adapters (respects adapter settings, public for UI module)
 pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
     use crate::api::load_app_settings;
+    use std::collections::HashMap;
 
     let settings = load_app_settings();
     let adapters = settings.adapters;
+
+    // Get HQPlayer zone links for DSP field population
+    let hqp_links: HashMap<String, String> = state
+        .hqp_zone_links
+        .get_links()
+        .await
+        .into_iter()
+        .map(|l| (l.zone_id, l.instance))
+        .collect();
+
+    // Helper to create DspInfo if zone is linked to HQPlayer
+    let get_dsp = |zone_id: &str| -> Option<DspInfo> {
+        hqp_links.get(zone_id).map(|instance| DspInfo {
+            r#type: "hqplayer".to_string(),
+            instance: Some(instance.clone()),
+            pipeline: Some(format!(
+                "/hqp/pipeline?zone_id={}",
+                urlencoding::encode(zone_id)
+            )),
+            profiles: Some("/hqp/profiles".to_string()),
+        })
+    };
+
     let mut zones = Vec::new();
 
     // Roon zones (prefixed with roon: for routing)
     if adapters.roon {
         for z in state.roon.get_zones().await {
+            let zone_id = format!("roon:{}", z.zone_id);
             zones.push(ZoneInfo {
-                zone_id: format!("roon:{}", z.zone_id),
+                dsp: get_dsp(&zone_id),
+                zone_id,
                 zone_name: z.display_name,
                 source: "roon".to_string(),
                 state: z.state,
@@ -88,8 +128,10 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
     // LMS players (prefixed with lms:)
     if adapters.lms {
         for p in state.lms.get_cached_players().await {
+            let zone_id = format!("lms:{}", p.playerid);
             zones.push(ZoneInfo {
-                zone_id: format!("lms:{}", p.playerid),
+                dsp: get_dsp(&zone_id),
+                zone_id,
                 zone_name: p.name,
                 source: "lms".to_string(),
                 state: if p.mode == "play" {
@@ -106,8 +148,10 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
     // OpenHome zones (prefixed with openhome:)
     if adapters.openhome {
         for z in state.openhome.get_zones().await {
+            let zone_id = format!("openhome:{}", z.zone_id);
             zones.push(ZoneInfo {
-                zone_id: format!("openhome:{}", z.zone_id),
+                dsp: get_dsp(&zone_id),
+                zone_id,
                 zone_name: z.zone_name,
                 source: "openhome".to_string(),
                 state: z.state.clone(),
@@ -118,8 +162,10 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
     // UPnP zones (prefixed with upnp:)
     if adapters.upnp {
         for z in state.upnp.get_zones().await {
+            let zone_id = format!("upnp:{}", z.zone_id);
             zones.push(ZoneInfo {
-                zone_id: format!("upnp:{}", z.zone_id),
+                dsp: get_dsp(&zone_id),
+                zone_id,
                 zone_name: z.zone_name,
                 source: "upnp".to_string(),
                 state: z.state.clone(),

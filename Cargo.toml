@@ -7,12 +7,20 @@ description = "Source-agnostic hi-fi control bridge for hardware surfaces and Ho
 license = "MIT"
 repository = "https://github.com/open-horizon-labs/unified-hifi-control"
 
+[features]
+default = ["server"]
+server = ["dioxus/server"]
+web = ["dioxus/web"]
+
 [dependencies]
 # Web framework
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"] }
+
+# Dioxus UI framework (SSR + client hydration)
+dioxus = { version = "0.7", features = ["fullstack"] }
 
 # Roon API (the key discovery!)
 # Package is named "roon-api" in Cargo.toml, repo is "rust-roon-api"
