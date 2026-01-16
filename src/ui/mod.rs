@@ -241,7 +241,10 @@ pub async fn knobs_page(State(_state): State<AppState>) -> impl IntoResponse {
 pub async fn settings_page(State(_state): State<AppState>) -> impl IntoResponse {
     // Render the Dioxus component to HTML string
     let html = dioxus::ssr::render_element(rsx! { SettingsPage {} });
-    Html(format!("<!DOCTYPE html>\n<html lang=\"en\" data-theme=\"dark\">\n{}</html>", html))
+    Html(format!(
+        "<!DOCTYPE html>\n<html lang=\"en\" data-theme=\"dark\">\n{}</html>",
+        html
+    ))
 }
 
 /// GET /knobs/flash - Web flasher redirect page
