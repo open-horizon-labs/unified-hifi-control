@@ -106,7 +106,9 @@ sub beforeRender {
     # Add template variables
     $params->{'running'}    = Plugins::UnifiedHiFi::Helper->running();
     $params->{'webUrl'}     = Plugins::UnifiedHiFi::Helper->webUrl();
-    $params->{'binaries'}   = [Plugins::UnifiedHiFi::Helper->binaries()];
+    # Single binary per platform now - dropdown only shows if size > 1 (never)
+    my $platformBinary = Plugins::UnifiedHiFi::Helper::BINARY_MAP->{Plugins::UnifiedHiFi::Helper->detectPlatform()};
+    $params->{'binaries'}   = $platformBinary ? [$platformBinary] : [];
     $params->{'loglevels'}  = ['error', 'warn', 'info', 'debug'];
     $params->{'rotations'}  = [0, 90, 180, 270];
 
