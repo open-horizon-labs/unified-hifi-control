@@ -38,6 +38,7 @@ use constant BINARY_MAP => {
     'darwin-x86_64'  => 'unified-hifi-darwin-x86_64',
     'linux-x86_64'   => 'unified-hifi-linux-x86_64',
     'linux-aarch64'  => 'unified-hifi-linux-aarch64',
+    'linux-armv7l'   => 'unified-hifi-linux-armv7l',
     'win64'          => 'unified-hifi-win64.exe',
 };
 
@@ -45,55 +46,6 @@ sub binDir {
 	my $binDir = catdir(Plugins::UnifiedHiFi::Plugin->_pluginDataFor('basedir'), 'Bin');
     make_path($binDir) unless (-d $binDir);
     return $binDir;
-}
-
-# Detect OS and return available binaries
-sub binaries {
-    my $class = shift;
-
-    my $os = Slim::Utils::OSDetect::OS();
-    my $details = Slim::Utils::OSDetect::details();
-    my $arch = $details->{'osArch'} || $details->{'binArch'} || 'x86_64';
-
-    my $bindir = binDir();
-    my @binaries;
-
-    if (main::ISWINDOWS) {
-        push @binaries, 'unified-hifi-win64.exe';
-    }
-    elsif (main::ISMAC) {
-        if ($arch =~ /arm|aarch64/i) {
-            push @binaries, 'unified-hifi-darwin-arm64';
-        } else {
-            push @binaries, 'unified-hifi-darwin-x86_64';
-        }
-    }
-    else {
-        # Linux and other Unix-like systems
-        if ($arch =~ /x86_64|amd64/i) {
-            push @binaries, 'unified-hifi-linux-x86_64';
-        }
-        elsif ($arch =~ /aarch64|arm64/i) {
-            push @binaries, 'unified-hifi-linux-aarch64';
-        }
-        elsif ($arch =~ /arm/i) {
-            push @binaries, 'unified-hifi-linux-armv7l';
-        }
-        else {
-            # Fallback to x86_64
-            push @binaries, 'unified-hifi-linux-x86_64';
-        }
-    }
-
-    # Filter to only existing files
-    my @available;
-    for my $bin (@binaries) {
-        my $path = catfile($bindir, $bin);
-        push @available, $bin if -e $path;
-    }
-
-    $log->debug("Available binaries for $os/$arch: " . join(', ', @available));
-    return @available;
 }
 
 # Detect platform for binary download
@@ -107,9 +59,15 @@ sub detectPlatform {
         return $arch =~ /arm|aarch64/i ? 'darwin-arm64' : 'darwin-x86_64';
     } elsif (main::ISWINDOWS) {
         return 'win64';
-    } else {
-        return $arch =~ /aarch64|arm64/i ? 'linux-aarch64' : 'linux-x86_64';
+    # Linux and other Unix-like systems
+    } elsif ($arch =~ /aarch64|arm64/i) {
+        return 'linux-aarch64';
+    } elsif ($arch =~ /arm/i) {
+        return 'linux-armv7l';
     }
+
+    # Fallback to x86_64
+    return 'linux-x86_64';
 }
 
 # Get plugin version from install.xml
@@ -128,10 +86,8 @@ sub needsBinaryDownload {
         return 0;
     }
 
-    my $bindir = binDir();
-    my $binaryPath = catfile($bindir, $binaryName);
-
-    return !(-e $binaryPath && -x $binaryPath);
+    my $binaryPath = $class->bin();
+    return !(-e $binaryPath && -x _);
 }
 
 # Get binary status for UI
@@ -155,11 +111,10 @@ sub ensureBinary {
         return;
     }
 
-    my $bindir = binDir();
-    my $binaryPath = catfile($bindir, $binaryName);
+    my $binaryPath = $class->bin();
 
     # Already exists and executable
-    if (-e $binaryPath && -x $binaryPath) {
+    if (-e $binaryPath && -x _) {
         $callback->($binaryPath) if $callback;
         return $binaryPath;
     }
@@ -263,31 +218,20 @@ sub downloadBinary {
 sub bin {
     my $class = shift;
 
-    my $bindir = binDir();
-    my @available = $class->binaries();
-
-    # If no binaries available, check if we can use platform-specific one
-    unless (@available) {
-        my $platform = $class->detectPlatform();
-        my $binaryName = BINARY_MAP->{$platform};
-        if ($binaryName) {
-            my $path = catfile($bindir, $binaryName);
-            return $path if -e $path && -x $path;
-        }
-        return;
-    }
-
     # Use preference or default to first available
-    my $selected = $prefs->get('bin') || $available[0];
+    my $selected = $prefs->get('bin');
 
-    # Validate selection
-    unless (grep { $_ eq $selected } @available) {
-        $selected = $available[0];
-        $prefs->set('bin', $selected);
+    if (!$selected) {
+        $selected = BINARY_MAP->{$class->detectPlatform()};
+        $prefs->set('bin', $selected) if $selected;
     }
 
-    my $binaryPath = catfile($bindir, $selected);
-    chmod 0755, $binaryPath if !main::ISWINDOWS && -e $binaryPath;
+    return unless $selected;
+
+    my $binaryPath = catfile(binDir(), $selected);
+    chmod 0755, $binaryPath if !main::ISWINDOWS && -f $binaryPath && !-x _;
+
+    main::DEBUGLOG && $log->is_debug && $log->debug("Using binary: $binaryPath");
 
     return $binaryPath;
 }
