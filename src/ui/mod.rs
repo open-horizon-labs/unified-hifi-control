@@ -1040,9 +1040,9 @@ pub async fn zone_page(State(_state): State<AppState>) -> impl IntoResponse {
             <p id="zone-album" style="margin:0;color:var(--pico-muted-color);"><small>—</small></p>
             <hr>
             <div style="display:flex;gap:0.5rem;align-items:center;margin:1rem 0;">
-                <button id="btn-prev" style="width:3rem;">◀◀</button>
-                <button id="btn-play" style="width:3rem;">⏯</button>
-                <button id="btn-next" style="width:3rem;">▶▶</button>
+                <button id="btn-prev">◀◀</button>
+                <button id="btn-play">⏯</button>
+                <button id="btn-next">▶▶</button>
                 <span style="margin-left:1rem;">Volume: <strong id="zone-volume">—</strong></span>
                 <button id="btn-vol-down" style="width:2.5rem;" title="Volume Down">−</button>
                 <button id="btn-vol-up" style="width:2.5rem;" title="Volume Up">+</button>
