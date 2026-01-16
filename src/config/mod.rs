@@ -243,9 +243,11 @@ fn migrate_roon_config(data_dir: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::env;
 
     #[test]
+    #[serial]
     fn test_lms_host_env_enables_lms_config() {
         // Issue #62: When LMS_HOST is set, config.lms should be Some
         // This simulates the LMS plugin starting the bridge with LMS_HOST=127.0.0.1
@@ -273,6 +275,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_lms_host_and_port_env() {
         env::set_var("LMS_HOST", "192.168.1.100");
         env::set_var("LMS_PORT", "9001");
@@ -291,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_lms_host_env_detected() {
         // Test the helper function that checks if LMS should be auto-enabled
         env::set_var("LMS_HOST", "127.0.0.1");

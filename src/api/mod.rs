@@ -1541,9 +1541,11 @@ pub async fn api_settings_post_handler(Json(settings): Json<AppSettings>) -> imp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::env;
 
     #[test]
+    #[serial]
     fn test_lms_auto_enabled_with_env_var() {
         // Issue #62: When LMS_HOST is set, adapters.lms should be auto-enabled
         env::set_var("LMS_HOST", "127.0.0.1");
@@ -1561,6 +1563,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_lms_not_enabled_without_env_var() {
         // Without LMS_HOST, LMS should default to disabled
         env::remove_var("LMS_HOST");
