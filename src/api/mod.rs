@@ -1492,9 +1492,9 @@ pub fn load_app_settings() -> AppSettings {
     };
 
     // Issue #62: Auto-enable LMS adapter when started from LMS plugin
-    // The LMS plugin passes LMS_HOST env var when starting the bridge
-    if crate::config::is_lms_env_configured() && !settings.adapters.lms {
-        tracing::info!("LMS_HOST env var detected, auto-enabling LMS adapter");
+    // The LMS plugin sets LMS_UNIFIEDHIFI_STARTED=true when launching the bridge
+    if crate::config::is_lms_plugin_started() && !settings.adapters.lms {
+        tracing::info!("LMS plugin detected (LMS_UNIFIEDHIFI_STARTED), auto-enabling LMS adapter");
         settings.adapters.lms = true;
     }
 
@@ -1546,27 +1546,27 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_lms_auto_enabled_with_env_var() {
-        // Issue #62: When LMS_HOST is set, adapters.lms should be auto-enabled
-        env::set_var("LMS_HOST", "127.0.0.1");
+    fn test_lms_auto_enabled_when_plugin_started() {
+        // Issue #62: When started from LMS plugin, adapters.lms should be auto-enabled
+        env::set_var("LMS_UNIFIEDHIFI_STARTED", "true");
         env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent-api");
 
         let settings = load_app_settings();
 
-        env::remove_var("LMS_HOST");
+        env::remove_var("LMS_UNIFIEDHIFI_STARTED");
         env::remove_var("UHC_CONFIG_DIR");
 
         assert!(
             settings.adapters.lms,
-            "adapters.lms should be true when LMS_HOST env var is set"
+            "adapters.lms should be true when LMS_UNIFIEDHIFI_STARTED=true"
         );
     }
 
     #[test]
     #[serial]
-    fn test_lms_not_enabled_without_env_var() {
-        // Without LMS_HOST, LMS should default to disabled
-        env::remove_var("LMS_HOST");
+    fn test_lms_not_enabled_without_plugin_signal() {
+        // Without LMS_UNIFIEDHIFI_STARTED, LMS should default to disabled
+        env::remove_var("LMS_UNIFIEDHIFI_STARTED");
         env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent-api2");
 
         let settings = load_app_settings();
@@ -1575,7 +1575,7 @@ mod tests {
 
         assert!(
             !settings.adapters.lms,
-            "adapters.lms should be false when LMS_HOST env var is not set"
+            "adapters.lms should be false without LMS_UNIFIEDHIFI_STARTED"
         );
     }
 }

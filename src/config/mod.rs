@@ -151,10 +151,12 @@ pub fn get_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("./data")
 }
 
-/// Check if LMS is configured via environment variables (LMS plugin startup)
-/// Used by AppSettings to auto-enable LMS adapter when started from LMS plugin
-pub fn is_lms_env_configured() -> bool {
-    std::env::var("LMS_HOST").is_ok()
+/// Check if started from LMS UnifiedHiFi plugin (explicit signal)
+/// The LMS plugin sets LMS_UNIFIEDHIFI_STARTED=true when launching the bridge
+pub fn is_lms_plugin_started() -> bool {
+    std::env::var("LMS_UNIFIEDHIFI_STARTED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
 }
 
 pub fn load_config() -> Result<Config> {
@@ -295,12 +297,16 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_lms_host_env_detected() {
-        // Test the helper function that checks if LMS should be auto-enabled
-        env::set_var("LMS_HOST", "127.0.0.1");
-        assert!(is_lms_env_configured());
-        env::remove_var("LMS_HOST");
-        assert!(!is_lms_env_configured());
+    fn test_lms_plugin_started_detection() {
+        // Test the helper function that checks if started from LMS plugin
+        env::set_var("LMS_UNIFIEDHIFI_STARTED", "true");
+        assert!(is_lms_plugin_started());
+        env::set_var("LMS_UNIFIEDHIFI_STARTED", "1");
+        assert!(is_lms_plugin_started());
+        env::set_var("LMS_UNIFIEDHIFI_STARTED", "false");
+        assert!(!is_lms_plugin_started());
+        env::remove_var("LMS_UNIFIEDHIFI_STARTED");
+        assert!(!is_lms_plugin_started());
     }
 }
 
