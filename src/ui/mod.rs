@@ -281,7 +281,7 @@ async function loadZones() {
         }
 
         section.innerHTML = '<div class="zone-grid">' + zones.map(zone => {
-            const playIcon = zone.state === 'playing' ? '⏸' : '▶';
+            const playIcon = zone.state === 'playing' ? '⏸︎' : '▶';
             const hqpLink = hqpZoneLinks[zone.zone_id];
             const hqpBadge = hqpLink ? `<mark style="font-size:0.7em;padding:0.1em 0.3em;margin-left:0.5em;">HQP</mark>` : '';
             const sourceBadge = zone.source ? `<mark style="font-size:0.7em;padding:0.1em 0.3em;margin-left:0.5em;background:var(--pico-muted-background);">${esc(zone.source)}</mark>` : '';
@@ -1197,7 +1197,7 @@ function updateZoneDisplay(zone, np) {
     const isPlaying = np?.is_playing || false;
     document.getElementById('btn-prev').disabled = !np?.is_previous_allowed;
     document.getElementById('btn-next').disabled = !np?.is_next_allowed;
-    document.getElementById('btn-play').textContent = isPlaying ? '⏸' : '▶';
+    document.getElementById('btn-play').textContent = isPlaying ? '⏸︎' : '▶';
 
     // Show/hide HQP section based on zone link
     const hqpInstance = zoneLinkMap[zone.zone_id];
