@@ -90,6 +90,7 @@ path = "src/bin/protocol_checker.rs"
 
 [dev-dependencies]
 tokio-test = "0.4"
+serial_test = "3"
 
 [profile.release]
 lto = true

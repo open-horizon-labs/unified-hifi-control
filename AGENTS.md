@@ -1,5 +1,33 @@
 # Agent Guidelines
 
+## Open Horizon Labs Tools
+
+This project uses three complementary tools:
+
+### ba (Task Tracker)
+**When to use:** Tracking work items, managing tasks across sessions
+**Protocol:**
+- `ba ready` - See claimable tasks
+- `ba claim <id> --session $SESSION_ID` - Claim a task
+- `ba complete <id>` - Mark task done
+- `ba create "description" -t task` - Create new task
+
+### superego (Metacognitive Advisor)
+**When to use:** Before commits, when choosing between approaches, when uncertain
+**Protocol:**
+- Mode: `pull` (reviews on request, not automatically)
+- Use `sg review` at decision points
+- Handle findings: P1-P3 fix immediately, P4 can discard with reason
+
+### wm (Working Memory)
+**When to use:** Automatic - captures learnings from sessions
+**Protocol:**
+- Runs automatically via hooks
+- Extracts tacit knowledge from completed work
+- No manual intervention needed
+
+---
+
 ## Branch Strategy
 
 **Default branch for Rust development: `v3`**
