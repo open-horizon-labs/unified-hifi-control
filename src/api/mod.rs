@@ -1473,16 +1473,32 @@ fn settings_path() -> std::path::PathBuf {
 
 pub fn load_app_settings() -> AppSettings {
     let path = settings_path();
-    if path.exists() {
+    let mut settings = if path.exists() {
         match std::fs::read_to_string(&path) {
             Ok(content) => match serde_json::from_str(&content) {
-                Ok(settings) => return settings,
-                Err(e) => tracing::warn!("Failed to parse app settings: {}", e),
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to parse app settings: {}", e);
+                    AppSettings::default()
+                }
             },
-            Err(e) => tracing::warn!("Failed to read app settings: {}", e),
+            Err(e) => {
+                tracing::warn!("Failed to read app settings: {}", e);
+                AppSettings::default()
+            }
         }
+    } else {
+        AppSettings::default()
+    };
+
+    // Issue #62: Auto-enable LMS adapter when started from LMS plugin
+    // The LMS plugin passes LMS_HOST env var when starting the bridge
+    if crate::config::is_lms_env_configured() && !settings.adapters.lms {
+        tracing::info!("LMS_HOST env var detected, auto-enabling LMS adapter");
+        settings.adapters.lms = true;
     }
-    AppSettings::default()
+
+    settings
 }
 
 fn save_app_settings(settings: &AppSettings) -> bool {
@@ -1519,5 +1535,44 @@ pub async fn api_settings_post_handler(Json(settings): Json<AppSettings>) -> imp
         Json(serde_json::json!({"ok": true}))
     } else {
         Json(serde_json::json!({"ok": false, "error": "Failed to save settings"}))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_lms_auto_enabled_with_env_var() {
+        // Issue #62: When LMS_HOST is set, adapters.lms should be auto-enabled
+        env::set_var("LMS_HOST", "127.0.0.1");
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent-api");
+
+        let settings = load_app_settings();
+
+        env::remove_var("LMS_HOST");
+        env::remove_var("UHC_CONFIG_DIR");
+
+        assert!(
+            settings.adapters.lms,
+            "adapters.lms should be true when LMS_HOST env var is set"
+        );
+    }
+
+    #[test]
+    fn test_lms_not_enabled_without_env_var() {
+        // Without LMS_HOST, LMS should default to disabled
+        env::remove_var("LMS_HOST");
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent-api2");
+
+        let settings = load_app_settings();
+
+        env::remove_var("UHC_CONFIG_DIR");
+
+        assert!(
+            !settings.adapters.lms,
+            "adapters.lms should be false when LMS_HOST env var is not set"
+        );
     }
 }

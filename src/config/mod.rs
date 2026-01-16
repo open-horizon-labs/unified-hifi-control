@@ -151,6 +151,12 @@ pub fn get_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("./data")
 }
 
+/// Check if LMS is configured via environment variables (LMS plugin startup)
+/// Used by AppSettings to auto-enable LMS adapter when started from LMS plugin
+pub fn is_lms_env_configured() -> bool {
+    std::env::var("LMS_HOST").is_ok()
+}
+
 pub fn load_config() -> Result<Config> {
     let config_dir = get_config_dir();
 
@@ -231,6 +237,66 @@ fn migrate_roon_config(data_dir: &std::path::Path) {
             }
             Err(e) => tracing::warn!("Failed to read Node.js Roon config: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_lms_host_env_enables_lms_config() {
+        // Issue #62: When LMS_HOST is set, config.lms should be Some
+        // This simulates the LMS plugin starting the bridge with LMS_HOST=127.0.0.1
+
+        // Set env var (will be cleaned up at end)
+        env::set_var("LMS_HOST", "127.0.0.1");
+        // Ensure no config file interferes (use temp dir)
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
+
+        let config = load_config().expect("config should load");
+
+        // Clean up
+        env::remove_var("LMS_HOST");
+        env::remove_var("UHC_CONFIG_DIR");
+
+        // The key assertion: LMS should be configured when LMS_HOST is set
+        assert!(
+            config.lms.is_some(),
+            "config.lms should be Some when LMS_HOST env var is set"
+        );
+
+        let lms = config.lms.unwrap();
+        assert_eq!(lms.host, "127.0.0.1");
+        assert_eq!(lms.port, 9000); // default port
+    }
+
+    #[test]
+    fn test_lms_host_and_port_env() {
+        env::set_var("LMS_HOST", "192.168.1.100");
+        env::set_var("LMS_PORT", "9001");
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
+
+        let config = load_config().expect("config should load");
+
+        env::remove_var("LMS_HOST");
+        env::remove_var("LMS_PORT");
+        env::remove_var("UHC_CONFIG_DIR");
+
+        assert!(config.lms.is_some());
+        let lms = config.lms.unwrap();
+        assert_eq!(lms.host, "192.168.1.100");
+        assert_eq!(lms.port, 9001);
+    }
+
+    #[test]
+    fn test_lms_host_env_detected() {
+        // Test the helper function that checks if LMS should be auto-enabled
+        env::set_var("LMS_HOST", "127.0.0.1");
+        assert!(is_lms_env_configured());
+        env::remove_var("LMS_HOST");
+        assert!(!is_lms_env_configured());
     }
 }
 
