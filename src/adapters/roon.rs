@@ -149,7 +149,8 @@ struct RoonState {
 pub struct RoonAdapter {
     state: Arc<RwLock<RoonState>>,
     bus: SharedBus,
-    shutdown: CancellationToken,
+    /// Wrapped in RwLock to allow creating fresh token on restart
+    shutdown: Arc<RwLock<CancellationToken>>,
     /// Base URL for Roon extension display (e.g., "http://hostname:3000")
     base_url: Arc<RwLock<Option<String>>>,
     /// Whether the adapter has been started
@@ -169,7 +170,7 @@ impl RoonAdapter {
         Self {
             state: Arc::new(RwLock::new(RoonState::default())),
             bus,
-            shutdown: CancellationToken::new(),
+            shutdown: Arc::new(RwLock::new(CancellationToken::new())),
             base_url: Arc::new(RwLock::new(None)),
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -182,7 +183,7 @@ impl RoonAdapter {
         Self {
             state: Arc::new(RwLock::new(RoonState::default())),
             bus,
-            shutdown: CancellationToken::new(),
+            shutdown: Arc::new(RwLock::new(CancellationToken::new())),
             base_url: Arc::new(RwLock::new(Some(base_url))),
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -210,9 +211,15 @@ impl RoonAdapter {
                 .ok_or_else(|| anyhow::anyhow!("Roon base_url not configured"))?
         };
 
+        // Create fresh cancellation token for this run (previous token may be cancelled)
+        let shutdown_clone = {
+            let mut token = self.shutdown.write().await;
+            *token = CancellationToken::new();
+            token.clone()
+        };
+
         let state_clone = self.state.clone();
         let bus_clone = self.bus.clone();
-        let shutdown_clone = self.shutdown.clone();
 
         // Spawn Roon event loop with reconnection logic
         tokio::spawn(async move {
@@ -260,7 +267,14 @@ impl RoonAdapter {
 
     /// Stop the Roon adapter (internal - use Startable trait)
     async fn stop_internal(&self) {
-        self.shutdown.cancel();
+        use std::sync::atomic::Ordering;
+
+        // Cancel background tasks
+        self.shutdown.read().await.cancel();
+
+        // Reset started flag so we can restart later
+        self.started.store(false, Ordering::SeqCst);
+
         tracing::info!("Roon adapter stopped");
     }
 

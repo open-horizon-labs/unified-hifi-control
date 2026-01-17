@@ -110,7 +110,8 @@ pub struct UPnPAdapter {
     state: Arc<RwLock<UPnPState>>,
     bus: SharedBus,
     http: Client,
-    shutdown: CancellationToken,
+    /// Wrapped in RwLock to allow creating fresh token on restart
+    shutdown: Arc<RwLock<CancellationToken>>,
 }
 
 impl UPnPAdapter {
@@ -126,7 +127,7 @@ impl UPnPAdapter {
                 .timeout(SOAP_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
-            shutdown: CancellationToken::new(),
+            shutdown: Arc::new(RwLock::new(CancellationToken::new())),
         }
     }
 
@@ -140,21 +141,27 @@ impl UPnPAdapter {
             state.running = true;
         }
 
+        // Create fresh cancellation token for this run (previous token may be cancelled)
+        let shutdown = {
+            let mut token = self.shutdown.write().await;
+            *token = CancellationToken::new();
+            token.clone()
+        };
+
         // Spawn discovery task
         let state = self.state.clone();
         let bus = self.bus.clone();
         let http = self.http.clone();
-        let shutdown = self.shutdown.clone();
+        let shutdown_clone = shutdown.clone();
 
         tokio::spawn(async move {
-            Self::discovery_loop(state.clone(), bus.clone(), http.clone(), shutdown).await;
+            Self::discovery_loop(state.clone(), bus.clone(), http.clone(), shutdown_clone).await;
         });
 
         // Spawn polling task
         let state = self.state.clone();
         let bus = self.bus.clone();
         let http = self.http.clone();
-        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             Self::poll_loop(state, bus, http, shutdown).await;
@@ -575,7 +582,7 @@ impl UPnPAdapter {
     /// Stop discovery (internal - use Startable trait)
     async fn stop_internal(&self) {
         // Cancel background tasks first
-        self.shutdown.cancel();
+        self.shutdown.read().await.cancel();
 
         let mut state = self.state.write().await;
         state.running = false;

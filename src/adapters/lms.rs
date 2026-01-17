@@ -329,7 +329,8 @@ pub struct LmsAdapter {
     state: Arc<RwLock<LmsState>>,
     rpc: LmsRpc,
     bus: SharedBus,
-    shutdown: CancellationToken,
+    /// Wrapped in RwLock to allow creating fresh token on restart
+    shutdown: Arc<RwLock<CancellationToken>>,
 }
 
 impl LmsAdapter {
@@ -344,7 +345,7 @@ impl LmsAdapter {
             state,
             rpc,
             bus,
-            shutdown: CancellationToken::new(),
+            shutdown: Arc::new(RwLock::new(CancellationToken::new())),
         };
         // Load saved config synchronously at startup
         adapter.load_config_sync();
@@ -485,11 +486,17 @@ impl LmsAdapter {
         self.bus
             .publish(BusEvent::LmsConnected { host: host.clone() });
 
+        // Create fresh cancellation token for this run (previous token may be cancelled)
+        let shutdown = {
+            let mut token = self.shutdown.write().await;
+            *token = CancellationToken::new();
+            token.clone()
+        };
+
         // Spawn polling task using shared RPC
         let state = self.state.clone();
         let bus = self.bus.clone();
         let rpc = self.rpc.clone();
-        let shutdown = self.shutdown.clone();
 
         tokio::spawn(async move {
             let mut poll_interval = interval(POLL_INTERVAL);
@@ -522,7 +529,7 @@ impl LmsAdapter {
     /// Stop polling (internal - use Startable trait)
     async fn stop_internal(&self) {
         // Cancel background tasks first
-        self.shutdown.cancel();
+        self.shutdown.read().await.cancel();
 
         let host = {
             let mut state = self.state.write().await;
