@@ -3,7 +3,6 @@
 //! Connects to Roon Core via SOOD discovery and WebSocket protocol.
 
 use anyhow::Result;
-use async_trait::async_trait;
 use roon_api::{
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     info,
@@ -18,7 +17,6 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use crate::adapters::Startable;
 use crate::bus::{
     BusEvent, NowPlaying as BusNowPlaying, PlaybackState, SharedBus,
     VolumeControl as BusVolumeControl, Zone as BusZone,
@@ -193,12 +191,12 @@ impl RoonAdapter {
     /// Create and immediately start Roon adapter (legacy API for compatibility)
     pub async fn new(bus: SharedBus, base_url: String) -> Result<Self> {
         let adapter = Self::new_configured(bus, base_url);
-        adapter.start_roon().await?;
+        adapter.start_internal().await?;
         Ok(adapter)
     }
 
     /// Start the Roon event loop (internal - use Startable trait)
-    async fn start_roon(&self) -> Result<()> {
+    async fn start_internal(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
 
         // Check if already started
@@ -261,9 +259,14 @@ impl RoonAdapter {
     }
 
     /// Stop the Roon adapter (internal - use Startable trait)
-    fn stop_adapter(&self) {
+    async fn stop_internal(&self) {
         self.shutdown.cancel();
         tracing::info!("Roon adapter stopped");
+    }
+
+    /// Check if adapter is configured (has base_url)
+    async fn is_configured(&self) -> bool {
+        self.base_url.read().await.is_some()
     }
 
     /// Get connection status
@@ -784,25 +787,5 @@ async fn run_roon_loop(
     Ok(())
 }
 
-// =============================================================================
-// Startable trait implementation
-// =============================================================================
-
-#[async_trait]
-impl Startable for RoonAdapter {
-    fn name(&self) -> &'static str {
-        "roon"
-    }
-
-    async fn start(&self) -> Result<()> {
-        self.start_roon().await
-    }
-
-    async fn stop(&self) {
-        self.stop_adapter()
-    }
-
-    async fn can_start(&self) -> bool {
-        self.base_url.read().await.is_some()
-    }
-}
+// Startable trait implementation via macro
+crate::impl_startable!(RoonAdapter, "roon", is_configured);

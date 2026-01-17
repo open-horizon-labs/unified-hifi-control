@@ -4,10 +4,7 @@
 //! OpenHome is an extension of UPnP that provides richer metadata and more
 //! control actions (next/previous track, playlists, etc.)
 
-use crate::adapters::traits::Startable;
 use crate::bus::{BusEvent, PlaybackState, SharedBus, VolumeControl as BusVolumeControl, Zone};
-use anyhow::Result;
-use async_trait::async_trait;
 use futures::StreamExt;
 use quick_xml::de::from_str as xml_from_str;
 use reqwest::Client;
@@ -145,7 +142,7 @@ impl OpenHomeAdapter {
     }
 
     /// Start SSDP discovery (internal - use Startable trait)
-    async fn start_discovery(&self) -> anyhow::Result<()> {
+    async fn start_internal(&self) -> anyhow::Result<()> {
         {
             let mut state = self.state.write().await;
             if state.running {
@@ -622,7 +619,7 @@ impl OpenHomeAdapter {
     }
 
     /// Stop discovery (internal - use Startable trait)
-    async fn stop_discovery(&self) {
+    async fn stop_internal(&self) {
         // Cancel background tasks first
         self.shutdown.cancel();
 
@@ -931,21 +928,5 @@ fn openhome_device_to_zone(device: &OpenHomeDevice) -> Zone {
     }
 }
 
-// =============================================================================
-// Startable trait implementation
-// =============================================================================
-
-#[async_trait]
-impl Startable for OpenHomeAdapter {
-    fn name(&self) -> &'static str {
-        "openhome"
-    }
-
-    async fn start(&self) -> Result<()> {
-        self.start_discovery().await
-    }
-
-    async fn stop(&self) {
-        self.stop_discovery().await
-    }
-}
+// Startable trait implementation via macro
+crate::impl_startable!(OpenHomeAdapter, "openhome");

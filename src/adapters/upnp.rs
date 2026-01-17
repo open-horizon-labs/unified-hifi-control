@@ -4,10 +4,7 @@
 //! Pure UPnP/DLNA has limited metadata support compared to OpenHome.
 //! Specifically, next/previous track are NOT supported by pure UPnP.
 
-use crate::adapters::traits::Startable;
 use crate::bus::{BusEvent, PlaybackState, SharedBus, VolumeControl as BusVolumeControl, Zone};
-use anyhow::Result;
-use async_trait::async_trait;
 use futures::StreamExt;
 use quick_xml::de::from_str as xml_from_str;
 use regex::Regex;
@@ -134,7 +131,7 @@ impl UPnPAdapter {
     }
 
     /// Start SSDP discovery (internal - use Startable trait)
-    async fn start_discovery(&self) -> anyhow::Result<()> {
+    async fn start_internal(&self) -> anyhow::Result<()> {
         {
             let mut state = self.state.write().await;
             if state.running {
@@ -576,7 +573,7 @@ impl UPnPAdapter {
     }
 
     /// Stop discovery (internal - use Startable trait)
-    async fn stop_discovery(&self) {
+    async fn stop_internal(&self) {
         // Cancel background tasks first
         self.shutdown.cancel();
 
@@ -891,21 +888,5 @@ fn upnp_renderer_to_zone(renderer: &UPnPRenderer) -> Zone {
     }
 }
 
-// =============================================================================
-// Startable trait implementation
-// =============================================================================
-
-#[async_trait]
-impl Startable for UPnPAdapter {
-    fn name(&self) -> &'static str {
-        "upnp"
-    }
-
-    async fn start(&self) -> Result<()> {
-        self.start_discovery().await
-    }
-
-    async fn stop(&self) {
-        self.stop_discovery().await
-    }
-}
+// Startable trait implementation via macro
+crate::impl_startable!(UPnPAdapter, "upnp");

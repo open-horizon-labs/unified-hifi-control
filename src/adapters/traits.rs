@@ -28,6 +28,60 @@ pub trait Startable: Send + Sync {
     }
 }
 
+/// Macro to implement Startable trait with minimal boilerplate.
+///
+/// Adapters must implement:
+/// - `async fn start_internal(&self) -> Result<()>`
+/// - `async fn stop_internal(&self)`
+/// - Optionally: custom `can_start` method (pass as third arg)
+///
+/// Usage:
+/// ```ignore
+/// impl_startable!(OpenHomeAdapter, "openhome");
+/// impl_startable!(LmsAdapter, "lms", is_configured);  // custom can_start
+/// ```
+#[macro_export]
+macro_rules! impl_startable {
+    // With custom can_start method
+    ($adapter:ty, $name:literal, $can_start:ident) => {
+        #[async_trait::async_trait]
+        impl $crate::adapters::Startable for $adapter {
+            fn name(&self) -> &'static str {
+                $name
+            }
+
+            async fn start(&self) -> anyhow::Result<()> {
+                self.start_internal().await
+            }
+
+            async fn stop(&self) {
+                self.stop_internal().await
+            }
+
+            async fn can_start(&self) -> bool {
+                self.$can_start().await
+            }
+        }
+    };
+    // Default can_start (always true)
+    ($adapter:ty, $name:literal) => {
+        #[async_trait::async_trait]
+        impl $crate::adapters::Startable for $adapter {
+            fn name(&self) -> &'static str {
+                $name
+            }
+
+            async fn start(&self) -> anyhow::Result<()> {
+                self.start_internal().await
+            }
+
+            async fn stop(&self) {
+                self.stop_internal().await
+            }
+        }
+    };
+}
+
 /// Context passed to adapter logic during execution
 pub struct AdapterContext {
     /// Event bus for publishing events

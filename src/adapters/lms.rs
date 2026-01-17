@@ -15,10 +15,8 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
-use crate::adapters::traits::Startable;
 use crate::bus::{BusEvent, PlaybackState, SharedBus, VolumeControl, Zone};
 use crate::config::get_config_dir;
-use async_trait::async_trait;
 
 const LMS_CONFIG_FILE: &str = "lms-config.json";
 
@@ -465,7 +463,7 @@ impl LmsAdapter {
     }
 
     /// Start polling for player updates (internal - use Startable trait)
-    async fn start_polling(&self) -> Result<()> {
+    async fn start_internal(&self) -> Result<()> {
         if !self.is_configured().await {
             return Err(anyhow!("LMS not configured"));
         }
@@ -522,7 +520,7 @@ impl LmsAdapter {
     }
 
     /// Stop polling (internal - use Startable trait)
-    async fn stop_polling(&self) {
+    async fn stop_internal(&self) {
         // Cancel background tasks first
         self.shutdown.cancel();
 
@@ -790,25 +788,5 @@ async fn update_players_internal(
     Ok(())
 }
 
-// =============================================================================
-// Startable trait implementation
-// =============================================================================
-
-#[async_trait]
-impl Startable for LmsAdapter {
-    fn name(&self) -> &'static str {
-        "lms"
-    }
-
-    async fn start(&self) -> Result<()> {
-        self.start_polling().await
-    }
-
-    async fn stop(&self) {
-        self.stop_polling().await
-    }
-
-    async fn can_start(&self) -> bool {
-        self.is_configured().await
-    }
-}
+// Startable trait implementation via macro
+crate::impl_startable!(LmsAdapter, "lms", is_configured);
