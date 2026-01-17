@@ -169,16 +169,18 @@ The gap analysis marks "Zone state location" as High severity, but:
 
 Full refactor touches every adapter, every API handler, the bus, and UI. This is a v4 rewrite disguised as a refactor. High risk for unproven benefit at RC stage.
 
-## Decision: Option B + Document Reality
+## Decision
 
-**Proceed with targeted fixes:**
-1. Fix lifecycle bug: Check `AdapterSettings` before calling `adapter.start()` in `main.rs`
-2. Add adapter status API: Expose "enabled but not running" vs "searching" vs "disabled"
-3. Update ARCHITECTURE.md: Acknowledge distributed pattern is intentional for Rust
+**Option B was initially recommended but rejected after review.**
+
+- [ARCHITECTURE-RECOMMENDATION-B-REJECTED.md](./ARCHITECTURE-RECOMMENDATION-B-REJECTED.md) - Why targeted fixes are insufficient
+- [ARCHITECTURE-RECOMMENDATION-A.md](./ARCHITECTURE-RECOMMENDATION-A.md) - Event bus refactor (approved approach)
+
+**Key insight:** "High effort" is obsolete with agentic coding. The architectural debt of Option B isn't worth accepting.
 
 ## Next Steps
 
 1. [x] Superego review of options
-2. [x] Decide: **targeted fixes + document reality**
-3. [ ] Create issues for lifecycle fixes (#81, #80, #71)
-4. [ ] Update ARCHITECTURE.md to reflect actual pattern
+2. [x] Review superego recommendation - rejected Option B
+3. [ ] Review Option A proposal
+4. [ ] Implement event bus architecture

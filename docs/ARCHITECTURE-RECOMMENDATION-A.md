@@ -1,0 +1,229 @@
+# Recommendation A: Event Bus Architecture Refactor
+
+**Status:** PROPOSED
+**Date:** 2026-01-17
+**Issue:** #83
+
+## Summary
+
+Refactor v3 to implement the event bus pattern with centralized coordination and aggregation.
+
+## Target Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   AdapterCoordinator                     │
+│  (owns lifecycle: start/stop based on settings)         │
+└─────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────┐
+│                       EventBus                           │
+│  (tokio broadcast channel for events + commands)        │
+└─────────────────────────────────────────────────────────┘
+     ▲           ▲           ▲              │
+     │           │           │              ▼
+┌────────┐  ┌────────┐  ┌────────┐   ┌─────────────┐
+│  LMS   │  │  Roon  │  │ UPnP   │   │   Zone      │
+│Adapter │  │Adapter │  │Adapter │   │ Aggregator  │
+│(events)│  │(events)│  │(events)│   │ (state)     │
+└────────┘  └────────┘  └────────┘   └─────────────┘
+                                             │
+                                             ▼
+                                      ┌─────────────┐
+                                      │   API/UI    │
+                                      └─────────────┘
+```
+
+## Key Components
+
+### 1. AdapterCoordinator
+
+Single decision point for adapter lifecycle.
+
+```rust
+pub struct AdapterCoordinator {
+    adapters: HashMap<String, Arc<dyn Adapter>>,
+    settings: Arc<RwLock<AdapterSettings>>,
+    bus: SharedBus,
+}
+
+impl AdapterCoordinator {
+    /// Start only adapters that are enabled in settings
+    pub async fn start(&self) -> Result<()> {
+        let settings = self.settings.read().await;
+        for (name, adapter) in &self.adapters {
+            if settings.is_enabled(name) {
+                adapter.start(self.bus.clone()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// React to settings changes at runtime
+    pub async fn on_settings_changed(&self, new_settings: AdapterSettings) {
+        // Start newly enabled, stop newly disabled
+    }
+}
+```
+
+**Benefits:**
+- Single place to add/remove adapters
+- Settings changes handled uniformly
+- No scattered `if settings.adapters.foo` checks
+
+### 2. Adapter Trait
+
+Adapters become event publishers, not state owners.
+
+```rust
+#[async_trait]
+pub trait Adapter: Send + Sync {
+    /// Unique prefix for zone IDs (e.g., "lms", "roon")
+    fn prefix(&self) -> &str;
+
+    /// Start discovery/connection, publish events to bus
+    async fn start(&self, bus: SharedBus) -> Result<()>;
+
+    /// Stop and clean up
+    async fn stop(&self) -> Result<()>;
+
+    /// Handle a command for a zone owned by this adapter
+    async fn handle_command(&self, zone_id: &str, command: Command) -> Result<CommandResponse>;
+}
+```
+
+**Key change:** Adapters don't store zones. They publish `ZoneDiscovered`, `ZoneUpdated`, `ZoneRemoved` events.
+
+### 3. Extended Bus Events
+
+```rust
+pub enum BusEvent {
+    // Zone lifecycle (adapters publish these)
+    ZoneDiscovered { zone: Zone },
+    ZoneUpdated { zone_id: String, update: ZoneUpdate },
+    ZoneRemoved { zone_id: String },
+
+    // Now playing (adapters publish these)
+    NowPlayingChanged { zone_id: String, now_playing: NowPlaying },
+
+    // Commands (API publishes, adapters consume)
+    Command { zone_id: String, command: Command },
+    CommandResponse { zone_id: String, result: Result<(), String> },
+
+    // Existing notification events...
+    RoonConnected { core_name: String, version: String },
+    // etc.
+}
+```
+
+### 4. ZoneAggregator
+
+Single source of truth for zone state.
+
+```rust
+pub struct ZoneAggregator {
+    zones: Arc<RwLock<HashMap<String, Zone>>>,
+    now_playing: Arc<RwLock<HashMap<String, NowPlaying>>>,
+}
+
+impl ZoneAggregator {
+    /// Subscribe to bus and maintain state
+    pub async fn run(&self, mut rx: broadcast::Receiver<BusEvent>) {
+        while let Ok(event) = rx.recv().await {
+            match event {
+                BusEvent::ZoneDiscovered { zone } => {
+                    self.zones.write().await.insert(zone.zone_id.clone(), zone);
+                }
+                BusEvent::ZoneRemoved { zone_id } => {
+                    self.zones.write().await.remove(&zone_id);
+                }
+                BusEvent::NowPlayingChanged { zone_id, now_playing } => {
+                    self.now_playing.write().await.insert(zone_id, now_playing);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// API calls this - no direct adapter access
+    pub async fn get_zones(&self) -> Vec<Zone> {
+        self.zones.read().await.values().cloned().collect()
+    }
+
+    pub async fn get_now_playing(&self, zone_id: &str) -> Option<NowPlaying> {
+        self.now_playing.read().await.get(zone_id).cloned()
+    }
+}
+```
+
+### 5. Simplified AppState
+
+```rust
+pub struct AppState {
+    pub coordinator: Arc<AdapterCoordinator>,
+    pub aggregator: Arc<ZoneAggregator>,
+    pub bus: SharedBus,
+    // HQPlayer special handling (DSP service, not zone source)
+    pub hqp_zone_links: Arc<HqpZoneLinkService>,
+}
+```
+
+API handlers call `aggregator.get_zones()` instead of iterating adapters.
+
+## Migration Path
+
+### Phase 1: Add New Components (Non-Breaking)
+1. Create `AdapterCoordinator` struct
+2. Create `ZoneAggregator` struct
+3. Add new `BusEvent` variants
+4. Wire up in `main.rs` alongside existing code
+
+### Phase 2: Migrate Adapters
+For each adapter:
+1. Add `Adapter` trait implementation
+2. Change from storing zones to publishing events
+3. Move zone state to aggregator
+
+### Phase 3: Simplify API Layer
+1. Change handlers to use `aggregator.get_zones()`
+2. Remove direct adapter references from `AppState`
+3. Route commands through bus
+
+### Phase 4: Cleanup
+1. Remove old zone storage from adapters
+2. Remove scattered settings checks
+3. Update tests
+
+## Risks & Mitigations
+
+| Risk | Mitigation |
+|------|------------|
+| Breaking existing behavior | Phase 1 is additive; can run old and new in parallel |
+| Event ordering issues | Aggregator processes events sequentially |
+| Performance regression | Tokio channels are cheap; benchmark before/after |
+
+## Success Criteria
+
+1. **Disabled adapter = nothing in UI** - No "searching" for disabled backends
+2. **Single coordination point** - Adding an adapter means implementing the trait
+3. **API layer simplified** - Handlers don't know about individual adapters
+4. **Tests pass** - Existing functionality preserved
+
+## Files To Modify
+
+| File | Change |
+|------|--------|
+| `src/coordinator.rs` | New: AdapterCoordinator |
+| `src/aggregator.rs` | New: ZoneAggregator |
+| `src/bus/mod.rs` | Extended events |
+| `src/adapters/*.rs` | Implement Adapter trait |
+| `src/api/mod.rs` | Use aggregator, simplified AppState |
+| `src/main.rs` | Wire up coordinator and aggregator |
+| `src/knobs/routes.rs` | Use aggregator instead of direct calls |
+
+## Open Questions
+
+1. **HQPlayer special case** - It's a DSP service, not a zone source. Keep separate or unify?
+2. **MQTT adapter** - It bridges to Home Assistant. Same trait or different?
+3. **Runtime settings changes** - Should disabling an adapter stop it immediately?
