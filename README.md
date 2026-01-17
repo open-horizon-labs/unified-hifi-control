@@ -187,6 +187,19 @@ If MQTT is enabled, firmware version is published to `unified-hifi/firmware/vers
 
 - [roon-knob](https://github.com/muness/roon-knob) — ESP32-S3 hardware controller (firmware)
 
+<details>
+<summary><strong>Version History (for nerds)</strong></summary>
+
+| Version | Stack | Notes |
+|---------|-------|-------|
+| **v1** | Node.js | Proof of concept — validated the idea of a unified control surface |
+| **v2** | Node.js | Production release — in-memory event bus, multi-backend support |
+| **v3** | Rust | Complete rewrite — native packages (Synology, QNAP, LMS plugin), 10x smaller memory footprint, single static binary |
+
+The v3 rewrite was motivated by packaging requests (NAS users wanted native packages, not Docker) and the opportunity to dramatically reduce resource usage. The Rust binary uses ~15MB RAM vs ~150MB for Node.js.
+
+</details>
+
 ## License
 
 As of v2.5.0, this project is licensed under the [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) license.
