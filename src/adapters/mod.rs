@@ -5,4 +5,7 @@ pub mod lms;
 pub mod mqtt;
 pub mod openhome;
 pub mod roon;
+pub mod traits;
 pub mod upnp;
+
+pub use traits::*;
