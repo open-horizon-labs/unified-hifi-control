@@ -4161,6 +4161,7 @@ name = "unified-hifi-control"
 version = "3.0.0-rc.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "chrono",
