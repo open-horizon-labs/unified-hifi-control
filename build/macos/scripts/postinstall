@@ -4,8 +4,8 @@
 
 set -e
 
-# Create data directory and public directory (required by Dioxus)
-mkdir -p /usr/local/var/unified-hifi-control/public
+# Create data directory
+mkdir -p /usr/local/var/unified-hifi-control
 mkdir -p /usr/local/var/log
 
 # Set permissions

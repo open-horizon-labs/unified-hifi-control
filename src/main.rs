@@ -76,6 +76,13 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
+    // Ensure public directory exists (required by Dioxus fullstack)
+    if !std::path::Path::new("public").exists() {
+        if let Err(e) = std::fs::create_dir_all("public") {
+            tracing::warn!("Failed to create public directory: {}", e);
+        }
+    }
+
     // Load configuration
     let config = config::load_config()?;
     tracing::info!("Configuration loaded, port: {}", config.port);

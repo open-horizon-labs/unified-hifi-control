@@ -11,9 +11,6 @@ chmod +x "${QPKG_ROOT}/unified-hifi-control.sh"
 # Create log file
 touch "${QPKG_ROOT}/unified-hifi-control.log"
 
-# Create public directory (required by Dioxus)
-mkdir -p "${QPKG_ROOT}/public"
-
 echo "Unified Hi-Fi Control installed successfully"
 echo "Access the web UI at http://$(hostname):8088"
 

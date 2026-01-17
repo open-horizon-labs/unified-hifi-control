@@ -42,6 +42,6 @@ package() {
 EOF
     chmod 644 "$pkgdir/etc/unified-hifi-control/config.json"
 
-    # Create data directory and public directory (required by Dioxus)
-    install -dm755 "$pkgdir/var/lib/unified-hifi-control/public"
+    # Create data directory for runtime files
+    install -dm755 "$pkgdir/var/lib/unified-hifi-control"
 }

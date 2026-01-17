@@ -26,9 +26,6 @@ case "$1" in
 
     cd $QPKG_ROOT
 
-    # Ensure public directory exists (required by Dioxus)
-    mkdir -p ${QPKG_ROOT}/public
-
     # Start the static binary (musl-linked, no dependencies)
     ${QPKG_ROOT}/unified-hifi-control >> $LOGF 2>&1 &
     echo $! > $PIDF
