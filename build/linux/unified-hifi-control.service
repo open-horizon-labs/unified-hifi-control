@@ -6,6 +6,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/var/lib/unified-hifi-control
+ExecStartPre=/bin/mkdir -p /var/lib/unified-hifi-control/public
 ExecStart=/usr/bin/unified-hifi-control
 Restart=always
 RestartSec=10

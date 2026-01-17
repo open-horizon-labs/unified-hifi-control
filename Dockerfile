@@ -39,8 +39,8 @@ RUN apt-get update && apt-get install -y \
 # Copy binary from builder
 COPY --from=builder /app/target/release/unified-hifi-control /app/
 
-# Create data directory for config persistence
-RUN mkdir -p /data
+# Create data directory for config persistence and public dir for Dioxus
+RUN mkdir -p /data /app/public
 
 # Version from build arg
 ARG APP_VERSION=dev

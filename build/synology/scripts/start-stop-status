@@ -24,6 +24,9 @@ start_daemon() {
         return 1
     fi
 
+    # Ensure public directory exists (required by Dioxus)
+    mkdir -p "${TARGET_DIR}/public"
+
     # Start the binary
     nohup "${TARGET_DIR}/unified-hifi-control" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
