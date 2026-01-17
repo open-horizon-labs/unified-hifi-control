@@ -72,28 +72,85 @@ impl AdapterCoordinator {
 - Settings changes handled uniformly
 - No scattered `if settings.adapters.foo` checks
 
-### 2. Adapter Trait
+### 2. Adapter Trait + Handle Pattern
 
-Adapters become event publishers, not state owners.
+Split adapter logic from lifecycle management:
 
 ```rust
+/// Adapter-specific logic (what each adapter implements)
 #[async_trait]
-pub trait Adapter: Send + Sync {
-    /// Unique prefix for zone IDs (e.g., "lms", "roon")
+pub trait AdapterLogic: Send + Sync {
     fn prefix(&self) -> &str;
 
-    /// Start discovery/connection, publish events to bus
-    async fn start(&self, bus: SharedBus) -> Result<()>;
+    /// Run discovery/connection loop until cancellation
+    async fn run(&self, ctx: AdapterContext) -> Result<()>;
 
-    /// Stop and clean up
-    async fn stop(&self) -> Result<()>;
+    /// Handle a command (called by AdapterHandle)
+    async fn handle_command(&self, zone_id: &str, cmd: Command) -> Result<CommandResponse>;
+}
 
-    /// Handle a command for a zone owned by this adapter
-    async fn handle_command(&self, zone_id: &str, command: Command) -> Result<CommandResponse>;
+/// Context passed to adapter logic
+pub struct AdapterContext {
+    pub bus: SharedBus,              // For publishing events
+    pub shutdown: CancellationToken, // For internal cancellation checks
 }
 ```
 
-**Key change:** Adapters don't store zones. They publish `ZoneDiscovered`, `ZoneUpdated`, `ZoneRemoved` events.
+**AdapterHandle** wraps any `AdapterLogic` and handles common lifecycle:
+
+```rust
+pub struct AdapterHandle<T: AdapterLogic> {
+    logic: T,
+    bus: SharedBus,
+    shutdown: CancellationToken,
+}
+
+impl<T: AdapterLogic> AdapterHandle<T> {
+    pub async fn run(self) {
+        let prefix = self.logic.prefix();
+        let mut rx = self.bus.subscribe();
+
+        tokio::select! {
+            // Run adapter-specific logic
+            result = self.logic.run(AdapterContext {
+                bus: self.bus.clone(),
+                shutdown: self.shutdown.clone(),
+            }) => {
+                if let Err(e) = result {
+                    tracing::error!("Adapter {} error: {}", prefix, e);
+                }
+            }
+
+            // Watch for shutdown signal on bus
+            _ = async {
+                while let Ok(event) = rx.recv().await {
+                    if matches!(event, BusEvent::ShuttingDown) {
+                        break;
+                    }
+                }
+            } => {
+                tracing::info!("Adapter {} received shutdown signal", prefix);
+            }
+
+            // Direct cancellation (backup)
+            _ = self.shutdown.cancelled() => {
+                tracing::info!("Adapter {} cancelled", prefix);
+            }
+        }
+
+        // Consistent cleanup - ACK is automatic
+        self.bus.publish(BusEvent::AdapterStopped {
+            prefix: prefix.to_string()
+        });
+    }
+}
+```
+
+**Benefits:**
+- Adapters only implement discovery/protocol logic
+- Shutdown handling is consistent (can't forget)
+- ACK on stop is automatic
+- Fixes #73 (SSE shutdown) as a natural consequence
 
 ### 3. Extended Bus Events
 
@@ -111,7 +168,15 @@ pub enum BusEvent {
     Command { zone_id: String, command: Command },
     CommandResponse { zone_id: String, result: Result<(), String> },
 
-    // Existing notification events...
+    // Adapter lifecycle (coordinator publishes)
+    AdapterStopping { prefix: String },
+    AdapterStopped { prefix: String },
+    ZonesFlushed { prefix: String },
+
+    // Global shutdown (coordinator publishes, SSE handlers watch)
+    ShuttingDown,
+
+    // Existing notification events (for backward compat during migration)
     RoonConnected { core_name: String, version: String },
     // etc.
 }
