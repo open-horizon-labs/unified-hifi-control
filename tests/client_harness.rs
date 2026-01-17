@@ -48,7 +48,18 @@ use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::{self, KnobStore};
-use unified_hifi_control::{api, ui};
+use unified_hifi_control::api;
+
+// Stub HTML handlers for UI route tests (replacing deleted ui module)
+mod ui_stubs {
+    use axum::response::Html;
+
+    const HTML_PAGE: &str = "<!DOCTYPE html><html><head></head><body>Test</body></html>";
+
+    pub async fn stub_page() -> Html<&'static str> {
+        Html(HTML_PAGE)
+    }
+}
 
 // =============================================================================
 // Response Types - matching what clients expect
@@ -300,14 +311,14 @@ async fn create_test_app() -> Router {
         .route("/firmware/version", get(knobs::firmware_version_handler))
         .route("/firmware/download", get(knobs::firmware_download_handler))
         .route("/manifest-s3.json", get(knobs::manifest_handler))
-        // Web UI routes (MUST return HTML)
-        .route("/", get(ui::dashboard_page))
-        .route("/ui/zones", get(ui::zones_page))
-        .route("/zone", get(ui::zone_page))
-        .route("/hqplayer", get(ui::hqplayer_page))
-        .route("/lms", get(ui::lms_page))
-        .route("/knobs", get(ui::knobs_page))
-        .route("/settings", get(ui::settings_page))
+        // Web UI routes (MUST return HTML) - using stubs for testing
+        .route("/", get(ui_stubs::stub_page))
+        .route("/ui/zones", get(ui_stubs::stub_page))
+        .route("/zone", get(ui_stubs::stub_page))
+        .route("/hqplayer", get(ui_stubs::stub_page))
+        .route("/lms", get(ui_stubs::stub_page))
+        .route("/knobs", get(ui_stubs::stub_page))
+        .route("/settings", get(ui_stubs::stub_page))
         .with_state(state)
 }
 

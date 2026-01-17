@@ -3,7 +3,7 @@
 //! A source-agnostic hi-fi control bridge for hardware surfaces and Home Assistant.
 
 use unified_hifi_control::{
-    adapters, aggregator, api, app, bus, config, coordinator, firmware, knobs, mdns, ui,
+    adapters, aggregator, api, app, bus, config, coordinator, firmware, knobs, mdns,
 };
 
 // Import Startable trait for adapter lifecycle methods
@@ -14,6 +14,7 @@ use api::load_app_settings;
 
 use anyhow::Result;
 use axum::{
+    response::{Html, IntoResponse, Redirect},
     routing::{delete, get, post, put},
     Router,
 };
@@ -23,6 +24,39 @@ use std::time::Instant;
 use tokio::signal;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Flash page - redirects to external web flasher
+async fn flash_page() -> impl IntoResponse {
+    Html(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Flash Knob - Unified Hi-Fi Control</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+</head>
+<body class="container">
+    <h1>Flash Knob Firmware</h1>
+    <article>
+        <p><strong>HTTPS Required</strong></p>
+        <p>Browser-based flashing requires HTTPS. Use the official web flasher:</p>
+        <p><a href="https://roon-knob.muness.com/" target="_blank" rel="noopener" role="button">Open Web Flasher</a></p>
+    </article>
+</body>
+</html>"#,
+    )
+}
+
+/// Legacy redirect: /control -> /ui/zones
+async fn control_redirect() -> impl IntoResponse {
+    Redirect::to("/ui/zones")
+}
+
+/// Legacy redirect: /admin -> /settings
+async fn settings_redirect() -> impl IntoResponse {
+    Redirect::to("/settings")
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -325,10 +359,10 @@ async fn main() -> Result<()> {
         // Protocol route: /zones returns JSON (for knob, iOS, etc.)
         .route("/zones", get(knobs::knob_zones_handler))
         // Legacy SSR routes (flash page not yet migrated)
-        .route("/knobs/flash", get(ui::flash_page))
+        .route("/knobs/flash", get(flash_page))
         // Legacy redirects
-        .route("/control", get(ui::control_redirect))
-        .route("/admin", get(ui::settings_redirect))
+        .route("/control", get(control_redirect))
+        .route("/admin", get(settings_redirect))
         // Middleware
         .layer(CorsLayer::permissive())
         .layer(CompressionLayer::new())

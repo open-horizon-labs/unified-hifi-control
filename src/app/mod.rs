@@ -5,6 +5,7 @@
 
 use dioxus::prelude::*;
 
+pub mod components;
 pub mod pages;
 
 use pages::{Dashboard, HqPlayer, Knobs, Lms, Settings, Zone, Zones};

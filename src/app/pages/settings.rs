@@ -8,6 +8,8 @@
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::app::components::Layout;
+
 /// Adapter settings from /api/settings
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AdapterSettings {
@@ -35,7 +37,6 @@ pub struct DiscoveryStatus {
 /// Server function to fetch settings
 #[server]
 pub async fn get_settings() -> Result<AppSettings, ServerFnError> {
-    // This runs on the server - fetch from internal API
     let client = reqwest::Client::new();
     let resp = client
         .get("http://127.0.0.1:8088/api/settings")
@@ -66,7 +67,6 @@ pub async fn save_settings(settings: AppSettings) -> Result<(), ServerFnError> {
 pub async fn get_discovery_status() -> Result<DiscoveryStatus, ServerFnError> {
     let client = reqwest::Client::new();
 
-    // Fetch status from each endpoint
     let (roon, openhome, upnp) = tokio::join!(
         client.get("http://127.0.0.1:8088/roon/status").send(),
         client.get("http://127.0.0.1:8088/openhome/status").send(),
@@ -147,8 +147,10 @@ pub fn Settings() -> Element {
     };
 
     rsx! {
-        // Layout wrapper
-        div { class: "container",
+        Layout {
+            title: "Settings".to_string(),
+            nav_active: "settings".to_string(),
+
             h1 { "Settings" }
 
             // Adapter Settings section

@@ -20,4 +20,3 @@ pub mod coordinator;
 pub mod firmware;
 pub mod knobs;
 pub mod mdns;
-pub mod ui;

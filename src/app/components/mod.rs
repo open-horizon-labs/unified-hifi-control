@@ -1,4 +1,4 @@
-//! Shared UI components for the Dioxus-based web UI.
+//! Shared UI components for the Dioxus fullstack web UI.
 
 pub mod layout;
 pub mod nav;

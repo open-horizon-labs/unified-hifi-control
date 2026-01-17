@@ -16,6 +16,7 @@ const CUSTOM_STYLES: &str = r#"
 :root { --pico-font-size: 15px; }
 .status-ok { color: var(--pico-ins-color); }
 .status-err { color: var(--pico-del-color); }
+.status-disabled { color: var(--pico-muted-color); }
 .zone-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; }
 .controls { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
 .controls button { margin: 0; padding: 0.5rem 1rem; }
