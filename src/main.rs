@@ -65,21 +65,11 @@ async fn main() -> Result<()> {
     // Create all adapter instances (needed for API handlers regardless of state)
     // =========================================================================
 
-    // Roon adapter - only fully initialize if enabled
-    let roon = if coord.is_enabled("roon").await {
-        match adapters::roon::RoonAdapter::new(bus.clone(), base_url.clone()).await {
-            Ok(adapter) => {
-                tracing::info!("Roon adapter initialized");
-                adapter
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize Roon adapter: {}", e);
-                adapters::roon::RoonAdapter::new_disconnected(bus.clone())
-            }
-        }
-    } else {
-        adapters::roon::RoonAdapter::new_disconnected(bus.clone())
-    };
+    // Roon adapter - coordinator handles starting based on enabled state
+    let roon = Arc::new(adapters::roon::RoonAdapter::new_configured(
+        bus.clone(),
+        base_url.clone(),
+    ));
 
     // HQPlayer instance manager (multi-instance support, no settings toggle)
     let hqp_instances = Arc::new(adapters::hqplayer::HqpInstanceManager::new(bus.clone()));
@@ -150,7 +140,7 @@ async fn main() -> Result<()> {
 
     // Build list of startable adapters
     let startable_adapters: Vec<Arc<dyn adapters::Startable>> =
-        vec![lms.clone(), openhome.clone(), upnp.clone()];
+        vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
     // Single loop to start all enabled adapters
     coord.start_all_enabled(&startable_adapters).await;
@@ -183,6 +173,8 @@ async fn main() -> Result<()> {
         knob_store,
         bus.clone(),
         zone_aggregator,
+        coord.clone(),
+        startable_adapters.clone(),
     );
 
     // Build API routes

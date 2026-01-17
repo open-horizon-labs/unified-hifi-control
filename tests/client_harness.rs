@@ -42,9 +42,11 @@ use unified_hifi_control::adapters::lms::LmsAdapter;
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
 use unified_hifi_control::adapters::roon::RoonAdapter;
 use unified_hifi_control::adapters::upnp::UPnPAdapter;
+use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
+use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::{self, KnobStore};
 use unified_hifi_control::{api, ui};
 
@@ -164,8 +166,11 @@ struct HqpLoadProfileRequest {
 async fn create_test_app() -> Router {
     let bus = create_bus();
 
+    // Create coordinator (tests don't need real lifecycle management)
+    let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
+
     // Create disconnected adapters
-    let roon = RoonAdapter::new_disconnected(bus.clone());
+    let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
     let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
     let hqplayer = hqp_instances.get_default().await;
     let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
@@ -173,6 +178,10 @@ async fn create_test_app() -> Router {
     let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
     let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
     let knob_store = KnobStore::new(std::env::temp_dir());
+
+    // Build startable adapters list
+    let startable_adapters: Vec<Arc<dyn Startable>> =
+        vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
     let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
     let state = AppState::new(
@@ -186,6 +195,8 @@ async fn create_test_app() -> Router {
         knob_store,
         bus,
         aggregator,
+        coordinator,
+        startable_adapters,
     );
 
     // Build router with all routes (same as main.rs)

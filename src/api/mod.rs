@@ -5,8 +5,10 @@ use crate::adapters::lms::LmsAdapter;
 use crate::adapters::openhome::OpenHomeAdapter;
 use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
+use crate::adapters::Startable;
 use crate::aggregator::ZoneAggregator;
 use crate::bus::SharedBus;
+use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
     extract::{Path, Query, State},
@@ -38,12 +40,14 @@ pub struct AppState {
     pub knobs: KnobStore,
     pub bus: SharedBus,
     pub aggregator: Arc<ZoneAggregator>,
+    pub coordinator: Arc<AdapterCoordinator>,
+    pub startable_adapters: Arc<Vec<Arc<dyn Startable>>>,
 }
 
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        roon: RoonAdapter,
+        roon: Arc<RoonAdapter>,
         hqplayer: Arc<HqpAdapter>,
         hqp_instances: Arc<HqpInstanceManager>,
         hqp_zone_links: Arc<HqpZoneLinkService>,
@@ -53,9 +57,11 @@ impl AppState {
         knobs: KnobStore,
         bus: SharedBus,
         aggregator: Arc<ZoneAggregator>,
+        coordinator: Arc<AdapterCoordinator>,
+        startable_adapters: Vec<Arc<dyn Startable>>,
     ) -> Self {
         Self {
-            roon: Arc::new(roon),
+            roon,
             hqplayer,
             hqp_instances,
             hqp_zone_links,
@@ -65,6 +71,8 @@ impl AppState {
             knobs,
             bus,
             aggregator,
+            coordinator,
+            startable_adapters: Arc::new(startable_adapters),
         }
     }
 }
@@ -1530,13 +1538,69 @@ pub async fn api_settings_get_handler() -> impl IntoResponse {
     Json(load_app_settings())
 }
 
-/// POST /api/settings - Update app settings
-pub async fn api_settings_post_handler(Json(settings): Json<AppSettings>) -> impl IntoResponse {
-    if save_app_settings(&settings) {
-        Json(serde_json::json!({"ok": true}))
-    } else {
-        Json(serde_json::json!({"ok": false, "error": "Failed to save settings"}))
+/// POST /api/settings - Update app settings with dynamic adapter enable/disable
+pub async fn api_settings_post_handler(
+    State(state): State<AppState>,
+    Json(new_settings): Json<AppSettings>,
+) -> impl IntoResponse {
+    // Load current settings to compare
+    let old_settings = load_app_settings();
+
+    // Save the new settings
+    if !save_app_settings(&new_settings) {
+        return Json(serde_json::json!({"ok": false, "error": "Failed to save settings"}));
     }
+
+    // Compare adapter enabled states and start/stop as needed
+    let old_adapters = &old_settings.adapters;
+    let new_adapters = &new_settings.adapters;
+
+    // Helper to process adapter state changes
+    let adapters_list = state.startable_adapters.clone();
+    let coord = state.coordinator.clone();
+
+    // Check each adapter for state changes
+    let adapter_changes: Vec<(&str, bool)> = vec![
+        ("roon", old_adapters.roon != new_adapters.roon),
+        ("lms", old_adapters.lms != new_adapters.lms),
+        ("openhome", old_adapters.openhome != new_adapters.openhome),
+        ("upnp", old_adapters.upnp != new_adapters.upnp),
+    ];
+
+    for (name, changed) in adapter_changes {
+        if !changed {
+            continue;
+        }
+
+        // Get the new enabled state
+        let now_enabled = match name {
+            "roon" => new_adapters.roon,
+            "lms" => new_adapters.lms,
+            "openhome" => new_adapters.openhome,
+            "upnp" => new_adapters.upnp,
+            _ => continue,
+        };
+
+        // Update coordinator state
+        coord.set_enabled(name, now_enabled).await;
+
+        // Find the adapter and start/stop it
+        if let Some(adapter) = adapters_list.iter().find(|a| a.name() == name) {
+            if now_enabled {
+                tracing::info!("Dynamically enabling adapter: {}", name);
+                if adapter.can_start().await {
+                    if let Err(e) = adapter.start().await {
+                        tracing::warn!("Failed to start adapter {}: {}", name, e);
+                    }
+                }
+            } else {
+                tracing::info!("Dynamically disabling adapter: {}", name);
+                adapter.stop().await;
+            }
+        }
+    }
+
+    Json(serde_json::json!({"ok": true}))
 }
 
 #[cfg(test)]
