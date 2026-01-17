@@ -80,7 +80,6 @@ ssdp-client = "2"
 base64 = "0.22.1"
 mdns-sd = "0.17.1"
 gethostname = "1.1.0"
-async-trait = "0.1.89"
 
 [[bin]]
 name = "unified-hifi-control"
