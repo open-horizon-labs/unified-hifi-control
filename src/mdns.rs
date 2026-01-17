@@ -32,10 +32,11 @@ pub fn advertise(port: u16, name: &str, base_url: &str) -> anyhow::Result<Servic
         service_type,
         name,
         &hostname,
-        (), // All local addresses
+        (), // Will be filled by enable_addr_auto()
         port,
         Some(txt),
-    )?;
+    )?
+    .enable_addr_auto();
 
     tracing::info!(
         "mDNS: Publishing service '{}' on port {} (type: {})",
