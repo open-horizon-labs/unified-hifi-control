@@ -355,11 +355,19 @@ mod tests {
             .await
             .unwrap();
         let body: Value = response.json().await.unwrap();
-        body["result"]["mode"].as_str().unwrap_or("unknown").to_string()
+        body["result"]["mode"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string()
     }
 
     /// Helper to send a command
-    async fn send_command(client: &reqwest::Client, addr: &SocketAddr, player_id: &str, cmd: Vec<Value>) {
+    async fn send_command(
+        client: &reqwest::Client,
+        addr: &SocketAddr,
+        player_id: &str,
+        cmd: Vec<Value>,
+    ) {
         let request = json!({
             "id": 1,
             "method": "slim.request",

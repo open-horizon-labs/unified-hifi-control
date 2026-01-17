@@ -577,4 +577,50 @@ mod mock_server_tests {
         adapter.stop().await;
         mock.stop().await;
     }
+
+    /// Tests that the LMS adapter's "play" command correctly starts from stopped.
+    ///
+    /// This ensures the fix for resume-from-pause doesn't break play-from-stopped.
+    #[tokio::test]
+    async fn lms_adapter_play_starts_from_stopped() {
+        // Start mock server with player in stopped state
+        let mock = MockLmsServer::start().await;
+        let player_id = "aa:bb:cc:dd:ee:ff";
+        mock.add_player(player_id, "Test Player").await;
+        mock.set_mode(player_id, "stop").await;
+
+        let (bus, _rx) = test_bus();
+        let adapter = LmsAdapter::new(bus);
+
+        adapter
+            .configure(
+                mock.addr().ip().to_string(),
+                Some(mock.addr().port()),
+                None,
+                None,
+            )
+            .await;
+
+        adapter.start().await.unwrap();
+
+        // Verify initial state is stopped
+        let player = adapter.get_player_status(player_id).await.unwrap();
+        assert_eq!(player.mode, "stop", "Player should start stopped");
+
+        // Send "play" command through the adapter
+        adapter.control(player_id, "play", None).await.unwrap();
+
+        // Give the adapter a moment to update its cache
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Verify player is now playing
+        let player = adapter.get_player_status(player_id).await.unwrap();
+        assert_eq!(
+            player.mode, "play",
+            "Player should be playing after 'play' command from stopped"
+        );
+
+        adapter.stop().await;
+        mock.stop().await;
+    }
 }

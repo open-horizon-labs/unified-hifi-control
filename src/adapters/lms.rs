@@ -538,9 +538,24 @@ impl LmsAdapter {
     /// Control player
     pub async fn control(&self, player_id: &str, command: &str, value: Option<i32>) -> Result<()> {
         let params: Vec<Value> = match command {
-            // LMS quirk: "play" command starts playback but doesn't resume from pause.
-            // Use "pause 0" (unpause) which works for both resume and general play.
-            "play" => vec![json!("pause"), json!(0)],
+            // LMS quirk: "play" starts from stopped but doesn't resume from pause.
+            // "pause 0" resumes from pause but is a no-op from stopped.
+            // Check cached mode to send the appropriate command.
+            "play" => {
+                let is_paused = self
+                    .state
+                    .read()
+                    .await
+                    .players
+                    .get(player_id)
+                    .map(|p| p.mode == "pause")
+                    .unwrap_or(false);
+                if is_paused {
+                    vec![json!("pause"), json!(0)]
+                } else {
+                    vec![json!("play")]
+                }
+            }
             "pause" => vec![json!("pause"), json!(1)],
             "stop" => vec![json!("stop")],
             "play_pause" => vec![json!("pause")], // Toggle
