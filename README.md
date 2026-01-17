@@ -12,7 +12,11 @@ Hi-fi software assumes you're at a computer or using vendor-specific apps. This 
 
 ## Status
 
-**v3.0.0-rc.1** — Works with [roon-knob](https://github.com/muness/roon-knob) for hardware control of Roon, OpenHome, UPnP, or LMS/Lyrion zones.
+**Stable: [v2.7.0](https://github.com/open-horizon-labs/unified-hifi-control/releases/tag/v2.7.0)** (Node.js) — Production ready
+
+**Preview: v3.0.0-rc.1** (Rust) — Native packages for Synology, QNAP, LMS; 10x smaller memory footprint
+
+Works with [roon-knob](https://github.com/muness/roon-knob) for hardware control of Roon, OpenHome, UPnP, or LMS/Lyrion zones.
 
 ## Installation
 
