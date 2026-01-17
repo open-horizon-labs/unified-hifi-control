@@ -37,6 +37,23 @@ jobs:
           mkdir -p dist/bin
           cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
 
+      - name: Create LMS-compatible binary names
+        run: |
+          cd dist/bin
+          # Create LMS-compatible names for on-demand download
+          case "${{ matrix.output }}" in
+            unified-hifi-linux-x64)
+              cp unified-hifi-linux-x64 unified-hifi-linux-x86_64
+              ;;
+            unified-hifi-linux-arm64)
+              cp unified-hifi-linux-arm64 unified-hifi-linux-aarch64
+              ;;
+            unified-hifi-linux-armv7)
+              cp unified-hifi-linux-armv7 unified-hifi-linux-armv7l
+              ;;
+          esac
+          ls -la
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
@@ -73,6 +90,20 @@ jobs:
           mkdir -p dist/bin
           cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
 
+      - name: Create LMS-compatible binary names
+        run: |
+          cd dist/bin
+          # Create LMS-compatible names for on-demand download
+          case "${{ matrix.output }}" in
+            unified-hifi-macos-x64)
+              cp unified-hifi-macos-x64 unified-hifi-darwin-x86_64
+              ;;
+            unified-hifi-macos-arm64)
+              cp unified-hifi-macos-arm64 unified-hifi-darwin-arm64
+              ;;
+          esac
+          ls -la
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
@@ -100,6 +131,14 @@ jobs:
         run: |
           mkdir -p dist/bin
           cp target/release/unified-hifi-control.exe dist/bin/unified-hifi-win-x64.exe
+
+      - name: Create LMS-compatible binary names
+        shell: bash
+        run: |
+          cd dist/bin
+          # Create LMS-compatible name for on-demand download
+          cp unified-hifi-win-x64.exe unified-hifi-win64.exe
+          ls -la
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -202,9 +241,191 @@ jobs:
             *.rpm
           retention-days: 5
 
+  build-lms-plugin:
+    name: Build LMS Plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update install.xml version
+        run: |
+          sed -i "s|<version>[^<]*</version>|<version>${{ steps.version.outputs.version }}</version>|" lms-plugin/install.xml
+          cat lms-plugin/install.xml
+
+      - name: Create LMS plugin ZIP
+        run: |
+          mkdir -p dist
+          cd lms-plugin
+          # Create ZIP with UnifiedHiFi as root directory (expected by LMS)
+          zip -r ../dist/lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip . \
+            -x "*.git*" \
+            -x "Bin/*"
+          # Create empty Bin directory with placeholder
+          mkdir -p Bin
+          echo "# Binaries downloaded on first run" > Bin/.gitkeep
+          zip -r ../dist/lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip Bin/.gitkeep
+          rm -rf Bin
+          cd ..
+          ls -la dist/
+
+      - name: Repack with correct directory structure
+        run: |
+          cd dist
+          mkdir -p repack
+          unzip lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip -d repack/UnifiedHiFi
+          rm lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip
+          cd repack
+          zip -r ../lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip UnifiedHiFi
+          cd ..
+          rm -rf repack
+          ls -la
+
+      - name: Compute SHA1
+        id: sha
+        run: |
+          SHA=$(sha1sum dist/lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip | cut -d' ' -f1)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "SHA1: $SHA"
+
+      - name: Upload LMS plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: lms-plugin
+          path: dist/lms-unified-hifi-control-*.zip
+          retention-days: 5
+
+  build-synology-packages:
+    name: Build Synology Packages
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: apollolake
+            target: x86_64-unknown-linux-musl
+            binary: unified-hifi-linux-x64
+          - arch: rtd1296
+            target: aarch64-unknown-linux-musl
+            binary: unified-hifi-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: build/synology/package/
+
+      - name: Rename binary
+        run: |
+          mv build/synology/package/${{ matrix.binary }} build/synology/package/unified-hifi-control
+          chmod +x build/synology/package/unified-hifi-control
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="0.0.0"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          # Update package.json version
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" build/synology/package.json
+
+      - name: Build Synology SPK
+        uses: tomgrv/synology-package-builder@v1
+        with:
+          dsm: '7.0'
+          arch: ${{ matrix.arch }}
+          projects: ./build/synology
+          output: /workspace/dist/installers
+
+      - name: Upload Synology package
+        uses: actions/upload-artifact@v4
+        with:
+          name: synology-${{ matrix.arch }}
+          path: dist/installers/*.spk
+          retention-days: 5
+
+  build-qnap-packages:
+    name: Build QNAP Packages
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            binary: unified-hifi-linux-x64
+          - arch: arm_64
+            target: aarch64-unknown-linux-musl
+            binary: unified-hifi-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/bin/
+
+      - name: Make binary executable
+        run: chmod +x dist/bin/*
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="0.0.0"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Prepare QNAP package
+        run: |
+          mkdir -p qnap-build/shared
+          cp dist/bin/${{ matrix.binary }} qnap-build/shared/unified-hifi-control
+          chmod +x qnap-build/shared/unified-hifi-control
+          cp build/qnap/shared/*.sh qnap-build/shared/
+          chmod +x qnap-build/shared/*.sh
+          sed "s/{{VERSION}}/${{ steps.version.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
+          echo '#!/bin/sh' > qnap-build/package_routines
+
+      - name: Build QPKG with Docker
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$(pwd)/qnap-build:/src" \
+            -w /src \
+            owncloudci/qnap-qpkg-builder@sha256:e342184e415b1df87ef00b8c1df47988ffd6a9d232a21331556067d400f06189 \
+            sh -c '/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
+
+      - name: Move QPKG to dist
+        run: |
+          mkdir -p dist/installers
+          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ steps.version.outputs.version }}_${{ matrix.arch }}.qpkg
+
+      - name: Upload QNAP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qnap-${{ matrix.arch }}
+          path: dist/installers/*.qpkg
+          retention-days: 5
+
   upload-release:
     name: Upload to Release
-    needs: [build-linux, build-macos, build-windows, build-linux-packages]
+    needs: [build-linux, build-macos, build-windows, build-linux-packages, build-lms-plugin, build-synology-packages, build-qnap-packages]
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
     permissions:
@@ -224,6 +445,9 @@ jobs:
           find artifacts -name "unified-hifi-*" -type f -exec cp {} release/ \;
           find artifacts -name "*.deb" -type f -exec cp {} release/ \;
           find artifacts -name "*.rpm" -type f -exec cp {} release/ \;
+          find artifacts -name "*.zip" -type f -exec cp {} release/ \;
+          find artifacts -name "*.spk" -type f -exec cp {} release/ \;
+          find artifacts -name "*.qpkg" -type f -exec cp {} release/ \;
           ls -la release/
 
       - name: Upload to release
@@ -253,3 +477,77 @@ jobs:
             name=$(basename "$f")
             echo "| $name | $size |" >> $GITHUB_STEP_SUMMARY
           done
+
+  update-repo-xml:
+    name: Update LMS repo.xml
+    needs: upload-release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v3
+
+      - name: Get release version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Download LMS zip and compute SHA
+        id: sha
+        run: |
+          ZIP_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip"
+          echo "Downloading $ZIP_URL"
+          curl -fSL --retry 3 --retry-delay 5 "$ZIP_URL" -o lms-plugin.zip
+          # Verify download succeeded and file is valid (> 1KB)
+          FILE_SIZE=$(stat -c%s lms-plugin.zip 2>/dev/null || stat -f%z lms-plugin.zip)
+          if [ "$FILE_SIZE" -lt 1024 ]; then
+            echo "Error: Downloaded file too small ($FILE_SIZE bytes), expected > 1KB"
+            exit 1
+          fi
+          echo "Downloaded $FILE_SIZE bytes"
+          SHA=$(sha1sum lms-plugin.zip | cut -d' ' -f1)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "Computed SHA: $SHA"
+
+      - name: Update repo.xml
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA="${{ steps.sha.outputs.sha }}"
+          REPO_URL="https://github.com/${{ github.repository }}"
+
+          cat > lms-plugin/repo.xml << 'REPOXML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <extensions>
+            <plugins>
+              <plugin name="UnifiedHiFi"
+                      version="VERSION_PLACEHOLDER"
+                      minTarget="8.0"
+                      maxTarget="*">
+                <title lang="EN">Unified Hi-Fi Control</title>
+                <desc lang="EN">Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer, and hardware knobs. Provides HTTP APIs, MQTT integration, and web UI for controlling your audio system from anywhere.</desc>
+                <url>URL_PLACEHOLDER</url>
+                <sha>SHA_PLACEHOLDER</sha>
+                <creator>Muness Castle</creator>
+                <link>https://forums.lyrion.org/forum/user-forums/3rd-party-hardware/1804977-roon-knob-includes-lms-support</link>
+              </plugin>
+            </plugins>
+          </extensions>
+          REPOXML
+
+          # Remove leading whitespace and substitute placeholders
+          sed -i 's/^          //' lms-plugin/repo.xml
+          sed -i "s|VERSION_PLACEHOLDER|$VERSION|" lms-plugin/repo.xml
+          sed -i "s|URL_PLACEHOLDER|${REPO_URL}/releases/download/v${VERSION}/lms-unified-hifi-control-${VERSION}.zip|" lms-plugin/repo.xml
+          sed -i "s|SHA_PLACEHOLDER|$SHA|" lms-plugin/repo.xml
+
+          cat lms-plugin/repo.xml
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add lms-plugin/repo.xml
+          git commit -m "chore: Update repo.xml to v${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
+          git push

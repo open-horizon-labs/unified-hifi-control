@@ -1,0 +1,15 @@
+{
+  "name": "unified-hifi-control",
+  "version": "3.0.0",
+  "description": "Source-agnostic hi-fi control bridge for Roon, LMS, UPnP, and more",
+  "synology": {
+    "maintainer": "Open Horizon Labs",
+    "maintainer_url": "https://github.com/open-horizon-labs/unified-hifi-control",
+    "displayName": "Unified Hi-Fi Control",
+    "os_min_ver": "7.0-40000",
+    "thirdparty": true,
+    "dsmuidir": false,
+    "startable": true
+  },
+  "target": "./package"
+}
