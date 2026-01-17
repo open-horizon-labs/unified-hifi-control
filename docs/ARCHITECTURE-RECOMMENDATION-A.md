@@ -216,14 +216,75 @@ For each adapter:
 |------|--------|
 | `src/coordinator.rs` | New: AdapterCoordinator |
 | `src/aggregator.rs` | New: ZoneAggregator |
-| `src/bus/mod.rs` | Extended events |
-| `src/adapters/*.rs` | Implement Adapter trait |
+| `src/bus/mod.rs` | Extended events (lifecycle, zone events) |
+| `src/adapters/mod.rs` | New: Adapter trait definition |
+| `src/adapters/roon.rs` | Implement Adapter trait, publish events |
+| `src/adapters/lms.rs` | Implement Adapter trait, publish events |
+| `src/adapters/openhome.rs` | Implement Adapter trait, publish events |
+| `src/adapters/upnp.rs` | Implement Adapter trait, publish events |
+| `src/adapters/hqplayer.rs` | Implement Adapter trait, publish events |
+| `src/adapters/mqtt.rs` | **Remove** (re-add later as event consumer) |
 | `src/api/mod.rs` | Use aggregator, simplified AppState |
 | `src/main.rs` | Wire up coordinator and aggregator |
 | `src/knobs/routes.rs` | Use aggregator instead of direct calls |
 
-## Open Questions
+## Decisions on Open Questions
 
-1. **HQPlayer special case** - It's a DSP service, not a zone source. Keep separate or unify?
-2. **MQTT adapter** - It bridges to Home Assistant. Same trait or different?
-3. **Runtime settings changes** - Should disabling an adapter stop it immediately?
+### 1. HQPlayer: Same Adapter Pattern
+
+HQPlayer follows the same adapter/aggregator split. It's not a special case.
+
+- Implements `Adapter` trait
+- Publishes `ZoneDiscovered`/`ZoneUpdated` events for HQPlayer zones
+- DSP linkage (applying HQPlayer to Roon/LMS zones) handled separately via `HqpZoneLinkService`
+
+### 2. MQTT Bridge: Remove for Now
+
+Rip out MQTT adapter to simplify the refactor. Can be re-added later following the new pattern.
+
+- Reduces scope of initial refactor
+- Home Assistant integration can return as a proper event consumer post-refactor
+
+### 3. Shutdown Protocol: Yes, Immediate Stop with ACK
+
+When an adapter is disabled at runtime:
+
+```
+Coordinator                    Bus                      Aggregator
+    │                           │                            │
+    │──AdapterStopping(prefix)──▶                            │
+    │                           │──AdapterStopping(prefix)──▶│
+    │                           │                            │
+    │                           │   (aggregator flushes      │
+    │                           │    zones with that prefix) │
+    │                           │                            │
+    │◀──────────────────────────│◀──ZonesFlushed(prefix)────│
+    │                           │                            │
+    │──stop()──▶ Adapter        │                            │
+    │◀──ACK─────                │                            │
+    │                           │                            │
+    │──AdapterStopped(prefix)──▶│                            │
+```
+
+**Events:**
+```rust
+pub enum BusEvent {
+    // ... existing events ...
+
+    // Adapter lifecycle (coordinator publishes)
+    AdapterStopping { prefix: String },
+    AdapterStopped { prefix: String },
+
+    // Aggregator responses
+    ZonesFlushed { prefix: String },
+}
+```
+
+**Aggregator behavior:**
+- On `AdapterStopping`: Remove all zones where `zone_id.starts_with(prefix)`
+- Publish `ZonesFlushed` to acknowledge
+
+**Adapter behavior:**
+- `stop()` is async, returns `Result<()>`
+- Clean up connections, cancel tasks
+- Coordinator waits for `stop()` to complete before publishing `AdapterStopped`
