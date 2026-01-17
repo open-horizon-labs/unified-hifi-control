@@ -1,0 +1,681 @@
+//! Extended event types for the unified event bus architecture.
+//!
+//! This module defines comprehensive event types that abstract across
+//! different audio sources (Roon, LMS, HQPlayer, etc.) into a unified
+//! zone-based model.
+
+use serde::{Deserialize, Serialize};
+
+// =============================================================================
+// Core Data Structures
+// =============================================================================
+
+/// Unified zone representation across all adapters.
+///
+/// A zone represents a logical playback destination (Roon zone, LMS player,
+/// HQPlayer instance, etc.) with a consistent interface regardless of source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Zone {
+    /// Unique zone identifier (e.g., "roon:1234", "lms:00:11:22:33:44:55")
+    pub zone_id: String,
+
+    /// Human-readable zone name
+    pub zone_name: String,
+
+    /// Current playback state
+    pub state: PlaybackState,
+
+    /// Volume control information (if available)
+    pub volume_control: Option<VolumeControl>,
+
+    /// Currently playing track (if any)
+    pub now_playing: Option<NowPlaying>,
+
+    /// Source adapter identifier (e.g., "roon", "lms", "hqplayer")
+    pub source: String,
+
+    /// Whether playback controls are available
+    pub is_controllable: bool,
+
+    /// Whether the zone supports seeking
+    pub is_seekable: bool,
+
+    /// Last update timestamp (milliseconds since epoch)
+    pub last_updated: u64,
+}
+
+/// Playback state enumeration
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum PlaybackState {
+    Playing,
+    Paused,
+    Stopped,
+    Loading,
+    /// Buffering (used by streaming sources)
+    Buffering,
+    /// Unknown/unavailable state
+    Unknown,
+}
+
+impl Default for PlaybackState {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl std::fmt::Display for PlaybackState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Playing => write!(f, "playing"),
+            Self::Paused => write!(f, "paused"),
+            Self::Stopped => write!(f, "stopped"),
+            Self::Loading => write!(f, "loading"),
+            Self::Buffering => write!(f, "buffering"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl From<&str> for PlaybackState {
+    fn from(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "playing" | "play" => Self::Playing,
+            "paused" | "pause" => Self::Paused,
+            "stopped" | "stop" => Self::Stopped,
+            "loading" => Self::Loading,
+            "buffering" => Self::Buffering,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Volume control information for a zone or output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VolumeControl {
+    /// Current volume value (in the scale defined by min/max)
+    pub value: f32,
+
+    /// Minimum volume value (e.g., -64 for dB, 0 for percentage)
+    pub min: f32,
+
+    /// Maximum volume value (e.g., 0 for dB, 100 for percentage)
+    pub max: f32,
+
+    /// Volume step size (for relative adjustments)
+    pub step: f32,
+
+    /// Whether volume is currently muted
+    pub is_muted: bool,
+
+    /// Volume scale type
+    pub scale: VolumeScale,
+
+    /// Output ID for this volume control (for multi-output zones)
+    pub output_id: Option<String>,
+}
+
+/// Volume scale type
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeScale {
+    /// Decibels (typically -64 to 0)
+    Decibel,
+    /// Percentage (0 to 100)
+    Percentage,
+    /// Linear (0.0 to 1.0)
+    Linear,
+    /// Unknown/unspecified
+    Unknown,
+}
+
+impl Default for VolumeScale {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// Now playing track information.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NowPlaying {
+    /// Track title
+    pub title: String,
+
+    /// Artist name
+    pub artist: String,
+
+    /// Album name
+    pub album: String,
+
+    /// Image key or URL for album art
+    pub image_key: Option<String>,
+
+    /// Current seek position in seconds
+    pub seek_position: Option<f64>,
+
+    /// Total track duration in seconds
+    pub duration: Option<f64>,
+
+    /// Additional metadata (format, bitrate, etc.)
+    pub metadata: Option<TrackMetadata>,
+}
+
+/// Additional track metadata
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TrackMetadata {
+    /// Audio format (e.g., "FLAC", "DSD", "MQA")
+    pub format: Option<String>,
+
+    /// Sample rate in Hz (e.g., 44100, 192000)
+    pub sample_rate: Option<u32>,
+
+    /// Bit depth (e.g., 16, 24, 32)
+    pub bit_depth: Option<u8>,
+
+    /// Bitrate in kbps
+    pub bitrate: Option<u32>,
+
+    /// Genre
+    pub genre: Option<String>,
+
+    /// Composer
+    pub composer: Option<String>,
+
+    /// Track number
+    pub track_number: Option<u32>,
+
+    /// Disc number
+    pub disc_number: Option<u32>,
+}
+
+/// Zone update payload for partial updates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ZoneUpdate {
+    /// Zone identifier
+    pub zone_id: String,
+
+    /// Updated playback state (if changed)
+    pub state: Option<PlaybackState>,
+
+    /// Updated volume (if changed)
+    pub volume: Option<f32>,
+
+    /// Updated mute state (if changed)
+    pub is_muted: Option<bool>,
+
+    /// Updated seek position (if changed)
+    pub seek_position: Option<f64>,
+}
+
+// =============================================================================
+// Commands
+// =============================================================================
+
+/// Playback and control commands that can be sent to zones.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "action", content = "params")]
+pub enum Command {
+    /// Start or resume playback
+    Play,
+
+    /// Pause playback
+    Pause,
+
+    /// Toggle play/pause
+    PlayPause,
+
+    /// Stop playback
+    Stop,
+
+    /// Skip to next track
+    Next,
+
+    /// Skip to previous track
+    Previous,
+
+    /// Set absolute volume
+    VolumeAbsolute {
+        /// Target volume value
+        value: f32,
+        /// Specific output ID (for multi-output zones)
+        output_id: Option<String>,
+    },
+
+    /// Adjust volume relatively
+    VolumeRelative {
+        /// Volume adjustment (positive = louder, negative = quieter)
+        delta: f32,
+        /// Specific output ID (for multi-output zones)
+        output_id: Option<String>,
+    },
+
+    /// Set mute state
+    Mute {
+        /// True to mute, false to unmute
+        muted: bool,
+        /// Specific output ID (for multi-output zones)
+        output_id: Option<String>,
+    },
+
+    /// Toggle mute state
+    MuteToggle {
+        /// Specific output ID (for multi-output zones)
+        output_id: Option<String>,
+    },
+
+    /// Seek to position
+    Seek {
+        /// Target position in seconds
+        position: f64,
+    },
+
+    /// Seek relative to current position
+    SeekRelative {
+        /// Seek offset in seconds (positive = forward, negative = backward)
+        offset: f64,
+    },
+
+    /// Set shuffle mode
+    Shuffle {
+        enabled: bool,
+    },
+
+    /// Set repeat mode
+    Repeat {
+        mode: RepeatMode,
+    },
+}
+
+/// Repeat mode options
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RepeatMode {
+    Off,
+    One,
+    All,
+}
+
+/// Result of a command execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommandResponse {
+    /// Zone ID the command was sent to
+    pub zone_id: String,
+
+    /// The command that was executed
+    pub command: Command,
+
+    /// Whether the command succeeded
+    pub success: bool,
+
+    /// Error message if command failed
+    pub error: Option<String>,
+
+    /// Timestamp of execution
+    pub timestamp: u64,
+}
+
+// =============================================================================
+// Bus Events
+// =============================================================================
+
+/// All events that can be published on the event bus.
+///
+/// Events are organized into categories:
+/// - Zone lifecycle: Discovery, updates, removal
+/// - Now playing: Track changes, seek updates
+/// - Commands: Incoming commands and their results
+/// - Adapter lifecycle: Adapter start/stop, cleanup
+/// - System: Shutdown, health checks
+/// - Legacy: Backward-compatible events for existing integrations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload")]
+pub enum BusEvent {
+    // =========================================================================
+    // Zone Lifecycle Events
+    // =========================================================================
+
+    /// A new zone was discovered by an adapter
+    ZoneDiscovered {
+        /// Full zone information
+        zone: Zone,
+    },
+
+    /// Zone information was updated
+    ZoneUpdated {
+        /// Zone identifier
+        zone_id: String,
+        /// Display name
+        display_name: String,
+        /// Current state
+        state: String,
+    },
+
+    /// A zone was removed (went offline, adapter disconnected, etc.)
+    ZoneRemoved {
+        /// Zone identifier
+        zone_id: String,
+    },
+
+    // =========================================================================
+    // Now Playing Events
+    // =========================================================================
+
+    /// Now playing information changed for a zone
+    NowPlayingChanged {
+        /// Zone identifier
+        zone_id: String,
+        /// Track title
+        title: Option<String>,
+        /// Artist name
+        artist: Option<String>,
+        /// Album name
+        album: Option<String>,
+        /// Image key for album art
+        image_key: Option<String>,
+    },
+
+    /// Seek position changed (for progress updates)
+    SeekPositionChanged {
+        zone_id: String,
+        position: i64,
+    },
+
+    /// Volume changed
+    VolumeChanged {
+        output_id: String,
+        value: f32,
+        is_muted: bool,
+    },
+
+    // =========================================================================
+    // Command Events
+    // =========================================================================
+
+    /// A command was received for a zone
+    CommandReceived {
+        /// Target zone
+        zone_id: String,
+        /// The command to execute
+        command: Command,
+        /// Optional request ID for correlation
+        request_id: Option<String>,
+    },
+
+    /// Result of a command execution
+    CommandResult {
+        /// The command response
+        response: CommandResponse,
+        /// Request ID for correlation (if provided in CommandReceived)
+        request_id: Option<String>,
+    },
+
+    // =========================================================================
+    // Adapter Lifecycle Events
+    // =========================================================================
+
+    /// An adapter is stopping (zones will be flushed)
+    AdapterStopping {
+        /// Adapter identifier (e.g., "roon", "lms", "hqplayer")
+        adapter: String,
+        /// Reason for stopping
+        reason: Option<String>,
+    },
+
+    /// An adapter has fully stopped
+    AdapterStopped {
+        /// Adapter identifier
+        adapter: String,
+    },
+
+    /// All zones from an adapter were flushed
+    ZonesFlushed {
+        /// Adapter identifier
+        adapter: String,
+        /// Zone IDs that were removed
+        zone_ids: Vec<String>,
+    },
+
+    /// An adapter connected to its backend
+    AdapterConnected {
+        /// Adapter identifier
+        adapter: String,
+        /// Connection details
+        details: Option<String>,
+    },
+
+    /// An adapter disconnected from its backend
+    AdapterDisconnected {
+        /// Adapter identifier
+        adapter: String,
+        /// Reason for disconnection
+        reason: Option<String>,
+    },
+
+    // =========================================================================
+    // System Events
+    // =========================================================================
+
+    /// System is shutting down
+    ShuttingDown {
+        /// Reason for shutdown
+        reason: Option<String>,
+    },
+
+    /// Health check event (can be used for monitoring)
+    HealthCheck {
+        /// Timestamp
+        timestamp: u64,
+    },
+
+    // =========================================================================
+    // Legacy Events (for backward compatibility)
+    // =========================================================================
+
+    /// Roon Core connected (legacy)
+    RoonConnected {
+        core_name: String,
+        version: String,
+    },
+
+    /// Roon Core disconnected (legacy)
+    RoonDisconnected,
+
+    /// HQPlayer connected (legacy)
+    HqpConnected {
+        host: String,
+    },
+
+    /// HQPlayer disconnected (legacy)
+    HqpDisconnected {
+        host: String,
+    },
+
+    /// HQPlayer state changed (legacy)
+    HqpStateChanged {
+        host: String,
+        state: String,
+    },
+
+    /// HQPlayer pipeline changed (legacy)
+    HqpPipelineChanged {
+        host: String,
+        filter: Option<String>,
+        shaper: Option<String>,
+        rate: Option<String>,
+    },
+
+    /// LMS connected (legacy)
+    LmsConnected {
+        host: String,
+    },
+
+    /// LMS disconnected (legacy)
+    LmsDisconnected {
+        host: String,
+    },
+
+    /// LMS player state changed (legacy)
+    LmsPlayerStateChanged {
+        player_id: String,
+        state: String,
+    },
+
+    /// Control command from external source (legacy, for MQTT/HA)
+    ControlCommand {
+        zone_id: String,
+        action: String,
+        value: Option<serde_json::Value>,
+    },
+}
+
+impl BusEvent {
+    /// Get the event type as a string (for logging/filtering)
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::ZoneDiscovered { .. } => "zone_discovered",
+            Self::ZoneUpdated { .. } => "zone_updated",
+            Self::ZoneRemoved { .. } => "zone_removed",
+            Self::NowPlayingChanged { .. } => "now_playing_changed",
+            Self::SeekPositionChanged { .. } => "seek_position_changed",
+            Self::VolumeChanged { .. } => "volume_changed",
+            Self::CommandReceived { .. } => "command_received",
+            Self::CommandResult { .. } => "command_result",
+            Self::AdapterStopping { .. } => "adapter_stopping",
+            Self::AdapterStopped { .. } => "adapter_stopped",
+            Self::ZonesFlushed { .. } => "zones_flushed",
+            Self::AdapterConnected { .. } => "adapter_connected",
+            Self::AdapterDisconnected { .. } => "adapter_disconnected",
+            Self::ShuttingDown { .. } => "shutting_down",
+            Self::HealthCheck { .. } => "health_check",
+            Self::RoonConnected { .. } => "roon_connected",
+            Self::RoonDisconnected => "roon_disconnected",
+            Self::HqpConnected { .. } => "hqp_connected",
+            Self::HqpDisconnected { .. } => "hqp_disconnected",
+            Self::HqpStateChanged { .. } => "hqp_state_changed",
+            Self::HqpPipelineChanged { .. } => "hqp_pipeline_changed",
+            Self::LmsConnected { .. } => "lms_connected",
+            Self::LmsDisconnected { .. } => "lms_disconnected",
+            Self::LmsPlayerStateChanged { .. } => "lms_player_state_changed",
+            Self::ControlCommand { .. } => "control_command",
+        }
+    }
+
+    /// Check if this is a zone-related event
+    pub fn is_zone_event(&self) -> bool {
+        matches!(
+            self,
+            Self::ZoneDiscovered { .. }
+                | Self::ZoneUpdated { .. }
+                | Self::ZoneRemoved { .. }
+                | Self::ZonesFlushed { .. }
+        )
+    }
+
+    /// Check if this is a playback-related event
+    pub fn is_playback_event(&self) -> bool {
+        matches!(
+            self,
+            Self::NowPlayingChanged { .. }
+                | Self::SeekPositionChanged { .. }
+                | Self::VolumeChanged { .. }
+        )
+    }
+
+    /// Check if this is a command-related event
+    pub fn is_command_event(&self) -> bool {
+        matches!(
+            self,
+            Self::CommandReceived { .. } | Self::CommandResult { .. } | Self::ControlCommand { .. }
+        )
+    }
+
+    /// Check if this is an adapter lifecycle event
+    pub fn is_adapter_event(&self) -> bool {
+        matches!(
+            self,
+            Self::AdapterStopping { .. }
+                | Self::AdapterStopped { .. }
+                | Self::AdapterConnected { .. }
+                | Self::AdapterDisconnected { .. }
+        )
+    }
+
+    /// Check if this is a legacy event
+    pub fn is_legacy_event(&self) -> bool {
+        matches!(
+            self,
+            Self::RoonConnected { .. }
+                | Self::RoonDisconnected
+                | Self::HqpConnected { .. }
+                | Self::HqpDisconnected { .. }
+                | Self::HqpStateChanged { .. }
+                | Self::HqpPipelineChanged { .. }
+                | Self::LmsConnected { .. }
+                | Self::LmsDisconnected { .. }
+                | Self::LmsPlayerStateChanged { .. }
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_playback_state_from_str() {
+        assert_eq!(PlaybackState::from("playing"), PlaybackState::Playing);
+        assert_eq!(PlaybackState::from("PAUSED"), PlaybackState::Paused);
+        assert_eq!(PlaybackState::from("stop"), PlaybackState::Stopped);
+        assert_eq!(PlaybackState::from("unknown_state"), PlaybackState::Unknown);
+    }
+
+    #[test]
+    fn test_playback_state_display() {
+        assert_eq!(PlaybackState::Playing.to_string(), "playing");
+        assert_eq!(PlaybackState::Paused.to_string(), "paused");
+    }
+
+    #[test]
+    fn test_event_type() {
+        let event = BusEvent::ZoneDiscovered {
+            zone: Zone {
+                zone_id: "test:1".to_string(),
+                zone_name: "Test Zone".to_string(),
+                state: PlaybackState::Stopped,
+                volume_control: None,
+                now_playing: None,
+                source: "test".to_string(),
+                is_controllable: true,
+                is_seekable: true,
+                last_updated: 0,
+            },
+        };
+        assert_eq!(event.event_type(), "zone_discovered");
+        assert!(event.is_zone_event());
+        assert!(!event.is_legacy_event());
+    }
+
+    #[test]
+    fn test_command_serialization() {
+        let cmd = Command::VolumeAbsolute {
+            value: 50.0,
+            output_id: Some("out1".to_string()),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("VolumeAbsolute"));
+        assert!(json.contains("50.0"));
+    }
+
+    #[test]
+    fn test_bus_event_serialization() {
+        let event = BusEvent::NowPlayingChanged {
+            zone_id: "roon:123".to_string(),
+            title: Some("Test Song".to_string()),
+            artist: Some("Test Artist".to_string()),
+            album: Some("Test Album".to_string()),
+            image_key: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("now_playing_changed") || json.contains("NowPlayingChanged"));
+    }
+}

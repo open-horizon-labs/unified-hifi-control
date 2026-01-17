@@ -3,82 +3,11 @@
 //! Uses tokio::sync::broadcast for pub/sub pattern.
 //! Events are typed and can carry payloads.
 
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-/// Event types that can be published on the bus
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload")]
-pub enum BusEvent {
-    // Roon events
-    RoonConnected {
-        core_name: String,
-        version: String,
-    },
-    RoonDisconnected,
-    ZoneUpdated {
-        zone_id: String,
-        display_name: String,
-        state: String,
-    },
-    ZoneRemoved {
-        zone_id: String,
-    },
-    NowPlayingChanged {
-        zone_id: String,
-        title: Option<String>,
-        artist: Option<String>,
-        album: Option<String>,
-        image_key: Option<String>,
-    },
-    SeekPositionChanged {
-        zone_id: String,
-        position: i64,
-    },
-    VolumeChanged {
-        output_id: String,
-        value: f32,
-        is_muted: bool,
-    },
-
-    // HQPlayer events
-    HqpConnected {
-        host: String,
-    },
-    HqpDisconnected {
-        host: String,
-    },
-    HqpStateChanged {
-        host: String,
-        state: String,
-    },
-    HqpPipelineChanged {
-        host: String,
-        filter: Option<String>,
-        shaper: Option<String>,
-        rate: Option<String>,
-    },
-
-    // LMS events
-    LmsConnected {
-        host: String,
-    },
-    LmsDisconnected {
-        host: String,
-    },
-    LmsPlayerStateChanged {
-        player_id: String,
-        state: String,
-    },
-
-    // Control commands (for MQTT/external integration)
-    ControlCommand {
-        zone_id: String,
-        action: String,
-        value: Option<serde_json::Value>,
-    },
-}
+pub mod events;
+pub use events::*;
 
 /// Event bus handle for publishing and subscribing
 #[derive(Clone)]

@@ -380,6 +380,80 @@ impl MqttAdapter {
                 // Don't re-publish control commands
                 return Ok(());
             }
+            // New architecture events
+            BusEvent::ZoneDiscovered { zone } => (
+                format!("zones/{}/discovered", zone.zone_id),
+                serde_json::json!({
+                    "zone_id": zone.zone_id,
+                    "zone_name": zone.zone_name,
+                    "source": zone.source,
+                    "state": zone.state.to_string()
+                }),
+            ),
+            BusEvent::CommandReceived { zone_id, command, request_id } => (
+                format!("zones/{}/command", zone_id),
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "command": command,
+                    "request_id": request_id
+                }),
+            ),
+            BusEvent::CommandResult { response, request_id } => (
+                format!("zones/{}/command_result", response.zone_id),
+                serde_json::json!({
+                    "zone_id": response.zone_id,
+                    "success": response.success,
+                    "error": response.error,
+                    "request_id": request_id
+                }),
+            ),
+            BusEvent::AdapterStopping { adapter, reason } => (
+                format!("adapters/{}/stopping", adapter),
+                serde_json::json!({
+                    "adapter": adapter,
+                    "reason": reason
+                }),
+            ),
+            BusEvent::AdapterStopped { adapter } => (
+                format!("adapters/{}/stopped", adapter),
+                serde_json::json!({
+                    "adapter": adapter
+                }),
+            ),
+            BusEvent::ZonesFlushed { adapter, zone_ids } => (
+                format!("adapters/{}/zones_flushed", adapter),
+                serde_json::json!({
+                    "adapter": adapter,
+                    "zone_ids": zone_ids
+                }),
+            ),
+            BusEvent::AdapterConnected { adapter, details } => (
+                format!("adapters/{}/status", adapter),
+                serde_json::json!({
+                    "adapter": adapter,
+                    "connected": true,
+                    "details": details
+                }),
+            ),
+            BusEvent::AdapterDisconnected { adapter, reason } => (
+                format!("adapters/{}/status", adapter),
+                serde_json::json!({
+                    "adapter": adapter,
+                    "connected": false,
+                    "reason": reason
+                }),
+            ),
+            BusEvent::ShuttingDown { reason } => (
+                "system/shutdown".to_string(),
+                serde_json::json!({
+                    "shutting_down": true,
+                    "reason": reason
+                }),
+            ),
+            BusEvent::HealthCheck { timestamp: _ } => {
+                // Don't publish health checks to MQTT
+                return Ok(());
+            }
         };
 
         let topic = format!("{}/{}", prefix, topic_suffix);
