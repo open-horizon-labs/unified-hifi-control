@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::bus::{BusEvent, SharedBus};
 use crate::config::get_data_dir;
@@ -141,10 +142,12 @@ struct RoonState {
 }
 
 /// Roon adapter
+#[derive(Clone)]
 pub struct RoonAdapter {
     state: Arc<RwLock<RoonState>>,
     #[allow(dead_code)]
     bus: SharedBus,
+    shutdown: CancellationToken,
 }
 
 /// Initial reconnection delay
@@ -160,7 +163,14 @@ impl RoonAdapter {
         Self {
             state: Arc::new(RwLock::new(RoonState::default())),
             bus,
+            shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Stop the Roon adapter
+    pub fn stop(&self) {
+        self.shutdown.cancel();
+        tracing::info!("Roon adapter stopped");
     }
 
     /// Create and start Roon adapter
@@ -170,6 +180,8 @@ impl RoonAdapter {
         let state = Arc::new(RwLock::new(RoonState::default()));
         let state_clone = state.clone();
         let bus_clone = bus.clone();
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
 
         // Spawn Roon event loop with reconnection logic
         tokio::spawn(async move {
@@ -197,14 +209,26 @@ impl RoonAdapter {
                 }
 
                 tracing::info!("Roon loop exited, reconnecting in {:?}...", retry_delay);
-                tokio::time::sleep(retry_delay).await;
 
-                // Exponential backoff up to max
-                retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
+                // Check for shutdown before sleeping
+                tokio::select! {
+                    _ = shutdown_clone.cancelled() => {
+                        tracing::info!("Roon adapter shutdown requested");
+                        break;
+                    }
+                    _ = tokio::time::sleep(retry_delay) => {
+                        // Exponential backoff up to max
+                        retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
+                    }
+                }
             }
         });
 
-        Ok(Self { state, bus })
+        Ok(Self {
+            state,
+            bus,
+            shutdown,
+        })
     }
 
     /// Get connection status

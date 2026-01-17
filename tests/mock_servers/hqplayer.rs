@@ -2,7 +2,6 @@
 //!
 //! Simulates the TCP/XML protocol on port 4321
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

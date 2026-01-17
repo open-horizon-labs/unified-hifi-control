@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::get_config_dir;
 
@@ -53,6 +54,7 @@ struct FirmwareState {
 pub struct FirmwareService {
     client: Client,
     state: Arc<RwLock<FirmwareState>>,
+    shutdown: CancellationToken,
 }
 
 impl Default for FirmwareService {
@@ -72,7 +74,14 @@ impl FirmwareService {
         Self {
             client,
             state: Arc::new(RwLock::new(FirmwareState::default())),
+            shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Stop the firmware polling service
+    pub fn stop(&self) {
+        self.shutdown.cancel();
+        tracing::info!("Firmware service stopped");
     }
 
     /// Get firmware directory path
@@ -276,6 +285,7 @@ impl FirmwareService {
             DEFAULT_POLL_INTERVAL_MINUTES
         };
 
+        let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
             // Check immediately on startup
             if let Err(e) = self.check_for_updates().await {
@@ -287,9 +297,16 @@ impl FirmwareService {
             ticker.tick().await; // Skip first tick (we already checked)
 
             loop {
-                ticker.tick().await;
-                if let Err(e) = self.check_for_updates().await {
-                    tracing::warn!("Firmware check failed: {}", e);
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        tracing::debug!("Firmware polling shutdown requested");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        if let Err(e) = self.check_for_updates().await {
+                            tracing::warn!("Firmware check failed: {}", e);
+                        }
+                    }
                 }
             }
         });

@@ -4,7 +4,7 @@
 //! This serves as an executable contract test for clients consuming the API.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 /// StatusResponse schema - GET /status
 #[derive(Debug, Deserialize)]

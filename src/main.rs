@@ -175,6 +175,9 @@ async fn main() -> Result<()> {
     let knob_store = knobs::KnobStore::new(data_dir);
     tracing::info!("Knob store initialized");
 
+    // Clone Roon adapter for shutdown access (cheap - just Arc clones)
+    let roon_for_shutdown = roon.clone();
+
     // Build application state (clone Arcs so we can access adapters for shutdown)
     let state = api::AppState::new(
         roon,
@@ -360,20 +363,22 @@ async fn main() -> Result<()> {
     let firmware_auto_update = std::env::var("FIRMWARE_AUTO_UPDATE")
         .map(|v| v != "false")
         .unwrap_or(true);
-    if firmware_auto_update {
+    let firmware_service = if firmware_auto_update {
         let poll_interval = std::env::var("FIRMWARE_POLL_INTERVAL_MINUTES")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60);
-        let firmware_service = std::sync::Arc::new(firmware::FirmwareService::new());
-        firmware_service.start_polling(poll_interval);
+        let service = Arc::new(firmware::FirmwareService::new());
+        service.clone().start_polling(poll_interval);
         tracing::info!(
             "Firmware auto-update enabled (poll interval: {} min)",
             poll_interval
         );
+        Some(service)
     } else {
         tracing::info!("Firmware auto-update disabled");
-    }
+        None
+    };
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
@@ -382,6 +387,10 @@ async fn main() -> Result<()> {
 
     // Cleanup: stop adapters (mDNS daemon will be dropped automatically)
     tracing::info!("Shutting down adapters...");
+    roon_for_shutdown.stop();
+    if let Some(ref fw) = firmware_service {
+        fw.stop();
+    }
     lms.stop().await;
     mqtt.stop().await;
     openhome.stop().await;
