@@ -305,6 +305,7 @@ mod tests {
     use super::*;
     use crate::bus::create_bus;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_register_and_check_enabled() {

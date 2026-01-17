@@ -18,7 +18,6 @@ use tower::ServiceExt;
 
 use unified_hifi_control::adapters::hqplayer::{HqpInstanceManager, HqpZoneLinkService};
 use unified_hifi_control::adapters::lms::LmsAdapter;
-use unified_hifi_control::adapters::mqtt::MqttAdapter;
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
 use unified_hifi_control::adapters::roon::RoonAdapter;
 use unified_hifi_control::adapters::upnp::UPnPAdapter;
@@ -37,7 +36,6 @@ async fn create_test_app() -> Router {
     let hqplayer = hqp_instances.get_default().await;
     let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
     let lms = Arc::new(LmsAdapter::new(bus.clone()));
-    let mqtt = Arc::new(MqttAdapter::new(bus.clone()));
     let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
     let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
     let knob_store = KnobStore::new(std::env::temp_dir());
@@ -48,7 +46,6 @@ async fn create_test_app() -> Router {
         hqp_instances,
         hqp_zone_links,
         lms,
-        mqtt,
         openhome,
         upnp,
         knob_store,
