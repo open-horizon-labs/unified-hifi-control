@@ -480,8 +480,12 @@ impl LmsAdapter {
             state.running = true;
         }
 
-        // Initial update
-        self.update_players().await?;
+        // Initial update - reset running flag on failure so we can retry
+        if let Err(e) = self.update_players().await {
+            let mut state = self.state.write().await;
+            state.running = false;
+            return Err(e);
+        }
 
         {
             let mut state = self.state.write().await;
