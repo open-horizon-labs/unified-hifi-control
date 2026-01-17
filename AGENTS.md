@@ -1,23 +1,48 @@
 # Agent Guidelines
 
-## Open Horizon Labs Tools
+## Task Management
 
-This project uses three complementary tools:
+Use GitHub for all task tracking:
 
-### ba (Task Tracker)
-**When to use:** Tracking work items, managing tasks across sessions
-**Protocol:**
-- `ba ready` - See claimable tasks
-- `ba claim <id> --session $SESSION_ID` - Claim a task
-- `ba complete <id>` - Mark task done
-- `ba create "description" -t task` - Create new task
+### GitHub Issues
+**Purpose:** Describe problems and desired outcomes
+- Create issues for bugs, features, and improvements
+- Focus on the *what* and *why*, not implementation details
+- Reference related issues with `#123` syntax
+- Add OH endeavor ID for cross-reference: `OH: 80222d6d` (enables agent linkage to Open Horizons context)
+
+### Branches
+**Purpose:** Isolate work in progress
+- Create a branch for each issue: `fix/issue-123-description` or `feat/issue-123-description`
+- Base Rust work on `v3`, not `master`
+- Keep branches focused on a single issue
+
+### Pull Requests
+**Purpose:** Propose implementations for review
+- Link to the issue being addressed: `Fixes #123`
+- Describe what changed and how to test
+- Request review from coderabbit and superego
+
+---
+
+## Code Review
+
+This project uses two complementary review tools:
 
 ### superego (Metacognitive Advisor)
 **When to use:** Before commits, when choosing between approaches, when uncertain
 **Protocol:**
 - Mode: `pull` (reviews on request, not automatically)
-- Use `sg review` at decision points
+- Use `sg review` at decision points during development
+- Post superego reviews to PRs for visibility
 - Handle findings: P1-P3 fix immediately, P4 can discard with reason
+
+### coderabbit (Automated Code Review)
+**When to use:** Automatically runs on all PRs
+**Protocol:**
+- Reviews code style, potential bugs, and best practices
+- Address feedback before merging
+- Use `@coderabbit` in PR comments to ask questions
 
 ### wm (Working Memory)
 **When to use:** Automatic - captures learnings from sessions
@@ -30,12 +55,10 @@ This project uses three complementary tools:
 
 ## Branch Strategy
 
-**Default branch for Rust development: `v3`**
-
 - `master` = Node.js v2.x (legacy, stable)
 - `v3` = Rust v3.x (active development)
 
-When creating PRs or branches for Rust work, base them on `v3`, not `master`.
+**Default branch for Rust development: `v3`**
 
 ## Test-Driven Development (TDD)
 
@@ -73,3 +96,12 @@ The Rust server must be a drop-in replacement for the Node.js server. All API re
 - Field names (`zone_name` not `display_name`)
 - Zone ID prefixes (`roon:`, `openhome:`, `upnp:`, `lms:`)
 - Error response formats
+
+## Architecture
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the event bus pattern and design principles.
+
+**Key insight:** Complexity should be absorbed by the bus, not distributed across components. When in doubt:
+- Adapters are dumb (discover, translate, handle commands)
+- Aggregator owns state (merge, hydrate, track last-seen)
+- UI talks to aggregator only (never directly to backends)
