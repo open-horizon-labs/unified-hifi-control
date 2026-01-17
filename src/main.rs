@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -210,6 +211,9 @@ async fn main() -> Result<()> {
     // Clone Roon adapter for shutdown access (cheap - just Arc clones)
     let roon_for_shutdown = roon.clone();
 
+    // Create shutdown token for graceful SSE termination (fixes #73)
+    let shutdown_token = CancellationToken::new();
+
     // Build application state (clone Arcs so we can access adapters for shutdown)
     let state = api::AppState::new(
         roon,
@@ -225,7 +229,11 @@ async fn main() -> Result<()> {
         coord.clone(),
         startable_adapters.clone(),
         Instant::now(),
+        shutdown_token.clone(),
     );
+
+    // Clone state for shutdown diagnostics
+    let state_for_shutdown = state.clone();
 
     // Build API routes
     let app = Router::new()
@@ -410,14 +418,36 @@ async fn main() -> Result<()> {
     };
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    // Create shutdown future that cancels token before graceful shutdown (fixes #73)
+    let graceful_shutdown = {
+        let token = shutdown_token.clone();
+        let state = state_for_shutdown.clone();
+        async move {
+            shutdown_signal().await;
+
+            // Cancel SSE streams BEFORE Axum starts waiting for connections
+            token.cancel();
+
+            // Log active SSE connections for diagnostics
+            let active = state.active_sse_connections();
+            if active > 0 {
+                tracing::info!(
+                    "Cancelling {} active SSE connection(s) for graceful shutdown",
+                    active
+                );
+            }
+        }
+    };
+
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(graceful_shutdown)
         .await?;
 
     // Cleanup: publish ShuttingDown event and stop adapters
     tracing::info!("Shutting down adapters...");
 
-    // Publish ShuttingDown event for any bus listeners (fixes #73)
+    // Publish ShuttingDown event for any bus listeners
     bus.publish(bus::BusEvent::ShuttingDown {
         reason: Some("User requested shutdown".to_string()),
     });

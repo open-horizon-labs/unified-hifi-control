@@ -19,13 +19,15 @@ use axum::{
     },
     Json,
 };
-use futures::stream::Stream;
+use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 /// Shared application state
 #[derive(Clone)]
@@ -43,6 +45,10 @@ pub struct AppState {
     pub coordinator: Arc<AdapterCoordinator>,
     pub startable_adapters: Arc<Vec<Arc<dyn Startable>>>,
     pub start_time: Instant,
+    /// Cancellation token for graceful shutdown (terminates SSE streams)
+    pub shutdown: CancellationToken,
+    /// Count of active SSE connections (for shutdown diagnostics)
+    pub sse_connections: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -61,6 +67,7 @@ impl AppState {
         coordinator: Arc<AdapterCoordinator>,
         startable_adapters: Vec<Arc<dyn Startable>>,
         start_time: Instant,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             roon,
@@ -76,7 +83,14 @@ impl AppState {
             coordinator,
             startable_adapters: Arc::new(startable_adapters),
             start_time,
+            shutdown,
+            sse_connections: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Get the count of active SSE connections
+    pub fn active_sse_connections(&self) -> usize {
+        self.sse_connections.load(Ordering::Relaxed)
     }
 }
 
@@ -648,13 +662,39 @@ pub async fn lms_volume_handler(
 // =============================================================================
 
 /// GET /events - Server-Sent Events stream
+/// Guard that decrements SSE connection count on drop
+struct SseConnectionGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        let prev = self.counter.fetch_sub(1, Ordering::Relaxed);
+        tracing::debug!("SSE connection closed ({} remaining)", prev - 1);
+    }
+}
+
 pub async fn events_handler(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Track this connection
+    let count = state.sse_connections.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::debug!("SSE connection opened ({} active)", count);
+
+    let guard = SseConnectionGuard {
+        counter: state.sse_connections.clone(),
+    };
+    let shutdown = state.shutdown.clone();
     let rx = state.bus.subscribe();
 
-    let stream = BroadcastStream::new(rx).filter_map(|result| {
-        match result {
+    // Create stream that terminates on shutdown
+    // Use futures::StreamExt::take_until via UFCS (tokio_stream doesn't have it)
+    let base_stream = BroadcastStream::new(rx);
+    let with_shutdown =
+        futures::StreamExt::take_until(base_stream, async move { shutdown.cancelled().await });
+
+    let stream = with_shutdown
+        .filter_map(|result| match result {
             Ok(event) => {
                 // Serialize event to JSON
                 match serde_json::to_string(&event) {
@@ -663,8 +703,12 @@ pub async fn events_handler(
                 }
             }
             Err(_) => None, // Skip lagged messages
-        }
-    });
+        })
+        // Ensure guard lives until stream ends (decrements counter on drop)
+        .chain(stream::once(async move {
+            drop(guard);
+            std::future::pending::<Result<Event, Infallible>>().await
+        }));
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()

@@ -14,6 +14,7 @@ use axum::{
 };
 use serde_json::Value;
 use std::{sync::Arc, time::Instant};
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use unified_hifi_control::adapters::hqplayer::{HqpInstanceManager, HqpZoneLinkService};
@@ -23,11 +24,11 @@ use unified_hifi_control::adapters::roon::RoonAdapter;
 use unified_hifi_control::adapters::upnp::UPnPAdapter;
 use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
+use unified_hifi_control::api;
 use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::{self, KnobStore};
-use unified_hifi_control::api;
 
 // Stub HTML handlers for UI route tests (replacing deleted ui module)
 mod ui_stubs {
@@ -76,6 +77,7 @@ async fn create_test_app() -> Router {
         coordinator,
         startable_adapters,
         Instant::now(),
+        CancellationToken::new(),
     );
 
     // Build router with all routes (same as main.rs)
