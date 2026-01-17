@@ -49,7 +49,12 @@ impl SpawnLoopVisitor {
     fn is_tokio_spawn_call(&self, call: &ExprCall) -> bool {
         // Check for tokio::spawn(...) pattern
         if let Expr::Path(path) = &*call.func {
-            let segments: Vec<_> = path.path.segments.iter().map(|s| s.ident.to_string()).collect();
+            let segments: Vec<_> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
             return segments == vec!["tokio", "spawn"];
         }
         false
@@ -57,7 +62,10 @@ impl SpawnLoopVisitor {
 
     fn is_select_macro_path(&self, mac: &Macro) -> bool {
         // Check for tokio::select! or select! pattern
-        let path_str: String = mac.path.segments.iter()
+        let path_str: String = mac
+            .path
+            .segments
+            .iter()
             .map(|s| s.ident.to_string())
             .collect::<Vec<_>>()
             .join("::");
@@ -88,7 +96,8 @@ impl<'ast> Visit<'ast> for SpawnLoopVisitor {
             self.has_select_in_loop = false;
 
             // Try to get some context about this loop
-            self.loop_context = loop_expr.label
+            self.loop_context = loop_expr
+                .label
                 .as_ref()
                 .map(|l| format!("'{}", l.name.ident))
                 .unwrap_or_else(|| "loop".to_string());
@@ -100,7 +109,10 @@ impl<'ast> Visit<'ast> for SpawnLoopVisitor {
             if !self.has_select_in_loop {
                 self.violations.push((
                     self.current_file.clone(),
-                    format!("Spawned {} without cancellation handling", self.loop_context),
+                    format!(
+                        "Spawned {} without cancellation handling",
+                        self.loop_context
+                    ),
                 ));
             }
 

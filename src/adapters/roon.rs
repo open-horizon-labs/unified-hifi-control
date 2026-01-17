@@ -224,7 +224,11 @@ impl RoonAdapter {
             }
         });
 
-        Ok(Self { state, bus, shutdown })
+        Ok(Self {
+            state,
+            bus,
+            shutdown,
+        })
     }
 
     /// Get connection status
