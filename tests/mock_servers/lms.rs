@@ -170,17 +170,14 @@ async fn handle_jsonrpc(
     // Handle commands that modify state
     match command {
         "play" => {
-            // LMS "play" command starts playback from stopped/beginning
-            // NOTE: This does NOT resume from pause - use "pause 0" for that
+            // LMS "play" command starts playback from stopped OR resumes from pause
+            // Per real-world testing (issue #68), a single "play" command handles both
             let mut state = state.write().await;
             if let Some(player) = state.players.get_mut(player_id) {
-                // Only start playing if stopped (not if paused!)
-                // This matches real LMS behavior where "play" starts playlist
-                // but doesn't resume from pause
-                if player.mode == "stop" {
+                // "play" works from both stopped and paused states
+                if player.mode == "stop" || player.mode == "pause" {
                     player.mode = "play".to_string();
                 }
-                // If paused, "play" does nothing - need "pause 0" to resume
             }
             return Ok(Json(JsonRpcResponse {
                 id: request.id,
@@ -406,10 +403,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_lms_play_does_not_resume_from_pause() {
-        // This test documents the LMS quirk that the current adapter doesn't handle:
-        // - The "play" command does NOT resume from pause
-        // - You need "pause 0" to resume
+    async fn mock_lms_play_resumes_from_pause() {
+        // Per real-world testing (issue #68), "play" command resumes from pause
+        // This matches actual LMS behavior - a single command handles both start and resume
         let server = MockLmsServer::start().await;
         let player_id = "aa:bb:cc:dd:ee:ff";
         server.add_player(player_id, "Test Player").await;
@@ -421,11 +417,11 @@ mod tests {
         // Verify initial state is paused
         assert_eq!(get_mode(&client, &addr, player_id).await, "pause");
 
-        // Send "play" - in real LMS, this does NOT resume from pause!
+        // Send "play" - this resumes from pause (confirmed by user testing)
         send_command(&client, &addr, player_id, vec![json!("play")]).await;
 
-        // Player should still be paused (play doesn't resume!)
-        assert_eq!(get_mode(&client, &addr, player_id).await, "pause");
+        // Player should now be playing
+        assert_eq!(get_mode(&client, &addr, player_id).await, "play");
 
         server.stop().await;
     }
