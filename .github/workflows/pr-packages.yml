@@ -82,11 +82,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/dx
-          key: dx-cli-0.6
+          key: dx-cli-0.7.3
 
       - name: Install Dioxus CLI
         if: steps.cache-dx.outputs.cache-hit != 'true'
-        run: cargo install dioxus-cli --locked
+        run: cargo install dioxus-cli@0.7.3 --locked
 
       - name: Build Tailwind CSS
         run: make css
@@ -119,11 +119,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cross
-          key: cross-0.2
+          key: cross-0.2.5
 
       - name: Install cross
         if: steps.cache-cross.outputs.cache-hit != 'true'
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross@0.2.5
 
       - name: Build with cross
         run: cross build --release --target x86_64-unknown-linux-musl
