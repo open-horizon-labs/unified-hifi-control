@@ -80,7 +80,7 @@ The release workflow builds for 6 targets across 3 platforms, plus web assets, D
 
 **How:**
 ```dockerfile
-FROM ghcr.io/linuxserver/baseimage-alpine:3.20
+FROM ghcr.io/linuxcontainers/alpine:3.20
 ```
 
 ### 5. Web Assets Artifact Sharing

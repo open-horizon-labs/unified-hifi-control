@@ -1,8 +1,7 @@
 # CI Dockerfile - uses pre-built binaries and web assets
 # This is much faster than building inside Docker with QEMU emulation
-# Use GHCR for fast pulls from GitHub Actions (same datacenter)
-
-FROM ghcr.io/linuxserver/baseimage-alpine:3.20
+# Use GHCR for faster pulls from GitHub Actions (same datacenter)
+FROM ghcr.io/linuxcontainers/alpine:3.20
 
 WORKDIR /app
 
