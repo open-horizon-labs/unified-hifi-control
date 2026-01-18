@@ -43,17 +43,23 @@ pub fn Lms() -> Element {
 
     // Load config resource
     let mut config = use_resource(|| async {
-        crate::app::api::fetch_json::<LmsConfig>("/lms/config").await.ok()
+        crate::app::api::fetch_json::<LmsConfig>("/lms/config")
+            .await
+            .ok()
     });
 
     // Load players resource
     let mut players = use_resource(|| async {
-        crate::app::api::fetch_json::<Vec<LmsPlayer>>("/lms/players").await.ok()
+        crate::app::api::fetch_json::<Vec<LmsPlayer>>("/lms/players")
+            .await
+            .ok()
     });
 
     // Check if LMS is enabled
     let settings = use_resource(|| async {
-        crate::app::api::fetch_json::<AppSettings>("/api/settings").await.ok()
+        crate::app::api::fetch_json::<AppSettings>("/api/settings")
+            .await
+            .ok()
     });
 
     // Sync config to form when loaded
@@ -121,7 +127,12 @@ pub fn Lms() -> Element {
     };
 
     let cfg = config.read().clone().flatten();
-    let lms_enabled = settings.read().clone().flatten().map(|s| s.adapters.lms).unwrap_or(false);
+    let lms_enabled = settings
+        .read()
+        .clone()
+        .flatten()
+        .map(|s| s.adapters.lms)
+        .unwrap_or(false);
     let players_list = players.read().clone().flatten().unwrap_or_default();
     let is_loading = config.read().is_none();
 
@@ -270,10 +281,7 @@ pub fn Lms() -> Element {
 
 /// Player card component
 #[component]
-fn PlayerCard(
-    player: LmsPlayer,
-    on_control: EventHandler<(String, String)>,
-) -> Element {
+fn PlayerCard(player: LmsPlayer, on_control: EventHandler<(String, String)>) -> Element {
     let player_id = player.player_id.clone();
     let player_id_prev = player_id.clone();
     let player_id_play = player_id.clone();

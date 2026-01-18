@@ -34,7 +34,9 @@ pub fn Zone() -> Element {
 
     // Load zones resource
     let mut zones = use_resource(|| async {
-        crate::app::api::fetch_json::<ZonesResponse>("/zones").await.ok()
+        crate::app::api::fetch_json::<ZonesResponse>("/zones")
+            .await
+            .ok()
     });
 
     // Now playing (depends on selected zone)
@@ -70,8 +72,15 @@ pub fn Zone() -> Element {
                 // Check if zone has HQP
                 if let Some(ref resp) = zones_data {
                     if let Some(zone) = resp.zones.iter().find(|z| z.zone_id == zone_id) {
-                        if zone.dsp.as_ref().map(|d| d.r#type.as_deref() == Some("hqplayer")).unwrap_or(false) {
-                            if let Ok(pipeline) = crate::app::api::fetch_json::<HqpPipeline>("/hqp/pipeline").await {
+                        if zone
+                            .dsp
+                            .as_ref()
+                            .map(|d| d.r#type.as_deref() == Some("hqplayer"))
+                            .unwrap_or(false)
+                        {
+                            if let Ok(pipeline) =
+                                crate::app::api::fetch_json::<HqpPipeline>("/hqp/pipeline").await
+                            {
                                 hqp_pipeline.set(Some(pipeline));
                             }
                         } else {
@@ -104,7 +113,9 @@ pub fn Zone() -> Element {
         if sse.should_refresh_hqp() {
             if hqp_pipeline().is_some() {
                 spawn(async move {
-                    if let Ok(pipeline) = crate::app::api::fetch_json::<HqpPipeline>("/hqp/pipeline").await {
+                    if let Ok(pipeline) =
+                        crate::app::api::fetch_json::<HqpPipeline>("/hqp/pipeline").await
+                    {
                         hqp_pipeline.set(Some(pipeline));
                     }
                 });
@@ -117,7 +128,11 @@ pub fn Zone() -> Element {
         if let Some(zone_id) = selected_zone_id() {
             let action = action.to_string();
             spawn(async move {
-                let req = ControlRequest { zone_id, action, value };
+                let req = ControlRequest {
+                    zone_id,
+                    action,
+                    value,
+                };
                 let _ = crate::app::api::post_json_no_response("/control", &req).await;
             });
         }
@@ -149,9 +164,16 @@ pub fn Zone() -> Element {
     };
 
     let np = now_playing();
-    let zones_list = zones.read().clone().flatten().map(|r| r.zones).unwrap_or_default();
+    let zones_list = zones
+        .read()
+        .clone()
+        .flatten()
+        .map(|r| r.zones)
+        .unwrap_or_default();
     let selected = selected_zone_id();
-    let selected_zone = selected.as_ref().and_then(|id| zones_list.iter().find(|z| &z.zone_id == id));
+    let selected_zone = selected
+        .as_ref()
+        .and_then(|id| zones_list.iter().find(|z| &z.zone_id == id));
 
     let has_hqp = selected_zone
         .and_then(|z| z.dsp.as_ref())
@@ -237,10 +259,16 @@ fn ZoneDisplay(
     let image_url = np.and_then(|n| n.image_url.clone()).unwrap_or_default();
 
     let volume_display = np
-        .and_then(|n| n.volume.map(|v| {
-            let suffix = if n.volume_type.as_deref() == Some("db") { " dB" } else { "" };
-            format!("{}{}", v.round() as i32, suffix)
-        }))
+        .and_then(|n| {
+            n.volume.map(|v| {
+                let suffix = if n.volume_type.as_deref() == Some("db") {
+                    " dB"
+                } else {
+                    ""
+                };
+                format!("{}{}", v.round() as i32, suffix)
+            })
+        })
         .unwrap_or_else(|| "—".to_string());
 
     let can_prev = np.map(|n| n.is_previous_allowed).unwrap_or(false);
@@ -329,9 +357,15 @@ fn HqpSection(
     let settings = pipe.settings.as_ref();
 
     // Helper to render a select
-    let render_select = |id: &'static str, label_text: &str, opts: Option<&crate::app::api::HqpSettingOptions>, _setting_name: &'static str| {
+    let render_select = |id: &'static str,
+                         label_text: &str,
+                         opts: Option<&crate::app::api::HqpSettingOptions>,
+                         _setting_name: &'static str| {
         let options = opts.map(|o| o.options.clone()).unwrap_or_default();
-        let selected = opts.and_then(|o| o.selected.as_ref()).map(|s| s.value.clone()).unwrap_or_default();
+        let selected = opts
+            .and_then(|o| o.selected.as_ref())
+            .map(|s| s.value.clone())
+            .unwrap_or_default();
 
         rsx! {
             label {

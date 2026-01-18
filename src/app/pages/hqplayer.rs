@@ -71,38 +71,40 @@ pub fn HqPlayer() -> Element {
     let mut config_status = use_signal(|| None::<String>);
 
     // Load config resource
-    let config = use_resource(|| async {
-        api::fetch_json::<HqpConfig>("/hqplayer/config").await.ok()
-    });
+    let config =
+        use_resource(|| async { api::fetch_json::<HqpConfig>("/hqplayer/config").await.ok() });
 
     // Load status resource
-    let mut status = use_resource(|| async {
-        api::fetch_json::<HqpStatus>("/hqp/status").await.ok()
-    });
+    let mut status =
+        use_resource(|| async { api::fetch_json::<HqpStatus>("/hqp/status").await.ok() });
 
     // Load pipeline resource
-    let mut pipeline = use_resource(|| async {
-        api::fetch_json::<HqpPipeline>("/hqp/pipeline").await.ok()
-    });
+    let mut pipeline =
+        use_resource(|| async { api::fetch_json::<HqpPipeline>("/hqp/pipeline").await.ok() });
 
     // Load profiles resource
     let profiles = use_resource(|| async {
-        api::fetch_json::<Vec<HqpProfile>>("/hqp/profiles").await.ok()
+        api::fetch_json::<Vec<HqpProfile>>("/hqp/profiles")
+            .await
+            .ok()
     });
 
     // Load zones resource
-    let mut zones = use_resource(|| async {
-        api::fetch_json::<ZonesResponse>("/knob/zones").await.ok()
-    });
+    let mut zones =
+        use_resource(|| async { api::fetch_json::<ZonesResponse>("/knob/zones").await.ok() });
 
     // Load zone links resource
     let mut zone_links = use_resource(|| async {
-        api::fetch_json::<ZoneLinksResponse>("/hqp/zones/links").await.ok()
+        api::fetch_json::<ZoneLinksResponse>("/hqp/zones/links")
+            .await
+            .ok()
     });
 
     // Load instances resource
     let instances = use_resource(|| async {
-        api::fetch_json::<InstancesResponse>("/hqp/instances").await.ok()
+        api::fetch_json::<InstancesResponse>("/hqp/instances")
+            .await
+            .ok()
     });
 
     // Sync config to form when loaded
@@ -149,7 +151,10 @@ pub fn HqPlayer() -> Element {
 
             match api::post_json::<_, serde_json::Value>("/hqplayer/configure", &req).await {
                 Ok(resp) => {
-                    let connected = resp.get("connected").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let connected = resp
+                        .get("connected")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     if connected {
                         config_status.set(Some("Connected!".to_string()));
                     } else {
@@ -187,9 +192,24 @@ pub fn HqPlayer() -> Element {
     let current_status = status.read().clone().flatten();
     let current_pipeline = pipeline.read().clone().flatten();
     let profiles_list = profiles.read().clone().flatten().unwrap_or_default();
-    let zones_list = zones.read().clone().flatten().map(|r| r.zones).unwrap_or_default();
-    let links_list = zone_links.read().clone().flatten().map(|r| r.links).unwrap_or_default();
-    let instances_list = instances.read().clone().flatten().map(|r| r.instances).unwrap_or_default();
+    let zones_list = zones
+        .read()
+        .clone()
+        .flatten()
+        .map(|r| r.zones)
+        .unwrap_or_default();
+    let links_list = zone_links
+        .read()
+        .clone()
+        .flatten()
+        .map(|r| r.links)
+        .unwrap_or_default();
+    let instances_list = instances
+        .read()
+        .clone()
+        .flatten()
+        .map(|r| r.instances)
+        .unwrap_or_default();
 
     rsx! {
         Layout {
@@ -445,7 +465,10 @@ fn ZoneLinkTable(
     }
 
     // Build a map of zone_id -> instance
-    let link_map: std::collections::HashMap<_, _> = links.iter().map(|l| (l.zone_id.clone(), l.instance.clone())).collect();
+    let link_map: std::collections::HashMap<_, _> = links
+        .iter()
+        .map(|l| (l.zone_id.clone(), l.instance.clone()))
+        .collect();
 
     let get_backend = |zone_id: &str| {
         if zone_id.starts_with("lms:") {

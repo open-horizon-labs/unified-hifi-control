@@ -13,10 +13,18 @@ pub enum SseEvent {
     // Roon events
     RoonConnected,
     RoonDisconnected,
-    ZoneUpdated { zone_id: String },
-    ZoneRemoved { zone_id: String },
-    NowPlayingChanged { zone_id: String },
-    VolumeChanged { zone_id: String },
+    ZoneUpdated {
+        zone_id: String,
+    },
+    ZoneRemoved {
+        zone_id: String,
+    },
+    NowPlayingChanged {
+        zone_id: String,
+    },
+    VolumeChanged {
+        zone_id: String,
+    },
 
     // HQPlayer events
     HqpConnected,
@@ -27,7 +35,9 @@ pub enum SseEvent {
     // LMS events
     LmsConnected,
     LmsDisconnected,
-    LmsPlayerStateChanged { player_id: String },
+    LmsPlayerStateChanged {
+        player_id: String,
+    },
 
     // OpenHome events
     OpenHomeDeviceFound,

@@ -23,7 +23,9 @@ pub fn Zones() -> Element {
 
     // Load zones resource
     let mut zones = use_resource(|| async {
-        crate::app::api::fetch_json::<ZonesResponse>("/zones").await.ok()
+        crate::app::api::fetch_json::<ZonesResponse>("/zones")
+            .await
+            .ok()
     });
 
     // Now playing state (populated after zones load)
@@ -36,7 +38,10 @@ pub fn Zones() -> Element {
             spawn(async move {
                 let mut np_map = HashMap::new();
                 for zone in &zone_list {
-                    let url = format!("/now_playing?zone_id={}", urlencoding::encode(&zone.zone_id));
+                    let url = format!(
+                        "/now_playing?zone_id={}",
+                        urlencoding::encode(&zone.zone_id)
+                    );
                     if let Ok(np) = crate::app::api::fetch_json::<NowPlaying>(&url).await {
                         np_map.insert(zone.zone_id.clone(), np);
                     }
@@ -64,7 +69,12 @@ pub fn Zones() -> Element {
     };
 
     let is_loading = zones.read().is_none();
-    let zones_list = zones.read().clone().flatten().map(|r| r.zones).unwrap_or_default();
+    let zones_list = zones
+        .read()
+        .clone()
+        .flatten()
+        .map(|r| r.zones)
+        .unwrap_or_default();
     let np_map = now_playing();
 
     let content = if is_loading {
@@ -122,14 +132,24 @@ fn ZoneCard(
     let is_playing = np.map(|n| n.is_playing).unwrap_or(false);
     let play_icon = if is_playing { "⏸︎" } else { "▶" };
 
-    let has_hqp = zone.dsp.as_ref().map(|d| d.r#type.as_deref() == Some("hqplayer")).unwrap_or(false);
+    let has_hqp = zone
+        .dsp
+        .as_ref()
+        .map(|d| d.r#type.as_deref() == Some("hqplayer"))
+        .unwrap_or(false);
 
     // Format volume display
     let volume_display = np
-        .and_then(|n| n.volume.map(|v| {
-            let suffix = if n.volume_type.as_deref() == Some("db") { " dB" } else { "" };
-            format!("{}{}", v.round() as i32, suffix)
-        }))
+        .and_then(|n| {
+            n.volume.map(|v| {
+                let suffix = if n.volume_type.as_deref() == Some("db") {
+                    " dB"
+                } else {
+                    ""
+                };
+                format!("{}{}", v.round() as i32, suffix)
+            })
+        })
         .unwrap_or_else(|| "—".to_string());
 
     // Now playing display

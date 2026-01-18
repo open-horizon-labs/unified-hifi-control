@@ -33,17 +33,20 @@ pub fn Knobs() -> Element {
 
     // Load knobs resource
     let mut knobs = use_resource(|| async {
-        api::fetch_json::<KnobDevicesResponse>("/knob/devices").await.ok()
+        api::fetch_json::<KnobDevicesResponse>("/knob/devices")
+            .await
+            .ok()
     });
 
     // Load zones resource
-    let mut zones = use_resource(|| async {
-        api::fetch_json::<ZonesResponse>("/zones").await.ok()
-    });
+    let mut zones =
+        use_resource(|| async { api::fetch_json::<ZonesResponse>("/zones").await.ok() });
 
     // Load firmware version resource
     let mut firmware_version = use_resource(|| async {
-        api::fetch_json::<FirmwareVersion>("/firmware/version").await.ok()
+        api::fetch_json::<FirmwareVersion>("/firmware/version")
+            .await
+            .ok()
     });
 
     // Refresh on SSE events
@@ -139,8 +142,18 @@ pub fn Knobs() -> Element {
     };
 
     let is_loading = knobs.read().is_none();
-    let knobs_list = knobs.read().clone().flatten().map(|r| r.knobs).unwrap_or_default();
-    let zones_list = zones.read().clone().flatten().map(|r| r.zones).unwrap_or_default();
+    let knobs_list = knobs
+        .read()
+        .clone()
+        .flatten()
+        .map(|r| r.knobs)
+        .unwrap_or_default();
+    let zones_list = zones
+        .read()
+        .clone()
+        .flatten()
+        .map(|r| r.zones)
+        .unwrap_or_default();
     let fw_version = firmware_version.read().clone().flatten().map(|r| r.version);
 
     rsx! {

@@ -33,7 +33,9 @@ pub fn Settings() -> Element {
 
     // Load settings resource
     let settings = use_resource(|| async {
-        crate::app::api::fetch_json::<AppSettings>("/api/settings").await.ok()
+        crate::app::api::fetch_json::<AppSettings>("/api/settings")
+            .await
+            .ok()
     });
 
     // Sync settings to signals when loaded
@@ -48,13 +50,19 @@ pub fn Settings() -> Element {
 
     // Discovery status resources
     let mut roon_status = use_resource(|| async {
-        crate::app::api::fetch_json::<RoonStatus>("/roon/status").await.ok()
+        crate::app::api::fetch_json::<RoonStatus>("/roon/status")
+            .await
+            .ok()
     });
     let mut openhome_status = use_resource(|| async {
-        crate::app::api::fetch_json::<OpenHomeStatus>("/openhome/status").await.ok()
+        crate::app::api::fetch_json::<OpenHomeStatus>("/openhome/status")
+            .await
+            .ok()
     });
     let mut upnp_status = use_resource(|| async {
-        crate::app::api::fetch_json::<UpnpStatus>("/upnp/status").await.ok()
+        crate::app::api::fetch_json::<UpnpStatus>("/upnp/status")
+            .await
+            .ok()
     });
 
     // Refresh discovery on SSE events

@@ -15,16 +15,24 @@ pub fn Dashboard() -> Element {
 
     // Use resources for async data fetching (handles SSR/client properly)
     let status = use_resource(|| async {
-        crate::app::api::fetch_json::<AppStatus>("/status").await.ok()
+        crate::app::api::fetch_json::<AppStatus>("/status")
+            .await
+            .ok()
     });
     let mut roon = use_resource(|| async {
-        crate::app::api::fetch_json::<RoonStatus>("/roon/status").await.ok()
+        crate::app::api::fetch_json::<RoonStatus>("/roon/status")
+            .await
+            .ok()
     });
     let mut hqp = use_resource(|| async {
-        crate::app::api::fetch_json::<HqpStatus>("/hqp/status").await.ok()
+        crate::app::api::fetch_json::<HqpStatus>("/hqp/status")
+            .await
+            .ok()
     });
     let mut lms = use_resource(|| async {
-        crate::app::api::fetch_json::<LmsStatus>("/lms/status").await.ok()
+        crate::app::api::fetch_json::<LmsStatus>("/lms/status")
+            .await
+            .ok()
     });
 
     // Refresh on SSE events

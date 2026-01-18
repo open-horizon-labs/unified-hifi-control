@@ -17,70 +17,83 @@ pub struct NavProps {
     pub hide_knobs: bool,
 }
 
-/// Navigation bar component using Pico CSS nav pattern.
+/// Navigation bar component using Pico CSS nav pattern with mobile responsiveness.
 #[component]
 pub fn Nav(props: NavProps) -> Element {
+    let mut menu_open = use_signal(|| false);
+
     rsx! {
-        nav {
-            ul {
+        nav { class: "responsive-nav",
+            // Brand + hamburger row
+            ul { class: "nav-brand",
                 li {
                     strong { "Hi-Fi Control" }
                 }
+                li { class: "nav-toggle",
+                    button {
+                        "aria-label": "Toggle navigation",
+                        "aria-expanded": "{menu_open}",
+                        onclick: move |_| menu_open.toggle(),
+                        "☰"
+                    }
+                }
             }
+            // Navigation links
             ul {
+                class: if menu_open() { "nav-links show" } else { "nav-links" },
                 li {
                     if props.active == "dashboard" {
-                        a { href: "/", "aria-current": "page", strong { "Dashboard" } }
+                        a { href: "/", "aria-current": "page", onclick: move |_| menu_open.set(false), strong { "Dashboard" } }
                     } else {
-                        a { href: "/", "Dashboard" }
+                        a { href: "/", onclick: move |_| menu_open.set(false), "Dashboard" }
                     }
                 }
                 li {
                     if props.active == "zones" {
-                        a { href: "/ui/zones", "aria-current": "page", strong { "Zones" } }
+                        a { href: "/ui/zones", "aria-current": "page", onclick: move |_| menu_open.set(false), strong { "Zones" } }
                     } else {
-                        a { href: "/ui/zones", "Zones" }
+                        a { href: "/ui/zones", onclick: move |_| menu_open.set(false), "Zones" }
                     }
                 }
                 li {
                     if props.active == "zone" {
-                        a { href: "/zone", "aria-current": "page", strong { "Zone" } }
+                        a { href: "/zone", "aria-current": "page", onclick: move |_| menu_open.set(false), strong { "Zone" } }
                     } else {
-                        a { href: "/zone", "Zone" }
+                        a { href: "/zone", onclick: move |_| menu_open.set(false), "Zone" }
                     }
                 }
                 if !props.hide_hqp {
                     li {
                         if props.active == "hqplayer" {
-                            a { href: "/hqplayer", "aria-current": "page", strong { "HQPlayer" } }
+                            a { href: "/hqplayer", "aria-current": "page", onclick: move |_| menu_open.set(false), strong { "HQPlayer" } }
                         } else {
-                            a { href: "/hqplayer", "HQPlayer" }
+                            a { href: "/hqplayer", onclick: move |_| menu_open.set(false), "HQPlayer" }
                         }
                     }
                 }
                 if !props.hide_lms {
                     li {
                         if props.active == "lms" {
-                            a { href: "/lms", "aria-current": "page", strong { "LMS" } }
+                            a { href: "/lms", "aria-current": "page", onclick: move |_| menu_open.set(false), strong { "LMS" } }
                         } else {
-                            a { href: "/lms", "LMS" }
+                            a { href: "/lms", onclick: move |_| menu_open.set(false), "LMS" }
                         }
                     }
                 }
                 if !props.hide_knobs {
                     li {
                         if props.active == "knobs" {
-                            a { href: "/knobs", "aria-current": "page", strong { "Knobs" } }
+                            a { href: "/knobs", "aria-current": "page", onclick: move |_| menu_open.set(false), strong { "Knobs" } }
                         } else {
-                            a { href: "/knobs", "Knobs" }
+                            a { href: "/knobs", onclick: move |_| menu_open.set(false), "Knobs" }
                         }
                     }
                 }
                 li {
                     if props.active == "settings" {
-                        a { href: "/settings", "aria-current": "page", strong { "Settings" } }
+                        a { href: "/settings", "aria-current": "page", onclick: move |_| menu_open.set(false), strong { "Settings" } }
                     } else {
-                        a { href: "/settings", "Settings" }
+                        a { href: "/settings", onclick: move |_| menu_open.set(false), "Settings" }
                     }
                 }
             }
