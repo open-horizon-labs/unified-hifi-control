@@ -425,7 +425,7 @@ jobs:
           dsm: '7.0'
           arch: ${{ matrix.arch }}
           projects: ./build/synology
-          output: /workspace/dist/installers
+          output: ./dist/installers
 
       - name: Upload Synology package
         uses: actions/upload-artifact@v4
@@ -510,9 +510,48 @@ jobs:
   build-docker:
     name: Build and Push Docker
     runs-on: ubuntu-latest
-    needs: [build-web-assets]
+    needs: [build-linux, build-web-assets]
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            binary: unified-hifi-linux-x64
+          - platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            binary: unified-hifi-linux-arm64
+          - platform: linux/arm/v7
+            target: armv7-unknown-linux-musleabihf
+            binary: unified-hifi-linux-armv7
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/
+
+      - name: Download web assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: dist/public/
+
+      - name: Prepare binary
+        run: |
+          mv dist/${{ matrix.binary }} dist/unified-hifi-control
+          chmod +x dist/unified-hifi-control
+          ls -la dist/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Get version
         id: version
@@ -524,8 +563,39 @@ jobs:
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=muness/unified-hifi-control,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-${{ matrix.target }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  docker-manifest:
+    name: Create Docker Manifest
+    runs-on: ubuntu-latest
+    needs: [build-docker]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docker-digest-*
+          path: /tmp/digests
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -549,18 +619,21 @@ jobs:
             type=semver,pattern={{major}}
             type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            APP_VERSION=${{ steps.version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'muness/unified-hifi-control@sha256:%s ' *)
+
+      - name: Create manifest for legacy image name
+        working-directory: /tmp/digests
+        run: |
+          # Also tag muness/roon-extension-knob for backwards compatibility
+          TAGS=$(jq -cr '.tags | map(select(contains("roon-extension-knob"))) | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          if [ -n "$TAGS" ]; then
+            docker buildx imagetools create $TAGS \
+              $(printf 'muness/unified-hifi-control@sha256:%s ' *)
+          fi
 
   upload-release:
     name: Upload to Release
