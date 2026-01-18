@@ -65,12 +65,13 @@ mod server {
 
     pub async fn run() -> Result<()> {
         // Initialize logging
+        // Priority: RUST_LOG > LOG_LEVEL (legacy) > default
+        let log_filter = std::env::var("RUST_LOG")
+            .or_else(|_| std::env::var("LOG_LEVEL"))
+            .unwrap_or_else(|_| "unified_hifi_control=debug,tower_http=debug,roon_api=info".into());
+
         tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                    "unified_hifi_control=debug,tower_http=debug,roon_api=info".into()
-                }),
-            )
+            .with(tracing_subscriber::EnvFilter::new(&log_filter))
             .with(tracing_subscriber::fmt::layer())
             .init();
 

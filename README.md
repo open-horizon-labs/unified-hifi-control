@@ -62,6 +62,8 @@ services:
       - ./data:/data
     environment:
       - CONFIG_DIR=/data
+      # - UHC_PORT=8088       # Bridge port (default: 8088)
+      # - RUST_LOG=info       # Log level: trace, debug, info, warn, error
     restart: unless-stopped
 ```
 
@@ -69,6 +71,18 @@ services:
 docker compose up -d
 # Access http://localhost:8088
 ```
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `UHC_PORT` | Bridge HTTP port | `8088` |
+| `CONFIG_DIR` | Directory for config/state files | `/data` |
+| `RUST_LOG` | Log filter (e.g., `info`, `debug`, `unified_hifi_control=debug`) | `debug` |
+| `LMS_HOST` | Auto-configure LMS backend (used by LMS plugin) | — |
+| `LMS_PORT` | LMS server port | `9000` |
+
+Legacy aliases: `PORT` (→ `UHC_PORT`), `LOG_LEVEL` (→ `RUST_LOG`)
 
 **Note:** Port 8088 is also HQPlayer's default. If running both on the same host, change one.
 

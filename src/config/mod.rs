@@ -159,6 +159,19 @@ pub fn load_config() -> Result<Config> {
                 .try_parsing(true),
         );
 
+    // Support PORT env vars with explicit precedence: UHC_PORT > PORT > config > default
+    // Handle manually to ensure consistent behavior across all environments
+    if let Ok(port) = std::env::var("UHC_PORT") {
+        if let Ok(port_num) = port.parse::<u16>() {
+            builder = builder.set_override("port", port_num as i64)?;
+        }
+    } else if let Ok(port) = std::env::var("PORT") {
+        // Legacy PORT fallback (used by LMS plugin Helper.pm, Docker, etc.)
+        if let Ok(port_num) = port.parse::<u16>() {
+            builder = builder.set_override("port", port_num as i64)?;
+        }
+    }
+
     // Support legacy LMS_HOST/LMS_PORT env vars (used by LMS plugin Helper.pm)
     if let Ok(host) = std::env::var("LMS_HOST") {
         builder = builder.set_override("lms.host", host)?;
@@ -290,6 +303,75 @@ mod tests {
         assert!(!is_lms_plugin_started());
         env::remove_var("LMS_UNIFIEDHIFI_STARTED");
         assert!(!is_lms_plugin_started());
+    }
+
+    #[test]
+    #[serial]
+    fn test_port_env_fallback() {
+        // Issue #75: PORT env var should work as fallback when UHC_PORT is not set
+        // Clean slate - remove any existing port env vars
+        env::remove_var("UHC_PORT");
+        env::remove_var("PORT");
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
+
+        // Set only PORT (legacy)
+        env::set_var("PORT", "3000");
+
+        let config = load_config().expect("config should load");
+
+        // Clean up
+        env::remove_var("PORT");
+        env::remove_var("UHC_CONFIG_DIR");
+
+        assert_eq!(config.port, 3000, "PORT env var should set config.port");
+    }
+
+    #[test]
+    #[serial]
+    fn test_uhc_port_takes_precedence_over_port() {
+        // Issue #75: UHC_PORT should take precedence over legacy PORT
+        env::remove_var("UHC_PORT");
+        env::remove_var("PORT");
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
+
+        // Set both - UHC_PORT should win
+        env::set_var("UHC_PORT", "5000");
+        env::set_var("PORT", "3000");
+
+        let config = load_config().expect("config should load");
+
+        // Clean up
+        env::remove_var("UHC_PORT");
+        env::remove_var("PORT");
+        env::remove_var("UHC_CONFIG_DIR");
+
+        assert_eq!(
+            config.port, 5000,
+            "UHC_PORT should take precedence over PORT"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_invalid_port_uses_default() {
+        // Invalid PORT value should fall back to default (8088)
+        env::remove_var("UHC_PORT");
+        env::remove_var("PORT");
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
+
+        // Set invalid PORT
+        env::set_var("PORT", "not-a-number");
+
+        let config = load_config().expect("config should load");
+
+        // Clean up
+        env::remove_var("PORT");
+        env::remove_var("UHC_CONFIG_DIR");
+
+        assert_eq!(
+            config.port, 8088,
+            "Invalid PORT should fall back to default"
+        );
     }
 }
 
