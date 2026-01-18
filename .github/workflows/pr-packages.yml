@@ -136,10 +136,14 @@ jobs:
 
       - name: Install cargo-zigbuild
         if: steps.cache-zigbuild.outputs.cache-hit != 'true'
-        run: cargo install cargo-zigbuild --locked
+        run: |
+          source "$HOME/.cargo/env"
+          cargo install cargo-zigbuild --locked
 
       - name: Build with zigbuild
-        run: cargo zigbuild --release --target x86_64-unknown-linux-musl
+        run: |
+          source "$HOME/.cargo/env"
+          cargo zigbuild --release --target x86_64-unknown-linux-musl
 
       - name: Rename binary
         run: |

@@ -112,10 +112,14 @@ jobs:
 
       - name: Install cargo-zigbuild
         if: steps.cache-zigbuild.outputs.cache-hit != 'true'
-        run: cargo install cargo-zigbuild --locked
+        run: |
+          source "$HOME/.cargo/env"
+          cargo install cargo-zigbuild --locked
 
       - name: Build with zigbuild
-        run: cargo zigbuild --release --target ${{ matrix.target }}
+        run: |
+          source "$HOME/.cargo/env"
+          cargo zigbuild --release --target ${{ matrix.target }}
 
       - name: Smoke test armv7 binary
         if: matrix.target == 'armv7-unknown-linux-musleabihf'
