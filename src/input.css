@@ -3,46 +3,31 @@
 /* Source scanning for Dioxus .rs files */
 @source "../src/**/*.rs";
 
-/* Custom theme for Hi-Fi Control */
-@theme {
-  /* Primary colors - dark theme optimized for hi-fi aesthetic */
-  --color-primary: #6366f1;
-  --color-primary-hover: #818cf8;
-  --color-primary-active: #4f46e5;
+/*
+ * Theme: Uses dioxus-primitives CSS variables from dx-components-theme.css
+ * --primary-color-* : background shades (dark theme: darker = lower number)
+ * --secondary-color-* : text/foreground shades (dark theme: lighter = lower number)
+ */
 
-  /* Status colors */
-  --color-success: #22c55e;
-  --color-danger: #ef4444;
-  --color-warning: #f59e0b;
-  --color-muted: #9ca3af;
-
-  /* Dark theme base */
-  --color-bg-dark: #111827;
-  --color-bg-card: #1f2937;
-  --color-bg-elevated: #374151;
-  --color-text-primary: #f9fafb;
-  --color-text-secondary: #d1d5db;
-  --color-border: #374151;
-}
-
-/* Base styles */
+/* Base styles - integrate with dioxus-primitives theme */
 @layer base {
   body {
-    @apply bg-gray-900 text-gray-100 antialiased;
+    @apply antialiased;
+    /* Let dx-components-theme.css handle body bg/color via CSS vars */
   }
 }
 
 /* Custom utility classes for the app */
 @layer components {
-  /* Status indicators */
+  /* Status indicators - using standard Tailwind colors */
   .status-ok {
-    @apply text-success;
+    @apply text-green-500;
   }
   .status-err {
-    @apply text-danger;
+    @apply text-red-500;
   }
   .status-disabled {
-    @apply text-muted;
+    @apply text-gray-500;
   }
 
   /* Zone grid layout */

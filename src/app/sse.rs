@@ -6,7 +6,23 @@
 use dioxus::prelude::*;
 use serde::Deserialize;
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
+/// Payload for zone-related events
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ZonePayload {
+    pub zone_id: String,
+}
+
+/// Payload for LMS player events
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct LmsPlayerPayload {
+    pub player_id: String,
+}
+
 /// SSE event types from the server
+/// Server sends: {"type":"EventName","payload":{...}}
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "type")]
 pub enum SseEvent {
@@ -14,16 +30,19 @@ pub enum SseEvent {
     RoonConnected,
     RoonDisconnected,
     ZoneUpdated {
-        zone_id: String,
+        payload: ZonePayload,
     },
     ZoneRemoved {
-        zone_id: String,
+        payload: ZonePayload,
     },
     NowPlayingChanged {
-        zone_id: String,
+        payload: ZonePayload,
     },
     VolumeChanged {
-        zone_id: String,
+        payload: ZonePayload,
+    },
+    SeekPositionChanged {
+        payload: ZonePayload,
     },
 
     // HQPlayer events
@@ -36,7 +55,7 @@ pub enum SseEvent {
     LmsConnected,
     LmsDisconnected,
     LmsPlayerStateChanged {
-        player_id: String,
+        payload: LmsPlayerPayload,
     },
 
     // OpenHome events
@@ -64,7 +83,7 @@ pub struct SseContext {
 }
 
 impl SseContext {
-    /// Check if we should refresh based on event types
+    /// Check if we should refresh zones/now_playing based on event types
     pub fn should_refresh_zones(&self) -> bool {
         matches!(
             self.last_event.read().as_ref(),
@@ -76,6 +95,7 @@ impl SseContext {
                 | Some(SseEvent::RoonDisconnected)
                 | Some(SseEvent::LmsConnected)
                 | Some(SseEvent::LmsDisconnected)
+                | Some(SseEvent::LmsPlayerStateChanged { .. })
         )
     }
 
@@ -133,8 +153,7 @@ impl SseContext {
 /// Initialize SSE context provider - call once at app root
 pub fn use_sse_provider() {
     let last_event = use_signal(|| None::<SseEvent>);
-    #[allow(unused_mut)] // mut needed for WASM build, not server
-    let mut connected = use_signal(|| false);
+    let connected = use_signal(|| false);
     let event_count = use_signal(|| 0u64);
 
     let ctx = SseContext {
@@ -145,13 +164,71 @@ pub fn use_sse_provider() {
 
     use_context_provider(|| ctx);
 
-    // Client-side only: use polling for updates
-    // Note: True SSE with wasm-bindgen closures requires special handling
-    // For now, we rely on use_resource polling in components
+    // Client-side only: establish actual EventSource connection
     #[cfg(target_arch = "wasm32")]
     {
-        // Mark as connected immediately on client (SSR context will be false)
-        connected.set(true);
+        use_effect(move || {
+            use web_sys::EventSource;
+
+            // Create EventSource connection to /events
+            let es = match EventSource::new("/events") {
+                Ok(es) => es,
+                Err(e) => {
+                    web_sys::console::error_1(
+                        &format!("Failed to create EventSource: {:?}", e).into(),
+                    );
+                    return;
+                }
+            };
+
+            web_sys::console::log_1(&"SSE: Creating EventSource connection to /events".into());
+
+            // onopen handler
+            let mut connected_clone = connected;
+            let onopen = Closure::wrap(Box::new(move |_: web_sys::Event| {
+                web_sys::console::log_1(&"SSE: Connection opened".into());
+                connected_clone.set(true);
+            }) as Box<dyn FnMut(_)>);
+            es.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+            onopen.forget(); // Leak closure to keep it alive
+
+            // onmessage handler
+            let mut last_event_clone = last_event;
+            let mut event_count_clone = event_count;
+            let onmessage = Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
+                if let Some(data) = e.data().as_string() {
+                    web_sys::console::log_1(
+                        &format!("SSE: Received: {}", &data[..data.len().min(100)]).into(),
+                    );
+                    // Parse the SSE event
+                    match serde_json::from_str::<SseEvent>(&data) {
+                        Ok(event) => {
+                            web_sys::console::log_1(
+                                &format!("SSE: Parsed event: {:?}", event).into(),
+                            );
+                            last_event_clone.set(Some(event));
+                            event_count_clone.set(event_count_clone() + 1);
+                        }
+                        Err(e) => {
+                            web_sys::console::warn_1(&format!("SSE: Parse error: {}", e).into());
+                        }
+                    }
+                }
+            }) as Box<dyn FnMut(_)>);
+            es.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+            onmessage.forget(); // Leak closure to keep it alive
+
+            // onerror handler
+            let mut connected_err = connected;
+            let onerror = Closure::wrap(Box::new(move |_: web_sys::Event| {
+                web_sys::console::warn_1(&"SSE: Connection error".into());
+                connected_err.set(false);
+            }) as Box<dyn FnMut(_)>);
+            es.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+            onerror.forget(); // Leak closure to keep it alive
+
+            // Note: EventSource will auto-reconnect on errors
+        });
     }
 }
 

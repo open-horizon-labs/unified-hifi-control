@@ -7,6 +7,8 @@
     'Noto Color Emoji';
     --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New',
     monospace;
+    --color-red-500: oklch(63.7% 0.237 25.331);
+    --color-green-500: oklch(72.3% 0.219 149.579);
     --color-indigo-300: oklch(78.5% 0.115 274.713);
     --color-indigo-400: oklch(67.3% 0.182 276.935);
     --color-indigo-500: oklch(58.5% 0.233 277.117);
@@ -44,9 +46,6 @@
     --default-transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
     --default-font-family: var(--font-sans);
     --default-mono-font-family: var(--font-mono);
-    --color-success: #22c55e;
-    --color-danger: #ef4444;
-    --color-muted: #9ca3af;
   }
 }
 @layer base {
@@ -509,9 +508,6 @@
   .text-indigo-400 {
     color: var(--color-indigo-400);
   }
-  .text-muted {
-    color: var(--color-muted);
-  }
   .text-white {
     color: var(--color-white);
   }
@@ -579,21 +575,19 @@
 }
 @layer base {
   body {
-    background-color: var(--color-gray-900);
-    color: var(--color-gray-100);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
 }
 @layer components {
   .status-ok {
-    color: var(--color-success);
+    color: var(--color-green-500);
   }
   .status-err {
-    color: var(--color-danger);
+    color: var(--color-red-500);
   }
   .status-disabled {
-    color: var(--color-muted);
+    color: var(--color-gray-500);
   }
   .zone-grid {
     display: grid;

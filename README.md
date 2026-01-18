@@ -247,9 +247,16 @@ dx build --release --platform web
 ### Run
 
 ```bash
-# Run from dx output directory (contains required wasm assets)
-./target/dx/unified-hifi-control/release/web/unified-hifi-control
+# Recommended: Use dx serve for development (builds + runs + hot reload)
+PORT=8088 dx serve --release --platform web --features web --port 8088
 
+# Access at http://127.0.0.1:8088
+```
+
+For production deployment, run the binary directly from the dx output directory:
+
+```bash
+./target/dx/unified-hifi-control/release/web/unified-hifi-control
 # Access at http://127.0.0.1:8088
 ```
 
