@@ -8,16 +8,23 @@ The release workflow builds for 6 targets across 3 platforms, plus web assets, D
 
 ## Caching Strategies
 
-### 1. sccache for Native Builds
+### 1. sccache + rust-cache for Native Builds
 
 **Used by:** Web Assets (WASM), macOS, Windows
 
-**Why:** [sccache](https://github.com/mozilla/sccache) caches individual compilation units, not just dependencies. This means incremental changes compile much faster than with directory-based caching.
+**Why both?** They cache different things:
+- **sccache**: Caches individual compilation units (`.o` files)
+- **rust-cache**: Caches `target/` directory including proc-macro `.dylib` files
+
+Proc-macros (serde_derive, dioxus, thiserror, etc.) can't be cached by sccache due to "crate-type" limitations - they must be recompiled. But rust-cache preserves the compiled proc-macro binaries between runs.
 
 **How:**
 ```yaml
 - name: Setup sccache
   uses: mozilla-actions/sccache-action@v0.0.9
+
+- name: Cache Rust
+  uses: Swatinem/rust-cache@v2
 
 - name: Build
   env:
@@ -25,8 +32,6 @@ The release workflow builds for 6 targets across 3 platforms, plus web assets, D
     RUSTC_WRAPPER: "sccache"
   run: cargo build --release
 ```
-
-**Why not rust-cache?** rust-cache caches the `target/` directory but cleans up "anything that is not a dependency" on save. This removes WASM build artifacts that take significant time to regenerate.
 
 ### 2. rust-cache for Cross Builds
 
@@ -116,10 +121,10 @@ The LMS plugin downloads this tarball at runtime since it can't bundle large bin
 
 | Target | Caching | Base Image |
 |--------|---------|------------|
-| Web Assets (WASM) | sccache | N/A |
-| macOS x86_64 | sccache | N/A |
-| macOS aarch64 | sccache | N/A |
-| Windows x86_64 | sccache | N/A |
+| Web Assets (WASM) | sccache + rust-cache | N/A |
+| macOS x86_64 | sccache + rust-cache | N/A |
+| macOS aarch64 | sccache + rust-cache | N/A |
+| Windows x86_64 | sccache + rust-cache | N/A |
 | Linux x86_64-musl | rust-cache | GHCR |
 | Linux aarch64-musl | rust-cache | GHCR |
 | Linux armv7-musl | rust-cache | GHCR |
@@ -127,7 +132,7 @@ The LMS plugin downloads this tarball at runtime since it can't bundle large bin
 
 ## Lessons Learned
 
-1. **sccache vs rust-cache:** Use sccache for native builds, rust-cache for containerized builds (cross).
+1. **sccache + rust-cache:** Use both for native builds. sccache caches compilation units, rust-cache caches proc-macro dylibs. For containerized builds (cross), use rust-cache only since sccache can't run inside the container.
 
 2. **CARGO_HOME placement:** For cross builds, set `CARGO_HOME` inside the workspace so the container can mount it:
    ```yaml
