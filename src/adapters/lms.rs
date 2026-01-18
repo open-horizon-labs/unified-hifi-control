@@ -1,7 +1,16 @@
 //! LMS (Logitech Media Server) JSON-RPC Client
 //!
-//! Implements the JSON-RPC protocol over HTTP.
+//! Implements the JSON-RPC protocol over HTTP and CLI event subscription over TCP.
 //! Documentation: http://HOST:9000/html/docs/cli-api.html
+//!
+//! ## Event-Driven Updates
+//!
+//! This adapter supports real-time event notifications via the LMS CLI telnet protocol.
+//! When enabled, the adapter maintains a persistent TCP connection to LMS port 9090 and
+//! subscribes to `playlist,mixer,power,client` events. This dramatically reduces CPU usage
+//! compared to polling, especially with many players (22+).
+//!
+//! The polling fallback runs at reduced frequency (30s vs 2s) when subscription is active.
 
 use anyhow::{anyhow, Result};
 use reqwest::Client;
@@ -11,10 +20,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::bus::{BusEvent, PlaybackState, SharedBus, VolumeControl, Zone};
 use crate::config::get_config_dir;
@@ -39,7 +50,124 @@ fn config_path() -> PathBuf {
 }
 
 const DEFAULT_PORT: u16 = 9000;
+/// CLI telnet port for event subscription
+const CLI_PORT: u16 = 9090;
+/// Fast polling interval (when no subscription active)
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Slow polling interval (when subscription is active, serves as fallback)
+const POLL_INTERVAL_WITH_SUBSCRIPTION: Duration = Duration::from_secs(30);
+/// Reconnection delay for CLI subscription
+const CLI_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// Maximum reconnection delay (exponential backoff cap)
+const CLI_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+
+// =============================================================================
+// CLI Event Parsing
+// =============================================================================
+
+/// Parsed CLI event from LMS
+#[derive(Debug, Clone, PartialEq)]
+pub enum CliEvent {
+    /// Playlist changed (newsong, play, stop, pause, etc.)
+    Playlist {
+        player_id: String,
+        command: String,
+        /// Track name for newsong events
+        track_name: Option<String>,
+        /// Playlist index for newsong events
+        index: Option<u32>,
+    },
+    /// Mixer changed (volume)
+    Mixer {
+        player_id: String,
+        param: String,
+        value: i32,
+    },
+    /// Power state changed
+    Power { player_id: String, state: bool },
+    /// Client connected/disconnected/new
+    Client { player_id: String, action: String },
+    /// Unknown/unparsed event (logged but not acted upon)
+    Unknown { raw_line: String },
+}
+
+/// Parse a raw CLI event line from LMS
+///
+/// LMS CLI events are URL-encoded, space-separated lines:
+/// `<playerid> <command> <args...>`
+///
+/// Example events:
+/// - `00%3A04%3A20%3Axx%3Ayy%3Azz playlist newsong Track%20Name 5`
+/// - `00%3A04%3A20%3Axx%3Ayy%3Azz mixer volume 75`
+/// - `00%3A04%3A20%3Axx%3Ayy%3Azz power 1`
+/// - `00%3A04%3A20%3Axx%3Ayy%3Azz client new`
+pub fn parse_cli_event(line: &str) -> CliEvent {
+    let line = line.trim();
+    if line.is_empty() {
+        return CliEvent::Unknown {
+            raw_line: line.to_string(),
+        };
+    }
+
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return CliEvent::Unknown {
+            raw_line: line.to_string(),
+        };
+    }
+
+    // Decode player ID (URL-encoded MAC address)
+    let player_id = urlencoding::decode(parts[0])
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| parts[0].to_string());
+
+    let command = parts[1];
+
+    match command {
+        "playlist" => {
+            let subcommand = parts.get(2).copied().unwrap_or("");
+            let track_name = parts.get(3).and_then(|s| {
+                urlencoding::decode(s)
+                    .ok()
+                    .map(|decoded| decoded.into_owned())
+            });
+            let index = parts.get(4).and_then(|s| s.parse().ok());
+
+            CliEvent::Playlist {
+                player_id,
+                command: subcommand.to_string(),
+                track_name,
+                index,
+            }
+        }
+        "mixer" => {
+            let param = parts.get(2).copied().unwrap_or("volume");
+            let value = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+            CliEvent::Mixer {
+                player_id,
+                param: param.to_string(),
+                value,
+            }
+        }
+        "power" => {
+            let state = parts.get(2).is_some_and(|s| *s == "1");
+
+            CliEvent::Power { player_id, state }
+        }
+        "client" => {
+            let action = parts.get(2).copied().unwrap_or("unknown");
+
+            CliEvent::Client {
+                player_id,
+                action: action.to_string(),
+            }
+        }
+        _ => CliEvent::Unknown {
+            raw_line: line.to_string(),
+        },
+    }
+}
 
 /// Shared JSON-RPC client operations for LMS
 /// Extracted to avoid code duplication between LmsAdapter and the polling task
@@ -325,6 +453,8 @@ struct LmsState {
     connected: bool,
     running: bool,
     players: HashMap<String, LmsPlayer>,
+    /// Whether CLI subscription is active (for reduced polling frequency)
+    cli_subscription_active: bool,
 }
 
 impl Default for LmsState {
@@ -337,6 +467,7 @@ impl Default for LmsState {
             connected: false,
             running: false,
             players: HashMap::new(),
+            cli_subscription_active: false,
         }
     }
 }
@@ -512,7 +643,7 @@ impl LmsAdapter {
             state.host.clone().unwrap_or_default()
         };
 
-        tracing::info!("LMS client connected to {}", host);
+        info!("LMS client connected to {}", host);
         self.bus
             .publish(BusEvent::LmsConnected { host: host.clone() });
 
@@ -523,21 +654,51 @@ impl LmsAdapter {
             token.clone()
         };
 
-        // Spawn polling task using shared RPC
+        // Spawn CLI subscription task for real-time events
+        let cli_state = self.state.clone();
+        let cli_bus = self.bus.clone();
+        let cli_rpc = self.rpc.clone();
+        let cli_shutdown = shutdown.clone();
+        let cli_host = host.clone();
+
+        tokio::spawn(async move {
+            run_cli_subscription(cli_host, cli_state, cli_bus, cli_rpc, cli_shutdown).await;
+        });
+
+        // Spawn polling task using shared RPC (adaptive interval based on subscription status)
         let state = self.state.clone();
         let bus = self.bus.clone();
         let rpc = self.rpc.clone();
 
         tokio::spawn(async move {
-            let mut poll_interval = interval(POLL_INTERVAL);
+            // Start with fast polling; will switch to slow when subscription is active
+            let mut current_interval = POLL_INTERVAL;
+            let mut poll_timer = interval(current_interval);
 
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => {
-                        tracing::info!("LMS polling shutting down");
+                        info!("LMS polling shutting down");
                         break;
                     }
-                    _ = poll_interval.tick() => {
+                    _ = poll_timer.tick() => {
+                        // Check if we need to adjust polling interval
+                        let subscription_active = state.read().await.cli_subscription_active;
+                        let target_interval = if subscription_active {
+                            POLL_INTERVAL_WITH_SUBSCRIPTION
+                        } else {
+                            POLL_INTERVAL
+                        };
+
+                        if target_interval != current_interval {
+                            debug!(
+                                "Adjusting poll interval: {:?} -> {:?} (subscription_active={})",
+                                current_interval, target_interval, subscription_active
+                            );
+                            current_interval = target_interval;
+                            poll_timer = interval(current_interval);
+                        }
+
                         if let Err(e) = update_players_internal(&rpc, &state, &bus).await {
                             tracing::error!("Failed to update LMS players: {}", e);
                         }
@@ -545,7 +706,7 @@ impl LmsAdapter {
                 }
             }
 
-            tracing::info!("LMS polling stopped");
+            info!("LMS polling stopped");
         });
 
         Ok(())
@@ -812,5 +973,527 @@ async fn update_players_internal(
     Ok(())
 }
 
+// =============================================================================
+// CLI Subscription (Event-Driven Updates)
+// =============================================================================
+
+/// Run the CLI subscription loop with automatic reconnection
+///
+/// Connects to LMS CLI port (9090), subscribes to events, and processes them.
+/// Automatically reconnects on disconnection with exponential backoff.
+async fn run_cli_subscription(
+    host: String,
+    state: Arc<RwLock<LmsState>>,
+    bus: SharedBus,
+    rpc: LmsRpc,
+    shutdown: CancellationToken,
+) {
+    let mut retry_delay = CLI_RECONNECT_DELAY;
+
+    loop {
+        // Check for shutdown before attempting connection
+        if shutdown.is_cancelled() {
+            info!("CLI subscription shutting down before connection attempt");
+            break;
+        }
+
+        info!("Connecting to LMS CLI at {}:{}", host, CLI_PORT);
+
+        match connect_and_subscribe(&host, &state, &bus, &rpc, &shutdown).await {
+            Ok(()) => {
+                // Clean disconnection (shutdown requested)
+                info!("CLI subscription ended cleanly");
+                break;
+            }
+            Err(e) => {
+                warn!(
+                    "CLI subscription error: {}. Reconnecting in {:?}...",
+                    e, retry_delay
+                );
+
+                // Mark subscription as inactive
+                {
+                    let mut s = state.write().await;
+                    s.cli_subscription_active = false;
+                }
+
+                // Wait before reconnecting (with shutdown check)
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        info!("CLI subscription shutting down during reconnect wait");
+                        break;
+                    }
+                    _ = tokio::time::sleep(retry_delay) => {
+                        // Exponential backoff up to max
+                        retry_delay = (retry_delay * 2).min(CLI_MAX_RECONNECT_DELAY);
+                    }
+                }
+            }
+        }
+    }
+
+    // Ensure subscription is marked inactive on exit
+    {
+        let mut s = state.write().await;
+        s.cli_subscription_active = false;
+    }
+}
+
+/// Connect to LMS CLI and process events
+async fn connect_and_subscribe(
+    host: &str,
+    state: &Arc<RwLock<LmsState>>,
+    bus: &SharedBus,
+    rpc: &LmsRpc,
+    shutdown: &CancellationToken,
+) -> Result<()> {
+    let addr = format!("{}:{}", host, CLI_PORT);
+    let stream = TcpStream::connect(&addr).await?;
+
+    info!("Connected to LMS CLI at {}", addr);
+
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    // Send subscription command
+    // Subscribe to: playlist, mixer, power, client events
+    let subscribe_cmd = "subscribe playlist,mixer,power,client\n";
+    writer.write_all(subscribe_cmd.as_bytes()).await?;
+    writer.flush().await?;
+
+    info!("Subscribed to LMS CLI events");
+
+    // Mark subscription as active
+    {
+        let mut s = state.write().await;
+        s.cli_subscription_active = true;
+    }
+
+    // Process events
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("CLI subscription received shutdown signal");
+                return Ok(());
+            }
+            result = reader.read_line(&mut line) => {
+                match result {
+                    Ok(0) => {
+                        // EOF - connection closed
+                        return Err(anyhow!("LMS CLI connection closed"));
+                    }
+                    Ok(_) => {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            debug!("CLI event: {}", trimmed);
+                            handle_cli_event(trimmed, state, bus, rpc).await;
+                        }
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("CLI read error: {}", e));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handle a parsed CLI event
+async fn handle_cli_event(
+    line: &str,
+    state: &Arc<RwLock<LmsState>>,
+    bus: &SharedBus,
+    rpc: &LmsRpc,
+) {
+    let event = parse_cli_event(line);
+
+    match event {
+        CliEvent::Playlist {
+            player_id, command, ..
+        } => {
+            debug!("Playlist event for {}: {}", player_id, command);
+
+            // Refresh player status on playlist changes
+            match rpc.get_player_status(&player_id).await {
+                Ok(status) => {
+                    let zone_id = format!("lms:{}", player_id);
+
+                    // Update cached state
+                    {
+                        let mut s = state.write().await;
+                        if let Some(player) = s.players.get_mut(&player_id) {
+                            player.state = status.state.clone();
+                            player.mode = status.mode.clone();
+                            player.volume = status.volume;
+                            player.time = status.time;
+                            player.duration = status.duration;
+                            player.title = status.title.clone();
+                            player.artist = status.artist.clone();
+                            player.album = status.album.clone();
+                            player.artwork_url = status.artwork_url.clone();
+                            player.coverid = status.coverid.clone();
+                        }
+                    }
+
+                    // Publish bus events
+                    bus.publish(BusEvent::LmsPlayerStateChanged {
+                        player_id: player_id.clone(),
+                        state: status.state.clone(),
+                    });
+
+                    if !status.title.is_empty() {
+                        bus.publish(BusEvent::NowPlayingChanged {
+                            zone_id,
+                            title: Some(status.title),
+                            artist: Some(status.artist),
+                            album: Some(status.album),
+                            image_key: status.artwork_url.or(status.coverid),
+                        });
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to refresh player status after playlist event: {}",
+                        e
+                    );
+                }
+            }
+        }
+        CliEvent::Mixer {
+            player_id,
+            param,
+            value,
+        } => {
+            if param == "volume" {
+                debug!("Volume change for {}: {}", player_id, value);
+
+                // Update cached state
+                {
+                    let mut s = state.write().await;
+                    if let Some(player) = s.players.get_mut(&player_id) {
+                        player.volume = value;
+                    }
+                }
+
+                // Publish volume changed event
+                bus.publish(BusEvent::VolumeChanged {
+                    output_id: player_id,
+                    value: value as f32,
+                    is_muted: false, // LMS doesn't expose mute via CLI events
+                });
+            }
+        }
+        CliEvent::Power {
+            player_id,
+            state: power_state,
+        } => {
+            debug!("Power change for {}: {}", player_id, power_state);
+
+            // Update cached state
+            {
+                let mut s = state.write().await;
+                if let Some(player) = s.players.get_mut(&player_id) {
+                    player.power = power_state;
+                }
+            }
+
+            // Publish state change
+            // When power turns on, we don't know the actual playback state yet
+            // When power turns off, playback is effectively stopped
+            if !power_state {
+                bus.publish(BusEvent::LmsPlayerStateChanged {
+                    player_id,
+                    state: "stopped".to_string(),
+                });
+            }
+        }
+        CliEvent::Client { player_id, action } => {
+            debug!("Client event for {}: {}", player_id, action);
+
+            match action.as_str() {
+                "new" | "reconnect" => {
+                    // New client - refresh player list
+                    if let Ok(status) = rpc.get_player_status(&player_id).await {
+                        let mut s = state.write().await;
+                        let is_new = !s.players.contains_key(&player_id);
+
+                        // Create or update player
+                        let player = LmsPlayer {
+                            playerid: player_id.clone(),
+                            connected: true,
+                            power: status.power,
+                            state: status.state,
+                            mode: status.mode,
+                            volume: status.volume,
+                            title: status.title,
+                            artist: status.artist,
+                            album: status.album,
+                            ..Default::default()
+                        };
+
+                        s.players.insert(player_id.clone(), player.clone());
+
+                        if is_new {
+                            let zone = lms_player_to_zone(&player);
+                            bus.publish(BusEvent::ZoneDiscovered { zone });
+                        }
+                    }
+                }
+                "disconnect" => {
+                    // Client disconnected
+                    let mut s = state.write().await;
+                    if let Some(player) = s.players.get_mut(&player_id) {
+                        player.connected = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        CliEvent::Unknown { raw_line } => {
+            // Log unknown events at trace level for debugging
+            tracing::trace!("Unknown CLI event: {}", raw_line);
+        }
+    }
+}
+
 // Startable trait implementation via macro
 crate::impl_startable!(LmsAdapter, "lms", is_configured);
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------------------------
+    // CLI Event Parsing Tests (TDD)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_cli_event_playlist_newsong() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc playlist newsong Track%20Name 5";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Playlist {
+                player_id,
+                command,
+                track_name,
+                index,
+            } => {
+                assert_eq!(player_id, "00:04:20:aa:bb:cc");
+                assert_eq!(command, "newsong");
+                assert_eq!(track_name, Some("Track Name".to_string()));
+                assert_eq!(index, Some(5));
+            }
+            _ => panic!("Expected Playlist event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_playlist_play() {
+        let line = "00%3A04%3A20%3Axx%3Ayy%3Azz playlist play";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Playlist {
+                player_id,
+                command,
+                track_name,
+                index,
+            } => {
+                assert_eq!(player_id, "00:04:20:xx:yy:zz");
+                assert_eq!(command, "play");
+                assert_eq!(track_name, None);
+                assert_eq!(index, None);
+            }
+            _ => panic!("Expected Playlist event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_mixer_volume() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc mixer volume 75";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Mixer {
+                player_id,
+                param,
+                value,
+            } => {
+                assert_eq!(player_id, "00:04:20:aa:bb:cc");
+                assert_eq!(param, "volume");
+                assert_eq!(value, 75);
+            }
+            _ => panic!("Expected Mixer event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_power_on() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc power 1";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Power { player_id, state } => {
+                assert_eq!(player_id, "00:04:20:aa:bb:cc");
+                assert!(state);
+            }
+            _ => panic!("Expected Power event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_power_off() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc power 0";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Power { player_id, state } => {
+                assert_eq!(player_id, "00:04:20:aa:bb:cc");
+                assert!(!state);
+            }
+            _ => panic!("Expected Power event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_client_new() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc client new";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Client { player_id, action } => {
+                assert_eq!(player_id, "00:04:20:aa:bb:cc");
+                assert_eq!(action, "new");
+            }
+            _ => panic!("Expected Client event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_client_disconnect() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc client disconnect";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Client { player_id, action } => {
+                assert_eq!(player_id, "00:04:20:aa:bb:cc");
+                assert_eq!(action, "disconnect");
+            }
+            _ => panic!("Expected Client event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_unknown() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc unknown_command arg1 arg2";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Unknown { raw_line } => {
+                assert_eq!(raw_line, line);
+            }
+            _ => panic!("Expected Unknown event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_empty_line() {
+        let event = parse_cli_event("");
+        assert!(matches!(event, CliEvent::Unknown { .. }));
+
+        let event = parse_cli_event("   ");
+        assert!(matches!(event, CliEvent::Unknown { .. }));
+    }
+
+    #[test]
+    fn test_parse_cli_event_single_token() {
+        let event = parse_cli_event("player_only");
+        assert!(matches!(event, CliEvent::Unknown { .. }));
+    }
+
+    #[test]
+    fn test_parse_cli_event_unencoded_player_id() {
+        // Some LMS versions might send unencoded player IDs
+        let line = "00:04:20:aa:bb:cc mixer volume 50";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Mixer {
+                player_id,
+                param,
+                value,
+            } => {
+                assert_eq!(player_id, "00:04:20:aa:bb:cc");
+                assert_eq!(param, "volume");
+                assert_eq!(value, 50);
+            }
+            _ => panic!("Expected Mixer event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_special_characters_in_track_name() {
+        // Track name with special characters
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc playlist newsong Hello%2C%20World%21 0";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Playlist { track_name, .. } => {
+                assert_eq!(track_name, Some("Hello, World!".to_string()));
+            }
+            _ => panic!("Expected Playlist event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_playlist_pause() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc playlist pause 1";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Playlist {
+                player_id, command, ..
+            } => {
+                assert_eq!(player_id, "00:04:20:aa:bb:cc");
+                assert_eq!(command, "pause");
+            }
+            _ => panic!("Expected Playlist event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_playlist_stop() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc playlist stop";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Playlist { command, .. } => {
+                assert_eq!(command, "stop");
+            }
+            _ => panic!("Expected Playlist event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_mixer_muting() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc mixer muting 1";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Mixer { param, value, .. } => {
+                assert_eq!(param, "muting");
+                assert_eq!(value, 1);
+            }
+            _ => panic!("Expected Mixer event, got {:?}", event),
+        }
+    }
+}
