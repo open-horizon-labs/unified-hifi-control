@@ -118,7 +118,7 @@ jobs:
           ls -la $CARGO_HOME/registry/index 2>/dev/null | head -5 || echo "No registry index"
 
       - name: Build with cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: $CARGO_HOME/bin/cross build --release --target ${{ matrix.target }}
 
       - name: Rename binary
         run: |
