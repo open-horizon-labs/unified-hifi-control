@@ -32,6 +32,7 @@ GET /knob/now_playing/image
 GET /knob/zones
 GET /knobs/flash
 GET /lms/config
+GET /lms/discover
 GET /lms/player/{player_id}
 GET /lms/players
 GET /lms/status

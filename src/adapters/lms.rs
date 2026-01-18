@@ -16,6 +16,7 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use crate::adapters::lms_discovery::discover_lms_servers;
 use crate::bus::{BusEvent, PlaybackState, SharedBus, VolumeControl, Zone};
 use crate::config::{get_config_file_path, read_config_file};
 
@@ -422,6 +423,59 @@ impl LmsAdapter {
         }
     }
 
+    /// Attempt auto-discovery and configure if exactly one server is found.
+    /// Returns Ok(true) if auto-configured, Ok(false) if no single server found, Err on failure.
+    ///
+    /// Only auto-configures if:
+    /// - No existing configuration (host is None)
+    /// - Exactly one LMS server responds to discovery
+    pub async fn auto_discover_and_configure(&self) -> Result<bool> {
+        // Don't auto-configure if already configured
+        if self.is_configured().await {
+            tracing::debug!("LMS already configured, skipping auto-discovery");
+            return Ok(false);
+        }
+
+        tracing::info!("Attempting LMS auto-discovery...");
+
+        let servers = discover_lms_servers(None).await?;
+
+        match servers.len() {
+            0 => {
+                tracing::info!("LMS auto-discovery: no servers found");
+                Ok(false)
+            }
+            1 => {
+                let server = &servers[0];
+                tracing::info!(
+                    "LMS auto-discovery: found single server '{}' at {}:{}",
+                    server.name,
+                    server.host,
+                    server.json_port
+                );
+                // Auto-configure with discovered settings
+                self.configure(server.host.clone(), Some(server.json_port), None, None)
+                    .await;
+                Ok(true)
+            }
+            n => {
+                tracing::info!(
+                    "LMS auto-discovery: found {} servers, not auto-configuring (manual selection required)",
+                    n
+                );
+                for server in &servers {
+                    tracing::info!(
+                        "  - '{}' at {}:{}",
+                        server.name,
+                        server.host,
+                        server.json_port
+                    );
+                }
+                Ok(false)
+            }
+        }
+    }
+
     /// Configure the LMS connection
     pub async fn configure(
         &self,
@@ -480,8 +534,27 @@ impl LmsAdapter {
 
     /// Start polling for player updates (internal - use Startable trait)
     async fn start_internal(&self) -> Result<()> {
+        // If not configured, attempt auto-discovery
         if !self.is_configured().await {
-            return Err(anyhow!("LMS not configured"));
+            match self.auto_discover_and_configure().await {
+                Ok(true) => {
+                    tracing::info!("LMS auto-configured via discovery");
+                }
+                Ok(false) => {
+                    return Err(anyhow!(
+                        "LMS not configured and auto-discovery did not find exactly one server. \
+                         Configure manually via POST /lms/configure or use GET /lms/discover to see available servers."
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!("LMS auto-discovery failed: {}", e);
+                    return Err(anyhow!(
+                        "LMS not configured and auto-discovery failed: {}. \
+                         Configure manually via POST /lms/configure.",
+                        e
+                    ));
+                }
+            }
         }
 
         // Check if already running to prevent double-start

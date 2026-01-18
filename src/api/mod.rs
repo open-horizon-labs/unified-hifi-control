@@ -657,6 +657,33 @@ pub async fn lms_volume_handler(
     }
 }
 
+/// LMS discovery request query params
+#[derive(Deserialize)]
+pub struct LmsDiscoverRequest {
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// GET /lms/discover - Discover LMS servers on the local network via UDP broadcast
+pub async fn lms_discover_handler(Query(params): Query<LmsDiscoverRequest>) -> impl IntoResponse {
+    use crate::adapters::discover_lms_servers;
+
+    match discover_lms_servers(params.timeout_ms).await {
+        Ok(servers) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "discovered": servers })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Discovery failed: {}", e),
+            }),
+        )
+            .into_response(),
+    }
+}
+
 // =============================================================================
 // SSE Events
 // =============================================================================
