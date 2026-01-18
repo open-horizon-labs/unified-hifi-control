@@ -513,6 +513,35 @@ mod server {
 #[cfg(feature = "server")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Handle --version and --help before starting server
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("unified-hifi-control {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("unified-hifi-control {}", env!("CARGO_PKG_VERSION"));
+        println!();
+        println!(
+            "Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer, and hardware knobs."
+        );
+        println!();
+        println!("USAGE:");
+        println!("    unified-hifi-control [OPTIONS]");
+        println!();
+        println!("OPTIONS:");
+        println!("    -h, --help       Print help information");
+        println!("    -V, --version    Print version information");
+        println!();
+        println!("ENVIRONMENT VARIABLES:");
+        println!("    PORT             HTTP server port (default: 8088)");
+        println!("    CONFIG_DIR       Configuration directory");
+        println!("    LOG_LEVEL        Log level (debug, info, warn, error)");
+        println!("    LMS_HOST         LMS server host (auto-enables LMS backend)");
+        println!("    LMS_PORT         LMS server port (default: 9000)");
+        return Ok(());
+    }
+
     server::run().await
 }
 
