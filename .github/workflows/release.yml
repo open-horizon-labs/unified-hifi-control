@@ -433,15 +433,18 @@ jobs:
           projects: ./build/synology
           output: ./dist/installers
 
-      - name: Debug - find SPK files
-        if: always()
+      - name: Find and copy SPK
         run: |
-          echo "=== Searching for SPK files ==="
-          find . -name "*.spk" -type f 2>/dev/null || echo "No .spk files found"
-          echo "=== Contents of dist/ ==="
-          ls -laR dist/ 2>/dev/null || echo "No dist/ directory"
-          echo "=== Contents of build/synology/ ==="
-          ls -laR build/synology/ 2>/dev/null || echo "No build/synology/ directory"
+          echo "=== Searching entire workspace for SPK files ==="
+          find $GITHUB_WORKSPACE -name "*.spk" -type f 2>/dev/null || echo "No .spk found in workspace"
+          echo "=== Checking common output locations ==="
+          ls -la ./dist/ 2>/dev/null || echo "No ./dist/"
+          ls -la /tmp/*.spk 2>/dev/null || echo "No /tmp/*.spk"
+          echo "=== Copying any found SPK files ==="
+          mkdir -p dist/installers
+          find $GITHUB_WORKSPACE -name "*.spk" -type f -exec cp {} dist/installers/ \; 2>/dev/null || true
+          find /tmp -name "*.spk" -type f -exec cp {} dist/installers/ \; 2>/dev/null || true
+          ls -la dist/installers/ 2>/dev/null || echo "dist/installers is empty"
 
       - name: Upload Synology package
         uses: actions/upload-artifact@v4
