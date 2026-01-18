@@ -8,7 +8,7 @@
       <title lang="EN">Unified Hi-Fi Control</title>
       <desc lang="EN">Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer, and hardware knobs. Provides HTTP APIs, MQTT integration, and web UI for controlling your audio system from anywhere.</desc>
       <url>https://github.com/open-horizon-labs/unified-hifi-control/releases/download/v3.0.0-rc.2/lms-unified-hifi-control-3.0.0-rc.2.zip</url>
-      <sha>379d65f5eb2602e55bfe18b132794660fe142580</sha>
+      <sha>c4ea70aed540d995863ee7541da64a6f0d445004</sha>
       <creator>Muness Castle</creator>
       <link>https://forums.lyrion.org/forum/user-forums/3rd-party-hardware/1804977-roon-knob-includes-lms-support</link>
     </plugin>
