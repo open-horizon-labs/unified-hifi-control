@@ -139,6 +139,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-${{ matrix.target }}"
+          cache-all-crates: true
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
@@ -182,6 +183,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "windows-build"
+          cache-all-crates: true
 
       - name: Build
         run: cargo build --release
