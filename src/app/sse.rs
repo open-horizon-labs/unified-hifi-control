@@ -7,6 +7,10 @@ use dioxus::prelude::*;
 use serde::Deserialize;
 
 #[cfg(target_arch = "wasm32")]
+use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
 /// Payload for zone-related events
@@ -150,6 +154,24 @@ impl SseContext {
     }
 }
 
+/// RAII guard to close EventSource on drop
+#[cfg(target_arch = "wasm32")]
+struct EventSourceGuard {
+    es: web_sys::EventSource,
+    // Store closures so they're dropped with the guard (prevents leaks)
+    _onopen: Closure<dyn FnMut(web_sys::Event)>,
+    _onmessage: Closure<dyn FnMut(web_sys::MessageEvent)>,
+    _onerror: Closure<dyn FnMut(web_sys::Event)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for EventSourceGuard {
+    fn drop(&mut self) {
+        web_sys::console::log_1(&"SSE: Closing EventSource connection".into());
+        self.es.close();
+    }
+}
+
 /// Initialize SSE context provider - call once at app root
 pub fn use_sse_provider() {
     let last_event = use_signal(|| None::<SseEvent>);
@@ -167,8 +189,19 @@ pub fn use_sse_provider() {
     // Client-side only: establish actual EventSource connection
     #[cfg(target_arch = "wasm32")]
     {
+        // Use a hook to store the EventSource guard - it persists across renders
+        // and closes the connection when the component unmounts
+        let _guard: Rc<RefCell<Option<EventSourceGuard>>> =
+            use_hook(|| Rc::new(RefCell::new(None)));
+
+        let guard_clone = _guard.clone();
         use_effect(move || {
             use web_sys::EventSource;
+
+            // Only create if we don't have one already
+            if guard_clone.borrow().is_some() {
+                return;
+            }
 
             // Create EventSource connection to /events
             let es = match EventSource::new("/events") {
@@ -190,7 +223,6 @@ pub fn use_sse_provider() {
                 connected_clone.set(true);
             }) as Box<dyn FnMut(_)>);
             es.set_onopen(Some(onopen.as_ref().unchecked_ref()));
-            onopen.forget(); // Leak closure to keep it alive
 
             // onmessage handler
             let mut last_event_clone = last_event;
@@ -216,7 +248,6 @@ pub fn use_sse_provider() {
                 }
             }) as Box<dyn FnMut(_)>);
             es.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-            onmessage.forget(); // Leak closure to keep it alive
 
             // onerror handler
             let mut connected_err = connected;
@@ -225,9 +256,14 @@ pub fn use_sse_provider() {
                 connected_err.set(false);
             }) as Box<dyn FnMut(_)>);
             es.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-            onerror.forget(); // Leak closure to keep it alive
 
-            // Note: EventSource will auto-reconnect on errors
+            // Store guard - closures are now owned by the guard and will be dropped properly
+            *guard_clone.borrow_mut() = Some(EventSourceGuard {
+                es,
+                _onopen: onopen,
+                _onmessage: onmessage,
+                _onerror: onerror,
+            });
         });
     }
 }

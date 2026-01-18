@@ -14,6 +14,7 @@ body {
   font-weight: 400;
 }
 
+/* Default: follow system preference */
 @media (prefers-color-scheme: dark) {
   :root {
     --dark: initial;
@@ -26,6 +27,33 @@ body {
     --dark: ;
     --light: initial;
   }
+}
+
+/* Manual theme overrides via class on <html> */
+:root.theme-light {
+  --dark: ;
+  --light: initial;
+}
+
+:root.theme-dark {
+  --dark: initial;
+  --light: ;
+}
+
+:root.theme-oled {
+  --dark: initial;
+  --light: ;
+}
+
+/* OLED black: pure black surfaces for AMOLED screens */
+:root.theme-oled {
+  --primary-color-1: #000;
+  --primary-color-2: #000;
+  --primary-color-3: #000;
+  --primary-color-4: #0a0a0a;
+  --primary-color-5: #0a0a0a;
+  --primary-color-6: #1a1a1a;
+  --primary-color-7: #2a2a2a;
 }
 
 :root {

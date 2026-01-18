@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 use crate::app::api::{AdapterSettings, AppSettings, RoonStatus};
 use crate::app::components::Layout;
 use crate::app::sse::use_sse;
+use crate::app::theme::{use_theme, Theme};
 
 /// OpenHome status response
 #[derive(Clone, Debug, Default, serde::Deserialize, PartialEq)]
@@ -24,6 +25,7 @@ struct UpnpStatus {
 #[component]
 pub fn Settings() -> Element {
     let sse = use_sse();
+    let theme_ctx = use_theme();
 
     // Adapter toggle signals
     let mut roon_enabled = use_signal(|| true);
@@ -162,6 +164,34 @@ pub fn Settings() -> Element {
                     }
                     p { class: "mt-3 text-sm text-muted",
                         "Changes take effect immediately. Disabled adapters won't contribute zones."
+                    }
+                }
+            }
+
+            // Theme Settings section
+            section { class: "mb-8",
+                div { class: "mb-4",
+                    h2 { class: "text-xl font-semibold", "Appearance" }
+                    p { class: "text-muted text-sm", "Choose your preferred color theme" }
+                }
+
+                div { class: "card p-6",
+                    div { class: "flex flex-wrap gap-3",
+                        for theme in [Theme::System, Theme::Light, Theme::Dark, Theme::Oled] {
+                            button {
+                                class: if theme_ctx.get() == theme { "btn-primary" } else { "btn-outline" },
+                                onclick: move |_| theme_ctx.set(theme),
+                                "{theme.label()}"
+                            }
+                        }
+                    }
+                    p { class: "mt-3 text-sm text-muted",
+                        match theme_ctx.get() {
+                            Theme::System => "Using your system's color scheme preference.",
+                            Theme::Light => "Light theme for bright environments.",
+                            Theme::Dark => "Dark theme for low-light environments.",
+                            Theme::Oled => "Pure black theme for AMOLED displays.",
+                        }
                     }
                 }
             }

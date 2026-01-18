@@ -9,15 +9,20 @@ pub mod api;
 pub mod components;
 pub mod pages;
 pub mod sse;
+pub mod theme;
 
 use pages::{Dashboard, HqPlayer, Knobs, Lms, Settings, Zone, Zones};
 use sse::use_sse_provider;
+use theme::use_theme_provider;
 
 /// Root app component with routing
 #[component]
 pub fn App() -> Element {
     // Initialize SSE context at app root (single EventSource for all pages)
     use_sse_provider();
+
+    // Initialize theme context at app root (handles localStorage + DOM class)
+    use_theme_provider();
 
     rsx! {
         Router::<Route> {}
