@@ -51,6 +51,9 @@ jobs:
   build-linux:
     name: Build Linux (musl static)
     runs-on: ubuntu-latest
+    env:
+      # Set CARGO_HOME inside workspace so cross container can mount it
+      CARGO_HOME: ${{ github.workspace }}/.cargo
     strategy:
       matrix:
         include:
@@ -73,6 +76,7 @@ jobs:
         with:
           shared-key: "cross-${{ matrix.target }}"
           cache-all-crates: true
+          workspaces: ". -> target"
 
       - name: Cache cross
         id: cache-cross
