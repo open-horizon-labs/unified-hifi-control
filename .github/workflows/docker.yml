@@ -1,15 +1,16 @@
-name: Build and Push Docker
+name: Docker Edge Build
 
+# Only for master branch (edge builds) and PRs
+# Release builds handled by release.yml
 on:
   push:
     branches: [master]
-    tags: ['v*']
   pull_request:
     branches: [master]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 concurrency:
@@ -60,23 +61,14 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-  docker:
-    name: Build and Push Docker Image
+  docker-edge:
+    name: Build Docker Edge
     runs-on: ubuntu-latest
     needs: [lint, test]
+    # Only push edge builds from master, not PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Get version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="edge"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Docker image version: $VERSION"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -90,74 +82,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            muness/unified-hifi-control
-            muness/roon-extension-knob
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
-            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/master' }}
-            type=ref,event=pr
-
-      - name: Build and push
+      - name: Build and push edge
         uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            muness/unified-hifi-control:edge
+            muness/roon-extension-knob:edge
           build-args: |
-            APP_VERSION=${{ steps.version.outputs.version }}
+            APP_VERSION=edge
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    needs: [docker]
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Get version from tag
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Generate release notes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          PREV_TAG=$(gh api repos/${{ github.repository }}/tags --jq '.[].name' | grep '^v' | sort -V | grep -B1 "^${{ github.ref_name }}$" | head -1)
-          if [ "$PREV_TAG" = "${{ github.ref_name }}" ]; then
-            PREV_TAG=""
-          fi
-          if [ -n "$PREV_TAG" ]; then
-            gh api repos/${{ github.repository }}/releases/generate-notes \
-              -f tag_name="${{ github.ref_name }}" \
-              -f previous_tag_name="$PREV_TAG" \
-              --jq '.body' > release_notes.md 2>/dev/null || echo "## What's Changed" > release_notes.md
-          else
-            echo "## What's Changed" > release_notes.md
-          fi
-
-      - name: Build release body
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          cat release_notes.md > final_body.md
-          if [ -f .github/RELEASE_TEMPLATE.md ]; then
-            sed "s/{{VERSION}}/$VERSION/g" .github/RELEASE_TEMPLATE.md >> final_body.md
-          fi
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: false
-          prerelease: ${{ contains(github.ref, '-') }}
-          body_path: final_body.md

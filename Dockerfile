@@ -12,8 +12,8 @@ RUN apt-get update && apt-get install -y \
 # Install wasm32 target for client build
 RUN rustup target add wasm32-unknown-unknown
 
-# Install Dioxus CLI
-RUN cargo install dioxus-cli --locked
+# Install Dioxus CLI (pinned version for reproducible builds)
+RUN cargo install dioxus-cli@0.7.3 --locked
 
 # Copy manifests
 COPY Cargo.toml Cargo.lock Dioxus.toml ./
