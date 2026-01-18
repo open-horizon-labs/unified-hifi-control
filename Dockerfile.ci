@@ -1,8 +1,8 @@
 # CI Dockerfile - uses pre-built binaries and web assets
 # This is much faster than building inside Docker with QEMU emulation
-# Use Chainguard's wolfi-base - avoids Docker Hub rate limits
+# Use GHCR for fast pulls from GitHub Actions (same datacenter)
 
-FROM cgr.dev/chainguard/wolfi-base:latest
+FROM ghcr.io/linuxserver/baseimage-alpine:3.20
 
 WORKDIR /app
 
