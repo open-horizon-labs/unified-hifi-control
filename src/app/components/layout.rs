@@ -42,6 +42,24 @@ pub fn Layout(props: LayoutProps) -> Element {
             rel: "stylesheet",
             href: asset!("/public/tailwind.css")
         }
+        // Favicons
+        document::Link {
+            rel: "icon",
+            r#type: "image/png",
+            sizes: "32x32",
+            href: asset!("/public/favicon-32x32.png")
+        }
+        document::Link {
+            rel: "icon",
+            r#type: "image/png",
+            sizes: "16x16",
+            href: asset!("/public/favicon-16x16.png")
+        }
+        document::Link {
+            rel: "apple-touch-icon",
+            sizes: "180x180",
+            href: asset!("/public/apple-touch-icon.png")
+        }
 
         // Body content
         Nav {
