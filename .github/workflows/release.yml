@@ -100,8 +100,9 @@ jobs:
         with:
           # Cross builds need all crates cached, not just dependencies
           cache-all-crates: true
-          # Use target as key to avoid cache collisions between architectures
-          key: cross-${{ matrix.target }}
+          # shared-key replaces automatic job-based key entirely, ensuring each target
+          # gets a completely separate cache (key only adds a suffix to shared prefix)
+          shared-key: cross-${{ matrix.target }}
 
       - name: Cache cross
         id: cache-cross

@@ -44,8 +44,11 @@ Proc-macros (serde_derive, dioxus, thiserror, etc.) can't be cached by sccache d
 - name: Cache Rust (cross builds)
   uses: Swatinem/rust-cache@v2
   with:
-    cache-directories: target/${{ matrix.target }}
+    cache-all-crates: true
+    shared-key: cross-${{ matrix.target }}
 ```
+
+**Why `shared-key` instead of `key`:** The `key` parameter only adds a suffix to the automatic job-based cache key. Since all Linux matrix jobs run on the same OS/arch runner, they can collide and restore each other's caches. Using `shared-key` completely replaces the automatic key, ensuring each target triple gets a completely separate cache.
 
 **Why this works:** Cross mounts the host's `target/` directory into the container, so rust-cache's directory-based caching is effective here.
 
