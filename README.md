@@ -197,6 +197,50 @@ The v3 rewrite was motivated by packaging requests (NAS users wanted native pack
 
 </details>
 
+## Development
+
+### Prerequisites
+
+- Rust 1.84+ with `wasm32-unknown-unknown` target
+- [Dioxus CLI](https://dioxuslabs.com/learn/0.6/getting_started)
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install dioxus-cli --locked
+```
+
+### Build
+
+```bash
+# Development build (server only)
+cargo build
+
+# Release build with web assets (WASM + server)
+dx build --release --platform web --features web
+```
+
+### Run
+
+```bash
+# After dx build
+./target/dx/unified-hifi-control/release/web/unified-hifi-control
+
+# Access at http://127.0.0.1:8088
+```
+
+### Test
+
+```bash
+cargo test --workspace
+```
+
+### Lint
+
+```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+```
+
 ## License
 
 As of v2.5.0, this project is licensed under the [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) license.
