@@ -14,11 +14,14 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
+use tracing::debug;
 
 use crate::bus::{BusEvent, PlaybackState, SharedBus, VolumeControl, Zone};
 use crate::config::get_config_dir;
 
 const LMS_CONFIG_FILE: &str = "lms-config.json";
+/// Request ID for LMS JSON-RPC calls (aids debugging in LMS logs)
+const LMS_REQUEST_ID: i32 = 217;
 
 /// Saved config for persistence
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,10 +68,16 @@ impl LmsRpc {
         let url = format!("{}/jsonrpc.js", base_url);
 
         let body = json!({
-            "id": 1,
+            "id": LMS_REQUEST_ID,
             "method": "slim.request",
             "params": [player_id.unwrap_or(""), params]
         });
+
+        debug!(
+            player_id = player_id.unwrap_or("<server>"),
+            params = ?body["params"][1],
+            "LMS request"
+        );
 
         let mut request = self
             .client
@@ -91,6 +100,12 @@ impl LmsRpc {
         }
 
         let data: Value = response.json().await?;
+
+        debug!(
+            player_id = player_id.unwrap_or("<server>"),
+            result = ?data.get("result"),
+            "LMS response"
+        );
 
         if let Some(error) = data.get("error") {
             if !error.is_null() {
@@ -561,25 +576,11 @@ impl LmsAdapter {
     /// Control player
     pub async fn control(&self, player_id: &str, command: &str, value: Option<i32>) -> Result<()> {
         let params: Vec<Value> = match command {
-            // LMS quirk: "play" starts from stopped but doesn't resume from pause.
-            // "pause 0" resumes from pause but is a no-op from stopped.
-            // Check cached mode to send the appropriate command.
-            "play" => {
-                let is_paused = self
-                    .state
-                    .read()
-                    .await
-                    .players
-                    .get(player_id)
-                    .map(|p| p.mode == "pause")
-                    .unwrap_or(false);
-                if is_paused {
-                    vec![json!("pause"), json!(0)]
-                } else {
-                    vec![json!("play")]
-                }
-            }
-            "pause" => vec![json!("pause"), json!(1)],
+            // Per real-world testing (issue #68), "play" handles both start and resume.
+            // No need to check cached state - just send the command directly.
+            "play" => vec![json!("play")],
+            // "pause" without args toggles pause state - matches expected UI behavior
+            "pause" => vec![json!("pause")],
             "stop" => vec![json!("stop")],
             "play_pause" => vec![json!("pause")], // Toggle
             "next" => vec![json!("playlist"), json!("index"), json!("+1")],

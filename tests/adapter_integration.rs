@@ -532,9 +532,9 @@ mod mock_server_tests {
 
     /// Tests that the LMS adapter's "play" command correctly resumes from pause.
     ///
-    /// This is a regression test for issue #68: the LMS "play" command doesn't
-    /// resume from pause (it only starts playback from stopped). The adapter
-    /// must use "pause 0" (unpause) to resume playback.
+    /// Per real-world testing (issue #68), the LMS "play" command handles both
+    /// starting from stopped AND resuming from pause. The adapter can simply
+    /// send "play" without checking cached state.
     #[tokio::test]
     async fn lms_adapter_play_resumes_from_pause() {
         // Start mock server with player in paused state
@@ -562,7 +562,6 @@ mod mock_server_tests {
         assert_eq!(player.mode, "pause", "Player should start paused");
 
         // Send "play" command through the adapter
-        // The adapter should translate this to "pause 0" (unpause)
         adapter.control(player_id, "play", None).await.unwrap();
 
         // Give the adapter a moment to update its cache
