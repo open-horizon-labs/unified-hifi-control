@@ -25,7 +25,7 @@ use crate::bus::{
     BusEvent, NowPlaying as BusNowPlaying, PlaybackState, SharedBus, TrackMetadata,
     VolumeControl as BusVolumeControl, VolumeScale, Zone as BusZone,
 };
-use crate::config::get_config_dir;
+use crate::config::{get_config_file_path, read_config_file};
 
 const HQP_CONFIG_FILE: &str = "hqp-config.json";
 
@@ -65,43 +65,37 @@ fn default_web_port() -> u16 {
 }
 
 fn hqp_config_path() -> PathBuf {
-    get_config_dir().join(HQP_CONFIG_FILE)
+    get_config_file_path(HQP_CONFIG_FILE)
 }
 
 /// Load HQP config from disk (supports both single-object and array formats)
+/// Issue #76: Uses read_config_file for backwards-compatible fallback
 pub fn load_hqp_configs() -> Vec<HqpInstanceConfig> {
-    let path = hqp_config_path();
-    if !path.exists() {
-        return Vec::new();
+    // read_config_file checks subdir first, falls back to root for legacy files
+    let content = match read_config_file(HQP_CONFIG_FILE) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    // Try parsing as array first
+    if let Ok(configs) = serde_json::from_str::<Vec<HqpInstanceConfig>>(&content) {
+        return configs;
     }
 
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            // Try parsing as array first
-            if let Ok(configs) = serde_json::from_str::<Vec<HqpInstanceConfig>>(&content) {
-                return configs;
-            }
-
-            // Fall back to single-object format (legacy)
-            if let Ok(single) = serde_json::from_str::<SavedHqpConfig>(&content) {
-                return vec![HqpInstanceConfig {
-                    name: "default".to_string(),
-                    host: single.host,
-                    port: single.port,
-                    web_port: single.web_port,
-                    username: single.username,
-                    password: single.password,
-                }];
-            }
-
-            tracing::warn!("Failed to parse HQP config file");
-            Vec::new()
-        }
-        Err(e) => {
-            tracing::warn!("Failed to read HQP config: {}", e);
-            Vec::new()
-        }
+    // Fall back to single-object format (legacy)
+    if let Ok(single) = serde_json::from_str::<SavedHqpConfig>(&content) {
+        return vec![HqpInstanceConfig {
+            name: "default".to_string(),
+            host: single.host,
+            port: single.port,
+            web_port: single.web_port,
+            username: single.username,
+            password: single.password,
+        }];
     }
+
+    tracing::warn!("Failed to parse HQP config file");
+    Vec::new()
 }
 
 /// Save HQP configs to disk (always saves as array)
@@ -2000,7 +1994,7 @@ impl HqpInstanceManager {
 const ZONE_LINKS_FILE: &str = "hqp-zone-links.json";
 
 fn zone_links_path() -> PathBuf {
-    get_config_dir().join(ZONE_LINKS_FILE)
+    get_config_file_path(ZONE_LINKS_FILE)
 }
 
 /// Zone link info for API responses
@@ -2028,14 +2022,11 @@ impl HqpZoneLinkService {
     }
 
     /// Load links from disk synchronously (at startup)
+    /// Issue #76: Uses read_config_file for backwards-compatible fallback
     fn load_links_sync(&self) {
-        let path = zone_links_path();
-        if !path.exists() {
-            return;
-        }
-
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str::<HashMap<String, String>>(&content) {
+        // read_config_file checks subdir first, falls back to root for legacy files
+        if let Some(content) = read_config_file(ZONE_LINKS_FILE) {
+            match serde_json::from_str::<HashMap<String, String>>(&content) {
                 Ok(saved_links) => {
                     if let Ok(mut links) = self.links.try_write() {
                         *links = saved_links;
@@ -2043,8 +2034,7 @@ impl HqpZoneLinkService {
                     }
                 }
                 Err(e) => tracing::warn!("Failed to parse zone links: {}", e),
-            },
-            Err(e) => tracing::warn!("Failed to read zone links: {}", e),
+            }
         }
     }
 

@@ -133,6 +133,7 @@ tokio-test = "0.4"
 serial_test = "3"
 syn = { version = "2", features = ["full", "parsing", "visit"] }
 walkdir = "2"
+tempfile = "3"
 
 [profile.release]
 lto = true

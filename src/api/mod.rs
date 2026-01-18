@@ -1527,28 +1527,25 @@ impl Default for AppSettings {
     }
 }
 
+const APP_SETTINGS_FILE: &str = "app-settings.json";
+
 fn settings_path() -> std::path::PathBuf {
-    crate::config::get_config_dir().join("app-settings.json")
+    crate::config::get_config_file_path(APP_SETTINGS_FILE)
 }
 
+/// Load app settings from disk
+/// Issue #76: Uses read_config_file for backwards-compatible fallback
 pub fn load_app_settings() -> AppSettings {
-    let path = settings_path();
-    let mut settings = if path.exists() {
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str(&content) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Failed to parse app settings: {}", e);
-                    AppSettings::default()
-                }
-            },
+    // read_config_file checks subdir first, falls back to root for legacy files
+    let mut settings = match crate::config::read_config_file(APP_SETTINGS_FILE) {
+        Some(content) => match serde_json::from_str(&content) {
+            Ok(s) => s,
             Err(e) => {
-                tracing::warn!("Failed to read app settings: {}", e);
+                tracing::warn!("Failed to parse app settings: {}", e);
                 AppSettings::default()
             }
-        }
-    } else {
-        AppSettings::default()
+        },
+        None => AppSettings::default(),
     };
 
     // Issue #62: Auto-enable LMS adapter when started from LMS plugin

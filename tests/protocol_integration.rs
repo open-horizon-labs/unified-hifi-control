@@ -56,7 +56,7 @@ async fn create_test_app() -> Router {
     let lms = Arc::new(LmsAdapter::new(bus.clone()));
     let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
     let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
-    let knob_store = KnobStore::new(std::env::temp_dir());
+    let knob_store = KnobStore::new();
 
     // Build startable adapters list
     let startable_adapters: Vec<Arc<dyn Startable>> =

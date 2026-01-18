@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::bus::{BusEvent, PlaybackState, SharedBus, VolumeControl, Zone};
-use crate::config::get_config_dir;
+use crate::config::{get_config_file_path, read_config_file};
 
 const LMS_CONFIG_FILE: &str = "lms-config.json";
 /// Request ID for LMS JSON-RPC calls (aids debugging in LMS logs)
@@ -35,7 +35,7 @@ struct SavedLmsConfig {
 }
 
 fn config_path() -> PathBuf {
-    get_config_dir().join(LMS_CONFIG_FILE)
+    get_config_file_path(LMS_CONFIG_FILE)
 }
 
 const DEFAULT_PORT: u16 = 9000;
@@ -370,28 +370,26 @@ impl LmsAdapter {
     }
 
     /// Load config from disk (sync, for startup)
+    /// Issue #76: Uses read_config_file for backwards-compatible fallback
     fn load_config_sync(&self) {
-        let path = config_path();
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => match serde_json::from_str::<SavedLmsConfig>(&content) {
-                    Ok(saved) => {
-                        // Use try_write to avoid async in sync context
-                        if let Ok(mut state) = self.state.try_write() {
-                            state.host = Some(saved.host.clone());
-                            state.port = saved.port;
-                            state.username = saved.username;
-                            state.password = saved.password;
-                            tracing::info!(
-                                "Loaded LMS config from disk: {}:{}",
-                                saved.host,
-                                saved.port
-                            );
-                        }
+        // read_config_file checks subdir first, falls back to root for legacy files
+        if let Some(content) = read_config_file(LMS_CONFIG_FILE) {
+            match serde_json::from_str::<SavedLmsConfig>(&content) {
+                Ok(saved) => {
+                    // Use try_write to avoid async in sync context
+                    if let Ok(mut state) = self.state.try_write() {
+                        state.host = Some(saved.host.clone());
+                        state.port = saved.port;
+                        state.username = saved.username;
+                        state.password = saved.password;
+                        tracing::info!(
+                            "Loaded LMS config from disk: {}:{}",
+                            saved.host,
+                            saved.port
+                        );
                     }
-                    Err(e) => tracing::warn!("Failed to parse LMS config: {}", e),
-                },
-                Err(e) => tracing::warn!("Failed to read LMS config: {}", e),
+                }
+                Err(e) => tracing::warn!("Failed to parse LMS config: {}", e),
             }
         }
     }

@@ -21,7 +21,9 @@ use crate::bus::{
     BusEvent, NowPlaying as BusNowPlaying, PlaybackState, SharedBus,
     VolumeControl as BusVolumeControl, Zone as BusZone,
 };
-use crate::config::get_data_dir;
+use crate::config::get_config_file_path;
+
+const ROON_STATE_FILE: &str = "roon_state.json";
 
 /// Pending image request - stores the oneshot sender to deliver the result
 type ImageRequest = oneshot::Sender<Option<ImageData>>;
@@ -33,9 +35,10 @@ pub struct ImageData {
     pub data: Vec<u8>,
 }
 
-/// Get the Roon state file path in the data directory
+/// Get the Roon state file path in the config subdirectory
+/// Issue #76: Organize config files into unified-hifi/ subdirectory
 fn get_roon_state_path() -> PathBuf {
-    get_data_dir().join("roon_state.json")
+    get_config_file_path(ROON_STATE_FILE)
 }
 
 /// Maximum relative volume step per call (prevents wild jumps)
@@ -552,14 +555,15 @@ async fn run_roon_loop(
 ) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
 
-    // Ensure data directory exists for state persistence
-    let data_dir = get_data_dir();
-    if !data_dir.exists() {
-        std::fs::create_dir_all(&data_dir)?;
-        tracing::info!("Created data directory: {:?}", data_dir);
-    }
-
+    // Ensure config subdirectory exists for state persistence
+    // Issue #76: State files now go into unified-hifi/ subdirectory
     let state_path = get_roon_state_path();
+    if let Some(parent) = state_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+            tracing::info!("Created config subdirectory: {:?}", parent);
+        }
+    }
     let state_path_str = state_path.to_string_lossy().to_string();
     tracing::info!("Roon state file: {}", state_path_str);
 

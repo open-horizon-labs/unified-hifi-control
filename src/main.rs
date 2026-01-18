@@ -91,6 +91,9 @@ mod server {
         let config = config::load_config()?;
         tracing::info!("Configuration loaded, port: {}", config.port);
 
+        // Issue #76: Migrate config files to unified-hifi/ subdirectory
+        config::migrate_config_to_subdir();
+
         // Migrate Node.js config files if present (seamless Docker image swap)
         config::migrate_nodejs_configs();
 
@@ -215,8 +218,8 @@ mod server {
         tracing::info!("ZoneAggregator started");
 
         // Initialize Knob device store
-        let data_dir = config::get_data_dir();
-        let knob_store = knobs::KnobStore::new(data_dir);
+        // Issue #76: Uses config subdirectory for knobs.json
+        let knob_store = knobs::KnobStore::new();
         tracing::info!("Knob store initialized");
 
         // Clone Roon adapter for shutdown access (cheap - just Arc clones)

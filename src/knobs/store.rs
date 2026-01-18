@@ -11,9 +11,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+use crate::config::{get_config_file_path, read_config_file};
+
+const KNOBS_FILE: &str = "knobs.json";
 
 /// Power mode configuration (timeout-based state transition)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -131,26 +134,29 @@ fn compute_sha(config: &KnobConfig, name: &str) -> String {
 #[derive(Clone)]
 pub struct KnobStore {
     knobs: Arc<RwLock<HashMap<String, Knob>>>,
-    data_dir: PathBuf,
+}
+
+impl Default for KnobStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl KnobStore {
     /// Create new store, loading existing knobs from disk
-    pub fn new(data_dir: PathBuf) -> Self {
-        let knobs = Self::load_from_disk(&data_dir);
+    /// Issue #76: Uses config subdirectory for knobs.json
+    pub fn new() -> Self {
+        let knobs = Self::load_from_disk();
         Self {
             knobs: Arc::new(RwLock::new(knobs)),
-            data_dir,
         }
     }
 
-    fn knobs_file(data_dir: &std::path::Path) -> PathBuf {
-        data_dir.join("knobs.json")
-    }
-
-    fn load_from_disk(data_dir: &std::path::Path) -> HashMap<String, Knob> {
-        let path = Self::knobs_file(data_dir);
-        if let Ok(content) = fs::read_to_string(&path) {
+    /// Load knobs from disk with backwards-compatible fallback
+    /// Issue #76: Uses read_config_file to check subdir first, fall back to root
+    fn load_from_disk() -> HashMap<String, Knob> {
+        // read_config_file checks subdir first, falls back to root for legacy files
+        if let Some(content) = read_config_file(KNOBS_FILE) {
             if let Ok(knobs) = serde_json::from_str(&content) {
                 return knobs;
             }
@@ -158,9 +164,11 @@ impl KnobStore {
         HashMap::new()
     }
 
+    /// Save knobs to disk in the config subdirectory
+    /// Issue #76: Always writes to unified-hifi/ subdirectory
     async fn save_to_disk(&self) {
         let knobs = self.knobs.read().await;
-        let path = Self::knobs_file(&self.data_dir);
+        let path = get_config_file_path(KNOBS_FILE);
 
         // Ensure directory exists
         if let Some(parent) = path.parent() {
