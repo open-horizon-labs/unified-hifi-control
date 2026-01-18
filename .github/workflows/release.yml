@@ -103,12 +103,18 @@ jobs:
           sudo mv zig-linux-x86_64-0.13.0 /opt/zig
           echo "/opt/zig" >> $GITHUB_PATH
 
+      - name: Cache cargo-zigbuild
+        id: cache-zigbuild
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-0.20
+
       - name: Install cargo-zigbuild
+        if: steps.cache-zigbuild.outputs.cache-hit != 'true'
         run: cargo install cargo-zigbuild --locked
 
       - name: Build with zigbuild
-        env:
-          PATH: /opt/zig:$PATH
         run: cargo zigbuild --release --target ${{ matrix.target }}
 
       - name: Smoke test armv7 binary
@@ -160,10 +166,19 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
-      - name: Install zig and cargo-zigbuild
-        run: |
-          brew install zig
-          cargo install cargo-zigbuild --locked
+      - name: Install zig
+        run: brew install zig
+
+      - name: Cache cargo-zigbuild
+        id: cache-zigbuild
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-macos-0.20
+
+      - name: Install cargo-zigbuild
+        if: steps.cache-zigbuild.outputs.cache-hit != 'true'
+        run: cargo install cargo-zigbuild --locked
 
       - name: Build universal binary
         run: cargo zigbuild --release --target universal2-apple-darwin
