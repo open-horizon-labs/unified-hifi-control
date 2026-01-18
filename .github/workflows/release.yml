@@ -23,8 +23,12 @@ jobs:
         with:
           shared-key: "wasm-build"
           cache-all-crates: true
-          # Include dioxus target directory
           workspaces: ". -> target"
+          # Preserve Dioxus-specific build directories
+          cache-directories: |
+            target/dx
+            target/wasm-release
+            target/wasm32-unknown-unknown
 
       - name: Cache Dioxus CLI
         id: cache-dx
