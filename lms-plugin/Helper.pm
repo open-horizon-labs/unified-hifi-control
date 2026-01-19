@@ -69,6 +69,52 @@ sub binDir {
     return $binDir;
 }
 
+# Get the plugin install directory (where the plugin ZIP was extracted)
+# This is where bundled binaries would be if present
+sub pluginDir {
+    my $class = shift;
+    return Plugins::UnifiedHiFi::Plugin->_pluginDataFor('basedir');
+}
+
+# Get the Bin directory inside the plugin install location (for bundled binaries)
+sub pluginBinDir {
+    my $class = shift;
+
+    my $pluginDir = $class->pluginDir();
+    return unless $pluginDir;
+
+    return catdir($pluginDir, 'Bin');
+}
+
+# Get bundled binary path (if it exists in the plugin install directory)
+sub bundledBin {
+    my $class = shift;
+
+    my $pluginBinDir = $class->pluginBinDir();
+    return unless $pluginBinDir;
+
+    my $platform = $class->detectPlatform();
+    my $binaryName = BINARY_MAP->{$platform};
+    return unless $binaryName;
+
+    # Bundled binaries use a generic name: unified-hifi-control (or .exe on Windows)
+    my $bundledName = main::ISWINDOWS ? 'unified-hifi-control.exe' : 'unified-hifi-control';
+    my $bundledPath = catfile($pluginBinDir, $bundledName);
+
+    return (-e $bundledPath && -x _) ? $bundledPath : undef;
+}
+
+# Get bundled web assets directory (if it exists in the plugin install directory)
+sub bundledPublicDir {
+    my $class = shift;
+
+    my $pluginDir = $class->pluginDir();
+    return unless $pluginDir;
+
+    my $publicDir = catdir($pluginDir, 'public');
+    return (-d $publicDir) ? $publicDir : undef;
+}
+
 # Detect platform for binary download
 sub detectPlatform {
     my $class = shift;
@@ -97,6 +143,7 @@ sub pluginVersion {
 }
 
 # Check if binary needs download
+# Returns false if bundled binary exists or if cached binary exists
 sub needsBinaryDownload {
     my $class = shift;
 
@@ -107,14 +154,27 @@ sub needsBinaryDownload {
         return 0;
     }
 
+    # Check for bundled binary first (no download needed)
+    if ($class->bundledBin()) {
+        return 0;
+    }
+
+    # Check cached binary
     my $binaryPath = $class->bin();
     return !(-e $binaryPath && -x _);
 }
 
 # Check if web assets need download
+# Returns false if bundled public dir exists or if cached public dir exists
 sub needsWebAssetsDownload {
     my $class = shift;
 
+    # Check for bundled web assets first (no download needed)
+    if ($class->bundledPublicDir()) {
+        return 0;
+    }
+
+    # Check cached web assets
     my $publicDir = catdir($class->binDir(), 'public');
     return !(-d $publicDir);
 }
@@ -188,10 +248,18 @@ sub ensureBinary {
 sub ensureWebAssets {
     my ($class, $callback) = @_;
 
+    # Check for bundled web assets first
+    my $bundledPublic = $class->bundledPublicDir();
+    if ($bundledPublic) {
+        $log->debug("Using bundled web assets at $bundledPublic");
+        $callback->(1) if $callback;
+        return 1;
+    }
+
     my $binDir = $class->binDir();
     my $publicDir = catdir($binDir, 'public');
 
-    # Already exists
+    # Already exists in cache
     if (-d $publicDir) {
         $log->debug("Web assets already present at $publicDir");
         $callback->(1) if $callback;
@@ -395,11 +463,19 @@ sub downloadBinary {
     }
 }
 
-# Get path to the selected binary (downloads if needed for sync start)
+# Get path to the binary to use
+# Priority: 1. Bundled binary (in plugin install dir), 2. Cached binary (in LMS cache)
 sub bin {
     my $class = shift;
 
-    # Use preference or default to first available
+    # Check for bundled binary first
+    my $bundled = $class->bundledBin();
+    if ($bundled) {
+        $log->debug("Using bundled binary: $bundled");
+        return $bundled;
+    }
+
+    # Fall back to cached binary
     my $selected = $prefs->get('bin');
 
     if (!$selected) {
@@ -613,5 +689,24 @@ Plugins::UnifiedHiFi::Helper - Binary lifecycle management
 =head1 DESCRIPTION
 
 Manages the unified-hifi-control binary: spawning, monitoring, and restarting.
+
+Supports two modes of binary deployment:
+
+=over 4
+
+=item Bundled (full ZIP)
+
+The plugin ZIP includes pre-built binaries in C<Bin/> and web assets in C<public/>.
+These are used directly without any download. Used for PR testing and offline installs.
+
+=item Bootstrap (default)
+
+The plugin ZIP includes only Perl code. On first run, the binary and web assets
+are downloaded from GitHub releases and cached in the LMS cache directory.
+This is the default for release builds - smaller download, works on any platform.
+
+=back
+
+Binary lookup priority: bundled (plugin install dir) > cached (LMS cache dir).
 
 =cut
