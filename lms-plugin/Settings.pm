@@ -25,9 +25,7 @@ sub page {
 }
 
 sub prefs {
-    return ($prefs, qw(
-        autorun port bin loglevel
-    ));
+    return ($prefs, qw(autorun));
 }
 
 sub handler {
@@ -39,28 +37,6 @@ sub handler {
     }
     elsif ($params->{'stop'}) {
         Plugins::UnifiedHiFi::Helper->stop();
-    }
-
-    # Check if we need to restart the helper after saving settings
-    my $needsRestart = 0;
-    if ($params->{'saveSettings'}) {
-        if (($params->{'pref_port'} // 8088) != ($prefs->get('port') // 8088)) {
-            $needsRestart = 1;
-        }
-
-        # Check if binary changed
-        elsif (($params->{'pref_bin'} // '') ne ($prefs->get('bin') // '')) {
-            $needsRestart = 1;
-        }
-
-        elsif (($params->{'pref_loglevel'} // 'info') ne ($prefs->get('loglevel') // 'info')) {
-            $needsRestart = 1;
-        }
-
-        # Restart if running and settings changed
-        if ($needsRestart && Plugins::UnifiedHiFi::Helper->running()) {
-            $params->{needsRestart} = 1;
-        }
     }
 
     Plugins::UnifiedHiFi::Helper->knobStatus(sub {
@@ -76,23 +52,9 @@ sub handler {
 sub beforeRender {
     my ($class, $params, $client) = @_;
 
-    if ( $params->{saveSettings} && $params->{needsRestart} ) {
-        $log->info("Settings changed, restarting helper");
-        Plugins::UnifiedHiFi::Helper->stop();
-        # Always attempt start after stop to ensure service is running
-        # Small delay to allow process to fully terminate
-        Slim::Utils::Timers::setTimer(undef, time() + 1, sub {
-            Plugins::UnifiedHiFi::Helper->start();
-        });
-    }
-
     # Add template variables
     $params->{'running'}    = Plugins::UnifiedHiFi::Helper->running();
     $params->{'webUrl'}     = Plugins::UnifiedHiFi::Helper->webUrl();
-    # Single binary per platform now - dropdown only shows if size > 1 (never)
-    my $platformBinary = Plugins::UnifiedHiFi::Helper::BINARY_MAP->{Plugins::UnifiedHiFi::Helper->detectPlatform()};
-    $params->{'binaries'}   = $platformBinary ? [$platformBinary] : [];
-    $params->{'loglevels'}  = ['error', 'warn', 'info', 'debug'];
 
     # Binary download status
     $params->{'binaryStatus'}   = Plugins::UnifiedHiFi::Helper->binaryStatus();

@@ -452,8 +452,7 @@ sub _doStart {
 
     return if running();
 
-    my $port = $prefs->get('port') || 8088;
-    my $loglevel = $prefs->get('loglevel') || 'info';
+    my $port = $class->port();
 
     # Build environment for subprocess
     # Use plugin's data directory (survives plugin updates)
@@ -466,10 +465,10 @@ sub _doStart {
     my $cmd;
     if (main::ISWINDOWS) {
         # Windows: use start /B
-        $cmd = "set PORT=$port && set LOG_LEVEL=$loglevel && set CONFIG_DIR=$configDir && set LMS_HOST=127.0.0.1 && set LMS_PORT=$lmsPort && set LMS_UNIFIEDHIFI_STARTED=true && \"$binaryPath\"";
+        $cmd = "set PORT=$port && set CONFIG_DIR=$configDir && set LMS_HOST=127.0.0.1 && set LMS_PORT=$lmsPort && set LMS_UNIFIEDHIFI_STARTED=true && \"$binaryPath\"";
     } else {
         # Unix: use env and nohup with background
-        $cmd = "PORT=$port LOG_LEVEL=$loglevel CONFIG_DIR='$configDir' LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort LMS_UNIFIEDHIFI_STARTED=true nohup '$binaryPath' > /dev/null 2>&1";
+        $cmd = "PORT=$port CONFIG_DIR='$configDir' LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort LMS_UNIFIEDHIFI_STARTED=true nohup '$binaryPath' > /dev/null 2>&1";
     }
 
     $log->debug("Running: $cmd");
@@ -494,6 +493,8 @@ sub stop {
     Slim::Utils::Timers::killTimers($class, \&_resetRestarts);
 
     $helperProc && $helperProc->die;
+    $helperProc && $helperProc->wait;  # Reap process
+
     $restarts = 0;
 }
 
@@ -502,11 +503,14 @@ sub running {
     return $helperProc && $helperProc->alive;
 }
 
+sub port {
+    return $prefs->get('port') || 8088;
+}
+
 # Get the web UI URL
 sub webUrl {
     my $class = shift;
-    my $port = $prefs->get('port') || 8088;
-    return sprintf('http://%s:%d', Slim::Utils::Network::serverAddr(), $port);
+    return sprintf('http://%s:%d', Slim::Utils::Network::serverAddr(), $class->port());
 }
 
 # Health check timer callback
@@ -574,8 +578,7 @@ sub _helperAPICall {
 
     return $cb->({}) unless __PACKAGE__->running();
 
-    my $port = $prefs->get('port') || 8088;
-    my $url = "http://localhost:$port/$endpoint";
+    my $url = sprintf('http://localhost:%s/%s', __PACKAGE__->port(), $endpoint);
 
     main::DEBUGLOG && $log->is_debug && $log->debug("Calling bridge: $url");
 

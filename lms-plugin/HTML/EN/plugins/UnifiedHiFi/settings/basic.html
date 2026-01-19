@@ -5,13 +5,11 @@
     <!-- Binary download status -->
     [% IF binaryStatus == 'not_downloaded' %]
     <div class="prefDesc" style="padding: 10px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; margin-bottom: 15px;">
-        <b>&#9888; Binary Required:</b> The bridge binary for <code>[% binaryPlatform %]</code> (~75 MB)
-        will be downloaded when you click "Start Bridge".
+        [% "PLUGIN_UNIFIED_HIFI_DOWNLOAD_NEEDED" | string(binaryPlatform) %]
     </div>
     [% ELSIF binaryStatus == 'downloading' %]
     <div class="prefDesc" style="padding: 10px; background: #cce5ff; border: 1px solid #007bff; border-radius: 4px; margin-bottom: 15px;">
-        <b>&#8635; Downloading:</b> Binary for <code>[% binaryPlatform %]</code> is being downloaded...
-        <br/><small>This may take a few minutes. Page will refresh automatically.</small>
+        [% "PLUGIN_UNIFIED_HIFI_DOWNLOADING" | string(binaryPlatform) %]
         <script>setTimeout(function() { location.reload(); }, 5000);</script>
     </div>
     [% END %]
@@ -46,34 +44,6 @@
         <label for="pref_autorun">Enable auto-start</label>
     [% END %]
 
-    [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI_PORT" desc="PLUGIN_UNIFIED_HIFI_PORT_DESC" %]
-        <input type="number" name="pref_port" id="pref_port"
-               value="[% prefs.port || 8088 %]" min="1024" max="65535"
-               style="width: 80px;" />
-    [% END %]
-
-    [% IF binaries.size > 1; WRAPPER setting title="PLUGIN_UNIFIED_HIFI_BINARY" desc="PLUGIN_UNIFIED_HIFI_BINARY_DESC" %]
-        <select name="pref_bin" id="pref_bin">
-            [% FOREACH bin IN binaries %]
-                <option value="[% bin %]"
-                        [% IF prefs.bin == bin %]selected[% END %]>
-                    [% bin %]
-                </option>
-            [% END %]
-        </select>
-    [% END; END %]
-
-    [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI_LOGLEVEL" desc="PLUGIN_UNIFIED_HIFI_LOGLEVEL_DESC" %]
-        <select name="pref_loglevel" id="pref_loglevel">
-            [% FOREACH level IN loglevels %]
-                <option value="[% level %]"
-                        [% IF prefs.loglevel == level %]selected[% END %]>
-                    [% level %]
-                </option>
-            [% END %]
-        </select>
-    [% END %]
-
 <!-- Knob Configuration Section -->
     <hr/>
     [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI_KNOB" desc="" %]
@@ -94,7 +64,8 @@
             </tr>
             [% FOREACH knob = knobStatus.knobs %]
                 <tr>
-                    <td style="vertical-align: middle; padding-right: 10px">[% knob.name | html %]</td>
+                    [% knobName = knob.name || "The Knob" %]
+                    <td style="vertical-align: middle; padding-right: 10px">[% knobName | html %]</td>
                     <td style="vertical-align: middle; padding-right: 10px">[% knob.knob_id | html %]</td>
                     <td style="vertical-align: middle; padding-right: 10px">[% knob.version | html %]</td>
                     <td style="vertical-align: middle; padding-right: 10px">
@@ -106,7 +77,7 @@
                         [% END %]
                     </td>
                     <td>
-                        <input type="submit" value="[% "EDIT" | string %] &#8594;" onclick="window.open('[% webUrl %]/knobs/[% knob.knob_id | uri %]', '_blank'); return false;" />
+                        <input type="submit" value="[% "EDIT" | string %] &#8594;" onclick="window.open('[% webUrl %]/knobs', '_blank'); return false;" />
                     </td>
                 </tr>
             [% END %]

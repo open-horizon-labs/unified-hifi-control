@@ -16,12 +16,6 @@ PLUGIN_UNIFIED_HIFI_START_BRIDGE
 PLUGIN_UNIFIED_HIFI_STOP_BRIDGE
 	EN	Stop Bridge
 
-PLUGIN_UNIFIED_HIFI_PORT
-	EN	Bridge port
-
-PLUGIN_UNIFIED_HIFI_PORT_DESC
-	EN	HTTP port for the bridge web UI and API (default: 8088). Change if conflicting with HQPlayer.
-
 PLUGIN_UNIFIED_HIFI_BINARY
 	EN	Binary
 
@@ -36,12 +30,6 @@ PLUGIN_UNIFIED_HIFI_STOPPED
 
 PLUGIN_UNIFIED_HIFI_OPENUI
 	EN	Open Web UI
-
-PLUGIN_UNIFIED_HIFI_LOGLEVEL
-	EN	Log level
-
-PLUGIN_UNIFIED_HIFI_LOGLEVEL_DESC
-	EN	Set the logging verbosity for troubleshooting.
 
 PLUGIN_UNIFIED_HIFI_STATUS
 	EN	Status
@@ -63,3 +51,9 @@ PLUGIN_UNIFIED_HIFI_KNOB_BATTERY_CHARGING
 
 PLUGIN_UNIFIED_HIFI_KNOB_ID
 	EN	ID
+
+PLUGIN_UNIFIED_HIFI_DOWNLOAD_NEEDED
+	EN	<b>&#9888; Binary Required:</b> The bridge binary for <code>%s</code> will be downloaded when you click "Start Bridge".
+
+PLUGIN_UNIFIED_HIFI_DOWNLOADING
+	EN	<b>&#8635; Downloading:</b> Binary for <code>%s</code> is being downloaded... This may take a few minutes. Page will refresh automatically.
