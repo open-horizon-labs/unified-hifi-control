@@ -352,3 +352,4 @@ This adds ~14s but catches ABI issues, missing linkage, and startup crashes befo
 9. **Direct zig download**: Downloading zig directly is faster than package managers.
 
 10. **Build NAS packages directly**: Synology's toolkit downloads 1GB+ and creates unwanted debug packages. Build SPKs directly with `tar`. QNAP's qbuild is lightweight enough to use via Docker.
+# LMS Binary Bundling - WIP
