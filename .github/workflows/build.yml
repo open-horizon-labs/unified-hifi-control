@@ -493,8 +493,8 @@ jobs:
           path: dist/bin/
           retention-days: 5
 
-  build-macos:
-    name: Build macOS (universal)
+  build-macos-x64:
+    name: Build macOS (x86_64)
     needs: plan
     if: needs.plan.outputs.build_macos == 'true'
     runs-on: macos-latest
@@ -504,13 +504,15 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin,aarch64-apple-darwin
+          targets: x86_64-apple-darwin
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-x64
 
       - name: Build x86_64
         env:
@@ -518,18 +520,75 @@ jobs:
           RUSTC_WRAPPER: "sccache"
         run: cargo build --release --target x86_64-apple-darwin
 
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-macos-x64
+          path: target/x86_64-apple-darwin/release/unified-hifi-control
+          retention-days: 5
+
+  build-macos-arm64:
+    name: Build macOS (arm64)
+    needs: plan
+    if: needs.plan.outputs.build_macos == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-arm64
+
       - name: Build aarch64
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: cargo build --release --target aarch64-apple-darwin
 
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-macos-arm64
+          path: target/aarch64-apple-darwin/release/unified-hifi-control
+          retention-days: 5
+
+  build-macos-universal:
+    name: Build macOS (universal)
+    needs: [plan, build-macos-x64, build-macos-arm64]
+    if: |
+      always() &&
+      needs.plan.outputs.build_macos == 'true' &&
+      needs.build-macos-x64.result == 'success' &&
+      needs.build-macos-arm64.result == 'success'
+    runs-on: macos-latest
+    steps:
+      - name: Download x86_64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-macos-x64
+          path: x64/
+
+      - name: Download arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-macos-arm64
+          path: arm64/
+
       - name: Create universal binary with lipo
         run: |
           mkdir -p dist/bin
           lipo -create \
-            target/x86_64-apple-darwin/release/unified-hifi-control \
-            target/aarch64-apple-darwin/release/unified-hifi-control \
+            x64/unified-hifi-control \
+            arm64/unified-hifi-control \
             -output dist/bin/unified-hifi-macos-universal
           file dist/bin/unified-hifi-macos-universal
 
@@ -1139,7 +1198,7 @@ jobs:
 
   upload-release:
     name: Upload to Release
-    needs: [plan, build-linux-x64, build-linux-arm, build-macos, build-windows, build-linux-packages, build-lms-plugin, build-synology, build-qnap-x64, build-qnap-arm, build-web-assets]
+    needs: [plan, build-linux-x64, build-linux-arm, build-macos-universal, build-windows, build-linux-packages, build-lms-plugin, build-synology, build-qnap-x64, build-qnap-arm, build-web-assets]
     if: needs.plan.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -1284,7 +1343,7 @@ jobs:
       - build-linux-x64
       - build-web-assets
       - build-linux-arm
-      - build-macos
+      - build-macos-universal
       - build-windows
       - build-lms-plugin
       - build-synology
