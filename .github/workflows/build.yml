@@ -1,0 +1,1169 @@
+name: Build
+
+on:
+  pull_request:
+    branches: [master, v3]
+  push:
+    branches: [v3, 'feature/**']
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      build_lms:
+        description: 'Build LMS plugin'
+        type: boolean
+        default: false
+      build_synology:
+        description: 'Build Synology SPK'
+        type: boolean
+        default: false
+      build_qnap:
+        description: 'Build QNAP (x64)'
+        type: boolean
+        default: true
+      build_qnap_arm:
+        description: 'Build QNAP (arm64)'
+        type: boolean
+        default: false
+      build_linux_arm:
+        description: 'Build Linux ARM (arm64 + armv7)'
+        type: boolean
+        default: false
+      build_macos:
+        description: 'Build macOS universal'
+        type: boolean
+        default: false
+      build_windows:
+        description: 'Build Windows'
+        type: boolean
+        default: false
+      build_docker:
+        description: 'Build Docker (x64)'
+        type: boolean
+        default: true
+      build_linux_packages:
+        description: 'Build deb/rpm packages'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Helper to check if a build is requested via label or input
+# Labels: build:lms, build:synology, build:qnap-arm, build:linux-arm, build:macos, build:windows, build:all
+env:
+  IS_RELEASE: ${{ github.event_name == 'release' }}
+
+jobs:
+  # =============================================================================
+  # ALWAYS RUN: Lint, Test, Web Assets, Linux x64
+  # =============================================================================
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "native-build"
+          cache-all-crates: true
+          cache-on-failure: true
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "test-build"
+
+      - name: Run tests
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo test --workspace
+
+  build-web-assets:
+    name: Build Web Assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "wasm-build"
+          cache-all-crates: true
+          cache-on-failure: true
+          cache-directories: target/dx
+
+      - name: Cache Dioxus CLI
+        id: cache-dx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx
+          key: dx-cli-0.7.3
+
+      - name: Install Dioxus CLI
+        if: steps.cache-dx.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli@0.7.3 --locked
+
+      - name: Build Tailwind CSS
+        run: make css
+
+      - name: Build web assets
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: dx build --release --platform web --features web
+
+      - name: Create web assets tarball
+        if: github.event_name == 'release'
+        run: |
+          cd target/dx/unified-hifi-control/release/web
+          tar -czvf web-assets.tar.gz public/
+          mv web-assets.tar.gz ${{ github.workspace }}/
+
+      - name: Upload web assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-assets
+          path: target/dx/unified-hifi-control/release/web/public/
+          retention-days: 5
+
+      - name: Upload web assets tarball
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-assets-tarball
+          path: web-assets.tar.gz
+          retention-days: 5
+
+  build-linux-x64:
+    name: Build Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: zigbuild-x86_64-unknown-linux-musl
+
+      - name: Install zig
+        run: |
+          curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+          sudo mv zig-linux-x86_64-0.13.0 /opt/zig
+          echo "/opt/zig" >> $GITHUB_PATH
+
+      - name: Cache cargo-zigbuild
+        id: cache-zigbuild
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-0.20
+
+      - name: Install cargo-zigbuild
+        if: steps.cache-zigbuild.outputs.cache-hit != 'true'
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build with zigbuild
+        run: cargo zigbuild --release --target x86_64-unknown-linux-musl
+
+      - name: Rename binary
+        run: |
+          mkdir -p dist/bin
+          cp target/x86_64-unknown-linux-musl/release/unified-hifi-control dist/bin/unified-hifi-linux-x64
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: dist/bin/
+          retention-days: 5
+
+  # =============================================================================
+  # OPTIONAL: Linux ARM builds (label: build:linux-arm, build:all)
+  # =============================================================================
+
+  build-linux-arm:
+    name: Build Linux ARM (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'release' ||
+      contains(github.event.pull_request.labels.*.name, 'build:linux-arm') ||
+      contains(github.event.pull_request.labels.*.name, 'build:all') ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_linux_arm)
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+            output: unified-hifi-linux-arm64
+            arch: arm64
+          - target: armv7-unknown-linux-musleabihf
+            output: unified-hifi-linux-armv7
+            arch: armv7
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: zigbuild-${{ matrix.target }}
+
+      - name: Install zig
+        run: |
+          curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+          sudo mv zig-linux-x86_64-0.13.0 /opt/zig
+          echo "/opt/zig" >> $GITHUB_PATH
+
+      - name: Cache cargo-zigbuild
+        id: cache-zigbuild
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-0.20
+
+      - name: Install cargo-zigbuild
+        if: steps.cache-zigbuild.outputs.cache-hit != 'true'
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build with zigbuild
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Smoke test armv7 binary
+        if: matrix.target == 'armv7-unknown-linux-musleabihf'
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-user-static
+          qemu-arm-static ./target/${{ matrix.target }}/release/unified-hifi-control --version
+
+      - name: Rename binary
+        run: |
+          mkdir -p dist/bin
+          cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/bin/
+          retention-days: 5
+
+  # =============================================================================
+  # OPTIONAL: macOS (label: build:macos, build:all)
+  # =============================================================================
+
+  build-macos:
+    name: Build macOS (universal)
+    runs-on: macos-latest
+    if: |
+      github.event_name == 'release' ||
+      contains(github.event.pull_request.labels.*.name, 'build:macos') ||
+      contains(github.event.pull_request.labels.*.name, 'build:all') ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_macos)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build x86_64
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Build aarch64
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Create universal binary with lipo
+        run: |
+          mkdir -p dist/bin
+          lipo -create \
+            target/x86_64-apple-darwin/release/unified-hifi-control \
+            target/aarch64-apple-darwin/release/unified-hifi-control \
+            -output dist/bin/unified-hifi-macos-universal
+          file dist/bin/unified-hifi-macos-universal
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-macos-universal
+          path: dist/bin/
+          retention-days: 5
+
+  # =============================================================================
+  # OPTIONAL: Windows (label: build:windows, build:all)
+  # =============================================================================
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    if: |
+      github.event_name == 'release' ||
+      contains(github.event.pull_request.labels.*.name, 'build:windows') ||
+      contains(github.event.pull_request.labels.*.name, 'build:all') ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_windows)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo build --release
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          mkdir -p dist/bin
+          cp target/release/unified-hifi-control.exe dist/bin/unified-hifi-win64.exe
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-windows
+          path: dist/bin/
+          retention-days: 5
+
+  # =============================================================================
+  # OPTIONAL: LMS Plugin (label: build:lms, build:all)
+  # =============================================================================
+
+  build-lms-plugin:
+    name: Build LMS Plugin
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'release' ||
+      contains(github.event.pull_request.labels.*.name, 'build:lms') ||
+      contains(github.event.pull_request.labels.*.name, 'build:all') ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_lms)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update install.xml version
+        run: |
+          sed -i "s|<version>[^<]*</version>|<version>${{ steps.version.outputs.version }}</version>|" lms-plugin/install.xml
+
+      - name: Create LMS plugin ZIP
+        run: |
+          mkdir -p dist
+          cd lms-plugin
+          zip -r ../dist/lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip . \
+            -x "*.git*" \
+            -x "Bin/*"
+          mkdir -p Bin
+          echo "# Binaries downloaded on first run" > Bin/.gitkeep
+          zip -r ../dist/lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip Bin/.gitkeep
+          rm -rf Bin
+
+      - name: Repack with correct directory structure
+        run: |
+          cd dist
+          mkdir -p repack
+          unzip lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip -d repack/UnifiedHiFi
+          rm lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip
+          cd repack
+          zip -r ../lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip UnifiedHiFi
+          cd ..
+          rm -rf repack
+
+      - name: Upload LMS plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: lms-plugin
+          path: dist/lms-unified-hifi-control-*.zip
+          retention-days: 5
+
+  # =============================================================================
+  # OPTIONAL: Synology SPK (label: build:synology, build:all)
+  # =============================================================================
+
+  build-synology:
+    name: Build Synology SPK (${{ matrix.arch }})
+    needs: [build-linux-x64, build-linux-arm, build-web-assets]
+    # Needs build-linux-arm only when ARM targets are requested
+    if: |
+      always() &&
+      needs.build-linux-x64.result == 'success' &&
+      needs.build-web-assets.result == 'success' &&
+      (
+        github.event_name == 'release' ||
+        contains(github.event.pull_request.labels.*.name, 'build:synology') ||
+        contains(github.event.pull_request.labels.*.name, 'build:all') ||
+        (github.event_name == 'workflow_dispatch' && inputs.build_synology)
+      )
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: apollolake
+            target: x86_64-unknown-linux-musl
+            binary: unified-hifi-linux-x64
+          - arch: rtd1296
+            target: aarch64-unknown-linux-musl
+            binary: unified-hifi-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if ARM binary available
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          if [[ "${{ needs.build-linux-arm.result }}" != "success" ]]; then
+            echo "::warning::ARM build not available, skipping ${{ matrix.arch }}"
+            exit 1
+          fi
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: build/synology/package/
+
+      - name: Download web assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: build/synology/package/public/
+
+      - name: Rename binary
+        run: |
+          mv build/synology/package/${{ matrix.binary }} build/synology/package/unified-hifi-control
+          chmod +x build/synology/package/unified-hifi-control
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          sed -i "s/version=\"{{VERSION}}\"/version=\"$VERSION\"/" build/synology/INFO
+          sed -i "s/arch=\"{{ARCH}}\"/arch=\"${{ matrix.arch }}\"/" build/synology/INFO
+
+      - name: Build Synology SPK
+        run: |
+          cd build/synology
+          tar -czf package.tgz -C package .
+          mkdir -p ../../dist/installers
+          SPK_NAME="UnifiedHifiControl-${{ matrix.arch }}-${{ steps.version.outputs.version }}.spk"
+          tar -cf "../../dist/installers/${SPK_NAME}" \
+            INFO PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG \
+            package.tgz scripts conf WIZARD_UIFILES
+
+      - name: Upload Synology package
+        uses: actions/upload-artifact@v4
+        with:
+          name: synology-${{ matrix.arch }}
+          path: dist/installers/*.spk
+          retention-days: 5
+
+  # =============================================================================
+  # OPTIONAL: QNAP x64 (default on, label: build:qnap, build:all)
+  # =============================================================================
+
+  build-qnap-x64:
+    name: Build QNAP (x64)
+    needs: [build-linux-x64, build-web-assets]
+    if: |
+      github.event_name == 'release' ||
+      github.event_name == 'pull_request' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_qnap)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: dist/bin/
+
+      - name: Download web assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: dist/public/
+
+      - name: Make binary executable
+        run: chmod +x dist/bin/*
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Prepare QNAP package
+        run: |
+          mkdir -p qnap-build/shared
+          cp dist/bin/unified-hifi-linux-x64 qnap-build/shared/unified-hifi-control
+          chmod +x qnap-build/shared/unified-hifi-control
+          cp -r dist/public qnap-build/shared/public
+          cp build/qnap/shared/*.sh qnap-build/shared/
+          chmod +x qnap-build/shared/*.sh
+          cp -r build/qnap/shared/icons qnap-build/
+          sed "s/{{VERSION}}/${{ steps.version.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
+          echo '#!/bin/sh' > qnap-build/package_routines
+
+      - name: Build QPKG with Docker
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$(pwd)/qnap-build:/src" \
+            -w /src \
+            owncloudci/qnap-qpkg-builder@sha256:e342184e415b1df87ef00b8c1df47988ffd6a9d232a21331556067d400f06189 \
+            sh -c '/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
+
+      - name: Move QPKG to dist
+        run: |
+          mkdir -p dist/installers
+          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ steps.version.outputs.version }}_x86_64.qpkg
+
+      - name: Upload QNAP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qnap-x86_64
+          path: dist/installers/*.qpkg
+          retention-days: 5
+
+  # =============================================================================
+  # OPTIONAL: QNAP ARM (label: build:qnap-arm, build:all)
+  # =============================================================================
+
+  build-qnap-arm:
+    name: Build QNAP (arm64)
+    needs: [build-linux-arm, build-web-assets]
+    if: |
+      always() &&
+      needs.build-linux-arm.result == 'success' &&
+      needs.build-web-assets.result == 'success' &&
+      (
+        github.event_name == 'release' ||
+        contains(github.event.pull_request.labels.*.name, 'build:qnap-arm') ||
+        contains(github.event.pull_request.labels.*.name, 'build:all') ||
+        (github.event_name == 'workflow_dispatch' && inputs.build_qnap_arm)
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-aarch64-unknown-linux-musl
+          path: dist/bin/
+
+      - name: Download web assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: dist/public/
+
+      - name: Make binary executable
+        run: chmod +x dist/bin/*
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Prepare QNAP package
+        run: |
+          mkdir -p qnap-build/shared
+          cp dist/bin/unified-hifi-linux-arm64 qnap-build/shared/unified-hifi-control
+          chmod +x qnap-build/shared/unified-hifi-control
+          cp -r dist/public qnap-build/shared/public
+          cp build/qnap/shared/*.sh qnap-build/shared/
+          chmod +x qnap-build/shared/*.sh
+          cp -r build/qnap/shared/icons qnap-build/
+          sed "s/{{VERSION}}/${{ steps.version.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
+          echo '#!/bin/sh' > qnap-build/package_routines
+
+      - name: Build QPKG with Docker
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$(pwd)/qnap-build:/src" \
+            -w /src \
+            owncloudci/qnap-qpkg-builder@sha256:e342184e415b1df87ef00b8c1df47988ffd6a9d232a21331556067d400f06189 \
+            sh -c '/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
+
+      - name: Move QPKG to dist
+        run: |
+          mkdir -p dist/installers
+          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ steps.version.outputs.version }}_arm_64.qpkg
+
+      - name: Upload QNAP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qnap-arm_64
+          path: dist/installers/*.qpkg
+          retention-days: 5
+
+  # =============================================================================
+  # OPTIONAL: Docker x64 (default on for PRs)
+  # =============================================================================
+
+  build-docker-x64:
+    name: Build Docker (x64)
+    runs-on: ubuntu-latest
+    needs: [build-linux-x64, build-web-assets]
+    if: |
+      github.event_name == 'pull_request' ||
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_docker)
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: binaries/
+
+      - name: Download web assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: public/
+
+      - name: Prepare binary
+        run: |
+          mv binaries/unified-hifi-linux-x64 binaries/unified-hifi-linux-amd64
+          ls -la binaries/ public/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: muness/unified-hifi-control
+          tags: |
+            type=ref,event=pr
+            type=ref,event=branch
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.ci
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # =============================================================================
+  # RELEASE ONLY: Multi-arch Docker
+  # =============================================================================
+
+  build-docker-release:
+    name: Build Docker (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [build-linux-x64, build-linux-arm, build-web-assets]
+    if: github.event_name == 'release'
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+            binary: unified-hifi-linux-x64
+            arch: amd64
+          - platform: linux/arm64
+            target: aarch64-unknown-linux-musl
+            binary: unified-hifi-linux-arm64
+            arch: arm64
+          - platform: linux/arm/v7
+            target: armv7-unknown-linux-musleabihf
+            binary: unified-hifi-linux-armv7
+            arch: armv7
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/
+
+      - name: Download web assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: dist/public/
+
+      - name: Prepare binary
+        run: |
+          mv dist/${{ matrix.binary }} dist/unified-hifi-control
+          chmod +x dist/unified-hifi-control
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=muness/unified-hifi-control,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-${{ matrix.target }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  docker-manifest:
+    name: Create Docker Manifest
+    runs-on: ubuntu-latest
+    needs: [build-docker-release]
+    if: github.event_name == 'release'
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docker-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            muness/unified-hifi-control
+            muness/roon-extension-knob
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'muness/unified-hifi-control@sha256:%s ' *)
+
+      - name: Create manifest for legacy image name
+        working-directory: /tmp/digests
+        run: |
+          TAGS=$(jq -cr '.tags | map(select(contains("roon-extension-knob"))) | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          if [ -n "$TAGS" ]; then
+            docker buildx imagetools create $TAGS \
+              $(printf 'muness/unified-hifi-control@sha256:%s ' *)
+          fi
+
+  # =============================================================================
+  # RELEASE ONLY: Linux packages (deb/rpm)
+  # =============================================================================
+
+  build-linux-packages:
+    name: Build Linux Packages (deb/rpm)
+    needs: [build-linux-x64, build-linux-arm, build-web-assets]
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'release' ||
+      contains(github.event.pull_request.labels.*.name, 'build:linux-packages') ||
+      contains(github.event.pull_request.labels.*.name, 'build:all') ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_linux_packages)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*-linux-*
+          path: dist/bin/
+          merge-multiple: true
+
+      - name: Download web assets
+        uses: actions/download-artifact@v4
+        with:
+          name: web-assets
+          path: dist/public/
+
+      - name: Make binaries executable
+        run: chmod +x dist/bin/*
+
+      - name: Install fpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm
+          sudo gem install fpm
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build deb package (x64)
+        run: |
+          fpm -s dir -t deb \
+            -n unified-hifi-control \
+            -v ${{ steps.version.outputs.version }} \
+            --description "Source-agnostic hi-fi control bridge" \
+            --url "https://github.com/open-horizon-labs/unified-hifi-control" \
+            --license "PolyForm Noncommercial 1.0.0" \
+            -a amd64 \
+            --after-install build/linux/postinst.sh \
+            dist/bin/unified-hifi-linux-x64=/usr/bin/unified-hifi-control \
+            dist/public/=/usr/share/unified-hifi-control/public \
+            build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
+
+      - name: Build rpm package (x64)
+        run: |
+          fpm -s dir -t rpm \
+            -n unified-hifi-control \
+            -v ${{ steps.version.outputs.version }} \
+            --description "Source-agnostic hi-fi control bridge" \
+            --url "https://github.com/open-horizon-labs/unified-hifi-control" \
+            --license "PolyForm Noncommercial 1.0.0" \
+            -a x86_64 \
+            --after-install build/linux/postinst.sh \
+            dist/bin/unified-hifi-linux-x64=/usr/bin/unified-hifi-control \
+            dist/public/=/usr/share/unified-hifi-control/public \
+            build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
+
+      - name: Build deb package (arm64)
+        if: hashFiles('dist/bin/unified-hifi-linux-arm64') != ''
+        run: |
+          fpm -s dir -t deb \
+            -n unified-hifi-control \
+            -v ${{ steps.version.outputs.version }} \
+            --description "Source-agnostic hi-fi control bridge" \
+            --url "https://github.com/open-horizon-labs/unified-hifi-control" \
+            --license "PolyForm Noncommercial 1.0.0" \
+            -a arm64 \
+            --after-install build/linux/postinst.sh \
+            dist/bin/unified-hifi-linux-arm64=/usr/bin/unified-hifi-control \
+            dist/public/=/usr/share/unified-hifi-control/public \
+            build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
+
+      - name: Build deb package (armv7/armhf)
+        if: hashFiles('dist/bin/unified-hifi-linux-armv7') != ''
+        run: |
+          fpm -s dir -t deb \
+            -n unified-hifi-control \
+            -v ${{ steps.version.outputs.version }} \
+            --description "Source-agnostic hi-fi control bridge" \
+            --url "https://github.com/open-horizon-labs/unified-hifi-control" \
+            --license "PolyForm Noncommercial 1.0.0" \
+            -a armhf \
+            --after-install build/linux/postinst.sh \
+            dist/bin/unified-hifi-linux-armv7=/usr/bin/unified-hifi-control \
+            dist/public/=/usr/share/unified-hifi-control/public \
+            build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            *.deb
+            *.rpm
+          retention-days: 5
+
+  # =============================================================================
+  # RELEASE ONLY: Upload to GitHub Release
+  # =============================================================================
+
+  upload-release:
+    name: Upload to Release
+    needs: [build-linux-x64, build-linux-arm, build-macos, build-windows, build-linux-packages, build-lms-plugin, build-synology, build-qnap-x64, build-qnap-arm, build-web-assets]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Display structure
+        run: ls -R artifacts/
+
+      - name: Flatten binaries
+        run: |
+          mkdir -p release
+          find artifacts -name "unified-hifi-*" -type f \
+            ! -name "*.js" ! -name "*.wasm" \
+            -exec cp {} release/ \;
+          find artifacts -name "*.deb" -type f -exec cp {} release/ \;
+          find artifacts -name "*.rpm" -type f -exec cp {} release/ \;
+          find artifacts -name "*.zip" -type f -exec cp {} release/ \;
+          find artifacts -name "*.spk" -type f -exec cp {} release/ \;
+          find artifacts -name "*.qpkg" -type f -exec cp {} release/ \;
+          find artifacts -name "*.tar.gz" -type f -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Generate asset list
+        run: |
+          cat > release-assets.md << 'EOF'
+          ## Download Guide
+
+          ### Standalone Binaries
+          | Platform | File |
+          |----------|------|
+          | Linux x64 | `unified-hifi-linux-x64` |
+          | Linux ARM64 | `unified-hifi-linux-arm64` |
+          | Linux ARMv7 | `unified-hifi-linux-armv7` |
+          | macOS (Universal) | `unified-hifi-macos-universal` |
+          | Windows x64 | `unified-hifi-win64.exe` |
+
+          ### Linux Packages
+          - `.deb` packages for Debian/Ubuntu
+          - `.rpm` packages for Fedora/RHEL
+
+          ### NAS Packages
+          - `.spk` for Synology DSM 7+
+          - `.qpkg` for QNAP
+
+          ### LMS Plugin
+          - `lms-unified-hifi-control-*.zip` - Install via LMS Settings > Plugins
+
+          ### Web Assets
+          - `web-assets.tar.gz` - Pre-built web UI (included in packages)
+          EOF
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          append_body: true
+          body_path: release-assets.md
+
+  # =============================================================================
+  # RELEASE ONLY: Update LMS repo.xml
+  # =============================================================================
+
+  update-repo-xml:
+    name: Update LMS repo.xml
+    needs: upload-release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v3
+
+      - name: Get release version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Download LMS zip and compute SHA
+        id: sha
+        run: |
+          ZIP_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip"
+          echo "Downloading $ZIP_URL"
+          curl -fSL --retry 3 --retry-delay 5 "$ZIP_URL" -o lms-plugin.zip
+          FILE_SIZE=$(stat -c%s lms-plugin.zip 2>/dev/null || stat -f%z lms-plugin.zip)
+          if [ "$FILE_SIZE" -lt 1024 ]; then
+            echo "Error: Downloaded file too small ($FILE_SIZE bytes), expected > 1KB"
+            exit 1
+          fi
+          SHA=$(sha1sum lms-plugin.zip | cut -d' ' -f1)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Update repo.xml
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA="${{ steps.sha.outputs.sha }}"
+          REPO_URL="https://github.com/${{ github.repository }}"
+
+          cat > lms-plugin/repo.xml << 'REPOXML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <extensions>
+            <plugins>
+              <plugin name="UnifiedHiFi"
+                      version="VERSION_PLACEHOLDER"
+                      minTarget="8.0"
+                      maxTarget="*">
+                <title lang="EN">Unified Hi-Fi Control</title>
+                <desc lang="EN">Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer, and hardware knobs. Provides HTTP APIs, MQTT integration, and web UI for controlling your audio system from anywhere.</desc>
+                <url>URL_PLACEHOLDER</url>
+                <sha>SHA_PLACEHOLDER</sha>
+                <creator>Muness Castle</creator>
+                <link>https://forums.lyrion.org/forum/user-forums/3rd-party-hardware/1804977-roon-knob-includes-lms-support</link>
+              </plugin>
+            </plugins>
+          </extensions>
+          REPOXML
+
+          sed -i 's/^          //' lms-plugin/repo.xml
+          sed -i "s|VERSION_PLACEHOLDER|$VERSION|" lms-plugin/repo.xml
+          sed -i "s|URL_PLACEHOLDER|${REPO_URL}/releases/download/v${VERSION}/lms-unified-hifi-control-${VERSION}.zip|" lms-plugin/repo.xml
+          sed -i "s|SHA_PLACEHOLDER|$SHA|" lms-plugin/repo.xml
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add lms-plugin/repo.xml
+          git commit -m "chore: Update repo.xml to v${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
+          git push
+
+  # =============================================================================
+  # Build Summary
+  # =============================================================================
+
+  summary:
+    name: Build Summary
+    needs: [lint, test, build-linux-x64, build-web-assets]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+        continue-on-error: true
+
+      - name: Display build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Binaries" >> $GITHUB_STEP_SUMMARY
+          echo "| Binary | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
+          find artifacts -name 'unified-hifi-*' -type f 2>/dev/null | while read f; do
+            size=$(du -h "$f" | cut -f1)
+            name=$(basename "$f")
+            echo "| $name | $size |" >> $GITHUB_STEP_SUMMARY
+          done || echo "| (none) | - |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Packages" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|------|" >> $GITHUB_STEP_SUMMARY
+          find artifacts -name '*.qpkg' -o -name '*.spk' -o -name '*.zip' -o -name '*.deb' -o -name '*.rpm' 2>/dev/null | while read f; do
+            size=$(du -h "$f" | cut -f1)
+            name=$(basename "$f")
+            echo "| $name | $size |" >> $GITHUB_STEP_SUMMARY
+          done || echo "| (none) | - |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_Add labels to enable optional builds: build:lms, build:synology, build:qnap-arm, build:linux-arm, build:macos, build:windows, build:all_" >> $GITHUB_STEP_SUMMARY

@@ -1,10 +1,48 @@
-# GitHub Release Workflow Caching Strategy
+# GitHub Build Workflow
 
-This document explains the caching, parallelization, and artifact reuse strategies in `.github/workflows/release.yml` and `.github/workflows/pr-packages.yml`.
+This document explains the build workflow architecture in `.github/workflows/build.yml`.
 
-## Overview
+## Philosophy: Single Source of Truth
 
-The release workflow builds for 5 targets across 3 platforms, plus web assets, Docker images, and platform-specific packages. Using cargo-zigbuild enables effective caching for cross-compiled Linux targets.
+We use **one unified workflow** (`build.yml`) instead of separate PR and release workflows. This prevents:
+
+- **Drift**: Separate workflows diverge over time (different cache keys, different build steps)
+- **Duplication**: Same job definitions copied between files
+- **Testing gaps**: PR builds don't match release builds
+
+The unified workflow uses conditionals to control what runs based on trigger and labels/inputs.
+
+## Configurable Builds
+
+### For PRs: Use Labels
+
+Add labels to your PR to enable optional builds:
+
+| Label | Builds |
+|-------|--------|
+| `build:lms` | LMS plugin ZIP |
+| `build:synology` | Synology SPK (x64 + arm64) |
+| `build:qnap-arm` | QNAP arm64 package |
+| `build:linux-arm` | Linux arm64 + armv7 binaries |
+| `build:macos` | macOS universal binary |
+| `build:windows` | Windows exe |
+| `build:linux-packages` | deb/rpm packages |
+| `build:all` | Everything |
+
+**Default PR builds** (always run):
+- Lint + Tests
+- Web assets (WASM)
+- Linux x64 binary
+- QNAP x64 package
+- Docker x64 image
+
+### For Manual Runs: Use Inputs
+
+`workflow_dispatch` provides checkboxes for each optional build target.
+
+### For Releases: Everything
+
+When triggered by a GitHub release, all builds run automatically.
 
 ## Parallelization Strategy
 
@@ -21,7 +59,7 @@ Jobs are structured to maximize parallelism while respecting dependencies:
         ▼                    ▼                    ▼
 ┌───────────────┐  ┌─────────────────┐  ┌─────────────────┐
 │ build-linux   │  │  build-macos    │  │  build-windows  │
-│ (matrix: 3)   │  │  (universal)    │  │                 │
+│ (x64 + ARM)   │  │  (universal)    │  │                 │
 └───────┬───────┘  └────────┬────────┘  └────────┬────────┘
         │                   │                    │
         └───────────────────┼────────────────────┘
@@ -35,29 +73,26 @@ Jobs are structured to maximize parallelism while respecting dependencies:
                 └───────────────────────┘
 ```
 
-- **Independent jobs run in parallel**: Linux matrix (3 targets), macOS, Windows all build simultaneously
-- **Dependent jobs wait**: Docker/packages wait for binaries + web assets
+- **Independent jobs run in parallel**: All binary builds start simultaneously
+- **Dependent jobs wait**: Packaging jobs wait for binaries + web assets
+- **Optional jobs skip cleanly**: ARM builds skip if not requested, dependent jobs handle missing artifacts
 
 ## Caching Strategies
 
-### 1. rust-cache with Cross-Workflow Sharing
-
-**Key insight:** Use `shared-key` to share caches between PR builds and release builds.
+### 1. rust-cache with Shared Keys
 
 ```yaml
 - name: Cache Rust
   uses: Swatinem/rust-cache@v2
   with:
-    shared-key: "wasm-build"        # Same key in PR and release workflows
+    shared-key: "wasm-build"        # Same key across all triggers
     cache-all-crates: true          # Cache all dependencies, not just workspace
     cache-on-failure: true          # Save cache even if build fails
     cache-directories: target/dx    # Include dioxus build artifacts
 ```
 
-**Critical:** Both workflows must use **identical settings** for the same `shared-key`. Mismatched options (e.g., one has `cache-all-crates`, other doesn't) can prevent cache sharing.
-
 **Options explained:**
-- `shared-key`: Overrides job-based cache key to share across workflows/jobs
+- `shared-key`: Overrides job-based cache key to share across triggers
 - `cache-all-crates`: Caches all crates, not just workspace members (important for proc-macros)
 - `cache-on-failure`: Saves partial cache if build fails (speeds up retry)
 - `cache-directories`: Additional directories to cache (e.g., `target/dx` for dioxus)
@@ -96,24 +131,12 @@ Proc-macros (serde_derive, dioxus, thiserror) can't be cached by sccache due to 
 - No Docker image pulls (~15s saved per build)
 - Produces static musl binaries
 
-**Setup:**
 ```yaml
 - name: Install zig
   run: |
     curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
     sudo mv zig-linux-x86_64-0.13.0 /opt/zig
     echo "/opt/zig" >> $GITHUB_PATH
-
-- name: Cache cargo-zigbuild
-  id: cache-zigbuild
-  uses: actions/cache@v4
-  with:
-    path: ~/.cargo/bin/cargo-zigbuild
-    key: cargo-zigbuild-0.20
-
-- name: Install cargo-zigbuild
-  if: steps.cache-zigbuild.outputs.cache-hit != 'true'
-  run: cargo install cargo-zigbuild --locked
 
 - name: Build
   run: cargo zigbuild --release --target ${{ matrix.target }}
@@ -133,15 +156,9 @@ Proc-macros (serde_derive, dioxus, thiserror) can't be cached by sccache due to 
 
 ```yaml
 - name: Build x86_64
-  env:
-    SCCACHE_GHA_ENABLED: "true"
-    RUSTC_WRAPPER: "sccache"
   run: cargo build --release --target x86_64-apple-darwin
 
 - name: Build aarch64
-  env:
-    SCCACHE_GHA_ENABLED: "true"
-    RUSTC_WRAPPER: "sccache"
   run: cargo build --release --target aarch64-apple-darwin
 
 - name: Create universal binary
@@ -152,11 +169,8 @@ Proc-macros (serde_derive, dioxus, thiserror) can't be cached by sccache due to 
       -output unified-hifi-macos-universal
 ```
 
-Both architectures build in the same job, sharing one cache entry that contains both `target/x86_64-apple-darwin/` and `target/aarch64-apple-darwin/`.
-
 ### 5. Tool Binary Caching
 
-**Dioxus CLI and cargo-zigbuild:**
 ```yaml
 - name: Cache Dioxus CLI
   id: cache-dx
@@ -173,8 +187,6 @@ Both architectures build in the same job, sharing one cache entry that contains 
 **Why:** Tools take 2-3 minutes to compile. Caching binaries saves this on every run.
 
 ### 6. GHCR Base Images
-
-**Used by:** Dockerfile.ci, Dockerfile.release
 
 ```dockerfile
 FROM ghcr.io/linuxcontainers/alpine:3.20
@@ -251,18 +263,21 @@ spk/
 
 ## Build Matrix
 
-| Target | Caching | Build Tool | Notes |
-|--------|---------|------------|-------|
-| Web Assets (WASM) | sccache + rust-cache | dx (dioxus-cli) | shared-key: wasm-build |
-| macOS universal | sccache + rust-cache | cargo + lipo | Both archs in one job |
-| Windows x86_64 | sccache + rust-cache | cargo | Native build |
-| Linux x86_64-musl | rust-cache only | cargo-zigbuild | No sccache (zig wrapper) |
-| Linux aarch64-musl | rust-cache only | cargo-zigbuild | No sccache (zig wrapper) |
-| Linux armv7-musl | rust-cache only | cargo-zigbuild | +QEMU smoke test |
-| Docker multi-arch | N/A | pre-built binaries | Uses Dockerfile.release |
-| Synology SPK | N/A | tar | Direct archive, no toolkit |
-| QNAP QPKG | N/A | qbuild (Docker) | Uses pre-built binaries |
-| Linux deb/rpm | N/A | fpm | Uses pre-built binaries |
+| Target | Caching | Build Tool | Default | Label |
+|--------|---------|------------|---------|-------|
+| Web Assets (WASM) | sccache + rust-cache | dx | Always | - |
+| Linux x86_64-musl | rust-cache | cargo-zigbuild | Always | - |
+| Linux aarch64-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
+| Linux armv7-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
+| macOS universal | sccache + rust-cache | cargo + lipo | Release | `build:macos` |
+| Windows x86_64 | sccache + rust-cache | cargo | Release | `build:windows` |
+| Docker x64 | N/A | pre-built binary | PR/push | - |
+| Docker multi-arch | N/A | pre-built binaries | Release | - |
+| Synology SPK | N/A | tar | Release | `build:synology` |
+| QNAP x64 | N/A | qbuild (Docker) | Always | - |
+| QNAP arm64 | N/A | qbuild (Docker) | Release | `build:qnap-arm` |
+| Linux deb/rpm | N/A | fpm | Release | `build:linux-packages` |
+| LMS Plugin | N/A | zip | Release | `build:lms` |
 
 ## Smoke Testing Cross-Compiled Binaries
 
@@ -280,20 +295,22 @@ This adds ~14s but catches ABI issues, missing linkage, and startup crashes befo
 
 ## Lessons Learned
 
-1. **Align cache settings across workflows:** When using `shared-key` to share caches between PR and release workflows, ALL settings (`cache-all-crates`, `cache-on-failure`, `cache-directories`) must match. Mismatches prevent cache sharing.
+1. **Single workflow, conditional jobs**: One `build.yml` prevents drift between PR and release builds. Use `if:` conditions to control what runs.
 
-2. **sccache + rust-cache:** Use both for native builds. sccache caches `.o` files, rust-cache caches proc-macro dylibs. zigbuild jobs can only use rust-cache (sccache incompatible with zig wrapper).
+2. **Labels for PR customization**: Instead of separate "full build" workflows, use labels like `build:all` to enable extra builds when testing specific platforms.
 
-3. **Avoid containerized cross-compilation:** `cross` runs cargo in Docker containers, breaking Cargo's fingerprint caching. `cargo-zigbuild` cross-compiles without containers.
+3. **sccache + rust-cache**: Use both for native builds. sccache caches `.o` files, rust-cache caches proc-macro dylibs. zigbuild jobs can only use rust-cache (sccache incompatible with zig wrapper).
 
-4. **Universal macOS via lipo:** Build each arch with native cargo, combine with `lipo`. zigbuild can't find macOS system frameworks.
+4. **Avoid containerized cross-compilation**: `cross` runs cargo in Docker containers, breaking Cargo's fingerprint caching. `cargo-zigbuild` cross-compiles without containers.
 
-5. **QEMU for cross-arch testing:** Smoke test armv7 binaries on x86_64 runners. Catches real issues (like missing `--version` support).
+5. **Universal macOS via lipo**: Build each arch with native cargo, combine with `lipo`. zigbuild can't find macOS system frameworks.
 
-6. **Registry locality matters:** GHCR from GitHub Actions is ~10x faster than Docker Hub due to network co-location.
+6. **QEMU for cross-arch testing**: Smoke test armv7 binaries on x86_64 runners. Catches real issues.
 
-7. **Pin tool versions in cache keys:** `dx-cli-0.7.3` ensures cache invalidation when upgrading tools.
+7. **Registry locality matters**: GHCR from GitHub Actions is ~10x faster than Docker Hub.
 
-8. **Direct zig download:** Downloading zig directly is faster than using package managers or install actions that might compile from source.
+8. **Pin tool versions in cache keys**: `dx-cli-0.7.3` ensures cache invalidation when upgrading tools.
 
-9. **Build NAS packages directly:** Synology's pkgscripts-ng toolkit downloads a 1GB+ chroot and creates unwanted debug packages. Since we already have cross-compiled binaries, build SPKs directly with `tar` - it's faster and simpler. QNAP's qbuild is lightweight enough to use via Docker.
+9. **Direct zig download**: Downloading zig directly is faster than package managers.
+
+10. **Build NAS packages directly**: Synology's toolkit downloads 1GB+ and creates unwanted debug packages. Build SPKs directly with `tar`. QNAP's qbuild is lightweight enough to use via Docker.
