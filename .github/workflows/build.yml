@@ -194,8 +194,7 @@ jobs:
           TABLE_ROWS=""
 
           add_row() {
-            TABLE_ROWS="${TABLE_ROWS}| $1 | $2 |
-"
+            TABLE_ROWS="${TABLE_ROWS}| $1 | $2 |"$'\n'
             HAS_OPTIONAL="true"
           }
 
