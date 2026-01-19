@@ -226,11 +226,15 @@ jobs:
   build-linux-arm:
     name: Build Linux ARM (${{ matrix.arch }})
     runs-on: ubuntu-latest
+    # Triggered by direct label OR by downstream jobs that need ARM binaries
     if: |
       github.event_name == 'release' ||
       contains(github.event.pull_request.labels.*.name, 'build:linux-arm') ||
+      contains(github.event.pull_request.labels.*.name, 'build:qnap-arm') ||
+      contains(github.event.pull_request.labels.*.name, 'build:synology') ||
+      contains(github.event.pull_request.labels.*.name, 'build:linux-packages') ||
       contains(github.event.pull_request.labels.*.name, 'build:all') ||
-      (github.event_name == 'workflow_dispatch' && inputs.build_linux_arm)
+      (github.event_name == 'workflow_dispatch' && (inputs.build_linux_arm || inputs.build_qnap_arm || inputs.build_synology || inputs.build_linux_packages))
     strategy:
       matrix:
         include:
