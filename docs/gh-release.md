@@ -20,7 +20,8 @@ Add labels to your PR to enable optional builds:
 
 | Label | Builds |
 |-------|--------|
-| `build:lms` | LMS plugin ZIP |
+| `build:lms` | LMS plugin ZIPs (bootstrap + linux-x64 full) |
+| `build:lms-macos` | LMS plugin + macOS full ZIP (for testing on Mac) |
 | `build:synology` | Synology SPK (x64 + arm64) |
 | `build:qnap` | QNAP x64 package |
 | `build:qnap-arm` | QNAP arm64 package |
@@ -315,7 +316,8 @@ spk/
 | QNAP x64 | N/A | qbuild (Docker) | Release | `build:qnap` |
 | QNAP arm64 | N/A | qbuild (Docker) | Release | `build:qnap-arm` |
 | Linux deb/rpm | N/A | fpm | Release | `build:linux-packages` |
-| LMS Plugin | N/A | zip | Release | `build:lms` |
+| LMS Bootstrap ZIP | N/A | zip | Release | `build:lms` |
+| LMS Full ZIPs | N/A | zip + binary | Release | `build:lms` |
 
 ## Smoke Testing Cross-Compiled Binaries
 
@@ -352,4 +354,57 @@ This adds ~14s but catches ABI issues, missing linkage, and startup crashes befo
 9. **Direct zig download**: Downloading zig directly is faster than package managers.
 
 10. **Build NAS packages directly**: Synology's toolkit downloads 1GB+ and creates unwanted debug packages. Build SPKs directly with `tar`. QNAP's qbuild is lightweight enough to use via Docker.
-# LMS Binary Bundling - WIP
+
+## LMS Plugin Binary Bundling
+
+The LMS plugin supports two distribution modes:
+
+### Bootstrap ZIP (Default for Releases)
+
+**File:** `lms-unified-hifi-control-VERSION.zip`
+
+- Contains only Perl code and plugin metadata
+- Small download (~50KB)
+- On first run, downloads binary + web assets from GitHub releases
+- Works on any platform (downloads correct binary for detected architecture)
+- Requires network access on first run
+- Best for: end users who want small downloads and automatic updates
+
+### Full ZIPs (For PR Testing and Offline)
+
+**Files:** `lms-unified-hifi-control-VERSION-PLATFORM.zip`
+
+Available platforms:
+- `linux-x64` - Intel/AMD Linux servers
+- `linux-arm64` - ARM64 Linux (Raspberry Pi 4, etc.)
+- `linux-armv7` - ARMv7 Linux (Raspberry Pi 2/3, etc.)
+- `macos` - macOS (Universal binary: Intel + Apple Silicon)
+- `windows` - Windows 64-bit
+
+Characteristics:
+- Contains bundled binary in `Bin/` directory
+- Contains bundled web assets in `public/` directory
+- Larger download (~15-25MB depending on platform)
+- Works immediately without network access
+- Best for: PR testing, offline installations, air-gapped systems
+
+### Binary Lookup Priority
+
+When the LMS plugin starts, `Helper.pm` looks for binaries in this order:
+
+1. **Bundled binary** (`$pluginDir/Bin/unified-hifi-control`)
+2. **Cached binary** (`$cacheDir/UnifiedHiFi/Bin/$binaryName`)
+3. **Download** (from GitHub releases matching plugin version)
+
+If a bundled binary exists, no download is attempted. The cached location is used for bootstrap ZIPs that download on first run.
+
+### Testing LMS Changes in PRs
+
+1. Add the `build:lms` label to your PR
+2. Wait for CI to complete
+3. Download `lms-plugin-linux-x64` artifact (or appropriate platform)
+4. Install the ZIP in LMS via Settings > Plugins > Install Plugin from File
+
+For macOS testing:
+1. Add the `build:lms-macos` label instead (also triggers macOS binary build)
+2. Download `lms-plugin-macos` artifact

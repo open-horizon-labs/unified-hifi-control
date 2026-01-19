@@ -1485,7 +1485,8 @@ jobs:
       - build-linux-arm
       - build-macos-universal
       - build-windows
-      - build-lms-plugin
+      - build-lms-bootstrap
+      - build-lms-full
       - build-synology
       - build-qnap-x64
       - build-qnap-arm
