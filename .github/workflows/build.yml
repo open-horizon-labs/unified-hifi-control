@@ -83,6 +83,7 @@ jobs:
           HAS_LABEL_MACOS: ${{ contains(github.event.pull_request.labels.*.name, 'build:macos') }}
           HAS_LABEL_WINDOWS: ${{ contains(github.event.pull_request.labels.*.name, 'build:windows') }}
           HAS_LABEL_LMS: ${{ contains(github.event.pull_request.labels.*.name, 'build:lms') }}
+          HAS_LABEL_LMS_MACOS: ${{ contains(github.event.pull_request.labels.*.name, 'build:lms-macos') }}
           HAS_LABEL_SYNOLOGY: ${{ contains(github.event.pull_request.labels.*.name, 'build:synology') }}
           HAS_LABEL_QNAP: ${{ contains(github.event.pull_request.labels.*.name, 'build:qnap') }}
           HAS_LABEL_QNAP_ARM: ${{ contains(github.event.pull_request.labels.*.name, 'build:qnap-arm') }}
@@ -123,10 +124,11 @@ jobs:
           if [[ "$INPUT_LINUX_PACKAGES" == "true" ]]; then BUILD_LINUX_ARM="true"; fi
           echo "build_linux_arm=$BUILD_LINUX_ARM" >> $GITHUB_OUTPUT
 
-          # macOS
+          # macOS (also triggered by build:lms-macos)
           BUILD_MACOS="false"
           if should_build; then BUILD_MACOS="true"; fi
           if [[ "$HAS_LABEL_MACOS" == "true" ]]; then BUILD_MACOS="true"; fi
+          if [[ "$HAS_LABEL_LMS_MACOS" == "true" ]]; then BUILD_MACOS="true"; fi
           if [[ "$INPUT_MACOS" == "true" ]]; then BUILD_MACOS="true"; fi
           echo "build_macos=$BUILD_MACOS" >> $GITHUB_OUTPUT
 
@@ -137,10 +139,11 @@ jobs:
           if [[ "$INPUT_WINDOWS" == "true" ]]; then BUILD_WINDOWS="true"; fi
           echo "build_windows=$BUILD_WINDOWS" >> $GITHUB_OUTPUT
 
-          # LMS Plugin
+          # LMS Plugin (also triggered by build:lms-macos)
           BUILD_LMS="false"
           if should_build; then BUILD_LMS="true"; fi
           if [[ "$HAS_LABEL_LMS" == "true" ]]; then BUILD_LMS="true"; fi
+          if [[ "$HAS_LABEL_LMS_MACOS" == "true" ]]; then BUILD_LMS="true"; fi
           if [[ "$INPUT_LMS" == "true" ]]; then BUILD_LMS="true"; fi
           echo "build_lms=$BUILD_LMS" >> $GITHUB_OUTPUT
 
@@ -179,38 +182,92 @@ jobs:
           if [[ "$INPUT_LINUX_PACKAGES" == "true" ]]; then BUILD_LINUX_PACKAGES="true"; fi
           echo "build_linux_packages=$BUILD_LINUX_PACKAGES" >> $GITHUB_OUTPUT
 
-          # Build enabled list for annotation
-          ENABLED=""
-          [[ "$BUILD_LINUX_ARM" == "true" ]] && ENABLED="$ENABLED linux-arm"
-          [[ "$BUILD_MACOS" == "true" ]] && ENABLED="$ENABLED macos"
-          [[ "$BUILD_WINDOWS" == "true" ]] && ENABLED="$ENABLED windows"
-          [[ "$BUILD_LMS" == "true" ]] && ENABLED="$ENABLED lms"
-          [[ "$BUILD_SYNOLOGY" == "true" ]] && ENABLED="$ENABLED synology"
-          [[ "$BUILD_QNAP" == "true" ]] && ENABLED="$ENABLED qnap"
-          [[ "$BUILD_QNAP_ARM" == "true" ]] && ENABLED="$ENABLED qnap-arm"
-          [[ "$BUILD_DOCKER" == "true" ]] && ENABLED="$ENABLED docker"
-          [[ "$BUILD_LINUX_PACKAGES" == "true" ]] && ENABLED="$ENABLED linux-packages"
+          # Step summary - show label → build mapping
+          echo "### Build Plan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Default:** lint, test, web-assets, linux-x64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Workflow annotation (appears in Actions UI)
-          if [[ -n "$ENABLED" ]]; then
-            echo "::notice title=Build Plan::Optional builds enabled:$ENABLED"
-          else
-            echo "::notice title=Build Plan::Default builds only (lint, test, web-assets, linux-x64)"
+          # Collect enabled builds with their trigger
+          ENABLED_LIST=""
+          if [[ "$BUILD_LMS" == "true" ]]; then
+            if [[ "$EVENT_NAME" == "release" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| lms | release |"
+            elif [[ "$HAS_LABEL_LMS_MACOS" == "true" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| lms | build:lms-macos |"
+            elif [[ "$HAS_LABEL_LMS" == "true" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| lms | build:lms |"
+            fi
+          fi
+          if [[ "$BUILD_MACOS" == "true" ]]; then
+            if [[ "$EVENT_NAME" == "release" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| macos | release |"
+            elif [[ "$HAS_LABEL_LMS_MACOS" == "true" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| macos | build:lms-macos |"
+            elif [[ "$HAS_LABEL_MACOS" == "true" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| macos | build:macos |"
+            fi
+          fi
+          if [[ "$BUILD_LINUX_ARM" == "true" ]]; then
+            TRIGGER=""
+            [[ "$EVENT_NAME" == "release" ]] && TRIGGER="release"
+            [[ "$HAS_LABEL_LINUX_ARM" == "true" ]] && TRIGGER="build:linux-arm"
+            [[ "$HAS_LABEL_SYNOLOGY" == "true" ]] && TRIGGER="build:synology (implicit)"
+            [[ "$HAS_LABEL_QNAP_ARM" == "true" ]] && TRIGGER="build:qnap-arm (implicit)"
+            [[ "$HAS_LABEL_LINUX_PACKAGES" == "true" ]] && TRIGGER="build:linux-packages (implicit)"
+            ENABLED_LIST="$ENABLED_LIST\n| linux-arm | $TRIGGER |"
+          fi
+          if [[ "$BUILD_WINDOWS" == "true" ]]; then
+            if [[ "$EVENT_NAME" == "release" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| windows | release |"
+            elif [[ "$HAS_LABEL_WINDOWS" == "true" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| windows | build:windows |"
+            fi
+          fi
+          if [[ "$BUILD_SYNOLOGY" == "true" ]]; then
+            if [[ "$EVENT_NAME" == "release" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| synology | release |"
+            elif [[ "$HAS_LABEL_SYNOLOGY" == "true" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| synology | build:synology |"
+            fi
+          fi
+          if [[ "$BUILD_QNAP" == "true" ]]; then
+            if [[ "$EVENT_NAME" == "release" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| qnap | release |"
+            elif [[ "$HAS_LABEL_QNAP" == "true" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| qnap | build:qnap |"
+            fi
+          fi
+          if [[ "$BUILD_QNAP_ARM" == "true" ]]; then
+            if [[ "$EVENT_NAME" == "release" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| qnap-arm | release |"
+            elif [[ "$HAS_LABEL_QNAP_ARM" == "true" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| qnap-arm | build:qnap-arm |"
+            fi
+          fi
+          if [[ "$BUILD_DOCKER" == "true" ]]; then
+            if [[ "$EVENT_NAME" == "release" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| docker | release |"
+            elif [[ "$HAS_LABEL_DOCKER" == "true" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| docker | build:docker |"
+            fi
+          fi
+          if [[ "$BUILD_LINUX_PACKAGES" == "true" ]]; then
+            if [[ "$EVENT_NAME" == "release" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| linux-packages | release |"
+            elif [[ "$HAS_LABEL_LINUX_PACKAGES" == "true" ]]; then
+              ENABLED_LIST="$ENABLED_LIST\n| linux-packages | build:linux-packages |"
+            fi
           fi
 
-          # Step summary (detailed table)
-          echo "### Build Plan" >> $GITHUB_STEP_SUMMARY
-          echo "| Target | Build |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Linux ARM | $BUILD_LINUX_ARM |" >> $GITHUB_STEP_SUMMARY
-          echo "| macOS | $BUILD_MACOS |" >> $GITHUB_STEP_SUMMARY
-          echo "| Windows | $BUILD_WINDOWS |" >> $GITHUB_STEP_SUMMARY
-          echo "| LMS Plugin | $BUILD_LMS |" >> $GITHUB_STEP_SUMMARY
-          echo "| Synology | $BUILD_SYNOLOGY |" >> $GITHUB_STEP_SUMMARY
-          echo "| QNAP x64 | $BUILD_QNAP |" >> $GITHUB_STEP_SUMMARY
-          echo "| QNAP ARM | $BUILD_QNAP_ARM |" >> $GITHUB_STEP_SUMMARY
-          echo "| Docker x64 | $BUILD_DOCKER |" >> $GITHUB_STEP_SUMMARY
-          echo "| Linux Packages | $BUILD_LINUX_PACKAGES |" >> $GITHUB_STEP_SUMMARY
+          if [[ -n "$ENABLED_LIST" ]]; then
+            echo "**Optional builds enabled:**" >> $GITHUB_STEP_SUMMARY
+            echo "| Build | Triggered by |" >> $GITHUB_STEP_SUMMARY
+            echo "|-------|--------------|" >> $GITHUB_STEP_SUMMARY
+            echo -e "$ENABLED_LIST" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No optional builds enabled. Add labels like \`build:lms\`, \`build:macos\`, etc._" >> $GITHUB_STEP_SUMMARY
+          fi
 
   # =============================================================================
   # ALWAYS RUN: Lint, Test, Web Assets, Linux x64
