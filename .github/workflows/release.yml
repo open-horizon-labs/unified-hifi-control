@@ -134,23 +134,7 @@ jobs:
         run: |
           mkdir -p dist/bin
           cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
-
-      - name: Create LMS-compatible binary names
-        run: |
-          cd dist/bin
-          # Create LMS-compatible names for on-demand download
-          case "${{ matrix.output }}" in
-            unified-hifi-linux-x64)
-              cp unified-hifi-linux-x64 unified-hifi-linux-x86_64
-              ;;
-            unified-hifi-linux-arm64)
-              cp unified-hifi-linux-arm64 unified-hifi-linux-aarch64
-              ;;
-            unified-hifi-linux-armv7)
-              cp unified-hifi-linux-armv7 unified-hifi-linux-armv7l
-              ;;
-          esac
-          ls -la
+          ls -la dist/bin/
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -230,15 +214,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/bin
-          cp target/release/unified-hifi-control.exe dist/bin/unified-hifi-win-x64.exe
-
-      - name: Create LMS-compatible binary names
-        shell: bash
-        run: |
-          cd dist/bin
-          # Create LMS-compatible name for on-demand download
-          cp unified-hifi-win-x64.exe unified-hifi-win64.exe
-          ls -la
+          cp target/release/unified-hifi-control.exe dist/bin/unified-hifi-win64.exe
+          ls -la dist/bin/
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -474,15 +451,12 @@ jobs:
 
       - name: Find and copy SPK
         run: |
-          echo "=== Searching entire workspace for SPK files ==="
+          echo "=== Searching for SPK files ==="
           find $GITHUB_WORKSPACE -name "*.spk" -type f 2>/dev/null || echo "No .spk found in workspace"
-          echo "=== Checking common output locations ==="
-          ls -la ./dist/ 2>/dev/null || echo "No ./dist/"
-          ls -la /tmp/*.spk 2>/dev/null || echo "No /tmp/*.spk"
-          echo "=== Copying any found SPK files ==="
+          echo "=== Copying release SPKs (excluding debug) ==="
           mkdir -p dist/installers
-          find $GITHUB_WORKSPACE -name "*.spk" -type f -exec cp {} dist/installers/ \; 2>/dev/null || true
-          find /tmp -name "*.spk" -type f -exec cp {} dist/installers/ \; 2>/dev/null || true
+          find $GITHUB_WORKSPACE -name "*.spk" -type f ! -name "*_debug.spk" -exec cp {} dist/installers/ \; 2>/dev/null || true
+          find /tmp -name "*.spk" -type f ! -name "*_debug.spk" -exec cp {} dist/installers/ \; 2>/dev/null || true
           ls -la dist/installers/ 2>/dev/null || echo "dist/installers is empty"
 
       - name: Upload Synology package
@@ -713,19 +687,56 @@ jobs:
       - name: Flatten binaries
         run: |
           mkdir -p release
-          find artifacts -name "unified-hifi-*" -type f -exec cp {} release/ \;
+          # Copy binaries (exclude .js and .wasm - those are in web-assets.tar.gz)
+          find artifacts -name "unified-hifi-*" -type f \
+            ! -name "*.js" ! -name "*.wasm" \
+            -exec cp {} release/ \;
           find artifacts -name "*.deb" -type f -exec cp {} release/ \;
           find artifacts -name "*.rpm" -type f -exec cp {} release/ \;
           find artifacts -name "*.zip" -type f -exec cp {} release/ \;
-          find artifacts -name "*.spk" -type f -exec cp {} release/ \;
+          # Skip debug SPKs
+          find artifacts -name "*.spk" -type f ! -name "*_debug.spk" -exec cp {} release/ \;
           find artifacts -name "*.qpkg" -type f -exec cp {} release/ \;
           find artifacts -name "*.tar.gz" -type f -exec cp {} release/ \;
           ls -la release/
+
+      - name: Generate asset list
+        run: |
+          cat > release-assets.md << 'EOF'
+          ## Download Guide
+
+          ### Standalone Binaries
+          | Platform | File |
+          |----------|------|
+          | Linux x64 | `unified-hifi-linux-x64` |
+          | Linux ARM64 | `unified-hifi-linux-arm64` |
+          | Linux ARMv7 | `unified-hifi-linux-armv7` |
+          | macOS (Universal) | `unified-hifi-macos-universal` |
+          | Windows x64 | `unified-hifi-win64.exe` |
+
+          ### Linux Packages
+          - `.deb` packages for Debian/Ubuntu
+          - `.rpm` packages for Fedora/RHEL
+
+          ### NAS Packages
+          - `.spk` for Synology DSM 7+
+          - `.qpkg` for QNAP
+
+          ### LMS Plugin
+          - `lms-unified-hifi-control-*.zip` - Install via LMS Settings > Plugins
+
+          ### Web Assets
+          - `web-assets.tar.gz` - Pre-built web UI (included in packages)
+          EOF
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' release-assets.md
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
+          append_body: true
+          body_path: release-assets.md
 
   summary:
     name: Build Summary
