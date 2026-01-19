@@ -1320,3 +1320,77 @@ jobs:
           done || echo "| (none) | - |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "_Add labels to enable optional builds: build:lms, build:synology, build:qnap-arm, build:linux-arm, build:macos, build:windows, build:all_" >> $GITHUB_STEP_SUMMARY
+
+  # =============================================================================
+  # PR Comment with Artifact Links
+  # =============================================================================
+
+  pr-comment:
+    name: Post Artifact Links
+    needs: [summary]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post artifact links to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const runId = context.runId;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}`;
+
+            // Get artifacts for this run
+            const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId
+            });
+
+            // Build artifact table
+            let artifactTable = '';
+            if (artifacts.data.artifacts.length > 0) {
+              artifactTable = '| Artifact | Size |\n|----------|------|\n';
+              for (const artifact of artifacts.data.artifacts) {
+                const size = (artifact.size_in_bytes / 1024 / 1024).toFixed(1) + ' MB';
+                artifactTable += `| ${artifact.name} | ${size} |\n`;
+              }
+            } else {
+              artifactTable = '_No artifacts uploaded_';
+            }
+
+            const body = `### 📦 Build Artifacts
+
+            ${artifactTable}
+
+            [View workflow run](${runUrl}) to download artifacts.
+
+            _Updated: ${new Date().toISOString()}_`;
+
+            // Check if we already posted a comment
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+
+            const botComment = comments.data.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Build Artifacts')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body
+              });
+            }
