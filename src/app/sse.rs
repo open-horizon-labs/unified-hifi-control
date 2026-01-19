@@ -25,6 +25,14 @@ pub struct LmsPlayerPayload {
     pub player_id: String,
 }
 
+/// Payload for volume changed events
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct VolumePayload {
+    pub output_id: String,
+    pub value: f32,
+    pub is_muted: bool,
+}
+
 /// SSE event types from the server
 /// Server sends: {"type":"EventName","payload":{...}}
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -43,7 +51,7 @@ pub enum SseEvent {
         payload: ZonePayload,
     },
     VolumeChanged {
-        payload: ZonePayload,
+        payload: VolumePayload,
     },
     SeekPositionChanged {
         payload: ZonePayload,

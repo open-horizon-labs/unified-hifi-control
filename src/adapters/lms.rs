@@ -454,6 +454,8 @@ pub struct LmsStatus {
     pub port: u16,
     pub player_count: usize,
     pub players: Vec<LmsPlayerInfo>,
+    /// Whether CLI subscription is active (real-time events vs polling)
+    pub cli_subscription_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,6 +671,7 @@ impl LmsAdapter {
                     connected: p.connected,
                 })
                 .collect(),
+            cli_subscription_active: state.cli_subscription_active,
         }
     }
 

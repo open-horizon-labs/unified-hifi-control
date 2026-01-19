@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 
-use crate::app::api::{AdapterSettings, AppSettings, RoonStatus};
+use crate::app::api::{AdapterSettings, AppSettings, LmsStatus, RoonStatus};
 use crate::app::components::Layout;
 use crate::app::sse::use_sse;
 use crate::app::theme::{use_theme, Theme};
@@ -66,6 +66,11 @@ pub fn Settings() -> Element {
             .await
             .ok()
     });
+    let mut lms_status = use_resource(|| async {
+        crate::app::api::fetch_json::<LmsStatus>("/lms/status")
+            .await
+            .ok()
+    });
 
     // Refresh discovery on SSE events
     let event_count = sse.event_count;
@@ -75,6 +80,7 @@ pub fn Settings() -> Element {
             roon_status.restart();
             openhome_status.restart();
             upnp_status.restart();
+            lms_status.restart();
         }
     });
 
@@ -96,6 +102,7 @@ pub fn Settings() -> Element {
     let roon_st = roon_status.read().clone().flatten();
     let openhome_st = openhome_status.read().clone().flatten();
     let upnp_st = upnp_status.read().clone().flatten();
+    let lms_st = lms_status.read().clone().flatten();
 
     rsx! {
         Layout {
@@ -274,7 +281,7 @@ pub fn Settings() -> Element {
                                 }
                             }
                             // UPnP row
-                            tr {
+                            tr { class: "border-b border-default",
                                 td { class: "py-2 px-3", "UPnP/DLNA" }
                                 td { class: "py-2 px-3",
                                     if !upnp_enabled() {
@@ -294,6 +301,36 @@ pub fn Settings() -> Element {
                                         "-"
                                     } else if let Some(ref status) = upnp_st {
                                         "{status.renderer_count} renderer(s)"
+                                    } else {
+                                        "-"
+                                    }
+                                }
+                            }
+                            // LMS row
+                            tr {
+                                td { class: "py-2 px-3", "LMS" }
+                                td { class: "py-2 px-3",
+                                    if !lms_enabled() {
+                                        span { class: "status-disabled", "Disabled" }
+                                    } else if let Some(ref status) = lms_st {
+                                        if status.connected {
+                                            span { class: "status-ok", "✓ Connected" }
+                                        } else {
+                                            span { class: "status-err", "✗ Not connected" }
+                                        }
+                                    } else {
+                                        "Loading..."
+                                    }
+                                }
+                                td { class: "py-2 px-3 text-muted",
+                                    if !lms_enabled() {
+                                        "-"
+                                    } else if let Some(ref status) = lms_st {
+                                        if let (Some(host), Some(port)) = (&status.host, status.port) {
+                                            "{host}:{port}"
+                                        } else {
+                                            "-"
+                                        }
                                     } else {
                                         "-"
                                     }
