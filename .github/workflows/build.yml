@@ -3,6 +3,7 @@ name: Build
 on:
   pull_request:
     branches: [master, v3]
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [v3, 'feature/**']
   release:
