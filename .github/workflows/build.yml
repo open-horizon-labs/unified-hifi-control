@@ -1507,7 +1507,7 @@ jobs:
   pr-comment:
     name: Post Artifact Links
     needs: [summary]
-    if: github.event_name == 'pull_request'
+    if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
