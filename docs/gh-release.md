@@ -88,33 +88,68 @@ The GitHub Actions UI renders the full dependency DAG, showing `plan` at the roo
 Jobs are structured to maximize parallelism while respecting dependencies:
 
 ```
-                    ┌─────────────────┐
-                    │  build-web-     │
-                    │  assets         │
-                    └────────┬────────┘
-                             │
-        ┌────────────────────┼────────────────────┐
-        │                    │                    │
-        ▼                    ▼                    ▼
-┌───────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│ build-linux   │  │  build-macos    │  │  build-windows  │
-│ (x64 + ARM)   │  │  (universal)    │  │                 │
-└───────┬───────┘  └────────┬────────┘  └────────┬────────┘
-        │                   │                    │
-        └───────────────────┼────────────────────┘
-                            │
-                            ▼
-                ┌───────────────────────┐
-                │  build-docker         │
-                │  build-linux-packages │
-                │  build-synology       │
-                │  build-qnap           │
-                └───────────────────────┘
+                         ┌─────────────────┐
+                         │  build-web-     │
+                         │  assets         │
+                         └────────┬────────┘
+                                  │
+        ┌─────────────────────────┼─────────────────────────┐
+        │                         │                         │
+        ▼                         ▼                         ▼
+┌───────────────┐    ┌────────────────────────┐    ┌───────────────┐
+│ build-linux   │    │      build-macos       │    │ build-windows │
+│ (x64 + ARM)   │    │  ┌─────┐    ┌─────┐   │    │               │
+└───────┬───────┘    │  │ x64 │    │arm64│   │    └───────┬───────┘
+        │            │  └──┬──┘    └──┬──┘   │            │
+        │            │     └────┬─────┘      │            │
+        │            │          ▼            │            │
+        │            │    ┌──────────┐       │            │
+        │            │    │ universal│       │            │
+        │            │    │  (lipo)  │       │            │
+        │            │    └──────────┘       │            │
+        │            └────────────────────────┘            │
+        │                         │                        │
+        └─────────────────────────┼────────────────────────┘
+                                  │
+                                  ▼
+                     ┌───────────────────────┐
+                     │  build-docker         │
+                     │  build-linux-packages │
+                     │  build-synology       │
+                     │  build-qnap           │
+                     │  build-lms-full       │
+                     └───────────────────────┘
 ```
 
 - **Independent jobs run in parallel**: All binary builds start simultaneously
+- **macOS x64 and arm64 build in parallel**: Combined with `lipo` in a separate quick job
 - **Dependent jobs wait**: Packaging jobs wait for binaries + web assets
+- **Dynamic matrix for LMS**: Only builds platform variants whose binaries are enabled
 - **Optional jobs skip cleanly**: ARM builds skip if not requested, dependent jobs handle missing artifacts
+
+## PR Artifact Comments
+
+When a PR build completes, a bot comment is automatically posted with links to all artifacts:
+
+```markdown
+### 📦 Build Artifacts
+
+| Artifact | Size |
+|----------|------|
+| linux-x64-binary | 12.3 MB |
+| lms-plugin-linux-x64 | 15.1 MB |
+| web-assets | 2.4 MB |
+
+[View workflow run](link) to download artifacts.
+```
+
+The comment is updated on each push, so you always see the latest artifacts.
+
+## Label Triggers
+
+Adding a label to a PR triggers a new workflow run (via the `labeled` event type). This means:
+- Add `build:lms-macos` → new run starts with LMS + macOS builds enabled
+- No need to push a commit just to trigger a build with different labels
 
 ## Caching Strategies
 
@@ -189,22 +224,24 @@ Proc-macros (serde_derive, dioxus, thiserror) can't be cached by sccache due to 
     shared-key: zigbuild-${{ matrix.target }}  # Separate cache per target
 ```
 
-### 4. macOS Universal Binary (cargo + lipo)
+### 4. macOS Universal Binary (Parallel builds + lipo)
 
 **Why not zigbuild?** zigbuild can't find macOS system frameworks. Use native cargo for each arch, then combine with `lipo`.
 
+**Parallel job structure:**
+- `build-macos-x64`: Builds x86_64 binary (~1.5 min)
+- `build-macos-arm64`: Builds aarch64 binary (~1.5 min) - runs in parallel
+- `build-macos-universal`: Downloads both, combines with `lipo` (seconds)
+
+This cuts macOS build time from ~3 min (serial) to ~1.5 min (parallel).
+
 ```yaml
-- name: Build x86_64
-  run: cargo build --release --target x86_64-apple-darwin
-
-- name: Build aarch64
-  run: cargo build --release --target aarch64-apple-darwin
-
+# In build-macos-universal job:
 - name: Create universal binary
   run: |
     lipo -create \
-      target/x86_64-apple-darwin/release/unified-hifi-control \
-      target/aarch64-apple-darwin/release/unified-hifi-control \
+      x64/unified-hifi-control \
+      arm64/unified-hifi-control \
       -output unified-hifi-macos-universal
 ```
 
