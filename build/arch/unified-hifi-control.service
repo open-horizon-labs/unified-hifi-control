@@ -1,6 +1,6 @@
 [Unit]
 Description=Unified Hi-Fi Control Bridge
-Documentation=https://github.com/cloud-atlas-ai/unified-hifi-control
+Documentation=https://github.com/open-horizon-labs/unified-hifi-control
 After=network-online.target
 Wants=network-online.target
 
@@ -8,10 +8,14 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/var/lib/unified-hifi-control
 ExecStart=/usr/bin/unified-hifi-control
+Restart=always
+RestartSec=10
+
+# Environment
+Environment=PORT=8088
 Environment=CONFIG_DIR=/etc/unified-hifi-control
 Environment=DATA_DIR=/var/lib/unified-hifi-control
-Restart=on-failure
-RestartSec=5
+Environment=RUST_LOG=info
 
 # Run as dedicated user (created dynamically)
 DynamicUser=yes
@@ -26,6 +30,11 @@ PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictNamespaces=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=unified-hifi-control
 
 [Install]
 WantedBy=multi-user.target
