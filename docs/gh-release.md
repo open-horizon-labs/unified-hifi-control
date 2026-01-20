@@ -287,7 +287,11 @@ FROM ghcr.io/linuxcontainers/alpine:3.20
 
 ### 7. Web Assets Artifact Sharing
 
-Web assets (WASM + JS) are identical across all platforms. Build once, share via artifacts:
+Web assets (WASM + JS + CSS) are identical across all platforms. Build once, share via artifacts:
+
+**Build steps:**
+1. `make css` - Compiles Tailwind CSS (required before dx build)
+2. `dx build --release --platform web --features web` - Compiles Rust to WASM
 
 ```yaml
 # Build job uploads:
@@ -365,7 +369,8 @@ spk/
 | Synology SPK | N/A | tar | Release | `build:synology` |
 | QNAP x64 | N/A | qbuild (Docker) | Release | `build:qnap` |
 | QNAP arm64 | N/A | qbuild (Docker) | Release | `build:qnap-arm` |
-| Linux deb/rpm | N/A | fpm | Release | `build:linux-packages` |
+| Linux deb (x64/arm64/armv7) | N/A | fpm | Release | `build:linux-packages` |
+| Linux rpm (x64 only) | N/A | fpm | Release | `build:linux-packages` |
 | LMS Bootstrap ZIP | N/A | zip | Release | `build:lms` |
 | LMS Full ZIPs | N/A | zip + binary | Release | `build:lms` |
 
@@ -404,6 +409,8 @@ This adds ~14s but catches ABI issues, missing linkage, and startup crashes befo
 9. **Direct zig download**: Downloading zig directly is faster than package managers.
 
 10. **Build NAS packages directly**: Synology's toolkit downloads 1GB+ and creates unwanted debug packages. Build SPKs directly with `tar`. QNAP's qbuild is lightweight enough to use via Docker.
+
+11. **Conditional builds with `hashFiles`**: For jobs that conditionally build artifacts (like ARM packages when ARM binaries are available), use `if: hashFiles('path/to/file') != ''` to check if a file exists at step runtime. Combined with `always()` at job level and `merge-multiple: true` in artifact downloads, this allows graceful handling of optional dependencies.
 
 ## LMS Plugin Binary Bundling
 
