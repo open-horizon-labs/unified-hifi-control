@@ -25,9 +25,7 @@ sub page {
 }
 
 sub prefs {
-    return ($prefs, qw(
-        autorun port bin loglevel
-    ));
+    return ($prefs, qw(autorun port bin));
 }
 
 sub handler {
@@ -50,10 +48,6 @@ sub handler {
 
         # Check if binary changed
         elsif (($params->{'pref_bin'} // '') ne ($prefs->get('bin') // '')) {
-            $needsRestart = 1;
-        }
-
-        elsif (($params->{'pref_loglevel'} // 'info') ne ($prefs->get('loglevel') // 'info')) {
             $needsRestart = 1;
         }
 
@@ -92,7 +86,6 @@ sub beforeRender {
     # Single binary per platform now - dropdown only shows if size > 1 (never)
     my $platformBinary = Plugins::UnifiedHiFi::Helper::BINARY_MAP->{Plugins::UnifiedHiFi::Helper->detectPlatform()};
     $params->{'binaries'}   = $platformBinary ? [$platformBinary] : [];
-    $params->{'loglevels'}  = ['error', 'warn', 'info', 'debug'];
 
     # Binary download status
     $params->{'binaryStatus'}   = Plugins::UnifiedHiFi::Helper->binaryStatus();

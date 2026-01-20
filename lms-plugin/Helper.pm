@@ -529,7 +529,6 @@ sub _doStart {
     return if running();
 
     my $port = $prefs->get('port') || 8088;
-    my $loglevel = $prefs->get('loglevel') || 'info';
 
     # Build environment for subprocess
     # Use plugin's data directory (survives plugin updates)
@@ -546,33 +545,18 @@ sub _doStart {
     # Set environment variables for the subprocess
     # Using local ensures they're restored after Proc::Background->new() returns
     local $ENV{PORT} = $port;
-    local $ENV{LOG_LEVEL} = $loglevel;
     local $ENV{CONFIG_DIR} = $configDir;
     local $ENV{LMS_HOST} = '127.0.0.1';
     local $ENV{LMS_PORT} = $lmsPort;
     local $ENV{LMS_UNIFIEDHIFI_STARTED} = 'true';
 
-    $log->debug("Running: $binaryPath (with env: PORT=$port LOG_LEVEL=$loglevel CONFIG_DIR=$configDir LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort)");
-
-    # Handle logging based on prefs
-    my $logDest = '/dev/null';
-    if ($prefs->get('logging')) {
-        my $logFile = catfile(Slim::Utils::OSDetect::dirsFor('log'), 'unifiedhifi.log');
-
-        # Erase log on restart if enabled (prevents unbounded growth)
-        if ($prefs->get('eraselog')) {
-            unlink $logFile;
-        }
-
-        $logDest = $logFile;
-        $log->info("Bridge logging to: $logFile");
-    }
+    $log->debug("Running: $binaryPath (with env: PORT=$port CONFIG_DIR=$configDir LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort)");
 
     # Run via exec so shell replaces itself with binary (PID tracking works correctly)
     # This ensures $helperProc->die sends SIGTERM to the Bridge, not to a shell wrapper
     $helperProc = Proc::Background->new(
         { 'die_upon_destroy' => 1 },
-        "/bin/sh", "-c", "exec '$binaryPath' >> '$logDest' 2>&1"
+        "/bin/sh", "-c", "exec '$binaryPath' > /dev/null 2>&1"
     );
 
     # Schedule health checks
