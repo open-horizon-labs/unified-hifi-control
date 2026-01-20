@@ -43,6 +43,18 @@ PLUGIN_UNIFIED_HIFI_LOGLEVEL
 PLUGIN_UNIFIED_HIFI_LOGLEVEL_DESC
 	EN	Set the logging verbosity for troubleshooting.
 
+PLUGIN_UNIFIED_HIFI_LOGGING
+	EN	Bridge logging
+
+PLUGIN_UNIFIED_HIFI_LOGGING_DESC
+	EN	Write bridge output to a log file for debugging.
+
+PLUGIN_UNIFIED_HIFI_LOGGING_ENABLE
+	EN	Enable logging to file
+
+PLUGIN_UNIFIED_HIFI_ERASELOG
+	EN	Clear log on restart
+
 PLUGIN_UNIFIED_HIFI_STATUS
 	EN	Status
 

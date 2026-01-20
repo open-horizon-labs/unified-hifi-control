@@ -28,6 +28,8 @@ $prefs->init({
     port     => 8088,
     bin      => undef,
     loglevel => 'info',
+    logging  => 0,      # Write bridge output to log file (disabled by default)
+    eraselog => 1,      # Clear log file on restart (prevents unbounded growth)
 });
 
 sub initPlugin {

@@ -74,6 +74,16 @@
         </select>
     [% END %]
 
+    [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI_LOGGING" desc="PLUGIN_UNIFIED_HIFI_LOGGING_DESC" %]
+        <input type="checkbox" name="pref_logging" id="pref_logging"
+               value="1" [% IF prefs.logging %]checked[% END %] />
+        <label for="pref_logging">[% "PLUGIN_UNIFIED_HIFI_LOGGING_ENABLE" | string %]</label>
+        &nbsp;&nbsp;
+        <input type="checkbox" name="pref_eraselog" id="pref_eraselog"
+               value="1" [% IF prefs.eraselog %]checked[% END %] />
+        <label for="pref_eraselog">[% "PLUGIN_UNIFIED_HIFI_ERASELOG" | string %]</label>
+    [% END %]
+
 <!-- Knob Configuration Section -->
     <hr/>
     [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI_KNOB" desc="" %]

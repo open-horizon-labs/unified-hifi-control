@@ -552,19 +552,27 @@ sub _doStart {
     local $ENV{LMS_PORT} = $lmsPort;
     local $ENV{LMS_UNIFIEDHIFI_STARTED} = 'true';
 
-    # Log file for binary output (in LMS log directory)
-    my $logDir = Slim::Utils::OSDetect::dirsFor('log');
-    my $logFile = catfile($logDir, 'unified-hifi-control.log');
-
     $log->debug("Running: $binaryPath (with env: PORT=$port LOG_LEVEL=$loglevel CONFIG_DIR=$configDir LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort)");
-    $log->info("Bridge log file: $logFile");
+
+    # Handle logging based on prefs
+    my $logDest = '/dev/null';
+    if ($prefs->get('logging')) {
+        my $logFile = catfile(Slim::Utils::OSDetect::dirsFor('log'), 'unifiedhifi.log');
+
+        # Erase log on restart if enabled (prevents unbounded growth)
+        if ($prefs->get('eraselog')) {
+            unlink $logFile;
+        }
+
+        $logDest = $logFile;
+        $log->info("Bridge logging to: $logFile");
+    }
 
     # Run via exec so shell replaces itself with binary (PID tracking works correctly)
     # This ensures $helperProc->die sends SIGTERM to the Bridge, not to a shell wrapper
-    # Redirect stdout/stderr to log file for debugging
     $helperProc = Proc::Background->new(
         { 'die_upon_destroy' => 1 },
-        "/bin/sh", "-c", "exec '$binaryPath' >> '$logFile' 2>&1"
+        "/bin/sh", "-c", "exec '$binaryPath' >> '$logDest' 2>&1"
     );
 
     # Schedule health checks
