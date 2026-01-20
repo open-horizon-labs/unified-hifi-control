@@ -538,22 +538,33 @@ sub _doStart {
 
     $log->info("Starting Unified Hi-Fi Control: $binaryPath on port $port");
 
-    # Build command with environment variables
-    my $cmd;
-    if (main::ISWINDOWS) {
-        # Windows: use start /B
-        $cmd = "set PORT=$port && set LOG_LEVEL=$loglevel && set CONFIG_DIR=$configDir && set LMS_HOST=127.0.0.1 && set LMS_PORT=$lmsPort && set LMS_UNIFIEDHIFI_STARTED=true && \"$binaryPath\"";
-    } else {
-        # Unix: use env and nohup with background
-        $cmd = "PORT=$port LOG_LEVEL=$loglevel CONFIG_DIR='$configDir' LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort LMS_UNIFIEDHIFI_STARTED=true nohup '$binaryPath' > /dev/null 2>&1";
+    # On macOS, clear quarantine flag to prevent Gatekeeper blocking unsigned binary
+    if (Slim::Utils::OSDetect::OS() eq 'mac') {
+        system('xattr', '-cr', $binaryPath);
     }
 
-    $log->debug("Running: $cmd");
+    # Set environment variables for the subprocess
+    # Using local ensures they're restored after Proc::Background->new() returns
+    local $ENV{PORT} = $port;
+    local $ENV{LOG_LEVEL} = $loglevel;
+    local $ENV{CONFIG_DIR} = $configDir;
+    local $ENV{LMS_HOST} = '127.0.0.1';
+    local $ENV{LMS_PORT} = $lmsPort;
+    local $ENV{LMS_UNIFIEDHIFI_STARTED} = 'true';
 
-    # Run the command
+    # Log file for binary output (in LMS log directory)
+    my $logDir = Slim::Utils::OSDetect::dirsFor('log');
+    my $logFile = catfile($logDir, 'unified-hifi-control.log');
+
+    $log->debug("Running: $binaryPath (with env: PORT=$port LOG_LEVEL=$loglevel CONFIG_DIR=$configDir LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort)");
+    $log->info("Bridge log file: $logFile");
+
+    # Run via exec so shell replaces itself with binary (PID tracking works correctly)
+    # This ensures $helperProc->die sends SIGTERM to the Bridge, not to a shell wrapper
+    # Redirect stdout/stderr to log file for debugging
     $helperProc = Proc::Background->new(
         { 'die_upon_destroy' => 1 },
-        $cmd
+        "/bin/sh", "-c", "exec '$binaryPath' >> '$logFile' 2>&1"
     );
 
     # Schedule health checks

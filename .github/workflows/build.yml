@@ -776,8 +776,8 @@ jobs:
           cp ../binary/${{ matrix.binary_name }} Bin/${{ matrix.bundled_name }}
           chmod +x Bin/${{ matrix.bundled_name }}
 
-          # Copy web assets to public directory
-          cp -r ../web-assets public
+          # Copy web assets to Bin/public (Dioxus expects public/ next to binary)
+          cp -r ../web-assets Bin/public
 
           # Create ZIP with everything
           zip -r ../dist/lms-unified-hifi-control-${{ steps.version.outputs.version }}-${{ matrix.platform }}.zip . \
