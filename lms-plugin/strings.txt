@@ -75,3 +75,9 @@ PLUGIN_UNIFIED_HIFI_KNOB_BATTERY_CHARGING
 
 PLUGIN_UNIFIED_HIFI_KNOB_ID
 	EN	ID
+
+PLUGIN_UNIFIED_HIFI_DOWNLOAD_NEEDED
+	EN	<b>&#9888; Binary Required:</b> The bridge binary for <code>%s</code> will be downloaded when you click "Start Bridge".
+
+PLUGIN_UNIFIED_HIFI_DOWNLOADING
+	EN	<b>&#8635; Downloading:</b> Binary for <code>%s</code> is being downloaded... This may take a few minutes. Page will refresh automatically.

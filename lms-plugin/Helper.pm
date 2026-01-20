@@ -589,6 +589,7 @@ sub stop {
     Slim::Utils::Timers::killTimers($class, \&_resetRestarts);
 
     $helperProc && $helperProc->die;
+    $helperProc && $helperProc->wait;  # Reap zombie process
     $restarts = 0;
 }
 
