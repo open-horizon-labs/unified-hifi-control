@@ -36,6 +36,7 @@ Add labels to your PR to enable optional builds:
 - Lint + Tests
 - Fullstack build check (validates embedded assets)
 - Linux x64 binary
+- Smoke test (verifies binary boots, serves HTML with embedded CSS/JS/images)
 
 ### For Manual Runs: Use Inputs
 
@@ -209,6 +210,7 @@ Web assets (CSS, images) are **embedded directly in the binary** using Rust's `i
 |--------|---------|------------|---------|-------|
 | Fullstack Check | rust-cache | dx build --fullstack | Always | - |
 | Linux x86_64-musl | rust-cache | cargo-zigbuild | Always | - |
+| Smoke Test | N/A | curl | Always | - |
 | Linux aarch64-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
 | Linux armv7-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
 | macOS universal | sccache + rust-cache | cargo + lipo | Release | `build:macos` |

@@ -423,6 +423,87 @@ jobs:
           path: dist/bin/
           retention-days: 5
 
+  # Smoke test: verify the musl binary actually works with embedded assets
+  smoke-test:
+    name: Smoke Test Binary
+    needs: build-linux-x64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: dist/
+
+      - name: Make executable
+        run: chmod +x dist/unified-hifi-linux-x64
+
+      - name: Start server
+        run: |
+          dist/unified-hifi-linux-x64 &
+          echo $! > /tmp/server.pid
+          # Wait for server to be ready
+          for i in {1..30}; do
+            if curl -s http://localhost:8088/ > /dev/null 2>&1; then
+              echo "Server ready after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Verify HTTP response
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8088/)
+          if [ "$STATUS" != "200" ]; then
+            echo "Expected HTTP 200, got $STATUS"
+            exit 1
+          fi
+          echo "✓ HTTP 200 OK"
+
+      - name: Verify embedded assets
+        run: |
+          HTML=$(curl -s http://localhost:8088/)
+
+          # Check title
+          if ! echo "$HTML" | grep -q '<title>'; then
+            echo "Missing <title> tag"
+            exit 1
+          fi
+          echo "✓ HTML title present"
+
+          # Check embedded CSS (style tags)
+          STYLE_COUNT=$(echo "$HTML" | grep -c '<style')
+          if [ "$STYLE_COUNT" -lt 2 ]; then
+            echo "Expected 2+ <style> tags, got $STYLE_COUNT"
+            exit 1
+          fi
+          echo "✓ $STYLE_COUNT embedded CSS stylesheets"
+
+          # Check JavaScript (script tags for hydration)
+          if ! echo "$HTML" | grep -q '<script'; then
+            echo "Missing <script> tags"
+            exit 1
+          fi
+          echo "✓ JavaScript present"
+
+          # Check embedded images (base64 data URLs)
+          IMAGE_COUNT=$(echo "$HTML" | grep -c 'data:image')
+          if [ "$IMAGE_COUNT" -lt 1 ]; then
+            echo "Expected 1+ data:image URLs, got $IMAGE_COUNT"
+            exit 1
+          fi
+          echo "✓ $IMAGE_COUNT embedded images"
+
+          echo ""
+          echo "All smoke tests passed!"
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f /tmp/server.pid ]; then
+            kill $(cat /tmp/server.pid) 2>/dev/null || true
+          fi
+
   # =============================================================================
   # OPTIONAL: Controlled by plan outputs
   # =============================================================================
@@ -1422,6 +1503,7 @@ jobs:
       - test
       - fullstack-check
       - build-linux-x64
+      - smoke-test
       - build-linux-arm
       - build-macos-universal
       - build-windows
