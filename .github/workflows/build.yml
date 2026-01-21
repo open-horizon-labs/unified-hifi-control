@@ -438,6 +438,11 @@ jobs:
       - name: Make executable
         run: chmod +x dist/unified-hifi-linux-x64
 
+      - name: Create public directory
+        # Dioxus serve_dioxus_application expects a public/ directory next to the binary
+        # Even with embedded assets, this directory must exist (can be empty)
+        run: mkdir -p dist/public
+
       - name: Start server
         run: |
           export RUST_BACKTRACE=1
