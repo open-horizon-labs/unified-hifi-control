@@ -1452,6 +1452,37 @@ jobs:
           git commit -m "chore: Update repo.xml to v${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
           git push
 
+  publish-aur:
+    name: Publish to AUR
+    needs: [plan, upload-release]
+    if: needs.plan.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get release version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Update PKGBUILD version
+        run: |
+          cd build/arch
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.version.outputs.version }}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
+        with:
+          pkgname: unified-hifi-control-bin
+          pkgbuild: build/arch/PKGBUILD
+          assets: |
+            build/arch/unified-hifi-control.service
+            build/arch/unified-hifi-control.install
+          commit_username: ${{ github.actor }}
+          commit_email: ${{ github.actor }}@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to v${{ steps.version.outputs.version }}"
+
   # =============================================================================
   # Build Summary
   # =============================================================================
