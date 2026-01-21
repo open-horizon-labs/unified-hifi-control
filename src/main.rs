@@ -385,10 +385,9 @@ mod server {
             .layer(CompressionLayer::new())
             .layer(TraceLayer::new_for_http())
             .with_state(state)
-            // Dioxus fullstack app (serves UI routes with SSR + client hydration)
-            // Note: CSS and images are embedded (ADR 002), but we need serve_dioxus_application
-            // for WASM hydration to work (serve_api_application is SSR-only without client JS)
-            .serve_dioxus_application(dioxus::server::ServeConfig::new(), app::App);
+            // Dioxus fullstack app with SSR (ADR 002: single binary, no public/ directory)
+            // All CSS/images are embedded via include_str!/data URLs - no static file serving needed
+            .serve_api_application(dioxus::server::ServeConfig::new(), app::App);
 
         // Start server with graceful shutdown
         let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
