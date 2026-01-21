@@ -287,6 +287,16 @@ cargo fmt --check
 cargo clippy -- -D warnings
 ```
 
+### Verify Build (WASM + Server)
+
+To verify the full build compiles (both server and WASM client):
+
+```bash
+dx build --release
+```
+
+**Do NOT use** `cargo check --target wasm32-unknown-unknown` - this doesn't apply the correct feature flags. The dx CLI handles WASM feature configuration automatically.
+
 ## License
 
 As of v2.5.0, this project is licensed under the [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/) license.

@@ -12,12 +12,16 @@ pub fn HqpProfileSelect(
     /// Called when a profile is selected
     on_select: EventHandler<String>,
     /// Optional CSS class for the select element
-    #[props(default = "select select-bordered select-sm".to_string())]
+    #[props(default = "input".to_string())]
     class: String,
+    /// Disable the select element
+    #[props(default = false)]
+    disabled: bool,
 ) -> Element {
     rsx! {
         select {
             class: "{class}",
+            disabled: disabled,
             onchange: move |evt| {
                 let value = evt.value();
                 if !value.is_empty() {
@@ -52,12 +56,16 @@ pub fn HqpMatrixSelect(
     /// Called when a matrix profile is selected (passes the profile index)
     on_select: EventHandler<u32>,
     /// Optional CSS class for the select element
-    #[props(default = "select select-bordered select-sm".to_string())]
+    #[props(default = "input".to_string())]
     class: String,
+    /// Disable the select element
+    #[props(default = false)]
+    disabled: bool,
 ) -> Element {
     rsx! {
         select {
             class: "{class}",
+            disabled: disabled,
             onchange: move |evt| {
                 if let Ok(idx) = evt.value().parse::<u32>() {
                     on_select.call(idx);
@@ -96,7 +104,7 @@ pub fn HqpControlsCompact(
                 HqpProfileSelect {
                     profiles: profiles,
                     on_select: on_profile_select,
-                    class: "input input-sm flex-1",
+                    class: "input flex-1".to_string(),
                 }
             }
             if !matrix_profiles.is_empty() {
@@ -104,7 +112,7 @@ pub fn HqpControlsCompact(
                     profiles: matrix_profiles,
                     active: active_matrix,
                     on_select: on_matrix_select,
-                    class: "input input-sm flex-1",
+                    class: "input flex-1".to_string(),
                 }
             }
         }

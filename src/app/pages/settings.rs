@@ -34,6 +34,11 @@ pub fn Settings() -> Element {
     let mut upnp_enabled = use_signal(|| false);
     let mut hqplayer_enabled = use_signal(|| false);
 
+    // Hide tabs signals
+    let mut hide_knobs = use_signal(|| false);
+    let mut hide_hqp = use_signal(|| false);
+    let mut hide_lms = use_signal(|| false);
+
     // Load settings resource
     let settings = use_resource(|| async {
         crate::app::api::fetch_json::<AppSettings>("/api/settings")
@@ -49,6 +54,9 @@ pub fn Settings() -> Element {
             openhome_enabled.set(s.adapters.openhome);
             upnp_enabled.set(s.adapters.upnp);
             hqplayer_enabled.set(s.adapters.hqplayer);
+            hide_knobs.set(s.hide_knobs_page);
+            hide_hqp.set(s.hide_hqp_page);
+            hide_lms.set(s.hide_lms_page);
         }
     });
 
@@ -102,6 +110,9 @@ pub fn Settings() -> Element {
                 upnp: upnp_enabled(),
                 hqplayer: hqplayer_enabled(),
             },
+            hide_knobs_page: hide_knobs(),
+            hide_hqp_page: hide_hqp(),
+            hide_lms_page: hide_lms(),
         };
         spawn(async move {
             let _ = crate::app::api::post_json_no_response("/api/settings", &settings).await;
@@ -193,6 +204,58 @@ pub fn Settings() -> Element {
                     }
                     p { class: "mt-3 text-sm text-muted",
                         "Changes take effect immediately. Disabled adapters won't contribute zones."
+                    }
+                }
+            }
+
+            // Hide Tabs section
+            section { class: "mb-8",
+                div { class: "mb-4",
+                    h2 { class: "text-xl font-semibold", "Navigation" }
+                    p { class: "text-muted text-sm", "Hide pages from the navigation bar" }
+                }
+
+                div { class: "card p-6",
+                    div { class: "flex flex-wrap gap-6",
+                        label { class: "flex items-center gap-2",
+                            input {
+                                r#type: "checkbox",
+                                class: "checkbox",
+                                checked: hide_knobs(),
+                                onchange: move |_| {
+                                    hide_knobs.toggle();
+                                    save_settings();
+                                }
+                            }
+                            "Hide Knobs"
+                        }
+                        label { class: "flex items-center gap-2",
+                            input {
+                                r#type: "checkbox",
+                                class: "checkbox",
+                                checked: hide_hqp(),
+                                onchange: move |_| {
+                                    hide_hqp.toggle();
+                                    save_settings();
+                                }
+                            }
+                            "Hide HQPlayer"
+                        }
+                        label { class: "flex items-center gap-2",
+                            input {
+                                r#type: "checkbox",
+                                class: "checkbox",
+                                checked: hide_lms(),
+                                onchange: move |_| {
+                                    hide_lms.toggle();
+                                    save_settings();
+                                }
+                            }
+                            "Hide LMS"
+                        }
+                    }
+                    p { class: "mt-3 text-sm text-muted",
+                        "Hidden pages are removed from navigation but remain accessible via direct URL."
                     }
                 }
             }

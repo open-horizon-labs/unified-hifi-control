@@ -174,3 +174,5 @@ dx build --release --platform web
 - Even if it doesn't panic, no hydration = no interactivity
 
 **For development:** Use `dx serve` which handles both builds and hot reload.
+
+**Verify build:** Use `dx build --release` to verify both server and WASM compile. Do NOT use `cargo check --target wasm32-unknown-unknown` - it lacks correct feature flags. See [README.md Development section](README.md#verify-build-wasm--server) for details.

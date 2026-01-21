@@ -54,6 +54,12 @@ pub struct AdapterSettings {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AppSettings {
     pub adapters: AdapterSettings,
+    #[serde(default)]
+    pub hide_knobs_page: bool,
+    #[serde(default)]
+    pub hide_hqp_page: bool,
+    #[serde(default)]
+    pub hide_lms_page: bool,
 }
 
 // =============================================================================
@@ -122,6 +128,8 @@ pub struct HqpConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub web_port: Option<u16>,
+    #[serde(default)]
+    pub has_web_credentials: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -250,6 +258,8 @@ pub struct KnobConfig {
     // Advanced settings
     pub wifi_power_save_enabled: Option<bool>,
     pub cpu_freq_scaling_enabled: Option<bool>,
+    /// Poll interval when playback stopped (seconds)
+    pub sleep_poll_stopped_sec: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

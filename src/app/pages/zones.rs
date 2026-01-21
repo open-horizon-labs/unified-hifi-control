@@ -210,6 +210,29 @@ pub fn Zones() -> Element {
     let profiles = hqp_profiles();
     let matrix = hqp_matrix();
 
+    // Group zones by source protocol
+    let grouped_zones: Vec<(String, Vec<Zone>)> = {
+        let mut groups: std::collections::HashMap<String, Vec<Zone>> =
+            std::collections::HashMap::new();
+        for zone in zones_list.iter() {
+            let source = zone.source.clone().unwrap_or_else(|| "Other".to_string());
+            groups.entry(source).or_default().push(zone.clone());
+        }
+        // Sort groups in a sensible order: Roon, LMS, OpenHome, UPnP, then others
+        let priority = |s: &str| -> i32 {
+            match s.to_lowercase().as_str() {
+                "roon" => 0,
+                "lms" => 1,
+                "openhome" => 2,
+                "upnp" => 3,
+                _ => 4,
+            }
+        };
+        let mut result: Vec<_> = groups.into_iter().collect();
+        result.sort_by(|a, b| priority(&a.0).cmp(&priority(&b.0)));
+        result
+    };
+
     let content = if is_loading {
         rsx! {
             div { class: "card p-6", aria_busy: "true", "Loading zones..." }
@@ -220,17 +243,22 @@ pub fn Zones() -> Element {
         }
     } else {
         rsx! {
-            div { class: "zone-grid",
-                for zone in zones_list {
-                    ZoneCard {
-                        key: "{zone.zone_id}",
-                        zone: zone.clone(),
-                        now_playing: np_map.get(&zone.zone_id).cloned(),
-                        hqp_profiles: profiles.clone(),
-                        hqp_matrix: matrix.clone(),
-                        on_control: control,
-                        on_load_profile: load_profile,
-                        on_set_matrix: set_matrix,
+            for (source, group_zones) in grouped_zones {
+                div { class: "mb-8",
+                    h3 { class: "text-lg font-semibold mb-4 text-muted", "{source}" }
+                    div { class: "zone-grid",
+                        for zone in group_zones {
+                            ZoneCard {
+                                key: "{zone.zone_id}",
+                                zone: zone.clone(),
+                                now_playing: np_map.get(&zone.zone_id).cloned(),
+                                hqp_profiles: profiles.clone(),
+                                hqp_matrix: matrix.clone(),
+                                on_control: control,
+                                on_load_profile: load_profile,
+                                on_set_matrix: set_matrix,
+                            }
+                        }
                     }
                 }
             }

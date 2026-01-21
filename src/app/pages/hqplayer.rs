@@ -68,6 +68,7 @@ pub fn HqPlayer() -> Element {
     let mut web_port = use_signal(|| 8088u16);
     let mut username = use_signal(String::new);
     let mut password = use_signal(String::new);
+    let mut has_credentials = use_signal(|| false);
     let mut config_status = use_signal(|| None::<String>);
 
     // Load config resource
@@ -113,6 +114,7 @@ pub fn HqPlayer() -> Element {
             host.set(cfg.host.clone().unwrap_or_default());
             port.set(cfg.port.unwrap_or(4321));
             web_port.set(cfg.web_port.unwrap_or(8088));
+            has_credentials.set(cfg.has_web_credentials);
         }
     });
 
@@ -274,7 +276,7 @@ pub fn HqPlayer() -> Element {
                             input {
                                 class: "input",
                                 r#type: "text",
-                                placeholder: "admin",
+                                placeholder: if has_credentials() { "(saved - leave blank to keep)" } else { "admin" },
                                 value: "{username}",
                                 oninput: move |evt| username.set(evt.value())
                             }
@@ -284,13 +286,17 @@ pub fn HqPlayer() -> Element {
                             input {
                                 class: "input",
                                 r#type: "password",
-                                placeholder: "password",
+                                placeholder: if has_credentials() { "(saved - leave blank to keep)" } else { "password" },
                                 value: "{password}",
                                 oninput: move |evt| password.set(evt.value())
                             }
                         }
                     }
-                    p { class: "text-muted text-xs mb-4", "Web credentials enable profile switching via HQPlayer's web UI" }
+                    if has_credentials() {
+                        p { class: "text-muted text-xs mb-4", "✓ Credentials saved. Leave blank to keep existing, or enter new values to update." }
+                    } else {
+                        p { class: "text-muted text-xs mb-4", "Web credentials enable profile switching via HQPlayer's web UI" }
+                    }
                     div { class: "flex items-center gap-4",
                         button { class: "btn btn-primary", onclick: save_config, "Save Configuration" }
                         if let Some(ref status_msg) = config_status() {

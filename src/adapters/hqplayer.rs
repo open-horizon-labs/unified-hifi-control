@@ -463,8 +463,14 @@ impl HqpAdapter {
             state.host = Some(host);
             state.port = port;
             state.web_port = web_port.unwrap_or(DEFAULT_WEB_PORT);
-            state.web_username = web_username;
-            state.web_password = web_password;
+
+            // Only update credentials if new values are provided (preserve existing)
+            if web_username.is_some() {
+                state.web_username = web_username;
+            }
+            if web_password.is_some() {
+                state.web_password = web_password;
+            }
 
             // Reset auth state when reconfiguring
             state.digest_auth = None;

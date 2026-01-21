@@ -8,7 +8,7 @@ use crate::app::api::{
     self, FetchFirmwareResponse, FirmwareVersion, KnobConfig, KnobConfigResponse, KnobDevice,
     KnobDevicesResponse, PowerModeConfig, Zone, ZonesResponse,
 };
-use crate::app::components::{Layout, PowerModeInput};
+use crate::app::components::Layout;
 use crate::app::sse::use_sse;
 
 /// Knobs page component.
@@ -40,6 +40,10 @@ pub fn Knobs() -> Element {
         enabled: false,
         timeout_sec: 0,
     });
+    let mut deep_sleep_charging = use_signal(|| PowerModeConfig {
+        enabled: false,
+        timeout_sec: 0,
+    });
 
     // Power mode state (battery)
     let mut art_mode_battery = use_signal(|| PowerModeConfig {
@@ -54,10 +58,15 @@ pub fn Knobs() -> Element {
         enabled: true,
         timeout_sec: 60,
     });
+    let mut deep_sleep_battery = use_signal(|| PowerModeConfig {
+        enabled: true,
+        timeout_sec: 300,
+    });
 
     // Advanced power settings
     let mut wifi_power_save = use_signal(|| false);
     let mut cpu_freq_scaling = use_signal(|| false);
+    let mut sleep_poll_stopped = use_signal(|| 60u32);
 
     // Firmware fetch state
     let mut fw_fetching = use_signal(|| false);
@@ -119,6 +128,12 @@ pub fn Knobs() -> Element {
                             enabled: false,
                             timeout_sec: 0,
                         }));
+                        deep_sleep_charging.set(cfg.deep_sleep_charging.unwrap_or(
+                            PowerModeConfig {
+                                enabled: false,
+                                timeout_sec: 0,
+                            },
+                        ));
                         // Load power modes (battery)
                         art_mode_battery.set(cfg.art_mode_battery.unwrap_or(PowerModeConfig {
                             enabled: true,
@@ -132,9 +147,14 @@ pub fn Knobs() -> Element {
                             enabled: true,
                             timeout_sec: 60,
                         }));
+                        deep_sleep_battery.set(cfg.deep_sleep_battery.unwrap_or(PowerModeConfig {
+                            enabled: true,
+                            timeout_sec: 300,
+                        }));
                         // Load advanced settings
                         wifi_power_save.set(cfg.wifi_power_save_enabled.unwrap_or(false));
                         cpu_freq_scaling.set(cfg.cpu_freq_scaling_enabled.unwrap_or(false));
+                        sleep_poll_stopped.set(cfg.sleep_poll_stopped_sec.unwrap_or(60));
                     } else {
                         config_name.set(String::new());
                         config_rotation_charging.set(180);
@@ -152,6 +172,10 @@ pub fn Knobs() -> Element {
                             enabled: false,
                             timeout_sec: 0,
                         });
+                        deep_sleep_charging.set(PowerModeConfig {
+                            enabled: false,
+                            timeout_sec: 0,
+                        });
                         art_mode_battery.set(PowerModeConfig {
                             enabled: true,
                             timeout_sec: 30,
@@ -164,8 +188,13 @@ pub fn Knobs() -> Element {
                             enabled: true,
                             timeout_sec: 60,
                         });
+                        deep_sleep_battery.set(PowerModeConfig {
+                            enabled: true,
+                            timeout_sec: 300,
+                        });
                         wifi_power_save.set(false);
                         cpu_freq_scaling.set(false);
+                        sleep_poll_stopped.set(60);
                     }
                 }
                 Err(e) => {
@@ -182,16 +211,20 @@ pub fn Knobs() -> Element {
             let name = config_name();
             let rot_c = config_rotation_charging();
             let rot_nc = config_rotation_not_charging();
-            // Capture power modes
+            // Capture power modes (charging)
             let art_c = art_mode_charging();
             let dim_c = dim_charging();
             let sleep_c = sleep_charging();
+            let deep_c = deep_sleep_charging();
+            // Capture power modes (battery)
             let art_b = art_mode_battery();
             let dim_b = dim_battery();
             let sleep_b = sleep_battery();
+            let deep_b = deep_sleep_battery();
             // Capture advanced settings
             let wifi_ps = wifi_power_save();
             let cpu_fs = cpu_freq_scaling();
+            let poll_stopped = sleep_poll_stopped();
 
             save_status.set(Some("Saving...".to_string()));
 
@@ -203,13 +236,14 @@ pub fn Knobs() -> Element {
                     art_mode_charging: Some(art_c),
                     dim_charging: Some(dim_c),
                     sleep_charging: Some(sleep_c),
-                    deep_sleep_charging: None,
+                    deep_sleep_charging: Some(deep_c),
                     art_mode_battery: Some(art_b),
                     dim_battery: Some(dim_b),
                     sleep_battery: Some(sleep_b),
-                    deep_sleep_battery: None,
+                    deep_sleep_battery: Some(deep_b),
                     wifi_power_save_enabled: Some(wifi_ps),
                     cpu_freq_scaling_enabled: Some(cpu_fs),
+                    sleep_poll_stopped_sec: Some(poll_stopped),
                 };
 
                 let url = format!("/knob/config?knob_id={}", urlencoding::encode(&knob_id));
@@ -366,13 +400,16 @@ pub fn Knobs() -> Element {
                     art_mode_charging: art_mode_charging(),
                     dim_charging: dim_charging(),
                     sleep_charging: sleep_charging(),
+                    deep_sleep_charging: deep_sleep_charging(),
                     // Power modes (battery)
                     art_mode_battery: art_mode_battery(),
                     dim_battery: dim_battery(),
                     sleep_battery: sleep_battery(),
+                    deep_sleep_battery: deep_sleep_battery(),
                     // Advanced settings
                     wifi_power_save: wifi_power_save(),
                     cpu_freq_scaling: cpu_freq_scaling(),
+                    sleep_poll_stopped: sleep_poll_stopped(),
                     save_status: save_status(),
                     on_name_change: move |v| config_name.set(v),
                     on_rotation_charging_change: move |v| config_rotation_charging.set(v),
@@ -381,13 +418,16 @@ pub fn Knobs() -> Element {
                     on_art_mode_charging_change: move |v| art_mode_charging.set(v),
                     on_dim_charging_change: move |v| dim_charging.set(v),
                     on_sleep_charging_change: move |v| sleep_charging.set(v),
+                    on_deep_sleep_charging_change: move |v| deep_sleep_charging.set(v),
                     // Power mode change handlers (battery)
                     on_art_mode_battery_change: move |v| art_mode_battery.set(v),
                     on_dim_battery_change: move |v| dim_battery.set(v),
                     on_sleep_battery_change: move |v| sleep_battery.set(v),
+                    on_deep_sleep_battery_change: move |v| deep_sleep_battery.set(v),
                     // Advanced settings change handlers
                     on_wifi_power_save_change: move |v| wifi_power_save.set(v),
                     on_cpu_freq_scaling_change: move |v| cpu_freq_scaling.set(v),
+                    on_sleep_poll_stopped_change: move |v| sleep_poll_stopped.set(v),
                     on_save: save_config,
                     on_close: move |_| modal_open.set(false),
                 }
@@ -508,6 +548,36 @@ fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) 
     }
 }
 
+/// Compact power mode input for side-by-side layout
+#[component]
+fn PowerModeInputCompact(
+    label: &'static str,
+    config: PowerModeConfig,
+    on_change: EventHandler<PowerModeConfig>,
+) -> Element {
+    let timeout_sec = config.timeout_sec;
+    rsx! {
+        div { class: "flex items-center justify-between gap-2 py-1",
+            span { class: "text-sm", "{label}" }
+            div { class: "flex items-center gap-1",
+                input {
+                    class: "input w-16 text-center text-sm py-1",
+                    r#type: "number",
+                    min: "0",
+                    max: "3600",
+                    value: "{timeout_sec}",
+                    oninput: move |e| {
+                        if let Ok(v) = e.value().parse::<u32>() {
+                            on_change.call(PowerModeConfig { enabled: v > 0, timeout_sec: v });
+                        }
+                    }
+                }
+                span { class: "text-xs text-muted", "s" }
+            }
+        }
+    }
+}
+
 /// Config modal component
 #[component]
 fn ConfigModal(
@@ -519,13 +589,16 @@ fn ConfigModal(
     art_mode_charging: PowerModeConfig,
     dim_charging: PowerModeConfig,
     sleep_charging: PowerModeConfig,
+    deep_sleep_charging: PowerModeConfig,
     // Power modes (battery)
     art_mode_battery: PowerModeConfig,
     dim_battery: PowerModeConfig,
     sleep_battery: PowerModeConfig,
+    deep_sleep_battery: PowerModeConfig,
     // Advanced settings
     wifi_power_save: bool,
     cpu_freq_scaling: bool,
+    sleep_poll_stopped: u32,
     save_status: Option<String>,
     on_name_change: EventHandler<String>,
     on_rotation_charging_change: EventHandler<i32>,
@@ -534,13 +607,16 @@ fn ConfigModal(
     on_art_mode_charging_change: EventHandler<PowerModeConfig>,
     on_dim_charging_change: EventHandler<PowerModeConfig>,
     on_sleep_charging_change: EventHandler<PowerModeConfig>,
+    on_deep_sleep_charging_change: EventHandler<PowerModeConfig>,
     // Power mode change handlers (battery)
     on_art_mode_battery_change: EventHandler<PowerModeConfig>,
     on_dim_battery_change: EventHandler<PowerModeConfig>,
     on_sleep_battery_change: EventHandler<PowerModeConfig>,
+    on_deep_sleep_battery_change: EventHandler<PowerModeConfig>,
     // Advanced settings change handlers
     on_wifi_power_save_change: EventHandler<bool>,
     on_cpu_freq_scaling_change: EventHandler<bool>,
+    on_sleep_poll_stopped_change: EventHandler<u32>,
     on_save: EventHandler<()>,
     on_close: EventHandler<()>,
 ) -> Element {
@@ -550,7 +626,7 @@ fn ConfigModal(
             onclick: move |_| on_close.call(()),
 
             div {
-                class: "card p-6 max-w-2xl w-full mx-4 max-h-[90vh] overflow-y-auto",
+                class: "card p-6 max-w-3xl w-full mx-4 max-h-[90vh] overflow-y-auto",
                 onclick: move |e| e.stop_propagation(),
 
                 // Header
@@ -584,90 +660,98 @@ fn ConfigModal(
                             }
                         }
 
+                        // Power Settings - Side by Side (includes rotation)
                         fieldset { class: "mb-6",
-                            legend { class: "text-sm font-medium mb-2", "Display Rotation" }
-                            div { class: "form-grid",
-                                div {
-                                    label { class: "block text-sm text-muted mb-1", "Charging" }
-                                    select {
-                                        class: "input",
-                                        value: "{rotation_charging}",
-                                        onchange: move |e| {
-                                            if let Ok(v) = e.value().parse() {
-                                                on_rotation_charging_change.call(v);
+                            legend { class: "text-sm font-medium mb-2", "Display & Power Settings" }
+                            p { class: "text-sm text-muted mb-3", "Timeout values in seconds. Set 0 to disable." }
+
+                            div { class: "grid grid-cols-2 gap-6",
+                                // Charging column
+                                div { class: "bg-elevated rounded-lg p-4",
+                                    h4 { class: "text-sm font-semibold mb-3 flex items-center gap-2",
+                                        "⚡ Charging"
+                                    }
+                                    div { class: "space-y-2",
+                                        // Rotation
+                                        div { class: "flex items-center justify-between gap-2 py-1",
+                                            span { class: "text-sm", "Rotation" }
+                                            select {
+                                                class: "input w-20 text-center text-sm py-1",
+                                                value: "{rotation_charging}",
+                                                onchange: move |e| {
+                                                    if let Ok(v) = e.value().parse() {
+                                                        on_rotation_charging_change.call(v);
+                                                    }
+                                                },
+                                                option { value: "0", selected: rotation_charging == 0, "0°" }
+                                                option { value: "180", selected: rotation_charging == 180, "180°" }
                                             }
-                                        },
-                                        option { value: "0", selected: rotation_charging == 0, "0°" }
-                                        option { value: "180", selected: rotation_charging == 180, "180°" }
+                                        }
+                                        PowerModeInputCompact {
+                                            label: "Art Mode",
+                                            config: art_mode_charging.clone(),
+                                            on_change: on_art_mode_charging_change,
+                                        }
+                                        PowerModeInputCompact {
+                                            label: "Dim Display",
+                                            config: dim_charging.clone(),
+                                            on_change: on_dim_charging_change,
+                                        }
+                                        PowerModeInputCompact {
+                                            label: "Sleep",
+                                            config: sleep_charging.clone(),
+                                            on_change: on_sleep_charging_change,
+                                        }
+                                        PowerModeInputCompact {
+                                            label: "Deep Sleep",
+                                            config: deep_sleep_charging.clone(),
+                                            on_change: on_deep_sleep_charging_change,
+                                        }
                                     }
                                 }
-                                div {
-                                    label { class: "block text-sm text-muted mb-1", "Battery" }
-                                    select {
-                                        class: "input",
-                                        value: "{rotation_not_charging}",
-                                        onchange: move |e| {
-                                            if let Ok(v) = e.value().parse() {
-                                                on_rotation_not_charging_change.call(v);
-                                            }
-                                        },
-                                        option { value: "0", selected: rotation_not_charging == 0, "0°" }
-                                        option { value: "180", selected: rotation_not_charging == 180, "180°" }
+
+                                // Battery column
+                                div { class: "bg-elevated rounded-lg p-4",
+                                    h4 { class: "text-sm font-semibold mb-3 flex items-center gap-2",
+                                        "🔋 Battery"
                                     }
-                                }
-                            }
-                        }
-
-                        // Power Settings (Charging)
-                        fieldset { class: "mb-6",
-                            legend { class: "text-sm font-medium mb-2", "Power Settings (Charging)" }
-                            p { class: "text-sm text-muted mb-3", "Timeouts when connected to power. Set 0 to disable." }
-
-                            div { class: "space-y-3",
-                                PowerModeInput {
-                                    label: "Art Mode",
-                                    description: "Show album art only",
-                                    config: art_mode_charging.clone(),
-                                    on_change: on_art_mode_charging_change,
-                                }
-                                PowerModeInput {
-                                    label: "Dim Display",
-                                    description: "Reduce brightness",
-                                    config: dim_charging.clone(),
-                                    on_change: on_dim_charging_change,
-                                }
-                                PowerModeInput {
-                                    label: "Sleep",
-                                    description: "Turn off display",
-                                    config: sleep_charging.clone(),
-                                    on_change: on_sleep_charging_change,
-                                }
-                            }
-                        }
-
-                        // Power Settings (Battery)
-                        fieldset { class: "mb-6",
-                            legend { class: "text-sm font-medium mb-2", "Power Settings (Battery)" }
-                            p { class: "text-sm text-muted mb-3", "Timeouts when on battery power." }
-
-                            div { class: "space-y-3",
-                                PowerModeInput {
-                                    label: "Art Mode",
-                                    description: "Show album art only",
-                                    config: art_mode_battery.clone(),
-                                    on_change: on_art_mode_battery_change,
-                                }
-                                PowerModeInput {
-                                    label: "Dim Display",
-                                    description: "Reduce brightness",
-                                    config: dim_battery.clone(),
-                                    on_change: on_dim_battery_change,
-                                }
-                                PowerModeInput {
-                                    label: "Sleep",
-                                    description: "Turn off display",
-                                    config: sleep_battery.clone(),
-                                    on_change: on_sleep_battery_change,
+                                    div { class: "space-y-2",
+                                        // Rotation
+                                        div { class: "flex items-center justify-between gap-2 py-1",
+                                            span { class: "text-sm", "Rotation" }
+                                            select {
+                                                class: "input w-20 text-center text-sm py-1",
+                                                value: "{rotation_not_charging}",
+                                                onchange: move |e| {
+                                                    if let Ok(v) = e.value().parse() {
+                                                        on_rotation_not_charging_change.call(v);
+                                                    }
+                                                },
+                                                option { value: "0", selected: rotation_not_charging == 0, "0°" }
+                                                option { value: "180", selected: rotation_not_charging == 180, "180°" }
+                                            }
+                                        }
+                                        PowerModeInputCompact {
+                                            label: "Art Mode",
+                                            config: art_mode_battery.clone(),
+                                            on_change: on_art_mode_battery_change,
+                                        }
+                                        PowerModeInputCompact {
+                                            label: "Dim Display",
+                                            config: dim_battery.clone(),
+                                            on_change: on_dim_battery_change,
+                                        }
+                                        PowerModeInputCompact {
+                                            label: "Sleep",
+                                            config: sleep_battery.clone(),
+                                            on_change: on_sleep_battery_change,
+                                        }
+                                        PowerModeInputCompact {
+                                            label: "Deep Sleep",
+                                            config: deep_sleep_battery.clone(),
+                                            on_change: on_deep_sleep_battery_change,
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -675,7 +759,6 @@ fn ConfigModal(
                         // Advanced Settings
                         fieldset { class: "mb-6",
                             legend { class: "text-sm font-medium mb-2", "Advanced Settings" }
-                            p { class: "text-sm text-muted mb-3", "Performance and power optimization." }
 
                             div { class: "space-y-3",
                                 label { class: "flex items-center gap-3",
@@ -700,6 +783,27 @@ fn ConfigModal(
                                     div {
                                         span { class: "block text-sm font-medium", "CPU Frequency Scaling" }
                                         span { class: "block text-xs text-muted", "Dynamically adjust CPU frequency to save power" }
+                                    }
+                                }
+                                div { class: "flex items-center gap-4",
+                                    div { class: "flex-1",
+                                        span { class: "block text-sm font-medium", "Sleep Poll Interval" }
+                                        span { class: "block text-xs text-muted", "How often to check for updates when in sleep mode" }
+                                    }
+                                    div { class: "flex items-center gap-2",
+                                        input {
+                                            class: "input w-20 text-center",
+                                            r#type: "number",
+                                            min: "10",
+                                            max: "600",
+                                            value: "{sleep_poll_stopped}",
+                                            oninput: move |e| {
+                                                if let Ok(v) = e.value().parse::<u32>() {
+                                                    on_sleep_poll_stopped_change.call(v);
+                                                }
+                                            }
+                                        }
+                                        span { class: "text-sm text-muted", "sec" }
                                     }
                                 }
                             }

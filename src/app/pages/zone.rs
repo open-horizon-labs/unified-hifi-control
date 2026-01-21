@@ -5,7 +5,8 @@
 use dioxus::prelude::*;
 
 use crate::app::api::{
-    HqpMatrixProfilesResponse, HqpPipeline, HqpProfile, NowPlaying, Zone as ZoneData, ZonesResponse,
+    HqpMatrixProfilesResponse, HqpPipeline, HqpProfile, HqpStatus, NowPlaying, Zone as ZoneData,
+    ZonesResponse,
 };
 use crate::app::components::{ErrorAlert, HqpMatrixSelect, HqpProfileSelect, Layout};
 use crate::app::sse::use_sse;
@@ -52,6 +53,8 @@ pub fn Zone() -> Element {
     let mut hqp_profiles = use_signal(Vec::<HqpProfile>::new);
     let mut hqp_matrix = use_signal(|| None::<HqpMatrixProfilesResponse>);
     let mut hqp_error = use_signal(|| None::<String>);
+    let mut hqp_status = use_signal(|| None::<HqpStatus>);
+    let mut hqp_loading = use_signal(|| false);
 
     // Restore selected zone from localStorage on mount
     use_effect(move || {
@@ -86,6 +89,12 @@ pub fn Zone() -> Element {
                             .map(|d| d.r#type.as_deref() == Some("hqplayer"))
                             .unwrap_or(false)
                         {
+                            // Fetch HQP status
+                            if let Ok(status) =
+                                crate::app::api::fetch_json::<HqpStatus>("/hqplayer/status").await
+                            {
+                                hqp_status.set(Some(status));
+                            }
                             // Fetch pipeline
                             if let Ok(pipeline) =
                                 crate::app::api::fetch_json::<HqpPipeline>("/hqp/pipeline").await
@@ -112,6 +121,7 @@ pub fn Zone() -> Element {
                             hqp_pipeline.set(None);
                             hqp_profiles.set(Vec::new());
                             hqp_matrix.set(None);
+                            hqp_status.set(None);
                         }
                     }
                 }
@@ -121,6 +131,7 @@ pub fn Zone() -> Element {
             hqp_pipeline.set(None);
             hqp_profiles.set(Vec::new());
             hqp_matrix.set(None);
+            hqp_status.set(None);
         }
     });
 
@@ -168,6 +179,7 @@ pub fn Zone() -> Element {
     // Pipeline setting handler
     let set_pipeline = move |(setting, value): (String, String)| {
         hqp_error.set(None);
+        hqp_loading.set(true);
         spawn(async move {
             #[derive(serde::Serialize)]
             struct PipelineRequest {
@@ -185,12 +197,14 @@ pub fn Zone() -> Element {
                     hqp_pipeline.set(Some(pipeline));
                 }
             }
+            hqp_loading.set(false);
         });
     };
 
     // Load profile handler
     let load_profile = move |profile: String| {
         hqp_error.set(None);
+        hqp_loading.set(true);
         spawn(async move {
             #[derive(serde::Serialize)]
             struct ProfileRequest {
@@ -208,12 +222,14 @@ pub fn Zone() -> Element {
                     hqp_pipeline.set(Some(pipeline));
                 }
             }
+            hqp_loading.set(false);
         });
     };
 
     // Set matrix profile handler
     let set_matrix_profile = move |profile_idx: u32| {
         hqp_error.set(None);
+        hqp_loading.set(true);
         spawn(async move {
             #[derive(serde::Serialize)]
             struct MatrixRequest {
@@ -236,6 +252,7 @@ pub fn Zone() -> Element {
                     hqp_matrix.set(Some(matrix));
                 }
             }
+            hqp_loading.set(false);
         });
     };
 
@@ -330,6 +347,8 @@ pub fn Zone() -> Element {
                     pipeline: hqp_pipeline(),
                     profiles: hqp_profiles(),
                     matrix: hqp_matrix(),
+                    status: hqp_status(),
+                    loading: hqp_loading(),
                     on_set_pipeline: set_pipeline,
                     on_load_profile: load_profile,
                     on_set_matrix: set_matrix_profile,
@@ -349,6 +368,13 @@ fn ZoneDisplay(
     let np = now_playing.as_ref();
     let is_playing = np.map(|n| n.is_playing).unwrap_or(false);
     let play_icon = if is_playing { "⏸︎" } else { "▶" };
+
+    // Check if zone has HQPlayer DSP
+    let has_hqp = zone
+        .dsp
+        .as_ref()
+        .map(|d| d.r#type.as_deref() == Some("hqplayer"))
+        .unwrap_or(false);
 
     let (track, artist, album) = np
         .map(|n| {
@@ -404,7 +430,15 @@ fn ZoneDisplay(
                     class: "w-[200px] h-[200px] object-cover rounded-lg bg-elevated"
                 }
                 div { class: "flex-1 min-w-[200px]",
-                    h2 { id: "zone-name", class: "mb-1", "{zone.zone_name}" }
+                    h2 { id: "zone-name", class: "mb-1 flex items-center gap-2",
+                        "{zone.zone_name}"
+                        if has_hqp {
+                            span { class: "badge badge-primary text-sm", "HQP" }
+                        }
+                        if let Some(ref source) = zone.source {
+                            span { class: "badge badge-secondary text-sm", "{source}" }
+                        }
+                    }
                     p { class: "m-0",
                         small { if is_playing { "playing" } else { "stopped" } }
                     }
@@ -469,6 +503,8 @@ fn HqpSection(
     pipeline: Option<HqpPipeline>,
     profiles: Vec<HqpProfile>,
     matrix: Option<HqpMatrixProfilesResponse>,
+    status: Option<HqpStatus>,
+    loading: bool,
     on_set_pipeline: EventHandler<(String, String)>,
     on_load_profile: EventHandler<String>,
     on_set_matrix: EventHandler<u32>,
@@ -505,48 +541,77 @@ fn HqpSection(
         .unwrap_or_default();
     let matrix_current = matrix.as_ref().and_then(|m| m.current);
 
+    // Dynamic shaper label based on mode (SDM/DSD uses "Modulator", PCM uses "Dither")
+    let shaper_label = mode_opts
+        .as_ref()
+        .and_then(|m| m.selected.as_ref())
+        .and_then(|s| s.label.as_ref())
+        .map(|label| {
+            let lower = label.to_lowercase();
+            if lower.contains("sdm") || lower.contains("dsd") {
+                "Modulator"
+            } else {
+                "Dither"
+            }
+        })
+        .unwrap_or("Shaper");
+
     rsx! {
         section { id: "hqp-section",
             hgroup {
                 h2 { "HQPlayer DSP" }
-                p { "Pipeline controls for zone-linked HQPlayer" }
+                p { class: "flex items-center gap-2",
+                    "Pipeline controls for zone-linked HQPlayer"
+                    // Status indicator
+                    if let Some(ref st) = status {
+                        if st.connected {
+                            span { class: "status-ok text-sm", "✓ Connected" }
+                        } else {
+                            span { class: "status-err text-sm", "✗ Disconnected" }
+                        }
+                    }
+                    // Loading indicator
+                    if loading {
+                        span { class: "text-muted text-sm ml-2", aria_busy: "true", "Updating..." }
+                    }
+                }
             }
             article {
-                // Profile selector (if profiles available)
-                if !profiles.is_empty() {
-                    div { class: "mb-4",
-                        label {
-                            "Profile"
-                            HqpProfileSelect {
-                                profiles: profiles.clone(),
-                                on_select: on_load_profile,
-                                class: "".to_string(),
+                // Profile and Matrix selectors side by side
+                if !profiles.is_empty() || has_matrix {
+                    div { class: "grid grid-cols-2 gap-4 mb-4",
+                        if !profiles.is_empty() {
+                            label {
+                                "Profile"
+                                HqpProfileSelect {
+                                    profiles: profiles.clone(),
+                                    on_select: on_load_profile,
+                                    disabled: loading,
+                                }
+                            }
+                        }
+                        if has_matrix {
+                            label {
+                                "Matrix Profile"
+                                HqpMatrixSelect {
+                                    profiles: matrix_profiles,
+                                    active: matrix_current,
+                                    on_select: on_set_matrix,
+                                    disabled: loading,
+                                }
                             }
                         }
                     }
                 }
 
-                // Matrix profile selector (if matrix available)
-                if has_matrix {
-                    div { class: "mb-4",
-                        label {
-                            "Matrix Profile"
-                            HqpMatrixSelect {
-                                profiles: matrix_profiles,
-                                active: matrix_current,
-                                on_select: on_set_matrix,
-                                class: "".to_string(),
-                            }
-                        }
-                    }
-                }
-
-                div { class: "grid",
+                // Pipeline settings in a 2-column grid
+                div { class: "grid grid-cols-2 gap-4",
                     HqpSelect {
                         id: "hqp-mode",
                         label: "Mode",
                         setting: "mode",
                         options: mode_opts,
+                        disabled: loading,
                         on_change: on_set_pipeline,
                     }
                     HqpSelect {
@@ -554,15 +619,15 @@ fn HqpSection(
                         label: "Sample Rate",
                         setting: "samplerate",
                         options: samplerate_opts,
+                        disabled: loading,
                         on_change: on_set_pipeline,
                     }
-                }
-                div { class: "grid",
                     HqpSelect {
                         id: "hqp-filter1x",
                         label: "Filter (1x)",
                         setting: "filter1x",
                         options: filter1x_opts,
+                        disabled: loading,
                         on_change: on_set_pipeline,
                     }
                     HqpSelect {
@@ -570,15 +635,15 @@ fn HqpSection(
                         label: "Filter (Nx)",
                         setting: "filterNx",
                         options: filter_nx_opts,
+                        disabled: loading,
                         on_change: on_set_pipeline,
                     }
-                }
-                div { class: "grid",
                     HqpSelect {
                         id: "hqp-shaper",
-                        label: "Shaper",
+                        label: shaper_label,
                         setting: "shaper",
                         options: shaper_opts,
+                        disabled: loading,
                         on_change: on_set_pipeline,
                     }
                 }
@@ -594,6 +659,7 @@ fn HqpSelect(
     label: &'static str,
     setting: &'static str,
     options: Option<crate::app::api::HqpSettingOptions>,
+    #[props(default = false)] disabled: bool,
     on_change: EventHandler<(String, String)>,
 ) -> Element {
     let opts_list = options
@@ -609,9 +675,11 @@ fn HqpSelect(
 
     rsx! {
         label {
-            "{label}"
+            span { class: "block text-sm font-medium mb-1", "{label}" }
             select {
                 id: "{id}",
+                class: "input",
+                disabled: disabled,
                 onchange: move |evt: Event<FormData>| {
                     let value = evt.value();
                     on_change.call((setting_name.clone(), value));
