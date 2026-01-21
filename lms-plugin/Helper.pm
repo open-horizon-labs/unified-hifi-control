@@ -136,12 +136,21 @@ sub _doStart {
 
     $log->debug("Running: $binaryPath (with env: PORT=$port CONFIG_DIR=$configDir LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort)");
 
-    # Run via exec so shell replaces itself with binary (PID tracking works correctly)
-    # This ensures $helperProc->die sends SIGTERM to the Bridge, not to a shell wrapper
-    $helperProc = Proc::Background->new(
-        { 'die_upon_destroy' => 1 },
-        "/bin/sh", "-c", "exec '$binaryPath' > /dev/null 2>&1"
-    );
+    # Platform-specific process spawning
+    if (main::ISWINDOWS) {
+        # Windows: run binary directly, Proc::Background handles it
+        $helperProc = Proc::Background->new(
+            { 'die_upon_destroy' => 1 },
+            $binaryPath
+        );
+    } else {
+        # Unix: use exec so shell replaces itself with binary (PID tracking works correctly)
+        # This ensures $helperProc->die sends SIGTERM to the Bridge, not to a shell wrapper
+        $helperProc = Proc::Background->new(
+            { 'die_upon_destroy' => 1 },
+            "/bin/sh", "-c", "exec '$binaryPath' > /dev/null 2>&1"
+        );
+    }
 
     # Schedule health checks
     Slim::Utils::Timers::setTimer($class, time() + HEALTH_CHECK_INTERVAL, \&_healthCheck);
