@@ -1,5 +1,8 @@
 use dioxus::prelude::*;
 
+/// Embedded button CSS
+const BUTTON_CSS: &str = include_str!("./style.css");
+
 #[derive(Copy, Clone, PartialEq, Default)]
 #[non_exhaustive]
 pub enum ButtonVariant {
@@ -35,7 +38,7 @@ pub fn Button(
     children: Element,
 ) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {BUTTON_CSS} }
 
         button {
             r#type: "button",

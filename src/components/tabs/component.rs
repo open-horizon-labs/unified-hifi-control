@@ -1,6 +1,9 @@
 use dioxus::prelude::*;
 use dioxus_primitives::tabs::{self, TabContentProps, TabListProps, TabTriggerProps};
 
+/// Embedded tabs CSS
+const TABS_CSS: &str = include_str!("./style.css");
+
 /// The props for the [`Tabs`] component.
 #[derive(Props, Clone, PartialEq)]
 pub struct TabsProps {
@@ -66,7 +69,7 @@ impl TabsVariant {
 #[component]
 pub fn Tabs(props: TabsProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {TABS_CSS} }
         tabs::Tabs {
             class: props.class + " tabs",
             "data-variant": props.variant.to_class(),
