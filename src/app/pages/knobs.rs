@@ -555,14 +555,18 @@ fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) 
 #[component]
 fn PowerModeInputCompact(
     label: &'static str,
+    hint: &'static str,
     config: PowerModeConfig,
     on_change: EventHandler<PowerModeConfig>,
 ) -> Element {
     let timeout_sec = config.timeout_sec;
     rsx! {
         div { class: "flex items-center justify-between gap-2 py-1",
-            span { class: "text-sm", "{label}" }
-            div { class: "flex items-center gap-1",
+            div { class: "flex-1 min-w-0",
+                span { class: "text-sm block", "{label}" }
+                span { class: "text-xs text-muted block truncate", "{hint}" }
+            }
+            div { class: "flex items-center gap-1 flex-shrink-0",
                 input {
                     class: "input w-16 text-center text-sm py-1",
                     r#type: "number",
@@ -576,6 +580,98 @@ fn PowerModeInputCompact(
                     }
                 }
                 span { class: "text-xs text-muted", "s" }
+            }
+        }
+    }
+}
+
+/// Format timeout for display (e.g., "60s", "2m", "20m")
+fn format_timeout(secs: u32) -> String {
+    if secs == 0 {
+        "skip".to_string()
+    } else if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        let mins = secs / 60;
+        let rem = secs % 60;
+        if rem == 0 {
+            format!("{}m", mins)
+        } else {
+            format!("{}m{}s", mins, rem)
+        }
+    } else {
+        let hrs = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        if mins == 0 {
+            format!("{}h", hrs)
+        } else {
+            format!("{}h{}m", hrs, mins)
+        }
+    }
+}
+
+/// State cascade preview component - shows how timeouts resolve as a visual diagram
+#[component]
+fn StateCascadePreview(
+    is_charging: bool,
+    art_mode: PowerModeConfig,
+    dim: PowerModeConfig,
+    sleep: PowerModeConfig,
+    deep_sleep: PowerModeConfig,
+) -> Element {
+    // Build the cascade: each enabled state adds to cumulative time
+    // (name, timeout_to_reach, icon, is_power_off)
+    let mut states: Vec<(&str, u32, &str, bool)> = vec![("Normal", 0, "☀", false)];
+
+    if art_mode.enabled && art_mode.timeout_sec > 0 {
+        states.push(("Art", art_mode.timeout_sec, "🎨", false));
+    }
+    if dim.enabled && dim.timeout_sec > 0 {
+        states.push(("Dim", dim.timeout_sec, "🌙", false));
+    }
+    if sleep.enabled && sleep.timeout_sec > 0 {
+        states.push(("Sleep", sleep.timeout_sec, "💤", false));
+    }
+    if deep_sleep.enabled && deep_sleep.timeout_sec > 0 {
+        states.push(("Off", deep_sleep.timeout_sec, "⏻", true));
+    }
+
+    let final_is_power_off = states.last().map(|(_, _, _, off)| *off).unwrap_or(false);
+
+    rsx! {
+        div { class: "mt-3 pt-3 border-t border-white/10",
+            // State flow diagram
+            div { class: "flex items-center gap-1 flex-wrap",
+                for (i, (name, timeout, icon, is_off)) in states.iter().enumerate() {
+                    // Arrow and time label (before state, except first)
+                    if i > 0 {
+                        div { class: "flex flex-col items-center mx-0.5",
+                            span { class: "text-[10px] text-muted leading-none", "{format_timeout(*timeout)}" }
+                            span { class: "text-muted text-xs", "→" }
+                        }
+                    }
+                    // State box
+                    div {
+                        class: format!(
+                            "flex flex-col items-center px-2 py-1 rounded text-[10px] leading-tight {}",
+                            if i == states.len() - 1 {
+                                if *is_off { "bg-red-500/20 text-red-300" } else { "bg-green-500/20 text-green-300" }
+                            } else {
+                                "bg-white/5"
+                            }
+                        ),
+                        span { class: "text-sm", "{icon}" }
+                        span { "{name}" }
+                    }
+                }
+            }
+            // Summary line
+            p { class: "text-[10px] text-muted mt-1.5",
+                if final_is_power_off {
+                    "Powers off after inactivity. Rotate encoder to wake."
+                } else {
+                    "Display stays on indefinitely."
+                }
             }
         }
     }
@@ -665,8 +761,11 @@ fn ConfigModal(
 
                         // Power Settings - Side by Side (includes rotation)
                         fieldset { class: "mb-6",
-                            legend { class: "text-sm font-medium mb-2", "Display & Power Settings" }
-                            p { class: "text-sm text-muted mb-3", "Timeout values in seconds. Set 0 to disable." }
+                            legend { class: "text-sm font-medium mb-2", "Power Management" }
+                            p { class: "text-sm text-muted mb-3",
+                                "After inactivity, the display transitions through these states. "
+                                "Each timeout starts when the previous state begins. Set to 0 to skip."
+                            }
 
                             div { class: "grid grid-cols-2 gap-6",
                                 // Charging column
@@ -674,10 +773,13 @@ fn ConfigModal(
                                     h4 { class: "text-sm font-semibold mb-3 flex items-center gap-2",
                                         "⚡ Charging"
                                     }
-                                    div { class: "space-y-2",
+                                    div { class: "space-y-3",
                                         // Rotation
                                         div { class: "flex items-center justify-between gap-2 py-1",
-                                            span { class: "text-sm", "Rotation" }
+                                            div { class: "flex-1",
+                                                span { class: "text-sm block", "Rotation" }
+                                                span { class: "text-xs text-muted", "Display orientation" }
+                                            }
                                             select {
                                                 class: "input w-20 text-center text-sm py-1",
                                                 value: "{rotation_charging}",
@@ -692,24 +794,35 @@ fn ConfigModal(
                                         }
                                         PowerModeInputCompact {
                                             label: "Art Mode",
+                                            hint: "Hide controls, show album art",
                                             config: art_mode_charging.clone(),
                                             on_change: on_art_mode_charging_change,
                                         }
                                         PowerModeInputCompact {
-                                            label: "Dim Display",
+                                            label: "Dim",
+                                            hint: "Reduce to 30% brightness",
                                             config: dim_charging.clone(),
                                             on_change: on_dim_charging_change,
                                         }
                                         PowerModeInputCompact {
                                             label: "Sleep",
+                                            hint: "Turn off display",
                                             config: sleep_charging.clone(),
                                             on_change: on_sleep_charging_change,
                                         }
                                         PowerModeInputCompact {
                                             label: "Deep Sleep",
+                                            hint: "Full power down, encoder wakes",
                                             config: deep_sleep_charging.clone(),
                                             on_change: on_deep_sleep_charging_change,
                                         }
+                                    }
+                                    StateCascadePreview {
+                                        is_charging: true,
+                                        art_mode: art_mode_charging.clone(),
+                                        dim: dim_charging.clone(),
+                                        sleep: sleep_charging.clone(),
+                                        deep_sleep: deep_sleep_charging.clone(),
                                     }
                                 }
 
@@ -718,10 +831,13 @@ fn ConfigModal(
                                     h4 { class: "text-sm font-semibold mb-3 flex items-center gap-2",
                                         "🔋 Battery"
                                     }
-                                    div { class: "space-y-2",
+                                    div { class: "space-y-3",
                                         // Rotation
                                         div { class: "flex items-center justify-between gap-2 py-1",
-                                            span { class: "text-sm", "Rotation" }
+                                            div { class: "flex-1",
+                                                span { class: "text-sm block", "Rotation" }
+                                                span { class: "text-xs text-muted", "Display orientation" }
+                                            }
                                             select {
                                                 class: "input w-20 text-center text-sm py-1",
                                                 value: "{rotation_not_charging}",
@@ -736,24 +852,35 @@ fn ConfigModal(
                                         }
                                         PowerModeInputCompact {
                                             label: "Art Mode",
+                                            hint: "Hide controls, show album art",
                                             config: art_mode_battery.clone(),
                                             on_change: on_art_mode_battery_change,
                                         }
                                         PowerModeInputCompact {
-                                            label: "Dim Display",
+                                            label: "Dim",
+                                            hint: "Reduce to 30% brightness",
                                             config: dim_battery.clone(),
                                             on_change: on_dim_battery_change,
                                         }
                                         PowerModeInputCompact {
                                             label: "Sleep",
+                                            hint: "Turn off display",
                                             config: sleep_battery.clone(),
                                             on_change: on_sleep_battery_change,
                                         }
                                         PowerModeInputCompact {
                                             label: "Deep Sleep",
+                                            hint: "Full power down, encoder wakes",
                                             config: deep_sleep_battery.clone(),
                                             on_change: on_deep_sleep_battery_change,
                                         }
+                                    }
+                                    StateCascadePreview {
+                                        is_charging: false,
+                                        art_mode: art_mode_battery.clone(),
+                                        dim: dim_battery.clone(),
+                                        sleep: sleep_battery.clone(),
+                                        deep_sleep: deep_sleep_battery.clone(),
                                     }
                                 }
                             }
