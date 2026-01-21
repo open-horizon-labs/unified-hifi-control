@@ -34,8 +34,9 @@ Add labels to your PR to enable optional builds:
 
 **Default PR builds** (always run):
 - Lint + Tests
-- Web assets (WASM)
+- Fullstack build check (validates embedded assets)
 - Linux x64 binary
+- Smoke test (verifies binary boots, serves HTML with embedded CSS/JS/images)
 
 ### For Manual Runs: Use Inputs
 
@@ -89,7 +90,7 @@ Jobs maximize parallelism while respecting dependencies:
 
 - **Binary builds run in parallel**: Linux, macOS (x64 + arm64), and Windows start simultaneously
 - **macOS universal**: x64 and arm64 build in parallel, then combined with `lipo`
-- **Packaging waits for binaries + web assets**: Docker, Synology, QNAP, LMS jobs
+- **Packaging waits for binaries only**: Docker, Synology, QNAP, LMS jobs (no separate web assets needed - see below)
 - **Universal LMS ZIP**: Bundles all platform binaries in one package
 - **Optional jobs skip cleanly**: ARM builds skip if not requested
 
@@ -106,7 +107,6 @@ When a PR build completes, a bot comment is automatically posted with links to a
 |----------|------|
 | linux-x64-binary | 12.3 MB |
 | lms-plugin-linux-x64 | 15.1 MB |
-| web-assets | 2.4 MB |
 
 [View workflow run](link) to download artifacts.
 ```
@@ -136,7 +136,7 @@ This prevents spurious builds from non-build labels (arch, coderabbit, etc.).
 
 | Build Type | Strategy | Notes |
 |------------|----------|-------|
-| WASM | rust-cache only | sccache doesn't work with wasm32 |
+| Fullstack check | rust-cache only | Validates `dx build --fullstack` works |
 | Linux (zigbuild) | rust-cache only | sccache doesn't work with zig wrapper |
 | macOS/Windows | sccache + rust-cache | sccache for `.o` files, rust-cache for proc-macros |
 | Tools (dx, zigbuild) | actions/cache | Pin version in cache key |
@@ -149,12 +149,11 @@ This prevents spurious builds from non-build labels (arch, coderabbit, etc.).
 ```yaml
 - uses: Swatinem/rust-cache@v2
   with:
-    shared-key: "wasm-build"
+    shared-key: "fullstack-build"
     cache-all-crates: true
     cache-on-failure: true
     cache-directories: |
       target/dx
-      target/wasm32-unknown-unknown
 ```
 
 **sccache** caches individual compilation units (`.o` files). Used with rust-cache for native builds:
@@ -178,9 +177,26 @@ This prevents spurious builds from non-build labels (arch, coderabbit, etc.).
     key: dx-cli-0.7.3
 ```
 
-### Web Assets
+### Embedded Assets (ADR 002)
 
-Web assets (WASM + JS + CSS) are built once and shared via artifacts to all packaging jobs.
+Web assets (CSS, images) are **embedded directly in the binary** using Rust's `include_str!` and `include_bytes!` macros. This eliminates the need for separate asset distribution.
+
+**How it works:**
+- `src/app/embedded_assets.rs` - Contains compile-time asset embedding
+- CSS is inlined in the HTML via `<style>` tags
+- Images are served as base64 data URLs
+- Total embedded: ~65KB (negligible for a 10MB binary)
+
+**Why this works with `cargo zigbuild`:**
+- `include_str!`/`include_bytes!` are standard Rust macros
+- They work with any Cargo build, not just `dx build`
+- The `fullstack-check` job validates the Dioxus SSR configuration is correct
+- Release binaries are built with `cargo zigbuild`, which compiles the embedded assets
+
+**Benefits:**
+- Single binary distribution (no `public/` folder needed)
+- No more `DIOXUS_PUBLIC_PATH` environment variable hacks
+- Simplified packaging for all targets (Docker, Synology, QNAP, AUR, deb/rpm)
 
 ### NAS Packages
 
@@ -192,8 +208,9 @@ Web assets (WASM + JS + CSS) are built once and shared via artifacts to all pack
 
 | Target | Caching | Build Tool | Default | Label |
 |--------|---------|------------|---------|-------|
-| Web Assets (WASM) | rust-cache | dx | Always | - |
+| Fullstack Check | rust-cache | dx build --fullstack | Always | - |
 | Linux x86_64-musl | rust-cache | cargo-zigbuild | Always | - |
+| Smoke Test | N/A | curl | Always | - |
 | Linux aarch64-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
 | Linux armv7-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
 | macOS universal | sccache + rust-cache | cargo + lipo | Release | `build:macos` |
@@ -205,8 +222,9 @@ Web assets (WASM + JS + CSS) are built once and shared via artifacts to all pack
 | QNAP arm64 | N/A | qbuild (Docker) | Release | `build:qnap-arm` |
 | Linux deb (x64/arm64/armv7) | N/A | fpm | Release | `build:linux-packages` |
 | Linux rpm (x64 only) | N/A | fpm | Release | `build:linux-packages` |
-| LMS Bootstrap ZIP | N/A | zip | Release | `build:lms` |
-| LMS Full ZIPs | N/A | zip + binary | Release | `build:lms` |
+| LMS Universal ZIP | N/A | zip + binaries | Release | `build:lms` |
+
+Note: All binaries include embedded web assets (CSS, images) - no separate asset distribution needed.
 
 ## Smoke Testing Cross-Compiled Binaries
 

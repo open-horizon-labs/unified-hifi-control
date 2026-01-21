@@ -9,17 +9,9 @@ title = "Unified Hi-Fi Control"
 reload_html = true
 watch_path = ["src", "public"]
 
+[web.resource]
+# Stylesheets injected into index.html (ADR 002: single-binary distribution)
+style = ["/tailwind.css", "/dx-components-theme.css"]
+
 [web.resource.dev]
 base_path = "/"
-
-[web.resource]
-style = ["/dx-components-theme.css", "/tailwind.css"]
-
-# Favicon
-[[web.resource.head]]
-element = "link"
-attrs = { rel = "icon", href = "/favicon.ico" }
-
-[[web.resource.head]]
-element = "link"
-attrs = { rel = "apple-touch-icon", sizes = "180x180", href = "/apple-touch-icon.png" }

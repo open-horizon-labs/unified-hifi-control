@@ -3,12 +3,33 @@
 PACKAGE_NAME="unified-hifi-control"
 PACKAGE_DIR="/var/packages/${PACKAGE_NAME}"
 TARGET_DIR="${PACKAGE_DIR}/target"
+PID_FILE="/var/run/${PACKAGE_NAME}.pid"
+
+# Check if service was running (upgrade scenario - DSM should stop it but be safe)
+WAS_RUNNING=false
+if [ -f "$PID_FILE" ]; then
+    PID=$(cat "$PID_FILE" 2>/dev/null)
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        WAS_RUNNING=true
+        echo "Stopping existing service for upgrade..."
+        kill "$PID" 2>/dev/null
+        sleep 2
+        kill -9 "$PID" 2>/dev/null || true
+        rm -f "$PID_FILE"
+    fi
+fi
 
 # Make binary executable
 chmod +x "${TARGET_DIR}/unified-hifi-control"
 
 # Create data directory if it doesn't exist
 mkdir -p "${PACKAGE_DIR}/var"
+
+# Restart service if it was running before upgrade
+if [ "$WAS_RUNNING" = true ]; then
+    echo "Restarting service after upgrade..."
+    "${PACKAGE_DIR}/scripts/start-stop-status" start
+fi
 
 echo "Unified Hi-Fi Control installed successfully"
 echo "Access the web UI at http://$(hostname):8088"

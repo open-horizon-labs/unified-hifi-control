@@ -1,0 +1,12 @@
+# CodeRabbit configuration
+# https://docs.coderabbit.ai/guides/configure-coderabbit
+
+reviews:
+  # Disable auto-labeling - it triggers our build workflow unnecessarily
+  auto_label: false
+
+  # Keep reviews enabled
+  enabled: true
+
+  # Request changes instead of just commenting
+  request_changes_workflow: true

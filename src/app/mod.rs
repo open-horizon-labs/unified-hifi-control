@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 
 pub mod api;
 pub mod components;
+pub mod embedded_assets;
 pub mod pages;
 pub mod settings_context;
 pub mod sse;

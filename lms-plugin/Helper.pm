@@ -44,17 +44,6 @@ sub pluginBinDir {
     return catdir($pluginDir, 'Bin');
 }
 
-# Get bundled web assets directory
-sub bundledPublicDir {
-    my $class = shift;
-
-    my $pluginBinDir = $class->pluginBinDir();
-    return unless $pluginBinDir;
-
-    my $publicDir = catdir($pluginBinDir, 'public');
-    return (-d $publicDir) ? $publicDir : undef;
-}
-
 # Get plugin version from install.xml
 sub pluginVersion {
     return Plugins::UnifiedHiFi::Plugin->_pluginDataFor('version') || '0.0.0';
@@ -295,7 +284,9 @@ Binaries are bundled in the plugin ZIP in LMS platform folder structure:
       aarch64-linux/unified-hifi-control
       arm-linux/unified-hifi-control
       MSWin32-x64-multi-thread/unified-hifi-control.exe
-      public/  (web assets)
+
+Web assets (CSS, images) are embedded in the binary - no separate public/
+folder is needed (see ADR 002).
 
 LMS's C<Slim::Utils::Misc::findBin()> automatically finds the correct binary
 for the current platform.

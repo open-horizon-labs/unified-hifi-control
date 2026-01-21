@@ -3,10 +3,13 @@ use dioxus_primitives::navbar::{
     self, NavbarContentProps, NavbarItemProps, NavbarNavProps, NavbarProps, NavbarTriggerProps,
 };
 
+/// Embedded navbar CSS
+const NAVBAR_CSS: &str = include_str!("./style.css");
+
 #[component]
 pub fn Navbar(props: NavbarProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {NAVBAR_CSS} }
         navbar::Navbar {
             class: "navbar",
             disabled: props.disabled,

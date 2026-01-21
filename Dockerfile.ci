@@ -1,4 +1,4 @@
-# CI Dockerfile - uses pre-built binaries and web assets
+# CI Dockerfile - uses pre-built binaries with embedded web assets (ADR 002)
 # This is much faster than building inside Docker with QEMU emulation
 # Use GHCR for faster pulls from GitHub Actions (same datacenter)
 FROM ghcr.io/linuxcontainers/alpine:3.20
@@ -8,13 +8,10 @@ WORKDIR /app
 # Install runtime dependencies
 RUN apk add --no-cache ca-certificates
 
-# Copy pre-built binary (set by build arg)
+# Copy pre-built binary (web assets are embedded)
 ARG TARGETARCH
 COPY binaries/unified-hifi-linux-${TARGETARCH} /app/unified-hifi-control
 RUN chmod +x /app/unified-hifi-control
-
-# Copy pre-built web assets (WASM + JS)
-COPY public/ /app/public/
 
 # Create data directory for config persistence
 RUN mkdir -p /data

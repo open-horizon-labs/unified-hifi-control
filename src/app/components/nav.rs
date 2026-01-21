@@ -1,5 +1,6 @@
 //! Navigation component using Tailwind CSS.
 
+use crate::app::embedded_assets::LOGO_DATA_URL;
 use crate::app::settings_context::use_settings;
 use crate::app::Route;
 use dioxus::prelude::*;
@@ -59,7 +60,7 @@ pub fn Nav(props: NavProps) -> Element {
                 div { class: "flex items-center",
                     Link { class: "nav-brand flex items-center", to: Route::Dashboard {},
                         img {
-                            src: "/hifi-logo.png",
+                            src: "{*LOGO_DATA_URL}",
                             alt: "Hi-Fi Control",
                             class: "h-6 w-6 rounded"
                         }

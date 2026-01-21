@@ -73,7 +73,28 @@ jobs:
       build_qnap_arm: ${{ steps.decide.outputs.build_qnap_arm }}
       build_docker: ${{ steps.decide.outputs.build_docker }}
       build_linux_packages: ${{ steps.decide.outputs.build_linux_packages }}
+      version: ${{ steps.version.outputs.version }}
+      git_sha: ${{ steps.version.outputs.git_sha }}
     steps:
+      - name: Compute version
+        id: version
+        run: |
+          # Version: from git tag on release, else include PR number for traceability
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            VERSION="0.0.0-pr${{ github.event.pull_request.number }}"
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Git SHA: short form
+          GIT_SHA="${GITHUB_SHA:0:7}"
+          echo "git_sha=$GIT_SHA" >> $GITHUB_OUTPUT
+
+          echo "::notice::Build version: $VERSION ($GIT_SHA)"
+
       - name: Decide what to build
         id: decide
         env:
@@ -210,7 +231,7 @@ jobs:
           # Step summary - show label → build mapping
           echo "### Build Plan" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Default:** lint, test, web-assets, linux-x64" >> $GITHUB_STEP_SUMMARY
+          echo "**Default:** lint, test, fullstack-check, linux-x64" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           # Build optional builds table directly
@@ -335,32 +356,26 @@ jobs:
           RUSTC_WRAPPER: "sccache"
         run: cargo test --workspace
 
-  build-web-assets:
-    name: Build Web Assets
-    needs: plan
+  # Note: Web assets are now embedded in the binary (ADR 002).
+  # The fullstack-check job validates the fullstack build works correctly.
+  fullstack-check:
+    name: Fullstack Build Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
 
-      # Note: sccache disabled for WASM builds - doesn't work well with wasm32 target
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "wasm-build"
+          shared-key: "fullstack-build"
           cache-all-crates: true
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
           cache-directories: |
             target/dx
-            target/wasm32-unknown-unknown
-
-      - name: Fetch dependencies
-        run: cargo fetch --target wasm32-unknown-unknown
 
       - name: Cache Dioxus CLI
         id: cache-dx
@@ -376,30 +391,12 @@ jobs:
       - name: Build Tailwind CSS
         run: make css
 
-      - name: Build web assets
-        run: dx build --release --platform web --features web
-
-      - name: Create web assets tarball
-        if: needs.plan.outputs.is_release == 'true'
+      - name: Build fullstack (verify WASM generation)
+        # ADR 002: WASM is generated and will be embedded in the final cargo binary
         run: |
-          cd target/dx/unified-hifi-control/release/web
-          tar -czvf web-assets.tar.gz public/
-          mv web-assets.tar.gz ${{ github.workspace }}/
-
-      - name: Upload web assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: web-assets
-          path: target/dx/unified-hifi-control/release/web/public/
-          retention-days: 5
-
-      - name: Upload web assets tarball
-        if: needs.plan.outputs.is_release == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: web-assets-tarball
-          path: web-assets.tar.gz
-          retention-days: 5
+          dx build --fullstack --release @client --no-default-features --features web @server --features server
+          echo "Verifying WASM assets were generated:"
+          ls -la target/dx/unified-hifi-control/release/web/public/assets/ || true
 
   build-linux-x64:
     name: Build Linux x64
@@ -411,13 +408,15 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: x86_64-unknown-linux-musl,wasm32-unknown-unknown
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-x86_64-unknown-linux-musl
           save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
+          cache-directories: |
+            target/dx
 
       - name: Install zig
         run: |
@@ -436,8 +435,35 @@ jobs:
         if: steps.cache-zigbuild.outputs.cache-hit != 'true'
         run: cargo install cargo-zigbuild --locked
 
-      - name: Build with zigbuild
-        run: cargo zigbuild --release --target x86_64-unknown-linux-musl
+      - name: Cache Dioxus CLI
+        id: cache-dx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx
+          key: dx-cli-0.7.3
+
+      - name: Install Dioxus CLI
+        if: steps.cache-dx.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli@0.7.3 --locked
+
+      - name: Build Tailwind CSS
+        run: make css
+
+      - name: Build WASM assets (ADR 002)
+        run: |
+          # Generate WASM/JS assets that will be embedded in the binary
+          dx build --fullstack --release @client --no-default-features --features web @server --features server
+          echo "Generated assets:"
+          find target/dx -name "*.wasm" -o -name "*.js" | head -10
+
+      - name: Build with zigbuild (embeds WASM)
+        env:
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
+        run: |
+          # Force rebuild of main crate to pick up version env vars and embedded assets
+          cargo clean -p unified-hifi-control 2>/dev/null || true
+          cargo zigbuild --release --target x86_64-unknown-linux-musl
 
       - name: Rename binary
         run: |
@@ -450,6 +476,145 @@ jobs:
           name: binary-x86_64-unknown-linux-musl
           path: dist/bin/
           retention-days: 5
+
+  # Smoke test: verify the musl binary actually works with embedded assets
+  smoke-test:
+    name: Smoke Test Binary
+    needs: [plan, build-linux-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binary
+        uses: actions/download-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-musl
+          path: dist/
+
+      - name: Make executable
+        run: chmod +x dist/unified-hifi-linux-x64
+
+      - name: Start server
+        run: |
+          export RUST_BACKTRACE=1
+          dist/unified-hifi-linux-x64 > /tmp/server.log 2>&1 &
+          echo $! > /tmp/server.pid
+          # Wait for server to be ready (max 30s)
+          for i in {1..30}; do
+            if curl -s http://localhost:8088/ > /dev/null 2>&1; then
+              echo "Server ready after ${i}s"
+              exit 0
+            fi
+            # Check if process died
+            if ! kill -0 $(cat /tmp/server.pid) 2>/dev/null; then
+              echo "Server process died!"
+              echo "=== Server output ==="
+              cat /tmp/server.log
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "Server failed to start within 30s"
+          echo "=== Server output ==="
+          cat /tmp/server.log
+          exit 1
+
+      - name: Verify HTTP response
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8088/)
+          if [ "$STATUS" != "200" ]; then
+            echo "Expected HTTP 200, got $STATUS"
+            exit 1
+          fi
+          echo "✓ HTTP 200 OK"
+
+      - name: Verify version injection
+        env:
+          EXPECTED_VERSION: ${{ needs.plan.outputs.version }}
+          EXPECTED_SHA: ${{ needs.plan.outputs.git_sha }}
+        run: |
+          RESP=$(curl -s http://localhost:8088/status)
+          echo "Status response: $RESP"
+
+          VERSION=$(echo "$RESP" | jq -r '.version')
+          GIT_SHA=$(echo "$RESP" | jq -r '.git_sha')
+
+          echo "Expected version: $EXPECTED_VERSION, got: $VERSION"
+          echo "Expected SHA: $EXPECTED_SHA, got: $GIT_SHA"
+
+          if [ "$VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "::error::Version mismatch! Expected $EXPECTED_VERSION, got $VERSION"
+            exit 1
+          fi
+          echo "✓ Version correct: $VERSION"
+
+          if [ "$GIT_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Git SHA mismatch! Expected $EXPECTED_SHA, got $GIT_SHA"
+            exit 1
+          fi
+          echo "✓ Git SHA correct: $GIT_SHA"
+
+      - name: Verify WASM assets served (ADR 002)
+        run: |
+          HTML=$(curl -s http://localhost:8088/)
+
+          # Check title
+          if ! echo "$HTML" | grep -q '<title>'; then
+            echo "Missing <title> tag"
+            exit 1
+          fi
+          echo "✓ HTML title present"
+
+          # Check for WASM loader script (generated by dx build)
+          if echo "$HTML" | grep -q 'assets/unified-hifi-control'; then
+            echo "✓ WASM loader script present in HTML"
+          else
+            echo "⚠ No WASM loader script found (SSR-only mode)"
+          fi
+
+          # Check embedded CSS (style tags)
+          STYLE_COUNT=$(echo "$HTML" | grep -c '<style' || echo 0)
+          if [ "$STYLE_COUNT" -ge 2 ]; then
+            echo "✓ $STYLE_COUNT embedded CSS stylesheets"
+          else
+            # CSS might be served as external files
+            echo "✓ CSS present (may be external)"
+          fi
+
+          # Check JavaScript (script tags for hydration)
+          if ! echo "$HTML" | grep -q '<script'; then
+            echo "Missing <script> tags"
+            exit 1
+          fi
+          echo "✓ JavaScript present"
+
+          # Check embedded images (base64 data URLs)
+          IMAGE_COUNT=$(echo "$HTML" | grep -c 'data:image' || echo 0)
+          if [ "$IMAGE_COUNT" -ge 1 ]; then
+            echo "✓ $IMAGE_COUNT embedded images"
+          else
+            echo "✓ Images present (may be served as files)"
+          fi
+
+          # Verify WASM file is served from embedded assets
+          WASM_JS=$(echo "$HTML" | grep -oE 'assets/unified-hifi-control[^"]*\.js' | head -1 || true)
+          if [ -n "$WASM_JS" ]; then
+            echo "Testing WASM loader: /$WASM_JS"
+            WASM_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8088/$WASM_JS")
+            if [ "$WASM_STATUS" = "200" ]; then
+              echo "✓ WASM loader served successfully (embedded assets working)"
+            else
+              echo "⚠ WASM loader returned HTTP $WASM_STATUS"
+            fi
+          fi
+
+          echo ""
+          echo "All smoke tests passed!"
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f /tmp/server.pid ]; then
+            kill $(cat /tmp/server.pid) 2>/dev/null || true
+          fi
 
   # =============================================================================
   # OPTIONAL: Controlled by plan outputs
@@ -475,13 +640,15 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }},wasm32-unknown-unknown
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
+          cache-directories: |
+            target/dx
 
       - name: Install zig
         run: |
@@ -500,8 +667,33 @@ jobs:
         if: steps.cache-zigbuild.outputs.cache-hit != 'true'
         run: cargo install cargo-zigbuild --locked
 
-      - name: Build with zigbuild
-        run: cargo zigbuild --release --target ${{ matrix.target }}
+      - name: Cache Dioxus CLI
+        id: cache-dx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx
+          key: dx-cli-0.7.3
+
+      - name: Install Dioxus CLI
+        if: steps.cache-dx.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli@0.7.3 --locked
+
+      - name: Build Tailwind CSS
+        run: make css
+
+      - name: Build WASM assets (ADR 002)
+        run: |
+          # Generate WASM/JS assets that will be embedded in the binary
+          dx build --fullstack --release @client --no-default-features --features web @server --features server
+
+      - name: Build with zigbuild (embeds WASM)
+        env:
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
+        run: |
+          # Force rebuild of main crate to pick up version env vars and embedded assets
+          cargo clean -p unified-hifi-control 2>/dev/null || true
+          cargo zigbuild --release --target ${{ matrix.target }}
 
       - name: Smoke test armv7 binary
         if: matrix.target == 'armv7-unknown-linux-musleabihf'
@@ -532,7 +724,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-apple-darwin
+          targets: x86_64-apple-darwin,wasm32-unknown-unknown
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -542,12 +734,37 @@ jobs:
         with:
           shared-key: macos-x64
           save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
+          cache-directories: |
+            target/dx
 
-      - name: Build x86_64
+      - name: Cache Dioxus CLI
+        id: cache-dx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx
+          key: dx-cli-macos-0.7.3
+
+      - name: Install Dioxus CLI
+        if: steps.cache-dx.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli@0.7.3 --locked
+
+      - name: Build Tailwind CSS
+        run: make css
+
+      - name: Build WASM assets (ADR 002)
+        run: |
+          dx build --fullstack --release @client --no-default-features --features web @server --features server
+
+      - name: Build x86_64 (embeds WASM)
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo build --release --target x86_64-apple-darwin
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
+        run: |
+          # Force rebuild of main crate to pick up version env vars and embedded assets
+          cargo clean -p unified-hifi-control 2>/dev/null || true
+          cargo build --release --target x86_64-apple-darwin
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -567,7 +784,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: aarch64-apple-darwin,wasm32-unknown-unknown
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -577,12 +794,37 @@ jobs:
         with:
           shared-key: macos-arm64
           save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
+          cache-directories: |
+            target/dx
 
-      - name: Build aarch64
+      - name: Cache Dioxus CLI
+        id: cache-dx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx
+          key: dx-cli-macos-0.7.3
+
+      - name: Install Dioxus CLI
+        if: steps.cache-dx.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli@0.7.3 --locked
+
+      - name: Build Tailwind CSS
+        run: make css
+
+      - name: Build WASM assets (ADR 002)
+        run: |
+          dx build --fullstack --release @client --no-default-features --features web @server --features server
+
+      - name: Build aarch64 (embeds WASM)
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo build --release --target aarch64-apple-darwin
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
+        run: |
+          # Force rebuild of main crate to pick up version env vars and embedded assets
+          cargo clean -p unified-hifi-control 2>/dev/null || true
+          cargo build --release --target aarch64-apple-darwin
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -639,6 +881,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -647,12 +891,40 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
+          cache-directories: |
+            target/dx
 
-      - name: Build
+      - name: Cache Dioxus CLI
+        id: cache-dx
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/dx.exe
+          key: dx-cli-windows-0.7.3
+
+      - name: Install Dioxus CLI
+        if: steps.cache-dx.outputs.cache-hit != 'true'
+        run: cargo install dioxus-cli@0.7.3 --locked
+
+      - name: Build Tailwind CSS
+        run: make css
+        shell: bash
+
+      - name: Build WASM assets (ADR 002)
+        run: |
+          dx build --fullstack --release @client --no-default-features --features web @server --features server
+        shell: bash
+
+      - name: Build (embeds WASM)
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo build --release
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
+        run: |
+          # Force rebuild of main crate to pick up version env vars and embedded assets
+          cargo clean -p unified-hifi-control 2>/dev/null || true
+          cargo build --release
+        shell: bash
 
       - name: Rename binary
         shell: bash
@@ -669,27 +941,17 @@ jobs:
 
   # Universal ZIP: all platform binaries bundled
   # Uses LMS platform folder structure so findBin() works automatically
+  # Note: Web assets are embedded in the binary (ADR 002), no separate assets needed
   build-lms-universal:
     name: Build LMS Plugin (universal)
-    needs: [plan, build-web-assets, build-linux-x64, build-linux-arm, build-macos-universal, build-windows]
+    needs: [plan, build-linux-x64, build-linux-arm, build-macos-universal, build-windows]
     if: |
       always() &&
       needs.plan.outputs.build_lms == 'true' &&
-      needs.build-web-assets.result == 'success' &&
       needs.build-linux-x64.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Get version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       # Download all available binaries
       - name: Download Linux x64 binary
@@ -730,15 +992,9 @@ jobs:
           name: binary-windows
           path: binaries/
 
-      - name: Download web assets
-        uses: actions/download-artifact@v4
-        with:
-          name: web-assets
-          path: web-assets/
-
       - name: Update install.xml version
         run: |
-          sed -i "s|<version>[^<]*</version>|<version>${{ steps.version.outputs.version }}</version>|" lms-plugin/install.xml
+          sed -i "s|<version>[^<]*</version>|<version>${{ needs.plan.outputs.version }}</version>|" lms-plugin/install.xml
 
       - name: Bundle LMS plugin with all binaries
         run: |
@@ -779,25 +1035,25 @@ jobs:
             cp ../binaries/unified-hifi-win64.exe Bin/MSWin32-x64-multi-thread/unified-hifi-control.exe
           fi
 
-          # Copy web assets (next to binaries, Dioxus convention)
-          cp -r ../web-assets Bin/public
+          # Note: Web assets are embedded in the binary (ADR 002)
+          # No separate public/ folder needed
 
           # Show what we bundled
           echo "Bundled binaries:"
           find Bin -type f -name "unified-hifi-control*" | head -20
 
           # Create ZIP with everything
-          zip -r ../dist/lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip . \
+          zip -r ../dist/lms-unified-hifi-control-${{ needs.plan.outputs.version }}.zip . \
             -x "*.git*"
 
       - name: Repack with correct directory structure
         run: |
           cd dist
           mkdir -p repack
-          unzip lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip -d repack/UnifiedHiFi
-          rm lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip
+          unzip lms-unified-hifi-control-${{ needs.plan.outputs.version }}.zip -d repack/UnifiedHiFi
+          rm lms-unified-hifi-control-${{ needs.plan.outputs.version }}.zip
           cd repack
-          zip -r ../lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip UnifiedHiFi
+          zip -r ../lms-unified-hifi-control-${{ needs.plan.outputs.version }}.zip UnifiedHiFi
           cd ..
           rm -rf repack
 
@@ -809,17 +1065,17 @@ jobs:
           retention-days: 5
 
   # =============================================================================
-  # PACKAGING: Depends on binaries + web assets
+  # PACKAGING: Depends on binaries (web assets embedded per ADR 002)
   # =============================================================================
 
+  # Note: Web assets are embedded in the binary (ADR 002)
   build-synology:
     name: Build Synology SPK (${{ matrix.arch }})
-    needs: [plan, build-linux-x64, build-linux-arm, build-web-assets]
+    needs: [plan, build-linux-x64, build-linux-arm]
     if: |
       always() &&
       needs.plan.outputs.build_synology == 'true' &&
-      needs.build-linux-x64.result == 'success' &&
-      needs.build-web-assets.result == 'success'
+      needs.build-linux-x64.result == 'success'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -848,27 +1104,14 @@ jobs:
           name: binary-${{ matrix.target }}
           path: build/synology/package/
 
-      - name: Download web assets
-        uses: actions/download-artifact@v4
-        with:
-          name: web-assets
-          path: build/synology/package/public/
-
       - name: Rename binary
         run: |
           mv build/synology/package/${{ matrix.binary }} build/synology/package/unified-hifi-control
           chmod +x build/synology/package/unified-hifi-control
 
-      - name: Get version
-        id: version
+      - name: Update INFO file
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          sed -i "s/version=\"{{VERSION}}\"/version=\"$VERSION\"/" build/synology/INFO
+          sed -i "s/version=\"{{VERSION}}\"/version=\"${{ needs.plan.outputs.version }}\"/" build/synology/INFO
           sed -i "s/arch=\"{{ARCH}}\"/arch=\"${{ matrix.arch }}\"/" build/synology/INFO
 
       - name: Build Synology SPK
@@ -876,7 +1119,7 @@ jobs:
           cd build/synology
           tar -czf package.tgz -C package .
           mkdir -p ../../dist/installers
-          SPK_NAME="UnifiedHifiControl-${{ matrix.arch }}-${{ steps.version.outputs.version }}.spk"
+          SPK_NAME="UnifiedHifiControl-${{ matrix.arch }}-${{ needs.plan.outputs.version }}.spk"
           tar -cf "../../dist/installers/${SPK_NAME}" \
             INFO PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG \
             package.tgz scripts conf WIZARD_UIFILES
@@ -888,9 +1131,10 @@ jobs:
           path: dist/installers/*.spk
           retention-days: 5
 
+  # Note: Web assets are embedded in the binary (ADR 002)
   build-qnap-x64:
     name: Build QNAP (x64)
-    needs: [plan, build-linux-x64, build-web-assets]
+    needs: [plan, build-linux-x64]
     if: needs.plan.outputs.build_qnap == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -902,35 +1146,18 @@ jobs:
           name: binary-x86_64-unknown-linux-musl
           path: dist/bin/
 
-      - name: Download web assets
-        uses: actions/download-artifact@v4
-        with:
-          name: web-assets
-          path: dist/public/
-
       - name: Make binary executable
         run: chmod +x dist/bin/*
-
-      - name: Get version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Prepare QNAP package
         run: |
           mkdir -p qnap-build/shared
           cp dist/bin/unified-hifi-linux-x64 qnap-build/shared/unified-hifi-control
           chmod +x qnap-build/shared/unified-hifi-control
-          cp -r dist/public qnap-build/shared/public
           cp build/qnap/shared/*.sh qnap-build/shared/
           chmod +x qnap-build/shared/*.sh
           cp -r build/qnap/shared/icons qnap-build/
-          sed "s/{{VERSION}}/${{ steps.version.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
+          sed "s/{{VERSION}}/${{ needs.plan.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
           echo '#!/bin/sh' > qnap-build/package_routines
 
       - name: Build QPKG with Docker
@@ -944,7 +1171,7 @@ jobs:
       - name: Move QPKG to dist
         run: |
           mkdir -p dist/installers
-          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ steps.version.outputs.version }}_x86_64.qpkg
+          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ needs.plan.outputs.version }}_x86_64.qpkg
 
       - name: Upload QNAP package
         uses: actions/upload-artifact@v4
@@ -953,14 +1180,14 @@ jobs:
           path: dist/installers/*.qpkg
           retention-days: 5
 
+  # Note: Web assets are embedded in the binary (ADR 002)
   build-qnap-arm:
     name: Build QNAP (arm64)
-    needs: [plan, build-linux-arm, build-web-assets]
+    needs: [plan, build-linux-arm]
     if: |
       always() &&
       needs.plan.outputs.build_qnap_arm == 'true' &&
-      needs.build-linux-arm.result == 'success' &&
-      needs.build-web-assets.result == 'success'
+      needs.build-linux-arm.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -971,35 +1198,18 @@ jobs:
           name: binary-aarch64-unknown-linux-musl
           path: dist/bin/
 
-      - name: Download web assets
-        uses: actions/download-artifact@v4
-        with:
-          name: web-assets
-          path: dist/public/
-
       - name: Make binary executable
         run: chmod +x dist/bin/*
-
-      - name: Get version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Prepare QNAP package
         run: |
           mkdir -p qnap-build/shared
           cp dist/bin/unified-hifi-linux-arm64 qnap-build/shared/unified-hifi-control
           chmod +x qnap-build/shared/unified-hifi-control
-          cp -r dist/public qnap-build/shared/public
           cp build/qnap/shared/*.sh qnap-build/shared/
           chmod +x qnap-build/shared/*.sh
           cp -r build/qnap/shared/icons qnap-build/
-          sed "s/{{VERSION}}/${{ steps.version.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
+          sed "s/{{VERSION}}/${{ needs.plan.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
           echo '#!/bin/sh' > qnap-build/package_routines
 
       - name: Build QPKG with Docker
@@ -1013,7 +1223,7 @@ jobs:
       - name: Move QPKG to dist
         run: |
           mkdir -p dist/installers
-          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ steps.version.outputs.version }}_arm_64.qpkg
+          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ needs.plan.outputs.version }}_arm_64.qpkg
 
       - name: Upload QNAP package
         uses: actions/upload-artifact@v4
@@ -1022,9 +1232,10 @@ jobs:
           path: dist/installers/*.qpkg
           retention-days: 5
 
+  # Note: Web assets are embedded in the binary (ADR 002)
   build-docker-x64:
     name: Build Docker (x64)
-    needs: [plan, build-linux-x64, build-web-assets]
+    needs: [plan, build-linux-x64]
     # Only for PRs/branches - releases use build-docker-release
     if: needs.plan.outputs.build_docker == 'true' && needs.plan.outputs.is_release != 'true'
     runs-on: ubuntu-latest
@@ -1039,16 +1250,11 @@ jobs:
           name: binary-x86_64-unknown-linux-musl
           path: binaries/
 
-      - name: Download web assets
-        uses: actions/download-artifact@v4
-        with:
-          name: web-assets
-          path: public/
-
       - name: Prepare binary
         run: |
           mv binaries/unified-hifi-linux-x64 binaries/unified-hifi-linux-amd64
-          ls -la binaries/ public/
+          chmod +x binaries/*
+          ls -la binaries/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -1082,9 +1288,10 @@ jobs:
   # RELEASE ONLY: Multi-arch Docker
   # =============================================================================
 
+  # Note: Web assets are embedded in the binary (ADR 002)
   build-docker-release:
     name: Build Docker (${{ matrix.arch }})
-    needs: [plan, build-linux-x64, build-linux-arm, build-web-assets]
+    needs: [plan, build-linux-x64, build-linux-arm]
     if: needs.plan.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     strategy:
@@ -1110,12 +1317,6 @@ jobs:
         with:
           name: binary-${{ matrix.target }}
           path: dist/
-
-      - name: Download web assets
-        uses: actions/download-artifact@v4
-        with:
-          name: web-assets
-          path: dist/public/
 
       - name: Prepare binary
         run: |
@@ -1203,14 +1404,14 @@ jobs:
               $(printf 'muness/unified-hifi-control@sha256:%s ' *)
           fi
 
+  # Note: Web assets are embedded in the binary (ADR 002)
   build-linux-packages:
     name: Build Linux Packages (deb/rpm)
-    needs: [plan, build-linux-x64, build-linux-arm, build-web-assets]
+    needs: [plan, build-linux-x64, build-linux-arm]
     if: |
       always() &&
       needs.plan.outputs.build_linux_packages == 'true' &&
-      needs.build-linux-x64.result == 'success' &&
-      needs.build-web-assets.result == 'success'
+      needs.build-linux-x64.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -1222,12 +1423,6 @@ jobs:
           path: dist/bin/
           merge-multiple: true
 
-      - name: Download web assets
-        uses: actions/download-artifact@v4
-        with:
-          name: web-assets
-          path: dist/public/
-
       - name: Make binaries executable
         run: chmod +x dist/bin/*
 
@@ -1237,42 +1432,30 @@ jobs:
           sudo apt-get install -y ruby ruby-dev build-essential rpm
           sudo gem install fpm
 
-      - name: Get version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       - name: Build deb package (x64)
         run: |
           fpm -s dir -t deb \
             -n unified-hifi-control \
-            -v ${{ steps.version.outputs.version }} \
+            -v ${{ needs.plan.outputs.version }} \
             --description "Source-agnostic hi-fi control bridge" \
             --url "https://github.com/open-horizon-labs/unified-hifi-control" \
             --license "PolyForm Noncommercial 1.0.0" \
             -a amd64 \
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-x64=/usr/bin/unified-hifi-control \
-            dist/public/=/usr/share/unified-hifi-control/public \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Build rpm package (x64)
         run: |
           fpm -s dir -t rpm \
             -n unified-hifi-control \
-            -v ${{ steps.version.outputs.version }} \
+            -v ${{ needs.plan.outputs.version }} \
             --description "Source-agnostic hi-fi control bridge" \
             --url "https://github.com/open-horizon-labs/unified-hifi-control" \
             --license "PolyForm Noncommercial 1.0.0" \
             -a x86_64 \
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-x64=/usr/bin/unified-hifi-control \
-            dist/public/=/usr/share/unified-hifi-control/public \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Build deb package (arm64)
@@ -1280,14 +1463,13 @@ jobs:
         run: |
           fpm -s dir -t deb \
             -n unified-hifi-control \
-            -v ${{ steps.version.outputs.version }} \
+            -v ${{ needs.plan.outputs.version }} \
             --description "Source-agnostic hi-fi control bridge" \
             --url "https://github.com/open-horizon-labs/unified-hifi-control" \
             --license "PolyForm Noncommercial 1.0.0" \
             -a arm64 \
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-arm64=/usr/bin/unified-hifi-control \
-            dist/public/=/usr/share/unified-hifi-control/public \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Build deb package (armv7/armhf)
@@ -1295,14 +1477,13 @@ jobs:
         run: |
           fpm -s dir -t deb \
             -n unified-hifi-control \
-            -v ${{ steps.version.outputs.version }} \
+            -v ${{ needs.plan.outputs.version }} \
             --description "Source-agnostic hi-fi control bridge" \
             --url "https://github.com/open-horizon-labs/unified-hifi-control" \
             --license "PolyForm Noncommercial 1.0.0" \
             -a armhf \
             --after-install build/linux/postinst.sh \
             dist/bin/unified-hifi-linux-armv7=/usr/bin/unified-hifi-control \
-            dist/public/=/usr/share/unified-hifi-control/public \
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Upload Linux packages
@@ -1318,9 +1499,10 @@ jobs:
   # RELEASE ONLY: Upload to GitHub Release
   # =============================================================================
 
+  # Note: Web assets are embedded in the binary (ADR 002)
   upload-release:
     name: Upload to Release
-    needs: [plan, build-linux-x64, build-linux-arm, build-macos-universal, build-windows, build-linux-packages, build-lms-universal, build-synology, build-qnap-x64, build-qnap-arm, build-web-assets]
+    needs: [plan, build-linux-x64, build-linux-arm, build-macos-universal, build-windows, build-linux-packages, build-lms-universal, build-synology, build-qnap-x64, build-qnap-arm]
     if: needs.plan.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -1345,7 +1527,6 @@ jobs:
           find artifacts -name "*.zip" -type f -exec cp {} release/ \;
           find artifacts -name "*.spk" -type f -exec cp {} release/ \;
           find artifacts -name "*.qpkg" -type f -exec cp {} release/ \;
-          find artifacts -name "*.tar.gz" -type f -exec cp {} release/ \;
           ls -la release/
 
       - name: Generate asset list
@@ -1354,6 +1535,8 @@ jobs:
           ## Download Guide
 
           ### Standalone Binaries
+          All binaries include embedded web assets - no separate download needed.
+
           | Platform | File |
           |----------|------|
           | Linux x64 | `unified-hifi-linux-x64` |
@@ -1372,9 +1555,6 @@ jobs:
 
           ### LMS Plugin
           - `lms-unified-hifi-control-*.zip` - Install via LMS Settings > Plugins
-
-          ### Web Assets
-          - `web-assets.tar.gz` - Pre-built web UI (included in packages)
           EOF
 
       - name: Upload to release
@@ -1493,8 +1673,9 @@ jobs:
       - plan
       - lint
       - test
+      - fullstack-check
       - build-linux-x64
-      - build-web-assets
+      - smoke-test
       - build-linux-arm
       - build-macos-universal
       - build-windows

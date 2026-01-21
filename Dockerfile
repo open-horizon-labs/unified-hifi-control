@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.4
-# Build stage
+# Build stage - ADR 002: Single binary with embedded web assets
 FROM rust:1.92-slim AS builder
 
 WORKDIR /app
@@ -14,13 +14,13 @@ RUN apt-get update && apt-get install -y \
 # Install wasm32 target for client build
 RUN rustup target add wasm32-unknown-unknown
 
-# Install Dioxus CLI (with cache mount for cargo registry)
+# Install Dioxus CLI and Tailwind (with cache mount for cargo registry)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo install dioxus-cli@0.7.3
 
 # Copy manifests first (for dependency caching)
-COPY Cargo.toml Cargo.lock Dioxus.toml ./
+COPY Cargo.toml Cargo.lock Dioxus.toml Makefile ./
 
 # Create dummy source for dependency caching
 RUN mkdir -p src/app && \
@@ -34,18 +34,22 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo build --release 2>/dev/null || true
 
-# Copy actual source and public assets
+# Copy actual source
 COPY src/ ./src/
-COPY public/ ./public/
+COPY input.css tailwind.config.js ./
 
-# Build with Dioxus (with cache mounts for faster rebuilds)
+# Build Tailwind CSS (downloads standalone CLI if needed)
+RUN make css
+
+# ADR 002: Build WASM assets first, then build server which embeds them
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    dx build --release --platform web --features web && \
-    cp -r target/dx/unified-hifi-control/release/web /app/dist
+    dx build --fullstack --release @client --no-default-features --features web @server --features server && \
+    cargo build --release && \
+    cp target/release/unified-hifi-control /app/unified-hifi-control-bin
 
-# Runtime stage
+# Runtime stage - minimal image, no public/ directory needed
 FROM debian:bookworm-slim
 
 WORKDIR /app
@@ -55,9 +59,8 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy binary and web assets from builder
-COPY --from=builder /app/dist/unified-hifi-control /app/
-COPY --from=builder /app/dist/public /app/public
+# Copy binary with embedded web assets (ADR 002 - no public/ directory)
+COPY --from=builder /app/unified-hifi-control-bin /app/unified-hifi-control
 
 # Create data directory for config persistence
 RUN mkdir -p /data

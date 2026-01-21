@@ -3,6 +3,9 @@
 use dioxus::prelude::*;
 
 use super::nav::Nav;
+use crate::app::embedded_assets::{
+    APPLE_TOUCH_ICON_DATA_URL, DX_THEME_CSS, FAVICON_DATA_URL, TAILWIND_CSS,
+};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct LayoutProps {
@@ -26,31 +29,26 @@ pub struct LayoutProps {
 /// Main layout component wrapping all pages.
 #[component]
 pub fn Layout(props: LayoutProps) -> Element {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = env!("UHC_VERSION");
+    let git_sha = env!("UHC_GIT_SHA");
     let full_title = format!("{} - Unified Hi-Fi Control", props.title);
 
     rsx! {
         // Head elements - Dioxus hoists these to the real <head>
         document::Title { "{full_title}" }
-        // DioxusLabs components theme (CSS variables for dark/light mode)
-        document::Link {
-            rel: "stylesheet",
-            href: asset!("/public/dx-components-theme.css")
-        }
-        // Tailwind CSS utilities
-        document::Link {
-            rel: "stylesheet",
-            href: asset!("/public/tailwind.css")
-        }
-        // Favicon
+        // DioxusLabs components theme (CSS variables for dark/light mode) - embedded
+        document::Style { {DX_THEME_CSS} }
+        // Tailwind CSS utilities - embedded
+        document::Style { {TAILWIND_CSS} }
+        // Favicon - embedded as data URL
         document::Link {
             rel: "icon",
-            href: "/favicon.ico"
+            href: "{*FAVICON_DATA_URL}"
         }
         document::Link {
             rel: "apple-touch-icon",
             sizes: "180x180",
-            href: "/apple-touch-icon.png"
+            href: "{*APPLE_TOUCH_ICON_DATA_URL}"
         }
 
         // Body content
@@ -64,7 +62,7 @@ pub fn Layout(props: LayoutProps) -> Element {
             {props.children}
         }
         footer { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center py-3",
-            small { class: "text-muted", "Unified Hi-Fi Control v{version}" }
+            small { class: "text-muted", "Unified Hi-Fi Control v{version} ({git_sha})" }
         }
     }
 }

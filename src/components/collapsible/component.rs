@@ -3,10 +3,13 @@ use dioxus_primitives::collapsible::{
     self, CollapsibleContentProps, CollapsibleProps, CollapsibleTriggerProps,
 };
 
+/// Embedded collapsible CSS
+const COLLAPSIBLE_CSS: &str = include_str!("./style.css");
+
 #[component]
 pub fn Collapsible(props: CollapsibleProps) -> Element {
     rsx! {
-        document::Link { rel: "stylesheet", href: asset!("./style.css") }
+        document::Style { {COLLAPSIBLE_CSS} }
         collapsible::Collapsible {
             keep_mounted: props.keep_mounted,
             default_open: props.default_open,

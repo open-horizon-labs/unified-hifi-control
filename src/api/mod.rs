@@ -123,6 +123,7 @@ pub struct PlayersWrapper<T: Serialize> {
 pub struct StatusResponse {
     pub service: &'static str,
     pub version: &'static str,
+    pub git_sha: &'static str,
     pub uptime_secs: u64,
     pub roon_connected: bool,
     pub hqplayer_connected: bool,
@@ -142,7 +143,8 @@ pub async fn status_handler(State(state): State<AppState>) -> Json<StatusRespons
 
     Json(StatusResponse {
         service: "unified-hifi-control",
-        version: env!("CARGO_PKG_VERSION"),
+        version: env!("UHC_VERSION"),
+        git_sha: env!("UHC_GIT_SHA"),
         uptime_secs: state.start_time.elapsed().as_secs(),
         roon_connected: roon_status.connected,
         hqplayer_connected: hqp_status.connected,
