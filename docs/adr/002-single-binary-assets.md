@@ -1,7 +1,25 @@
 # ADR 002: Single Binary Asset Distribution
 
 ## Status
-**Proposed**
+**Accepted**
+
+## Problem Statement
+
+**Users cannot reliably run the binary after installation.**
+
+The current architecture requires:
+1. Binary installed to `/usr/bin/unified-hifi-control`
+2. Web assets installed to `/usr/share/unified-hifi-control/public/`
+3. `DIOXUS_PUBLIC_PATH` environment variable set in service files
+4. Dioxus runtime creating symlinks or finding assets
+
+This fails when:
+- Package scripts misconfigure paths (AUR, deb, rpm all had bugs)
+- `ProtectSystem=strict` blocks runtime symlink creation
+- Users run binary directly without env vars set
+- Asset folder gets deleted or moved
+
+**Root cause:** Dioxus fullstack hardcodes looking for `public/` relative to the executable, requiring workarounds in every deployment target.
 
 ## Context
 
