@@ -455,9 +455,12 @@ mod server {
             }
         };
 
-        axum::serve(listener, router)
-            .with_graceful_shutdown(graceful_shutdown)
-            .await?;
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(graceful_shutdown)
+        .await?;
 
         // Cleanup: publish ShuttingDown event and stop adapters
         tracing::info!("Shutting down adapters...");
