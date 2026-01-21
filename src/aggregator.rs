@@ -91,10 +91,19 @@ impl ZoneAggregator {
                     // Find zone containing this output and update volume_control
                     let mut zones = self.zones.write().await;
                     for zone in zones.values_mut() {
-                        // Check if this zone's ID matches or contains the output_id
-                        // Roon: output_id is separate from zone_id
-                        // LMS: output_id is the player MAC (same as zone_id suffix)
-                        if zone.zone_id.contains(&output_id) || output_id.contains(&zone.zone_id) {
+                        // Match by volume_control.output_id (works for Roon where output_id != zone_id)
+                        // Fall back to zone_id suffix match for LMS (output_id is player MAC)
+                        let matches = zone
+                            .volume_control
+                            .as_ref()
+                            .and_then(|vc| vc.output_id.as_ref())
+                            .map(|oid| oid == &output_id)
+                            .unwrap_or_else(|| {
+                                // Fallback: check if zone_id ends with output_id (LMS style)
+                                zone.zone_id.ends_with(&output_id)
+                            });
+
+                        if matches {
                             if let Some(ref mut vc) = zone.volume_control {
                                 vc.value = value;
                                 vc.is_muted = is_muted;

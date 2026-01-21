@@ -103,6 +103,7 @@ impl SseContext {
                 SseEvent::ZoneUpdated { .. }
                     | SseEvent::ZoneRemoved { .. }
                     | SseEvent::NowPlayingChanged { .. }
+                    | SseEvent::SeekPositionChanged { .. }
                     | SseEvent::VolumeChanged { .. }
                     | SseEvent::RoonConnected
                     | SseEvent::RoonDisconnected
