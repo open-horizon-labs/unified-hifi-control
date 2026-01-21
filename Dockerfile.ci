@@ -13,8 +13,9 @@ ARG TARGETARCH
 COPY binaries/unified-hifi-linux-${TARGETARCH} /app/unified-hifi-control
 RUN chmod +x /app/unified-hifi-control
 
-# Create data directory for config persistence
-RUN mkdir -p /data
+# Create data directory for config persistence and empty public directory
+# (Dioxus requires public/ to exist even with embedded assets - see ADR 002)
+RUN mkdir -p /data /app/public
 
 # Version from build arg
 ARG APP_VERSION=dev

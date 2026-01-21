@@ -14,8 +14,9 @@ COPY dist/unified-hifi-control /app/
 # Make binary executable
 RUN chmod +x /app/unified-hifi-control
 
-# Create data directory for config persistence
-RUN mkdir -p /data
+# Create data directory for config persistence and empty public directory
+# (Dioxus requires public/ to exist even with embedded assets - see ADR 002)
+RUN mkdir -p /data /app/public
 
 # Environment
 ENV PORT=8088

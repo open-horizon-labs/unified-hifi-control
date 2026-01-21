@@ -40,8 +40,15 @@ sha256sums_armv7h=('SKIP')
 package() {
     cd "${srcdir}"
 
-    # Install binary (includes embedded web assets)
-    install -Dm755 binary "${pkgdir}/usr/bin/${_pkgname}"
+    # Install to /opt/ so we can create public/ directory next to binary
+    # (Dioxus requires public/ to exist - see ADR 002)
+    install -dm755 "${pkgdir}/opt/${_pkgname}"
+    install -Dm755 binary "${pkgdir}/opt/${_pkgname}/${_pkgname}"
+    install -dm755 "${pkgdir}/opt/${_pkgname}/public"
+
+    # Create symlink in /usr/bin for PATH access
+    install -dm755 "${pkgdir}/usr/bin"
+    ln -s "/opt/${_pkgname}/${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
 
     # Install systemd service
     install -Dm644 "${_pkgname}.service" \
