@@ -820,16 +820,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       # Download all available binaries
       - name: Download Linux x64 binary
         uses: actions/download-artifact@v4
@@ -871,7 +861,7 @@ jobs:
 
       - name: Update install.xml version
         run: |
-          sed -i "s|<version>[^<]*</version>|<version>${{ steps.version.outputs.version }}</version>|" lms-plugin/install.xml
+          sed -i "s|<version>[^<]*</version>|<version>${{ needs.plan.outputs.version }}</version>|" lms-plugin/install.xml
 
       - name: Bundle LMS plugin with all binaries
         run: |
@@ -920,17 +910,17 @@ jobs:
           find Bin -type f -name "unified-hifi-control*" | head -20
 
           # Create ZIP with everything
-          zip -r ../dist/lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip . \
+          zip -r ../dist/lms-unified-hifi-control-${{ needs.plan.outputs.version }}.zip . \
             -x "*.git*"
 
       - name: Repack with correct directory structure
         run: |
           cd dist
           mkdir -p repack
-          unzip lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip -d repack/UnifiedHiFi
-          rm lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip
+          unzip lms-unified-hifi-control-${{ needs.plan.outputs.version }}.zip -d repack/UnifiedHiFi
+          rm lms-unified-hifi-control-${{ needs.plan.outputs.version }}.zip
           cd repack
-          zip -r ../lms-unified-hifi-control-${{ steps.version.outputs.version }}.zip UnifiedHiFi
+          zip -r ../lms-unified-hifi-control-${{ needs.plan.outputs.version }}.zip UnifiedHiFi
           cd ..
           rm -rf repack
 
@@ -986,16 +976,9 @@ jobs:
           mv build/synology/package/${{ matrix.binary }} build/synology/package/unified-hifi-control
           chmod +x build/synology/package/unified-hifi-control
 
-      - name: Get version
-        id: version
+      - name: Update INFO file
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          sed -i "s/version=\"{{VERSION}}\"/version=\"$VERSION\"/" build/synology/INFO
+          sed -i "s/version=\"{{VERSION}}\"/version=\"${{ needs.plan.outputs.version }}\"/" build/synology/INFO
           sed -i "s/arch=\"{{ARCH}}\"/arch=\"${{ matrix.arch }}\"/" build/synology/INFO
 
       - name: Build Synology SPK
@@ -1003,7 +986,7 @@ jobs:
           cd build/synology
           tar -czf package.tgz -C package .
           mkdir -p ../../dist/installers
-          SPK_NAME="UnifiedHifiControl-${{ matrix.arch }}-${{ steps.version.outputs.version }}.spk"
+          SPK_NAME="UnifiedHifiControl-${{ matrix.arch }}-${{ needs.plan.outputs.version }}.spk"
           tar -cf "../../dist/installers/${SPK_NAME}" \
             INFO PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG \
             package.tgz scripts conf WIZARD_UIFILES
@@ -1033,16 +1016,6 @@ jobs:
       - name: Make binary executable
         run: chmod +x dist/bin/*
 
-      - name: Get version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       - name: Prepare QNAP package
         run: |
           mkdir -p qnap-build/shared
@@ -1051,7 +1024,7 @@ jobs:
           cp build/qnap/shared/*.sh qnap-build/shared/
           chmod +x qnap-build/shared/*.sh
           cp -r build/qnap/shared/icons qnap-build/
-          sed "s/{{VERSION}}/${{ steps.version.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
+          sed "s/{{VERSION}}/${{ needs.plan.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
           echo '#!/bin/sh' > qnap-build/package_routines
 
       - name: Build QPKG with Docker
@@ -1065,7 +1038,7 @@ jobs:
       - name: Move QPKG to dist
         run: |
           mkdir -p dist/installers
-          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ steps.version.outputs.version }}_x86_64.qpkg
+          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ needs.plan.outputs.version }}_x86_64.qpkg
 
       - name: Upload QNAP package
         uses: actions/upload-artifact@v4
@@ -1095,16 +1068,6 @@ jobs:
       - name: Make binary executable
         run: chmod +x dist/bin/*
 
-      - name: Get version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       - name: Prepare QNAP package
         run: |
           mkdir -p qnap-build/shared
@@ -1113,7 +1076,7 @@ jobs:
           cp build/qnap/shared/*.sh qnap-build/shared/
           chmod +x qnap-build/shared/*.sh
           cp -r build/qnap/shared/icons qnap-build/
-          sed "s/{{VERSION}}/${{ steps.version.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
+          sed "s/{{VERSION}}/${{ needs.plan.outputs.version }}/" build/qnap/qpkg.cfg > qnap-build/qpkg.cfg
           echo '#!/bin/sh' > qnap-build/package_routines
 
       - name: Build QPKG with Docker
@@ -1127,7 +1090,7 @@ jobs:
       - name: Move QPKG to dist
         run: |
           mkdir -p dist/installers
-          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ steps.version.outputs.version }}_arm_64.qpkg
+          mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ needs.plan.outputs.version }}_arm_64.qpkg
 
       - name: Upload QNAP package
         uses: actions/upload-artifact@v4
@@ -1336,21 +1299,11 @@ jobs:
           sudo apt-get install -y ruby ruby-dev build-essential rpm
           sudo gem install fpm
 
-      - name: Get version
-        id: version
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="0.0.0-dev"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       - name: Build deb package (x64)
         run: |
           fpm -s dir -t deb \
             -n unified-hifi-control \
-            -v ${{ steps.version.outputs.version }} \
+            -v ${{ needs.plan.outputs.version }} \
             --description "Source-agnostic hi-fi control bridge" \
             --url "https://github.com/open-horizon-labs/unified-hifi-control" \
             --license "PolyForm Noncommercial 1.0.0" \
@@ -1363,7 +1316,7 @@ jobs:
         run: |
           fpm -s dir -t rpm \
             -n unified-hifi-control \
-            -v ${{ steps.version.outputs.version }} \
+            -v ${{ needs.plan.outputs.version }} \
             --description "Source-agnostic hi-fi control bridge" \
             --url "https://github.com/open-horizon-labs/unified-hifi-control" \
             --license "PolyForm Noncommercial 1.0.0" \
@@ -1377,7 +1330,7 @@ jobs:
         run: |
           fpm -s dir -t deb \
             -n unified-hifi-control \
-            -v ${{ steps.version.outputs.version }} \
+            -v ${{ needs.plan.outputs.version }} \
             --description "Source-agnostic hi-fi control bridge" \
             --url "https://github.com/open-horizon-labs/unified-hifi-control" \
             --license "PolyForm Noncommercial 1.0.0" \
@@ -1391,7 +1344,7 @@ jobs:
         run: |
           fpm -s dir -t deb \
             -n unified-hifi-control \
-            -v ${{ steps.version.outputs.version }} \
+            -v ${{ needs.plan.outputs.version }} \
             --description "Source-agnostic hi-fi control bridge" \
             --url "https://github.com/open-horizon-labs/unified-hifi-control" \
             --license "PolyForm Noncommercial 1.0.0" \
