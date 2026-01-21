@@ -83,6 +83,19 @@ pub enum SseEvent {
     Unknown,
 }
 
+impl SseEvent {
+    /// Extract zone_id from zone-related events
+    pub fn zone_id(&self) -> Option<&str> {
+        match self {
+            SseEvent::ZoneUpdated { payload } => Some(&payload.zone_id),
+            SseEvent::ZoneRemoved { payload } => Some(&payload.zone_id),
+            SseEvent::NowPlayingChanged { payload } => Some(&payload.zone_id),
+            SseEvent::SeekPositionChanged { payload } => Some(&payload.zone_id),
+            _ => None,
+        }
+    }
+}
+
 /// Global SSE state shared via context
 #[derive(Clone, Copy)]
 pub struct SseContext {

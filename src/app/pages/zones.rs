@@ -30,6 +30,12 @@ async fn fetch_all_now_playing(zones: &[Zone]) -> HashMap<String, NowPlaying> {
     np_map
 }
 
+/// Fetch now playing for a single zone by ID
+async fn fetch_zone_now_playing(zone_id: &str) -> Option<NowPlaying> {
+    let url = format!("/now_playing?zone_id={}", urlencoding::encode(zone_id));
+    crate::app::api::fetch_json::<NowPlaying>(&url).await.ok()
+}
+
 /// Zones listing page component.
 #[component]
 pub fn Zones() -> Element {
@@ -86,21 +92,41 @@ pub fn Zones() -> Element {
             zones.restart();
         }
 
-        // Refresh now_playing on playback/volume changes (without reloading zones)
-        if matches!(
-            event.as_ref(),
-            Some(
-                SseEvent::NowPlayingChanged { .. }
-                    | SseEvent::VolumeChanged { .. }
-                    | SseEvent::LmsPlayerStateChanged { .. }
-            )
-        ) {
-            let zone_list = zones_list_signal();
-            if !zone_list.is_empty() {
-                spawn(async move {
-                    let np_map = fetch_all_now_playing(&zone_list).await;
-                    now_playing.set(np_map);
-                });
+        // Refresh now_playing on playback/volume changes
+        // Use selective per-zone fetching to avoid race conditions when multiple
+        // zones update rapidly (fixes issue #109 - wrong album art display)
+        if let Some(ref evt) = event {
+            match evt {
+                // Zone-scoped event: fetch only the specific zone that changed
+                SseEvent::NowPlayingChanged { .. } => {
+                    if let Some(zone_id) = evt.zone_id() {
+                        let zone_id = zone_id.to_string();
+                        spawn(async move {
+                            if let Some(np) = fetch_zone_now_playing(&zone_id).await {
+                                now_playing.with_mut(|map| {
+                                    map.insert(zone_id, np);
+                                });
+                            }
+                        });
+                    }
+                }
+                // Volume/LMS events: fetch all zones and merge atomically
+                // (output_id/player_id don't map directly to zone_id)
+                SseEvent::VolumeChanged { .. } | SseEvent::LmsPlayerStateChanged { .. } => {
+                    let zone_list = zones_list_signal();
+                    if !zone_list.is_empty() {
+                        spawn(async move {
+                            let np_map = fetch_all_now_playing(&zone_list).await;
+                            now_playing.with_mut(|map| {
+                                for (k, v) in np_map {
+                                    map.insert(k, v);
+                                }
+                            });
+                        });
+                    }
+                }
+                // SeekPositionChanged doesn't affect track/artist/album art - no fetch needed
+                _ => {}
             }
         }
     });
