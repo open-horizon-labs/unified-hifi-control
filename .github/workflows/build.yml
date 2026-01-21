@@ -392,8 +392,8 @@ jobs:
         run: make css
 
       - name: Build fullstack (SSR with embedded assets)
-        # Server uses default features, client needs explicit --no-default-features to exclude server deps from WASM
-        run: dx build --fullstack --release @client --no-default-features --features web
+        # ADR 002: serve_api_application() = SSR-only, no WASM needed
+        run: dx build --fullstack --release
 
   build-linux-x64:
     name: Build Linux x64
