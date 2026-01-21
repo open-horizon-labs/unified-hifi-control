@@ -437,7 +437,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars (deps stay cached)
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo zigbuild --release --target x86_64-unknown-linux-musl
+          cargo zigbuild --release --features server --target x86_64-unknown-linux-musl
 
       - name: Rename binary
         run: |
@@ -626,7 +626,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars (deps stay cached)
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo zigbuild --release --target ${{ matrix.target }}
+          cargo zigbuild --release --features server --target ${{ matrix.target }}
 
       - name: Smoke test armv7 binary
         if: matrix.target == 'armv7-unknown-linux-musleabihf'
@@ -677,7 +677,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars (deps stay cached)
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --features server --target x86_64-apple-darwin
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -717,7 +717,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars (deps stay cached)
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --features server --target aarch64-apple-darwin
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
@@ -792,7 +792,7 @@ jobs:
         run: |
           # Force rebuild of main crate to pick up version env vars (deps stay cached)
           cargo clean -p unified-hifi-control 2>/dev/null || true
-          cargo build --release
+          cargo build --release --features server
 
       - name: Rename binary
         shell: bash
