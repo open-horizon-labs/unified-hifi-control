@@ -175,18 +175,25 @@ This prevents spurious builds from non-build labels (arch, coderabbit, etc.).
     shared-key: "wasm-build"        # Same key across all triggers
     cache-all-crates: true          # Cache all dependencies, not just workspace
     cache-on-failure: true          # Save cache even if build fails
-    cache-directories: target/dx    # Include dioxus build artifacts
+    cache-directories: |            # Include build artifacts
+      target/dx
+      target/wasm32-unknown-unknown
+
+- name: Fetch dependencies
+  run: cargo fetch --target wasm32-unknown-unknown
 ```
 
 **Options explained:**
 - `shared-key`: Overrides job-based cache key to share across triggers
 - `cache-all-crates`: Caches all crates, not just workspace members (important for proc-macros)
 - `cache-on-failure`: Saves partial cache if build fails (speeds up retry)
-- `cache-directories`: Additional directories to cache (e.g., `target/dx` for dioxus)
+- `cache-directories`: Additional directories to cache (e.g., `target/dx` for dioxus, `target/wasm32-unknown-unknown` for WASM compilation)
+
+**WASM builds:** We run `cargo fetch` before building to ensure dependencies are downloaded and cached by rust-cache. sccache is NOT used for WASM builds because it doesn't work well with the wasm32 target.
 
 ### 2. sccache for Compilation Units
 
-**Used by:** Native builds (Web Assets, macOS, Windows)
+**Used by:** Native builds (macOS, Windows, Tests)
 
 ```yaml
 - name: Setup sccache
@@ -358,7 +365,7 @@ spk/
 
 | Target | Caching | Build Tool | Default | Label |
 |--------|---------|------------|---------|-------|
-| Web Assets (WASM) | sccache + rust-cache | dx | Always | - |
+| Web Assets (WASM) | rust-cache | dx | Always | - |
 | Linux x86_64-musl | rust-cache | cargo-zigbuild | Always | - |
 | Linux aarch64-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
 | Linux armv7-musl | rust-cache | cargo-zigbuild | Release | `build:linux-arm` |
@@ -394,7 +401,7 @@ This adds ~14s but catches ABI issues, missing linkage, and startup crashes befo
 
 2. **Labels for PR customization**: Instead of separate "full build" workflows, use labels like `build:all` to enable extra builds when testing specific platforms.
 
-3. **sccache + rust-cache**: Use both for native builds. sccache caches `.o` files, rust-cache caches proc-macro dylibs. zigbuild jobs can only use rust-cache (sccache incompatible with zig wrapper).
+3. **sccache + rust-cache**: Use both for native builds (macOS, Windows). sccache caches `.o` files, rust-cache caches proc-macro dylibs. WASM and zigbuild jobs use rust-cache only (sccache doesn't work well with wasm32 target or zig wrapper).
 
 4. **Avoid containerized cross-compilation**: `cross` runs cargo in Docker containers, breaking Cargo's fingerprint caching. `cargo-zigbuild` cross-compiles without containers.
 
