@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 use crate::app::api::{
     HqpMatrixProfilesResponse, HqpPipeline, HqpProfile, NowPlaying, Zone as ZoneData, ZonesResponse,
 };
-use crate::app::components::Layout;
+use crate::app::components::{ErrorAlert, HqpMatrixSelect, HqpProfileSelect, Layout};
 use crate::app::sse::use_sse;
 
 /// Control request body
@@ -309,13 +309,9 @@ pub fn Zone() -> Element {
 
             // HQP error display
             if let Some(error) = hqp_error() {
-                div { class: "card bg-error/10 border-error text-error p-3 mb-4",
-                    "{error}"
-                    button {
-                        class: "btn btn-ghost btn-sm ml-2",
-                        onclick: move |_| hqp_error.set(None),
-                        "×"
-                    }
+                ErrorAlert {
+                    message: error,
+                    on_dismiss: move |_| hqp_error.set(None),
                 }
             }
 
@@ -521,21 +517,10 @@ fn HqpSection(
                     div { class: "mb-4",
                         label {
                             "Profile"
-                            select {
-                                id: "hqp-profile",
-                                onchange: move |evt: Event<FormData>| {
-                                    let value = evt.value();
-                                    if !value.is_empty() {
-                                        on_load_profile.call(value);
-                                    }
-                                },
-                                option { value: "", "-- Select Profile --" }
-                                for profile in profiles.iter() {
-                                    option {
-                                        value: "{profile.name.as_deref().unwrap_or_default()}",
-                                        "{profile.title.as_deref().unwrap_or(profile.name.as_deref().unwrap_or(\"Unknown\"))}"
-                                    }
-                                }
+                            HqpProfileSelect {
+                                profiles: profiles.clone(),
+                                on_select: on_load_profile,
+                                class: "".to_string(),
                             }
                         }
                     }
@@ -546,20 +531,11 @@ fn HqpSection(
                     div { class: "mb-4",
                         label {
                             "Matrix Profile"
-                            select {
-                                id: "hqp-matrix",
-                                onchange: move |evt: Event<FormData>| {
-                                    if let Ok(idx) = evt.value().parse::<u32>() {
-                                        on_set_matrix.call(idx);
-                                    }
-                                },
-                                for mp in matrix_profiles.iter() {
-                                    option {
-                                        value: "{mp.index}",
-                                        selected: matrix_current == Some(mp.index),
-                                        "{mp.name}"
-                                    }
-                                }
+                            HqpMatrixSelect {
+                                profiles: matrix_profiles,
+                                active: matrix_current,
+                                on_select: on_set_matrix,
+                                class: "".to_string(),
                             }
                         }
                     }

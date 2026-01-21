@@ -3,7 +3,7 @@
 //! Shows all available zones using Dioxus resources.
 
 use crate::app::api::{HqpMatrixProfilesResponse, HqpProfile, NowPlaying, Zone, ZonesResponse};
-use crate::app::components::{Layout, VolumeControlsCompact};
+use crate::app::components::{ErrorAlert, HqpControlsCompact, Layout, VolumeControlsCompact};
 use crate::app::sse::{use_sse, SseEvent};
 use dioxus::prelude::*;
 use std::collections::HashMap;
@@ -242,13 +242,9 @@ pub fn Zones() -> Element {
 
             // HQP error display
             if let Some(error) = hqp_error() {
-                div { class: "card bg-error/10 border-error text-error p-3 mb-4",
-                    "{error}"
-                    button {
-                        class: "btn btn-ghost btn-sm ml-2",
-                        onclick: move |_| hqp_error.set(None),
-                        "×"
-                    }
+                ErrorAlert {
+                    message: error,
+                    on_dismiss: move |_| hqp_error.set(None),
                 }
             }
 
@@ -365,42 +361,12 @@ fn ZoneCard(
 
             // HQP controls (for HQP zones only)
             if has_hqp && (!hqp_profiles.is_empty() || has_matrix) {
-                div { class: "flex gap-2 mt-4",
-                    if !hqp_profiles.is_empty() {
-                        select {
-                            class: "input input-sm flex-1",
-                            onchange: move |evt: Event<FormData>| {
-                                let value = evt.value();
-                                if !value.is_empty() {
-                                    on_load_profile.call(value);
-                                }
-                            },
-                            option { value: "", "Profile..." }
-                            for profile in hqp_profiles.iter() {
-                                option {
-                                    value: "{profile.name.as_deref().unwrap_or_default()}",
-                                    "{profile.title.as_deref().unwrap_or(profile.name.as_deref().unwrap_or(\"?\"))}"
-                                }
-                            }
-                        }
-                    }
-                    if has_matrix {
-                        select {
-                            class: "input input-sm flex-1",
-                            onchange: move |evt: Event<FormData>| {
-                                if let Ok(idx) = evt.value().parse::<u32>() {
-                                    on_set_matrix.call(idx);
-                                }
-                            },
-                            for mp in matrix_profiles.iter() {
-                                option {
-                                    value: "{mp.index}",
-                                    selected: matrix_current == Some(mp.index),
-                                    "{mp.name}"
-                                }
-                            }
-                        }
-                    }
+                HqpControlsCompact {
+                    profiles: hqp_profiles,
+                    matrix_profiles: matrix_profiles,
+                    active_matrix: matrix_current,
+                    on_profile_select: on_load_profile,
+                    on_matrix_select: on_set_matrix,
                 }
             }
 

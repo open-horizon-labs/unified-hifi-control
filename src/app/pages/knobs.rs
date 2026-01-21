@@ -8,7 +8,7 @@ use crate::app::api::{
     self, FetchFirmwareResponse, FirmwareVersion, KnobConfig, KnobConfigResponse, KnobDevice,
     KnobDevicesResponse, PowerModeConfig, Zone, ZonesResponse,
 };
-use crate::app::components::Layout;
+use crate::app::components::{Layout, PowerModeInput};
 use crate::app::sse::use_sse;
 
 /// Knobs page component.
@@ -725,41 +725,6 @@ fn ConfigModal(
                         }
                     }
                 }
-            }
-        }
-    }
-}
-
-/// Power mode input row component
-#[component]
-fn PowerModeInput(
-    label: &'static str,
-    description: &'static str,
-    config: PowerModeConfig,
-    on_change: EventHandler<PowerModeConfig>,
-) -> Element {
-    let timeout_sec = config.timeout_sec;
-
-    rsx! {
-        div { class: "flex items-center gap-4",
-            div { class: "flex-1",
-                label { class: "block text-sm font-medium", "{label}" }
-                p { class: "text-xs text-muted", "{description}" }
-            }
-            div { class: "flex items-center gap-2",
-                input {
-                    class: "input w-20 text-center",
-                    r#type: "number",
-                    min: "0",
-                    max: "3600",
-                    value: "{timeout_sec}",
-                    oninput: move |e| {
-                        if let Ok(v) = e.value().parse::<u32>() {
-                            on_change.call(PowerModeConfig { enabled: v > 0, timeout_sec: v });
-                        }
-                    }
-                }
-                span { class: "text-sm text-muted", "sec" }
             }
         }
     }
