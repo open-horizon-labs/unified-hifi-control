@@ -59,7 +59,8 @@ jobs:
           cache-on-failure: true
 
       - name: Run tests
-        run: cargo test --workspace
+        # Need --features server because default features are empty (for WASM compatibility)
+        run: cargo test --workspace --features server
 
   docker-edge:
     name: Build Docker Edge

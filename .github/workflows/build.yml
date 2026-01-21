@@ -354,7 +354,8 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo test --workspace
+        # Need --features server because default features are empty (for WASM compatibility)
+        run: cargo test --workspace --features server
 
   # Note: Web assets are now embedded in the binary (ADR 002).
   # The fullstack-check job validates the fullstack build works correctly.
