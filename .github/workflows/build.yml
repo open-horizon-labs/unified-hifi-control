@@ -380,16 +380,19 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
+      # Note: sccache disabled for WASM builds - doesn't work well with wasm32 target
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "wasm-build"
           cache-all-crates: true
           cache-on-failure: true
-          cache-directories: target/dx
+          cache-directories: |
+            target/dx
+            target/wasm32-unknown-unknown
+
+      - name: Fetch dependencies
+        run: cargo fetch --target wasm32-unknown-unknown
 
       - name: Cache Dioxus CLI
         id: cache-dx
@@ -406,9 +409,6 @@ jobs:
         run: make css
 
       - name: Build web assets
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: dx build --release --platform web --features web
 
       - name: Create web assets tarball

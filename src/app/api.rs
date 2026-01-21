@@ -47,11 +47,19 @@ pub struct AdapterSettings {
     pub lms: bool,
     pub openhome: bool,
     pub upnp: bool,
+    #[serde(default)]
+    pub hqplayer: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AppSettings {
     pub adapters: AdapterSettings,
+    #[serde(default)]
+    pub hide_knobs_page: bool,
+    #[serde(default)]
+    pub hide_hqp_page: bool,
+    #[serde(default)]
+    pub hide_lms_page: bool,
 }
 
 // =============================================================================
@@ -82,6 +90,8 @@ pub struct NowPlaying {
     pub line2: Option<String>,
     pub line3: Option<String>,
     pub image_url: Option<String>,
+    /// Image key for cache busting (changes when track changes)
+    pub image_key: Option<String>,
     pub is_playing: bool,
     pub volume: Option<f32>,
     pub volume_type: Option<String>,
@@ -120,6 +130,8 @@ pub struct HqpConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub web_port: Option<u16>,
+    #[serde(default)]
+    pub has_web_credentials: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -175,6 +187,23 @@ pub struct HqpProfile {
     pub value: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct HqpProfilesResponse {
+    pub profiles: Vec<HqpProfile>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct HqpMatrixProfile {
+    pub index: u32,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct HqpMatrixProfilesResponse {
+    pub profiles: Vec<HqpMatrixProfile>,
+    pub current: Option<u32>,
+}
+
 // =============================================================================
 // Knob Types
 // =============================================================================
@@ -206,11 +235,33 @@ pub struct KnobConfigResponse {
     pub config: Option<KnobConfig>,
 }
 
+/// Power mode configuration for knob timeout-based state transitions
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PowerModeConfig {
+    pub enabled: bool,
+    pub timeout_sec: u32,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct KnobConfig {
     pub name: Option<String>,
     pub rotation_charging: Option<i32>,
     pub rotation_not_charging: Option<i32>,
+    // Power modes when charging
+    pub art_mode_charging: Option<PowerModeConfig>,
+    pub dim_charging: Option<PowerModeConfig>,
+    pub sleep_charging: Option<PowerModeConfig>,
+    pub deep_sleep_charging: Option<PowerModeConfig>,
+    // Power modes when on battery
+    pub art_mode_battery: Option<PowerModeConfig>,
+    pub dim_battery: Option<PowerModeConfig>,
+    pub sleep_battery: Option<PowerModeConfig>,
+    pub deep_sleep_battery: Option<PowerModeConfig>,
+    // Advanced settings
+    pub wifi_power_save_enabled: Option<bool>,
+    pub cpu_freq_scaling_enabled: Option<bool>,
+    /// Poll interval when playback stopped (seconds)
+    pub sleep_poll_stopped_sec: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

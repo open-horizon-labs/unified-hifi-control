@@ -506,6 +506,7 @@ pub struct LmsAdapter {
 impl LmsAdapter {
     pub fn new(bus: SharedBus) -> Self {
         let state = Arc::new(RwLock::new(LmsState::default()));
+        #[allow(clippy::expect_used)] // HTTP client creation only fails if TLS setup fails
         let client = Client::builder()
             .timeout(Duration::from_secs(10))
             .build()

@@ -338,6 +338,29 @@ mod cross_adapter {
 mod error_handling {
     use super::*;
 
+    /// RAII guard for env vars - restores original value (or removes) on drop
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn hqp_handles_connection_timeout() {
         let (bus, _rx) = test_bus();
@@ -360,13 +383,24 @@ mod error_handling {
     }
 
     #[tokio::test]
-    async fn lms_handles_invalid_json_gracefully() {
+    #[serial_test::serial]
+    async fn lms_fails_gracefully_when_unconfigured() {
+        // Use temp config dir to ensure no saved config interferes
+        let _guard = EnvGuard::set(
+            "UHC_CONFIG_DIR",
+            "/tmp/uhc-test-nonexistent-lms-unconfigured",
+        );
+
         let (bus, _rx) = test_bus();
         let adapter = LmsAdapter::new(bus);
 
         // Without configuration, operations should fail gracefully
         let result = adapter.get_players().await;
-        assert!(result.is_err());
+
+        assert!(
+            result.is_err(),
+            "get_players should fail when not configured"
+        );
     }
 }
 

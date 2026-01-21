@@ -455,9 +455,12 @@ mod server {
             }
         };
 
-        axum::serve(listener, router)
-            .with_graceful_shutdown(graceful_shutdown)
-            .await?;
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(graceful_shutdown)
+        .await?;
 
         // Cleanup: publish ShuttingDown event and stop adapters
         tracing::info!("Shutting down adapters...");
@@ -484,6 +487,7 @@ mod server {
     }
 
     /// Wait for shutdown signal (Ctrl+C or SIGTERM)
+    #[allow(clippy::expect_used)] // Signal handlers must succeed for graceful shutdown
     async fn shutdown_signal() {
         let ctrl_c = async {
             signal::ctrl_c()

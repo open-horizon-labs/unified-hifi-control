@@ -1,5 +1,6 @@
 //! Navigation component using Tailwind CSS.
 
+use crate::app::settings_context::use_settings;
 use crate::app::Route;
 use dioxus::prelude::*;
 
@@ -7,13 +8,13 @@ use dioxus::prelude::*;
 pub struct NavProps {
     /// The currently active page ID (e.g., "dashboard", "zones")
     pub active: String,
-    /// Hide HQPlayer tab
+    /// Hide HQPlayer tab (fallback if settings not loaded)
     #[props(default = false)]
     pub hide_hqp: bool,
-    /// Hide LMS tab
+    /// Hide LMS tab (fallback if settings not loaded)
     #[props(default = false)]
     pub hide_lms: bool,
-    /// Hide Knobs tab
+    /// Hide Knobs tab (fallback if settings not loaded)
     #[props(default = false)]
     pub hide_knobs: bool,
 }
@@ -22,6 +23,20 @@ pub struct NavProps {
 #[component]
 pub fn Nav(props: NavProps) -> Element {
     let mut menu_open = use_signal(|| false);
+
+    // Use shared settings context for reactive updates
+    let settings_ctx = use_settings();
+
+    // Use context values if loaded, otherwise fall back to props
+    let (hide_hqp, hide_lms, hide_knobs) = if settings_ctx.is_loaded() {
+        (
+            settings_ctx.hide_hqp(),
+            settings_ctx.hide_lms(),
+            settings_ctx.hide_knobs(),
+        )
+    } else {
+        (props.hide_hqp, props.hide_lms, props.hide_knobs)
+    };
 
     let nav_link_class = |page: &str| {
         if props.active == page {
@@ -42,7 +57,13 @@ pub fn Nav(props: NavProps) -> Element {
             div { class: "nav-inner",
                 // Logo / Brand
                 div { class: "flex items-center",
-                    Link { class: "nav-brand", to: Route::Dashboard {}, "Hi-Fi Control" }
+                    Link { class: "nav-brand flex items-center", to: Route::Dashboard {},
+                        img {
+                            src: "/hifi-logo.png",
+                            alt: "Hi-Fi Control",
+                            class: "h-6 w-6 rounded"
+                        }
+                    }
                 }
 
                 // Desktop navigation - use Link for client-side routing (no page reload)
@@ -50,13 +71,13 @@ pub fn Nav(props: NavProps) -> Element {
                     Link { class: nav_link_class("dashboard"), to: Route::Dashboard {}, "Dashboard" }
                     Link { class: nav_link_class("zones"), to: Route::Zones {}, "Zones" }
                     Link { class: nav_link_class("zone"), to: Route::Zone {}, "Zone" }
-                    if !props.hide_hqp {
+                    if !hide_hqp {
                         Link { class: nav_link_class("hqplayer"), to: Route::HqPlayer {}, "HQPlayer" }
                     }
-                    if !props.hide_lms {
+                    if !hide_lms {
                         Link { class: nav_link_class("lms"), to: Route::Lms {}, "LMS" }
                     }
-                    if !props.hide_knobs {
+                    if !hide_knobs {
                         Link { class: nav_link_class("knobs"), to: Route::Knobs {}, "Knobs" }
                     }
                     Link { class: nav_link_class("settings"), to: Route::Settings {}, "Settings" }
@@ -90,13 +111,13 @@ pub fn Nav(props: NavProps) -> Element {
                     Link { class: nav_link_class("dashboard"), to: Route::Dashboard {}, onclick: move |_| menu_open.set(false), "Dashboard" }
                     Link { class: nav_link_class("zones"), to: Route::Zones {}, onclick: move |_| menu_open.set(false), "Zones" }
                     Link { class: nav_link_class("zone"), to: Route::Zone {}, onclick: move |_| menu_open.set(false), "Zone" }
-                    if !props.hide_hqp {
+                    if !hide_hqp {
                         Link { class: nav_link_class("hqplayer"), to: Route::HqPlayer {}, onclick: move |_| menu_open.set(false), "HQPlayer" }
                     }
-                    if !props.hide_lms {
+                    if !hide_lms {
                         Link { class: nav_link_class("lms"), to: Route::Lms {}, onclick: move |_| menu_open.set(false), "LMS" }
                     }
-                    if !props.hide_knobs {
+                    if !hide_knobs {
                         Link { class: nav_link_class("knobs"), to: Route::Knobs {}, onclick: move |_| menu_open.set(false), "Knobs" }
                     }
                     Link { class: nav_link_class("settings"), to: Route::Settings {}, onclick: move |_| menu_open.set(false), "Settings" }

@@ -65,6 +65,7 @@ impl Default for FirmwareService {
 
 impl FirmwareService {
     pub fn new() -> Self {
+        #[allow(clippy::expect_used)] // HTTP client creation only fails if TLS setup fails
         let client = Client::builder()
             .user_agent("unified-hifi-control")
             .timeout(Duration::from_secs(30))

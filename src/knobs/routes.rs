@@ -9,9 +9,11 @@
 //! - POST /knob/config - Update device configuration
 //! - GET /knob/devices - List registered knobs (admin)
 
+use std::net::SocketAddr;
+
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{ConnectInfo, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::Response,
     Json,
@@ -30,6 +32,36 @@ fn extract_knob_id(headers: &HeaderMap, query_knob_id: Option<&str>) -> Option<S
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .or_else(|| query_knob_id.map(|s| s.to_string()))
+}
+
+/// Format IP address, converting IPv4-mapped IPv6 to plain IPv4
+fn format_ip(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => {
+            // Check for IPv4-mapped IPv6 address (::ffff:x.x.x.x)
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                v4.to_string()
+            } else {
+                v6.to_string()
+            }
+        }
+    }
+}
+
+/// Extract client IP from headers (X-Forwarded-For, X-Real-IP) or socket address
+fn extract_client_ip(headers: &HeaderMap, socket_addr: Option<SocketAddr>) -> Option<String> {
+    // Check X-Forwarded-For first (when behind a proxy)
+    if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        // X-Forwarded-For can be a comma-separated list; take the first one
+        return forwarded.split(',').next().map(|s| s.trim().to_string());
+    }
+    // Check X-Real-IP (nginx style)
+    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        return Some(real_ip.to_string());
+    }
+    // Fall back to socket address
+    socket_addr.map(|addr| format_ip(addr.ip()))
 }
 
 /// Extract knob version from headers
@@ -219,6 +251,7 @@ async fn get_zone_infos(state: &AppState) -> Vec<ZoneInfo> {
 /// GET /knob/now_playing - Get current playback state (routes by zone_id prefix)
 pub async fn knob_now_playing_handler(
     State(state): State<AppState>,
+    connect_info: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
     headers: HeaderMap,
     Query(params): Query<NowPlayingQuery>,
 ) -> Result<Json<NowPlayingResponse>, (StatusCode, Json<serde_json::Value>)> {
@@ -241,6 +274,7 @@ pub async fn knob_now_playing_handler(
     // Update knob status if knob ID present
     let knob_id = extract_knob_id(&headers, params.knob_id.as_deref());
     let knob_version = extract_knob_version(&headers);
+    let client_ip = extract_client_ip(&headers, connect_info.ok().map(|c| c.0));
     let mut config_sha = None;
 
     if let Some(ref id) = knob_id {
@@ -254,7 +288,7 @@ pub async fn knob_now_playing_handler(
             zone_id: Some(zone_id.clone()),
             battery_level,
             battery_charging,
-            ..Default::default()
+            ip: client_ip,
         };
         state.knobs.update_status(id, status_update).await;
         config_sha = state.knobs.get_config_sha(id).await;
@@ -546,6 +580,7 @@ pub struct ImageQuery {
 use crate::knobs::image::jpeg_to_rgb565;
 
 /// GET /knob/now_playing/image - Get album artwork
+#[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
 pub async fn knob_image_handler(
     State(state): State<AppState>,
     Query(params): Query<ImageQuery>,
@@ -992,10 +1027,16 @@ pub async fn knob_config_handler(
         )
     })?;
 
+    // Build config response with name included in config object (matches frontend expected format)
+    let mut config = serde_json::to_value(&knob.config).unwrap_or_default();
+    if let serde_json::Value::Object(ref mut obj) = config {
+        obj.insert("knob_id".to_string(), serde_json::json!(knob_id.clone()));
+        obj.insert("name".to_string(), serde_json::json!(knob.name));
+    }
+
     Ok(Json(serde_json::json!({
         "knob_id": knob_id,
-        "name": knob.name,
-        "config": knob.config,
+        "config": config,
         "config_sha": knob.config_sha,
     })))
 }
@@ -1116,6 +1157,7 @@ struct FirmwareVersionInfo {
 }
 
 /// GET /firmware/version - Get available firmware version
+#[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
 pub async fn firmware_version_handler() -> Response {
     let fw_dir = firmware_dir();
 
@@ -1205,6 +1247,7 @@ pub async fn firmware_version_handler() -> Response {
 }
 
 /// GET /firmware/download - Download firmware binary
+#[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
 pub async fn firmware_download_handler() -> Response {
     let fw_dir = firmware_dir();
 
@@ -1291,6 +1334,7 @@ pub async fn firmware_download_handler() -> Response {
 }
 
 /// GET /manifest-s3.json - ESP Web Tools manifest
+#[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
 pub async fn manifest_handler() -> Response {
     let fw_dir = firmware_dir();
     let version_path = fw_dir.join("version.json");

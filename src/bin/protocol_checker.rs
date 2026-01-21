@@ -12,6 +12,9 @@
 //! Types: status, roon-status, zone, zones, control-request, volume-request,
 //!        success-response, error-response, bus-event
 
+// Dev tool - allow unwrap for CLI simplicity
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::expect_used)]
 // Schema structs are used for JSON validation via Deserialize, fields read by serde
 #![allow(dead_code)]
 

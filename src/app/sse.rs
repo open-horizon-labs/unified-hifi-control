@@ -99,65 +99,76 @@ impl SseContext {
     pub fn should_refresh_zones(&self) -> bool {
         matches!(
             self.last_event.read().as_ref(),
-            Some(SseEvent::ZoneUpdated { .. })
-                | Some(SseEvent::ZoneRemoved { .. })
-                | Some(SseEvent::NowPlayingChanged { .. })
-                | Some(SseEvent::VolumeChanged { .. })
-                | Some(SseEvent::RoonConnected)
-                | Some(SseEvent::RoonDisconnected)
-                | Some(SseEvent::LmsConnected)
-                | Some(SseEvent::LmsDisconnected)
-                | Some(SseEvent::LmsPlayerStateChanged { .. })
+            Some(
+                SseEvent::ZoneUpdated { .. }
+                    | SseEvent::ZoneRemoved { .. }
+                    | SseEvent::NowPlayingChanged { .. }
+                    | SseEvent::SeekPositionChanged { .. }
+                    | SseEvent::VolumeChanged { .. }
+                    | SseEvent::RoonConnected
+                    | SseEvent::RoonDisconnected
+                    | SseEvent::LmsConnected
+                    | SseEvent::LmsDisconnected
+                    | SseEvent::LmsPlayerStateChanged { .. }
+            )
         )
     }
 
     pub fn should_refresh_roon(&self) -> bool {
         matches!(
             self.last_event.read().as_ref(),
-            Some(SseEvent::RoonConnected) | Some(SseEvent::RoonDisconnected)
+            Some(SseEvent::RoonConnected | SseEvent::RoonDisconnected)
         )
     }
 
     pub fn should_refresh_hqp(&self) -> bool {
         matches!(
             self.last_event.read().as_ref(),
-            Some(SseEvent::HqpConnected)
-                | Some(SseEvent::HqpDisconnected)
-                | Some(SseEvent::HqpStateChanged)
-                | Some(SseEvent::HqpPipelineChanged)
+            Some(
+                SseEvent::HqpConnected
+                    | SseEvent::HqpDisconnected
+                    | SseEvent::HqpStateChanged
+                    | SseEvent::HqpPipelineChanged
+            )
         )
     }
 
     pub fn should_refresh_lms(&self) -> bool {
         matches!(
             self.last_event.read().as_ref(),
-            Some(SseEvent::LmsConnected)
-                | Some(SseEvent::LmsDisconnected)
-                | Some(SseEvent::LmsPlayerStateChanged { .. })
+            Some(
+                SseEvent::LmsConnected
+                    | SseEvent::LmsDisconnected
+                    | SseEvent::LmsPlayerStateChanged { .. }
+            )
         )
     }
 
     pub fn should_refresh_discovery(&self) -> bool {
         matches!(
             self.last_event.read().as_ref(),
-            Some(SseEvent::RoonConnected)
-                | Some(SseEvent::RoonDisconnected)
-                | Some(SseEvent::OpenHomeDeviceFound)
-                | Some(SseEvent::OpenHomeDeviceLost)
-                | Some(SseEvent::UpnpRendererFound)
-                | Some(SseEvent::UpnpRendererLost)
+            Some(
+                SseEvent::RoonConnected
+                    | SseEvent::RoonDisconnected
+                    | SseEvent::OpenHomeDeviceFound
+                    | SseEvent::OpenHomeDeviceLost
+                    | SseEvent::UpnpRendererFound
+                    | SseEvent::UpnpRendererLost
+            )
         )
     }
 
     pub fn should_refresh_knobs(&self) -> bool {
         matches!(
             self.last_event.read().as_ref(),
-            Some(SseEvent::ZoneUpdated { .. })
-                | Some(SseEvent::ZoneRemoved { .. })
-                | Some(SseEvent::RoonConnected)
-                | Some(SseEvent::RoonDisconnected)
-                | Some(SseEvent::LmsConnected)
-                | Some(SseEvent::LmsDisconnected)
+            Some(
+                SseEvent::ZoneUpdated { .. }
+                    | SseEvent::ZoneRemoved { .. }
+                    | SseEvent::RoonConnected
+                    | SseEvent::RoonDisconnected
+                    | SseEvent::LmsConnected
+                    | SseEvent::LmsDisconnected
+            )
         )
     }
 }

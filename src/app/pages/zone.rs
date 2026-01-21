@@ -4,8 +4,11 @@
 
 use dioxus::prelude::*;
 
-use crate::app::api::{HqpPipeline, NowPlaying, Zone as ZoneData, ZonesResponse};
-use crate::app::components::Layout;
+use crate::app::api::{
+    HqpMatrixProfilesResponse, HqpPipeline, HqpProfile, HqpStatus, NowPlaying, Zone as ZoneData,
+    ZonesResponse,
+};
+use crate::app::components::{ErrorAlert, HqpMatrixSelect, HqpProfileSelect, Layout};
 use crate::app::sse::use_sse;
 
 /// Control request body
@@ -46,6 +49,13 @@ pub fn Zone() -> Element {
     // HQPlayer pipeline (depends on selected zone having HQP)
     let mut hqp_pipeline = use_signal(|| None::<HqpPipeline>);
 
+    // HQPlayer profiles
+    let mut hqp_profiles = use_signal(Vec::<HqpProfile>::new);
+    let mut hqp_matrix = use_signal(|| None::<HqpMatrixProfilesResponse>);
+    let mut hqp_error = use_signal(|| None::<String>);
+    let mut hqp_status = use_signal(|| None::<HqpStatus>);
+    let mut hqp_loading = use_signal(|| false);
+
     // Restore selected zone from localStorage on mount
     use_effect(move || {
         #[cfg(target_arch = "wasm32")]
@@ -79,20 +89,53 @@ pub fn Zone() -> Element {
                             .map(|d| d.r#type.as_deref() == Some("hqplayer"))
                             .unwrap_or(false)
                         {
+                            // Fetch HQP status
+                            if let Ok(status) =
+                                crate::app::api::fetch_json::<HqpStatus>("/hqplayer/status").await
+                            {
+                                hqp_status.set(Some(status));
+                            }
+                            // Fetch pipeline
                             if let Ok(pipeline) =
                                 crate::app::api::fetch_json::<HqpPipeline>("/hqp/pipeline").await
                             {
                                 hqp_pipeline.set(Some(pipeline));
                             }
+                            // Fetch profiles
+                            if let Ok(profiles) =
+                                crate::app::api::fetch_json::<Vec<HqpProfile>>("/hqplayer/profiles")
+                                    .await
+                            {
+                                hqp_profiles.set(profiles);
+                            }
+                            // Fetch matrix profiles
+                            if let Ok(matrix) =
+                                crate::app::api::fetch_json::<HqpMatrixProfilesResponse>(
+                                    "/hqplayer/matrix/profiles",
+                                )
+                                .await
+                            {
+                                hqp_matrix.set(Some(matrix));
+                            }
                         } else {
+                            // Clear HQP state when zone has no HQP
                             hqp_pipeline.set(None);
+                            hqp_profiles.set(Vec::new());
+                            hqp_matrix.set(None);
+                            hqp_status.set(None);
+                            hqp_error.set(None);
                         }
                     }
                 }
             });
         } else {
+            // Clear all state when no zone selected
             now_playing.set(None);
             hqp_pipeline.set(None);
+            hqp_profiles.set(Vec::new());
+            hqp_matrix.set(None);
+            hqp_status.set(None);
+            hqp_error.set(None);
         }
     });
 
@@ -138,8 +181,83 @@ pub fn Zone() -> Element {
     };
 
     // Pipeline setting handler
-    let set_pipeline = move |(_setting, _value): (&'static str, &'static str)| {
-        // TODO: Implement pipeline setting
+    let set_pipeline = move |(setting, value): (String, String)| {
+        hqp_error.set(None);
+        hqp_loading.set(true);
+        spawn(async move {
+            #[derive(serde::Serialize)]
+            struct PipelineRequest {
+                setting: String,
+                value: String,
+            }
+            let req = PipelineRequest { setting, value };
+            if let Err(e) = crate::app::api::post_json_no_response("/hqp/pipeline", &req).await {
+                hqp_error.set(Some(format!("Pipeline update failed: {e}")));
+            } else {
+                // Refresh pipeline after successful change
+                if let Ok(pipeline) =
+                    crate::app::api::fetch_json::<HqpPipeline>("/hqp/pipeline").await
+                {
+                    hqp_pipeline.set(Some(pipeline));
+                }
+            }
+            hqp_loading.set(false);
+        });
+    };
+
+    // Load profile handler
+    let load_profile = move |profile: String| {
+        hqp_error.set(None);
+        hqp_loading.set(true);
+        spawn(async move {
+            #[derive(serde::Serialize)]
+            struct ProfileRequest {
+                profile: String,
+            }
+            let req = ProfileRequest { profile };
+            if let Err(e) = crate::app::api::post_json_no_response("/hqplayer/profile", &req).await
+            {
+                hqp_error.set(Some(format!("Profile load failed: {e}")));
+            } else {
+                // Refresh pipeline after profile load
+                if let Ok(pipeline) =
+                    crate::app::api::fetch_json::<HqpPipeline>("/hqp/pipeline").await
+                {
+                    hqp_pipeline.set(Some(pipeline));
+                }
+            }
+            hqp_loading.set(false);
+        });
+    };
+
+    // Set matrix profile handler
+    let set_matrix_profile = move |profile_idx: u32| {
+        hqp_error.set(None);
+        hqp_loading.set(true);
+        spawn(async move {
+            #[derive(serde::Serialize)]
+            struct MatrixRequest {
+                profile: u32,
+            }
+            let req = MatrixRequest {
+                profile: profile_idx,
+            };
+            if let Err(e) =
+                crate::app::api::post_json_no_response("/hqplayer/matrix/profile", &req).await
+            {
+                hqp_error.set(Some(format!("Matrix profile failed: {e}")));
+            } else {
+                // Refresh matrix after change
+                if let Ok(matrix) = crate::app::api::fetch_json::<HqpMatrixProfilesResponse>(
+                    "/hqplayer/matrix/profiles",
+                )
+                .await
+                {
+                    hqp_matrix.set(Some(matrix));
+                }
+            }
+            hqp_loading.set(false);
+        });
     };
 
     // Zone selection handler
@@ -210,10 +328,18 @@ pub fn Zone() -> Element {
                 }
             }
 
+            // HQP error display
+            if let Some(error) = hqp_error() {
+                ErrorAlert {
+                    message: error,
+                    on_dismiss: move |_| hqp_error.set(None),
+                }
+            }
+
             // Zone display (only shown when zone selected)
-            if selected_zone.is_some() {
+            if let Some(zone) = selected_zone {
                 ZoneDisplay {
-                    zone: selected_zone.unwrap().clone(),
+                    zone: zone.clone(),
                     now_playing: np,
                     on_control: control,
                 }
@@ -223,7 +349,13 @@ pub fn Zone() -> Element {
             if has_hqp {
                 HqpSection {
                     pipeline: hqp_pipeline(),
+                    profiles: hqp_profiles(),
+                    matrix: hqp_matrix(),
+                    status: hqp_status(),
+                    loading: hqp_loading(),
                     on_set_pipeline: set_pipeline,
+                    on_load_profile: load_profile,
+                    on_set_matrix: set_matrix_profile,
                 }
             }
         }
@@ -241,6 +373,13 @@ fn ZoneDisplay(
     let is_playing = np.map(|n| n.is_playing).unwrap_or(false);
     let play_icon = if is_playing { "⏸︎" } else { "▶" };
 
+    // Check if zone has HQPlayer DSP
+    let has_hqp = zone
+        .dsp
+        .as_ref()
+        .map(|d| d.r#type.as_deref() == Some("hqplayer"))
+        .unwrap_or(false);
+
     let (track, artist, album) = np
         .map(|n| {
             if n.line1.as_deref().unwrap_or("Idle") != "Idle" {
@@ -255,7 +394,19 @@ fn ZoneDisplay(
         })
         .unwrap_or_default();
 
-    let image_url = np.and_then(|n| n.image_url.clone()).unwrap_or_default();
+    // Album art URL with cache-busting image_key
+    let base_image_url = np.and_then(|n| n.image_url.clone()).unwrap_or_default();
+    let image_key = np.and_then(|n| n.image_key.clone());
+    let image_url = if let Some(key) = image_key {
+        let sep = if base_image_url.contains('?') {
+            "&"
+        } else {
+            "?"
+        };
+        format!("{}{}k={}", base_image_url, sep, key)
+    } else {
+        base_image_url
+    };
 
     // Volume type handling:
     // - "db": show value with " dB" suffix
@@ -295,7 +446,15 @@ fn ZoneDisplay(
                     class: "w-[200px] h-[200px] object-cover rounded-lg bg-elevated"
                 }
                 div { class: "flex-1 min-w-[200px]",
-                    h2 { id: "zone-name", class: "mb-1", "{zone.zone_name}" }
+                    h2 { id: "zone-name", class: "mb-1 flex items-center gap-2",
+                        "{zone.zone_name}"
+                        if has_hqp {
+                            span { class: "badge badge-primary text-sm", "HQP" }
+                        }
+                        if let Some(ref source) = zone.source {
+                            span { class: "badge badge-secondary text-sm", "{source}" }
+                        }
+                    }
                     p { class: "m-0",
                         small { if is_playing { "playing" } else { "stopped" } }
                     }
@@ -358,70 +517,199 @@ fn ZoneDisplay(
 #[component]
 fn HqpSection(
     pipeline: Option<HqpPipeline>,
-    on_set_pipeline: EventHandler<(&'static str, &'static str)>,
+    profiles: Vec<HqpProfile>,
+    matrix: Option<HqpMatrixProfilesResponse>,
+    status: Option<HqpStatus>,
+    loading: bool,
+    on_set_pipeline: EventHandler<(String, String)>,
+    on_load_profile: EventHandler<String>,
+    on_set_matrix: EventHandler<u32>,
 ) -> Element {
     let Some(ref pipe) = pipeline else {
         return rsx! {
-            section { id: "hqp-section",
-                hgroup {
-                    h2 { "HQPlayer DSP" }
-                    p { "Pipeline controls for zone-linked HQPlayer" }
+            section { id: "hqp-section", class: "mt-6",
+                div { class: "card p-6",
+                    div { class: "flex items-center justify-between mb-4",
+                        h3 { class: "text-lg font-semibold m-0", "HQPlayer DSP" }
+                    }
+                    p { class: "text-muted text-center py-8", aria_busy: "true",
+                        "Loading DSP settings..."
+                    }
                 }
-                article { aria_busy: "true", "Loading DSP settings..." }
             }
         };
     };
 
     let settings = pipe.settings.as_ref();
 
-    // Helper to render a select
-    let render_select = |id: &'static str,
-                         label_text: &str,
-                         opts: Option<&crate::app::api::HqpSettingOptions>,
-                         _setting_name: &'static str| {
-        let options = opts.map(|o| o.options.clone()).unwrap_or_default();
-        let selected = opts
-            .and_then(|o| o.selected.as_ref())
-            .map(|s| s.value.clone())
-            .unwrap_or_default();
+    // Extract options for each setting
+    let mode_opts = settings.and_then(|s| s.mode.clone());
+    let samplerate_opts = settings.and_then(|s| s.samplerate.clone());
+    let filter1x_opts = settings.and_then(|s| s.filter1x.clone());
+    let filter_nx_opts = settings.and_then(|s| s.filter_nx.clone());
+    let shaper_opts = settings.and_then(|s| s.shaper.clone());
 
-        rsx! {
-            label {
-                "{label_text}"
-                select {
-                    id: "{id}",
-                    onchange: move |_evt: Event<FormData>| {
-                        // TODO: Implement pipeline change
-                    },
-                    for opt in options {
-                        option {
-                            value: "{opt.value}",
-                            selected: opt.value == selected,
-                            "{opt.label.as_deref().unwrap_or(&opt.value)}"
+    // Matrix profile info
+    let has_matrix = matrix
+        .as_ref()
+        .map(|m| !m.profiles.is_empty())
+        .unwrap_or(false);
+    let matrix_profiles = matrix
+        .as_ref()
+        .map(|m| m.profiles.clone())
+        .unwrap_or_default();
+    let matrix_current = matrix.as_ref().and_then(|m| m.current);
+
+    // Dynamic shaper label based on mode (SDM/DSD uses "Modulator", PCM uses "Dither")
+    let shaper_label = mode_opts
+        .as_ref()
+        .and_then(|m| m.selected.as_ref())
+        .and_then(|s| s.label.as_ref())
+        .map(|label| {
+            let lower = label.to_lowercase();
+            if lower.contains("sdm") || lower.contains("dsd") {
+                "Modulator"
+            } else {
+                "Dither"
+            }
+        })
+        .unwrap_or("Shaper");
+
+    rsx! {
+        section { id: "hqp-section", class: "mt-6",
+            div { class: "card p-6",
+                // Header with status
+                div { class: "flex items-center justify-between mb-4",
+                    h3 { class: "text-lg font-semibold m-0", "HQPlayer DSP" }
+                    div { class: "flex items-center gap-2",
+                        // Status indicator
+                        if let Some(ref st) = status {
+                            if st.connected {
+                                span { class: "status-ok text-sm", "✓ Connected" }
+                            } else {
+                                span { class: "status-err text-sm", "✗ Disconnected" }
+                            }
                         }
+                        // Loading indicator
+                        if loading {
+                            span { class: "text-muted text-sm", aria_busy: "true", "Updating..." }
+                        }
+                    }
+                }
+
+                // Profile selectors (full width, stacked on mobile)
+                if !profiles.is_empty() || has_matrix {
+                    div { class: "grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6",
+                        if !profiles.is_empty() {
+                            label { class: "block",
+                                span { class: "block text-sm font-medium mb-1", "Profile" }
+                                HqpProfileSelect {
+                                    profiles: profiles.clone(),
+                                    on_select: on_load_profile,
+                                    disabled: loading,
+                                }
+                            }
+                        }
+                        if has_matrix {
+                            label { class: "block",
+                                span { class: "block text-sm font-medium mb-1", "Matrix" }
+                                HqpMatrixSelect {
+                                    profiles: matrix_profiles,
+                                    active: matrix_current,
+                                    on_select: on_set_matrix,
+                                    disabled: loading,
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Pipeline settings - responsive grid
+                div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4",
+                    HqpSelect {
+                        id: "hqp-mode",
+                        label: "Mode",
+                        setting: "mode",
+                        options: mode_opts,
+                        disabled: loading,
+                        on_change: on_set_pipeline,
+                    }
+                    HqpSelect {
+                        id: "hqp-samplerate",
+                        label: "Sample Rate",
+                        setting: "samplerate",
+                        options: samplerate_opts,
+                        disabled: loading,
+                        on_change: on_set_pipeline,
+                    }
+                    HqpSelect {
+                        id: "hqp-filter1x",
+                        label: "Filter (1x)",
+                        setting: "filter1x",
+                        options: filter1x_opts,
+                        disabled: loading,
+                        on_change: on_set_pipeline,
+                    }
+                    HqpSelect {
+                        id: "hqp-filterNx",
+                        label: "Filter (Nx)",
+                        setting: "filterNx",
+                        options: filter_nx_opts,
+                        disabled: loading,
+                        on_change: on_set_pipeline,
+                    }
+                    HqpSelect {
+                        id: "hqp-shaper",
+                        label: shaper_label,
+                        setting: "shaper",
+                        options: shaper_opts,
+                        disabled: loading,
+                        on_change: on_set_pipeline,
                     }
                 }
             }
         }
-    };
+    }
+}
+
+/// HQPlayer setting select component
+#[component]
+fn HqpSelect(
+    id: &'static str,
+    label: &'static str,
+    setting: &'static str,
+    options: Option<crate::app::api::HqpSettingOptions>,
+    #[props(default = false)] disabled: bool,
+    on_change: EventHandler<(String, String)>,
+) -> Element {
+    let opts_list = options
+        .as_ref()
+        .map(|o| o.options.clone())
+        .unwrap_or_default();
+    let selected = options
+        .as_ref()
+        .and_then(|o| o.selected.as_ref())
+        .map(|s| s.value.clone())
+        .unwrap_or_default();
+    let setting_name = setting.to_string();
 
     rsx! {
-        section { id: "hqp-section",
-            hgroup {
-                h2 { "HQPlayer DSP" }
-                p { "Pipeline controls for zone-linked HQPlayer" }
-            }
-            article {
-                div { class: "grid",
-                    {render_select("hqp-mode", "Mode", settings.and_then(|s| s.mode.as_ref()), "mode")}
-                    {render_select("hqp-samplerate", "Sample Rate", settings.and_then(|s| s.samplerate.as_ref()), "samplerate")}
-                }
-                div { class: "grid",
-                    {render_select("hqp-filter1x", "Filter (1x)", settings.and_then(|s| s.filter1x.as_ref()), "filter1x")}
-                    {render_select("hqp-filterNx", "Filter (Nx)", settings.and_then(|s| s.filter_nx.as_ref()), "filterNx")}
-                }
-                div { class: "grid",
-                    {render_select("hqp-shaper", "Shaper", settings.and_then(|s| s.shaper.as_ref()), "shaper")}
+        label {
+            span { class: "block text-sm font-medium mb-1", "{label}" }
+            select {
+                id: "{id}",
+                class: "input",
+                disabled: disabled,
+                onchange: move |evt: Event<FormData>| {
+                    let value = evt.value();
+                    on_change.call((setting_name.clone(), value));
+                },
+                for opt in opts_list {
+                    option {
+                        value: "{opt.value}",
+                        selected: opt.value == selected,
+                        "{opt.label.as_deref().unwrap_or(&opt.value)}"
+                    }
                 }
             }
         }

@@ -375,13 +375,15 @@ pub struct HqpAdapter {
 
 impl HqpAdapter {
     pub fn new(bus: SharedBus) -> Self {
+        #[allow(clippy::expect_used)] // HTTP client creation only fails if TLS setup fails
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("Failed to create HTTP client");
         let adapter = Self {
             state: Arc::new(RwLock::new(HqpAdapterState::default())),
             connection: Arc::new(Mutex::new(None)),
-            http_client: Client::builder()
-                .timeout(Duration::from_secs(3))
-                .build()
-                .expect("Failed to create HTTP client"),
+            http_client,
             bus,
         };
         // Load saved config synchronously at startup
@@ -461,8 +463,14 @@ impl HqpAdapter {
             state.host = Some(host);
             state.port = port;
             state.web_port = web_port.unwrap_or(DEFAULT_WEB_PORT);
-            state.web_username = web_username;
-            state.web_password = web_password;
+
+            // Only update credentials if new values are provided (preserve existing)
+            if web_username.is_some() {
+                state.web_username = web_username;
+            }
+            if web_password.is_some() {
+                state.web_password = web_password;
+            }
 
             // Reset auth state when reconfiguring
             state.digest_auth = None;
@@ -823,6 +831,7 @@ impl HqpAdapter {
     }
 
     /// Build XML request
+    #[allow(clippy::unwrap_used)] // XML writer to Vec and UTF-8 conversion cannot fail
     fn build_request(element: &str, attrs: &[(&str, &str)]) -> String {
         let mut writer = Writer::new(Cursor::new(Vec::new()));
 
@@ -1489,6 +1498,7 @@ impl HqpAdapter {
     }
 
     /// Parse hidden form inputs from HTML
+    #[allow(clippy::unwrap_used)] // Regex patterns are compile-time constants
     fn parse_hidden_inputs(html: &str) -> HashMap<String, String> {
         let mut fields = HashMap::new();
 
@@ -1518,6 +1528,7 @@ impl HqpAdapter {
     }
 
     /// Parse profiles from HTML select
+    #[allow(clippy::unwrap_used)] // Regex patterns are compile-time constants
     fn parse_profiles_from_html(html: &str) -> Vec<HqpProfile> {
         let mut profiles = Vec::new();
 

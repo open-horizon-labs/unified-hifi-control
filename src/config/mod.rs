@@ -372,22 +372,38 @@ mod tests {
     use serial_test::serial;
     use std::env;
 
+    /// RAII guard for env vars - restores original value (or removes) on drop
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: impl AsRef<str>) -> Self {
+            let original = env::var(key).ok();
+            env::set_var(key, value.as_ref());
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => env::set_var(self.key, v),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn test_lms_host_env_enables_lms_config() {
         // Issue #62: When LMS_HOST is set, config.lms should be Some
         // This simulates the LMS plugin starting the bridge with LMS_HOST=127.0.0.1
-
-        // Set env var (will be cleaned up at end)
-        env::set_var("LMS_HOST", "127.0.0.1");
-        // Ensure no config file interferes (use temp dir)
-        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
+        let _g1 = EnvGuard::set("LMS_HOST", "127.0.0.1");
+        let _g2 = EnvGuard::set("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
 
         let config = load_config().expect("config should load");
-
-        // Clean up
-        env::remove_var("LMS_HOST");
-        env::remove_var("UHC_CONFIG_DIR");
 
         // The key assertion: LMS should be configured when LMS_HOST is set
         assert!(
@@ -403,15 +419,11 @@ mod tests {
     #[test]
     #[serial]
     fn test_lms_host_and_port_env() {
-        env::set_var("LMS_HOST", "192.168.1.100");
-        env::set_var("LMS_PORT", "9001");
-        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
+        let _g1 = EnvGuard::set("LMS_HOST", "192.168.1.100");
+        let _g2 = EnvGuard::set("LMS_PORT", "9001");
+        let _g3 = EnvGuard::set("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
 
         let config = load_config().expect("config should load");
-
-        env::remove_var("LMS_HOST");
-        env::remove_var("LMS_PORT");
-        env::remove_var("UHC_CONFIG_DIR");
 
         assert!(config.lms.is_some());
         let lms = config.lms.unwrap();
@@ -423,13 +435,19 @@ mod tests {
     #[serial]
     fn test_lms_plugin_started_detection() {
         // Test the helper function that checks if started from LMS plugin
-        env::set_var("LMS_UNIFIEDHIFI_STARTED", "true");
-        assert!(is_lms_plugin_started());
-        env::set_var("LMS_UNIFIEDHIFI_STARTED", "1");
-        assert!(is_lms_plugin_started());
-        env::set_var("LMS_UNIFIEDHIFI_STARTED", "false");
-        assert!(!is_lms_plugin_started());
-        env::remove_var("LMS_UNIFIEDHIFI_STARTED");
+        {
+            let _g = EnvGuard::set("LMS_UNIFIEDHIFI_STARTED", "true");
+            assert!(is_lms_plugin_started());
+        }
+        {
+            let _g = EnvGuard::set("LMS_UNIFIEDHIFI_STARTED", "1");
+            assert!(is_lms_plugin_started());
+        }
+        {
+            let _g = EnvGuard::set("LMS_UNIFIEDHIFI_STARTED", "false");
+            assert!(!is_lms_plugin_started());
+        }
+        // Without env var
         assert!(!is_lms_plugin_started());
     }
 
@@ -437,19 +455,11 @@ mod tests {
     #[serial]
     fn test_port_env_fallback() {
         // Issue #75: PORT env var should work as fallback when UHC_PORT is not set
-        // Clean slate - remove any existing port env vars
-        env::remove_var("UHC_PORT");
-        env::remove_var("PORT");
-        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
-
-        // Set only PORT (legacy)
-        env::set_var("PORT", "3000");
+        let _g1 = EnvGuard::set("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
+        let _g2 = EnvGuard::set("PORT", "3000");
+        env::remove_var("UHC_PORT"); // Ensure UHC_PORT not set
 
         let config = load_config().expect("config should load");
-
-        // Clean up
-        env::remove_var("PORT");
-        env::remove_var("UHC_CONFIG_DIR");
 
         assert_eq!(config.port, 3000, "PORT env var should set config.port");
     }
@@ -458,20 +468,11 @@ mod tests {
     #[serial]
     fn test_uhc_port_takes_precedence_over_port() {
         // Issue #75: UHC_PORT should take precedence over legacy PORT
-        env::remove_var("UHC_PORT");
-        env::remove_var("PORT");
-        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
-
-        // Set both - UHC_PORT should win
-        env::set_var("UHC_PORT", "5000");
-        env::set_var("PORT", "3000");
+        let _g1 = EnvGuard::set("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
+        let _g2 = EnvGuard::set("UHC_PORT", "5000");
+        let _g3 = EnvGuard::set("PORT", "3000");
 
         let config = load_config().expect("config should load");
-
-        // Clean up
-        env::remove_var("UHC_PORT");
-        env::remove_var("PORT");
-        env::remove_var("UHC_CONFIG_DIR");
 
         assert_eq!(
             config.port, 5000,
@@ -483,18 +484,11 @@ mod tests {
     #[serial]
     fn test_invalid_port_uses_default() {
         // Invalid PORT value should fall back to default (8088)
-        env::remove_var("UHC_PORT");
-        env::remove_var("PORT");
-        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
-
-        // Set invalid PORT
-        env::set_var("PORT", "not-a-number");
+        let _g1 = EnvGuard::set("UHC_CONFIG_DIR", "/tmp/uhc-test-nonexistent");
+        let _g2 = EnvGuard::set("PORT", "not-a-number");
+        env::remove_var("UHC_PORT"); // Ensure UHC_PORT not set
 
         let config = load_config().expect("config should load");
-
-        // Clean up
-        env::remove_var("PORT");
-        env::remove_var("UHC_CONFIG_DIR");
 
         assert_eq!(
             config.port, 8088,

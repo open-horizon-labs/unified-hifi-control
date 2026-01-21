@@ -8,10 +8,12 @@ use dioxus::prelude::*;
 pub mod api;
 pub mod components;
 pub mod pages;
+pub mod settings_context;
 pub mod sse;
 pub mod theme;
 
 use pages::{Dashboard, HqPlayer, Knobs, Lms, Settings, Zone, Zones};
+use settings_context::use_settings_provider;
 use sse::use_sse_provider;
 use theme::use_theme_provider;
 
@@ -23,6 +25,9 @@ pub fn App() -> Element {
 
     // Initialize theme context at app root (handles localStorage + DOM class)
     use_theme_provider();
+
+    // Initialize settings context at app root (shared nav visibility state)
+    use_settings_provider();
 
     rsx! {
         Router::<Route> {}

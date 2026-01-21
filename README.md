@@ -239,7 +239,7 @@ cp scripts/pre-commit .git/hooks/
 make css
 
 # Full build with web UI (WASM + server) - REQUIRED for web UI
-dx build --release --platform web
+dx build --release --platform web --features web
 ```
 
 **Note:** `cargo build` only builds the server without the WASM client. The web UI requires `dx build` which produces both the server binary and the WASM bundle needed for hydration (interactive components).
@@ -286,6 +286,20 @@ cargo test --workspace
 cargo fmt --check
 cargo clippy -- -D warnings
 ```
+
+### Verify Build (WASM + Server)
+
+To verify the full build compiles (both server and WASM client):
+
+```bash
+dx build --release --platform web --features web
+```
+
+**Important flags:**
+- `--platform web` - Enables fullstack SSR + client hydration
+- `--features web` - Enables WASM client bundle generation
+
+**Do NOT use** `cargo check --target wasm32-unknown-unknown` - this doesn't apply the correct feature flags.
 
 ## License
 

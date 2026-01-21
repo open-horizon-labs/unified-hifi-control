@@ -701,6 +701,7 @@ async fn run_roon_loop(
                                 );
                                 let converted = convert_zone(&zone);
                                 let is_new = !s.zones.contains_key(&zone.zone_id);
+                                let old_zone = s.zones.get(&zone.zone_id).cloned();
 
                                 if is_new {
                                     // New zone - emit ZoneDiscovered
@@ -725,6 +726,33 @@ async fn run_roon_loop(
                                         album: Some(np.album.clone()),
                                         image_key: np.image_key.clone(),
                                     });
+                                }
+
+                                // Publish volume changed for each output with changed volume
+                                for output in &converted.outputs {
+                                    if let Some(ref vol) = output.volume {
+                                        let old_vol = old_zone.as_ref().and_then(|oz| {
+                                            oz.outputs
+                                                .iter()
+                                                .find(|o| o.output_id == output.output_id)
+                                                .and_then(|o| o.volume.as_ref())
+                                        });
+
+                                        // Emit if volume changed or this is a new zone
+                                        let vol_changed = old_vol
+                                            .map(|ov| {
+                                                ov.value != vol.value || ov.is_muted != vol.is_muted
+                                            })
+                                            .unwrap_or(true);
+
+                                        if vol_changed {
+                                            bus_for_events.publish(BusEvent::VolumeChanged {
+                                                output_id: output.output_id.clone(),
+                                                value: vol.value.unwrap_or(0.0),
+                                                is_muted: vol.is_muted.unwrap_or(false),
+                                            });
+                                        }
+                                    }
                                 }
 
                                 s.zones.insert(zone.zone_id.clone(), converted);

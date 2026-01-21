@@ -81,8 +81,15 @@
 
   /* Zone grid layout */
   .zone-grid {
-    @apply grid gap-4;
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    @apply grid gap-6;
+    grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  }
+
+  /* Zone card styling */
+  .zone-card {
+    @apply p-5 rounded-lg;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-default);
   }
 
   /* Control button group */

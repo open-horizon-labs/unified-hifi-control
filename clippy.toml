@@ -1,0 +1,24 @@
+# Clippy configuration for unified-hifi-control
+# https://rust-lang.github.io/rust-clippy/master/index.html
+
+# Cognitive complexity threshold for functions
+cognitive-complexity-threshold = 30
+
+# Maximum number of lines in a function
+too-many-lines-threshold = 150
+
+# Maximum number of arguments for a function
+too-many-arguments-threshold = 10
+
+# Large types that should be boxed
+trivial-copy-size-limit = 16
+
+# Allowed wildcard imports (Dioxus prelude needs this)
+allowed-wildcard-imports = ["dioxus::prelude"]
+
+# Standard macros that can have interior mutability
+ignore-interior-mutability = ["std::sync::Arc", "tokio::sync::RwLock", "std::cell::OnceCell"]
+
+# Disallowed types - enforce patterns
+# Note: Can't easily enforce "adapters only accessed via aggregator" here,
+# but we can add a custom AST lint test for that
