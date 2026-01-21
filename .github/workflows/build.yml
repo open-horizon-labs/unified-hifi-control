@@ -303,6 +303,7 @@ jobs:
           shared-key: "native-build"
           cache-all-crates: true
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Check formatting
         run: cargo fmt --check
@@ -326,6 +327,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "test-build"
+          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Run tests
         env:
@@ -352,6 +354,7 @@ jobs:
           shared-key: "wasm-build"
           cache-all-crates: true
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
           cache-directories: |
             target/dx
             target/wasm32-unknown-unknown
@@ -414,6 +417,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-x86_64-unknown-linux-musl
+          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Install zig
         run: |
@@ -477,6 +481,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Install zig
         run: |
@@ -536,6 +541,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-x64
+          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Build x86_64
         env:
@@ -570,6 +576,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-arm64
+          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Build aarch64
         env:
@@ -638,6 +645,8 @@ jobs:
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Build
         env:
@@ -1016,7 +1025,8 @@ jobs:
   build-docker-x64:
     name: Build Docker (x64)
     needs: [plan, build-linux-x64, build-web-assets]
-    if: needs.plan.outputs.build_docker == 'true'
+    # Only for PRs/branches - releases use build-docker-release
+    if: needs.plan.outputs.build_docker == 'true' && needs.plan.outputs.is_release != 'true'
     runs-on: ubuntu-latest
     permissions:
       packages: write
