@@ -2,10 +2,12 @@
 
 post_install() {
     echo ":: Unified Hi-Fi Control installed"
-    echo ":: To enable and start the service:"
-    echo "   systemctl enable --now unified-hifi-control"
-    echo ":: Web UI available at http://localhost:8088"
-    echo ":: Configuration: /etc/unified-hifi-control/"
+    echo ""
+    echo ":: To start the service:"
+    echo "   sudo systemctl enable --now unified-hifi-control"
+    echo ""
+    echo ":: After starting, web UI will be at: http://localhost:8088"
+    echo ":: Configuration directory: /etc/unified-hifi-control/"
 }
 
 post_upgrade() {
