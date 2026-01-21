@@ -73,7 +73,26 @@ jobs:
       build_qnap_arm: ${{ steps.decide.outputs.build_qnap_arm }}
       build_docker: ${{ steps.decide.outputs.build_docker }}
       build_linux_packages: ${{ steps.decide.outputs.build_linux_packages }}
+      version: ${{ steps.version.outputs.version }}
+      git_sha: ${{ steps.version.outputs.git_sha }}
     steps:
+      - name: Compute version
+        id: version
+        run: |
+          # Version: from git tag on release, else from Cargo.toml
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Git SHA: short form
+          GIT_SHA="${GITHUB_SHA:0:7}"
+          echo "git_sha=$GIT_SHA" >> $GITHUB_OUTPUT
+
+          echo "::notice::Build version: $VERSION ($GIT_SHA)"
+
       - name: Decide what to build
         id: decide
         env:
@@ -409,6 +428,9 @@ jobs:
         run: cargo install cargo-zigbuild --locked
 
       - name: Build with zigbuild
+        env:
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
         run: cargo zigbuild --release --target x86_64-unknown-linux-musl
 
       - name: Rename binary
@@ -566,6 +588,9 @@ jobs:
         run: cargo install cargo-zigbuild --locked
 
       - name: Build with zigbuild
+        env:
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
         run: cargo zigbuild --release --target ${{ matrix.target }}
 
       - name: Smoke test armv7 binary
@@ -612,6 +637,8 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
         run: cargo build --release --target x86_64-apple-darwin
 
       - name: Upload binary
@@ -647,6 +674,8 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
         run: cargo build --release --target aarch64-apple-darwin
 
       - name: Upload binary
@@ -717,6 +746,8 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
         run: cargo build --release
 
       - name: Rename binary

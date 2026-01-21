@@ -29,7 +29,8 @@ pub struct LayoutProps {
 /// Main layout component wrapping all pages.
 #[component]
 pub fn Layout(props: LayoutProps) -> Element {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = env!("UHC_VERSION");
+    let git_sha = env!("UHC_GIT_SHA");
     let full_title = format!("{} - Unified Hi-Fi Control", props.title);
 
     rsx! {
@@ -61,7 +62,7 @@ pub fn Layout(props: LayoutProps) -> Element {
             {props.children}
         }
         footer { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center py-3",
-            small { class: "text-muted", "Unified Hi-Fi Control v{version}" }
+            small { class: "text-muted", "Unified Hi-Fi Control v{version} ({git_sha})" }
         }
     }
 }

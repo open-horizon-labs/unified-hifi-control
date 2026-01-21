@@ -76,16 +76,10 @@ mod server {
             .init();
 
         tracing::info!(
-            "Starting Unified Hi-Fi Control (Rust) v{}",
-            env!("CARGO_PKG_VERSION")
+            "Starting Unified Hi-Fi Control (Rust) v{} ({})",
+            env!("UHC_VERSION"),
+            env!("UHC_GIT_SHA")
         );
-
-        // Ensure public directory exists (required by Dioxus fullstack)
-        if !std::path::Path::new("public").exists() {
-            if let Err(e) = std::fs::create_dir_all("public") {
-                tracing::warn!("Failed to create public directory: {}", e);
-            }
-        }
 
         // Load configuration
         let config = config::load_config()?;
@@ -521,11 +515,19 @@ async fn main() -> anyhow::Result<()> {
     // Handle --version and --help before starting server
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("unified-hifi-control {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "unified-hifi-control {} ({})",
+            env!("UHC_VERSION"),
+            env!("UHC_GIT_SHA")
+        );
         return Ok(());
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("unified-hifi-control {}", env!("CARGO_PKG_VERSION"));
+        println!(
+            "unified-hifi-control {} ({})",
+            env!("UHC_VERSION"),
+            env!("UHC_GIT_SHA")
+        );
         println!();
         println!(
             "Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer, and hardware knobs."
