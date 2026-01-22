@@ -251,12 +251,14 @@ impl RoonAdapter {
                     }
                 }
 
-                // Clear state on exit
+                // Clear state on exit (including image service and pending requests)
                 {
                     let mut s = state_clone.write().await;
                     s.connected = false;
                     s.transport = None;
+                    s.image = None;
                     s.zones.clear();
+                    s.pending_images.clear();
                 }
 
                 tracing::info!("Roon loop exited, reconnecting in {:?}...", retry_delay);

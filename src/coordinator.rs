@@ -189,7 +189,8 @@ impl AdapterCoordinator {
 
     /// Stop a single adapter
     pub async fn stop_adapter(&self, prefix: &str) -> Result<()> {
-        // Extract handle and cancel token while holding lock, then release before awaiting
+        // Extract handle while holding lock, reset token immediately to avoid race
+        // with concurrent start_adapter cloning a cancelled token
         let handle = {
             let mut adapters = self.adapters.write().await;
 
@@ -207,6 +208,9 @@ impl AdapterCoordinator {
             // Cancel the adapter's token
             adapter.cancel.cancel();
 
+            // Reset token immediately so concurrent start_adapter gets fresh token
+            adapter.cancel = self.shutdown.child_token();
+
             // Take the handle - lock released after this block
             adapter.handle.take()
         };
@@ -223,14 +227,6 @@ impl AdapterCoordinator {
                 Err(_) => {
                     warn!("Adapter {} did not stop within timeout, abandoning", prefix);
                 }
-            }
-        }
-
-        // Re-acquire lock to reset cancel token for potential restart
-        {
-            let mut adapters = self.adapters.write().await;
-            if let Some(adapter) = adapters.get_mut(prefix) {
-                adapter.cancel = self.shutdown.child_token();
             }
         }
 
