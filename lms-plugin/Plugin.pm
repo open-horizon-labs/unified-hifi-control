@@ -13,6 +13,7 @@ use Slim::Utils::Log;
 use Slim::Utils::Strings qw(string);
 
 use Plugins::UnifiedHiFi::Helper;
+use Plugins::UnifiedHiFi::Settings;
 
 my $log = Slim::Utils::Log->addLogCategory({
     'category'     => 'plugin.unifiedhifi',
@@ -33,8 +34,8 @@ sub initPlugin {
 
     $class->SUPER::initPlugin(@_);
 
-    require Plugins::UnifiedHiFi::Settings;
     Plugins::UnifiedHiFi::Settings->new;
+    Plugins::UnifiedHiFi::Helper->init;
 
     # Start the helper if autorun is enabled
     if ($prefs->get('autorun')) {

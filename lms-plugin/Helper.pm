@@ -7,6 +7,7 @@ use strict;
 use warnings;
 
 use File::Spec::Functions qw(catfile catdir);
+use File::Path qw(make_path);
 use JSON::XS;
 use Proc::Background;
 
@@ -28,20 +29,23 @@ use constant HEALTH_CHECK_INTERVAL => 30;  # seconds
 use constant MAX_RESTARTS          => 5;   # before giving up
 use constant RESTART_RESET_TIME    => 300; # reset counter after 5 min stable
 
-# Get the plugin install directory (where the plugin ZIP was extracted)
-sub pluginDir {
-    my $class = shift;
-    return Plugins::UnifiedHiFi::Plugin->_pluginDataFor('basedir');
-}
+my ($configDir, $publicDir);
 
-# Get the Bin directory inside the plugin install location
-sub pluginBinDir {
-    my $class = shift;
+sub init {
+    my ($class) = @_;
 
-    my $pluginDir = $class->pluginDir();
-    return unless $pluginDir;
+    # Use LMS's cache directory for config (contains public/ for web assets)
+    $configDir = catdir($serverPrefs->get('cachedir'), 'unifiedhifi');
+    unless (-d $configDir) {
+        make_path($configDir) or $log->error("Failed to create data directory $configDir: $!");
+    }
 
-    return catdir($pluginDir, 'Bin');
+    $publicDir = catdir(Plugins::UnifiedHiFi::Plugin->_pluginDataFor('basedir'), 'Bin', 'public');
+
+    # On macOS, clear quarantine flag to prevent Gatekeeper blocking unsigned binary
+    if (Slim::Utils::OSDetect::OS() eq 'mac' && (my $binary = $class->bin())) {
+        system('xattr', '-cr', $binary);
+    }
 }
 
 # Get plugin version from install.xml
@@ -54,18 +58,12 @@ sub pluginVersion {
 sub bin {
     my $class = shift;
 
-    # Register our plugin's Bin directory with LMS's binary finder
-    my $pluginBinDir = $class->pluginBinDir();
-    if ($pluginBinDir && -d $pluginBinDir) {
-        Slim::Utils::Misc::addFindBinPaths($pluginBinDir);
-    }
-
     # Let LMS find the right binary for this platform
     # LMS knows about platform folders (darwin/, x86_64-linux/, MSWin32-x64-multi-thread/, etc.)
     my $binary = Slim::Utils::Misc::findBin('unified-hifi-control');
 
-    if ($binary && -x $binary) {
-        $log->debug("Found binary via LMS findBin: $binary");
+    if ($binary) {
+        $log->debug("Found binary via LMS findbin: $binary");
         return $binary;
     }
 
@@ -92,28 +90,13 @@ sub start {
         return;
     }
 
-    $class->_doStart($binary);
-}
-
-# Internal: actually start the helper process
-sub _doStart {
-    my ($class, $binaryPath) = @_;
-
     return if running();
 
     my $port = $prefs->get('port') || 8088;
 
-    # Build environment for subprocess
-    # Use plugin's Bin directory for config (contains public/ for web assets)
-    my $configDir = $class->pluginBinDir();
     my $lmsPort = $serverPrefs->get('httpport');
 
-    $log->info("Starting Unified Hi-Fi Control: $binaryPath on port $port");
-
-    # On macOS, clear quarantine flag to prevent Gatekeeper blocking unsigned binary
-    if (Slim::Utils::OSDetect::OS() eq 'mac') {
-        system('xattr', '-cr', $binaryPath);
-    }
+    $log->info("Starting Unified Hi-Fi Control: $binary on port $port");
 
     # Set environment variables for the subprocess
     # Using local ensures they're restored after Proc::Background->new() returns
@@ -123,21 +106,20 @@ sub _doStart {
     local $ENV{LMS_PORT} = $lmsPort;
     local $ENV{LMS_UNIFIEDHIFI_STARTED} = 'true';
 
-    $log->debug("Running: $binaryPath (with env: PORT=$port CONFIG_DIR=$configDir LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort)");
-
+    $log->debug("Running: $binary (with env: PORT=$port CONFIG_DIR=$configDir LMS_HOST=127.0.0.1 LMS_PORT=$lmsPort)");
     # Platform-specific process spawning
     if (main::ISWINDOWS) {
         # Windows: run binary directly, Proc::Background handles it
         $helperProc = Proc::Background->new(
             { 'die_upon_destroy' => 1 },
-            $binaryPath
+            $binary
         );
     } else {
         # Unix: use exec so shell replaces itself with binary (PID tracking works correctly)
         # This ensures $helperProc->die sends SIGTERM to the Bridge, not to a shell wrapper
         $helperProc = Proc::Background->new(
             { 'die_upon_destroy' => 1 },
-            "/bin/sh", "-c", "exec '$binaryPath' > /dev/null 2>&1"
+            "/bin/sh", "-c", "exec '$binary' > /dev/null 2>&1"
         );
     }
 
