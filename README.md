@@ -12,9 +12,7 @@ Hi-fi software assumes you're at a computer or using vendor-specific apps. This 
 
 ## Status
 
-**Stable: [v2.7.0](https://github.com/open-horizon-labs/unified-hifi-control/releases/tag/v2.7.0)** (Node.js) — Production ready
-
-**Preview: v3.0.0-rc.1** (Rust) — Native packages for Synology, QNAP, LMS; 10x smaller memory footprint
+**Stable: [v3.1.3](https://github.com/open-horizon-labs/unified-hifi-control/releases/tag/v3.1.3)** (Rust) — Native packages for Synology, QNAP, LMS; 10x smaller memory footprint
 
 Works with [roon-knob](https://github.com/muness/roon-knob) for hardware control of Roon, OpenHome, UPnP, or LMS/Lyrion zones.
 
@@ -23,7 +21,7 @@ Works with [roon-knob](https://github.com/muness/roon-knob) for hardware control
 ### Docker (Recommended)
 
 ```bash
-docker pull muness/unified-hifi-control:v3.0.0-rc.1
+docker pull muness/unified-hifi-control:latest
 ```
 
 ### Synology NAS (DSM 7)
@@ -56,7 +54,7 @@ Pre-built binaries available for Linux (x64, arm64, armv7), macOS (x64, arm64), 
 # docker-compose.yml
 services:
   unified-hifi-control:
-    image: muness/unified-hifi-control:v3.0.0-rc.1
+    image: muness/unified-hifi-control:latest
     network_mode: host  # Required for Roon/UPnP discovery
     volumes:
       - ./data:/data
@@ -184,8 +182,6 @@ Ask Claude: "What's playing right now?" or "Turn the volume down a bit" or "Swit
 ## Firmware Updates
 
 The bridge automatically polls GitHub for new [roon-knob](https://github.com/muness/roon-knob) firmware releases every 6 hours (default, configurable) and downloads updates when available. Knobs check `/firmware/version` on startup and can OTA update from the bridge.
-
-**Opt-out:** Set `FIRMWARE_AUTO_UPDATE=false` to disable automatic polling and downloading. The bridge will not check GitHub for updates, but the `/firmware/version` and `/firmware/download` endpoints remain available for manual firmware management.
 
 **Configuration:**
 - `FIRMWARE_AUTO_UPDATE` - Enable/disable automatic updates (default: `true`)
