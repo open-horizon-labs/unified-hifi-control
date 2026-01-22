@@ -1,14 +1,8 @@
 # Unified Hi-Fi Control
 
-A source-agnostic hi-fi control bridge that connects music sources and audio pipeline control to any surface — hardware knobs, web UIs, or Home Assistant.
+Control your hi-fi system from anywhere — a hardware knob on your couch, your phone, or just ask Claude.
 
-## Vision
-
-Hi-fi software assumes you're at a computer or using vendor-specific apps. This bridge fills the gap:
-
-- **Music Sources:** Roon, Lyrion/LMS, OpenHome, UPnP/DLNA — all optional, any can contribute zones
-- **Audio Pipeline:** HQPlayer DSP enrichment (link any zone to HQPlayer for upsampling/filtering)
-- **Surfaces:** Anything that speaks HTTP or MQTT — ESP32 hardware, web UIs, Home Assistant, Claude (via MCP), etc.
+This bridge connects your music sources (Roon, LMS, UPnP) to any control surface you prefer. No vendor lock-in: mix and match sources, add HQPlayer DSP processing, and control it all from one place.
 
 ## Status
 
@@ -22,7 +16,6 @@ Once the bridge is running, control your system from:
 - **[roon-knob](https://github.com/muness/roon-knob)** — ESP32-S3 hardware knob with OLED display
 - **iOS & Apple Watch** — In alpha testing. [Get in touch](https://github.com/open-horizon-labs/unified-hifi-control/issues) if you'd like to try it.
 - **Claude & AI agents** — Via the built-in MCP server (see [MCP Server](#mcp-server-claude-integration) below)
-- **Home Assistant** — Via MQTT integration
 
 ## Installation
 
@@ -94,39 +87,16 @@ Legacy aliases: `PORT` (→ `UHC_PORT`), `LOG_LEVEL` (→ `RUST_LOG`)
 
 ## HQPlayer DSP Integration
 
-**For users who already route audio through HQPlayer:** Expose HQPlayer's DSP controls (profile switching, filter selection) directly from your zones, without managing HQPlayer as a separate playback zone.
+If you route audio through HQPlayer for upsampling or filtering, this bridge lets you control HQPlayer's DSP settings (profiles, filters, shapers) alongside your zone controls.
 
-### Prerequisites
-
-Zone linking assumes you've already configured audio routing through HQPlayer using one of these methods:
-
-- **Roon:** Native HQPlayer integration (Settings → Audio → select HQPlayer as output)
-- **LMS/BubbleUPnP:** Route to HQPlayer's UPnP renderer (HQPlayer Embedded exposes this)
-- **OpenHome:** Use BubbleUPnP Server to expose HQPlayer's UPnP renderer as OpenHome
-
-This bridge doesn't handle audio routing - it exposes DSP controls for HQPlayer instances you've already integrated.
+**Note:** You need to set up audio routing to HQPlayer separately (via Roon, LMS/BubbleUPnP, or OpenHome). This bridge exposes the DSP controls, not the audio path.
 
 ### Setup
 
-Configure HQPlayer via the web UI at `/hqplayer`:
-1. Enter your HQPlayer host IP address
-2. Set the native port (default: 4321) and web port (default: 8088)
-3. Optionally add web credentials for profile switching (HQPlayer Embedded)
-4. Click Save — connection status updates automatically
-
-### Zone Linking
-
-Use web UI at `/hqplayer` to link your zones:
-1. Select a zone (e.g., "Living Room" Roon zone that outputs to HQPlayer)
-2. Choose which HQPlayer instance handles its DSP
-3. Zone's now-playing data now includes HQPlayer pipeline info
-
-### Features
-
-- **Multi-instance support:** Run multiple HQPlayer instances, link different zones to each
-- **Zone enrichment:** Primary zones show HQPlayer DSP status in `backend_data.hqp`
-- **Profile switching:** Load HQPlayer Embedded profiles via web UI or MCP tools
-- **Pipeline control:** Adjust filter, shaper, and dither settings
+1. Open the web UI at `/hqplayer`
+2. Enter your HQPlayer host IP and ports (native: 4321, web: 8088)
+3. Link zones to HQPlayer instances — each zone can use a different HQPlayer
+4. Zone now-playing info will include HQPlayer pipeline status
 
 ## Architecture
 
@@ -138,22 +108,22 @@ Use web UI at `/hqplayer` to link your zones:
 │  │        │  │  /LMS  │  │          │  │  /DLNA │  │   DSP    │    │
 │  └────────┘  └────────┘  └──────────┘  └────────┘  └──────────┘    │
 │                                                                      │
-│  HTTP API + SSE + optional MQTT                                      │
+│  HTTP API + SSE                                                       │
 └─────────────────────────────────────────────────────────────────────┘
                               │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-           ESP32           Web UI        Home Assistant
-           Knob                          (via MQTT)
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+           ESP32                           Web UI
+           Knob
 ```
 
 ## MCP Server (Claude Integration)
 
-The bridge includes an MCP server that lets Claude control your hi-fi system directly.
+Control your hi-fi with natural language. The bridge includes an MCP server so Claude can play, pause, adjust volume, and switch HQPlayer profiles.
 
 ### Setup
 
-1. Start the bridge: `docker compose up -d` or `npm start`
+1. Start the bridge (`docker compose up -d`)
 2. Add to your Claude Code MCP config:
 
 ```json
@@ -187,16 +157,17 @@ The bridge includes an MCP server that lets Claude control your hi-fi system dir
 
 Ask Claude: "What's playing right now?" or "Turn the volume down a bit" or "Switch to my DSD profile in HQPlayer"
 
-## Firmware Updates
+<details>
+<summary><strong>Firmware Updates (roon-knob)</strong></summary>
 
-The bridge automatically polls GitHub for new [roon-knob](https://github.com/muness/roon-knob) firmware releases every 6 hours (default, configurable) and downloads updates when available. Knobs check `/firmware/version` on startup and can OTA update from the bridge.
+The bridge automatically downloads new [roon-knob](https://github.com/muness/roon-knob) firmware from GitHub every 6 hours. Knobs check `/firmware/version` on startup and OTA update from the bridge.
 
-**Configuration:**
-- `FIRMWARE_AUTO_UPDATE` - Enable/disable automatic updates (default: `true`)
-- `FIRMWARE_POLL_INTERVAL_MINUTES` - Poll interval in minutes when auto-update enabled (default: `360` minutes / 6 hours)
-- `FIRMWARE_POLL_INTERVAL_MS` - Legacy: Poll interval in milliseconds (prefer `_MINUTES` above)
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `FIRMWARE_AUTO_UPDATE` | Enable/disable auto-download | `true` |
+| `FIRMWARE_POLL_INTERVAL_MINUTES` | Check interval | `360` (6 hours) |
 
-If MQTT is enabled, firmware version is published to `unified-hifi/firmware/version` for Home Assistant monitoring.
+</details>
 
 <details>
 <summary><strong>Version History (for nerds)</strong></summary>
@@ -211,95 +182,45 @@ The v3 rewrite was motivated by packaging requests (NAS users wanted native pack
 
 </details>
 
-## Development
+<details>
+<summary><strong>Development</strong></summary>
 
 ### Prerequisites
 
 - Rust 1.84+ with `wasm32-unknown-unknown` target
 - [Dioxus CLI](https://dioxuslabs.com/learn/0.6/getting_started)
-- [sccache](https://github.com/mozilla/sccache) (shared compilation cache - speeds up rebuilds significantly)
-- `curl` (for Tailwind CLI download)
 
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo install dioxus-cli --locked
-
-# Optional: shared compilation cache (speeds up rebuilds significantly)
-brew install sccache  # macOS, or: cargo install sccache
-echo 'export RUSTC_WRAPPER=sccache' >> ~/.zshrc  # or ~/.bashrc
-
-# Install pre-commit hook (runs fmt + clippy)
 cp scripts/pre-commit .git/hooks/
 ```
 
-### Build
+### Build & Run
 
 ```bash
-# Build Tailwind CSS (auto-downloads standalone CLI, no Node.js)
-make css
+make css                                              # Build Tailwind CSS
+dx build --release --platform web --features web      # Build server + WASM
 
-# Full build with web UI (WASM + server) - REQUIRED for web UI
-dx build --release --platform web --features web
-```
-
-**Note:** `cargo build` only builds the server without the WASM client. The web UI requires `dx build` which produces both the server binary and the WASM bundle needed for hydration (interactive components).
-
-### Run
-
-```bash
-# Run the server (from dx build output directory)
 cd target/dx/unified-hifi-control/release/web
-PORT=8088 ./unified-hifi-control
-
-# Access at http://127.0.0.1:8088
+PORT=8088 ./unified-hifi-control                      # Run at http://localhost:8088
 ```
 
-For development with hot reload:
-
+For hot reload during development:
 ```bash
 PORT=8088 dx serve --release --platform web --features web --port 8088
 ```
 
-**Note:** `dx serve` runs a dev server proxy which may cause issues with Roon discovery (wrong port advertised). For testing with Roon, run the binary directly.
-
-**Important:** The server must be run from the `dx build` output directory where the `public/wasm/` folder exists. Running the binary from elsewhere will cause a panic or non-functional UI.
-
-### CSS Development
-
-```bash
-# Watch mode - rebuilds CSS on changes to src/input.css or .rs files
-make css-watch
-
-# In another terminal, run dx serve for hot reload
-dx serve
-```
-
-### Test
+### Test & Lint
 
 ```bash
 cargo test --workspace
+cargo fmt --check && cargo clippy -- -D warnings
 ```
 
-### Lint
+**Note:** Use `dx build`, not `cargo build` — the web UI requires the WASM bundle that only `dx` produces.
 
-```bash
-cargo fmt --check
-cargo clippy -- -D warnings
-```
-
-### Verify Build (WASM + Server)
-
-To verify the full build compiles (both server and WASM client):
-
-```bash
-dx build --release --platform web --features web
-```
-
-**Important flags:**
-- `--platform web` - Enables fullstack SSR + client hydration
-- `--features web` - Enables WASM client bundle generation
-
-**Do NOT use** `cargo check --target wasm32-unknown-unknown` - this doesn't apply the correct feature flags.
+</details>
 
 ## License
 
