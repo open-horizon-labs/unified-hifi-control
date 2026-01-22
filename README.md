@@ -8,10 +8,6 @@ Control your hi-fi system from anywhere — a hardware knob on your couch, your 
 
 This bridge connects your music sources (Roon, LMS, UPnP) to any control surface you prefer. No vendor lock-in: mix and match sources, add HQPlayer DSP processing, and control it all from one place.
 
-## Status
-
-**Stable: [v3.1.3](https://github.com/open-horizon-labs/unified-hifi-control/releases/tag/v3.1.3)** (Rust) — Native packages for Synology, QNAP, LMS; 10x smaller memory footprint
-
 ## Control Surfaces
 
 Once the bridge is running, control your system from:
