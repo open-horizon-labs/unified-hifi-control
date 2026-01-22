@@ -111,8 +111,15 @@ sub _doStart {
     $log->info("Starting Unified Hi-Fi Control: $binaryPath on port $port");
 
     # On macOS, clear quarantine flag to prevent Gatekeeper blocking unsigned binary
-    if (Slim::Utils::OSDetect::OS() eq 'mac') {
-        system('xattr', '-cr', $binaryPath);
+    my $os = Slim::Utils::OSDetect::OS();
+    $log->debug("Detected OS: $os");
+    if ($os eq 'mac') {
+        $log->info("Clearing macOS quarantine flag on: $binaryPath");
+        my $ret = system('/usr/bin/xattr', '-cr', $binaryPath);
+        if ($ret != 0) {
+            $log->warn("xattr -cr failed with code $ret - binary may be blocked by Gatekeeper");
+            $log->warn("You may need to manually approve the binary: right-click the binary in Finder and select Open");
+        }
     }
 
     # Set environment variables for the subprocess
