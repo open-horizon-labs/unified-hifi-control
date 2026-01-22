@@ -143,8 +143,8 @@ struct RoonState {
     zones: HashMap<String, Zone>,
     transport: Option<Transport>,
     image: Option<Image>,
-    /// Pending image requests: request_id -> oneshot sender
-    pending_images: HashMap<usize, ImageRequest>,
+    /// Pending image requests: request_id -> (image_key, oneshot sender)
+    pending_images: HashMap<usize, (String, ImageRequest)>,
 }
 
 /// Roon adapter
@@ -441,7 +441,9 @@ impl RoonAdapter {
             let req_id = image.get_image(image_key, args).await;
 
             if let Some(req_id) = req_id {
-                state.pending_images.insert(req_id, tx);
+                state
+                    .pending_images
+                    .insert(req_id, (image_key.to_string(), tx));
                 req_id
             } else {
                 return Err(anyhow::anyhow!("Failed to request image"));
@@ -451,7 +453,15 @@ impl RoonAdapter {
         tracing::debug!("Requested image {} with req_id {}", image_key, req_id);
 
         // Wait for response with timeout
-        match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), rx).await;
+
+        // Clean up pending request on timeout or cancellation
+        if !matches!(result, Ok(Ok(Some(_)))) {
+            let mut state = self.state.write().await;
+            state.pending_images.remove(&req_id);
+        }
+
+        match result {
             Ok(Ok(Some(data))) => Ok(data),
             Ok(Ok(None)) => Err(anyhow::anyhow!("Image not found")),
             Ok(Err(_)) => Err(anyhow::anyhow!("Image request cancelled")),
@@ -811,35 +821,37 @@ async fn run_roon_loop(
                             data.len()
                         );
                         let mut s = state_for_events.write().await;
-                        // Find pending request by image_key (req_id may be stored differently)
-                        // For now, we'll use a simpler approach - store by image_key
-                        if let Some((_req_id, sender)) = s
+                        // Find pending request by matching image_key
+                        if let Some(req_id) = s
                             .pending_images
                             .iter()
-                            .find(|(_, _)| true) // Take any pending request
-                            .map(|(k, _)| (*k, ()))
-                            .and_then(|(k, _)| s.pending_images.remove(&k).map(|s| (k, s)))
+                            .find(|(_, (key, _))| key == &image_key)
+                            .map(|(k, _)| *k)
                         {
-                            let _ = sender.send(Some(ImageData {
-                                content_type: "image/jpeg".to_string(),
-                                data,
-                            }));
+                            if let Some((_key, sender)) = s.pending_images.remove(&req_id) {
+                                let _ = sender.send(Some(ImageData {
+                                    content_type: "image/jpeg".to_string(),
+                                    data,
+                                }));
+                            }
                         }
                     }
                     Parsed::Png((image_key, data)) => {
                         tracing::debug!("Received PNG image: {} ({} bytes)", image_key, data.len());
                         let mut s = state_for_events.write().await;
-                        if let Some((_req_id, sender)) = s
+                        // Find pending request by matching image_key
+                        if let Some(req_id) = s
                             .pending_images
                             .iter()
-                            .find(|(_, _)| true)
-                            .map(|(k, _)| (*k, ()))
-                            .and_then(|(k, _)| s.pending_images.remove(&k).map(|s| (k, s)))
+                            .find(|(_, (key, _))| key == &image_key)
+                            .map(|(k, _)| *k)
                         {
-                            let _ = sender.send(Some(ImageData {
-                                content_type: "image/png".to_string(),
-                                data,
-                            }));
+                            if let Some((_key, sender)) = s.pending_images.remove(&req_id) {
+                                let _ = sender.send(Some(ImageData {
+                                    content_type: "image/png".to_string(),
+                                    data,
+                                }));
+                            }
                         }
                     }
                     _ => {}
