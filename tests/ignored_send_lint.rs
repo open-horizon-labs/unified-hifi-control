@@ -63,9 +63,8 @@ impl<'ast> Visit<'ast> for IgnoredSendVisitor {
                         if self.is_send_call(&method_call.method.to_string()) {
                             self.violations.push((
                                 self.current_file.clone(),
-                                format!(
-                                    "let _ = ...send(...) - ignoring send result hides failures"
-                                ),
+                                "let _ = ...send(...) - ignoring send result hides failures"
+                                    .to_string(),
                             ));
                         }
                     }
@@ -75,12 +74,36 @@ impl<'ast> Visit<'ast> for IgnoredSendVisitor {
                             if self.is_send_call(&method_call.method.to_string()) {
                                 self.violations.push((
                                     self.current_file.clone(),
-                                    format!(
-                                        "let _ = ...send(...).await - ignoring async send result"
-                                    ),
+                                    "let _ = ...send(...).await - ignoring async send result"
+                                        .to_string(),
                                 ));
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Also catch bare send statements: `tx.send(x);` or `tx.send(x).await;`
+        if let Stmt::Expr(expr, Some(_semi)) = stmt {
+            // Check for bare .send() call
+            if let Expr::MethodCall(method_call) = expr {
+                if self.is_send_call(&method_call.method.to_string()) {
+                    self.violations.push((
+                        self.current_file.clone(),
+                        "...send(...); - bare send statement ignores result".to_string(),
+                    ));
+                }
+            }
+            // Check for bare .send().await call
+            if let Expr::Await(await_expr) = expr {
+                if let Expr::MethodCall(method_call) = &*await_expr.base {
+                    if self.is_send_call(&method_call.method.to_string()) {
+                        self.violations.push((
+                            self.current_file.clone(),
+                            "...send(...).await; - bare async send statement ignores result"
+                                .to_string(),
+                        ));
                     }
                 }
             }
@@ -125,6 +148,25 @@ fn detects_ignored_send() {
     assert!(
         !visitor.violations.is_empty(),
         "Should detect ignored send result"
+    );
+}
+
+#[test]
+fn detects_bare_send_statement() {
+    let bad_code = r#"
+        fn example() {
+            let (tx, rx) = oneshot::channel();
+            tx.send(42);  // BAD - bare statement
+        }
+    "#;
+
+    let syntax: File = syn::parse_file(bad_code).unwrap();
+    let mut visitor = IgnoredSendVisitor::new("test.rs".to_string());
+    visitor.visit_file(&syntax);
+
+    assert!(
+        !visitor.violations.is_empty(),
+        "Should detect bare send statement"
     );
 }
 
