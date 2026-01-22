@@ -361,6 +361,7 @@ jobs:
   # Uses content-based caching to skip build when source unchanged
   build-wasm:
     name: Build WASM Assets
+    needs: plan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -372,6 +373,8 @@ jobs:
           path: |
             target/dx/
             target/wasm32-unknown-unknown/
+          # Version is baked in at compile time, but we accept stale version display
+          # for PRs in exchange for cache efficiency. Releases change Cargo.toml anyway.
           key: wasm-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'input.css') }}
           restore-keys: |
             wasm-
@@ -409,6 +412,9 @@ jobs:
 
       - name: Build WASM assets (ADR 002)
         if: steps.cache-wasm.outputs.cache-hit != 'true'
+        env:
+          UHC_VERSION: ${{ needs.plan.outputs.version }}
+          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
         run: |
           dx build --fullstack --release @client --no-default-features --features web @server --features server
           echo "Generated assets:"
