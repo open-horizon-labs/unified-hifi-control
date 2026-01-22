@@ -15,7 +15,7 @@
 use std::fs;
 use std::path::Path;
 use syn::visit::Visit;
-use syn::{Expr, ExprCall, ExprLoop, ExprMacro, File, Macro, StmtMacro};
+use syn::{Expr, ExprCall, ExprLoop, ExprMacro, ExprMethodCall, File, Macro, StmtMacro};
 use walkdir::WalkDir;
 
 /// Tracks spawned async blocks and whether they contain uncancellable loops
@@ -60,6 +60,13 @@ impl SpawnLoopVisitor {
         false
     }
 
+    fn is_joinset_spawn_method(&self, method_call: &ExprMethodCall) -> bool {
+        // Check for handles.spawn(...) or joinset.spawn(...) pattern
+        // JoinSet::spawn has same cancellation requirements as tokio::spawn
+        // Look for method named "spawn" - this catches JoinSet.spawn(), handles.spawn(), etc.
+        method_call.method == "spawn"
+    }
+
     fn is_select_macro_path(&self, mac: &Macro) -> bool {
         // Check for tokio::select! or select! pattern
         let path_str: String = mac
@@ -85,6 +92,20 @@ impl<'ast> Visit<'ast> for SpawnLoopVisitor {
         } else {
             // Continue visiting normally
             syn::visit::visit_expr_call(self, call);
+        }
+    }
+
+    fn visit_expr_method_call(&mut self, method_call: &'ast ExprMethodCall) {
+        if self.is_joinset_spawn_method(method_call) {
+            self.in_spawn_depth += 1;
+            // Visit the arguments (the async block)
+            for arg in &method_call.args {
+                self.visit_expr(arg);
+            }
+            self.in_spawn_depth -= 1;
+        } else {
+            // Continue visiting normally
+            syn::visit::visit_expr_method_call(self, method_call);
         }
     }
 

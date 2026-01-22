@@ -237,7 +237,7 @@ impl RoonAdapter {
                         tracing::info!("Roon adapter shutdown requested during discovery");
                         break;
                     }
-                    result = run_roon_loop(state_clone.clone(), bus_clone.clone(), base_url.clone()) => {
+                    result = run_roon_loop(state_clone.clone(), bus_clone.clone(), base_url.clone(), shutdown_clone.clone()) => {
                         result
                     }
                 };
@@ -552,6 +552,7 @@ async fn run_roon_loop(
     state: Arc<RwLock<RoonState>>,
     bus: SharedBus,
     base_url: String,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
 
@@ -609,229 +610,239 @@ async fn run_roon_loop(
     let bus_for_events = bus.clone();
     let state_path_for_events = state_path_str.clone();
     let base_url_for_events = base_url;
+    let shutdown_for_events = shutdown.clone();
     handles.spawn(async move {
         loop {
-            if let Some((event, msg)) = core_rx.recv().await {
-                match event {
-                    CoreEvent::Found(mut core) => {
-                        let core_name = core.display_name.clone();
-                        let core_version = core.display_version.clone();
-
-                        tracing::info!("Roon Core found: {} (version {})", core_name, core_version);
-
-                        // Update status shown in Roon Settings → Extensions
-                        if let Some(status) = core.get_status() {
-                            let message = format!("Connected • {}", base_url_for_events);
-                            status.set_status(message, false).await;
-                        }
-
-                        let mut s = state_for_events.write().await;
-                        s.connected = true;
-                        s.core_name = Some(core_name.clone());
-                        s.core_version = Some(core_version.clone());
-
-                        // Publish connected event
-                        bus_for_events.publish(BusEvent::RoonConnected {
-                            core_name: core_name.clone(),
-                            version: core_version.clone(),
-                        });
-
-                        // Get transport service and subscribe to zones
-                        if let Some(transport) = core.get_transport().cloned() {
-                            transport.subscribe_zones().await;
-                            s.transport = Some(transport);
-                        }
-
-                        // Get image service for album art
-                        if let Some(image) = core.get_image().cloned() {
-                            s.image = Some(image);
-                            tracing::info!("Roon Image service available");
-                        }
-                    }
-                    CoreEvent::Lost(mut core) => {
-                        let lost_core_name = core.display_name.clone();
-                        let lost_core_version = core.display_version.clone();
-
-                        tracing::warn!(
-                            "Roon Core lost: {} (version {})",
-                            lost_core_name,
-                            lost_core_version
-                        );
-
-                        // Update status shown in Roon Settings → Extensions
-                        if let Some(status) = core.get_status() {
-                            status
-                                .set_status("Disconnected - searching...".to_string(), true)
-                                .await;
-                        }
-
-                        let mut s = state_for_events.write().await;
-                        s.connected = false;
-                        s.core_name = None;
-                        s.core_version = None;
-                        s.zones.clear();
-                        s.transport = None;
-
-                        // Publish disconnected event
-                        bus_for_events.publish(BusEvent::RoonDisconnected);
-                    }
-                    _ => {}
+            // Use select! to allow cancellation and handle channel close
+            // Issue #128: Without this, the loop would spin on channel close
+            // causing high CPU and preventing graceful shutdown
+            let event_result = tokio::select! {
+                _ = shutdown_for_events.cancelled() => {
+                    tracing::info!("Roon event handler shutdown requested");
+                    break;
                 }
+                result = core_rx.recv() => result
+            };
 
-                // Handle parsed messages
-                if let Some((_, parsed)) = msg {
-                    match parsed {
-                        Parsed::RoonState(roon_state) => {
-                            // Persist pairing state to data directory
-                            if let Err(e) =
-                                RoonApi::save_roon_state(&state_path_for_events, roon_state)
-                            {
-                                tracing::warn!("Failed to save Roon state: {}", e);
+            let Some((event, msg)) = event_result else {
+                // Channel closed - exit gracefully to allow reconnection
+                tracing::info!("Roon event channel closed, exiting handler");
+                break;
+            };
+
+            match event {
+                CoreEvent::Found(mut core) => {
+                    let core_name = core.display_name.clone();
+                    let core_version = core.display_version.clone();
+
+                    tracing::info!("Roon Core found: {} (version {})", core_name, core_version);
+
+                    // Update status shown in Roon Settings → Extensions
+                    if let Some(status) = core.get_status() {
+                        let message = format!("Connected • {}", base_url_for_events);
+                        status.set_status(message, false).await;
+                    }
+
+                    let mut s = state_for_events.write().await;
+                    s.connected = true;
+                    s.core_name = Some(core_name.clone());
+                    s.core_version = Some(core_version.clone());
+
+                    // Publish connected event
+                    bus_for_events.publish(BusEvent::RoonConnected {
+                        core_name: core_name.clone(),
+                        version: core_version.clone(),
+                    });
+
+                    // Get transport service and subscribe to zones
+                    if let Some(transport) = core.get_transport().cloned() {
+                        transport.subscribe_zones().await;
+                        s.transport = Some(transport);
+                    }
+
+                    // Get image service for album art
+                    if let Some(image) = core.get_image().cloned() {
+                        s.image = Some(image);
+                        tracing::info!("Roon Image service available");
+                    }
+                }
+                CoreEvent::Lost(mut core) => {
+                    let lost_core_name = core.display_name.clone();
+                    let lost_core_version = core.display_version.clone();
+
+                    tracing::warn!(
+                        "Roon Core lost: {} (version {})",
+                        lost_core_name,
+                        lost_core_version
+                    );
+
+                    // Update status shown in Roon Settings → Extensions
+                    if let Some(status) = core.get_status() {
+                        status
+                            .set_status("Disconnected - searching...".to_string(), true)
+                            .await;
+                    }
+
+                    let mut s = state_for_events.write().await;
+                    s.connected = false;
+                    s.core_name = None;
+                    s.core_version = None;
+                    s.zones.clear();
+                    s.transport = None;
+
+                    // Publish disconnected event
+                    bus_for_events.publish(BusEvent::RoonDisconnected);
+                }
+                _ => {}
+            }
+
+            // Handle parsed messages
+            if let Some((_, parsed)) = msg {
+                match parsed {
+                    Parsed::RoonState(roon_state) => {
+                        // Persist pairing state to data directory
+                        if let Err(e) = RoonApi::save_roon_state(&state_path_for_events, roon_state)
+                        {
+                            tracing::warn!("Failed to save Roon state: {}", e);
+                        } else {
+                            tracing::debug!("Roon state saved to {}", state_path_for_events);
+                        }
+                    }
+                    Parsed::Zones(zones) => {
+                        let mut s = state_for_events.write().await;
+                        for zone in zones {
+                            tracing::debug!(
+                                "Zone update: {} ({})",
+                                zone.display_name,
+                                zone.zone_id
+                            );
+                            let converted = convert_zone(&zone);
+                            let is_new = !s.zones.contains_key(&zone.zone_id);
+                            let old_zone = s.zones.get(&zone.zone_id).cloned();
+
+                            if is_new {
+                                // New zone - emit ZoneDiscovered
+                                let bus_zone = roon_zone_to_bus_zone(&converted);
+                                bus_for_events.publish(BusEvent::ZoneDiscovered { zone: bus_zone });
                             } else {
-                                tracing::debug!("Roon state saved to {}", state_path_for_events);
-                            }
-                        }
-                        Parsed::Zones(zones) => {
-                            let mut s = state_for_events.write().await;
-                            for zone in zones {
-                                tracing::debug!(
-                                    "Zone update: {} ({})",
-                                    zone.display_name,
-                                    zone.zone_id
-                                );
-                                let converted = convert_zone(&zone);
-                                let is_new = !s.zones.contains_key(&zone.zone_id);
-                                let old_zone = s.zones.get(&zone.zone_id).cloned();
-
-                                if is_new {
-                                    // New zone - emit ZoneDiscovered
-                                    let bus_zone = roon_zone_to_bus_zone(&converted);
-                                    bus_for_events
-                                        .publish(BusEvent::ZoneDiscovered { zone: bus_zone });
-                                } else {
-                                    // Existing zone - emit ZoneUpdated
-                                    bus_for_events.publish(BusEvent::ZoneUpdated {
-                                        zone_id: converted.zone_id.clone(),
-                                        display_name: converted.display_name.clone(),
-                                        state: converted.state.clone(),
-                                    });
-                                }
-
-                                // Publish now playing changed if present
-                                if let Some(ref np) = converted.now_playing {
-                                    bus_for_events.publish(BusEvent::NowPlayingChanged {
-                                        zone_id: converted.zone_id.clone(),
-                                        title: Some(np.title.clone()),
-                                        artist: Some(np.artist.clone()),
-                                        album: Some(np.album.clone()),
-                                        image_key: np.image_key.clone(),
-                                    });
-                                }
-
-                                // Publish volume changed for each output with changed volume
-                                for output in &converted.outputs {
-                                    if let Some(ref vol) = output.volume {
-                                        let old_vol = old_zone.as_ref().and_then(|oz| {
-                                            oz.outputs
-                                                .iter()
-                                                .find(|o| o.output_id == output.output_id)
-                                                .and_then(|o| o.volume.as_ref())
-                                        });
-
-                                        // Emit if volume changed or this is a new zone
-                                        let vol_changed = old_vol
-                                            .map(|ov| {
-                                                ov.value != vol.value || ov.is_muted != vol.is_muted
-                                            })
-                                            .unwrap_or(true);
-
-                                        if vol_changed {
-                                            bus_for_events.publish(BusEvent::VolumeChanged {
-                                                output_id: output.output_id.clone(),
-                                                value: vol.value.unwrap_or(0.0),
-                                                is_muted: vol.is_muted.unwrap_or(false),
-                                            });
-                                        }
-                                    }
-                                }
-
-                                s.zones.insert(zone.zone_id.clone(), converted);
-                            }
-                        }
-                        Parsed::ZonesSeek(zones_seek) => {
-                            let mut s = state_for_events.write().await;
-                            for seek in zones_seek {
-                                if let Some(zone) = s.zones.get_mut(&seek.zone_id) {
-                                    if let Some(np) = &mut zone.now_playing {
-                                        np.seek_position = seek.seek_position;
-
-                                        // Publish seek position changed
-                                        if let Some(pos) = seek.seek_position {
-                                            bus_for_events.publish(BusEvent::SeekPositionChanged {
-                                                zone_id: seek.zone_id.clone(),
-                                                position: pos,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Parsed::ZonesRemoved(zone_ids) => {
-                            let mut s = state_for_events.write().await;
-                            for zone_id in zone_ids {
-                                tracing::debug!("Zone removed: {}", zone_id);
-                                s.zones.remove(&zone_id);
-
-                                // Publish zone removed event
-                                bus_for_events.publish(BusEvent::ZoneRemoved {
-                                    zone_id: zone_id.clone(),
+                                // Existing zone - emit ZoneUpdated
+                                bus_for_events.publish(BusEvent::ZoneUpdated {
+                                    zone_id: converted.zone_id.clone(),
+                                    display_name: converted.display_name.clone(),
+                                    state: converted.state.clone(),
                                 });
                             }
-                        }
-                        Parsed::Jpeg((image_key, data)) => {
-                            tracing::debug!(
-                                "Received JPEG image: {} ({} bytes)",
-                                image_key,
-                                data.len()
-                            );
-                            let mut s = state_for_events.write().await;
-                            // Find pending request by image_key (req_id may be stored differently)
-                            // For now, we'll use a simpler approach - store by image_key
-                            if let Some((_req_id, sender)) = s
-                                .pending_images
-                                .iter()
-                                .find(|(_, _)| true) // Take any pending request
-                                .map(|(k, _)| (*k, ()))
-                                .and_then(|(k, _)| s.pending_images.remove(&k).map(|s| (k, s)))
-                            {
-                                let _ = sender.send(Some(ImageData {
-                                    content_type: "image/jpeg".to_string(),
-                                    data,
-                                }));
+
+                            // Publish now playing changed if present
+                            if let Some(ref np) = converted.now_playing {
+                                bus_for_events.publish(BusEvent::NowPlayingChanged {
+                                    zone_id: converted.zone_id.clone(),
+                                    title: Some(np.title.clone()),
+                                    artist: Some(np.artist.clone()),
+                                    album: Some(np.album.clone()),
+                                    image_key: np.image_key.clone(),
+                                });
                             }
-                        }
-                        Parsed::Png((image_key, data)) => {
-                            tracing::debug!(
-                                "Received PNG image: {} ({} bytes)",
-                                image_key,
-                                data.len()
-                            );
-                            let mut s = state_for_events.write().await;
-                            if let Some((_req_id, sender)) = s
-                                .pending_images
-                                .iter()
-                                .find(|(_, _)| true)
-                                .map(|(k, _)| (*k, ()))
-                                .and_then(|(k, _)| s.pending_images.remove(&k).map(|s| (k, s)))
-                            {
-                                let _ = sender.send(Some(ImageData {
-                                    content_type: "image/png".to_string(),
-                                    data,
-                                }));
+
+                            // Publish volume changed for each output with changed volume
+                            for output in &converted.outputs {
+                                if let Some(ref vol) = output.volume {
+                                    let old_vol = old_zone.as_ref().and_then(|oz| {
+                                        oz.outputs
+                                            .iter()
+                                            .find(|o| o.output_id == output.output_id)
+                                            .and_then(|o| o.volume.as_ref())
+                                    });
+
+                                    // Emit if volume changed or this is a new zone
+                                    let vol_changed = old_vol
+                                        .map(|ov| {
+                                            ov.value != vol.value || ov.is_muted != vol.is_muted
+                                        })
+                                        .unwrap_or(true);
+
+                                    if vol_changed {
+                                        bus_for_events.publish(BusEvent::VolumeChanged {
+                                            output_id: output.output_id.clone(),
+                                            value: vol.value.unwrap_or(0.0),
+                                            is_muted: vol.is_muted.unwrap_or(false),
+                                        });
+                                    }
+                                }
                             }
+
+                            s.zones.insert(zone.zone_id.clone(), converted);
                         }
-                        _ => {}
                     }
+                    Parsed::ZonesSeek(zones_seek) => {
+                        let mut s = state_for_events.write().await;
+                        for seek in zones_seek {
+                            if let Some(zone) = s.zones.get_mut(&seek.zone_id) {
+                                if let Some(np) = &mut zone.now_playing {
+                                    np.seek_position = seek.seek_position;
+
+                                    // Publish seek position changed
+                                    if let Some(pos) = seek.seek_position {
+                                        bus_for_events.publish(BusEvent::SeekPositionChanged {
+                                            zone_id: seek.zone_id.clone(),
+                                            position: pos,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Parsed::ZonesRemoved(zone_ids) => {
+                        let mut s = state_for_events.write().await;
+                        for zone_id in zone_ids {
+                            tracing::debug!("Zone removed: {}", zone_id);
+                            s.zones.remove(&zone_id);
+
+                            // Publish zone removed event
+                            bus_for_events.publish(BusEvent::ZoneRemoved {
+                                zone_id: zone_id.clone(),
+                            });
+                        }
+                    }
+                    Parsed::Jpeg((image_key, data)) => {
+                        tracing::debug!(
+                            "Received JPEG image: {} ({} bytes)",
+                            image_key,
+                            data.len()
+                        );
+                        let mut s = state_for_events.write().await;
+                        // Find pending request by image_key (req_id may be stored differently)
+                        // For now, we'll use a simpler approach - store by image_key
+                        if let Some((_req_id, sender)) = s
+                            .pending_images
+                            .iter()
+                            .find(|(_, _)| true) // Take any pending request
+                            .map(|(k, _)| (*k, ()))
+                            .and_then(|(k, _)| s.pending_images.remove(&k).map(|s| (k, s)))
+                        {
+                            let _ = sender.send(Some(ImageData {
+                                content_type: "image/jpeg".to_string(),
+                                data,
+                            }));
+                        }
+                    }
+                    Parsed::Png((image_key, data)) => {
+                        tracing::debug!("Received PNG image: {} ({} bytes)", image_key, data.len());
+                        let mut s = state_for_events.write().await;
+                        if let Some((_req_id, sender)) = s
+                            .pending_images
+                            .iter()
+                            .find(|(_, _)| true)
+                            .map(|(k, _)| (*k, ()))
+                            .and_then(|(k, _)| s.pending_images.remove(&k).map(|s| (k, s)))
+                        {
+                            let _ = sender.send(Some(ImageData {
+                                content_type: "image/png".to_string(),
+                                data,
+                            }));
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
