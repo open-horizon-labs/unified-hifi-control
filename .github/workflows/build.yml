@@ -361,7 +361,6 @@ jobs:
   # Uses content-based caching to skip build when source unchanged
   build-wasm:
     name: Build WASM Assets
-    needs: plan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -412,10 +411,8 @@ jobs:
 
       - name: Build WASM assets (ADR 002)
         if: steps.cache-wasm.outputs.cache-hit != 'true'
-        env:
-          UHC_VERSION: ${{ needs.plan.outputs.version }}
-          UHC_GIT_SHA: ${{ needs.plan.outputs.git_sha }}
         run: |
+          # Version is fetched from server at runtime, no need to bake into WASM
           dx build --fullstack --release @client --no-default-features --features web @server --features server
           echo "Generated assets:"
           find target/dx -name "*.wasm" -o -name "*.js" | head -10

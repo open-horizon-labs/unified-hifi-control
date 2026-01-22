@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AppStatus {
     pub version: String,
+    #[serde(default)]
+    pub git_sha: String,
     pub uptime_secs: u64,
     pub bus_subscribers: usize,
 }

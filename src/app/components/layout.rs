@@ -3,6 +3,7 @@
 use dioxus::prelude::*;
 
 use super::nav::Nav;
+use crate::app::api::AppStatus;
 use crate::app::embedded_assets::{
     APPLE_TOUCH_ICON_DATA_URL, DX_THEME_CSS, FAVICON_DATA_URL, TAILWIND_CSS,
 };
@@ -29,8 +30,22 @@ pub struct LayoutProps {
 /// Main layout component wrapping all pages.
 #[component]
 pub fn Layout(props: LayoutProps) -> Element {
-    let version = env!("UHC_VERSION");
-    let git_sha = env!("UHC_GIT_SHA");
+    // Fetch version from server to avoid WASM/server mismatch
+    let status = use_resource(|| async {
+        crate::app::api::fetch_json::<AppStatus>("/status")
+            .await
+            .ok()
+    });
+    let (version, git_sha) = match &*status.read() {
+        Some(Some(s)) => (s.version.clone(), s.git_sha.clone()),
+        _ => {
+            // Fallback to compile-time values during loading/error
+            (
+                env!("UHC_VERSION").to_string(),
+                env!("UHC_GIT_SHA").to_string(),
+            )
+        }
+    };
     let full_title = format!("{} - Unified Hi-Fi Control", props.title);
 
     rsx! {
