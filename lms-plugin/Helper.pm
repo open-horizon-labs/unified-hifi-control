@@ -24,12 +24,12 @@ my $serverPrefs = preferences('server');
 
 my $helperProc;
 my $restarts = 0; # Restart counter
+my $restartResetTimer; # Timer to reset restart counter
+my $configDir;
 
 use constant HEALTH_CHECK_INTERVAL => 30;  # seconds
 use constant MAX_RESTARTS          => 5;   # before giving up
 use constant RESTART_RESET_TIME    => 300; # reset counter after 5 min stable
-
-my ($configDir);
 
 sub init {
     my ($class) = @_;
@@ -156,6 +156,8 @@ sub webUrl {
 sub _healthCheck {
     my $class = shift;
 
+    Slim::Utils::Timers::killTimers($class, \&_healthCheck);
+
     if ($prefs->get('autorun')) {
         if (!running()) {
             $log->warn("Helper process died unexpectedly");
@@ -172,10 +174,10 @@ sub _healthCheck {
         } else {
             $log->debug("Helper running with PID " . $helperProc->pid);
 
-            # Process is healthy, schedule restart counter reset
-            if ($restarts > 0) {
+            # Process is healthy, schedule restart counter reset if no timer exists yet
+            if ($restarts > 0 && !defined($restartResetTimer)) {
                 Slim::Utils::Timers::killTimers($class, \&_resetRestarts);
-                Slim::Utils::Timers::setTimer(
+                $restartResetTimer ||= Slim::Utils::Timers::setTimer(
                     $class,
                     time() + RESTART_RESET_TIME,
                     \&_resetRestarts
@@ -194,6 +196,7 @@ sub _healthCheck {
 }
 
 sub _resetRestarts {
+    $restartResetTimer = undef;
     $restarts = 0;
 }
 
