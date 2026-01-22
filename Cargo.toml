@@ -1,6 +1,6 @@
 [package]
 name = "unified-hifi-control"
-version = "3.1.0-rc.0"
+version = "0.0.0"  # Injected from git tag at build time
 edition = "2021"
 authors = ["Muness Castle"]
 description = "Source-agnostic hi-fi control bridge for hardware surfaces and Home Assistant"
