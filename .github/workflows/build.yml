@@ -358,28 +358,37 @@ jobs:
 
   # Build WASM assets once - shared by all platform builds
   # WASM is platform-independent, so we build once and share
+  # Uses content-based caching to skip build when source unchanged
   build-wasm:
     name: Build WASM Assets
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache WASM build output
+        id: cache-wasm
+        uses: actions/cache@v4
+        with:
+          path: target/dx/
+          key: wasm-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'input.css') }}
+
       - name: Setup Rust
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Cache Rust
+      - name: Cache Rust dependencies
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "wasm-build"
           cache-all-crates: true
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
-          cache-directories: |
-            target/dx
 
       - name: Cache Dioxus CLI
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
         id: cache-dx
         uses: actions/cache@v4
         with:
@@ -387,17 +396,27 @@ jobs:
           key: dx-cli-0.7.3
 
       - name: Install Dioxus CLI
-        if: steps.cache-dx.outputs.cache-hit != 'true'
+        if: steps.cache-wasm.outputs.cache-hit != 'true' && steps.cache-dx.outputs.cache-hit != 'true'
         run: cargo install dioxus-cli@0.7.3 --locked
 
       - name: Build Tailwind CSS
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
         run: make css
 
       - name: Build WASM assets (ADR 002)
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
         run: |
           dx build --fullstack --release @client --no-default-features --features web @server --features server
           echo "Generated assets:"
           find target/dx -name "*.wasm" -o -name "*.js" | head -10
+
+      - name: Report cache status
+        run: |
+          if [ "${{ steps.cache-wasm.outputs.cache-hit }}" == "true" ]; then
+            echo "::notice::WASM cache hit - skipped build"
+          else
+            echo "::notice::WASM cache miss - built from source"
+          fi
 
       - name: Upload WASM assets
         uses: actions/upload-artifact@v4
