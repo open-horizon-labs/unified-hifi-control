@@ -88,7 +88,16 @@ The GitHub Actions UI renders the full dependency DAG, showing `plan` at the roo
 
 Jobs maximize parallelism while respecting dependencies:
 
-- **Binary builds run in parallel**: Linux, macOS (x64 + arm64), and Windows start simultaneously
+```
+plan ──► build-wasm ──┬─► build-linux-x64 ──► smoke-test
+                      ├─► build-linux-arm (arm64, armv7)
+                      ├─► build-macos-x64 ──┬─► build-macos-universal
+                      ├─► build-macos-arm64 ┘
+                      └─► build-windows
+```
+
+- **WASM built once**: Platform-independent, shared via artifact
+- **Binary builds run in parallel**: All platform builds start after WASM completes
 - **macOS universal**: x64 and arm64 build in parallel, then combined with `lipo`
 - **Packaging waits for binaries only**: Docker, Synology, QNAP, LMS jobs (no separate web assets needed - see below)
 - **Universal LMS ZIP**: Bundles all platform binaries in one package
@@ -136,11 +145,33 @@ This prevents spurious builds from non-build labels (arch, coderabbit, etc.).
 
 | Build Type | Strategy | Notes |
 |------------|----------|-------|
+| WASM assets | actions/cache + restore-keys | Content-based key, incremental on partial match |
 | Fullstack check | rust-cache only | Validates `dx build --fullstack` works |
 | Linux (zigbuild) | rust-cache only | sccache doesn't work with zig wrapper |
 | macOS/Windows | sccache + rust-cache | sccache for `.o` files, rust-cache for proc-macros |
 | Tools (dx, zigbuild) | actions/cache | Pin version in cache key |
 | Docker images | Use GHCR | 10x faster than Docker Hub from Actions |
+
+### WASM Caching
+
+WASM is built once and shared across all platform builds. The cache uses content-based keys with fallback:
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: |
+      target/dx/
+      target/wasm32-unknown-unknown/
+    key: wasm-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'input.css') }}
+    restore-keys: |
+      wasm-
+```
+
+| Scenario | Cache | Build time |
+|----------|-------|------------|
+| Exact match (no changes) | hit | ~10s |
+| Partial match (small change) | restored | ~1-2 min (incremental) |
+| No match (new deps) | miss | ~5 min (full) |
 
 ### Key Configurations
 
@@ -152,8 +183,6 @@ This prevents spurious builds from non-build labels (arch, coderabbit, etc.).
     shared-key: "fullstack-build"
     cache-all-crates: true
     cache-on-failure: true
-    cache-directories: |
-      target/dx
 ```
 
 **sccache** caches individual compilation units (`.o` files). Used with rust-cache for native builds:
