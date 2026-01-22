@@ -447,8 +447,6 @@ jobs:
           cache-all-crates: true
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
-          cache-directories: |
-            target/dx
 
       - name: Cache Dioxus CLI
         id: cache-dx
