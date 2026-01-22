@@ -14,7 +14,15 @@ Hi-fi software assumes you're at a computer or using vendor-specific apps. This 
 
 **Stable: [v3.1.3](https://github.com/open-horizon-labs/unified-hifi-control/releases/tag/v3.1.3)** (Rust) — Native packages for Synology, QNAP, LMS; 10x smaller memory footprint
 
-Works with [roon-knob](https://github.com/muness/roon-knob) for hardware control of Roon, OpenHome, UPnP, or LMS/Lyrion zones.
+## Control Surfaces
+
+Once the bridge is running, control your system from:
+
+- **Web UI** — Built-in at `http://your-bridge:8088`
+- **[roon-knob](https://github.com/muness/roon-knob)** — ESP32-S3 hardware knob with OLED display
+- **iOS & Apple Watch** — In alpha testing. [Get in touch](https://github.com/open-horizon-labs/unified-hifi-control/issues) if you'd like to try it.
+- **Claude & AI agents** — Via the built-in MCP server (see [MCP Server](#mcp-server-claude-integration) below)
+- **Home Assistant** — Via MQTT integration
 
 ## Installation
 
@@ -189,10 +197,6 @@ The bridge automatically polls GitHub for new [roon-knob](https://github.com/mun
 - `FIRMWARE_POLL_INTERVAL_MS` - Legacy: Poll interval in milliseconds (prefer `_MINUTES` above)
 
 If MQTT is enabled, firmware version is published to `unified-hifi/firmware/version` for Home Assistant monitoring.
-
-## Related
-
-- [roon-knob](https://github.com/muness/roon-knob) — ESP32-S3 hardware controller (firmware)
 
 <details>
 <summary><strong>Version History (for nerds)</strong></summary>
