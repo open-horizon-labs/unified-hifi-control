@@ -92,6 +92,63 @@ impl AppState {
     pub fn active_sse_connections(&self) -> usize {
         self.sse_connections.load(Ordering::Relaxed)
     }
+
+    /// Fetch image from the appropriate adapter based on zone_id prefix
+    ///
+    /// Routes to the correct backend (Roon, LMS, OpenHome, UPnP) based on
+    /// the zone_id prefix and fetches the image using that adapter's API.
+    ///
+    /// If `format` is Some("rgb565"), converts to RGB565 format for ESP32 LCDs.
+    pub async fn get_image(
+        &self,
+        zone_id: &str,
+        image_key: &str,
+        width: Option<u32>,
+        height: Option<u32>,
+        format: Option<&str>,
+    ) -> anyhow::Result<crate::bus::ImageData> {
+        use crate::bus::ImageData;
+        use crate::knobs::image::jpeg_to_rgb565;
+
+        // Fetch raw image from appropriate adapter
+        let raw_image = if zone_id.starts_with("lms:") {
+            let (content_type, data) = self.lms.get_artwork(image_key, width, height).await?;
+            ImageData { content_type, data }
+        } else if zone_id.starts_with("openhome:") {
+            let img = self.openhome.get_image(image_key).await?;
+            ImageData {
+                content_type: img.content_type,
+                data: img.data,
+            }
+        } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
+            let img = self.roon.get_image(image_key, width, height).await?;
+            ImageData {
+                content_type: img.content_type,
+                data: img.data,
+            }
+        } else {
+            anyhow::bail!("Unknown zone type for image: {}", zone_id)
+        };
+
+        // Convert to RGB565 if requested (for ESP32 LCD displays)
+        if format == Some("rgb565") {
+            let target_w = width.unwrap_or(240);
+            let target_h = height.unwrap_or(240);
+
+            match jpeg_to_rgb565(&raw_image.data, target_w, target_h) {
+                Ok(rgb565) => Ok(ImageData {
+                    content_type: "application/octet-stream".to_string(),
+                    data: rgb565.data,
+                }),
+                Err(_) => {
+                    // Fall back to original on conversion error
+                    Ok(raw_image)
+                }
+            }
+        } else {
+            Ok(raw_image)
+        }
+    }
 }
 
 /// Error response

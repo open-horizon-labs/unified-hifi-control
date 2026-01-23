@@ -16,16 +16,17 @@ pub struct Rgb565Image {
     pub height: u32,
 }
 
-/// Convert JPEG buffer to RGB565 format for ESP32 LCD
+/// Convert any image buffer (JPEG, PNG, etc.) to RGB565 format for ESP32 LCD
 ///
 /// Returns RGB565 data in little-endian byte order (ESP32 native).
+/// Supports JPEG, PNG, GIF, BMP, ICO, TIFF, WebP, and other formats via the `image` crate.
 pub fn jpeg_to_rgb565(
-    jpeg_data: &[u8],
+    image_data: &[u8],
     target_width: u32,
     target_height: u32,
 ) -> Result<Rgb565Image, image::ImageError> {
-    // Decode JPEG
-    let img = image::load_from_memory_with_format(jpeg_data, ImageFormat::Jpeg)?;
+    // Auto-detect format and decode (works with JPEG, PNG, GIF, BMP, etc.)
+    let img = image::load_from_memory(image_data)?;
 
     // Resize if needed
     let img = if img.width() != target_width || img.height() != target_height {
@@ -42,6 +43,15 @@ pub fn jpeg_to_rgb565(
         width: target_width,
         height: target_height,
     })
+}
+
+/// Convert any image buffer to RGB565 format (alias with clearer name)
+pub fn image_bytes_to_rgb565(
+    image_data: &[u8],
+    target_width: u32,
+    target_height: u32,
+) -> Result<Rgb565Image, image::ImageError> {
+    jpeg_to_rgb565(image_data, target_width, target_height)
 }
 
 /// Convert any image to RGB565 format
