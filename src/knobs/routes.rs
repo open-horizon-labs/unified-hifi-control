@@ -402,7 +402,7 @@ pub struct ImageQuery {
     pub format: Option<String>,
 }
 
-use crate::knobs::image::jpeg_to_rgb565;
+// Image conversion is now handled by state.get_image()
 
 /// GET /knob/now_playing/image - Get album artwork
 #[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
@@ -412,145 +412,75 @@ pub async fn knob_image_handler(
 ) -> Response {
     let target_width = params.width.unwrap_or(240);
     let target_height = params.height.unwrap_or(240);
-    let format = params.format.as_deref().unwrap_or("jpeg");
+    let format = params.format.as_deref();
 
-    // Helper to convert to RGB565 if requested
-    let maybe_convert = |content_type: String, body: Vec<u8>| -> Response {
-        if format == "rgb565" {
-            // Convert JPEG to RGB565
-            match jpeg_to_rgb565(&body, target_width, target_height) {
-                Ok(rgb565) => Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/octet-stream")
-                    .header("X-Image-Format", "rgb565")
-                    .header("X-Image-Width", rgb565.width.to_string())
-                    .header("X-Image-Height", rgb565.height.to_string())
-                    .body(Body::from(rgb565.data))
-                    .unwrap(),
-                Err(_) => {
-                    // Fall back to original image on conversion error
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, content_type)
-                        .body(Body::from(body))
-                        .unwrap()
-                }
-            }
-        } else {
-            Response::builder()
+    // Handle legacy zone_id without prefix (assume Roon)
+    let zone_id = if !params.zone_id.contains(':') {
+        format!("roon:{}", params.zone_id)
+    } else {
+        params.zone_id.clone()
+    };
+
+    // Get zone from aggregator to find image_key
+    let zone = match state.aggregator.get_zone(&zone_id).await {
+        Some(z) => z,
+        None => {
+            let svg = placeholder_svg(target_width, target_height);
+            return Response::builder()
                 .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, content_type)
-                .body(Body::from(body))
-                .unwrap()
+                .header(header::CONTENT_TYPE, "image/svg+xml")
+                .body(Body::from(svg))
+                .unwrap();
         }
     };
 
-    // Route based on zone_id prefix
-    if params.zone_id.starts_with("lms:") {
-        // LMS zone
-        let player_id = params.zone_id.trim_start_matches("lms:");
-        let player = match state.lms.get_cached_player(player_id).await {
-            Some(p) => p,
-            None => {
-                let svg = placeholder_svg(target_width, target_height);
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/svg+xml")
-                    .body(Body::from(svg))
-                    .unwrap();
-            }
-        };
-
-        // Get image key - prefer artwork_url for streaming services
-        let image_key = player
-            .artwork_url
-            .or(player.coverid)
-            .or(player.artwork_track_id);
-
-        let image_key = match image_key {
-            Some(key) => key,
-            None => {
-                let svg = placeholder_svg(target_width, target_height);
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/svg+xml")
-                    .body(Body::from(svg))
-                    .unwrap();
-            }
-        };
-
-        // Fetch artwork from LMS
-        match state
-            .lms
-            .get_artwork(&image_key, Some(target_width), Some(target_height))
-            .await
-        {
-            Ok((content_type, body)) => maybe_convert(content_type, body),
-            Err(_) => {
-                let svg = placeholder_svg(target_width, target_height);
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/svg+xml")
-                    .body(Body::from(svg))
-                    .unwrap()
-            }
+    // Get image_key from now_playing
+    let image_key = match zone.now_playing.and_then(|np| np.image_key) {
+        Some(key) => key,
+        None => {
+            let svg = placeholder_svg(target_width, target_height);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/svg+xml")
+                .body(Body::from(svg))
+                .unwrap();
         }
-    } else if params.zone_id.starts_with("roon:") || !params.zone_id.contains(':') {
-        // Roon zone (or legacy zone_id without prefix)
-        let zone_id = if params.zone_id.starts_with("roon:") {
-            params.zone_id.trim_start_matches("roon:").to_string()
-        } else {
-            params.zone_id.clone()
-        };
+    };
 
-        let zone = match state.roon.get_zone(&zone_id).await {
-            Some(z) => z,
-            None => {
-                let svg = placeholder_svg(target_width, target_height);
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/svg+xml")
-                    .body(Body::from(svg))
-                    .unwrap();
-            }
-        };
+    // Fetch image through unified interface (handles format conversion)
+    match state
+        .get_image(
+            &zone_id,
+            &image_key,
+            Some(target_width),
+            Some(target_height),
+            format,
+        )
+        .await
+    {
+        Ok(image_data) => {
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, &image_data.content_type);
 
-        let image_key = match zone.now_playing.and_then(|np| np.image_key) {
-            Some(key) => key,
-            None => {
-                let svg = placeholder_svg(target_width, target_height);
-                return Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/svg+xml")
-                    .body(Body::from(svg))
-                    .unwrap();
+            // Add RGB565 metadata headers for ESP32 clients
+            if format == Some("rgb565") {
+                response = response
+                    .header("X-Image-Format", "rgb565")
+                    .header("X-Image-Width", target_width.to_string())
+                    .header("X-Image-Height", target_height.to_string());
             }
-        };
 
-        // Fetch from Roon image service
-        match state
-            .roon
-            .get_image(&image_key, Some(target_width), Some(target_height))
-            .await
-        {
-            Ok(image_data) => maybe_convert(image_data.content_type, image_data.data),
-            Err(_) => {
-                let svg = placeholder_svg(target_width, target_height);
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "image/svg+xml")
-                    .body(Body::from(svg))
-                    .unwrap()
-            }
+            response.body(Body::from(image_data.data)).unwrap()
         }
-    } else {
-        // Unknown zone type - return placeholder
-        let svg = placeholder_svg(target_width, target_height);
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "image/svg+xml")
-            .body(Body::from(svg))
-            .unwrap()
+        Err(_) => {
+            let svg = placeholder_svg(target_width, target_height);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/svg+xml")
+                .body(Body::from(svg))
+                .unwrap()
+        }
     }
 }
 

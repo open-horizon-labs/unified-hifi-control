@@ -190,6 +190,16 @@ pub struct TrackMetadata {
     pub disc_number: Option<u32>,
 }
 
+/// Image data returned from adapters
+#[derive(Debug, Clone)]
+pub struct ImageData {
+    /// MIME content type (e.g., "image/jpeg", "image/png")
+    pub content_type: String,
+
+    /// Raw image bytes
+    pub data: Vec<u8>,
+}
+
 /// Zone update payload for partial updates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ZoneUpdate {

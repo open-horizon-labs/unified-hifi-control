@@ -69,8 +69,6 @@ const ALLOWED_CONTEXTS: &[&str] = &[
     // Configuration endpoints
     "_configure_handler",
     "_config_handler",
-    // Image endpoints (Roon-specific image API)
-    "_image_handler",
     // Discovery endpoints
     "_discover_handler",
     "_detect_handler",
