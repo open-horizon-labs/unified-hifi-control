@@ -725,7 +725,7 @@ struct KnobNowPlayingResponse {
     is_playing: bool,
     zones: Vec<serde_json::Value>,
     config_sha: Option<String>,
-    zones_sha: Option<String>, // Must be present for dynamic zone detection (#148)
+    zones_sha: String, // Required for dynamic zone detection (#148)
 }
 
 mod knob_now_playing_schema {
@@ -765,9 +765,10 @@ mod knob_now_playing_schema {
         );
 
         let response = result.unwrap();
-        assert!(
-            response.zones_sha.is_some(),
-            "zones_sha must be present for dynamic zone detection (issue #148)"
+        assert_eq!(
+            response.zones_sha.len(),
+            8,
+            "zones_sha must be 8 hex chars for dynamic zone detection (issue #148)"
         );
     }
 
@@ -791,17 +792,18 @@ mod knob_now_playing_schema {
         let response: KnobNowPlayingResponse =
             serde_json::from_value(valid_response).expect("Valid response should parse");
 
-        // The key assertion: zones_sha must be present
-        assert!(
-            response.zones_sha.is_some(),
-            "zones_sha MUST be present in /knob/now_playing responses (PR #149, fixes #148)"
+        // The key assertion: zones_sha is a valid 8-char hex string
+        assert_eq!(
+            response.zones_sha.len(),
+            8,
+            "zones_sha MUST be 8 hex chars in /knob/now_playing responses (PR #149, fixes #148)"
         );
     }
 
-    /// This test demonstrates what WOULD break if zones_sha were missing
-    /// (verifying the regression test catches the issue)
+    /// This test verifies that responses without zones_sha fail contract validation
+    /// zones_sha is now a required field (PR #149)
     #[test]
-    fn missing_zones_sha_is_detectable() {
+    fn missing_zones_sha_fails_contract() {
         // Response WITHOUT zones_sha - this is what the old code produced
         let response_without_zones_sha = json!({
             "zone_id": "roon:zone-1",
@@ -814,18 +816,14 @@ mod knob_now_playing_schema {
             // zones_sha intentionally missing!
         });
 
-        let response: KnobNowPlayingResponse =
-            serde_json::from_value(response_without_zones_sha).expect("Should parse");
+        // Deserialization should FAIL because zones_sha is required
+        let result: Result<KnobNowPlayingResponse, _> =
+            serde_json::from_value(response_without_zones_sha);
 
-        // zones_sha will be None since it was missing from JSON
         assert!(
-            response.zones_sha.is_none(),
-            "Response without zones_sha should have None (this is the pre-fix behavior)"
+            result.is_err(),
+            "Response without zones_sha should fail contract validation (zones_sha is required)"
         );
-
-        // This is the assertion that would catch the regression:
-        // assert!(response.zones_sha.is_some(), "...");
-        // ^ If we uncommented this, the test would FAIL for pre-fix responses
     }
 }
 

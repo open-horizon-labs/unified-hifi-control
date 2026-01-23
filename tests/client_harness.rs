@@ -528,7 +528,15 @@ mod knob_client {
 
         // For valid responses, knob expects these EXACT field names
         // Node.js returns line1/line2/is_playing, NOT title/artist/state
-        let required_fields = ["line1", "line2", "is_playing", "zone_id", "zones"];
+        // zones_sha added in PR #149 for dynamic zone detection (#148)
+        let required_fields = [
+            "line1",
+            "line2",
+            "is_playing",
+            "zone_id",
+            "zones",
+            "zones_sha",
+        ];
         for field in required_fields {
             assert!(
                 json.get(field).is_some(),
