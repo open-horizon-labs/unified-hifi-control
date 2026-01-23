@@ -374,7 +374,8 @@ jobs:
             target/wasm32-unknown-unknown/
           # Version is baked in at compile time, but we accept stale version display
           # for PRs in exchange for cache efficiency. Releases change Cargo.toml anyway.
-          key: wasm-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'input.css') }}
+          # Note: Tailwind version pinned in Makefile - update cache key when upgrading
+          key: wasm-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'src/input.css', 'public/dx-components-theme.css') }}
           restore-keys: |
             wasm-
 
@@ -404,6 +405,14 @@ jobs:
       - name: Install Dioxus CLI
         if: steps.cache-wasm.outputs.cache-hit != 'true' && steps.cache-dx.outputs.cache-hit != 'true'
         run: cargo install dioxus-cli@0.7.3 --locked
+
+      - name: Cache Tailwind CLI
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
+        id: cache-tailwind
+        uses: actions/cache@v4
+        with:
+          path: ./tailwindcss
+          key: tailwind-cli-v4.1.18-linux-x64
 
       - name: Build Tailwind CSS
         if: steps.cache-wasm.outputs.cache-hit != 'true'
@@ -444,16 +453,31 @@ jobs:
 
   # Note: Web assets are now embedded in the binary (ADR 002).
   # The fullstack-check job validates the fullstack build works correctly.
+  # Uses same cache as build-wasm to avoid duplicate compilation.
   fullstack-check:
     name: Fullstack Build Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache WASM build output
+        id: cache-wasm
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/dx/
+            target/wasm32-unknown-unknown/
+          # Same cache key as build-wasm job - shares cached artifacts
+          key: wasm-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'src/input.css', 'public/dx-components-theme.css') }}
+          restore-keys: |
+            wasm-
+
       - name: Setup Rust
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "fullstack-build"
@@ -462,6 +486,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Cache Dioxus CLI
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
         id: cache-dx
         uses: actions/cache@v4
         with:
@@ -469,18 +494,44 @@ jobs:
           key: dx-cli-0.7.3
 
       - name: Install Dioxus CLI
-        if: steps.cache-dx.outputs.cache-hit != 'true'
+        if: steps.cache-wasm.outputs.cache-hit != 'true' && steps.cache-dx.outputs.cache-hit != 'true'
         run: cargo install dioxus-cli@0.7.3 --locked
 
+      - name: Cache Tailwind CLI
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
+        id: cache-tailwind
+        uses: actions/cache@v4
+        with:
+          path: ./tailwindcss
+          key: tailwind-cli-v4.1.18-linux-x64
+
       - name: Build Tailwind CSS
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
         run: make css
 
       - name: Build fullstack (verify WASM generation)
+        if: steps.cache-wasm.outputs.cache-hit != 'true'
         # ADR 002: WASM is generated and will be embedded in the final cargo binary
         run: |
           dx build --fullstack --release @client --no-default-features --features web @server --features server
           echo "Verifying WASM assets were generated:"
           ls -la target/dx/unified-hifi-control/release/web/public/assets/ || true
+
+      - name: Report cache status
+        run: |
+          if [ "${{ steps.cache-wasm.outputs.cache-hit }}" == "true" ]; then
+            echo "::notice::WASM cache hit - skipped fullstack build"
+          else
+            echo "::notice::WASM cache miss - built from source"
+          fi
+
+      - name: Verify WASM assets exist
+        run: |
+          if [ ! -d "target/dx/unified-hifi-control" ]; then
+            echo "::error::WASM assets not found - cache may be corrupted"
+            exit 1
+          fi
+          echo "WASM assets verified"
 
   build-linux-x64:
     name: Build Linux x64

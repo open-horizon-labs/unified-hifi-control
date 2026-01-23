@@ -1,5 +1,8 @@
 # Unified Hi-Fi Control - Build helpers
 
+# Pin Tailwind version for reproducible builds (update manually when needed)
+TAILWIND_VERSION := v4.1.18
+
 # Detect OS and architecture for Tailwind CLI download
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -32,11 +35,11 @@ help:
 
 setup-tailwind:
 	@if [ ! -f ./tailwindcss ]; then \
-		echo "Downloading Tailwind CSS standalone CLI..."; \
-		curl -sLO https://github.com/tailwindlabs/tailwindcss/releases/latest/download/$(TAILWIND_BINARY); \
+		echo "Downloading Tailwind CSS $(TAILWIND_VERSION) standalone CLI..."; \
+		curl -sLO https://github.com/tailwindlabs/tailwindcss/releases/download/$(TAILWIND_VERSION)/$(TAILWIND_BINARY); \
 		chmod +x $(TAILWIND_BINARY); \
 		mv $(TAILWIND_BINARY) tailwindcss; \
-		echo "Done! Tailwind CLI installed."; \
+		echo "Done! Tailwind CLI $(TAILWIND_VERSION) installed."; \
 	else \
 		echo "Tailwind CLI already installed."; \
 	fi
