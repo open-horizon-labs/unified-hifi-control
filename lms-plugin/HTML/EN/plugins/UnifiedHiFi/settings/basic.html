@@ -53,10 +53,10 @@
     <script TYPE="text/javascript" language="JavaScript">
         const knobDevicesUrl = '[% webUrl %]/knob/devices';
         const charging = '[% "PLUGIN_UNIFIED_HIFI_KNOB_BATTERY_CHARGING" | string %]';
-        const playerIdNameMap = JSON.parse('[% playerIdNameMap %]');
+        const playerIdNameMap = JSON.parse('[% playerIdNameMap | replace("'", "\\'") %]');
 
         function getKnobList(knobs) {
-            if (!knobs && knobs.length) {
+            if (!(knobs && knobs.length)) {
                 return;
             }
 
