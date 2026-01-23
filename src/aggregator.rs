@@ -163,26 +163,53 @@ impl ZoneAggregator {
         info!("ZoneAggregator stopped");
     }
 
-    /// Get all zones
+    /// Get all zones (hydrated with current now_playing)
     pub async fn get_zones(&self) -> Vec<Zone> {
-        self.zones.read().await.values().cloned().collect()
-    }
-
-    /// Get zones for a specific adapter
-    pub async fn get_zones_by_adapter(&self, adapter: &str) -> Vec<Zone> {
-        let prefix = format!("{}:", adapter);
-        self.zones
-            .read()
-            .await
+        let zones = self.zones.read().await;
+        let now_playing = self.now_playing.read().await;
+        zones
             .values()
-            .filter(|z| z.zone_id.starts_with(&prefix))
-            .cloned()
+            .map(|z| {
+                let mut zone = z.clone();
+                // Hydrate with current now_playing from separate map
+                if let Some(np) = now_playing.get(&zone.zone_id) {
+                    zone.now_playing = Some(np.clone());
+                }
+                zone
+            })
             .collect()
     }
 
-    /// Get a specific zone
+    /// Get zones for a specific adapter (hydrated with current now_playing)
+    pub async fn get_zones_by_adapter(&self, adapter: &str) -> Vec<Zone> {
+        let prefix = format!("{}:", adapter);
+        let zones = self.zones.read().await;
+        let now_playing = self.now_playing.read().await;
+        zones
+            .values()
+            .filter(|z| z.zone_id.starts_with(&prefix))
+            .map(|z| {
+                let mut zone = z.clone();
+                if let Some(np) = now_playing.get(&zone.zone_id) {
+                    zone.now_playing = Some(np.clone());
+                }
+                zone
+            })
+            .collect()
+    }
+
+    /// Get a specific zone (hydrated with current now_playing)
     pub async fn get_zone(&self, zone_id: &str) -> Option<Zone> {
-        self.zones.read().await.get(zone_id).cloned()
+        let zones = self.zones.read().await;
+        let now_playing = self.now_playing.read().await;
+        zones.get(zone_id).map(|z| {
+            let mut zone = z.clone();
+            // Hydrate with current now_playing from separate map
+            if let Some(np) = now_playing.get(zone_id) {
+                zone.now_playing = Some(np.clone());
+            }
+            zone
+        })
     }
 
     /// Get now playing for a zone

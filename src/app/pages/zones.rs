@@ -366,15 +366,16 @@ fn ZoneCard(
     let has_image = !image_url.is_empty();
 
     // Now playing display
-    let (track, artist) = np
+    let (track, artist, album) = np
         .map(|n| {
             if n.line1.as_deref().unwrap_or("Idle") != "Idle" {
                 (
                     n.line1.clone().unwrap_or_default(),
                     n.line2.clone().unwrap_or_default(),
+                    n.line3.clone().unwrap_or_default(),
                 )
             } else {
-                (String::new(), String::new())
+                (String::new(), String::new(), String::new())
             }
         })
         .unwrap_or_default();
@@ -427,6 +428,9 @@ fn ZoneCard(
                     if !track.is_empty() {
                         p { class: "font-medium text-sm truncate mb-1", "{track}" }
                         p { class: "text-sm text-muted truncate", "{artist}" }
+                        if !album.is_empty() {
+                            p { class: "text-xs text-muted truncate", "{album}" }
+                        }
                     } else {
                         p { class: "text-sm text-muted", "Nothing playing" }
                     }
