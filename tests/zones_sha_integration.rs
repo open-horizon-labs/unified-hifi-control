@@ -5,6 +5,8 @@
 
 mod mock_servers;
 
+use serial_test::serial;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -109,6 +111,7 @@ async fn create_test_app_with_lms(mock_addr: std::net::SocketAddr) -> Router {
 
 /// Issue #148: /knob/now_playing MUST include zones_sha for dynamic zone detection
 #[tokio::test]
+#[serial]
 async fn now_playing_includes_zones_sha() {
     // Enable LMS adapter in settings (simulates plugin signal)
     std::env::set_var("LMS_UNIFIEDHIFI_STARTED", "true");
@@ -165,9 +168,6 @@ async fn now_playing_includes_zones_sha() {
     );
 
     mock.stop().await;
-
-    // Clean up env var
-    std::env::remove_var("LMS_UNIFIEDHIFI_STARTED");
 }
 
 // Note: A test for "zones_sha changes when zones change" would require

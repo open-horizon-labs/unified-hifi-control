@@ -97,8 +97,9 @@ pub fn Zones() -> Element {
         // zones update rapidly (fixes issue #109 - wrong album art display)
         if let Some(ref evt) = event {
             match evt {
-                // Zone-scoped event: fetch only the specific zone that changed
-                SseEvent::NowPlayingChanged { .. } => {
+                // Zone-scoped events: fetch only the specific zone that changed
+                // ZoneUpdated includes state changes (play/pause) that affect is_playing
+                SseEvent::NowPlayingChanged { .. } | SseEvent::ZoneUpdated { .. } => {
                     if let Some(zone_id) = evt.zone_id() {
                         let zone_id = zone_id.to_string();
                         spawn(async move {

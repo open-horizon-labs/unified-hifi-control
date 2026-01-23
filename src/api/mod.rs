@@ -95,8 +95,11 @@ impl AppState {
 
     /// Fetch image from the appropriate adapter based on zone_id prefix
     ///
-    /// Routes to the correct backend (Roon, LMS, OpenHome, UPnP) based on
-    /// the zone_id prefix and fetches the image using that adapter's API.
+    /// Routes to the correct backend (Roon, LMS, OpenHome) based on the zone_id
+    /// prefix and fetches the image using that adapter's API.
+    ///
+    /// Note: UPnP zones don't support image retrieval as the protocol doesn't
+    /// expose album art URLs in a standardized way that can be proxied.
     ///
     /// If `format` is Some("rgb565"), converts to RGB565 format for ESP32 LCDs.
     pub async fn get_image(
@@ -120,6 +123,10 @@ impl AppState {
                 content_type: img.content_type,
                 data: img.data,
             }
+        } else if zone_id.starts_with("upnp:") {
+            anyhow::bail!(
+                "UPnP zones don't support image retrieval - the protocol doesn't expose album art URLs"
+            )
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
             let img = self.roon.get_image(image_key, width, height).await?;
             ImageData {
@@ -132,8 +139,13 @@ impl AppState {
 
         // Convert to RGB565 if requested (for ESP32 LCD displays)
         if format == Some("rgb565") {
-            let target_w = width.unwrap_or(240);
-            let target_h = height.unwrap_or(240);
+            // Use square dimensions when only one side specified (matches adapter behavior)
+            let (target_w, target_h) = match (width, height) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, w),
+                (None, Some(h)) => (h, h),
+                (None, None) => (240, 240),
+            };
 
             match jpeg_to_rgb565(&raw_image.data, target_w, target_h) {
                 Ok(rgb565) => Ok(ImageData {

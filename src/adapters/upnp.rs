@@ -894,8 +894,8 @@ fn upnp_renderer_to_zone(renderer: &UPnPRenderer) -> Zone {
             .as_millis() as u64,
         is_play_allowed: renderer.state != "playing",
         is_pause_allowed: renderer.state == "playing",
-        is_next_allowed: true,
-        is_previous_allowed: true,
+        is_next_allowed: false,
+        is_previous_allowed: false,
     }
 }
 

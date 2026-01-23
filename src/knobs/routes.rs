@@ -404,6 +404,8 @@ pub struct ImageQuery {
 
 // Image conversion is now handled by state.get_image()
 
+use crate::knobs::image::svg_to_rgb565;
+
 /// GET /knob/now_playing/image - Get album artwork
 #[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
 pub async fn knob_image_handler(
@@ -413,6 +415,35 @@ pub async fn knob_image_handler(
     let target_width = params.width.unwrap_or(240);
     let target_height = params.height.unwrap_or(240);
     let format = params.format.as_deref();
+
+    // Helper to return placeholder image in appropriate format
+    let placeholder_response = || -> Response {
+        let svg = placeholder_svg(target_width, target_height);
+        if format == Some("rgb565") {
+            // Convert SVG placeholder to RGB565
+            match svg_to_rgb565(svg.as_bytes(), target_width, target_height) {
+                Ok(rgb565) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/octet-stream")
+                    .header("X-Image-Format", "rgb565")
+                    .header("X-Image-Width", rgb565.width.to_string())
+                    .header("X-Image-Height", rgb565.height.to_string())
+                    .body(Body::from(rgb565.data))
+                    .unwrap(),
+                Err(_) => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "image/svg+xml")
+                    .body(Body::from(svg))
+                    .unwrap(),
+            }
+        } else {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/svg+xml")
+                .body(Body::from(svg))
+                .unwrap()
+        }
+    };
 
     // Handle legacy zone_id without prefix (assume Roon)
     let zone_id = if !params.zone_id.contains(':') {
@@ -424,27 +455,13 @@ pub async fn knob_image_handler(
     // Get zone from aggregator to find image_key
     let zone = match state.aggregator.get_zone(&zone_id).await {
         Some(z) => z,
-        None => {
-            let svg = placeholder_svg(target_width, target_height);
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "image/svg+xml")
-                .body(Body::from(svg))
-                .unwrap();
-        }
+        None => return placeholder_response(),
     };
 
     // Get image_key from now_playing
     let image_key = match zone.now_playing.and_then(|np| np.image_key) {
         Some(key) => key,
-        None => {
-            let svg = placeholder_svg(target_width, target_height);
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "image/svg+xml")
-                .body(Body::from(svg))
-                .unwrap();
-        }
+        None => return placeholder_response(),
     };
 
     // Fetch image through unified interface (handles format conversion)
@@ -473,14 +490,7 @@ pub async fn knob_image_handler(
 
             response.body(Body::from(image_data.data)).unwrap()
         }
-        Err(_) => {
-            let svg = placeholder_svg(target_width, target_height);
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "image/svg+xml")
-                .body(Body::from(svg))
-                .unwrap()
-        }
+        Err(_) => placeholder_response(),
     }
 }
 
