@@ -239,3 +239,109 @@ fn aggregator_exists_in_app_state() {
         "AppState must have a `pub aggregator: Arc<ZoneAggregator>` field"
     );
 }
+
+/// Adapter-to-prefix mapping for zone_id consistency check
+const ADAPTER_PREFIXES: &[(&str, &str)] = &[
+    ("roon.rs", "roon:"),
+    ("lms.rs", "lms:"),
+    ("openhome.rs", "openhome:"),
+    ("upnp.rs", "upnp:"),
+];
+
+/// Bus events that require prefixed zone_ids
+const ZONE_ID_BUS_EVENTS: &[&str] = &[
+    "BusEvent::ZoneUpdated",
+    "BusEvent::ZoneRemoved",
+    "BusEvent::NowPlayingChanged",
+    "BusEvent::SeekPositionChanged",
+];
+
+#[test]
+fn bus_events_use_prefixed_zone_ids() {
+    // Issue: Roon adapter was emitting bus events with raw zone_ids (e.g., "1601bb42...")
+    // but the aggregator stores zones with prefixed IDs (e.g., "roon:1601bb42...").
+    // This caused state updates to be silently dropped.
+    //
+    // This test ensures all adapters emit bus events with properly prefixed zone_ids.
+
+    let adapters_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("adapters");
+
+    let mut violations = Vec::new();
+
+    for (adapter_file, expected_prefix) in ADAPTER_PREFIXES {
+        let path = adapters_dir.join(adapter_file);
+        if !path.exists() {
+            continue;
+        }
+
+        let content = fs::read_to_string(&path).expect("Failed to read adapter file");
+
+        for event_type in ZONE_ID_BUS_EVENTS {
+            // Find all occurrences of this event type
+            let mut search_from = 0;
+            while let Some(event_pos) = content[search_from..].find(event_type) {
+                let absolute_pos = search_from + event_pos;
+
+                // Look for zone_id field within the next ~200 chars (the event struct)
+                let event_end = (absolute_pos + 300).min(content.len());
+                let event_block = &content[absolute_pos..event_end];
+
+                // Check if this block contains a zone_id field
+                if let Some(zone_id_pos) = event_block.find("zone_id:") {
+                    let after_zone_id = &event_block[zone_id_pos..];
+
+                    // Valid patterns (look in first 100 chars after zone_id:):
+                    // - format!("prefix:..." - direct prefix in format string
+                    // - prefixed_zone_id - variable that was set with format!
+                    // - zone.zone_id - from a Zone struct that already has prefix
+                    let check_region = &after_zone_id[..after_zone_id.len().min(100)];
+                    let has_format_prefix =
+                        check_region.contains("format!") && check_region.contains(expected_prefix);
+                    let has_prefixed_var = check_region.contains("prefixed_zone_id");
+                    let has_zone_struct = check_region.contains("zone.zone_id");
+
+                    if !has_format_prefix && !has_prefixed_var && !has_zone_struct {
+                        // Find line number
+                        let line_num = content[..absolute_pos].matches('\n').count() + 1;
+                        violations.push((
+                            adapter_file.to_string(),
+                            line_num,
+                            event_type.to_string(),
+                            expected_prefix.to_string(),
+                        ));
+                    }
+                }
+
+                search_from = absolute_pos + event_type.len();
+            }
+        }
+    }
+
+    if !violations.is_empty() {
+        let mut error_msg = String::from(
+            "\n\n\
+            ╔══════════════════════════════════════════════════════════════════════════════╗\n\
+            ║  ARCHITECTURE VIOLATION: Bus events must use prefixed zone_ids              ║\n\
+            ╚══════════════════════════════════════════════════════════════════════════════╝\n\n\
+            The ZoneAggregator stores zones with prefixed IDs (e.g., 'roon:xxx').\n\
+            Bus events must use the same format or updates will be silently dropped.\n\n\
+            Violations found:\n\n",
+        );
+
+        for (file, line, event, prefix) in &violations {
+            error_msg.push_str(&format!("  {}:{}\n", file, line));
+            error_msg.push_str(&format!("    Event: {}\n", event));
+            error_msg.push_str(&format!(
+                "    Expected: zone_id with '{}' prefix\n\n",
+                prefix
+            ));
+        }
+
+        error_msg
+            .push_str("Fix: Use format!(\"prefix:{}\", raw_id) or a prefixed_zone_id variable.\n");
+
+        panic!("{}", error_msg);
+    }
+}
