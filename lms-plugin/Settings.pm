@@ -30,7 +30,7 @@ sub prefs {
 }
 
 sub handler {
-    my ($class, $client, $params, $callback, @args) = @_;
+    my ($class, $client, $params, @args) = @_;
 
     # Handle start/stop actions
     if ($params->{'start'}) {
@@ -54,7 +54,7 @@ sub handler {
         }
     }
 
-    return $class->SUPER::handler($client, $params);
+    return $class->SUPER::handler($client, $params, @args);
 }
 
 sub beforeRender {

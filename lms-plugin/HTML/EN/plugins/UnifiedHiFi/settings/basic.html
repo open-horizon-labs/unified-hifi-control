@@ -94,8 +94,8 @@
                 cellVersion.textContent = knob.version;
 
                 let cellBattery = row.insertCell(4);
-                if (knob.status.battery_level) {
-                    cellBattery.textContent = knob.status.battery_level + '%';
+                if (knob.status?.battery_level !== undefined) {
+                    cellBattery.textContent = (knob.status.battery_level || 0) + '%';
                     if (knob.status.battery_charging) {
                         cellBattery.textContent += ' ' + charging;
                     }
