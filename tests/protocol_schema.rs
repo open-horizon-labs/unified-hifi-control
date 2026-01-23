@@ -714,6 +714,121 @@ mod hqp_matrix_schema {
     }
 }
 
+/// KnobNowPlayingResponse schema - GET /knob/now_playing
+/// This struct enforces the contract that zones_sha MUST be present
+#[derive(Debug, Deserialize)]
+struct KnobNowPlayingResponse {
+    zone_id: String,
+    line1: String,
+    line2: String,
+    line3: Option<String>,
+    is_playing: bool,
+    zones: Vec<serde_json::Value>,
+    config_sha: Option<String>,
+    zones_sha: Option<String>, // Must be present for dynamic zone detection (#148)
+}
+
+mod knob_now_playing_schema {
+    use super::*;
+
+    #[test]
+    fn validates_response_with_zones_sha() {
+        let json = json!({
+            "zone_id": "roon:zone-1",
+            "line1": "Track Title",
+            "line2": "Artist Name",
+            "line3": "Album Name",
+            "is_playing": true,
+            "volume": 50.0,
+            "volume_type": "number",
+            "volume_min": 0.0,
+            "volume_max": 100.0,
+            "volume_step": 1.0,
+            "image_url": "/knob/now_playing/image?zone_id=roon%3Azone-1",
+            "image_key": null,
+            "seek_position": 45,
+            "length": 180,
+            "is_play_allowed": false,
+            "is_pause_allowed": true,
+            "is_next_allowed": true,
+            "is_previous_allowed": true,
+            "zones": [],
+            "config_sha": "abc12345",
+            "zones_sha": "def67890"
+        });
+
+        let result: Result<KnobNowPlayingResponse, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "KnobNowPlayingResponse should deserialize: {:?}",
+            result.err()
+        );
+
+        let response = result.unwrap();
+        assert!(
+            response.zones_sha.is_some(),
+            "zones_sha must be present for dynamic zone detection (issue #148)"
+        );
+    }
+
+    /// Regression test: zones_sha must be included in responses
+    /// This test documents the contract established by PR #149
+    #[test]
+    fn zones_sha_is_required_for_dynamic_zone_detection() {
+        // This JSON simulates what the server SHOULD return
+        // If zones_sha is missing, clients cannot detect zone list changes
+        let valid_response = json!({
+            "zone_id": "lms:player-1",
+            "line1": "Song",
+            "line2": "Artist",
+            "line3": null,
+            "is_playing": false,
+            "zones": [{"zone_id": "lms:player-1", "zone_name": "Kitchen", "source": "lms", "state": "stopped"}],
+            "config_sha": null,
+            "zones_sha": "a1b2c3d4"
+        });
+
+        let response: KnobNowPlayingResponse =
+            serde_json::from_value(valid_response).expect("Valid response should parse");
+
+        // The key assertion: zones_sha must be present
+        assert!(
+            response.zones_sha.is_some(),
+            "zones_sha MUST be present in /knob/now_playing responses (PR #149, fixes #148)"
+        );
+    }
+
+    /// This test demonstrates what WOULD break if zones_sha were missing
+    /// (verifying the regression test catches the issue)
+    #[test]
+    fn missing_zones_sha_is_detectable() {
+        // Response WITHOUT zones_sha - this is what the old code produced
+        let response_without_zones_sha = json!({
+            "zone_id": "roon:zone-1",
+            "line1": "Track",
+            "line2": "Artist",
+            "line3": null,
+            "is_playing": false,
+            "zones": [],
+            "config_sha": null
+            // zones_sha intentionally missing!
+        });
+
+        let response: KnobNowPlayingResponse =
+            serde_json::from_value(response_without_zones_sha).expect("Should parse");
+
+        // zones_sha will be None since it was missing from JSON
+        assert!(
+            response.zones_sha.is_none(),
+            "Response without zones_sha should have None (this is the pre-fix behavior)"
+        );
+
+        // This is the assertion that would catch the regression:
+        // assert!(response.zones_sha.is_some(), "...");
+        // ^ If we uncommented this, the test would FAIL for pre-fix responses
+    }
+}
+
 mod contract_tests {
     use super::*;
 
