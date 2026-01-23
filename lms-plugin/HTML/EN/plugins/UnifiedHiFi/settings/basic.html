@@ -138,7 +138,7 @@
     [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI_AUTORUN" desc="PLUGIN_UNIFIED_HIFI_AUTORUN_DESC" %]
         <input type="checkbox" name="pref_autorun" id="pref_autorun"
                value="1" [% IF prefs.autorun %]checked[% END %] />
-        <label for="pref_autorun">Enable auto-start</label>
+        <label for="pref_autorun">[% "PLUGIN_UNIFIED_HIFI_AUTORUN_ENABLE" | string %]</label>
     [% END %]
 
     [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI_PORT" desc="PLUGIN_UNIFIED_HIFI_PORT_DESC" %]
