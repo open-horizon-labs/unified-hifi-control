@@ -758,17 +758,21 @@ async fn run_roon_loop(
                                 bus_for_events.publish(BusEvent::ZoneDiscovered { zone: bus_zone });
                             } else {
                                 // Existing zone - emit ZoneUpdated
+                                // Use prefixed zone_id to match ZoneDiscovered format
+                                let prefixed_zone_id = format!("roon:{}", converted.zone_id);
                                 bus_for_events.publish(BusEvent::ZoneUpdated {
-                                    zone_id: converted.zone_id.clone(),
+                                    zone_id: prefixed_zone_id.clone(),
                                     display_name: converted.display_name.clone(),
                                     state: converted.state.clone(),
                                 });
                             }
 
                             // Publish now playing changed if present
+                            // Use prefixed zone_id to match aggregator's stored format
+                            let prefixed_zone_id = format!("roon:{}", converted.zone_id);
                             if let Some(ref np) = converted.now_playing {
                                 bus_for_events.publish(BusEvent::NowPlayingChanged {
-                                    zone_id: converted.zone_id.clone(),
+                                    zone_id: prefixed_zone_id.clone(),
                                     title: Some(np.title.clone()),
                                     artist: Some(np.artist.clone()),
                                     album: Some(np.album.clone()),
@@ -814,9 +818,10 @@ async fn run_roon_loop(
                                     np.seek_position = seek.seek_position;
 
                                     // Publish seek position changed
+                                    // Use prefixed zone_id to match aggregator's stored format
                                     if let Some(pos) = seek.seek_position {
                                         bus_for_events.publish(BusEvent::SeekPositionChanged {
-                                            zone_id: seek.zone_id.clone(),
+                                            zone_id: format!("roon:{}", seek.zone_id),
                                             position: pos,
                                         });
                                     }
@@ -831,8 +836,9 @@ async fn run_roon_loop(
                             s.zones.remove(&zone_id);
 
                             // Publish zone removed event
+                            // Use prefixed zone_id to match aggregator's stored format
                             bus_for_events.publish(BusEvent::ZoneRemoved {
-                                zone_id: zone_id.clone(),
+                                zone_id: format!("roon:{}", zone_id),
                             });
                         }
                     }
