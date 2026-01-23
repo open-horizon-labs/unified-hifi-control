@@ -19,6 +19,5 @@ firmware/version.json
 # Note: Cargo.lock is committed for reproducible binary builds
 dist/
 
-# Generated CSS (rebuilt by CI via `make css`)
-public/tailwind.css
+# Note: public/tailwind.css is tracked because it's embedded via include_str!() at compile time
 # Note: public/dx-components-theme.css is hand-authored, NOT generated
