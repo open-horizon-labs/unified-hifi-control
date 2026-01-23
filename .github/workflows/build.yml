@@ -313,6 +313,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Tailwind CLI
+        id: cache-tailwind
+        uses: actions/cache@v4
+        with:
+          path: ./tailwindcss
+          key: tailwind-cli-v4.1.18-linux-x64
+
+      - name: Build Tailwind CSS
+        run: make css
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -337,6 +347,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache Tailwind CLI
+        id: cache-tailwind
+        uses: actions/cache@v4
+        with:
+          path: ./tailwindcss
+          key: tailwind-cli-v4.1.18-linux-x64
+
+      - name: Build Tailwind CSS
+        run: make css
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
