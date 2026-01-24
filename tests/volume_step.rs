@@ -81,6 +81,44 @@ fn lint_hqplayer_uses_api_step() {
 }
 
 // =============================================================================
+// API ENDPOINT TESTS: Ensure /zones includes volume_step
+// =============================================================================
+
+/// ZoneInfo struct must include volume_control with step field
+/// Bug: /zones returns volume_step: null because ZoneInfo doesn't map it from Zone
+#[test]
+fn lint_zones_endpoint_includes_volume_control() {
+    let src =
+        fs::read_to_string("src/knobs/routes.rs").expect("Failed to read src/knobs/routes.rs");
+
+    // ZoneInfo must have volume_control field to expose step to clients
+    let has_volume_control = src.contains("pub volume_control:") && src.contains("struct ZoneInfo");
+
+    assert!(
+        has_volume_control,
+        "REGRESSION: ZoneInfo struct must include 'volume_control' field.\n\
+         The /zones endpoint returns volume_step: null without this.\n\
+         Fix: Add 'pub volume_control: Option<VolumeControl>' to ZoneInfo"
+    );
+}
+
+/// get_all_zones_internal must map volume_control from Zone to ZoneInfo
+#[test]
+fn lint_zones_maps_volume_control() {
+    let src =
+        fs::read_to_string("src/knobs/routes.rs").expect("Failed to read src/knobs/routes.rs");
+
+    // The mapping in get_all_zones_internal must include volume_control
+    let maps_volume = src.contains("volume_control: z.volume_control");
+
+    assert!(
+        maps_volume,
+        "REGRESSION: get_all_zones_internal must map volume_control from Zone.\n\
+         Fix: Add 'volume_control: z.volume_control.clone()' to the ZoneInfo mapping"
+    );
+}
+
+// =============================================================================
 // UNIT TESTS: Call actual conversion functions
 // Requires: make lms_player_to_zone and roon_zone_to_bus_zone pub(crate)
 // =============================================================================

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::api::AppState;
+use crate::bus::VolumeControl;
 use crate::knobs::image::placeholder_svg;
 use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
 
@@ -94,6 +95,8 @@ pub struct ZoneInfo {
     pub zone_name: String,
     pub source: String,
     pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_control: Option<VolumeControl>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dsp: Option<DspInfo>,
 }
@@ -171,6 +174,7 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
             zone_name: z.zone_name,
             source: z.source,
             state: z.state.to_string(),
+            volume_control: z.volume_control,
         })
         .collect()
 }
@@ -1184,6 +1188,7 @@ mod tests {
             zone_name: name.to_string(),
             source: "test".to_string(),
             state: "stopped".to_string(),
+            volume_control: None,
             dsp: None,
         }
     }
