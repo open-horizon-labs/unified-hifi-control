@@ -349,6 +349,7 @@ fn ZoneCard(
     // Extract volume info for component
     let volume = np.and_then(|n| n.volume);
     let volume_type = np.and_then(|n| n.volume_type.clone());
+    let volume_step = np.and_then(|n| n.volume_step);
 
     // Album art URL with cache-busting image_key
     let base_image_url = np.and_then(|n| n.image_url.clone()).unwrap_or_default();
@@ -465,6 +466,7 @@ fn ZoneCard(
                 VolumeControlsCompact {
                     volume: volume,
                     volume_type: volume_type,
+                    volume_step: volume_step,
                     on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string())),
                     on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string())),
                 }
