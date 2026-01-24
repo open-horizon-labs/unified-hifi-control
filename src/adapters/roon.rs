@@ -112,6 +112,8 @@ pub struct VolumeInfo {
     pub min: Option<f32>,
     pub max: Option<f32>,
     pub is_muted: Option<bool>,
+    /// Volume step size from Roon API (varies per zone)
+    pub step: Option<f32>,
 }
 
 /// Now playing information
@@ -502,6 +504,7 @@ fn convert_zone(roon_zone: &RoonZone) -> Zone {
                 min: v.min,
                 max: v.max,
                 is_muted: v.is_muted,
+                step: v.step,
             }),
         })
         .collect();
@@ -534,7 +537,7 @@ fn roon_zone_to_bus_zone(zone: &Zone) -> BusZone {
             value: v.value.unwrap_or(50.0),
             min: v.min.unwrap_or(-64.0),
             max: v.max.unwrap_or(0.0),
-            step: 1.0,
+            step: v.step.unwrap_or(1.0),
             is_muted: v.is_muted.unwrap_or(false),
             scale: crate::bus::VolumeScale::Decibel,
             output_id: Some(o.output_id.clone()),

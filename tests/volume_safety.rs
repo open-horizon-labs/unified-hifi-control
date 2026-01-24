@@ -20,6 +20,7 @@ fn db_output() -> Output {
             min: Some(-64.0),
             max: Some(0.0),
             is_muted: Some(false),
+            step: Some(1.0),
         }),
     }
 }
@@ -68,6 +69,7 @@ fn pct_output() -> Output {
             min: Some(0.0),
             max: Some(100.0),
             is_muted: Some(false),
+            step: Some(1.0),
         }),
     }
 }

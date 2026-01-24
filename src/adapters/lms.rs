@@ -971,7 +971,9 @@ fn lms_player_to_zone(player: &LmsPlayer) -> Zone {
             value: player.volume as f32,
             min: 0.0,
             max: 100.0,
-            step: 1.0,
+            // LMS hardcodes $increment = 2.5 in Slim/Player/Client.pm:755
+            // This is not queryable via CLI/JSON-RPC, so we use the constant.
+            step: 2.5,
             is_muted: false, // LMS doesn't expose mute via JSON-RPC status
             scale: crate::bus::VolumeScale::Percentage,
             output_id: Some(player.playerid.clone()),

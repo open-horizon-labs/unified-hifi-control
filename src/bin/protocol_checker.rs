@@ -80,6 +80,7 @@ struct VolumeInfo {
     min: Option<f32>,
     max: Option<f32>,
     is_muted: Option<bool>,
+    step: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
