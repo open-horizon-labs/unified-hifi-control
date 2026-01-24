@@ -43,6 +43,10 @@ pub struct OpenHomeDevice {
     pub state: String,
     pub volume: Option<i32>,
     pub muted: bool,
+    /// VolumeMax from Characteristics action
+    pub volume_max: Option<u32>,
+    /// VolumeSteps from Characteristics action (step = volume_max / volume_steps)
+    pub volume_steps: Option<u32>,
     pub track_info: Option<TrackInfo>,
     #[serde(skip)]
     pub last_seen: std::time::Instant,
@@ -280,6 +284,8 @@ impl OpenHomeAdapter {
                             state: "stopped".to_string(),
                             volume: None,
                             muted: false,
+                            volume_max: None,
+                            volume_steps: None,
                             track_info: None,
                             last_seen: std::time::Instant::now(),
                             last_track_uri: None,
@@ -506,6 +512,29 @@ impl OpenHomeAdapter {
             }
         }
 
+        // Poll volume characteristics for step calculation
+        // See: http://wiki.openhome.org/wiki/Av:Developer:VolumeService
+        let characteristics = Self::soap_call(
+            http,
+            &format!("{}/Volume", base_url),
+            "urn:av-openhome-org:service:Volume:1",
+            "Characteristics",
+            "",
+        )
+        .await;
+
+        if let Ok(response) = characteristics {
+            let mut s = state.write().await;
+            if let Some(device) = s.devices.get_mut(uuid) {
+                if let Some(max_str) = Self::extract_xml_value(&response, "VolumeMax") {
+                    device.volume_max = max_str.parse().ok();
+                }
+                if let Some(steps_str) = Self::extract_xml_value(&response, "VolumeSteps") {
+                    device.volume_steps = steps_str.parse().ok();
+                }
+            }
+        }
+
         // Poll track info
         let track = Self::soap_call(
             http,
@@ -679,7 +708,7 @@ impl OpenHomeAdapter {
                     volume_control: Some(VolumeControl {
                         vol_type: "number".to_string(),
                         min: 0,
-                        max: 100,
+                        max: d.volume_max.map(|m| m as i32).unwrap_or(100),
                         is_muted: d.muted,
                     }),
                 }
@@ -709,7 +738,7 @@ impl OpenHomeAdapter {
             is_playing: device.state == "playing",
             volume: device.volume,
             volume_min: 0,
-            volume_max: 100,
+            volume_max: device.volume_max.map(|m| m as i32).unwrap_or(100),
             seek_position: None,
             length: None,
             image_key: track.and_then(|t| t.album_art_uri.clone()),
@@ -909,14 +938,22 @@ fn openhome_device_to_zone(device: &OpenHomeDevice) -> Zone {
         zone_id: format!("openhome:{}", device.uuid),
         zone_name: device.name.clone(),
         state: PlaybackState::from(device.state.as_str()),
-        volume_control: device.volume.map(|v| BusVolumeControl {
-            value: v as f32,
-            min: 0.0,
-            max: 100.0,
-            step: 1.0,
-            is_muted: device.muted,
-            scale: crate::bus::VolumeScale::Percentage,
-            output_id: Some(device.uuid.clone()),
+        volume_control: device.volume.map(|v| {
+            // Calculate step from Characteristics: step = VolumeMax / VolumeSteps
+            // See: http://wiki.openhome.org/wiki/Av:Developer:VolumeService
+            let step = match (device.volume_max, device.volume_steps) {
+                (Some(max), Some(steps)) if steps > 0 => max as f32 / steps as f32,
+                _ => 1.0, // Default if Characteristics not available
+            };
+            BusVolumeControl {
+                value: v as f32,
+                min: 0.0,
+                max: device.volume_max.map(|m| m as f32).unwrap_or(100.0),
+                step,
+                is_muted: device.muted,
+                scale: crate::bus::VolumeScale::Percentage,
+                output_id: Some(device.uuid.clone()),
+            }
         }),
         now_playing: device.track_info.as_ref().map(|t| crate::bus::NowPlaying {
             title: t.title.clone(),

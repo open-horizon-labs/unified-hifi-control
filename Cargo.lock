@@ -2148,12 +2148,12 @@ dependencies = [
 
 [[package]]
 name = "if-addrs"
-version = "0.12.0"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb2a33e9c38988ecbda730c85b0fd9ddcdf83c0305ac7fd21c8bb9f57f2f0cc8"
+checksum = "69b2eeee38fef3aa9b4cc5f1beea8a2444fc00e7377cafae396de3f5c2065e24"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3215,11 +3215,11 @@ dependencies = [
 
 [[package]]
 name = "roon-api"
-version = "0.2.0"
-source = "git+https://github.com/TheAppgineer/rust-roon-api.git?tag=0.2.0#b035a4426cea07ddee6f8cb989f19d044cd190ac"
+version = "0.3.1"
+source = "git+https://github.com/open-horizon-labs/rust-roon-api.git?branch=fix%2Ffractional-volume#f9727e29c88023bca62e96983eb4ef15807f7d10"
 dependencies = [
  "futures-util",
- "if-addrs 0.12.0",
+ "if-addrs 0.13.4",
  "log",
  "regex",
  "serde",

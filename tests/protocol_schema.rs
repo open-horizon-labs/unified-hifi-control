@@ -62,6 +62,7 @@ struct VolumeInfo {
     min: Option<f32>,
     max: Option<f32>,
     is_muted: Option<bool>,
+    step: Option<f32>,
 }
 
 /// ControlRequest schema - POST /roon/control body
@@ -198,7 +199,8 @@ mod zone_schema {
                     "value": 50.0,
                     "min": 0.0,
                     "max": 100.0,
-                    "is_muted": false
+                    "is_muted": false,
+                    "step": 1.0
                 }
             }]
         });
@@ -258,6 +260,95 @@ mod zone_schema {
                 result.err()
             );
         }
+    }
+
+    /// Regression test: VolumeInfo must include step field (issue #152)
+    /// Zones with dB scales often have fractional steps (e.g., 0.5 dB)
+    #[test]
+    fn volume_info_includes_step() {
+        let json = json!({
+            "zone_id": "zone-db-scale",
+            "display_name": "HQPlayer Zone",
+            "state": "playing",
+            "is_next_allowed": true,
+            "is_previous_allowed": true,
+            "is_pause_allowed": true,
+            "is_play_allowed": false,
+            "now_playing": null,
+            "outputs": [{
+                "output_id": "output-1",
+                "display_name": "DAC",
+                "volume": {
+                    "value": -20.0,
+                    "min": -64.0,
+                    "max": 0.0,
+                    "is_muted": false,
+                    "step": 0.5
+                }
+            }]
+        });
+
+        let result: Result<Zone, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "Zone with volume step should deserialize: {:?}",
+            result.err()
+        );
+
+        let zone = result.unwrap();
+        let volume = zone.outputs[0]
+            .volume
+            .as_ref()
+            .expect("volume should be present");
+        assert_eq!(
+            volume.step,
+            Some(0.5),
+            "VolumeInfo.step must be included for zones with fractional steps (issue #152)"
+        );
+    }
+
+    /// Regression test: LMS zones should have step=2.5 (from LMS server)
+    #[test]
+    fn lms_zone_volume_step_is_2_5() {
+        let json = json!({
+            "zone_id": "lms:aa:bb:cc:dd:ee:ff",
+            "display_name": "Kitchen Speaker",
+            "state": "stopped",
+            "is_next_allowed": false,
+            "is_previous_allowed": false,
+            "is_pause_allowed": false,
+            "is_play_allowed": true,
+            "now_playing": null,
+            "outputs": [{
+                "output_id": "lms:aa:bb:cc:dd:ee:ff",
+                "display_name": "Kitchen Speaker",
+                "volume": {
+                    "value": 50.0,
+                    "min": 0.0,
+                    "max": 100.0,
+                    "is_muted": false,
+                    "step": 2.5
+                }
+            }]
+        });
+
+        let result: Result<Zone, _> = serde_json::from_value(json);
+        assert!(
+            result.is_ok(),
+            "LMS zone should deserialize: {:?}",
+            result.err()
+        );
+
+        let zone = result.unwrap();
+        let volume = zone.outputs[0]
+            .volume
+            .as_ref()
+            .expect("volume should be present");
+        assert_eq!(
+            volume.step,
+            Some(2.5),
+            "LMS zones must have step=2.5 (from Slim/Player/Client.pm:755)"
+        );
     }
 }
 

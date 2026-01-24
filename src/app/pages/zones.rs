@@ -13,6 +13,8 @@ use std::collections::HashMap;
 struct ControlRequest {
     zone_id: String,
     action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<f64>,
 }
 
 /// Fetch now playing for all zones
@@ -135,7 +137,11 @@ pub fn Zones() -> Element {
     // Control handler
     let control = move |(zone_id, action): (String, String)| {
         spawn(async move {
-            let req = ControlRequest { zone_id, action };
+            let req = ControlRequest {
+                zone_id,
+                action,
+                value: None,
+            };
             if let Err(e) = crate::app::api::post_json_no_response("/control", &req).await {
                 #[cfg(target_arch = "wasm32")]
                 web_sys::console::warn_1(&format!("Control request failed: {e}").into());
@@ -349,6 +355,7 @@ fn ZoneCard(
     // Extract volume info for component
     let volume = np.and_then(|n| n.volume);
     let volume_type = np.and_then(|n| n.volume_type.clone());
+    let volume_step = np.and_then(|n| n.volume_step);
 
     // Album art URL with cache-busting image_key
     let base_image_url = np.and_then(|n| n.image_url.clone()).unwrap_or_default();
@@ -465,6 +472,7 @@ fn ZoneCard(
                 VolumeControlsCompact {
                     volume: volume,
                     volume_type: volume_type,
+                    volume_step: volume_step,
                     on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string())),
                     on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string())),
                 }

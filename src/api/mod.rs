@@ -285,11 +285,11 @@ pub async fn roon_control_handler(
     }
 }
 
-/// Volume request body
+/// Volume request body (f32 for fractional step support)
 #[derive(Deserialize)]
 pub struct VolumeRequest {
     pub output_id: String,
-    pub value: i32,
+    pub value: f32,
     #[serde(default)]
     pub relative: bool,
 }
@@ -704,7 +704,7 @@ pub async fn lms_control_handler(
 #[derive(Deserialize)]
 pub struct LmsVolumeRequest {
     pub player_id: String,
-    pub value: i32,
+    pub value: f32,
     #[serde(default)]
     pub relative: bool,
 }

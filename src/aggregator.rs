@@ -14,7 +14,6 @@ use crate::bus::{BusEvent, NowPlaying, SharedBus, Zone};
 /// - Provides query interface for API layer
 pub struct ZoneAggregator {
     zones: Arc<RwLock<HashMap<String, Zone>>>,
-    now_playing: Arc<RwLock<HashMap<String, NowPlaying>>>,
     bus: SharedBus,
 }
 
@@ -22,7 +21,6 @@ impl ZoneAggregator {
     pub fn new(bus: SharedBus) -> Self {
         Self {
             zones: Arc::new(RwLock::new(HashMap::new())),
-            now_playing: Arc::new(RwLock::new(HashMap::new())),
             bus,
         }
     }
@@ -56,7 +54,6 @@ impl ZoneAggregator {
                 BusEvent::ZoneRemoved { zone_id } => {
                     debug!("Zone removed: {}", zone_id);
                     self.zones.write().await.remove(zone_id.as_str());
-                    self.now_playing.write().await.remove(zone_id.as_str());
                 }
 
                 BusEvent::NowPlayingChanged {
@@ -67,19 +64,24 @@ impl ZoneAggregator {
                     image_key,
                 } => {
                     debug!("Now playing changed: {}", zone_id);
-                    let np = NowPlaying {
-                        title: title.unwrap_or_default(),
-                        artist: artist.unwrap_or_default(),
-                        album: album.unwrap_or_default(),
-                        image_key,
-                        seek_position: None,
-                        duration: None,
-                        metadata: None,
-                    };
-                    self.now_playing
-                        .write()
-                        .await
-                        .insert(zone_id.to_string(), np);
+                    if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
+                        // Preserve seek_position and duration from existing now_playing
+                        let (seek_position, duration) = zone
+                            .now_playing
+                            .as_ref()
+                            .map(|np| (np.seek_position, np.duration))
+                            .unwrap_or((None, None));
+
+                        zone.now_playing = Some(NowPlaying {
+                            title: title.unwrap_or_default(),
+                            artist: artist.unwrap_or_default(),
+                            album: album.unwrap_or_default(),
+                            image_key,
+                            seek_position,
+                            duration,
+                            metadata: None,
+                        });
+                    }
                 }
 
                 BusEvent::VolumeChanged {
@@ -118,8 +120,10 @@ impl ZoneAggregator {
 
                 BusEvent::SeekPositionChanged { zone_id, position } => {
                     debug!("Seek position changed: {} = {}", zone_id, position);
-                    if let Some(np) = self.now_playing.write().await.get_mut(zone_id.as_str()) {
-                        np.seek_position = Some(position as f64);
+                    if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
+                        if let Some(ref mut np) = zone.now_playing {
+                            np.seek_position = Some(position as f64);
+                        }
                     }
                 }
 
@@ -129,7 +133,6 @@ impl ZoneAggregator {
 
                     // Remove all zones with this prefix
                     let mut zones = self.zones.write().await;
-                    let mut np = self.now_playing.write().await;
 
                     let zone_ids: Vec<String> = zones
                         .keys()
@@ -139,7 +142,6 @@ impl ZoneAggregator {
 
                     for zone_id in &zone_ids {
                         zones.remove(zone_id);
-                        np.remove(zone_id);
                     }
 
                     // Publish flush acknowledgment
@@ -187,7 +189,11 @@ impl ZoneAggregator {
 
     /// Get now playing for a zone
     pub async fn get_now_playing(&self, zone_id: &str) -> Option<NowPlaying> {
-        self.now_playing.read().await.get(zone_id).cloned()
+        self.zones
+            .read()
+            .await
+            .get(zone_id)
+            .and_then(|z| z.now_playing.clone())
     }
 
     /// Get zone count

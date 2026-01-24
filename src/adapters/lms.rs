@@ -954,10 +954,12 @@ impl LmsAdapter {
         self.state.read().await.players.values().cloned().collect()
     }
 
-    /// Change volume
-    pub async fn change_volume(&self, player_id: &str, value: i32, relative: bool) -> Result<()> {
+    /// Change volume (f32 for fractional step support)
+    pub async fn change_volume(&self, player_id: &str, value: f32, relative: bool) -> Result<()> {
         let command = if relative { "vol_rel" } else { "vol_abs" };
-        self.control(player_id, command, Some(value)).await
+        // LMS uses integer volume 0-100, round at the last moment
+        self.control(player_id, command, Some(value.round() as i32))
+            .await
     }
 }
 
@@ -971,7 +973,9 @@ fn lms_player_to_zone(player: &LmsPlayer) -> Zone {
             value: player.volume as f32,
             min: 0.0,
             max: 100.0,
-            step: 1.0,
+            // LMS hardcodes $increment = 2.5 in Slim/Player/Client.pm:755
+            // This is not queryable via CLI/JSON-RPC, so we use the constant.
+            step: 2.5,
             is_muted: false, // LMS doesn't expose mute via JSON-RPC status
             scale: crate::bus::VolumeScale::Percentage,
             output_id: Some(player.playerid.clone()),

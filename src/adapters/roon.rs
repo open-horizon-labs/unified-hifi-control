@@ -42,11 +42,11 @@ fn get_roon_state_path() -> PathBuf {
 }
 
 /// Maximum relative volume step per call (prevents wild jumps)
-const MAX_RELATIVE_STEP: i32 = 10;
+const MAX_RELATIVE_STEP: f32 = 10.0;
 
 /// Default volume range when output info unavailable
-const DEFAULT_VOLUME_MIN: i32 = 0;
-const DEFAULT_VOLUME_MAX: i32 = 100;
+const DEFAULT_VOLUME_MIN: f32 = 0.0;
+const DEFAULT_VOLUME_MAX: f32 = 100.0;
 
 // =============================================================================
 // SAFETY CRITICAL: Volume range handling
@@ -58,9 +58,9 @@ const DEFAULT_VOLUME_MAX: i32 = 100;
 // Fix: Use zone's actual volume range (e.g., -64 to 0 dB).
 // See tests/volume_safety.rs for regression protection.
 
-/// Clamp value to range, handling NaN by returning min
+/// Clamp value to range (f32 for fractional step support)
 #[inline]
-pub fn clamp(value: i32, min: i32, max: i32) -> i32 {
+pub fn clamp(value: f32, min: f32, max: f32) -> f32 {
     value.max(min).min(max)
 }
 
@@ -68,7 +68,7 @@ pub fn clamp(value: i32, min: i32, max: i32) -> i32 {
 ///
 /// Returns (min, max) tuple. For dB zones this might be (-64, 0),
 /// for percentage zones (0, 100).
-pub fn get_volume_range(output: Option<&Output>) -> (i32, i32) {
+pub fn get_volume_range(output: Option<&Output>) -> (f32, f32) {
     let Some(output) = output else {
         return (DEFAULT_VOLUME_MIN, DEFAULT_VOLUME_MAX);
     };
@@ -77,8 +77,8 @@ pub fn get_volume_range(output: Option<&Output>) -> (i32, i32) {
         return (DEFAULT_VOLUME_MIN, DEFAULT_VOLUME_MAX);
     };
 
-    let min = vol.min.map(|v| v as i32).unwrap_or(DEFAULT_VOLUME_MIN);
-    let max = vol.max.map(|v| v as i32).unwrap_or(DEFAULT_VOLUME_MAX);
+    let min = vol.min.unwrap_or(DEFAULT_VOLUME_MIN);
+    let max = vol.max.unwrap_or(DEFAULT_VOLUME_MAX);
 
     (min, max)
 }
@@ -112,6 +112,8 @@ pub struct VolumeInfo {
     pub min: Option<f32>,
     pub max: Option<f32>,
     pub is_muted: Option<bool>,
+    /// Volume step size from Roon API (varies per zone)
+    pub step: Option<f32>,
 }
 
 /// Now playing information
@@ -352,7 +354,7 @@ impl RoonAdapter {
     /// volume range. dB-based zones (like HQPlayer) use ranges like -64 to 0.
     /// Naively clamping to 0-100 would send -12 dB → 0 (MAX VOLUME), risking
     /// equipment damage. See tests/volume_safety.rs for regression protection.
-    pub async fn change_volume(&self, output_id: &str, value: i32, relative: bool) -> Result<()> {
+    pub async fn change_volume(&self, output_id: &str, value: f32, relative: bool) -> Result<()> {
         // Clone transport and gather volume info while holding lock, then release before await
         let (transport, mode, final_value) = {
             let state = self.state.read().await;
@@ -384,7 +386,10 @@ impl RoonAdapter {
             }
         };
 
-        transport.change_volume(output_id, &mode, final_value).await;
+        // Roon transport API now takes f64 to support fractional dB steps
+        transport
+            .change_volume(output_id, &mode, final_value as f64)
+            .await;
         Ok(())
     }
 
@@ -502,6 +507,7 @@ fn convert_zone(roon_zone: &RoonZone) -> Zone {
                 min: v.min,
                 max: v.max,
                 is_muted: v.is_muted,
+                step: v.step,
             }),
         })
         .collect();
@@ -534,7 +540,7 @@ fn roon_zone_to_bus_zone(zone: &Zone) -> BusZone {
             value: v.value.unwrap_or(50.0),
             min: v.min.unwrap_or(-64.0),
             max: v.max.unwrap_or(0.0),
-            step: 1.0,
+            step: v.step.unwrap_or(1.0),
             is_muted: v.is_muted.unwrap_or(false),
             scale: crate::bus::VolumeScale::Decibel,
             output_id: Some(o.output_id.clone()),
@@ -655,7 +661,7 @@ async fn run_roon_loop(
             };
 
             match event {
-                CoreEvent::Found(mut core) => {
+                CoreEvent::Registered(mut core, _token) => {
                     let core_name = core.display_name.clone();
                     let core_version = core.display_version.clone();
 
@@ -744,9 +750,10 @@ async fn run_roon_loop(
                         let mut s = state_for_events.write().await;
                         for zone in zones {
                             tracing::debug!(
-                                "Zone update: {} ({})",
+                                "Zone update: {} ({}) - now_playing: {:?}",
                                 zone.display_name,
-                                zone.zone_id
+                                zone.zone_id,
+                                zone.now_playing.as_ref().map(|np| &np.three_line.line1)
                             );
                             let converted = convert_zone(&zone);
                             let is_new = !s.zones.contains_key(&zone.zone_id);

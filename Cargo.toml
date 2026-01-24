@@ -88,7 +88,8 @@ tower = { version = "0.5", optional = true }
 tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace"], optional = true }
 
 # Roon API (server only)
-roon-api = { git = "https://github.com/TheAppgineer/rust-roon-api.git", tag = "0.2.0", features = ["transport", "image", "status"], optional = true }
+roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git", branch = "fix/fractional-volume", features = ["transport", "image", "status"], optional = true }
+# TODO: Switch back to upstream after https://github.com/TheAppgineer/rust-roon-api/pull/1 is merged
 
 # HTTP client (server only)
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"], optional = true }

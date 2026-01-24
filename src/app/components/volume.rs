@@ -36,11 +36,23 @@ impl VolumeType {
     }
 }
 
+/// Format volume for display, showing decimals only when step is fractional
+fn format_volume(volume: f32, step: Option<f32>, suffix: &str) -> String {
+    // Show decimals if step is fractional (not a whole number)
+    let show_decimal = step.map(|s| s.fract() != 0.0).unwrap_or(false);
+    if show_decimal {
+        format!("{:.1}{}", volume, suffix)
+    } else {
+        format!("{}{}", volume.round() as i32, suffix)
+    }
+}
+
 /// Compact volume controls for zone cards
 #[component]
 pub fn VolumeControlsCompact(
     volume: Option<f32>,
     volume_type: Option<String>,
+    volume_step: Option<f32>,
     on_vol_down: EventHandler<()>,
     on_vol_up: EventHandler<()>,
 ) -> Element {
@@ -53,10 +65,10 @@ pub fn VolumeControlsCompact(
 
     let volume_display = match vol_type {
         VolumeType::Db => volume
-            .map(|v| format!("{} dB", v.round() as i32))
+            .map(|v| format_volume(v, volume_step, " dB"))
             .unwrap_or_default(),
         VolumeType::Number => volume
-            .map(|v| format!("{}", v.round() as i32))
+            .map(|v| format_volume(v, volume_step, ""))
             .unwrap_or_default(),
         VolumeType::Incremental | VolumeType::Fixed => String::new(),
     };
@@ -87,6 +99,7 @@ pub fn VolumeControlsCompact(
 pub fn VolumeControlsFull(
     volume: Option<f32>,
     volume_type: Option<String>,
+    volume_step: Option<f32>,
     on_vol_down: EventHandler<()>,
     on_vol_up: EventHandler<()>,
 ) -> Element {
@@ -99,10 +112,10 @@ pub fn VolumeControlsFull(
 
     let volume_display = match vol_type {
         VolumeType::Db => volume
-            .map(|v| format!("{} dB", v.round() as i32))
+            .map(|v| format_volume(v, volume_step, " dB"))
             .unwrap_or_default(),
         VolumeType::Number => volume
-            .map(|v| format!("{}", v.round() as i32))
+            .map(|v| format_volume(v, volume_step, ""))
             .unwrap_or_default(),
         VolumeType::Incremental | VolumeType::Fixed => String::new(),
     };
