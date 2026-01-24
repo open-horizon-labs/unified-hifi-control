@@ -17,7 +17,7 @@ struct ControlRequest {
     zone_id: String,
     action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    value: Option<i32>,
+    value: Option<f64>,
 }
 
 /// Pipeline setting request
@@ -166,7 +166,7 @@ pub fn Zone() -> Element {
     });
 
     // Control handler
-    let control = move |(action, value): (&'static str, Option<i32>)| {
+    let control = move |(action, value): (&'static str, Option<f64>)| {
         if let Some(zone_id) = selected_zone_id() {
             let action = action.to_string();
             spawn(async move {
@@ -367,7 +367,7 @@ pub fn Zone() -> Element {
 fn ZoneDisplay(
     zone: ZoneData,
     now_playing: Option<NowPlaying>,
-    on_control: EventHandler<(&'static str, Option<i32>)>,
+    on_control: EventHandler<(&'static str, Option<f64>)>,
 ) -> Element {
     let np = now_playing.as_ref();
     let is_playing = np.map(|n| n.is_playing).unwrap_or(false);
@@ -435,6 +435,7 @@ fn ZoneDisplay(
 
     let can_prev = np.map(|n| n.is_previous_allowed).unwrap_or(false);
     let can_next = np.map(|n| n.is_next_allowed).unwrap_or(false);
+    let volume_step = np.and_then(|n| n.volume_step).map(|s| s as f64);
 
     rsx! {
         article { id: "zone-display",
@@ -497,12 +498,12 @@ fn ZoneDisplay(
                             }
                             button {
                                 class: "w-10",
-                                onclick: move |_| on_control.call(("vol_down", Some(2))),
+                                onclick: move |_| on_control.call(("vol_down", volume_step)),
                                 "−"
                             }
                             button {
                                 class: "w-10",
-                                onclick: move |_| on_control.call(("vol_up", Some(2))),
+                                onclick: move |_| on_control.call(("vol_up", volume_step)),
                                 "+"
                             }
                         }
