@@ -2,7 +2,7 @@
 <extension>
   <name>PLUGIN_UNIFIED_HIFI</name>
   <module>Plugins::UnifiedHiFi::Plugin</module>
-  <version>3.0.0-rc.1</version>
+  <version>3.1.3</version>
   <description>PLUGIN_UNIFIED_HIFI_DESC</description>
   <creator>Muness Castle</creator>
   <link>https://forums.lyrion.org/forum/user-forums/3rd-party-hardware/1804977-roon-knob-includes-lms-support</link>

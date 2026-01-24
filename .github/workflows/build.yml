@@ -1754,12 +1754,17 @@ jobs:
           sed -i "s|URL_PLACEHOLDER|${REPO_URL}/releases/download/v${VERSION}/lms-unified-hifi-control-${VERSION}.zip|" lms-plugin/repo.xml
           sed -i "s|SHA_PLACEHOLDER|$SHA|" lms-plugin/repo.xml
 
+      - name: Update install.xml version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s|<version>[^<]*</version>|<version>$VERSION</version>|" lms-plugin/install.xml
+
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add lms-plugin/repo.xml
-          git commit -m "chore: Update repo.xml to v${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
+          git add lms-plugin/repo.xml lms-plugin/install.xml
+          git commit -m "chore: Update LMS plugin to v${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
           git push
 
   publish-aur:
