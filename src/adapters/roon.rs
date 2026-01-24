@@ -42,11 +42,11 @@ fn get_roon_state_path() -> PathBuf {
 }
 
 /// Maximum relative volume step per call (prevents wild jumps)
-const MAX_RELATIVE_STEP: i32 = 10;
+const MAX_RELATIVE_STEP: f32 = 10.0;
 
 /// Default volume range when output info unavailable
-const DEFAULT_VOLUME_MIN: i32 = 0;
-const DEFAULT_VOLUME_MAX: i32 = 100;
+const DEFAULT_VOLUME_MIN: f32 = 0.0;
+const DEFAULT_VOLUME_MAX: f32 = 100.0;
 
 // =============================================================================
 // SAFETY CRITICAL: Volume range handling
@@ -58,9 +58,9 @@ const DEFAULT_VOLUME_MAX: i32 = 100;
 // Fix: Use zone's actual volume range (e.g., -64 to 0 dB).
 // See tests/volume_safety.rs for regression protection.
 
-/// Clamp value to range, handling NaN by returning min
+/// Clamp value to range (f32 for fractional step support)
 #[inline]
-pub fn clamp(value: i32, min: i32, max: i32) -> i32 {
+pub fn clamp(value: f32, min: f32, max: f32) -> f32 {
     value.max(min).min(max)
 }
 
@@ -68,7 +68,7 @@ pub fn clamp(value: i32, min: i32, max: i32) -> i32 {
 ///
 /// Returns (min, max) tuple. For dB zones this might be (-64, 0),
 /// for percentage zones (0, 100).
-pub fn get_volume_range(output: Option<&Output>) -> (i32, i32) {
+pub fn get_volume_range(output: Option<&Output>) -> (f32, f32) {
     let Some(output) = output else {
         return (DEFAULT_VOLUME_MIN, DEFAULT_VOLUME_MAX);
     };
@@ -77,8 +77,8 @@ pub fn get_volume_range(output: Option<&Output>) -> (i32, i32) {
         return (DEFAULT_VOLUME_MIN, DEFAULT_VOLUME_MAX);
     };
 
-    let min = vol.min.map(|v| v as i32).unwrap_or(DEFAULT_VOLUME_MIN);
-    let max = vol.max.map(|v| v as i32).unwrap_or(DEFAULT_VOLUME_MAX);
+    let min = vol.min.unwrap_or(DEFAULT_VOLUME_MIN);
+    let max = vol.max.unwrap_or(DEFAULT_VOLUME_MAX);
 
     (min, max)
 }
@@ -354,7 +354,7 @@ impl RoonAdapter {
     /// volume range. dB-based zones (like HQPlayer) use ranges like -64 to 0.
     /// Naively clamping to 0-100 would send -12 dB → 0 (MAX VOLUME), risking
     /// equipment damage. See tests/volume_safety.rs for regression protection.
-    pub async fn change_volume(&self, output_id: &str, value: i32, relative: bool) -> Result<()> {
+    pub async fn change_volume(&self, output_id: &str, value: f32, relative: bool) -> Result<()> {
         // Clone transport and gather volume info while holding lock, then release before await
         let (transport, mode, final_value) = {
             let state = self.state.read().await;
@@ -386,7 +386,10 @@ impl RoonAdapter {
             }
         };
 
-        transport.change_volume(output_id, &mode, final_value).await;
+        // Roon transport API takes i32, round at the last moment to preserve precision
+        transport
+            .change_volume(output_id, &mode, final_value.round() as i32)
+            .await;
         Ok(())
     }
 

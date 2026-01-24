@@ -565,7 +565,7 @@ async fn control_roon(
                 )
             })?;
             // Use as_f64() which handles both JSON integers and floats
-            let step = value.and_then(|v| v.as_f64()).unwrap_or(1.0) as i32;
+            let step = value.and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             state
                 .roon
                 .change_volume(&output, step, true)
@@ -586,7 +586,7 @@ async fn control_roon(
                 )
             })?;
             // Use as_f64() which handles both JSON integers and floats
-            let step = value.and_then(|v| v.as_f64()).unwrap_or(1.0) as i32;
+            let step = value.and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
             state
                 .roon
                 .change_volume(&output, -step, true)
@@ -610,7 +610,7 @@ async fn control_roon(
             tracing::debug!("vol_abs raw value: {:?}", value);
             // Use as_f64() which handles both JSON integers and floats
             // (as_i64() returns None for floats like 75.0, causing fallback to 50)
-            let vol = value.and_then(|v| v.as_f64()).unwrap_or(50.0) as i32;
+            let vol = value.and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
             state
                 .roon
                 .change_volume(&output, vol, false)
@@ -656,7 +656,7 @@ async fn control_lms(
         "stop" => "stop",
         "vol_up" | "volume_up" => {
             // Use as_f64() which handles both JSON integers and floats
-            let step = value.and_then(|v| v.as_f64()).unwrap_or(5.0) as i32;
+            let step = value.and_then(|v| v.as_f64()).unwrap_or(2.5) as f32;
             state
                 .lms
                 .change_volume(player_id, step, true)
@@ -671,7 +671,7 @@ async fn control_lms(
         }
         "vol_down" | "volume_down" => {
             // Use as_f64() which handles both JSON integers and floats
-            let step = value.and_then(|v| v.as_f64()).unwrap_or(5.0) as i32;
+            let step = value.and_then(|v| v.as_f64()).unwrap_or(2.5) as f32;
             state
                 .lms
                 .change_volume(player_id, -step, true)
@@ -686,7 +686,7 @@ async fn control_lms(
         }
         "vol_abs" | "volume" => {
             // Use as_f64() which handles both JSON integers and floats
-            let vol = value.and_then(|v| v.as_f64()).unwrap_or(50.0) as i32;
+            let vol = value.and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
             state
                 .lms
                 .change_volume(player_id, vol, false)

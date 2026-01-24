@@ -179,7 +179,7 @@ mod lms_integration {
         let (bus, _rx) = test_bus();
         let adapter = LmsAdapter::new(bus);
 
-        let result = adapter.change_volume("player-1", 50, false).await;
+        let result = adapter.change_volume("player-1", 50.0, false).await;
         assert!(result.is_err());
     }
 }

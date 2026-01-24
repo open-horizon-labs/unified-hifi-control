@@ -29,8 +29,8 @@ fn db_output() -> Output {
 fn db_zone_respects_db_range() {
     let output = db_output();
     let (min, max) = get_volume_range(Some(&output));
-    assert_eq!(min, -64);
-    assert_eq!(max, 0);
+    assert_eq!(min, -64.0);
+    assert_eq!(max, 0.0);
 }
 
 #[test]
@@ -39,21 +39,21 @@ fn critical_db_minus12_stays_minus12() {
     // -12 dB is a reasonable listening level, NOT maximum volume
     let output = db_output();
     let (min, max) = get_volume_range(Some(&output));
-    assert_eq!(clamp(-12, min, max), -12);
+    assert_eq!(clamp(-12.0, min, max), -12.0);
 }
 
 #[test]
 fn db_values_below_zone_min_clamp_to_min() {
     let output = db_output();
     let (min, max) = get_volume_range(Some(&output));
-    assert_eq!(clamp(-100, min, max), -64);
+    assert_eq!(clamp(-100.0, min, max), -64.0);
 }
 
 #[test]
 fn db_values_above_zone_max_clamp_to_max() {
     let output = db_output();
     let (min, max) = get_volume_range(Some(&output));
-    assert_eq!(clamp(10, min, max), 0);
+    assert_eq!(clamp(10.0, min, max), 0.0);
 }
 
 // =============================================================================
@@ -78,29 +78,29 @@ fn pct_output() -> Output {
 fn pct_zone_respects_0_100_range() {
     let output = pct_output();
     let (min, max) = get_volume_range(Some(&output));
-    assert_eq!(min, 0);
-    assert_eq!(max, 100);
+    assert_eq!(min, 0.0);
+    assert_eq!(max, 100.0);
 }
 
 #[test]
 fn pct_50_stays_50() {
     let output = pct_output();
     let (min, max) = get_volume_range(Some(&output));
-    assert_eq!(clamp(50, min, max), 50);
+    assert_eq!(clamp(50.0, min, max), 50.0);
 }
 
 #[test]
 fn pct_values_below_0_clamp_to_0() {
     let output = pct_output();
     let (min, max) = get_volume_range(Some(&output));
-    assert_eq!(clamp(-10, min, max), 0);
+    assert_eq!(clamp(-10.0, min, max), 0.0);
 }
 
 #[test]
 fn pct_values_above_100_clamp_to_100() {
     let output = pct_output();
     let (min, max) = get_volume_range(Some(&output));
-    assert_eq!(clamp(150, min, max), 100);
+    assert_eq!(clamp(150.0, min, max), 100.0);
 }
 
 // =============================================================================
@@ -115,15 +115,15 @@ fn missing_volume_uses_safe_defaults() {
         volume: None,
     };
     let (min, max) = get_volume_range(Some(&output));
-    assert_eq!(min, 0);
-    assert_eq!(max, 100);
+    assert_eq!(min, 0.0);
+    assert_eq!(max, 100.0);
 }
 
 #[test]
 fn none_output_uses_safe_defaults() {
     let (min, max) = get_volume_range(None);
-    assert_eq!(min, 0);
-    assert_eq!(max, 100);
+    assert_eq!(min, 0.0);
+    assert_eq!(max, 100.0);
 }
 
 // =============================================================================
@@ -132,20 +132,20 @@ fn none_output_uses_safe_defaults() {
 
 #[test]
 fn clamp_value_exactly_at_min_boundary() {
-    assert_eq!(clamp(-64, -64, 0), -64);
-    assert_eq!(clamp(0, 0, 100), 0);
+    assert_eq!(clamp(-64.0, -64.0, 0.0), -64.0);
+    assert_eq!(clamp(0.0, 0.0, 100.0), 0.0);
 }
 
 #[test]
 fn clamp_value_exactly_at_max_boundary() {
-    assert_eq!(clamp(0, -64, 0), 0);
-    assert_eq!(clamp(100, 0, 100), 100);
+    assert_eq!(clamp(0.0, -64.0, 0.0), 0.0);
+    assert_eq!(clamp(100.0, 0.0, 100.0), 100.0);
 }
 
 #[test]
 fn clamp_value_in_middle_of_range() {
-    assert_eq!(clamp(-32, -64, 0), -32);
-    assert_eq!(clamp(50, 0, 100), 50);
+    assert_eq!(clamp(-32.0, -64.0, 0.0), -32.0);
+    assert_eq!(clamp(50.0, 0.0, 100.0), 50.0);
 }
 
 // =============================================================================
@@ -155,7 +155,7 @@ fn clamp_value_in_middle_of_range() {
 #[test]
 fn relative_step_clamped_prevents_wild_jumps() {
     // Even if someone sends +50, it should be clamped to MAX_RELATIVE_STEP (10)
-    let max_step = 10;
-    assert_eq!(clamp(50, -max_step, max_step), max_step);
-    assert_eq!(clamp(-50, -max_step, max_step), -max_step);
+    let max_step = 10.0;
+    assert_eq!(clamp(50.0, -max_step, max_step), max_step);
+    assert_eq!(clamp(-50.0, -max_step, max_step), -max_step);
 }

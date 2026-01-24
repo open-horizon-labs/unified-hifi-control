@@ -954,10 +954,12 @@ impl LmsAdapter {
         self.state.read().await.players.values().cloned().collect()
     }
 
-    /// Change volume
-    pub async fn change_volume(&self, player_id: &str, value: i32, relative: bool) -> Result<()> {
+    /// Change volume (f32 for fractional step support)
+    pub async fn change_volume(&self, player_id: &str, value: f32, relative: bool) -> Result<()> {
         let command = if relative { "vol_rel" } else { "vol_abs" };
-        self.control(player_id, command, Some(value)).await
+        // LMS uses integer volume 0-100, round at the last moment
+        self.control(player_id, command, Some(value.round() as i32))
+            .await
     }
 }
 

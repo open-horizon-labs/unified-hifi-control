@@ -119,6 +119,59 @@ fn lint_zones_maps_volume_control() {
 }
 
 // =============================================================================
+// CONTROL HANDLER TESTS: Ensure vol_up/vol_down respect fractional steps
+// =============================================================================
+
+/// Roon adapter change_volume must accept f32, not i32
+/// Bug: i32 truncates fractional steps like 0.5 to 0
+#[test]
+fn lint_roon_change_volume_uses_f32() {
+    let src =
+        fs::read_to_string("src/adapters/roon.rs").expect("Failed to read src/adapters/roon.rs");
+
+    // The function signature must use f32 for fractional step support
+    let uses_f32 = src.contains("fn change_volume(&self, output_id: &str, value: f32");
+
+    assert!(
+        uses_f32,
+        "REGRESSION: Roon change_volume must use f32, not i32.\n\
+         i32 truncates fractional steps (0.5 → 0).\n\
+         Fix: Change signature to 'value: f32'"
+    );
+}
+
+/// LMS adapter change_volume must accept f32, not i32
+#[test]
+fn lint_lms_change_volume_uses_f32() {
+    let src =
+        fs::read_to_string("src/adapters/lms.rs").expect("Failed to read src/adapters/lms.rs");
+
+    let uses_f32 = src.contains("fn change_volume(&self, player_id: &str, value: f32");
+
+    assert!(
+        uses_f32,
+        "REGRESSION: LMS change_volume must use f32, not i32.\n\
+         Fix: Change signature to 'value: f32'"
+    );
+}
+
+/// Routes must not cast step to i32 - loses fractional precision
+#[test]
+fn lint_routes_no_i32_step_cast() {
+    let src =
+        fs::read_to_string("src/knobs/routes.rs").expect("Failed to read src/knobs/routes.rs");
+
+    // Bug: "as i32" truncates fractional steps
+    let has_i32_cast = src.contains(".unwrap_or(1.0) as i32");
+
+    assert!(
+        !has_i32_cast,
+        "REGRESSION: Routes cast step to i32, losing fractional precision.\n\
+         Fix: Keep step as f32/f64 throughout"
+    );
+}
+
+// =============================================================================
 // UNIT TESTS: Call actual conversion functions
 // Requires: make lms_player_to_zone and roon_zone_to_bus_zone pub(crate)
 // =============================================================================
