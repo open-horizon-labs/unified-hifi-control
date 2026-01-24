@@ -14,6 +14,7 @@
 //! The base poll interval can be configured via `LMS_POLL_INTERVAL` env var (default: 2 seconds).
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,7 +29,11 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::adapters::handle::{AdapterHandle, RetryConfig};
 use crate::adapters::lms_discovery::discover_lms_servers;
+use crate::adapters::traits::{
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
+};
 use crate::bus::{BusEvent, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl, Zone};
 use crate::config::{get_config_file_path, read_config_file};
 
@@ -73,10 +78,6 @@ fn get_poll_interval_with_subscription() -> Duration {
     let base = get_poll_interval();
     Duration::from_secs(base.as_secs() * SUBSCRIPTION_INTERVAL_MULTIPLIER)
 }
-/// Reconnection delay for CLI subscription
-const CLI_RECONNECT_DELAY: Duration = Duration::from_secs(5);
-/// Maximum reconnection delay (exponential backoff cap)
-const CLI_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 /// TCP read timeout for CLI subscription (detect unresponsive LMS)
 const CLI_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -495,6 +496,7 @@ impl Default for LmsState {
 }
 
 /// LMS Adapter
+#[derive(Clone)]
 pub struct LmsAdapter {
     state: Arc<RwLock<LmsState>>,
     rpc: LmsRpc,
@@ -688,30 +690,7 @@ impl LmsAdapter {
 
     /// Start polling for player updates (internal - use Startable trait)
     async fn start_internal(&self) -> Result<()> {
-        // If not configured, attempt auto-discovery
-        if !self.is_configured().await {
-            match self.auto_discover_and_configure().await {
-                Ok(true) => {
-                    tracing::info!("LMS auto-configured via discovery");
-                }
-                Ok(false) => {
-                    return Err(anyhow!(
-                        "LMS not configured and auto-discovery did not find exactly one server. \
-                         Configure manually via POST /lms/configure or use GET /lms/discover to see available servers."
-                    ));
-                }
-                Err(e) => {
-                    tracing::warn!("LMS auto-discovery failed: {}", e);
-                    return Err(anyhow!(
-                        "LMS not configured and auto-discovery failed: {}. \
-                         Configure manually via POST /lms/configure.",
-                        e
-                    ));
-                }
-            }
-        }
-
-        // Check if already running to prevent double-start
+        // Check if already running and set running=true atomically to prevent race
         {
             let mut state = self.state.write().await;
             if state.running {
@@ -720,27 +699,6 @@ impl LmsAdapter {
             state.running = true;
         }
 
-        // Initial update - reset running flag on failure so we can retry
-        if let Err(e) = self.update_players().await {
-            let mut state = self.state.write().await;
-            state.running = false;
-            return Err(e);
-        }
-
-        {
-            let mut state = self.state.write().await;
-            state.connected = true;
-        }
-
-        let host = {
-            let state = self.state.read().await;
-            state.host.clone().unwrap_or_default()
-        };
-
-        info!("LMS client connected to {}", host);
-        self.bus
-            .publish(BusEvent::LmsConnected { host: host.clone() });
-
         // Create fresh cancellation token for this run (previous token may be cancelled)
         let shutdown = {
             let mut token = self.shutdown.write().await;
@@ -748,60 +706,12 @@ impl LmsAdapter {
             token.clone()
         };
 
-        // Spawn CLI subscription task for real-time events
-        let cli_state = self.state.clone();
-        let cli_bus = self.bus.clone();
-        let cli_rpc = self.rpc.clone();
-        let cli_shutdown = shutdown.clone();
-        let cli_host = host.clone();
-
-        tokio::spawn(async move {
-            run_cli_subscription(cli_host, cli_state, cli_bus, cli_rpc, cli_shutdown).await;
-        });
-
-        // Spawn polling task using shared RPC (adaptive interval based on subscription status)
-        let state = self.state.clone();
+        // Create AdapterHandle and spawn run_with_retry
+        let adapter = self.clone();
         let bus = self.bus.clone();
-        let rpc = self.rpc.clone();
+        let handle = AdapterHandle::new(adapter, bus, shutdown);
 
-        tokio::spawn(async move {
-            // Start with fast polling; will switch to slow when subscription is active
-            let mut current_interval = get_poll_interval();
-            let mut poll_timer = interval(current_interval);
-
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        info!("LMS polling shutting down");
-                        break;
-                    }
-                    _ = poll_timer.tick() => {
-                        // Check if we need to adjust polling interval
-                        let subscription_active = state.read().await.cli_subscription_active;
-                        let target_interval = if subscription_active {
-                            get_poll_interval_with_subscription()
-                        } else {
-                            get_poll_interval()
-                        };
-
-                        if target_interval != current_interval {
-                            debug!(
-                                "Adjusting poll interval: {:?} -> {:?} (subscription_active={})",
-                                current_interval, target_interval, subscription_active
-                            );
-                            current_interval = target_interval;
-                            poll_timer = interval(current_interval);
-                        }
-
-                        if let Err(e) = update_players_internal(&rpc, &state, &bus).await {
-                            tracing::error!("Failed to update LMS players: {}", e);
-                        }
-                    }
-                }
-            }
-
-            info!("LMS polling stopped");
-        });
+        tokio::spawn(async move { handle.run_with_retry(RetryConfig::default()).await });
 
         Ok(())
     }
@@ -1080,63 +990,67 @@ async fn update_players_internal(
 // CLI Subscription (Event-Driven Updates)
 // =============================================================================
 
-/// Run the CLI subscription loop with automatic reconnection
-///
-/// Connects to LMS CLI port (9090), subscribes to events, and processes them.
-/// Automatically reconnects on disconnection with exponential backoff.
-async fn run_cli_subscription(
-    host: String,
+/// Maximum consecutive poll failures before triggering restart
+const MAX_CONSECUTIVE_POLL_FAILURES: u32 = 3;
+
+/// Run the polling loop (extracted helper for AdapterLogic)
+/// Returns Err after consecutive failures to trigger adapter restart
+async fn run_polling_loop(
     state: Arc<RwLock<LmsState>>,
     bus: SharedBus,
     rpc: LmsRpc,
     shutdown: CancellationToken,
-) {
-    let mut retry_delay = CLI_RECONNECT_DELAY;
+) -> Result<()> {
+    // Start with fast polling; will switch to slow when subscription is active
+    let mut current_interval = get_poll_interval();
+    let mut poll_timer = interval(current_interval);
+    let mut consecutive_failures: u32 = 0;
 
     loop {
-        // Check for shutdown before attempting connection
-        if shutdown.is_cancelled() {
-            info!("CLI subscription shutting down before connection attempt");
-            break;
-        }
-
-        info!("Connecting to LMS CLI at {}:{}", host, CLI_PORT);
-
-        match connect_and_subscribe(&host, &state, &bus, &rpc, &shutdown).await {
-            Ok(()) => {
-                // Clean disconnection (shutdown requested)
-                info!("CLI subscription ended cleanly");
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("LMS polling shutting down");
                 break;
             }
-            Err(e) => {
-                // Check if we had a successful connection before failing
-                let was_connected = {
-                    let mut s = state.write().await;
-                    let was_active = s.cli_subscription_active;
-                    s.cli_subscription_active = false;
-                    was_active
+            _ = poll_timer.tick() => {
+                // Check if we need to adjust polling interval
+                let subscription_active = state.read().await.cli_subscription_active;
+                let target_interval = if subscription_active {
+                    get_poll_interval_with_subscription()
+                } else {
+                    get_poll_interval()
                 };
 
-                // Reset backoff if we had a working connection that later failed
-                if was_connected {
-                    retry_delay = CLI_RECONNECT_DELAY;
+                if target_interval != current_interval {
+                    debug!(
+                        "Adjusting poll interval: {:?} -> {:?} (subscription_active={})",
+                        current_interval, target_interval, subscription_active
+                    );
+                    current_interval = target_interval;
+                    poll_timer = interval(current_interval);
                 }
 
-                warn!(
-                    "CLI subscription error: {}. Reconnecting in {:?}...",
-                    e, retry_delay
-                );
-
-                // Wait before reconnecting (with shutdown check)
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        info!("CLI subscription shutting down during reconnect wait");
-                        break;
+                match update_players_internal(&rpc, &state, &bus).await {
+                    Ok(()) => {
+                        // Reset failure counter on success
+                        if consecutive_failures > 0 {
+                            debug!("LMS poll succeeded, resetting failure counter");
+                            consecutive_failures = 0;
+                        }
                     }
-                    _ = tokio::time::sleep(retry_delay) => {
-                        // Exponential backoff up to max (only if initial connection failed)
-                        if !was_connected {
-                            retry_delay = (retry_delay * 2).min(CLI_MAX_RECONNECT_DELAY);
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES {
+                            tracing::error!(
+                                "LMS poll failed {} consecutive times, triggering restart: {}",
+                                consecutive_failures, e
+                            );
+                            return Err(anyhow!("LMS unreachable after {} consecutive poll failures", consecutive_failures));
+                        } else {
+                            warn!(
+                                "LMS poll failed ({}/{}): {}",
+                                consecutive_failures, MAX_CONSECUTIVE_POLL_FAILURES, e
+                            );
                         }
                     }
                 }
@@ -1144,11 +1058,20 @@ async fn run_cli_subscription(
         }
     }
 
-    // Ensure subscription is marked inactive on exit
-    {
-        let mut s = state.write().await;
-        s.cli_subscription_active = false;
-    }
+    info!("LMS polling stopped");
+    Ok(())
+}
+
+/// Run CLI subscription once (calls connect_and_subscribe directly)
+async fn run_cli_subscription_once(
+    host: &str,
+    state: &Arc<RwLock<LmsState>>,
+    bus: &SharedBus,
+    rpc: &LmsRpc,
+    shutdown: &CancellationToken,
+) -> Result<()> {
+    info!("Connecting to LMS CLI at {}:{}", host, CLI_PORT);
+    connect_and_subscribe(host, state, bus, rpc, shutdown).await
 }
 
 /// Connect to LMS CLI and process events
@@ -1425,6 +1348,141 @@ async fn handle_cli_event(
         CliEvent::Unknown { raw_line } => {
             // Log unknown events at trace level for debugging
             tracing::trace!("Unknown CLI event: {}", raw_line);
+        }
+    }
+}
+
+// =============================================================================
+// AdapterLogic Implementation
+// =============================================================================
+
+#[async_trait]
+impl AdapterLogic for LmsAdapter {
+    fn prefix(&self) -> &'static str {
+        "lms"
+    }
+
+    async fn run(&self, ctx: AdapterContext) -> Result<()> {
+        // Check if configured, if not try auto_discover_and_configure()
+        if !self.is_configured().await {
+            match self.auto_discover_and_configure().await {
+                Ok(true) => {
+                    tracing::info!("LMS auto-configured via discovery");
+                }
+                Ok(false) => {
+                    return Err(anyhow!(
+                        "LMS not configured and auto-discovery did not find exactly one server. \
+                         Configure manually via POST /lms/configure or use GET /lms/discover to see available servers."
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!("LMS auto-discovery failed: {}", e);
+                    return Err(anyhow!(
+                        "LMS not configured and auto-discovery failed: {}. \
+                         Configure manually via POST /lms/configure.",
+                        e
+                    ));
+                }
+            }
+        }
+
+        // Initial update
+        self.update_players().await?;
+
+        // Set state.connected = true and state.running = true
+        {
+            let mut state = self.state.write().await;
+            state.connected = true;
+            state.running = true;
+        }
+
+        let host = {
+            let state = self.state.read().await;
+            state.host.clone().unwrap_or_default()
+        };
+
+        info!("LMS client connected to {}", host);
+        ctx.bus
+            .publish(BusEvent::LmsConnected { host: host.clone() });
+
+        // Spawn polling as independent background task so it isn't cancelled when CLI ends
+        let polling_state = self.state.clone();
+        let polling_bus = ctx.bus.clone();
+        let polling_rpc = self.rpc.clone();
+        let polling_shutdown = ctx.shutdown.clone();
+        let polling_task = tokio::spawn(async move {
+            run_polling_loop(polling_state, polling_bus, polling_rpc, polling_shutdown).await
+        });
+
+        // Run CLI subscription - failure is non-fatal, polling continues
+        tokio::select! {
+            _ = ctx.shutdown.cancelled() => {
+                info!("LMS adapter received shutdown signal");
+            }
+            result = run_cli_subscription_once(&host, &self.state, &ctx.bus, &self.rpc, &ctx.shutdown) => {
+                if let Err(e) = result {
+                    warn!("CLI subscription failed: {}. Continuing with polling only.", e);
+                    let mut state = self.state.write().await;
+                    state.cli_subscription_active = false;
+                }
+            }
+        }
+
+        // Wait for polling to complete (either shutdown or failure)
+        let result = match polling_task.await {
+            Ok(poll_result) => poll_result,
+            Err(e) => Err(anyhow!("Polling task panicked: {}", e)),
+        };
+
+        // Clean up state on exit
+        {
+            let mut state = self.state.write().await;
+            state.connected = false;
+            state.running = false;
+            state.cli_subscription_active = false;
+        }
+
+        // Publish LmsDisconnected
+        ctx.bus.publish(BusEvent::LmsDisconnected { host });
+
+        result
+    }
+
+    async fn handle_command(
+        &self,
+        zone_id: &str,
+        command: AdapterCommand,
+    ) -> Result<AdapterCommandResponse> {
+        // Extract player_id from zone_id (remove "lms:" prefix)
+        let player_id = zone_id.strip_prefix("lms:").unwrap_or(zone_id);
+
+        let result = match command {
+            AdapterCommand::Play => self.control(player_id, "play", None).await,
+            AdapterCommand::Pause => self.control(player_id, "pause", None).await,
+            AdapterCommand::PlayPause => self.control(player_id, "play_pause", None).await,
+            AdapterCommand::Stop => self.control(player_id, "stop", None).await,
+            AdapterCommand::Next => self.control(player_id, "next", None).await,
+            AdapterCommand::Previous => self.control(player_id, "previous", None).await,
+            AdapterCommand::VolumeAbsolute(v) => self.control(player_id, "vol_abs", Some(v)).await,
+            AdapterCommand::VolumeRelative(v) => self.control(player_id, "vol_rel", Some(v)).await,
+            AdapterCommand::Mute(_) => {
+                // LMS doesn't have direct mute support via JSON-RPC
+                return Ok(AdapterCommandResponse {
+                    success: false,
+                    error: Some("Mute not supported by LMS adapter".to_string()),
+                });
+            }
+        };
+
+        match result {
+            Ok(()) => Ok(AdapterCommandResponse {
+                success: true,
+                error: None,
+            }),
+            Err(e) => Ok(AdapterCommandResponse {
+                success: false,
+                error: Some(e.to_string()),
+            }),
         }
     }
 }

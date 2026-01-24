@@ -4,9 +4,15 @@
 //! Pure UPnP/DLNA has limited metadata support compared to OpenHome.
 //! Specifically, next/previous track are NOT supported by pure UPnP.
 
+use crate::adapters::handle::{AdapterHandle, RetryConfig};
+use crate::adapters::traits::{
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
+};
 use crate::bus::{
     BusEvent, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl as BusVolumeControl, Zone,
 };
+use anyhow::Result;
+use async_trait::async_trait;
 use futures::StreamExt;
 use quick_xml::de::from_str as xml_from_str;
 use regex::Regex;
@@ -108,6 +114,7 @@ struct UPnPState {
 }
 
 /// UPnP adapter for discovering and controlling DLNA Media Renderers
+#[derive(Clone)]
 pub struct UPnPAdapter {
     state: Arc<RwLock<UPnPState>>,
     bus: SharedBus,
@@ -135,6 +142,8 @@ impl UPnPAdapter {
 
     /// Start SSDP discovery (internal - use Startable trait)
     async fn start_internal(&self) -> anyhow::Result<()> {
+        // Use write lock to atomically check and set running flag
+        // This prevents race conditions where multiple starts could pass the check
         {
             let mut state = self.state.write().await;
             if state.running {
@@ -150,23 +159,13 @@ impl UPnPAdapter {
             token.clone()
         };
 
-        // Spawn discovery task
-        let state = self.state.clone();
+        // Create AdapterHandle and spawn with retry
+        let adapter = self.clone();
         let bus = self.bus.clone();
-        let http = self.http.clone();
-        let shutdown_clone = shutdown.clone();
 
         tokio::spawn(async move {
-            Self::discovery_loop(state.clone(), bus.clone(), http.clone(), shutdown_clone).await;
-        });
-
-        // Spawn polling task
-        let state = self.state.clone();
-        let bus = self.bus.clone();
-        let http = self.http.clone();
-
-        tokio::spawn(async move {
-            Self::poll_loop(state, bus, http, shutdown).await;
+            let handle = AdapterHandle::new(adapter, bus, shutdown);
+            handle.run_with_retry(RetryConfig::default()).await
         });
 
         tracing::info!("UPnP adapter started");
@@ -898,6 +897,105 @@ fn upnp_renderer_to_zone(renderer: &UPnPRenderer) -> Zone {
         is_pause_allowed: renderer.state == "playing",
         is_next_allowed: false,
         is_previous_allowed: false,
+    }
+}
+
+#[async_trait]
+impl AdapterLogic for UPnPAdapter {
+    fn prefix(&self) -> &'static str {
+        "upnp"
+    }
+
+    async fn run(&self, ctx: AdapterContext) -> Result<()> {
+        // Mark as running
+        {
+            let mut state = self.state.write().await;
+            state.running = true;
+        }
+
+        // Run discovery and poll loops concurrently with shutdown check
+        let state = self.state.clone();
+        let bus = ctx.bus.clone();
+        let http = self.http.clone();
+        let shutdown = ctx.shutdown.clone();
+
+        let discovery_state = state.clone();
+        let discovery_bus = bus.clone();
+        let discovery_http = http.clone();
+        let discovery_shutdown = shutdown.clone();
+
+        let poll_state = state.clone();
+        let poll_bus = bus.clone();
+        let poll_http = http.clone();
+        let poll_shutdown = shutdown.clone();
+
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("UPnP adapter shutting down");
+            }
+            _ = async {
+                tokio::join!(
+                    Self::discovery_loop(discovery_state, discovery_bus, discovery_http, discovery_shutdown),
+                    Self::poll_loop(poll_state, poll_bus, poll_http, poll_shutdown)
+                );
+            } => {}
+        }
+
+        // Cleanup state on exit
+        {
+            let mut state = self.state.write().await;
+            state.running = false;
+            state.renderers.clear();
+        }
+
+        Ok(())
+    }
+
+    async fn handle_command(
+        &self,
+        zone_id: &str,
+        command: AdapterCommand,
+    ) -> Result<AdapterCommandResponse> {
+        // Strip "upnp:" prefix if present (bus/aggregator uses prefixed IDs)
+        let uuid = zone_id.strip_prefix("upnp:").unwrap_or(zone_id);
+
+        let result = match command {
+            AdapterCommand::Play => self.control(uuid, "play", None).await,
+            AdapterCommand::Pause => self.control(uuid, "pause", None).await,
+            AdapterCommand::PlayPause => self.control(uuid, "play_pause", None).await,
+            AdapterCommand::Stop => self.control(uuid, "stop", None).await,
+            AdapterCommand::Next => {
+                return Ok(AdapterCommandResponse {
+                    success: false,
+                    error: Some("Next track not supported by pure UPnP renderers".to_string()),
+                });
+            }
+            AdapterCommand::Previous => {
+                return Ok(AdapterCommandResponse {
+                    success: false,
+                    error: Some("Previous track not supported by pure UPnP renderers".to_string()),
+                });
+            }
+            AdapterCommand::VolumeAbsolute(vol) => self.control(uuid, "vol_abs", Some(vol)).await,
+            AdapterCommand::VolumeRelative(delta) => {
+                self.control(uuid, "vol_rel", Some(delta)).await
+            }
+            AdapterCommand::Mute(mute) => {
+                self.control(uuid, "mute", Some(if mute { 1 } else { 0 }))
+                    .await
+            }
+        };
+
+        match result {
+            Ok(()) => Ok(AdapterCommandResponse {
+                success: true,
+                error: None,
+            }),
+            Err(e) => Ok(AdapterCommandResponse {
+                success: false,
+                error: Some(e.to_string()),
+            }),
+        }
     }
 }
 

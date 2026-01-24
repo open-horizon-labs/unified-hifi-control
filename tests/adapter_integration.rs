@@ -432,12 +432,21 @@ mod mock_server_tests {
             )
             .await;
 
-        // Start the adapter (connects and begins polling)
+        // Start the adapter (spawns async connection via AdapterHandle)
         let result = adapter.start().await;
         assert!(result.is_ok(), "Failed to start adapter: {:?}", result);
 
-        let status = adapter.get_status().await;
-        assert!(status.connected);
+        // Wait for connection to establish (AdapterHandle connects asynchronously)
+        let mut connected = false;
+        for _ in 0..50 {
+            let status = adapter.get_status().await;
+            if status.connected {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        assert!(connected, "Adapter failed to connect within timeout");
 
         // Fetch players from mock
         let players = adapter.get_players().await;

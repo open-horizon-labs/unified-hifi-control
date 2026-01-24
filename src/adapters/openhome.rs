@@ -4,9 +4,8 @@
 //! OpenHome is an extension of UPnP that provides richer metadata and more
 //! control actions (next/previous track, playlists, etc.)
 
-use crate::bus::{
-    BusEvent, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl as BusVolumeControl, Zone,
-};
+use anyhow::Result;
+use async_trait::async_trait;
 use futures::StreamExt;
 use quick_xml::de::from_str as xml_from_str;
 use reqwest::Client;
@@ -18,6 +17,14 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
+
+use crate::adapters::handle::{AdapterHandle, RetryConfig};
+use crate::adapters::traits::{
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
+};
+use crate::bus::{
+    BusEvent, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl as BusVolumeControl, Zone,
+};
 
 /// OpenHome URNs to search for - devices may advertise different services
 const OPENHOME_URNS: &[&str] = &[
@@ -123,6 +130,7 @@ struct OpenHomeState {
 }
 
 /// OpenHome adapter for discovering and controlling OpenHome devices
+#[derive(Clone)]
 pub struct OpenHomeAdapter {
     state: Arc<RwLock<OpenHomeState>>,
     bus: SharedBus,
@@ -150,6 +158,8 @@ impl OpenHomeAdapter {
 
     /// Start SSDP discovery (internal - use Startable trait)
     async fn start_internal(&self) -> anyhow::Result<()> {
+        // Use write lock to atomically check and set running flag
+        // This prevents race conditions where multiple starts could pass the check
         {
             let mut state = self.state.write().await;
             if state.running {
@@ -165,23 +175,11 @@ impl OpenHomeAdapter {
             token.clone()
         };
 
-        // Spawn discovery task
-        let state = self.state.clone();
-        let bus = self.bus.clone();
-        let http = self.http.clone();
-        let shutdown_clone = shutdown.clone();
+        // Create AdapterHandle and spawn run_with_retry
+        let handle = AdapterHandle::new(self.clone(), self.bus.clone(), shutdown);
 
         tokio::spawn(async move {
-            Self::discovery_loop(state.clone(), bus.clone(), http.clone(), shutdown_clone).await;
-        });
-
-        // Spawn polling task
-        let state = self.state.clone();
-        let bus = self.bus.clone();
-        let http = self.http.clone();
-
-        tokio::spawn(async move {
-            Self::poll_loop(state, bus, http, shutdown).await;
+            let _ = handle.run_with_retry(RetryConfig::default()).await;
         });
 
         tracing::info!("OpenHome adapter started");
@@ -975,6 +973,93 @@ fn openhome_device_to_zone(device: &OpenHomeDevice) -> Zone {
         is_pause_allowed: device.state == "playing",
         is_next_allowed: true,
         is_previous_allowed: true,
+    }
+}
+
+// AdapterLogic implementation for unified retry handling
+#[async_trait]
+impl AdapterLogic for OpenHomeAdapter {
+    fn prefix(&self) -> &'static str {
+        "openhome"
+    }
+
+    async fn run(&self, ctx: AdapterContext) -> Result<()> {
+        // Mark as running
+        {
+            let mut state = self.state.write().await;
+            state.running = true;
+        }
+
+        // Run discovery and poll loops concurrently with shutdown check
+        let discovery_state = self.state.clone();
+        let discovery_bus = self.bus.clone();
+        let discovery_http = self.http.clone();
+        let discovery_shutdown = ctx.shutdown.clone();
+
+        let poll_state = self.state.clone();
+        let poll_bus = self.bus.clone();
+        let poll_http = self.http.clone();
+        let poll_shutdown = ctx.shutdown.clone();
+
+        tokio::select! {
+            _ = ctx.shutdown.cancelled() => {
+                tracing::info!("OpenHome adapter received shutdown signal");
+            }
+            _ = Self::discovery_loop(discovery_state, discovery_bus, discovery_http, discovery_shutdown) => {
+                tracing::info!("OpenHome discovery loop ended");
+            }
+            _ = Self::poll_loop(poll_state, poll_bus, poll_http, poll_shutdown) => {
+                tracing::info!("OpenHome poll loop ended");
+            }
+        }
+
+        // Clean up state on exit
+        {
+            let mut state = self.state.write().await;
+            state.running = false;
+            state.devices.clear();
+        }
+
+        tracing::info!("OpenHome adapter stopped");
+        Ok(())
+    }
+
+    async fn handle_command(
+        &self,
+        zone_id: &str,
+        command: AdapterCommand,
+    ) -> Result<AdapterCommandResponse> {
+        // Strip prefix if present
+        let uuid = zone_id.strip_prefix("openhome:").unwrap_or(zone_id);
+
+        let result = match command {
+            AdapterCommand::Play => self.control(uuid, "play", None).await,
+            AdapterCommand::Pause => self.control(uuid, "pause", None).await,
+            AdapterCommand::PlayPause => self.control(uuid, "play_pause", None).await,
+            AdapterCommand::Stop => self.control(uuid, "stop", None).await,
+            AdapterCommand::Next => self.control(uuid, "next", None).await,
+            AdapterCommand::Previous => self.control(uuid, "previous", None).await,
+            AdapterCommand::VolumeAbsolute(v) => self.control(uuid, "vol_abs", Some(v)).await,
+            AdapterCommand::VolumeRelative(v) => self.control(uuid, "vol_rel", Some(v)).await,
+            AdapterCommand::Mute(_) => {
+                // OpenHome mute not directly supported via this adapter yet
+                return Ok(AdapterCommandResponse {
+                    success: false,
+                    error: Some("Mute not supported by OpenHome adapter".to_string()),
+                });
+            }
+        };
+
+        match result {
+            Ok(()) => Ok(AdapterCommandResponse {
+                success: true,
+                error: None,
+            }),
+            Err(e) => Ok(AdapterCommandResponse {
+                success: false,
+                error: Some(e.to_string()),
+            }),
+        }
     }
 }
 

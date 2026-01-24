@@ -3,6 +3,7 @@
 //! Connects to Roon Core via SOOD discovery and WebSocket protocol.
 
 use anyhow::Result;
+use async_trait::async_trait;
 use roon_api::{
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     info,
@@ -13,10 +14,16 @@ use roon_api::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{oneshot, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::adapters::handle::{AdapterHandle, RetryConfig};
+use crate::adapters::traits::{
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
+};
 use crate::bus::{
     BusEvent, NowPlaying as BusNowPlaying, PlaybackState, PrefixedZoneId, SharedBus,
     VolumeControl as BusVolumeControl, Zone as BusZone,
@@ -162,13 +169,6 @@ pub struct RoonAdapter {
     started: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Initial reconnection delay
-const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
-/// Maximum reconnection delay
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
-
-use std::time::Duration;
-
 impl RoonAdapter {
     /// Create a disconnected Roon adapter (stub, used when disabled)
     pub fn new_disconnected(bus: SharedBus) -> Self {
@@ -210,72 +210,29 @@ impl RoonAdapter {
             return Ok(()); // Already started
         }
 
-        let base_url = {
+        // Verify configuration
+        {
             let url = self.base_url.read().await;
-            url.clone()
-                .ok_or_else(|| anyhow::anyhow!("Roon base_url not configured"))?
-        };
+            if url.is_none() {
+                self.started.store(false, Ordering::SeqCst);
+                return Err(anyhow::anyhow!("Roon base_url not configured"));
+            }
+        }
 
         // Create fresh cancellation token for this run (previous token may be cancelled)
-        let shutdown_clone = {
+        let shutdown = {
             let mut token = self.shutdown.write().await;
             *token = CancellationToken::new();
             token.clone()
         };
 
-        let state_clone = self.state.clone();
-        let bus_clone = self.bus.clone();
+        // Create AdapterHandle and spawn run_with_retry
+        let handle = AdapterHandle::new(self.clone(), self.bus.clone(), shutdown);
+        let config = RetryConfig::new(Duration::from_secs(1), Duration::from_secs(60));
 
-        // Spawn Roon event loop with reconnection logic
         tokio::spawn(async move {
-            let mut retry_delay = INITIAL_RETRY_DELAY;
-
-            loop {
-                tracing::info!("Starting Roon discovery loop...");
-
-                // Wrap run_roon_loop in select! to allow cancellation during execution
-                let loop_result = tokio::select! {
-                    _ = shutdown_clone.cancelled() => {
-                        tracing::info!("Roon adapter shutdown requested during discovery");
-                        break;
-                    }
-                    result = run_roon_loop(state_clone.clone(), bus_clone.clone(), base_url.clone(), shutdown_clone.clone()) => {
-                        result
-                    }
-                };
-
-                match loop_result {
-                    Ok(()) => {
-                        tracing::info!("Roon event loop ended normally");
-                    }
-                    Err(e) => {
-                        tracing::error!("Roon event loop error: {}", e);
-                    }
-                }
-
-                // Clear state on exit (including image service and pending requests)
-                {
-                    let mut s = state_clone.write().await;
-                    s.connected = false;
-                    s.transport = None;
-                    s.image = None;
-                    s.zones.clear();
-                    s.pending_images.clear();
-                }
-
-                tracing::info!("Roon loop exited, reconnecting in {:?}...", retry_delay);
-
-                // Check for shutdown before sleeping
-                tokio::select! {
-                    _ = shutdown_clone.cancelled() => {
-                        tracing::info!("Roon adapter shutdown requested");
-                        break;
-                    }
-                    _ = tokio::time::sleep(retry_delay) => {
-                        // Exponential backoff up to max
-                        retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
-                    }
-                }
+            if let Err(e) = handle.run_with_retry(config).await {
+                tracing::error!("Roon adapter exited with error: {}", e);
             }
         });
 
@@ -485,6 +442,90 @@ impl RoonAdapter {
     }
 }
 
+#[async_trait]
+impl AdapterLogic for RoonAdapter {
+    fn prefix(&self) -> &'static str {
+        "roon"
+    }
+
+    async fn run(&self, ctx: AdapterContext) -> Result<()> {
+        let base_url = {
+            let url = self.base_url.read().await;
+            url.clone()
+                .ok_or_else(|| anyhow::anyhow!("Roon base_url not configured"))?
+        };
+
+        run_roon_loop(self.state.clone(), ctx.bus, base_url, ctx.shutdown).await
+    }
+
+    async fn handle_command(
+        &self,
+        zone_id: &str,
+        command: AdapterCommand,
+    ) -> Result<AdapterCommandResponse> {
+        // Strip "roon:" prefix if present (bus/aggregator uses prefixed IDs)
+        let zone_id = zone_id.strip_prefix("roon:").unwrap_or(zone_id);
+
+        let result = match command {
+            AdapterCommand::Play => self.control(zone_id, "play").await,
+            AdapterCommand::Pause => self.control(zone_id, "pause").await,
+            AdapterCommand::PlayPause => self.control(zone_id, "play_pause").await,
+            AdapterCommand::Stop => self.control(zone_id, "stop").await,
+            AdapterCommand::Next => self.control(zone_id, "next").await,
+            AdapterCommand::Previous => self.control(zone_id, "previous").await,
+            AdapterCommand::VolumeAbsolute(value) => {
+                // Get the first output for this zone
+                if let Some(zone) = self.get_zone(zone_id).await {
+                    if let Some(output) = zone.outputs.first() {
+                        self.change_volume(&output.output_id, value as f32, false)
+                            .await
+                    } else {
+                        Err(anyhow::anyhow!("Zone has no outputs"))
+                    }
+                } else {
+                    Err(anyhow::anyhow!("Zone not found"))
+                }
+            }
+            AdapterCommand::VolumeRelative(delta) => {
+                // Get the first output for this zone
+                if let Some(zone) = self.get_zone(zone_id).await {
+                    if let Some(output) = zone.outputs.first() {
+                        self.change_volume(&output.output_id, delta as f32, true)
+                            .await
+                    } else {
+                        Err(anyhow::anyhow!("Zone has no outputs"))
+                    }
+                } else {
+                    Err(anyhow::anyhow!("Zone not found"))
+                }
+            }
+            AdapterCommand::Mute(mute) => {
+                // Get the first output for this zone
+                if let Some(zone) = self.get_zone(zone_id).await {
+                    if let Some(output) = zone.outputs.first() {
+                        self.mute(&output.output_id, mute).await
+                    } else {
+                        Err(anyhow::anyhow!("Zone has no outputs"))
+                    }
+                } else {
+                    Err(anyhow::anyhow!("Zone not found"))
+                }
+            }
+        };
+
+        match result {
+            Ok(()) => Ok(AdapterCommandResponse {
+                success: true,
+                error: None,
+            }),
+            Err(e) => Ok(AdapterCommandResponse {
+                success: false,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+}
+
 /// Convert Roon zone to our Zone struct
 fn convert_zone(roon_zone: &RoonZone) -> Zone {
     let now_playing = roon_zone.now_playing.as_ref().map(|np| NowPlaying {
@@ -586,6 +627,9 @@ async fn run_roon_loop(
 ) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
 
+    // Flag to signal that the loop needs to restart (e.g., core lost, channel closed)
+    let restart_needed = Arc::new(AtomicBool::new(false));
+
     // Ensure config subdirectory exists for state persistence
     // Issue #76: State files now go into unified-hifi/ subdirectory
     let state_path = get_roon_state_path();
@@ -641,6 +685,7 @@ async fn run_roon_loop(
     let state_path_for_events = state_path_str.clone();
     let base_url_for_events = base_url;
     let shutdown_for_events = shutdown.clone();
+    let restart_needed_for_events = restart_needed.clone();
     handles.spawn(async move {
         loop {
             // Use select! to allow cancellation and handle channel close
@@ -657,6 +702,7 @@ async fn run_roon_loop(
             let Some((event, msg)) = event_result else {
                 // Channel closed - exit gracefully to allow reconnection
                 tracing::info!("Roon event channel closed, exiting handler");
+                restart_needed_for_events.store(true, std::sync::atomic::Ordering::SeqCst);
                 break;
             };
 
@@ -719,17 +765,23 @@ async fn run_roon_loop(
                             .await;
                     }
 
-                    let mut s = state_for_events.write().await;
-                    s.connected = false;
-                    s.core_name = None;
-                    s.core_version = None;
-                    s.zones.clear();
-                    s.transport = None;
-                    s.image = None;
-                    s.pending_images.clear();
+                    {
+                        let mut s = state_for_events.write().await;
+                        s.connected = false;
+                        s.core_name = None;
+                        s.core_version = None;
+                        s.zones.clear();
+                        s.transport = None;
+                        s.image = None;
+                        s.pending_images.clear();
+                    }
 
                     // Publish disconnected event
                     bus_for_events.publish(BusEvent::RoonDisconnected);
+
+                    // Signal restart needed and break
+                    restart_needed_for_events.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
                 }
                 _ => {}
             }
@@ -911,10 +963,32 @@ async fn run_roon_loop(
         }
     });
 
-    // Wait for all handles (runs forever unless error)
-    while handles.join_next().await.is_some() {}
+    // Wait for handles - abort all when one signals restart needed
+    while handles.join_next().await.is_some() {
+        // Check if any task signaled restart needed
+        if restart_needed.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!("Restart signaled, aborting remaining Roon tasks");
+            handles.abort_all();
+            break;
+        }
+    }
 
-    Ok(())
+    // Clear state before returning
+    {
+        let mut s = state.write().await;
+        s.connected = false;
+        s.transport = None;
+        s.image = None;
+        s.zones.clear();
+        s.pending_images.clear();
+    }
+
+    // Check if restart is needed
+    if restart_needed.load(std::sync::atomic::Ordering::SeqCst) {
+        Err(anyhow::anyhow!("Roon core lost, restart needed"))
+    } else {
+        Ok(())
+    }
 }
 
 // Startable trait implementation via macro
