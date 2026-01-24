@@ -335,7 +335,6 @@ jobs:
           shared-key: "native-build"
           cache-all-crates: true
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Check formatting
         run: cargo fmt --check
@@ -370,7 +369,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "test-build"
-          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Run tests
         env:
@@ -414,7 +412,6 @@ jobs:
           shared-key: "wasm-build"
           cache-all-crates: true
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Cache Dioxus CLI
         if: steps.cache-wasm.outputs.cache-hit != 'true'
@@ -505,7 +502,6 @@ jobs:
           shared-key: "fullstack-build"
           cache-all-crates: true
           cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Cache Dioxus CLI
         if: steps.cache-wasm.outputs.cache-hit != 'true'
@@ -571,7 +567,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-x86_64-unknown-linux-musl
-          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Install zig
         run: |
@@ -797,7 +792,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: zigbuild-${{ matrix.target }}
-          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Install zig
         run: |
@@ -880,7 +874,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-x64
-          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Download WASM assets
         uses: actions/download-artifact@v4
@@ -937,7 +930,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-arm64
-          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
 
       - name: Download WASM assets
         uses: actions/download-artifact@v4
@@ -1029,7 +1021,7 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
-          save-if: ${{ github.ref == 'refs/heads/v3' || github.ref == 'refs/heads/master' }}
+          shared-key: windows
 
       - name: Download WASM assets
         uses: actions/download-artifact@v4
