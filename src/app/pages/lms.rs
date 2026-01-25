@@ -150,8 +150,20 @@ pub fn Lms() -> Element {
                     div { class: "mb-4",
                         if let Some(ref c) = cfg {
                             if c.configured && c.connected {
-                                span { class: "status-ok",
-                                    "✓ Connected to {c.host.as_deref().unwrap_or(\"\")}:{c.port.unwrap_or(9000)}"
+                                div {
+                                    span { class: "status-ok",
+                                        "✓ Connected to {c.host.as_deref().unwrap_or(\"\")}:{c.port.unwrap_or(9000)}"
+                                    }
+                                }
+                                // Debug info: CLI subscription and polling
+                                div { class: "text-sm text-muted mt-1",
+                                    if c.cli_subscription_active {
+                                        span { class: "text-green-600", "CLI: active" }
+                                    } else {
+                                        span { class: "text-yellow-600", "CLI: inactive (polling only)" }
+                                    }
+                                    span { class: "mx-2", "•" }
+                                    span { "Poll: {c.poll_interval_secs}s" }
                                 }
                             } else if c.configured {
                                 span { class: "status-err",

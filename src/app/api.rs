@@ -113,6 +113,12 @@ pub struct LmsConfig {
     pub connected: bool,
     pub host: Option<String>,
     pub port: Option<u16>,
+    /// Whether CLI subscription is active (real-time events vs polling-only)
+    #[serde(default)]
+    pub cli_subscription_active: bool,
+    /// Current poll interval in seconds (2s when CLI down, 30s when CLI up)
+    #[serde(default)]
+    pub poll_interval_secs: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

@@ -1058,11 +1058,24 @@ pub async fn hqp_configure_handler(
 /// GET /lms/config - Get current LMS configuration
 pub async fn lms_config_handler(State(state): State<AppState>) -> impl IntoResponse {
     let status = state.lms.get_status().await;
+    // Get poll interval from env or use default
+    let poll_interval_secs = std::env::var("LMS_POLL_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(2);
+    // When CLI active, poll interval is 15x base
+    let effective_poll_interval = if status.cli_subscription_active {
+        poll_interval_secs * 15
+    } else {
+        poll_interval_secs
+    };
     Json(serde_json::json!({
         "configured": status.host.is_some(),
         "connected": status.connected,
         "host": status.host,
-        "port": status.port
+        "port": status.port,
+        "cli_subscription_active": status.cli_subscription_active,
+        "poll_interval_secs": effective_poll_interval
     }))
 }
 
