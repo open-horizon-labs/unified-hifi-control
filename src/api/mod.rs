@@ -1062,7 +1062,9 @@ pub async fn lms_config_handler(State(state): State<AppState>) -> impl IntoRespo
         "configured": status.host.is_some(),
         "connected": status.connected,
         "host": status.host,
-        "port": status.port
+        "port": status.port,
+        "cli_subscription_active": status.cli_subscription_active,
+        "poll_interval_secs": status.poll_interval_secs
     }))
 }
 

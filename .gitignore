@@ -12,9 +12,10 @@ firmware/version.json
 # Tailwind standalone CLI binary (downloaded via `make setup-tailwind`)
 /tailwindcss
 
-# Superego
+# Open Horizon Labs tools
 .superego/
 .wm/
+.ba/
 /target/
 # Note: Cargo.lock is committed for reproducible binary builds
 dist/

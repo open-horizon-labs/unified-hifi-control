@@ -94,19 +94,16 @@ impl ZoneAggregator {
                         output_id, value, is_muted
                     );
                     // Find zone containing this output and update volume_control
+                    // All adapters must use prefixed output_ids (e.g., "lms:xx:xx:xx", "roon:output-id")
+                    // The lint test `bus_events_use_prefixed_output_ids` enforces this.
                     let mut zones = self.zones.write().await;
                     for zone in zones.values_mut() {
-                        // Match by volume_control.output_id (works for Roon where output_id != zone_id)
-                        // Fall back to zone_id suffix match for LMS (output_id is player MAC)
                         let matches = zone
                             .volume_control
                             .as_ref()
                             .and_then(|vc| vc.output_id.as_ref())
                             .map(|oid| oid == &output_id)
-                            .unwrap_or_else(|| {
-                                // Fallback: check if zone_id ends with output_id (LMS style)
-                                zone.zone_id.ends_with(&output_id)
-                            });
+                            .unwrap_or(false);
 
                         if matches {
                             if let Some(ref mut vc) = zone.volume_control {

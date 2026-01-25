@@ -6,7 +6,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use roon_api::{
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
-    info,
     status::{self, Status},
     transport::{self, volume, Control, Transport, Zone as RoonZone},
     CoreEvent, Info, Parsed, RoonApi, Services, Svc,
@@ -29,6 +28,7 @@ use crate::bus::{
     VolumeControl as BusVolumeControl, Zone as BusZone,
 };
 use crate::config::get_config_file_path;
+use crate::knobs::KnobStore;
 
 const ROON_STATE_FILE: &str = "roon_state.json";
 
@@ -167,6 +167,8 @@ pub struct RoonAdapter {
     base_url: Arc<RwLock<Option<String>>>,
     /// Whether the adapter has been started
     started: Arc<std::sync::atomic::AtomicBool>,
+    /// Knob store for displaying controller count in Roon extension
+    knob_store: Option<KnobStore>,
 }
 
 impl RoonAdapter {
@@ -178,25 +180,28 @@ impl RoonAdapter {
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
             base_url: Arc::new(RwLock::new(None)),
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            knob_store: None,
         }
     }
 
     /// Create Roon adapter ready to start
     ///
     /// `base_url` is shown in Roon Settings → Extensions (e.g., "http://hostname:3000")
-    pub fn new_configured(bus: SharedBus, base_url: String) -> Self {
+    /// `knob_store` is used to display controller count in Roon extension status
+    pub fn new_configured(bus: SharedBus, base_url: String, knob_store: KnobStore) -> Self {
         Self {
             state: Arc::new(RwLock::new(RoonState::default())),
             bus,
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
             base_url: Arc::new(RwLock::new(Some(base_url))),
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            knob_store: Some(knob_store),
         }
     }
 
     /// Create and immediately start Roon adapter (legacy API for compatibility)
-    pub async fn new(bus: SharedBus, base_url: String) -> Result<Self> {
-        let adapter = Self::new_configured(bus, base_url);
+    pub async fn new(bus: SharedBus, base_url: String, knob_store: KnobStore) -> Result<Self> {
+        let adapter = Self::new_configured(bus, base_url, knob_store);
         adapter.start_internal().await?;
         Ok(adapter)
     }
@@ -455,7 +460,14 @@ impl AdapterLogic for RoonAdapter {
                 .ok_or_else(|| anyhow::anyhow!("Roon base_url not configured"))?
         };
 
-        run_roon_loop(self.state.clone(), ctx.bus, base_url, ctx.shutdown).await
+        run_roon_loop(
+            self.state.clone(),
+            ctx.bus,
+            base_url,
+            ctx.shutdown,
+            self.knob_store.clone(),
+        )
+        .await
     }
 
     async fn handle_command(
@@ -537,6 +549,18 @@ fn convert_zone(roon_zone: &RoonZone) -> Zone {
         length: np.length,
     });
 
+    // Log output volume info for debugging
+    for o in &roon_zone.outputs {
+        tracing::debug!(
+            "Zone '{}' output '{}': volume={:?}",
+            roon_zone.display_name,
+            o.display_name,
+            o.volume
+                .as_ref()
+                .map(|v| format!("value={:?} min={:?} max={:?}", v.value, v.min, v.max))
+        );
+    }
+
     let outputs = roon_zone
         .outputs
         .iter()
@@ -576,15 +600,30 @@ fn convert_zone(roon_zone: &RoonZone) -> Zone {
 /// Convert local Zone to bus Zone for ZoneDiscovered event
 fn roon_zone_to_bus_zone(zone: &Zone) -> BusZone {
     // Get volume from first output (if available)
+    // Use prefixed output_id for consistent aggregator matching
     let volume_control = zone.outputs.first().and_then(|o| {
-        o.volume.as_ref().map(|v| BusVolumeControl {
-            value: v.value.unwrap_or(50.0),
-            min: v.min.unwrap_or(-64.0),
-            max: v.max.unwrap_or(0.0),
-            step: v.step.unwrap_or(1.0),
-            is_muted: v.is_muted.unwrap_or(false),
-            scale: crate::bus::VolumeScale::Decibel,
-            output_id: Some(o.output_id.clone()),
+        o.volume.as_ref().map(|v| {
+            // Use get_volume_range for consistent defaults with change_volume
+            let (default_min, default_max) = get_volume_range(Some(o));
+            let min = v.min.unwrap_or(default_min);
+            let max = v.max.unwrap_or(default_max);
+            // Default to min (safest - for dB zones 0=max, for percent zones 0=min)
+            let value = v.value.unwrap_or(min);
+            // Infer scale from range: if max <= 0, it's dB; otherwise percentage
+            let scale = if max <= 0.0 {
+                crate::bus::VolumeScale::Decibel
+            } else {
+                crate::bus::VolumeScale::Percentage
+            };
+            BusVolumeControl {
+                value,
+                min,
+                max,
+                step: v.step.unwrap_or(1.0),
+                is_muted: v.is_muted.unwrap_or(false),
+                scale,
+                output_id: Some(format!("roon:{}", o.output_id)),
+            }
         })
     });
 
@@ -624,6 +663,7 @@ async fn run_roon_loop(
     bus: SharedBus,
     base_url: String,
     shutdown: CancellationToken,
+    knob_store: Option<KnobStore>,
 ) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
 
@@ -642,11 +682,16 @@ async fn run_roon_loop(
     let state_path_str = state_path.to_string_lossy().to_string();
     tracing::info!("Roon state file: {}", state_path_str);
 
-    // Extension info - uses CARGO_PKG_* from Cargo.toml
+    // Extension info - Issue #169: Use UHC_VERSION for consistent version display
     // Use same extension ID as Node.js for seamless migration
-    // Note: info! macro appends CARGO_PKG_NAME to the prefix, so:
-    // "com.muness" + "." + "unified-hifi-control" = "com.muness.unified-hifi-control"
-    let info = info!("com.muness", "Unified Hi-Fi Control");
+    let info = Info::new(
+        "com.muness.unified-hifi-control".to_string(),
+        "Unified Hi-Fi Control",
+        env!("UHC_VERSION"),
+        Some("Muness Castle"),
+        "",
+        Some(env!("CARGO_PKG_REPOSITORY")),
+    );
 
     // Create API instance
     let mut roon = RoonApi::new(info);
@@ -686,6 +731,7 @@ async fn run_roon_loop(
     let base_url_for_events = base_url;
     let shutdown_for_events = shutdown.clone();
     let restart_needed_for_events = restart_needed.clone();
+    let knob_store_for_events = knob_store;
     handles.spawn(async move {
         loop {
             // Use select! to allow cancellation and handle channel close
@@ -714,8 +760,24 @@ async fn run_roon_loop(
                     tracing::info!("Roon Core found: {} (version {})", core_name, core_version);
 
                     // Update status shown in Roon Settings → Extensions
+                    // Issue #169: Show version and controller count
                     if let Some(status) = core.get_status() {
-                        let message = format!("Connected • {}", base_url_for_events);
+                        let knob_count = if let Some(ref store) = knob_store_for_events {
+                            store.list().await.len()
+                        } else {
+                            0
+                        };
+                        let message = if knob_count > 0 {
+                            format!(
+                                "v{} • {} controller{} • {}",
+                                env!("UHC_VERSION"),
+                                knob_count,
+                                if knob_count == 1 { "" } else { "s" },
+                                base_url_for_events
+                            )
+                        } else {
+                            format!("v{} • {}", env!("UHC_VERSION"), base_url_for_events)
+                        };
                         status.set_status(message, false).await;
                     }
 
@@ -856,12 +918,22 @@ async fn run_roon_loop(
                                         })
                                         .unwrap_or(true);
 
+                                    // Handle VolumeChanged emission safely:
+                                    // - vol.value can be None transiently
+                                    // - Using unwrap_or(0.0) would set dB zones to max volume, risking damage
+                                    // - But we still want to emit mute changes using last known value
                                     if vol_changed {
-                                        bus_for_events.publish(BusEvent::VolumeChanged {
-                                            output_id: output.output_id.clone(),
-                                            value: vol.value.unwrap_or(0.0),
-                                            is_muted: vol.is_muted.unwrap_or(false),
-                                        });
+                                        // Try current value, then last known value from old_vol
+                                        let value_to_use =
+                                            vol.value.or_else(|| old_vol.and_then(|ov| ov.value));
+
+                                        if let Some(value) = value_to_use {
+                                            bus_for_events.publish(BusEvent::VolumeChanged {
+                                                output_id: format!("roon:{}", output.output_id),
+                                                value,
+                                                is_muted: vol.is_muted.unwrap_or(false),
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -993,3 +1065,109 @@ async fn run_roon_loop(
 
 // Startable trait implementation via macro
 crate::impl_startable!(RoonAdapter, "roon", is_configured);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a test zone with specified volume parameters
+    fn make_test_zone(
+        output_id: &str,
+        volume_value: Option<f32>,
+        volume_min: Option<f32>,
+        volume_max: Option<f32>,
+    ) -> Zone {
+        Zone {
+            zone_id: "test-zone".to_string(),
+            display_name: "Test Zone".to_string(),
+            state: "stopped".to_string(),
+            is_next_allowed: true,
+            is_previous_allowed: true,
+            is_pause_allowed: false,
+            is_play_allowed: true,
+            now_playing: None,
+            outputs: vec![Output {
+                output_id: output_id.to_string(),
+                display_name: "Test Output".to_string(),
+                volume: Some(VolumeInfo {
+                    value: volume_value,
+                    min: volume_min,
+                    max: volume_max,
+                    is_muted: None,
+                    step: None,
+                }),
+            }],
+        }
+    }
+
+    #[test]
+    fn roon_zone_to_bus_zone_db_scale_value_none_defaults_to_min() {
+        // dB zone: max <= 0 means dB scale
+        let zone = make_test_zone("output-1", None, Some(-80.0), Some(0.0));
+        let bus_zone = roon_zone_to_bus_zone(&zone);
+
+        let vc = bus_zone.volume_control.expect("should have volume_control");
+        assert_eq!(vc.value, -80.0, "value should default to min for dB zones");
+        assert_eq!(vc.min, -80.0);
+        assert_eq!(vc.max, 0.0);
+        assert_eq!(vc.scale, crate::bus::VolumeScale::Decibel);
+        assert_eq!(vc.step, 1.0, "step should default to 1.0");
+        assert!(!vc.is_muted, "is_muted should default to false");
+        assert_eq!(vc.output_id, Some("roon:output-1".to_string()));
+    }
+
+    #[test]
+    fn roon_zone_to_bus_zone_percent_scale_value_none_defaults_to_min() {
+        // Percentage zone: max > 0 means percentage scale
+        let zone = make_test_zone("output-2", None, Some(0.0), Some(100.0));
+        let bus_zone = roon_zone_to_bus_zone(&zone);
+
+        let vc = bus_zone.volume_control.expect("should have volume_control");
+        assert_eq!(
+            vc.value, 0.0,
+            "value should default to min for percentage zones"
+        );
+        assert_eq!(vc.min, 0.0);
+        assert_eq!(vc.max, 100.0);
+        assert_eq!(vc.scale, crate::bus::VolumeScale::Percentage);
+        assert_eq!(vc.step, 1.0, "step should default to 1.0");
+        assert!(!vc.is_muted, "is_muted should default to false");
+        assert_eq!(vc.output_id, Some("roon:output-2".to_string()));
+    }
+
+    #[test]
+    fn roon_zone_to_bus_zone_preserves_actual_value() {
+        // When value is Some, it should be preserved
+        let zone = make_test_zone("output-3", Some(-30.0), Some(-80.0), Some(0.0));
+        let bus_zone = roon_zone_to_bus_zone(&zone);
+
+        let vc = bus_zone.volume_control.expect("should have volume_control");
+        assert_eq!(vc.value, -30.0, "actual value should be preserved");
+    }
+
+    #[test]
+    fn roon_zone_to_bus_zone_no_volume_returns_none() {
+        // Zone with output but no volume should have volume_control = None
+        let zone = Zone {
+            zone_id: "test-zone".to_string(),
+            display_name: "Test Zone".to_string(),
+            state: "stopped".to_string(),
+            is_next_allowed: true,
+            is_previous_allowed: true,
+            is_pause_allowed: false,
+            is_play_allowed: true,
+            now_playing: None,
+            outputs: vec![Output {
+                output_id: "output-no-vol".to_string(),
+                display_name: "No Volume Output".to_string(),
+                volume: None,
+            }],
+        };
+        let bus_zone = roon_zone_to_bus_zone(&zone);
+
+        assert!(
+            bus_zone.volume_control.is_none(),
+            "should be None when output has no volume"
+        );
+    }
+}

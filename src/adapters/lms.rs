@@ -3,15 +3,41 @@
 //! Implements the JSON-RPC protocol over HTTP and CLI event subscription over TCP.
 //! Documentation: http://HOST:9000/html/docs/cli-api.html
 //!
-//! ## Event-Driven Updates
+//! ## Architecture (Issue #165)
 //!
-//! This adapter supports real-time event notifications via the LMS CLI telnet protocol.
-//! When enabled, the adapter maintains a persistent TCP connection to LMS port 9090 and
-//! subscribes to `playlist,mixer,power,client` events. This dramatically reduces CPU usage
-//! compared to polling, especially with many players (22+).
+//! This module contains two logically separate concerns that share state:
 //!
-//! The polling fallback runs at reduced frequency (15x base interval) when subscription is active.
-//! The base poll interval can be configured via `LMS_POLL_INTERVAL` env var (default: 2 seconds).
+//! 1. **Polling** (HTTP JSON-RPC on port 9000)
+//!    - Discovers LMS server and players
+//!    - Polls player status at configurable interval
+//!    - Primary mechanism - always works
+//!
+//! 2. **CLI Subscription** (TCP telnet on port 9090)
+//!    - Subscribes to real-time events: playlist, mixer, power, client
+//!    - Enhancement for faster updates and lower CPU
+//!    - Optional - polling continues if CLI unavailable
+//!
+//! ## Interaction Model
+//!
+//! The two paths coordinate via a single shared flag: `cli_subscription_active`
+//!
+//! ```text
+//! CLI connects    → flag = true  → Polling slows to 30s interval
+//! CLI fails/exits → flag = false → Polling speeds to 2s interval (immediate)
+//! CLI reconnects  → flag = true  → Polling slows again
+//! ```
+//!
+//! As of Issue #165, these are split into two independent adapters:
+//! - `LmsAdapter`: Polling only
+//! - `LmsCliAdapter`: CLI subscription only
+//!
+//! Each has its own AdapterHandle with independent retry. Use `create_lms_adapters()`
+//! factory function to create both with shared state.
+//!
+//! ## Configuration
+//!
+//! - `LMS_POLL_INTERVAL`: Base poll interval in seconds (default: 2)
+//! - When CLI active, polling runs at 15x base interval (default: 30s)
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -34,6 +60,7 @@ use crate::adapters::lms_discovery::discover_lms_servers;
 use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
 };
+use crate::adapters::Startable;
 use crate::bus::{BusEvent, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl, Zone};
 use crate::config::{get_config_file_path, read_config_file};
 
@@ -85,6 +112,15 @@ const CLI_READ_TIMEOUT: Duration = Duration::from_secs(120);
 // CLI Event Parsing
 // =============================================================================
 
+/// Now playing update data for bus emission
+struct NowPlayingUpdate {
+    player_id: String,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    image_key: Option<String>,
+}
+
 /// Parsed CLI event from LMS
 #[derive(Debug, Clone, PartialEq)]
 pub enum CliEvent {
@@ -102,7 +138,10 @@ pub enum CliEvent {
         player_id: String,
         param: String,
         /// Value is None when parsing fails (avoids silent conversion to 0)
-        value: Option<i32>,
+        /// f32 to support fractional steps (LMS uses 2.5% steps)
+        value: Option<f32>,
+        /// True if value is relative (starts with + or -), false if absolute
+        is_relative: bool,
     },
     /// Power state changed
     Power { player_id: String, state: bool },
@@ -163,12 +202,18 @@ pub fn parse_cli_event(line: &str) -> CliEvent {
         }
         "mixer" => {
             let param = parts.get(2).copied().unwrap_or("volume");
-            let value = parts.get(3).and_then(|s| s.parse().ok());
+            let raw_value = parts.get(3).copied().unwrap_or("");
+            let value: Option<f32> = raw_value.parse().ok();
+
+            // Detect relative values: starts with + OR value is negative
+            // Negative values don't make sense as absolute volumes, so they're always relative
+            let is_relative = raw_value.starts_with('+') || value.map(|v| v < 0.0).unwrap_or(false);
 
             CliEvent::Mixer {
                 player_id,
                 param: param.to_string(),
                 value,
+                is_relative,
             }
         }
         "power" => {
@@ -457,13 +502,20 @@ pub struct LmsStatus {
     pub players: Vec<LmsPlayerInfo>,
     /// Whether CLI subscription is active (real-time events vs polling)
     pub cli_subscription_active: bool,
+    /// Effective poll interval in seconds (2s base, 30s when CLI active)
+    pub poll_interval_secs: u64,
 }
 
+/// Summary information about an LMS player for status reporting
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LmsPlayerInfo {
+    /// Player MAC address identifier
     pub playerid: String,
+    /// Display name of the player
     pub name: String,
+    /// Current playback state (playing, paused, stopped)
     pub state: String,
+    /// Whether the player is connected to LMS
     pub connected: bool,
 }
 
@@ -659,6 +711,12 @@ impl LmsAdapter {
     /// Get connection status
     pub async fn get_status(&self) -> LmsStatus {
         let state = self.state.read().await;
+        let base_interval = get_poll_interval();
+        let effective_interval = if state.cli_subscription_active {
+            get_poll_interval_with_subscription()
+        } else {
+            base_interval
+        };
         LmsStatus {
             connected: state.connected,
             host: state.host.clone(),
@@ -675,6 +733,7 @@ impl LmsAdapter {
                 })
                 .collect(),
             cli_subscription_active: state.cli_subscription_active,
+            poll_interval_secs: effective_interval.as_secs(),
         }
     }
 
@@ -875,8 +934,9 @@ impl LmsAdapter {
 
 /// Convert an LMS player to a unified Zone representation
 fn lms_player_to_zone(player: &LmsPlayer) -> Zone {
+    let zone_id = PrefixedZoneId::lms(&player.playerid).to_string();
     Zone {
-        zone_id: format!("lms:{}", player.playerid),
+        zone_id: zone_id.clone(),
         zone_name: player.name.clone(),
         state: PlaybackState::from(player.state.as_str()),
         volume_control: Some(VolumeControl {
@@ -888,7 +948,8 @@ fn lms_player_to_zone(player: &LmsPlayer) -> Zone {
             step: 2.5,
             is_muted: false, // LMS doesn't expose mute via JSON-RPC status
             scale: crate::bus::VolumeScale::Percentage,
-            output_id: Some(player.playerid.clone()),
+            // Use prefixed zone_id as output_id for consistent aggregator matching
+            output_id: Some(zone_id),
         }),
         now_playing: if !player.title.is_empty() {
             Some(crate::bus::NowPlaying {
@@ -930,6 +991,22 @@ async fn update_players_internal(
     let previous_ids: std::collections::HashSet<String> =
         { state.read().await.players.keys().cloned().collect() };
 
+    // Collect updates to emit after releasing the lock
+    let mut now_playing_updates: Vec<NowPlayingUpdate> = Vec::new();
+    // State updates: (player_id, player_name, state)
+    let mut state_updates: Vec<(String, String, String)> = Vec::new();
+    // VolumeChanged: (player_id, volume)
+    let mut volume_updates: Vec<(String, i32)> = Vec::new();
+
+    // Helper to convert empty strings to None (metadata cleared)
+    let to_option = |s: &str| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    };
+
     for mut player in players {
         match rpc.get_player_status(&player.playerid).await {
             Ok(status) => {
@@ -953,8 +1030,89 @@ async fn update_players_internal(
             }
         }
 
-        let mut state = state.write().await;
-        state.players.insert(player.playerid.clone(), player);
+        // Check what changed for this player
+        let (now_playing_changed, state_changed, volume_changed) = {
+            let s = state.read().await;
+            if let Some(old_player) = s.players.get(&player.playerid) {
+                let np_changed = old_player.title != player.title
+                    || old_player.artist != player.artist
+                    || old_player.album != player.album
+                    || old_player.artwork_url != player.artwork_url
+                    || old_player.coverid != player.coverid;
+                let state_changed = old_player.state != player.state;
+                let volume_changed = old_player.volume != player.volume;
+                (np_changed, state_changed, volume_changed)
+            } else {
+                // New player - will be handled by ZoneDiscovered
+                (false, false, false)
+            }
+        };
+
+        if now_playing_changed {
+            // Emit even when metadata clears (all fields empty) so UI can update
+            now_playing_updates.push(NowPlayingUpdate {
+                player_id: player.playerid.clone(),
+                title: to_option(&player.title),
+                artist: to_option(&player.artist),
+                album: to_option(&player.album),
+                image_key: player.artwork_url.clone().or(player.coverid.clone()),
+            });
+        }
+
+        if state_changed {
+            state_updates.push((
+                player.playerid.clone(),
+                player.name.clone(),
+                player.state.clone(),
+            ));
+        }
+
+        if volume_changed {
+            volume_updates.push((player.playerid.clone(), player.volume));
+        }
+
+        let mut s = state.write().await;
+        s.players.insert(player.playerid.clone(), player);
+    }
+
+    // Emit NowPlayingChanged events for updated players (including metadata clearing)
+    for update in now_playing_updates {
+        debug!(
+            "Polling detected now_playing change for {}: {:?}",
+            update.player_id,
+            update.title.as_deref().unwrap_or("<cleared>")
+        );
+        bus.publish(BusEvent::NowPlayingChanged {
+            zone_id: PrefixedZoneId::lms(&update.player_id),
+            title: update.title,
+            artist: update.artist,
+            album: update.album,
+            image_key: update.image_key,
+        });
+    }
+
+    // Emit state change events (play/pause/stop)
+    for (player_id, player_name, state) in state_updates {
+        debug!("Polling detected state change for {}: {}", player_id, state);
+        // Publish ZoneUpdated so aggregator updates state (SSE uses zone_id prefix to refresh LMS page)
+        bus.publish(BusEvent::ZoneUpdated {
+            zone_id: PrefixedZoneId::lms(&player_id),
+            display_name: player_name,
+            state,
+        });
+    }
+
+    // Emit VolumeChanged events for volume changes
+    for (player_id, volume) in volume_updates {
+        debug!(
+            "Polling detected volume change for {}: {}",
+            player_id, volume
+        );
+        bus.publish(BusEvent::VolumeChanged {
+            output_id: PrefixedZoneId::lms(&player_id).to_string(),
+            value: volume as f32,
+            is_muted: false, // LMS doesn't expose mute via JSON-RPC
+        });
     }
 
     // Emit events for player set changes
@@ -1070,7 +1228,7 @@ async fn run_cli_subscription_once(
     rpc: &LmsRpc,
     shutdown: &CancellationToken,
 ) -> Result<()> {
-    info!("Connecting to LMS CLI at {}:{}", host, CLI_PORT);
+    info!("[CLI] Connecting to LMS CLI at {}:{}", host, CLI_PORT);
     connect_and_subscribe(host, state, bus, rpc, shutdown).await
 }
 
@@ -1085,7 +1243,7 @@ async fn connect_and_subscribe(
     let addr = format!("{}:{}", host, CLI_PORT);
     let stream = TcpStream::connect(&addr).await?;
 
-    info!("Connected to LMS CLI at {}", addr);
+    info!("[CLI] Connected to LMS CLI at {}", addr);
 
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -1096,7 +1254,7 @@ async fn connect_and_subscribe(
     writer.write_all(subscribe_cmd.as_bytes()).await?;
     writer.flush().await?;
 
-    info!("Subscribed to LMS CLI events");
+    info!("[CLI] Subscribed to LMS CLI events");
 
     // Mark subscription as active
     {
@@ -1112,7 +1270,7 @@ async fn connect_and_subscribe(
 
         tokio::select! {
             _ = shutdown.cancelled() => {
-                info!("CLI subscription received shutdown signal");
+                info!("[CLI] Received shutdown signal");
                 return Ok(());
             }
             result = tokio::time::timeout(CLI_READ_TIMEOUT, reader.read_line(&mut line)) => {
@@ -1161,8 +1319,8 @@ async fn handle_cli_event(
                 Ok(status) => {
                     let zone_id = PrefixedZoneId::lms(&player_id);
 
-                    // Update cached state
-                    {
+                    // Update cached state and get player name for ZoneUpdated
+                    let player_name = {
                         let mut s = state.write().await;
                         if let Some(player) = s.players.get_mut(&player_id) {
                             player.state = status.state.clone();
@@ -1175,12 +1333,16 @@ async fn handle_cli_event(
                             player.album = status.album.clone();
                             player.artwork_url = status.artwork_url.clone();
                             player.coverid = status.coverid.clone();
+                            player.name.clone()
+                        } else {
+                            player_id.clone() // Fallback to player_id if not in cache
                         }
-                    }
+                    };
 
-                    // Publish bus events
-                    bus.publish(BusEvent::LmsPlayerStateChanged {
-                        player_id: player_id.clone(),
+                    // Publish ZoneUpdated so aggregator updates state (SSE uses zone_id prefix to refresh LMS page)
+                    bus.publish(BusEvent::ZoneUpdated {
+                        zone_id: zone_id.clone(),
+                        display_name: player_name,
                         state: status.state.clone(),
                     });
 
@@ -1206,6 +1368,7 @@ async fn handle_cli_event(
             player_id,
             param,
             value,
+            is_relative,
         } => {
             // Only process mixer events when value was successfully parsed
             let Some(value) = value else {
@@ -1217,24 +1380,44 @@ async fn handle_cli_event(
             };
 
             if param == "volume" {
-                debug!("Volume change for {}: {}", player_id, value);
+                // Calculate absolute volume:
+                // - If relative, apply delta to cached volume (f32 for fractional steps like 2.5)
+                // - If absolute, use value directly
+                let absolute_volume = if is_relative {
+                    let current = {
+                        let s = state.read().await;
+                        s.players
+                            .get(&player_id)
+                            .map(|p| p.volume as f32)
+                            .unwrap_or(50.0)
+                    };
+                    // Apply relative change and clamp to 0-100 range
+                    (current + value).clamp(0.0, 100.0)
+                } else {
+                    value.clamp(0.0, 100.0)
+                };
 
-                // Update cached state
+                debug!(
+                    "Volume change for {}: {} (is_relative={}, result={})",
+                    player_id, value, is_relative, absolute_volume
+                );
+
+                // Update cached state (rounded to i32 for LMS internal format)
                 {
                     let mut s = state.write().await;
                     if let Some(player) = s.players.get_mut(&player_id) {
-                        player.volume = value;
+                        player.volume = absolute_volume.round() as i32;
                     }
                 }
 
-                // Publish volume changed event
+                // Publish volume changed event with prefixed output_id
                 bus.publish(BusEvent::VolumeChanged {
-                    output_id: player_id,
-                    value: value as f32,
+                    output_id: PrefixedZoneId::lms(&player_id).to_string(),
+                    value: absolute_volume,
                     is_muted: false,
                 });
             } else if param == "muting" {
-                let is_muted = value != 0;
+                let is_muted = value != 0.0;
                 debug!("Mute change for {}: {}", player_id, is_muted);
 
                 // Get current volume from cache for the event
@@ -1243,9 +1426,9 @@ async fn handle_cli_event(
                     s.players.get(&player_id).map(|p| p.volume).unwrap_or(0)
                 };
 
-                // Publish volume changed event with mute state
+                // Publish volume changed event with mute state and prefixed output_id
                 bus.publish(BusEvent::VolumeChanged {
-                    output_id: player_id,
+                    output_id: PrefixedZoneId::lms(&player_id).to_string(),
                     value: current_volume as f32,
                     is_muted,
                 });
@@ -1257,20 +1440,27 @@ async fn handle_cli_event(
         } => {
             debug!("Power change for {}: {}", player_id, power_state);
 
-            // Update cached state
-            {
+            // Update cached state and get player name for ZoneUpdated
+            let player_name = {
                 let mut s = state.write().await;
                 if let Some(player) = s.players.get_mut(&player_id) {
                     player.power = power_state;
+                    player.name.clone()
+                } else {
+                    player_id.clone()
                 }
-            }
+            };
 
             // Publish state change
             // When power turns on, we don't know the actual playback state yet
             // When power turns off, playback is effectively stopped
             if !power_state {
-                bus.publish(BusEvent::LmsPlayerStateChanged {
-                    player_id,
+                let zone_id = PrefixedZoneId::lms(&player_id);
+                // Publish ZoneUpdated so aggregator updates state
+                // Publish ZoneUpdated so aggregator updates state (SSE uses zone_id prefix to refresh LMS page)
+                bus.publish(BusEvent::ZoneUpdated {
+                    zone_id,
+                    display_name: player_name,
                     state: "stopped".to_string(),
                 });
             }
@@ -1405,41 +1595,24 @@ impl AdapterLogic for LmsAdapter {
         ctx.bus
             .publish(BusEvent::LmsConnected { host: host.clone() });
 
-        // Spawn polling as independent background task so it isn't cancelled when CLI ends
-        let polling_state = self.state.clone();
-        let polling_bus = ctx.bus.clone();
-        let polling_rpc = self.rpc.clone();
-        let polling_shutdown = ctx.shutdown.clone();
-        let polling_task = tokio::spawn(async move {
-            run_polling_loop(polling_state, polling_bus, polling_rpc, polling_shutdown).await
-        });
-
-        // Run CLI subscription - failure is non-fatal, polling continues
-        tokio::select! {
-            _ = ctx.shutdown.cancelled() => {
-                info!("LMS adapter received shutdown signal");
-            }
-            result = run_cli_subscription_once(&host, &self.state, &ctx.bus, &self.rpc, &ctx.shutdown) => {
-                if let Err(e) = result {
-                    warn!("CLI subscription failed: {}. Continuing with polling only.", e);
-                    let mut state = self.state.write().await;
-                    state.cli_subscription_active = false;
-                }
-            }
-        }
-
-        // Wait for polling to complete (either shutdown or failure)
-        let result = match polling_task.await {
-            Ok(poll_result) => poll_result,
-            Err(e) => Err(anyhow!("Polling task panicked: {}", e)),
-        };
+        // Run polling loop directly
+        // CLI subscription is now handled by separate LmsCliAdapter (Issue #165)
+        // Polling reads cli_subscription_active flag to adjust interval:
+        // - CLI active (flag=true): slow interval (30s)
+        // - CLI inactive (flag=false): fast interval (2s)
+        let result = run_polling_loop(
+            self.state.clone(),
+            ctx.bus.clone(),
+            self.rpc.clone(),
+            ctx.shutdown.clone(),
+        )
+        .await;
 
         // Clean up state on exit
         {
             let mut state = self.state.write().await;
             state.connected = false;
             state.running = false;
-            state.cli_subscription_active = false;
         }
 
         // Publish LmsDisconnected
@@ -1489,6 +1662,160 @@ impl AdapterLogic for LmsAdapter {
 
 // Startable trait implementation via macro
 crate::impl_startable!(LmsAdapter, "lms", is_configured);
+
+// =============================================================================
+// LMS CLI Adapter - Handles real-time event subscription (Issue #165)
+// =============================================================================
+
+/// LMS CLI Adapter - subscribes to real-time events on port 9090
+///
+/// This adapter runs independently of the main LmsAdapter (polling) with its
+/// own AdapterHandle retry logic. The only coordination is via the shared
+/// `cli_subscription_active` flag in LmsState.
+///
+/// When CLI connects: flag = true → polling slows down
+/// When CLI fails: flag = false → polling speeds up
+#[derive(Clone)]
+pub struct LmsCliAdapter {
+    /// Shared state with LmsAdapter
+    state: Arc<RwLock<LmsState>>,
+    /// Shared RPC client for fetching player status after events
+    rpc: LmsRpc,
+    /// Event bus for publishing updates
+    bus: SharedBus,
+    /// Shutdown token (separate from LmsAdapter's)
+    shutdown: Arc<RwLock<CancellationToken>>,
+    /// Guard against duplicate start() calls
+    running: Arc<RwLock<bool>>,
+}
+
+impl LmsCliAdapter {
+    /// Create CLI adapter with shared state from LmsAdapter
+    /// Use `create_lms_adapters()` factory function instead of calling directly.
+    fn new(state: Arc<RwLock<LmsState>>, rpc: LmsRpc, bus: SharedBus) -> Self {
+        Self {
+            state,
+            rpc,
+            bus,
+            shutdown: Arc::new(RwLock::new(CancellationToken::new())),
+            running: Arc::new(RwLock::new(false)),
+        }
+    }
+
+    /// Check if host is configured (CLI needs host to connect)
+    pub async fn is_configured(&self) -> bool {
+        self.state.read().await.host.is_some()
+    }
+}
+
+#[async_trait]
+impl AdapterLogic for LmsCliAdapter {
+    fn prefix(&self) -> &'static str {
+        "lms" // Same prefix as main adapter - they share zones
+    }
+
+    async fn run(&self, ctx: AdapterContext) -> Result<()> {
+        let host = {
+            let state = self.state.read().await;
+            state.host.clone()
+        };
+
+        let Some(host) = host else {
+            return Err(anyhow!("LMS CLI: No host configured"));
+        };
+
+        info!("[CLI] LMS CLI adapter starting for {}", host);
+
+        // Run CLI subscription - this will retry via AdapterHandle on failure
+        let result =
+            run_cli_subscription_once(&host, &self.state, &ctx.bus, &self.rpc, &ctx.shutdown).await;
+
+        // Always reset flag on exit so polling switches to fast interval
+        {
+            let mut state = self.state.write().await;
+            state.cli_subscription_active = false;
+        }
+
+        result
+    }
+
+    async fn handle_command(
+        &self,
+        _zone_id: &str,
+        _command: AdapterCommand,
+    ) -> Result<AdapterCommandResponse> {
+        // CLI adapter doesn't handle commands - main LmsAdapter does
+        Ok(AdapterCommandResponse {
+            success: false,
+            error: Some("CLI adapter does not handle commands".to_string()),
+        })
+    }
+}
+
+#[async_trait]
+impl Startable for LmsCliAdapter {
+    fn name(&self) -> &'static str {
+        "lms-cli"
+    }
+
+    async fn start(&self) -> Result<()> {
+        if !self.is_configured().await {
+            return Err(anyhow!("LMS CLI adapter not configured"));
+        }
+
+        // Guard against duplicate start() calls
+        {
+            let mut running = self.running.write().await;
+            if *running {
+                debug!("[CLI] LMS CLI adapter already running, skipping start");
+                return Ok(());
+            }
+            *running = true;
+        }
+
+        // Create fresh cancellation token
+        let shutdown = {
+            let mut token = self.shutdown.write().await;
+            *token = CancellationToken::new();
+            token.clone()
+        };
+
+        // Create AdapterHandle and spawn with retry
+        let adapter = self.clone();
+        let bus = self.bus.clone();
+        let running_flag = self.running.clone();
+        let handle = AdapterHandle::new(adapter, bus, shutdown);
+
+        tokio::spawn(async move {
+            let _ = handle.run_with_retry(RetryConfig::default()).await;
+            // Reset running flag when task completes
+            *running_flag.write().await = false;
+        });
+
+        Ok(())
+    }
+
+    async fn stop(&self) {
+        self.shutdown.read().await.cancel();
+    }
+
+    async fn can_start(&self) -> bool {
+        self.is_configured().await
+    }
+}
+
+/// Factory function to create both LMS adapters with shared state
+///
+/// Returns (LmsAdapter, LmsCliAdapter) that share state and can be
+/// registered independently with the coordinator.
+pub fn create_lms_adapters(bus: SharedBus) -> (Arc<LmsAdapter>, Arc<LmsCliAdapter>) {
+    let lms = Arc::new(LmsAdapter::new(bus.clone()));
+
+    // Create CLI adapter with shared state
+    let cli = Arc::new(LmsCliAdapter::new(lms.state.clone(), lms.rpc.clone(), bus));
+
+    (lms, cli)
+}
 
 // =============================================================================
 // Tests
@@ -1545,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cli_event_mixer_volume() {
+    fn test_parse_cli_event_mixer_volume_absolute() {
         let line = "00%3A04%3A20%3Aaa%3Abb%3Acc mixer volume 75";
         let event = parse_cli_event(line);
 
@@ -1554,10 +1881,44 @@ mod tests {
                 player_id,
                 param,
                 value,
+                is_relative,
             } => {
                 assert_eq!(player_id, "00:04:20:aa:bb:cc");
                 assert_eq!(param, "volume");
-                assert_eq!(value, Some(75));
+                assert_eq!(value, Some(75.0));
+                assert!(!is_relative, "75 should be absolute (no sign prefix)");
+            }
+            _ => panic!("Expected Mixer event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_mixer_volume_relative_positive() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc mixer volume +2.5";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Mixer {
+                value, is_relative, ..
+            } => {
+                assert_eq!(value, Some(2.5));
+                assert!(is_relative, "+2.5 should be relative");
+            }
+            _ => panic!("Expected Mixer event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_mixer_volume_relative_negative() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc mixer volume -3";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Mixer {
+                value, is_relative, ..
+            } => {
+                assert_eq!(value, Some(-3.0));
+                assert!(is_relative, "-3 should be relative");
             }
             _ => panic!("Expected Mixer event, got {:?}", event),
         }
@@ -1658,10 +2019,12 @@ mod tests {
                 player_id,
                 param,
                 value,
+                is_relative,
             } => {
                 assert_eq!(player_id, "00:04:20:aa:bb:cc");
                 assert_eq!(param, "volume");
-                assert_eq!(value, Some(50));
+                assert_eq!(value, Some(50.0));
+                assert!(!is_relative);
             }
             _ => panic!("Expected Mixer event, got {:?}", event),
         }
@@ -1718,7 +2081,7 @@ mod tests {
         match event {
             CliEvent::Mixer { param, value, .. } => {
                 assert_eq!(param, "muting");
-                assert_eq!(value, Some(1));
+                assert_eq!(value, Some(1.0));
             }
             _ => panic!("Expected Mixer event, got {:?}", event),
         }

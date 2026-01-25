@@ -883,7 +883,8 @@ fn upnp_renderer_to_zone(renderer: &UPnPRenderer) -> Zone {
             step: 1.0,
             is_muted: renderer.muted,
             scale: crate::bus::VolumeScale::Percentage,
-            output_id: Some(renderer.uuid.clone()),
+            // Use prefixed output_id for consistent aggregator matching
+            output_id: Some(format!("upnp:{}", renderer.uuid)),
         }),
         now_playing: None, // UPnP track info would need separate DIDL-Lite parsing
         source: "upnp".to_string(),

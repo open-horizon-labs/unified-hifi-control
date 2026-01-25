@@ -113,13 +113,29 @@ pub struct LmsConfig {
     pub connected: bool,
     pub host: Option<String>,
     pub port: Option<u16>,
+    /// Whether CLI subscription is active (real-time events vs polling-only)
+    #[serde(default)]
+    pub cli_subscription_active: bool,
+    /// Current poll interval in seconds (2s when CLI down, 30s when CLI up)
+    #[serde(default)]
+    pub poll_interval_secs: u64,
+}
+
+/// Wrapper for /lms/players response
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LmsPlayersResponse {
+    pub players: Vec<LmsPlayer>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct LmsPlayer {
+    /// Player ID (MAC address) - API returns "playerid" field
+    #[serde(alias = "playerid")]
     pub player_id: String,
     pub name: String,
     pub mode: String,
+    /// Current track title - API returns "title" field
+    #[serde(alias = "title")]
     pub current_title: Option<String>,
     pub artist: Option<String>,
     pub volume: i32,

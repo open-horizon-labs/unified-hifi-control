@@ -23,6 +23,13 @@ Use GitHub for all task tracking:
 - Describe what changed and how to test
 - Request review from coderabbit and superego
 
+### Git Workflow
+**DO NOT force push (`git push --force` or `git push -f`)**
+- This project uses squash merges, so commit history cleanup is unnecessary
+- Force pushing breaks checkouts for anyone tracking the branch
+- Force pushing loses SHA references (builds, comments, reviews)
+- Just push new commits - they all get squashed on merge anyway
+
 ---
 
 ## Code Review

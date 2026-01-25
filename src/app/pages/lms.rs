@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 
-use crate::app::api::{AppSettings, LmsConfig, LmsPlayer};
+use crate::app::api::{AppSettings, LmsConfig, LmsPlayer, LmsPlayersResponse};
 use crate::app::components::Layout;
 use crate::app::sse::use_sse;
 
@@ -48,11 +48,12 @@ pub fn Lms() -> Element {
             .ok()
     });
 
-    // Load players resource
+    // Load players resource (API returns { players: [...] })
     let mut players = use_resource(|| async {
-        crate::app::api::fetch_json::<Vec<LmsPlayer>>("/lms/players")
+        crate::app::api::fetch_json::<LmsPlayersResponse>("/lms/players")
             .await
             .ok()
+            .map(|r| r.players)
     });
 
     // Check if LMS is enabled
@@ -150,8 +151,20 @@ pub fn Lms() -> Element {
                     div { class: "mb-4",
                         if let Some(ref c) = cfg {
                             if c.configured && c.connected {
-                                span { class: "status-ok",
-                                    "✓ Connected to {c.host.as_deref().unwrap_or(\"\")}:{c.port.unwrap_or(9000)}"
+                                div {
+                                    span { class: "status-ok",
+                                        "✓ Connected to {c.host.as_deref().unwrap_or(\"\")}:{c.port.unwrap_or(9000)}"
+                                    }
+                                }
+                                // Debug info: CLI subscription and polling
+                                div { class: "text-sm text-muted mt-1",
+                                    if c.cli_subscription_active {
+                                        span { class: "text-green-600", "CLI: active" }
+                                    } else {
+                                        span { class: "text-yellow-600", "CLI: inactive (polling only)" }
+                                    }
+                                    span { class: "mx-2", "•" }
+                                    span { "Poll: {c.poll_interval_secs}s" }
                                 }
                             } else if c.configured {
                                 span { class: "status-err",

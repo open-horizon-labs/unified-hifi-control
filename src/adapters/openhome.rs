@@ -950,7 +950,8 @@ fn openhome_device_to_zone(device: &OpenHomeDevice) -> Zone {
                 step,
                 is_muted: device.muted,
                 scale: crate::bus::VolumeScale::Percentage,
-                output_id: Some(device.uuid.clone()),
+                // Use prefixed output_id for consistent aggregator matching
+                output_id: Some(format!("openhome:{}", device.uuid)),
             }
         }),
         now_playing: device.track_info.as_ref().map(|t| crate::bus::NowPlaying {

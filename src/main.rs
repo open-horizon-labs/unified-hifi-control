@@ -124,10 +124,17 @@ mod server {
         // Create all adapter instances (needed for API handlers regardless of state)
         // =========================================================================
 
+        // Initialize Knob device store early (needed for Roon extension status)
+        // Issue #76: Uses config subdirectory for knobs.json
+        let knob_store = knobs::KnobStore::new();
+        tracing::info!("Knob store initialized");
+
         // Roon adapter - coordinator handles starting based on enabled state
+        // Issue #169: Pass knob_store for controller count in extension status
         let roon = Arc::new(adapters::roon::RoonAdapter::new_configured(
             bus.clone(),
             base_url.clone(),
+            knob_store.clone(),
         ));
 
         // HQPlayer instance manager (multi-instance support, no settings toggle)
@@ -186,8 +193,9 @@ mod server {
             tracing::info!("HQPlayer: {} zone link(s) active", link_count);
         }
 
-        // LMS adapter
-        let lms = Arc::new(adapters::lms::LmsAdapter::new(bus.clone()));
+        // LMS adapters (polling + CLI subscription with shared state)
+        // Issue #165: Split into two adapters with independent retry
+        let (lms, lms_cli) = adapters::lms::create_lms_adapters(bus.clone());
         if let Some(ref lms_config) = config.lms {
             lms.configure(
                 lms_config.host.clone(),
@@ -209,8 +217,14 @@ mod server {
         // =========================================================================
 
         // Build list of startable adapters
-        let startable_adapters: Vec<Arc<dyn adapters::Startable>> =
-            vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
+        // Note: lms_cli shares config with lms - both start when LMS is configured
+        let startable_adapters: Vec<Arc<dyn adapters::Startable>> = vec![
+            roon.clone(),
+            lms.clone(),
+            lms_cli.clone(),
+            openhome.clone(),
+            upnp.clone(),
+        ];
 
         // Single loop to start all enabled adapters
         coord.start_all_enabled(&startable_adapters).await;
@@ -222,11 +236,6 @@ mod server {
             aggregator_for_spawn.run().await;
         });
         tracing::info!("ZoneAggregator started");
-
-        // Initialize Knob device store
-        // Issue #76: Uses config subdirectory for knobs.json
-        let knob_store = knobs::KnobStore::new();
-        tracing::info!("Knob store initialized");
 
         // Clone Roon adapter for shutdown access (cheap - just Arc clones)
         let roon_for_shutdown = roon.clone();

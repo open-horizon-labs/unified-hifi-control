@@ -122,7 +122,6 @@ impl SseContext {
                     | SseEvent::RoonDisconnected
                     | SseEvent::LmsConnected
                     | SseEvent::LmsDisconnected
-                    | SseEvent::LmsPlayerStateChanged { .. }
             )
         )
     }
@@ -147,14 +146,13 @@ impl SseContext {
     }
 
     pub fn should_refresh_lms(&self) -> bool {
-        matches!(
-            self.last_event.read().as_ref(),
-            Some(
-                SseEvent::LmsConnected
-                    | SseEvent::LmsDisconnected
-                    | SseEvent::LmsPlayerStateChanged { .. }
-            )
-        )
+        let event = self.last_event.read();
+        match event.as_ref() {
+            Some(SseEvent::LmsConnected | SseEvent::LmsDisconnected) => true,
+            // ZoneUpdated with lms: prefix indicates LMS player state change
+            Some(SseEvent::ZoneUpdated { payload }) => payload.zone_id.starts_with("lms:"),
+            _ => false,
+        }
     }
 
     pub fn should_refresh_discovery(&self) -> bool {
