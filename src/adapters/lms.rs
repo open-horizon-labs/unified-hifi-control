@@ -138,7 +138,10 @@ pub enum CliEvent {
         player_id: String,
         param: String,
         /// Value is None when parsing fails (avoids silent conversion to 0)
-        value: Option<i32>,
+        /// f32 to support fractional steps (LMS uses 2.5% steps)
+        value: Option<f32>,
+        /// True if value is relative (starts with + or -), false if absolute
+        is_relative: bool,
     },
     /// Power state changed
     Power { player_id: String, state: bool },
@@ -199,12 +202,18 @@ pub fn parse_cli_event(line: &str) -> CliEvent {
         }
         "mixer" => {
             let param = parts.get(2).copied().unwrap_or("volume");
-            let value = parts.get(3).and_then(|s| s.parse().ok());
+            let raw_value = parts.get(3).copied().unwrap_or("");
+            let value: Option<f32> = raw_value.parse().ok();
+
+            // Detect relative values: starts with + OR value is negative
+            // Negative values don't make sense as absolute volumes, so they're always relative
+            let is_relative = raw_value.starts_with('+') || value.map(|v| v < 0.0).unwrap_or(false);
 
             CliEvent::Mixer {
                 player_id,
                 param: param.to_string(),
                 value,
+                is_relative,
             }
         }
         "power" => {
@@ -1357,6 +1366,7 @@ async fn handle_cli_event(
             player_id,
             param,
             value,
+            is_relative,
         } => {
             // Only process mixer events when value was successfully parsed
             let Some(value) = value else {
@@ -1368,24 +1378,44 @@ async fn handle_cli_event(
             };
 
             if param == "volume" {
-                debug!("Volume change for {}: {}", player_id, value);
+                // Calculate absolute volume:
+                // - If relative, apply delta to cached volume (f32 for fractional steps like 2.5)
+                // - If absolute, use value directly
+                let absolute_volume = if is_relative {
+                    let current = {
+                        let s = state.read().await;
+                        s.players
+                            .get(&player_id)
+                            .map(|p| p.volume as f32)
+                            .unwrap_or(50.0)
+                    };
+                    // Apply relative change and clamp to 0-100 range
+                    (current + value).clamp(0.0, 100.0)
+                } else {
+                    value.clamp(0.0, 100.0)
+                };
 
-                // Update cached state
+                debug!(
+                    "Volume change for {}: {} (is_relative={}, result={})",
+                    player_id, value, is_relative, absolute_volume
+                );
+
+                // Update cached state (rounded to i32 for LMS internal format)
                 {
                     let mut s = state.write().await;
                     if let Some(player) = s.players.get_mut(&player_id) {
-                        player.volume = value;
+                        player.volume = absolute_volume.round() as i32;
                     }
                 }
 
                 // Publish volume changed event
                 bus.publish(BusEvent::VolumeChanged {
                     output_id: player_id,
-                    value: value as f32,
+                    value: absolute_volume,
                     is_muted: false,
                 });
             } else if param == "muting" {
-                let is_muted = value != 0;
+                let is_muted = value != 0.0;
                 debug!("Mute change for {}: {}", player_id, is_muted);
 
                 // Get current volume from cache for the event
@@ -1840,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cli_event_mixer_volume() {
+    fn test_parse_cli_event_mixer_volume_absolute() {
         let line = "00%3A04%3A20%3Aaa%3Abb%3Acc mixer volume 75";
         let event = parse_cli_event(line);
 
@@ -1849,10 +1879,44 @@ mod tests {
                 player_id,
                 param,
                 value,
+                is_relative,
             } => {
                 assert_eq!(player_id, "00:04:20:aa:bb:cc");
                 assert_eq!(param, "volume");
-                assert_eq!(value, Some(75));
+                assert_eq!(value, Some(75.0));
+                assert!(!is_relative, "75 should be absolute (no sign prefix)");
+            }
+            _ => panic!("Expected Mixer event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_mixer_volume_relative_positive() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc mixer volume +2.5";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Mixer {
+                value, is_relative, ..
+            } => {
+                assert_eq!(value, Some(2.5));
+                assert!(is_relative, "+2.5 should be relative");
+            }
+            _ => panic!("Expected Mixer event, got {:?}", event),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_event_mixer_volume_relative_negative() {
+        let line = "00%3A04%3A20%3Aaa%3Abb%3Acc mixer volume -3";
+        let event = parse_cli_event(line);
+
+        match event {
+            CliEvent::Mixer {
+                value, is_relative, ..
+            } => {
+                assert_eq!(value, Some(-3.0));
+                assert!(is_relative, "-3 should be relative");
             }
             _ => panic!("Expected Mixer event, got {:?}", event),
         }
@@ -1953,10 +2017,12 @@ mod tests {
                 player_id,
                 param,
                 value,
+                is_relative,
             } => {
                 assert_eq!(player_id, "00:04:20:aa:bb:cc");
                 assert_eq!(param, "volume");
-                assert_eq!(value, Some(50));
+                assert_eq!(value, Some(50.0));
+                assert!(!is_relative);
             }
             _ => panic!("Expected Mixer event, got {:?}", event),
         }
@@ -2013,7 +2079,7 @@ mod tests {
         match event {
             CliEvent::Mixer { param, value, .. } => {
                 assert_eq!(param, "muting");
-                assert_eq!(value, Some(1));
+                assert_eq!(value, Some(1.0));
             }
             _ => panic!("Expected Mixer event, got {:?}", event),
         }
