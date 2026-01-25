@@ -124,10 +124,17 @@ mod server {
         // Create all adapter instances (needed for API handlers regardless of state)
         // =========================================================================
 
+        // Initialize Knob device store early (needed for Roon extension status)
+        // Issue #76: Uses config subdirectory for knobs.json
+        let knob_store = knobs::KnobStore::new();
+        tracing::info!("Knob store initialized");
+
         // Roon adapter - coordinator handles starting based on enabled state
+        // Issue #169: Pass knob_store for controller count in extension status
         let roon = Arc::new(adapters::roon::RoonAdapter::new_configured(
             bus.clone(),
             base_url.clone(),
+            knob_store.clone(),
         ));
 
         // HQPlayer instance manager (multi-instance support, no settings toggle)
@@ -229,11 +236,6 @@ mod server {
             aggregator_for_spawn.run().await;
         });
         tracing::info!("ZoneAggregator started");
-
-        // Initialize Knob device store
-        // Issue #76: Uses config subdirectory for knobs.json
-        let knob_store = knobs::KnobStore::new();
-        tracing::info!("Knob store initialized");
 
         // Clone Roon adapter for shutdown access (cheap - just Arc clones)
         let roon_for_shutdown = roon.clone();
