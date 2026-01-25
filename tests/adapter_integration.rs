@@ -182,6 +182,93 @@ mod lms_integration {
         let result = adapter.change_volume("player-1", 50.0, false).await;
         assert!(result.is_err());
     }
+
+    /// Regression test for PR #164: Polling emits NowPlayingChanged events
+    /// including metadata clearing (title/artist/album become None)
+    ///
+    /// This test verifies the update_players() method emits proper bus events
+    /// when metadata changes, including when metadata is cleared.
+    #[tokio::test]
+    async fn polling_emits_now_playing_changed_including_cleared() {
+        use mock_servers::lms::MockLmsServer;
+
+        // Start mock LMS server
+        let server = MockLmsServer::start().await;
+        let player_id = "aa:bb:cc:dd:ee:ff";
+        server.add_player(player_id, "Test Player").await;
+
+        // Create adapter and subscribe to bus events
+        let (bus, mut rx) = test_bus();
+        let adapter = LmsAdapter::new(bus.clone());
+
+        // Configure adapter to connect to mock server
+        let addr = server.addr();
+        adapter
+            .configure(addr.ip().to_string(), Some(addr.port()), None, None)
+            .await;
+
+        // First update - establishes baseline (emits ZoneDiscovered)
+        adapter.update_players().await.expect("initial update");
+
+        // Drain any initial events (ZoneDiscovered, etc.)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while rx.try_recv().is_ok() {}
+
+        // Set now playing info on mock server
+        server
+            .set_now_playing(player_id, "Test Song", "Test Artist", "Test Album")
+            .await;
+        server.set_mode(player_id, "play").await;
+
+        // Second update - should emit NowPlayingChanged with track info
+        adapter.update_players().await.expect("update with track");
+
+        // Check for NowPlayingChanged event with track info
+        let event = expect_event(
+            &mut rx,
+            |e| matches!(e, BusEvent::NowPlayingChanged { title: Some(t), .. } if t == "Test Song"),
+            1000,
+        )
+        .await;
+        assert!(
+            event.is_some(),
+            "Expected NowPlayingChanged with track info"
+        );
+
+        // Clear metadata on mock server (simulating track stop)
+        server.set_now_playing(player_id, "", "", "").await;
+        server.set_mode(player_id, "stop").await;
+
+        // Third update - should emit NowPlayingChanged with cleared metadata (None values)
+        adapter.update_players().await.expect("update with cleared");
+
+        // Check for NowPlayingChanged event with cleared metadata
+        let cleared_event = expect_event(
+            &mut rx,
+            |e| matches!(e, BusEvent::NowPlayingChanged { title: None, .. }),
+            1000,
+        )
+        .await;
+        assert!(
+            cleared_event.is_some(),
+            "Expected NowPlayingChanged with cleared metadata (title: None)"
+        );
+
+        // Verify the cleared event has all None values
+        if let Some(BusEvent::NowPlayingChanged {
+            title,
+            artist,
+            album,
+            ..
+        }) = cleared_event
+        {
+            assert!(title.is_none(), "title should be None when cleared");
+            assert!(artist.is_none(), "artist should be None when cleared");
+            assert!(album.is_none(), "album should be None when cleared");
+        }
+
+        server.stop().await;
+    }
 }
 
 // =============================================================================
