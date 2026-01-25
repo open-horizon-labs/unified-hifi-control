@@ -121,11 +121,21 @@ pub struct LmsConfig {
     pub poll_interval_secs: u64,
 }
 
+/// Wrapper for /lms/players response
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LmsPlayersResponse {
+    pub players: Vec<LmsPlayer>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct LmsPlayer {
+    /// Player ID (MAC address) - API returns "playerid" field
+    #[serde(alias = "playerid")]
     pub player_id: String,
     pub name: String,
     pub mode: String,
+    /// Current track title - API returns "title" field
+    #[serde(alias = "title")]
     pub current_title: Option<String>,
     pub artist: Option<String>,
     pub volume: i32,

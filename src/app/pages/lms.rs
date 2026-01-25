@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 
-use crate::app::api::{AppSettings, LmsConfig, LmsPlayer};
+use crate::app::api::{AppSettings, LmsConfig, LmsPlayer, LmsPlayersResponse};
 use crate::app::components::Layout;
 use crate::app::sse::use_sse;
 
@@ -48,11 +48,12 @@ pub fn Lms() -> Element {
             .ok()
     });
 
-    // Load players resource
+    // Load players resource (API returns { players: [...] })
     let mut players = use_resource(|| async {
-        crate::app::api::fetch_json::<Vec<LmsPlayer>>("/lms/players")
+        crate::app::api::fetch_json::<LmsPlayersResponse>("/lms/players")
             .await
             .ok()
+            .map(|r| r.players)
     });
 
     // Check if LMS is enabled
