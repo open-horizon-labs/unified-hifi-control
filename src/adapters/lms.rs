@@ -3,15 +3,38 @@
 //! Implements the JSON-RPC protocol over HTTP and CLI event subscription over TCP.
 //! Documentation: http://HOST:9000/html/docs/cli-api.html
 //!
-//! ## Event-Driven Updates
+//! ## Architecture (Issue #165)
 //!
-//! This adapter supports real-time event notifications via the LMS CLI telnet protocol.
-//! When enabled, the adapter maintains a persistent TCP connection to LMS port 9090 and
-//! subscribes to `playlist,mixer,power,client` events. This dramatically reduces CPU usage
-//! compared to polling, especially with many players (22+).
+//! This module contains two logically separate concerns that share state:
 //!
-//! The polling fallback runs at reduced frequency (15x base interval) when subscription is active.
-//! The base poll interval can be configured via `LMS_POLL_INTERVAL` env var (default: 2 seconds).
+//! 1. **Polling** (HTTP JSON-RPC on port 9000)
+//!    - Discovers LMS server and players
+//!    - Polls player status at configurable interval
+//!    - Primary mechanism - always works
+//!
+//! 2. **CLI Subscription** (TCP telnet on port 9090)
+//!    - Subscribes to real-time events: playlist, mixer, power, client
+//!    - Enhancement for faster updates and lower CPU
+//!    - Optional - polling continues if CLI unavailable
+//!
+//! ## Interaction Model
+//!
+//! The two paths coordinate via a single shared flag: `cli_subscription_active`
+//!
+//! ```text
+//! CLI connects    → flag = true  → Polling slows to 30s interval
+//! CLI fails/exits → flag = false → Polling speeds to 2s interval (immediate)
+//! CLI reconnects  → flag = true  → Polling slows again
+//! ```
+//!
+//! Currently both run within a single adapter. Future refactor (Issue #165) will
+//! split into two independent adapters, each with AdapterHandle retry, sharing
+//! only the `cli_subscription_active` flag.
+//!
+//! ## Configuration
+//!
+//! - `LMS_POLL_INTERVAL`: Base poll interval in seconds (default: 2)
+//! - When CLI active, polling runs at 15x base interval (default: 30s)
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -84,6 +107,15 @@ const CLI_READ_TIMEOUT: Duration = Duration::from_secs(120);
 // =============================================================================
 // CLI Event Parsing
 // =============================================================================
+
+/// Now playing update data for bus emission
+struct NowPlayingUpdate {
+    player_id: String,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    image_key: Option<String>,
+}
 
 /// Parsed CLI event from LMS
 #[derive(Debug, Clone, PartialEq)]
@@ -930,6 +962,22 @@ async fn update_players_internal(
     let previous_ids: std::collections::HashSet<String> =
         { state.read().await.players.keys().cloned().collect() };
 
+    // Collect updates to emit after releasing the lock
+    let mut now_playing_updates: Vec<NowPlayingUpdate> = Vec::new();
+    // LmsPlayerStateChanged: (player_id, state)
+    let mut state_updates: Vec<(String, String)> = Vec::new();
+    // VolumeChanged: (player_id, volume)
+    let mut volume_updates: Vec<(String, i32)> = Vec::new();
+
+    // Helper to convert empty strings to None (metadata cleared)
+    let to_option = |s: &str| {
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
+    };
+
     for mut player in players {
         match rpc.get_player_status(&player.playerid).await {
             Ok(status) => {
@@ -953,8 +1001,80 @@ async fn update_players_internal(
             }
         }
 
-        let mut state = state.write().await;
-        state.players.insert(player.playerid.clone(), player);
+        // Check what changed for this player
+        let (now_playing_changed, state_changed, volume_changed) = {
+            let s = state.read().await;
+            if let Some(old_player) = s.players.get(&player.playerid) {
+                let np_changed = old_player.title != player.title
+                    || old_player.artist != player.artist
+                    || old_player.album != player.album
+                    || old_player.artwork_url != player.artwork_url
+                    || old_player.coverid != player.coverid;
+                let state_changed = old_player.state != player.state;
+                let volume_changed = old_player.volume != player.volume;
+                (np_changed, state_changed, volume_changed)
+            } else {
+                // New player - will be handled by ZoneDiscovered
+                (false, false, false)
+            }
+        };
+
+        if now_playing_changed {
+            // Emit even when metadata clears (all fields empty) so UI can update
+            now_playing_updates.push(NowPlayingUpdate {
+                player_id: player.playerid.clone(),
+                title: to_option(&player.title),
+                artist: to_option(&player.artist),
+                album: to_option(&player.album),
+                image_key: player.artwork_url.clone().or(player.coverid.clone()),
+            });
+        }
+
+        if state_changed {
+            state_updates.push((player.playerid.clone(), player.state.clone()));
+        }
+
+        if volume_changed {
+            volume_updates.push((player.playerid.clone(), player.volume));
+        }
+
+        let mut s = state.write().await;
+        s.players.insert(player.playerid.clone(), player);
+    }
+
+    // Emit NowPlayingChanged events for updated players (including metadata clearing)
+    for update in now_playing_updates {
+        debug!(
+            "Polling detected now_playing change for {}: {:?}",
+            update.player_id,
+            update.title.as_deref().unwrap_or("<cleared>")
+        );
+        bus.publish(BusEvent::NowPlayingChanged {
+            zone_id: PrefixedZoneId::lms(&update.player_id),
+            title: update.title,
+            artist: update.artist,
+            album: update.album,
+            image_key: update.image_key,
+        });
+    }
+
+    // Emit LmsPlayerStateChanged events for state changes (play/pause/stop)
+    for (player_id, state) in state_updates {
+        debug!("Polling detected state change for {}: {}", player_id, state);
+        bus.publish(BusEvent::LmsPlayerStateChanged { player_id, state });
+    }
+
+    // Emit VolumeChanged events for volume changes
+    for (player_id, volume) in volume_updates {
+        debug!(
+            "Polling detected volume change for {}: {}",
+            player_id, volume
+        );
+        bus.publish(BusEvent::VolumeChanged {
+            output_id: format!("lms:{}", player_id),
+            value: volume as f32,
+            is_muted: false, // LMS doesn't expose mute via JSON-RPC
+        });
     }
 
     // Emit events for player set changes
@@ -1405,7 +1525,8 @@ impl AdapterLogic for LmsAdapter {
         ctx.bus
             .publish(BusEvent::LmsConnected { host: host.clone() });
 
-        // Spawn polling as independent background task so it isn't cancelled when CLI ends
+        // Spawn polling task - starts at FAST interval (2s) since CLI not yet active
+        // Will switch to SLOW interval (30s) when CLI connects successfully
         let polling_state = self.state.clone();
         let polling_bus = ctx.bus.clone();
         let polling_rpc = self.rpc.clone();
@@ -1414,25 +1535,68 @@ impl AdapterLogic for LmsAdapter {
             run_polling_loop(polling_state, polling_bus, polling_rpc, polling_shutdown).await
         });
 
-        // Run CLI subscription - failure is non-fatal, polling continues
-        tokio::select! {
+        // Attempt CLI subscription - failure is NON-FATAL, polling continues
+        // CLI provides real-time events; if unavailable, polling handles everything
+        //
+        // DESIGN CHOICE: CLI does NOT retry independently within this adapter run.
+        // Rationale (see PR #164 for full discussion):
+        // - Polling is the primary mechanism and always works
+        // - CLI is an optimization, not a requirement
+        // - If CLI fails, polling switches to fast interval (2s) and handles updates
+        // - CLI gets a fresh attempt on next adapter restart (via AdapterHandle retry)
+        // - This avoids duplicate retry logic (AdapterHandle already handles retries)
+        // - Simpler code, single source of retry policy
+        let cli_task = {
+            let cli_state = self.state.clone();
+            let cli_bus = ctx.bus.clone();
+            let cli_rpc = self.rpc.clone();
+            let cli_shutdown = ctx.shutdown.clone();
+            let cli_host = host.clone();
+            tokio::spawn(async move {
+                match run_cli_subscription_once(
+                    &cli_host,
+                    &cli_state,
+                    &cli_bus,
+                    &cli_rpc,
+                    &cli_shutdown,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        info!("CLI subscription ended cleanly");
+                    }
+                    Err(e) => {
+                        warn!(
+                            "CLI subscription failed: {}. Continuing with polling only.",
+                            e
+                        );
+                    }
+                }
+                // Always reset cli_subscription_active so polling switches to fast interval
+                let mut state = cli_state.write().await;
+                state.cli_subscription_active = false;
+            })
+        };
+
+        // Wait for polling to complete (or fail) - CLI runs independently
+        // Only polling failure triggers adapter restart
+        let result = tokio::select! {
             _ = ctx.shutdown.cancelled() => {
                 info!("LMS adapter received shutdown signal");
+                Ok(())
             }
-            result = run_cli_subscription_once(&host, &self.state, &ctx.bus, &self.rpc, &ctx.shutdown) => {
-                if let Err(e) = result {
-                    warn!("CLI subscription failed: {}. Continuing with polling only.", e);
-                    let mut state = self.state.write().await;
-                    state.cli_subscription_active = false;
+            result = polling_task => {
+                // Polling completed or failed
+                match result {
+                    Ok(r) => r,
+                    Err(e) => Err(anyhow!("Polling task panicked: {}", e)),
                 }
             }
-        }
-
-        // Wait for polling to complete (either shutdown or failure)
-        let result = match polling_task.await {
-            Ok(poll_result) => poll_result,
-            Err(e) => Err(anyhow!("Polling task panicked: {}", e)),
         };
+
+        // Clean up CLI task
+        cli_task.abort();
+        let _ = cli_task.await;
 
         // Clean up state on exit
         {
