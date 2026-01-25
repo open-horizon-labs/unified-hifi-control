@@ -1,0 +1,5 @@
+#!/bin/bash
+# Pre-installation script
+# Runs before package files are extracted
+
+exit 0

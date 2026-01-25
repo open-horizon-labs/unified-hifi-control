@@ -1,6 +1,5 @@
 {
     "port-config": {
-        "protocol-file": "etc/protocol",
         "port-forward": {
             "rules": [{
                 "port": 8088,
@@ -8,18 +7,5 @@
                 "name": "Web UI"
             }]
         }
-    },
-    "webservice": {
-        "services": [{
-            "service": "unified-hifi-control",
-            "display_name": "Unified Hi-Fi Control",
-            "support_alias": false,
-            "support_server": false,
-            "type": "proxy",
-            "backend": 0,
-            "root": "ui",
-            "backend_port": 8088,
-            "icon": "PACKAGE_ICON.PNG"
-        }]
     }
 }

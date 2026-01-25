@@ -1212,9 +1212,11 @@ jobs:
       matrix:
         include:
           - arch: apollolake
+            cpu_arch: x86_64
             target: x86_64-unknown-linux-musl
             binary: unified-hifi-linux-x64
           - arch: rtd1296
+            cpu_arch: armv8
             target: aarch64-unknown-linux-musl
             binary: unified-hifi-linux-arm64
     steps:
@@ -1247,17 +1249,26 @@ jobs:
       - name: Build Synology SPK
         run: |
           cd build/synology
+
+          # Create package.tgz with binary
           tar -czf package.tgz -C package .
+
+          # Add extractsize to INFO (package.tgz size in KB)
+          EXTRACT_SIZE=$(du -k package.tgz | cut -f1)
+          echo "extractsize=\"${EXTRACT_SIZE}\"" >> INFO
+
+          # Create SPK (exclude empty WIZARD_UIFILES - optional component)
+          # Naming convention: {package}-{cpu_arch}-{version}-dsm7.spk (matches Tailscale)
           mkdir -p ../../dist/installers
-          SPK_NAME="UnifiedHifiControl-${{ matrix.arch }}-${{ needs.plan.outputs.version }}.spk"
-          tar -cf "../../dist/installers/${SPK_NAME}" \
+          SPK_NAME="unified-hifi-control-${{ matrix.cpu_arch }}-${{ needs.plan.outputs.version }}-dsm7.spk"
+          tar -cvf "../../dist/installers/${SPK_NAME}" \
             INFO PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG \
-            package.tgz scripts conf WIZARD_UIFILES
+            package.tgz scripts conf
 
       - name: Upload Synology package
         uses: actions/upload-artifact@v4
         with:
-          name: synology-${{ matrix.arch }}
+          name: synology-${{ matrix.cpu_arch }}
           path: dist/installers/*.spk
           retention-days: 5
 

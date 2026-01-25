@@ -1,0 +1,5 @@
+#!/bin/bash
+# Pre-upgrade script
+# Runs before upgrade begins (service already stopped by DSM)
+
+exit 0
