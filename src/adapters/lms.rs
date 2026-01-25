@@ -85,6 +85,15 @@ const CLI_READ_TIMEOUT: Duration = Duration::from_secs(120);
 // CLI Event Parsing
 // =============================================================================
 
+/// Now playing update data for bus emission
+struct NowPlayingUpdate {
+    player_id: String,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    image_key: Option<String>,
+}
+
 /// Parsed CLI event from LMS
 #[derive(Debug, Clone, PartialEq)]
 pub enum CliEvent {
@@ -931,14 +940,7 @@ async fn update_players_internal(
         { state.read().await.players.keys().cloned().collect() };
 
     // Collect updates to emit after releasing the lock
-    // NowPlayingChanged: (player_id, title, artist, album, image_key)
-    let mut now_playing_updates: Vec<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = Vec::new();
+    let mut now_playing_updates: Vec<NowPlayingUpdate> = Vec::new();
     // LmsPlayerStateChanged: (player_id, state)
     let mut state_updates: Vec<(String, String)> = Vec::new();
     // VolumeChanged: (player_id, volume)
@@ -996,13 +998,13 @@ async fn update_players_internal(
 
         if now_playing_changed {
             // Emit even when metadata clears (all fields empty) so UI can update
-            now_playing_updates.push((
-                player.playerid.clone(),
-                to_option(&player.title),
-                to_option(&player.artist),
-                to_option(&player.album),
-                player.artwork_url.clone().or(player.coverid.clone()),
-            ));
+            now_playing_updates.push(NowPlayingUpdate {
+                player_id: player.playerid.clone(),
+                title: to_option(&player.title),
+                artist: to_option(&player.artist),
+                album: to_option(&player.album),
+                image_key: player.artwork_url.clone().or(player.coverid.clone()),
+            });
         }
 
         if state_changed {
@@ -1018,18 +1020,18 @@ async fn update_players_internal(
     }
 
     // Emit NowPlayingChanged events for updated players (including metadata clearing)
-    for (player_id, title, artist, album, image_key) in now_playing_updates {
+    for update in now_playing_updates {
         debug!(
             "Polling detected now_playing change for {}: {:?}",
-            player_id,
-            title.as_deref().unwrap_or("<cleared>")
+            update.player_id,
+            update.title.as_deref().unwrap_or("<cleared>")
         );
         bus.publish(BusEvent::NowPlayingChanged {
-            zone_id: PrefixedZoneId::lms(&player_id),
-            title,
-            artist,
-            album,
-            image_key,
+            zone_id: PrefixedZoneId::lms(&update.player_id),
+            title: update.title,
+            artist: update.artist,
+            album: update.album,
+            image_key: update.image_key,
         });
     }
 
