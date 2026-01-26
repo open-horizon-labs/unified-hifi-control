@@ -317,149 +317,135 @@ pub fn Settings() -> Element {
                             }
                         }
                         tbody {
-                            // Roon row
-                            tr { class: "border-b border-default",
-                                td { class: "py-2 px-3", "Roon" }
-                                td { class: "py-2 px-3",
-                                    if !roon_enabled() {
-                                        span { class: "status-disabled", "Disabled" }
-                                    } else if let Some(ref status) = roon_st {
-                                        if status.connected {
-                                            span { class: "status-ok", "✓ Connected" }
-                                        } else {
-                                            span { class: "status-err", "✗ Not connected" }
-                                        }
-                                    } else {
-                                        "Loading..."
-                                    }
-                                }
-                                td { class: "py-2 px-3 text-muted",
-                                    if !roon_enabled() {
-                                        "-"
-                                    } else if let Some(ref status) = roon_st {
-                                        if status.connected {
-                                            if let Some(ref name) = status.core_name {
-                                                "{name}"
+                            // Only show rows for enabled adapters
+                            if roon_enabled() {
+                                tr { class: "border-b border-default",
+                                    td { class: "py-2 px-3", "Roon" }
+                                    td { class: "py-2 px-3",
+                                        if let Some(ref status) = roon_st {
+                                            if status.connected {
+                                                span { class: "status-ok", "✓ Connected" }
                                             } else {
-                                                "Core"
+                                                span { class: "status-err", "✗ Not connected" }
+                                            }
+                                        } else {
+                                            "Loading..."
+                                        }
+                                    }
+                                    td { class: "py-2 px-3 text-muted",
+                                        if let Some(ref status) = roon_st {
+                                            if status.connected {
+                                                if let Some(ref name) = status.core_name {
+                                                    "{name}"
+                                                } else {
+                                                    "Core"
+                                                }
+                                            } else {
+                                                "-"
                                             }
                                         } else {
                                             "-"
                                         }
-                                    } else {
-                                        "-"
                                     }
                                 }
                             }
-                            // OpenHome row
-                            tr { class: "border-b border-default",
-                                td { class: "py-2 px-3", "OpenHome" }
-                                td { class: "py-2 px-3",
-                                    if !openhome_enabled() {
-                                        span { class: "status-disabled", "Disabled" }
-                                    } else if let Some(ref status) = openhome_st {
-                                        if status.device_count > 0 {
-                                            span { class: "status-ok", "✓ Active" }
+                            if openhome_enabled() {
+                                tr { class: "border-b border-default",
+                                    td { class: "py-2 px-3", "OpenHome" }
+                                    td { class: "py-2 px-3",
+                                        if let Some(ref status) = openhome_st {
+                                            if status.device_count > 0 {
+                                                span { class: "status-ok", "✓ Active" }
+                                            } else {
+                                                "Searching..."
+                                            }
                                         } else {
-                                            "Searching..."
+                                            "Loading..."
                                         }
-                                    } else {
-                                        "Loading..."
                                     }
-                                }
-                                td { class: "py-2 px-3 text-muted",
-                                    if !openhome_enabled() {
-                                        "-"
-                                    } else if let Some(ref status) = openhome_st {
-                                        "{status.device_count} device(s)"
-                                    } else {
-                                        "-"
-                                    }
-                                }
-                            }
-                            // UPnP row
-                            tr { class: "border-b border-default",
-                                td { class: "py-2 px-3", "UPnP/DLNA" }
-                                td { class: "py-2 px-3",
-                                    if !upnp_enabled() {
-                                        span { class: "status-disabled", "Disabled" }
-                                    } else if let Some(ref status) = upnp_st {
-                                        if status.renderer_count > 0 {
-                                            span { class: "status-ok", "✓ Active" }
-                                        } else {
-                                            "Searching..."
-                                        }
-                                    } else {
-                                        "Loading..."
-                                    }
-                                }
-                                td { class: "py-2 px-3 text-muted",
-                                    if !upnp_enabled() {
-                                        "-"
-                                    } else if let Some(ref status) = upnp_st {
-                                        "{status.renderer_count} renderer(s)"
-                                    } else {
-                                        "-"
-                                    }
-                                }
-                            }
-                            // LMS row
-                            tr { class: "border-b border-default",
-                                td { class: "py-2 px-3", "LMS" }
-                                td { class: "py-2 px-3",
-                                    if !lms_enabled() {
-                                        span { class: "status-disabled", "Disabled" }
-                                    } else if let Some(ref status) = lms_st {
-                                        if status.connected {
-                                            span { class: "status-ok", "✓ Connected" }
-                                        } else {
-                                            span { class: "status-err", "✗ Not connected" }
-                                        }
-                                    } else {
-                                        "Loading..."
-                                    }
-                                }
-                                td { class: "py-2 px-3 text-muted",
-                                    if !lms_enabled() {
-                                        "-"
-                                    } else if let Some(ref status) = lms_st {
-                                        if let (Some(host), Some(port)) = (&status.host, status.port) {
-                                            "{host}:{port}"
+                                    td { class: "py-2 px-3 text-muted",
+                                        if let Some(ref status) = openhome_st {
+                                            "{status.device_count} device(s)"
                                         } else {
                                             "-"
                                         }
-                                    } else {
-                                        "-"
                                     }
                                 }
                             }
-                            // HQPlayer row
-                            tr {
-                                td { class: "py-2 px-3", "HQPlayer" }
-                                td { class: "py-2 px-3",
-                                    if !hqplayer_enabled() {
-                                        span { class: "status-disabled", "Disabled" }
-                                    } else if let Some(ref status) = hqp_st {
-                                        if status.connected {
-                                            span { class: "status-ok", "✓ Connected" }
+                            if upnp_enabled() {
+                                tr { class: "border-b border-default",
+                                    td { class: "py-2 px-3", "UPnP/DLNA" }
+                                    td { class: "py-2 px-3",
+                                        if let Some(ref status) = upnp_st {
+                                            if status.renderer_count > 0 {
+                                                span { class: "status-ok", "✓ Active" }
+                                            } else {
+                                                "Searching..."
+                                            }
                                         } else {
-                                            span { class: "status-err", "✗ Not connected" }
+                                            "Loading..."
                                         }
-                                    } else {
-                                        "Loading..."
                                     }
-                                }
-                                td { class: "py-2 px-3 text-muted",
-                                    if !hqplayer_enabled() {
-                                        "-"
-                                    } else if let Some(ref status) = hqp_st {
-                                        if let Some(ref host) = status.host {
-                                            "{host}"
+                                    td { class: "py-2 px-3 text-muted",
+                                        if let Some(ref status) = upnp_st {
+                                            "{status.renderer_count} renderer(s)"
                                         } else {
                                             "-"
                                         }
-                                    } else {
-                                        "-"
+                                    }
+                                }
+                            }
+                            if lms_enabled() {
+                                tr { class: "border-b border-default",
+                                    td { class: "py-2 px-3", "LMS" }
+                                    td { class: "py-2 px-3",
+                                        if let Some(ref status) = lms_st {
+                                            if status.connected {
+                                                span { class: "status-ok", "✓ Connected" }
+                                            } else {
+                                                span { class: "status-err", "✗ Not connected" }
+                                            }
+                                        } else {
+                                            "Loading..."
+                                        }
+                                    }
+                                    td { class: "py-2 px-3 text-muted",
+                                        if let Some(ref status) = lms_st {
+                                            if let (Some(host), Some(port)) = (&status.host, status.port) {
+                                                "{host}:{port}"
+                                            } else {
+                                                "-"
+                                            }
+                                        } else {
+                                            "-"
+                                        }
+                                    }
+                                }
+                            }
+                            if hqplayer_enabled() {
+                                tr {
+                                    td { class: "py-2 px-3", "HQPlayer" }
+                                    td { class: "py-2 px-3",
+                                        if let Some(ref status) = hqp_st {
+                                            if status.connected {
+                                                span { class: "status-ok", "✓ Connected" }
+                                            } else {
+                                                span { class: "status-err", "✗ Not connected" }
+                                            }
+                                        } else {
+                                            "Loading..."
+                                        }
+                                    }
+                                    td { class: "py-2 px-3 text-muted",
+                                        if let Some(ref status) = hqp_st {
+                                            if let Some(ref host) = status.host {
+                                                "{host}"
+                                            } else {
+                                                "-"
+                                            }
+                                        } else {
+                                            "-"
+                                        }
                                     }
                                 }
                             }
