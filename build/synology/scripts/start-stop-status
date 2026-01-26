@@ -19,6 +19,7 @@ fi
 
 PID_FILE="${PKGVAR}/${PACKAGE_NAME}.pid"
 LOG_FILE="${PKGVAR}/${PACKAGE_NAME}.log"
+CONFIG_DIR="${PKGVAR}"
 
 start_daemon() {
     if [ -f "$PID_FILE" ]; then
@@ -36,8 +37,8 @@ start_daemon() {
     # Ensure var directory exists
     mkdir -p "${PKGVAR}"
 
-    # Start the binary
-    nohup "${PKGDEST}/unified-hifi-control" >> "$LOG_FILE" 2>&1 &
+    # Start the binary with config in package var directory
+    UHC_CONFIG_DIR="${CONFIG_DIR}" nohup "${PKGDEST}/unified-hifi-control" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
     # Wait for process to start (configurable via STARTUP_WAIT)
