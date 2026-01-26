@@ -6,6 +6,8 @@ on:
     types: [opened, synchronize, reopened, labeled]
   push:
     branches: [v3, 'feature/**']
+    tags:
+      - 'v*'
   release:
     types: [published]
   workflow_dispatch:
@@ -79,8 +81,10 @@ jobs:
       - name: Compute version
         id: version
         run: |
-          # Version: from git tag on release, else include PR number for traceability
+          # Version: from git tag on release or tag push, else include PR number for traceability
           if [[ "${{ github.event_name }}" == "release" ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          elif [[ "${{ github.event_name }}" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF#refs/tags/v}"
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
             VERSION="0.0.0-pr${{ github.event.pull_request.number }}"
@@ -146,15 +150,21 @@ jobs:
             exit 0
           fi
 
-          # Helper function
+          # Helper function - returns true for release events, tag pushes, or build:all label
           should_build() {
             [[ "$EVENT_NAME" == "release" ]] && return 0
+            [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]] && return 0
             [[ "$HAS_LABEL_ALL" == "true" ]] && return 0
             return 1
           }
 
-          # Is this a release?
-          IS_RELEASE=$([[ "$EVENT_NAME" == "release" ]] && echo "true" || echo "false")
+          # Is this a release? (either a GitHub release event or a tag push)
+          IS_RELEASE="false"
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            IS_RELEASE="true"
+          elif [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
+            IS_RELEASE="true"
+          fi
           echo "is_release=$IS_RELEASE" >> $GITHUB_OUTPUT
 
           # Linux ARM: needed for ARM binaries, Synology ARM, QNAP ARM, linux packages
@@ -238,25 +248,36 @@ jobs:
           HAS_OPTIONAL="false"
           TABLE_ROWS=""
 
+          # Helper: is this a release trigger (either release event or tag push)?
+          IS_RELEASE_TRIGGER="false"
+          RELEASE_TRIGGER_NAME="release"
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            IS_RELEASE_TRIGGER="true"
+            RELEASE_TRIGGER_NAME="release"
+          elif [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
+            IS_RELEASE_TRIGGER="true"
+            RELEASE_TRIGGER_NAME="tag"
+          fi
+
           add_row() {
             TABLE_ROWS="${TABLE_ROWS}| $1 | $2 |"$'\n'
             HAS_OPTIONAL="true"
           }
 
           if [[ "$BUILD_LMS" == "true" ]]; then
-            if [[ "$EVENT_NAME" == "release" ]]; then add_row "lms" "release"
+            if [[ "$IS_RELEASE_TRIGGER" == "true" ]]; then add_row "lms" "$RELEASE_TRIGGER_NAME"
             elif [[ "$HAS_LABEL_LMS_MACOS" == "true" ]]; then add_row "lms" "build:lms-macos"
             elif [[ "$HAS_LABEL_LMS" == "true" ]]; then add_row "lms" "build:lms"
             fi
           fi
           if [[ "$BUILD_MACOS" == "true" ]]; then
-            if [[ "$EVENT_NAME" == "release" ]]; then add_row "macos" "release"
+            if [[ "$IS_RELEASE_TRIGGER" == "true" ]]; then add_row "macos" "$RELEASE_TRIGGER_NAME"
             elif [[ "$HAS_LABEL_LMS_MACOS" == "true" ]]; then add_row "macos" "build:lms-macos"
             elif [[ "$HAS_LABEL_MACOS" == "true" ]]; then add_row "macos" "build:macos"
             fi
           fi
           if [[ "$BUILD_LINUX_ARM" == "true" ]]; then
-            TRIGGER="release"
+            TRIGGER="$RELEASE_TRIGGER_NAME"
             [[ "$HAS_LABEL_LINUX_ARM" == "true" ]] && TRIGGER="build:linux-arm"
             [[ "$HAS_LABEL_SYNOLOGY" == "true" ]] && TRIGGER="build:synology (implicit)"
             [[ "$HAS_LABEL_QNAP_ARM" == "true" ]] && TRIGGER="build:qnap-arm (implicit)"
@@ -264,32 +285,32 @@ jobs:
             add_row "linux-arm" "$TRIGGER"
           fi
           if [[ "$BUILD_WINDOWS" == "true" ]]; then
-            if [[ "$EVENT_NAME" == "release" ]]; then add_row "windows" "release"
+            if [[ "$IS_RELEASE_TRIGGER" == "true" ]]; then add_row "windows" "$RELEASE_TRIGGER_NAME"
             elif [[ "$HAS_LABEL_WINDOWS" == "true" ]]; then add_row "windows" "build:windows"
             fi
           fi
           if [[ "$BUILD_SYNOLOGY" == "true" ]]; then
-            if [[ "$EVENT_NAME" == "release" ]]; then add_row "synology" "release"
+            if [[ "$IS_RELEASE_TRIGGER" == "true" ]]; then add_row "synology" "$RELEASE_TRIGGER_NAME"
             elif [[ "$HAS_LABEL_SYNOLOGY" == "true" ]]; then add_row "synology" "build:synology"
             fi
           fi
           if [[ "$BUILD_QNAP" == "true" ]]; then
-            if [[ "$EVENT_NAME" == "release" ]]; then add_row "qnap" "release"
+            if [[ "$IS_RELEASE_TRIGGER" == "true" ]]; then add_row "qnap" "$RELEASE_TRIGGER_NAME"
             elif [[ "$HAS_LABEL_QNAP" == "true" ]]; then add_row "qnap" "build:qnap"
             fi
           fi
           if [[ "$BUILD_QNAP_ARM" == "true" ]]; then
-            if [[ "$EVENT_NAME" == "release" ]]; then add_row "qnap-arm" "release"
+            if [[ "$IS_RELEASE_TRIGGER" == "true" ]]; then add_row "qnap-arm" "$RELEASE_TRIGGER_NAME"
             elif [[ "$HAS_LABEL_QNAP_ARM" == "true" ]]; then add_row "qnap-arm" "build:qnap-arm"
             fi
           fi
           if [[ "$BUILD_DOCKER" == "true" ]]; then
-            if [[ "$EVENT_NAME" == "release" ]]; then add_row "docker" "release"
+            if [[ "$IS_RELEASE_TRIGGER" == "true" ]]; then add_row "docker" "$RELEASE_TRIGGER_NAME"
             elif [[ "$HAS_LABEL_DOCKER" == "true" ]]; then add_row "docker" "build:docker"
             fi
           fi
           if [[ "$BUILD_LINUX_PACKAGES" == "true" ]]; then
-            if [[ "$EVENT_NAME" == "release" ]]; then add_row "linux-packages" "release"
+            if [[ "$IS_RELEASE_TRIGGER" == "true" ]]; then add_row "linux-packages" "$RELEASE_TRIGGER_NAME"
             elif [[ "$HAS_LABEL_LINUX_PACKAGES" == "true" ]]; then add_row "linux-packages" "build:linux-packages"
             fi
           fi
@@ -1770,13 +1791,25 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           sed -i "s|<version>[^<]*</version>|<version>$VERSION</version>|" lms-plugin/install.xml
 
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add lms-plugin/repo.xml lms-plugin/install.xml
-          git commit -m "chore: Update LMS plugin to v${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
-          git push
+      - name: Create PR for LMS plugin update
+        id: create-pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: Update LMS plugin to v${{ steps.version.outputs.version }}"
+          title: "chore: Update LMS plugin to v${{ steps.version.outputs.version }}"
+          body: "Auto-generated PR to update LMS plugin metadata for release v${{ steps.version.outputs.version }}."
+          branch: chore/lms-update-${{ steps.version.outputs.version }}
+          base: v3
+          add-paths: |
+            lms-plugin/repo.xml
+            lms-plugin/install.xml
+
+      - name: Enable auto-merge
+        if: steps.create-pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge ${{ steps.create-pr.outputs.pull-request-number }} --squash --auto
 
   publish-aur:
     name: Publish to AUR
