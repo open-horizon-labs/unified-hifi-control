@@ -1,9 +1,24 @@
 #!/bin/bash
 
 PACKAGE_NAME="unified-hifi-control"
-PACKAGE_DIR="/var/packages/${PACKAGE_NAME}"
-TARGET_DIR="${PACKAGE_DIR}/target"
-PID_FILE="/var/run/${PACKAGE_NAME}.pid"
+
+# Use Synology environment variables for paths
+if [ -n "${SYNOPKG_PKGVAR}" ]; then
+    PKGVAR="${SYNOPKG_PKGVAR}"
+else
+    PKGVAR="/var/packages/${PACKAGE_NAME}/var"
+fi
+
+if [ -n "${SYNOPKG_PKGDEST}" ]; then
+    PKGDEST="${SYNOPKG_PKGDEST}"
+else
+    PKGDEST="/var/packages/${PACKAGE_NAME}/target"
+fi
+
+PID_FILE="${PKGVAR}/${PACKAGE_NAME}.pid"
+
+# Ensure var directory exists
+mkdir -p "${PKGVAR}"
 
 # Check if service was running (upgrade scenario - DSM should stop it but be safe)
 WAS_RUNNING=false
@@ -20,15 +35,12 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 # Make binary executable
-chmod +x "${TARGET_DIR}/unified-hifi-control"
-
-# Create data directory if it doesn't exist
-mkdir -p "${PACKAGE_DIR}/var"
+chmod +x "${PKGDEST}/unified-hifi-control"
 
 # Restart service if it was running before upgrade
 if [ "$WAS_RUNNING" = true ]; then
     echo "Restarting service after upgrade..."
-    "${PACKAGE_DIR}/scripts/start-stop-status" start
+    "/var/packages/${PACKAGE_NAME}/scripts/start-stop-status" start
 fi
 
 echo "Unified Hi-Fi Control installed successfully"

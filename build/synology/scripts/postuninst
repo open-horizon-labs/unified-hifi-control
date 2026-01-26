@@ -3,8 +3,16 @@
 # Runs after package files are removed
 
 PACKAGE_NAME="unified-hifi-control"
-PID_FILE="/var/run/${PACKAGE_NAME}.pid"
-LOG_FILE="/var/log/${PACKAGE_NAME}.log"
+
+# Use Synology environment variables for paths
+if [ -n "${SYNOPKG_PKGVAR}" ]; then
+    PKGVAR="${SYNOPKG_PKGVAR}"
+else
+    PKGVAR="/var/packages/${PACKAGE_NAME}/var"
+fi
+
+PID_FILE="${PKGVAR}/${PACKAGE_NAME}.pid"
+LOG_FILE="${PKGVAR}/${PACKAGE_NAME}.log"
 
 # Clean up PID file if it exists
 rm -f "$PID_FILE"

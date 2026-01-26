@@ -3,11 +3,16 @@
 # Runs after upgrade completes
 
 PACKAGE_NAME="unified-hifi-control"
-PACKAGE_DIR="/var/packages/${PACKAGE_NAME}"
-TARGET_DIR="${PACKAGE_DIR}/target"
+
+# Use Synology environment variables for paths
+if [ -n "${SYNOPKG_PKGDEST}" ]; then
+    PKGDEST="${SYNOPKG_PKGDEST}"
+else
+    PKGDEST="/var/packages/${PACKAGE_NAME}/target"
+fi
 
 # Make binary executable
-chmod +x "${TARGET_DIR}/unified-hifi-control"
+chmod +x "${PKGDEST}/unified-hifi-control"
 
 echo "Unified Hi-Fi Control upgraded successfully"
 

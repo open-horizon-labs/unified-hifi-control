@@ -1,10 +1,25 @@
 #!/bin/bash
 
 PACKAGE_NAME="unified-hifi-control"
-PACKAGE_DIR="/var/packages/${PACKAGE_NAME}"
-TARGET_DIR="${PACKAGE_DIR}/target"
-PID_FILE="/var/run/${PACKAGE_NAME}.pid"
-LOG_FILE="/var/log/${PACKAGE_NAME}.log"
+
+# Use Synology environment variables for paths
+# SYNOPKG_PKGVAR: writable var directory (e.g., /var/packages/unified-hifi-control/var)
+# SYNOPKG_PKGDEST: package install directory (e.g., /var/packages/unified-hifi-control/target)
+if [ -n "${SYNOPKG_PKGVAR}" ]; then
+    PKGVAR="${SYNOPKG_PKGVAR}"
+else
+    PKGVAR="/var/packages/${PACKAGE_NAME}/var"
+fi
+
+if [ -n "${SYNOPKG_PKGDEST}" ]; then
+    PKGDEST="${SYNOPKG_PKGDEST}"
+else
+    PKGDEST="/var/packages/${PACKAGE_NAME}/target"
+fi
+
+PID_FILE="${PKGVAR}/${PACKAGE_NAME}.pid"
+LOG_FILE="${PKGVAR}/${PACKAGE_NAME}.log"
+CONFIG_DIR="${PKGVAR}"
 
 start_daemon() {
     if [ -f "$PID_FILE" ]; then
@@ -19,13 +34,11 @@ start_daemon() {
 
     echo "Starting ${PACKAGE_NAME}..."
 
-    if ! cd "${TARGET_DIR}"; then
-        echo "Failed to change to ${TARGET_DIR}"
-        return 1
-    fi
+    # Ensure var directory exists
+    mkdir -p "${PKGVAR}"
 
-    # Start the binary
-    nohup "${TARGET_DIR}/unified-hifi-control" >> "$LOG_FILE" 2>&1 &
+    # Start the binary with config in package var directory
+    UHC_CONFIG_DIR="${CONFIG_DIR}" nohup "${PKGDEST}/unified-hifi-control" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
     # Wait for process to start (configurable via STARTUP_WAIT)
