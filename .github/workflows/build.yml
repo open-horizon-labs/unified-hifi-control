@@ -1791,13 +1791,23 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           sed -i "s|<version>[^<]*</version>|<version>$VERSION</version>|" lms-plugin/install.xml
 
-      - name: Commit and push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add lms-plugin/repo.xml lms-plugin/install.xml
-          git commit -m "chore: Update LMS plugin to v${{ steps.version.outputs.version }} [skip ci]" || echo "No changes to commit"
-          git push
+      - name: Create PR for LMS plugin update
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: Update LMS plugin to v${{ steps.version.outputs.version }}"
+          title: "chore: Update LMS plugin to v${{ steps.version.outputs.version }}"
+          body: |
+            Auto-generated PR to update LMS plugin metadata for release v${{ steps.version.outputs.version }}.
+
+            This updates:
+            - `lms-plugin/repo.xml` - version, download URL, SHA
+            - `lms-plugin/install.xml` - version
+          branch: chore/lms-update-${{ steps.version.outputs.version }}
+          base: v3
+          add-paths: |
+            lms-plugin/repo.xml
+            lms-plugin/install.xml
 
   publish-aur:
     name: Publish to AUR
