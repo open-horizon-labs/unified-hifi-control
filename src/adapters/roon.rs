@@ -873,8 +873,28 @@ async fn run_roon_loop(
                             let is_new = !s.zones.contains_key(&zone.zone_id);
                             let old_zone = s.zones.get(&zone.zone_id).cloned();
 
-                            if is_new {
-                                // New zone - emit ZoneDiscovered
+                            // Check if zone gained volume_control (old had none, new has some)
+                            let old_had_volume = old_zone
+                                .as_ref()
+                                .and_then(|oz| oz.outputs.first())
+                                .and_then(|o| o.volume.as_ref())
+                                .is_some();
+                            let new_has_volume = converted
+                                .outputs
+                                .first()
+                                .and_then(|o| o.volume.as_ref())
+                                .is_some();
+                            let gained_volume = !old_had_volume && new_has_volume;
+
+                            if is_new || gained_volume {
+                                // New zone or zone gained volume - emit ZoneDiscovered
+                                // This ensures aggregator gets the full zone with volume_control
+                                if gained_volume {
+                                    tracing::info!(
+                                        "Zone '{}' gained volume control, re-emitting ZoneDiscovered",
+                                        converted.display_name
+                                    );
+                                }
                                 let bus_zone = roon_zone_to_bus_zone(&converted);
                                 bus_for_events.publish(BusEvent::ZoneDiscovered { zone: bus_zone });
                             } else {
