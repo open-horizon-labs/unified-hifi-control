@@ -6,6 +6,8 @@ on:
     types: [opened, synchronize, reopened, labeled]
   push:
     branches: [v3, 'feature/**']
+    tags:
+      - 'v*'
   release:
     types: [published]
   workflow_dispatch:
@@ -146,15 +148,21 @@ jobs:
             exit 0
           fi
 
-          # Helper function
+          # Helper function - returns true for release events, tag pushes, or build:all label
           should_build() {
             [[ "$EVENT_NAME" == "release" ]] && return 0
+            [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]] && return 0
             [[ "$HAS_LABEL_ALL" == "true" ]] && return 0
             return 1
           }
 
-          # Is this a release?
-          IS_RELEASE=$([[ "$EVENT_NAME" == "release" ]] && echo "true" || echo "false")
+          # Is this a release? (either a GitHub release event or a tag push)
+          IS_RELEASE="false"
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            IS_RELEASE="true"
+          elif [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
+            IS_RELEASE="true"
+          fi
           echo "is_release=$IS_RELEASE" >> $GITHUB_OUTPUT
 
           # Linux ARM: needed for ARM binaries, Synology ARM, QNAP ARM, linux packages
