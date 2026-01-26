@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct NavProps {
-    /// The currently active page ID (e.g., "dashboard", "zones")
+    /// The currently active page ID (e.g., "zones", "hqplayer", "settings")
     pub active: String,
     /// Hide HQPlayer tab (fallback if settings not loaded)
     #[props(default = false)]
