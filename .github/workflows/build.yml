@@ -277,11 +277,13 @@ jobs:
             fi
           fi
           if [[ "$BUILD_LINUX_ARM" == "true" ]]; then
-            TRIGGER="$RELEASE_TRIGGER_NAME"
+            TRIGGER=""
+            [[ "$IS_RELEASE_TRIGGER" == "true" ]] && TRIGGER="$RELEASE_TRIGGER_NAME"
             [[ "$HAS_LABEL_LINUX_ARM" == "true" ]] && TRIGGER="build:linux-arm"
             [[ "$HAS_LABEL_SYNOLOGY" == "true" ]] && TRIGGER="build:synology (implicit)"
             [[ "$HAS_LABEL_QNAP_ARM" == "true" ]] && TRIGGER="build:qnap-arm (implicit)"
             [[ "$HAS_LABEL_LINUX_PACKAGES" == "true" ]] && TRIGGER="build:linux-packages (implicit)"
+            [[ "$INPUT_LINUX_ARM" == "true" || "$INPUT_SYNOLOGY" == "true" || "$INPUT_QNAP_ARM" == "true" || "$INPUT_LINUX_PACKAGES" == "true" ]] && [[ -z "$TRIGGER" ]] && TRIGGER="workflow_dispatch"
             add_row "linux-arm" "$TRIGGER"
           fi
           if [[ "$BUILD_WINDOWS" == "true" ]]; then
