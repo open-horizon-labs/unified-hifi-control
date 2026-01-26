@@ -12,8 +12,10 @@ use crate::app::api::AppSettings;
 #[derive(Clone, Copy)]
 pub struct SettingsContext {
     hide_knobs: Signal<bool>,
-    hide_hqp: Signal<bool>,
-    hide_lms: Signal<bool>,
+    /// HQPlayer adapter enabled (page visible when true)
+    hqp_enabled: Signal<bool>,
+    /// LMS adapter enabled (page visible when true)
+    lms_enabled: Signal<bool>,
     /// Whether settings have been loaded from server
     loaded: Signal<bool>,
 }
@@ -29,24 +31,24 @@ impl SettingsContext {
         (self.hide_knobs)()
     }
 
-    /// Get hide_hqp value
+    /// Get hide_hqp value (true if adapter disabled)
     pub fn hide_hqp(&self) -> bool {
-        (self.hide_hqp)()
+        !(self.hqp_enabled)()
     }
 
-    /// Get hide_lms value
+    /// Get hide_lms value (true if adapter disabled)
     pub fn hide_lms(&self) -> bool {
-        (self.hide_lms)()
+        !(self.lms_enabled)()
     }
 
-    /// Update all hide settings at once
-    pub fn update(&self, hide_knobs: bool, hide_hqp: bool, hide_lms: bool) {
+    /// Update settings - now takes adapter enabled states
+    pub fn update(&self, hide_knobs: bool, hqp_enabled: bool, lms_enabled: bool) {
         let mut hk = self.hide_knobs;
-        let mut hh = self.hide_hqp;
-        let mut hl = self.hide_lms;
+        let mut he = self.hqp_enabled;
+        let mut le = self.lms_enabled;
         hk.set(hide_knobs);
-        hh.set(hide_hqp);
-        hl.set(hide_lms);
+        he.set(hqp_enabled);
+        le.set(lms_enabled);
     }
 
     /// Mark settings as loaded
@@ -59,14 +61,14 @@ impl SettingsContext {
 /// Initialize settings context provider - call once at app root
 pub fn use_settings_provider() {
     let hide_knobs = use_signal(|| false);
-    let hide_hqp = use_signal(|| false);
-    let hide_lms = use_signal(|| false);
+    let hqp_enabled = use_signal(|| false);
+    let lms_enabled = use_signal(|| false);
     let loaded = use_signal(|| false);
 
     let ctx = SettingsContext {
         hide_knobs,
-        hide_hqp,
-        hide_lms,
+        hqp_enabled,
+        lms_enabled,
         loaded,
     };
 
@@ -80,10 +82,11 @@ pub fn use_settings_provider() {
                 if let Ok(settings) =
                     crate::app::api::fetch_json::<AppSettings>("/api/settings").await
                 {
+                    // Page visibility now derived from adapter enabled state
                     ctx.update(
                         settings.hide_knobs_page,
-                        settings.hide_hqp_page,
-                        settings.hide_lms_page,
+                        settings.adapters.hqplayer,
+                        settings.adapters.lms,
                     );
                     ctx.mark_loaded();
                 }
