@@ -99,12 +99,12 @@ pub fn HqpControlsCompact(
     on_matrix_select: EventHandler<u32>,
 ) -> Element {
     rsx! {
-        div { class: "flex gap-2 mt-4",
+        div { class: "flex flex-wrap gap-2 mt-4",
             if !profiles.is_empty() {
                 HqpProfileSelect {
                     profiles: profiles,
                     on_select: on_profile_select,
-                    class: "input flex-1".to_string(),
+                    class: "input flex-1 min-w-0".to_string(),
                 }
             }
             if !matrix_profiles.is_empty() {
@@ -112,7 +112,7 @@ pub fn HqpControlsCompact(
                     profiles: matrix_profiles,
                     active: active_matrix,
                     on_select: on_matrix_select,
-                    class: "input flex-1".to_string(),
+                    class: "input flex-1 min-w-0".to_string(),
                 }
             }
         }

@@ -327,7 +327,6 @@ pub fn Knobs() -> Element {
                         table { class: "w-full",
                             thead {
                                 tr { class: "border-b border-default",
-                                    th { class: "text-left py-2 text-sm", "ID" }
                                     th { class: "text-left py-2 text-sm", "Name" }
                                     th { class: "text-left py-2 text-sm", "Version" }
                                     th { class: "text-left py-2 text-sm", "IP" }
@@ -533,8 +532,7 @@ fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) 
 
     rsx! {
         tr { class: "border-b border-default",
-            td { class: "py-2", code { class: "text-xs bg-elevated px-1 rounded", "{knob.knob_id}" } }
-            td { class: "py-2 text-sm text-muted", "{display_name}" }
+            td { class: "py-2", "{display_name}" }
             td { class: "py-2", "{version}" }
             td { class: "py-2", "{ip}" }
             td { class: "py-2", "{zone_name}" }
@@ -639,38 +637,38 @@ fn StateCascadePreview(
     let final_is_power_off = states.last().map(|(_, _, _, off)| *off).unwrap_or(false);
 
     rsx! {
-        div { class: "mt-3 pt-3 border-t border-white/10",
-            // State flow diagram
-            div { class: "flex items-center gap-1 flex-wrap",
+        div { class: "mt-4 p-3 bg-black/20 rounded-lg",
+            // State flow diagram - more prominent
+            div { class: "flex items-center gap-1.5 flex-wrap justify-center",
                 for (i, (name, timeout, icon, is_off)) in states.iter().enumerate() {
                     // Arrow and time label (before state, except first)
                     if i > 0 {
-                        div { class: "flex flex-col items-center mx-0.5",
-                            span { class: "text-[10px] text-muted leading-none", "{format_timeout(*timeout)}" }
-                            span { class: "text-muted text-xs", "→" }
+                        div { class: "flex flex-col items-center mx-1",
+                            span { class: "text-xs text-muted leading-none", "{format_timeout(*timeout)}" }
+                            span { class: "text-muted", "→" }
                         }
                     }
-                    // State box
+                    // State box - larger and more visible
                     div {
                         class: format!(
-                            "flex flex-col items-center px-2 py-1 rounded text-[10px] leading-tight {}",
+                            "flex flex-col items-center px-3 py-1.5 rounded text-xs leading-tight {}",
                             if i == states.len() - 1 {
-                                if *is_off { "bg-red-500/20 text-red-300" } else { "bg-green-500/20 text-green-300" }
+                                if *is_off { "bg-red-500/30 text-red-200 font-medium" } else { "bg-green-500/30 text-green-200 font-medium" }
                             } else {
-                                "bg-white/5"
+                                "bg-white/10"
                             }
                         ),
-                        span { class: "text-sm", "{icon}" }
+                        span { class: "text-base", "{icon}" }
                         span { "{name}" }
                     }
                 }
             }
             // Summary line
-            p { class: "text-[10px] text-muted mt-1.5",
+            p { class: "text-xs text-center text-muted mt-2",
                 if final_is_power_off {
-                    "Powers off after inactivity. Rotate encoder to wake."
+                    "Powers off after inactivity. Rotate to wake."
                 } else {
-                    "Display stays on indefinitely."
+                    "Display stays on."
                 }
             }
         }
@@ -763,14 +761,13 @@ fn ConfigModal(
                         fieldset { class: "mb-6",
                             legend { class: "text-sm font-medium mb-2", "Power Management" }
                             p { class: "text-sm text-muted mb-3",
-                                "After inactivity, the display transitions through these states. "
-                                "Each timeout starts when the previous state begins. Set to 0 to skip."
+                                "State transitions after inactivity. Timeouts are cumulative. 0 = skip."
                             }
 
                             div { class: "grid grid-cols-2 gap-6",
                                 // Charging column
                                 div { class: "bg-elevated rounded-lg p-4",
-                                    h4 { class: "text-sm font-semibold mb-3 flex items-center gap-2",
+                                    h4 { class: "text-base font-bold mb-4 flex items-center gap-2",
                                         "⚡ Charging"
                                     }
                                     div { class: "space-y-3",
@@ -828,7 +825,7 @@ fn ConfigModal(
 
                                 // Battery column
                                 div { class: "bg-elevated rounded-lg p-4",
-                                    h4 { class: "text-sm font-semibold mb-3 flex items-center gap-2",
+                                    h4 { class: "text-base font-bold mb-4 flex items-center gap-2",
                                         "🔋 Battery"
                                     }
                                     div { class: "space-y-3",
@@ -900,7 +897,7 @@ fn ConfigModal(
                                     }
                                     div {
                                         span { class: "block text-sm font-medium", "WiFi Power Save" }
-                                        span { class: "block text-xs text-muted", "Reduce WiFi power consumption (may increase latency)" }
+                                        span { class: "block text-xs text-muted", "Saves power, adds latency" }
                                     }
                                 }
                                 label { class: "flex items-center gap-3",
@@ -912,13 +909,13 @@ fn ConfigModal(
                                     }
                                     div {
                                         span { class: "block text-sm font-medium", "CPU Frequency Scaling" }
-                                        span { class: "block text-xs text-muted", "Dynamically adjust CPU frequency to save power" }
+                                        span { class: "block text-xs text-muted", "Dynamic frequency for power savings" }
                                     }
                                 }
                                 div { class: "flex items-center gap-4",
                                     div { class: "flex-1",
                                         span { class: "block text-sm font-medium", "Sleep Poll Interval" }
-                                        span { class: "block text-xs text-muted", "How often to check for updates when in sleep mode" }
+                                        span { class: "block text-xs text-muted", "Update check frequency in sleep" }
                                     }
                                     div { class: "flex items-center gap-2",
                                         input {

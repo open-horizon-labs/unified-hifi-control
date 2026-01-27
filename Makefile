@@ -45,10 +45,10 @@ setup-tailwind:
 	fi
 
 css: setup-tailwind
-	./tailwindcss -i src/input.css -o public/tailwind.css
+	./tailwindcss -i src/input.css -o public/tailwind.css --content "src/app/**/*.rs"
 
 css-watch: setup-tailwind
-	./tailwindcss -i src/input.css -o public/tailwind.css --watch
+	./tailwindcss -i src/input.css -o public/tailwind.css --content "src/app/**/*.rs" --watch
 
 clean:
 	rm -f public/tailwind.css

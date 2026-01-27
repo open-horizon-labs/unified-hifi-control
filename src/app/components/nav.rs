@@ -7,7 +7,7 @@ use dioxus::prelude::*;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct NavProps {
-    /// The currently active page ID (e.g., "dashboard", "zones")
+    /// The currently active page ID (e.g., "zones", "hqplayer", "settings")
     pub active: String,
     /// Hide HQPlayer tab (fallback if settings not loaded)
     #[props(default = false)]
@@ -58,7 +58,7 @@ pub fn Nav(props: NavProps) -> Element {
             div { class: "nav-inner",
                 // Logo / Brand
                 div { class: "flex items-center",
-                    Link { class: "nav-brand flex items-center", to: Route::Dashboard {},
+                    Link { class: "nav-brand flex items-center", to: Route::Zones {},
                         img {
                             src: "{*LOGO_DATA_URL}",
                             alt: "Hi-Fi Control",
@@ -69,9 +69,7 @@ pub fn Nav(props: NavProps) -> Element {
 
                 // Desktop navigation - use Link for client-side routing (no page reload)
                 div { class: "hidden lg:flex items-center space-x-4",
-                    Link { class: nav_link_class("dashboard"), to: Route::Dashboard {}, "Dashboard" }
                     Link { class: nav_link_class("zones"), to: Route::Zones {}, "Zones" }
-                    Link { class: nav_link_class("zone"), to: Route::Zone {}, "Zone" }
                     if !hide_hqp {
                         Link { class: nav_link_class("hqplayer"), to: Route::HqPlayer {}, "HQPlayer" }
                     }
@@ -109,9 +107,7 @@ pub fn Nav(props: NavProps) -> Element {
             // Mobile menu - use Link for client-side routing
             div { class: "{mobile_menu_class}", id: "mobile-menu",
                 div { class: "px-2 pt-2 pb-3 space-y-1",
-                    Link { class: nav_link_class("dashboard"), to: Route::Dashboard {}, onclick: move |_| menu_open.set(false), "Dashboard" }
                     Link { class: nav_link_class("zones"), to: Route::Zones {}, onclick: move |_| menu_open.set(false), "Zones" }
-                    Link { class: nav_link_class("zone"), to: Route::Zone {}, onclick: move |_| menu_open.set(false), "Zone" }
                     if !hide_hqp {
                         Link { class: nav_link_class("hqplayer"), to: Route::HqPlayer {}, onclick: move |_| menu_open.set(false), "HQPlayer" }
                     }

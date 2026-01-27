@@ -88,8 +88,13 @@ jobs:
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-          # Git SHA: short form
-          GIT_SHA="${GITHUB_SHA:0:7}"
+          # Git SHA: use PR head SHA for pull_request events (GITHUB_SHA is merge commit)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            GIT_SHA="${{ github.event.pull_request.head.sha }}"
+            GIT_SHA="${GIT_SHA:0:7}"
+          else
+            GIT_SHA="${GITHUB_SHA:0:7}"
+          fi
           echo "git_sha=$GIT_SHA" >> $GITHUB_OUTPUT
 
           echo "::notice::Build version: $VERSION ($GIT_SHA)"
@@ -319,7 +324,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -354,7 +359,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -432,7 +437,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-wasm.outputs.cache-hit != 'true'
@@ -522,7 +527,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-wasm.outputs.cache-hit != 'true'
@@ -597,7 +602,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -822,7 +827,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -887,7 +892,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -943,7 +948,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -1035,7 +1040,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -1043,7 +1048,7 @@ jobs:
         run: |
           curl -sLO https://github.com/tailwindlabs/tailwindcss/releases/download/v4.1.18/tailwindcss-windows-x64.exe
           chmod +x tailwindcss-windows-x64.exe
-          ./tailwindcss-windows-x64.exe -i src/input.css -o public/tailwind.css
+          ./tailwindcss-windows-x64.exe -i src/input.css -o public/tailwind.css --content "src/app/**/*.rs"
 
       - name: Build (embeds WASM)
         env:
