@@ -317,7 +317,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache generated CSS
         id: cache-css
@@ -352,7 +352,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache generated CSS
         id: cache-css
@@ -389,7 +389,7 @@ jobs:
     name: Build WASM Assets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache WASM build output
         id: cache-wasm
@@ -483,7 +483,7 @@ jobs:
     name: Fullstack Build Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache WASM build output
         id: cache-wasm
@@ -562,7 +562,7 @@ jobs:
     needs: [plan, build-wasm]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -787,7 +787,7 @@ jobs:
             output: unified-hifi-linux-armv7
             arch: armv7
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -866,7 +866,7 @@ jobs:
     if: needs.plan.outputs.build_macos == 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -922,7 +922,7 @@ jobs:
     if: needs.plan.outputs.build_macos == 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1016,7 +1016,7 @@ jobs:
     if: needs.plan.outputs.build_windows == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1087,7 +1087,7 @@ jobs:
       needs.build-linux-x64.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Download all available binaries
       - name: Download Linux x64 binary
@@ -1226,7 +1226,7 @@ jobs:
             target: aarch64-unknown-linux-musl
             binary: unified-hifi-linux-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check if binary available
         if: matrix.target == 'aarch64-unknown-linux-musl'
@@ -1285,7 +1285,7 @@ jobs:
     if: needs.plan.outputs.build_qnap == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download Linux binary
         uses: actions/download-artifact@v4
@@ -1337,7 +1337,7 @@ jobs:
       needs.build-linux-arm.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download Linux binary
         uses: actions/download-artifact@v4
@@ -1389,7 +1389,7 @@ jobs:
       needs.build-linux-x64.result == 'success'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download Linux binaries
         uses: actions/download-artifact@v4
@@ -1547,7 +1547,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: v3
 
@@ -1630,7 +1630,7 @@ jobs:
     if: needs.plan.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Get release version
         id: version
