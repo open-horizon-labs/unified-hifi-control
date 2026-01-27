@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Integration test for zones_sha in /knob/now_playing responses
 //!
 //! This test verifies that the bridge emits zones_sha for dynamic zone detection.

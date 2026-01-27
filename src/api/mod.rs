@@ -473,7 +473,7 @@ pub async fn roon_play_handler(
     State(state): State<AppState>,
     Json(req): Json<PlayRequest>,
 ) -> impl IntoResponse {
-    use crate::adapters::roon_browse::SearchSource;
+    use crate::adapters::roon_browse::{PlayAction, SearchSource};
 
     if !state.roon_browse.is_connected().await {
         return (
@@ -491,11 +491,59 @@ pub async fn roon_play_handler(
         _ => SearchSource::Library,
     };
 
-    let action = req.action.as_deref().unwrap_or("play");
+    let action = PlayAction::parse(req.action.as_deref().unwrap_or("play"));
 
     match state
         .roon_browse
         .search_and_play(&req.query, &req.zone_id, source, action)
+        .await
+    {
+        Ok(message) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "message": message })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Play item request body
+#[derive(Deserialize)]
+pub struct PlayItemRequest {
+    pub item_key: String,
+    pub zone_id: String,
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+/// POST /roon/play_item - Play a specific item by its key
+pub async fn roon_play_item_handler(
+    State(state): State<AppState>,
+    Json(req): Json<PlayItemRequest>,
+) -> impl IntoResponse {
+    use crate::adapters::roon_browse::PlayAction;
+
+    if !state.roon_browse.is_connected().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Roon Browse not connected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let action = PlayAction::parse(req.action.as_deref().unwrap_or("play"));
+
+    match state
+        .roon_browse
+        .play_item(&req.item_key, &req.zone_id, action)
         .await
     {
         Ok(message) => (

@@ -78,5 +78,7 @@ POST /lms/volume
 POST /openhome/control
 POST /roon/browse
 POST /roon/control
+POST /roon/play
+POST /roon/play_item
 POST /roon/volume
 POST /upnp/control

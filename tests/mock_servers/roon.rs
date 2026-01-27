@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Mock Roon Core for testing
 //!
 //! Provides a simplified mock that exposes Roon-like state via HTTP endpoints.

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Protocol Schema Test Harness
 //!
 //! Validates that all API responses and event bus messages conform to expected schemas.

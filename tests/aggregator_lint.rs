@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Aggregator regression tests
 //!
 //! Bug: NowPlayingChanged updates a separate HashMap, not zone.now_playing.

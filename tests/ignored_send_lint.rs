@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! AST-level test to detect ignored channel send results.
 //!
 //! Ignoring the result of channel send operations can hide important errors:

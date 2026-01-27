@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Adapter-level integration tests
 //!
 //! Tests adapter behavior with mock/simulated external services.

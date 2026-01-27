@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! AST-level test to ensure all tokio::spawn loops have proper cancellation handling.
 //!
 //! This test parses Rust source files and finds patterns like:

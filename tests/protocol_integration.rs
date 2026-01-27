@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Protocol Integration Tests
 //!
 //! These tests stand up an actual HTTP server and verify that all protocol

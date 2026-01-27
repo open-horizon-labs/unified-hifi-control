@@ -209,6 +209,7 @@ pub fn placeholder_svg(width: u32, height: u32) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use image::ImageEncoder;

@@ -217,6 +217,7 @@ pub async fn discover_lms_servers(timeout_ms: Option<u64>) -> Result<Vec<Discove
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

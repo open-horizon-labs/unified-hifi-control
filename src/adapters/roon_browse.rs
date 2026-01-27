@@ -35,6 +35,17 @@ const BROWSE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default search result limit
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 
+/// Category names returned by Roon search - these are containers, not playable items
+const CATEGORY_NAMES: &[&str] = &[
+    "Albums",
+    "Tracks",
+    "Artists",
+    "Works",
+    "Composers",
+    "Genres",
+    "Tags",
+];
+
 /// Search source - where to search
 #[derive(Debug, Clone, Copy, Default)]
 pub enum SearchSource {
@@ -42,6 +53,50 @@ pub enum SearchSource {
     Library,
     Tidal,
     Qobuz,
+}
+
+/// Play action - what to do with the selected item
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlayAction {
+    #[default]
+    Play,
+    Queue,
+    Radio,
+}
+
+impl PlayAction {
+    /// Parse from string, defaulting to Play for unknown values
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "queue" | "add" => Self::Queue,
+            "radio" | "start_radio" => Self::Radio,
+            _ => Self::Play,
+        }
+    }
+
+    /// Get the Roon action title
+    fn action_title(&self) -> &'static str {
+        match self {
+            Self::Play => "Play Now",
+            Self::Queue => "Queue",
+            Self::Radio => "Start Radio",
+        }
+    }
+}
+
+/// Find the first playable item in a list (hint is Action or ActionList)
+fn find_playable_item(items: &[BrowseItem]) -> Option<&BrowseItem> {
+    items.iter().find(|item| {
+        matches!(
+            item.hint,
+            Some(ItemHint::Action) | Some(ItemHint::ActionList)
+        )
+    })
+}
+
+/// Check if an item is a category (Albums, Tracks, etc.) rather than playable content
+fn is_category(item: &BrowseItem) -> bool {
+    CATEGORY_NAMES.contains(&item.title.as_str())
 }
 
 /// Get the Roon Browse state file path
@@ -299,13 +354,12 @@ impl RoonBrowseAdapter {
     /// Search and play the first matching result
     ///
     /// This is the AI DJ convenience method - search for music and start playing it.
-    /// `action` can be "play" (play now), "queue" (add to queue), or "radio" (start radio).
     pub async fn search_and_play(
         &self,
         query: &str,
         zone_id: &str,
         source: SearchSource,
-        action: &str,
+        action: PlayAction,
     ) -> Result<String> {
         let session_key = format!(
             "play_{}",
@@ -400,58 +454,386 @@ impl RoonBrowseAdapter {
             })
             .await?;
 
-        // Find first playable item (hint is Action or ActionList)
-        let playable = search_results
-            .items
-            .iter()
-            .find(|item| {
-                matches!(
-                    item.hint,
-                    Some(ItemHint::Action) | Some(ItemHint::ActionList)
-                )
-            })
-            .ok_or_else(|| anyhow::anyhow!("No playable results found for '{}'", query))?;
+        // Find first playable item directly in search results
+        if let Some(playable) = find_playable_item(&search_results.items) {
+            let playable_title = playable.title.clone();
+            let playable_key = playable
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Playable item has no item_key"))?;
 
-        let playable_title = playable.title.clone();
-        let playable_key = playable
+            return self
+                .execute_play_action(
+                    &session_key,
+                    bare_zone_id,
+                    &playable_title,
+                    &playable_key,
+                    action,
+                )
+                .await;
+        }
+
+        // No directly playable item - try navigating deeper
+        // First, try the first non-category result (might be an album/artist)
+        if let Some(result) = self
+            .try_navigate_to_playable(&session_key, bare_zone_id, &search_results.items, action)
+            .await?
+        {
+            return Ok(result);
+        }
+
+        // Try Albums or Tracks category as fallback
+        if let Some(result) = self
+            .try_category_playable(&session_key, bare_zone_id, &search_results.items, action)
+            .await?
+        {
+            return Ok(result);
+        }
+
+        Err(anyhow::anyhow!("No playable results found for '{}'", query))
+    }
+
+    /// Try to navigate into the first non-category item to find playable content
+    async fn try_navigate_to_playable(
+        &self,
+        session_key: &str,
+        zone_id: &str,
+        items: &[BrowseItem],
+        action: PlayAction,
+    ) -> Result<Option<String>> {
+        let first = match items.first() {
+            Some(item) if !is_category(item) && item.item_key.is_some() => item,
+            _ => return Ok(None),
+        };
+
+        let first_title = first.title.clone();
+        let first_key = first
             .item_key
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("Playable item has no item_key"))?;
+            .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
 
-        // Step 4: Browse into the playable item to get actions
+        // Navigate into the item
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(first_key),
+            zone_or_output_id: Some(zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        let inner_items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.to_string()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
+
+        // Look for playable at this level
+        if let Some(playable) = find_playable_item(&inner_items.items) {
+            let play_key = playable
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+            return Ok(Some(
+                self.execute_play_action(session_key, zone_id, &first_title, &play_key, action)
+                    .await?,
+            ));
+        }
+
+        // Try one more level if first item is a list (album → album details)
+        if let Some(inner_first) = inner_items.items.first() {
+            if matches!(inner_first.hint, Some(ItemHint::List)) {
+                if let Some(inner_key) = &inner_first.item_key {
+                    self.browse(BrowseOpts {
+                        multi_session_key: Some(session_key.to_string()),
+                        item_key: Some(inner_key.clone()),
+                        zone_or_output_id: Some(zone_id.to_string()),
+                        ..Default::default()
+                    })
+                    .await?;
+
+                    let deeper = self
+                        .load(LoadOpts {
+                            multi_session_key: Some(session_key.to_string()),
+                            count: Some(20),
+                            ..Default::default()
+                        })
+                        .await?;
+
+                    if let Some(playable) = find_playable_item(&deeper.items) {
+                        let play_key = playable
+                            .item_key
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+                        return Ok(Some(
+                            self.execute_play_action(
+                                session_key,
+                                zone_id,
+                                &first_title,
+                                &play_key,
+                                action,
+                            )
+                            .await?,
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Try to find playable content in Albums or Tracks category
+    async fn try_category_playable(
+        &self,
+        session_key: &str,
+        zone_id: &str,
+        items: &[BrowseItem],
+        action: PlayAction,
+    ) -> Result<Option<String>> {
+        let category = items
+            .iter()
+            .find(|item| item.title == "Albums" || item.title == "Tracks");
+
+        let cat = match category {
+            Some(c) if c.item_key.is_some() => c,
+            _ => return Ok(None),
+        };
+
+        let cat_key = cat
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Category has no key"))?;
+
+        // Navigate into the category
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(cat_key),
+            zone_or_output_id: Some(zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        let category_items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.to_string()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
+
+        // Find first playable in category
+        if let Some(playable) = find_playable_item(&category_items.items) {
+            let title = playable.title.clone();
+            let key = playable
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Playable item has no item_key"))?;
+
+            return Ok(Some(
+                self.execute_play_action(session_key, zone_id, &title, &key, action)
+                    .await?,
+            ));
+        }
+
+        // Category contains albums/tracks with hint=list - navigate into the first one
+        if let Some(first_item) = category_items.items.first() {
+            if let Some(first_key) = &first_item.item_key {
+                let first_title = first_item.title.clone();
+
+                self.browse(BrowseOpts {
+                    multi_session_key: Some(session_key.to_string()),
+                    item_key: Some(first_key.clone()),
+                    zone_or_output_id: Some(zone_id.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+
+                let deeper_items = self
+                    .load(LoadOpts {
+                        multi_session_key: Some(session_key.to_string()),
+                        count: Some(20),
+                        ..Default::default()
+                    })
+                    .await?;
+
+                if let Some(playable) = find_playable_item(&deeper_items.items) {
+                    let key = playable
+                        .item_key
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+                    return Ok(Some(
+                        self.execute_play_action(session_key, zone_id, &first_title, &key, action)
+                            .await?,
+                    ));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Play an item by its item_key
+    ///
+    /// Takes an item_key from search results and plays it on the specified zone.
+    /// Handles navigation through intermediate levels (albums, tracks) as needed.
+    pub async fn play_item(
+        &self,
+        item_key: &str,
+        zone_id: &str,
+        action: PlayAction,
+    ) -> Result<String> {
+        // Validate item_key format (should be non-empty and reasonable length)
+        if item_key.is_empty() {
+            return Err(anyhow::anyhow!("item_key cannot be empty"));
+        }
+        if item_key.len() > 500 {
+            return Err(anyhow::anyhow!("item_key appears malformed (too long)"));
+        }
+
+        let session_key = format!(
+            "play_item_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        let bare_zone_id = zone_id.strip_prefix("roon:").unwrap_or(zone_id);
+
+        // Browse to the item
         self.browse(BrowseOpts {
             multi_session_key: Some(session_key.clone()),
-            item_key: Some(playable_key),
+            item_key: Some(item_key.to_string()),
             zone_or_output_id: Some(bare_zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        let items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.clone()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
+
+        // Find a playable item directly
+        if let Some(playable) = find_playable_item(&items.items) {
+            let title = playable.title.clone();
+            let key = playable
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+            return self
+                .execute_play_action(&session_key, bare_zone_id, &title, &key, action)
+                .await;
+        }
+
+        // No direct playable - look for "Play Album" action
+        if let Some(play_album) = items.items.iter().find(|i| i.title == "Play Album") {
+            let key = play_album
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
+            return self
+                .execute_play_action(&session_key, bare_zone_id, "Album", &key, action)
+                .await;
+        }
+
+        // Try navigating into the first item (might be an album or track listing)
+        if let Some(first) = items.items.first() {
+            if let Some(key) = &first.item_key {
+                self.browse(BrowseOpts {
+                    multi_session_key: Some(session_key.clone()),
+                    item_key: Some(key.clone()),
+                    zone_or_output_id: Some(bare_zone_id.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+
+                let deeper = self
+                    .load(LoadOpts {
+                        multi_session_key: Some(session_key.clone()),
+                        count: Some(20),
+                        ..Default::default()
+                    })
+                    .await?;
+
+                // Look for playable at this level
+                if let Some(playable) = find_playable_item(&deeper.items) {
+                    let title = playable.title.clone();
+                    let item_key = playable
+                        .item_key
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+                    return self
+                        .execute_play_action(&session_key, bare_zone_id, &title, &item_key, action)
+                        .await;
+                }
+
+                // Check for Play Album action
+                if let Some(play_album) = deeper.items.iter().find(|i| i.title == "Play Album") {
+                    let key = play_album
+                        .item_key
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
+                    return self
+                        .execute_play_action(&session_key, bare_zone_id, &first.title, &key, action)
+                        .await;
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Could not find playable content for item_key '{}'",
+            item_key
+        ))
+    }
+
+    /// Helper to execute a play action on a specific item
+    async fn execute_play_action(
+        &self,
+        session_key: &str,
+        zone_id: &str,
+        item_title: &str,
+        item_key: &str,
+        action: PlayAction,
+    ) -> Result<String> {
+        // Browse into the item to get actions
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(item_key.to_string()),
+            zone_or_output_id: Some(zone_id.to_string()),
             ..Default::default()
         })
         .await?;
 
         let mut actions = self
             .load(LoadOpts {
-                multi_session_key: Some(session_key.clone()),
+                multi_session_key: Some(session_key.to_string()),
                 count: Some(10),
                 ..Default::default()
             })
             .await?;
 
         // Sometimes we get another action_list level (the track itself) before the actions
-        // If so, browse one more level to get the actual actions (Play Now, Queue, etc.)
         if actions.items.len() == 1 {
             if let Some(item) = actions.items.first() {
                 if matches!(item.hint, Some(ItemHint::ActionList)) {
                     if let Some(key) = &item.item_key {
                         self.browse(BrowseOpts {
-                            multi_session_key: Some(session_key.clone()),
+                            multi_session_key: Some(session_key.to_string()),
                             item_key: Some(key.clone()),
-                            zone_or_output_id: Some(bare_zone_id.to_string()),
+                            zone_or_output_id: Some(zone_id.to_string()),
                             ..Default::default()
                         })
                         .await?;
 
                         actions = self
                             .load(LoadOpts {
-                                multi_session_key: Some(session_key.clone()),
+                                multi_session_key: Some(session_key.to_string()),
                                 count: Some(10),
                                 ..Default::default()
                             })
@@ -461,13 +843,7 @@ impl RoonBrowseAdapter {
             }
         }
 
-        // Find the requested action
-        let action_title = match action {
-            "play" => "Play Now",
-            "queue" => "Queue",
-            "radio" => "Start Radio",
-            other => other,
-        };
+        let action_title = action.action_title();
 
         let action_item = actions
             .items
@@ -487,16 +863,16 @@ impl RoonBrowseAdapter {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
 
-        // Step 5: Execute the action
+        // Execute the action
         self.browse(BrowseOpts {
-            multi_session_key: Some(session_key.clone()),
+            multi_session_key: Some(session_key.to_string()),
             item_key: Some(action_key),
-            zone_or_output_id: Some(bare_zone_id.to_string()),
+            zone_or_output_id: Some(zone_id.to_string()),
             ..Default::default()
         })
         .await?;
 
-        Ok(format!("{}: {} '{}'", action_title, playable_title, query))
+        Ok(format!("{}: {}", action_title, item_title))
     }
 }
 

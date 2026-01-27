@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Architecture enforcement lint - ensures API handlers use aggregator, not direct adapter access.
 //!
 //! The ZoneAggregator is the single source of truth for zone state. API handlers should

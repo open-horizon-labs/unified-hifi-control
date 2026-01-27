@@ -185,6 +185,19 @@ const TOOLS = [
     },
   },
   {
+    name: 'hifi_play_item',
+    description: 'Play a specific item by its item_key (from hifi_search or hifi_browse results). Use this when you want to play a specific search result rather than the first match.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        item_key: { type: 'string', description: 'The item_key from search or browse results' },
+        zone_id: { type: 'string', description: 'Zone ID to play on (get from hifi_zones)' },
+        action: { type: 'string', description: 'What to do: "play" (default), "queue", or "radio"' },
+      },
+      required: ['item_key', 'zone_id'],
+    },
+  },
+  {
     name: 'hifi_browse',
     description: 'Navigate the Roon library hierarchy (artists, albums, genres, etc). Returns items at the current level. Use session_key from previous response to maintain navigation state.',
     inputSchema: {
@@ -309,6 +322,14 @@ async function handleTool(name, args) {
         if (source) body.source = source;
         if (action) body.action = action;
         const data = await apiFetch('/roon/play', { method: 'POST', body: JSON.stringify(body) });
+        return { content: [{ type: 'text', text: data.message || JSON.stringify(data, null, 2) }] };
+      }
+
+      case 'hifi_play_item': {
+        const { item_key, zone_id, action } = args;
+        const body = { item_key, zone_id };
+        if (action) body.action = action;
+        const data = await apiFetch('/roon/play_item', { method: 'POST', body: JSON.stringify(body) });
         return { content: [{ type: 'text', text: data.message || JSON.stringify(data, null, 2) }] };
       }
 

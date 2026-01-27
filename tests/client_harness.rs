@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Client Test Harness
 //!
 //! Simulates both the ESP32 Knob and iOS/Apple Watch clients to exercise

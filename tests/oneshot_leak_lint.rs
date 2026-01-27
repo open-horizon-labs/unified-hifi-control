@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! AST-level test to detect potential oneshot channel leaks.
 //!
 //! Patterns detected:

@@ -1090,6 +1090,7 @@ async fn run_roon_loop(
 crate::impl_startable!(RoonAdapter, "roon", is_configured);
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

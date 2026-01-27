@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Mock servers for adapter integration testing
 //!
 //! These mock servers simulate real backend services (Roon, LMS, HQPlayer, UPnP, OpenHome)

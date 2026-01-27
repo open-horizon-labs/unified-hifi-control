@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! AST-level test to detect `.find(|_| true)` anti-pattern.
 //!
 //! This pattern indicates code that arbitrarily selects from a collection

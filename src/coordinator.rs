@@ -20,7 +20,8 @@ use std::sync::Arc;
 /// All available adapters in the system.
 /// This is the single source of truth for what adapters exist.
 /// Note: "lms-cli" is a companion to "lms" and shares its enabled state.
-pub const AVAILABLE_ADAPTERS: &[&str] = &["roon", "roon_browse", "lms", "lms-cli", "openhome", "upnp"];
+pub const AVAILABLE_ADAPTERS: &[&str] =
+    &["roon", "roon_browse", "lms", "lms-cli", "openhome", "upnp"];
 
 /// Registered adapter with its spawn function
 struct RegisteredAdapter {
@@ -371,6 +372,7 @@ pub struct AdapterStatus {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::bus::create_bus;

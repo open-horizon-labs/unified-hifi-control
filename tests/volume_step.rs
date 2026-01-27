@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Volume step regression tests
 //!
 //! Bug: Adapters hardcode volume_step to 1.0, ignoring backend-specific values.

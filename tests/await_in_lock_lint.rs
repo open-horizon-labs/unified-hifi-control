@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! AST-level test to detect `.await` while holding a lock guard.
 //!
 //! Holding a lock (Mutex, RwLock) across an await point can cause deadlocks

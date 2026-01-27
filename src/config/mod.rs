@@ -367,6 +367,7 @@ fn migrate_roon_config(data_dir: &std::path::Path) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use serial_test::serial;

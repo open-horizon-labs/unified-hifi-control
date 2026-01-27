@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Mock HQPlayer for testing
 //!
 //! Simulates the TCP/XML protocol on port 4321

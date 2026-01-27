@@ -1822,6 +1822,7 @@ pub fn create_lms_adapters(bus: SharedBus) -> (Arc<LmsAdapter>, Arc<LmsCliAdapte
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! SAFETY CRITICAL: Volume control regression tests
 //!
 //! Bug: vol_abs used hardcoded 0-100 range, causing dB values like -12

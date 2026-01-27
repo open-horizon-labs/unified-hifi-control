@@ -289,6 +289,7 @@ mod server {
             // Roon Browse routes (AI DJ Phase 1)
             .route("/roon/search", get(api::roon_search_handler))
             .route("/roon/play", post(api::roon_play_handler))
+            .route("/roon/play_item", post(api::roon_play_item_handler))
             .route("/roon/browse", post(api::roon_browse_handler))
             .route("/roon/browse/status", get(api::roon_browse_status_handler))
             // HQPlayer routes

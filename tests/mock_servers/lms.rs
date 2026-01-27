@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Mock LMS (Logitech Media Server) for testing
 //!
 //! Simulates the JSON-RPC interface at /jsonrpc.js

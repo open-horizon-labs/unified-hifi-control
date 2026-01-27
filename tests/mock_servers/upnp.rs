@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Mock UPnP MediaRenderer for testing
 //!
 //! Provides HTTP endpoints for device description and SOAP control.
