@@ -283,7 +283,7 @@ pub fn Zones() -> Element {
             for (source, group_zones) in grouped_zones {
                 div { class: "mb-8",
                     h3 { class: "text-lg font-semibold mb-4 text-muted", "{source}" }
-                    div { class: "zone-grid",
+                    div { class: "grid gap-4 grid-cols-1 md:grid-cols-2 lg:grid-cols-3",
                         for zone in group_zones {
                             ZoneCard {
                                 key: "{zone.zone_id}",
@@ -344,7 +344,6 @@ fn ZoneCard(
 
     let np = now_playing.as_ref();
     let is_playing = np.map(|n| n.is_playing).unwrap_or(false);
-    let play_icon = if is_playing { "⏸︎" } else { "▶" };
 
     let has_hqp = zone
         .dsp
@@ -400,34 +399,28 @@ fn ZoneCard(
     rsx! {
         article { class: "zone-card",
             // Main content with album art and info (same layout as zone detail)
-            div { class: "flex gap-5 items-start",
-                // Album art (96px)
+            div { class: "flex gap-3 sm:gap-5 items-start overflow-hidden",
+                // Album art (smaller on mobile, 96px on larger screens)
                 if has_image {
                     img {
                         src: "{image_url}",
                         alt: "Album art",
-                        class: "w-24 h-24 object-cover rounded-lg bg-elevated flex-shrink-0"
+                        class: "w-16 h-16 sm:w-24 sm:h-24 object-cover rounded-lg bg-elevated flex-shrink-0"
                     }
                 } else {
-                    div { class: "w-24 h-24 rounded-lg bg-elevated flex items-center justify-center text-muted text-3xl flex-shrink-0",
+                    div { class: "w-16 h-16 sm:w-24 sm:h-24 rounded-lg bg-elevated flex items-center justify-center text-muted text-2xl sm:text-3xl flex-shrink-0",
                         "♪"
                     }
                 }
 
                 // Zone info
                 div { class: "flex-1 min-w-0",
-                    // Header with zone name and badges
+                    // Header with zone name and HQP badge
                     h3 { class: "flex items-center gap-2 mb-2 text-base font-semibold",
                         span { class: "truncate", "{zone.zone_name}" }
                         if has_hqp {
                             span { class: "badge badge-primary", "HQP" }
                         }
-                        if let Some(ref source) = zone.source {
-                            span { class: "badge badge-secondary", "{source}" }
-                        }
-                    }
-                    p { class: "text-sm text-muted mb-3",
-                        if is_playing { "playing" } else { "stopped" }
                     }
 
                     // Now playing info
@@ -452,21 +445,36 @@ fn ZoneCard(
             }
 
             // Transport controls
-            div { class: "flex items-center gap-2 mt-4",
+            div { class: "flex flex-wrap items-center gap-2 mt-4",
                 button {
                     class: "btn btn-ghost",
+                    "aria-label": "Previous track",
                     onclick: move |_| on_control.call((zone_id_prev.clone(), "previous".to_string())),
-                    "◀◀"
+                    svg { class: "w-5 h-5", fill: "currentColor", view_box: "0 0 24 24",
+                        path { d: "M6 6h2v12H6zm3.5 6l8.5 6V6z" }
+                    }
                 }
                 button {
                     class: "btn btn-primary",
+                    "aria-label": if is_playing { "Pause" } else { "Play" },
                     onclick: move |_| on_control.call((zone_id_play.clone(), "play_pause".to_string())),
-                    "{play_icon}"
+                    if is_playing {
+                        svg { class: "w-5 h-5", fill: "currentColor", view_box: "0 0 24 24",
+                            path { d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z" }
+                        }
+                    } else {
+                        svg { class: "w-5 h-5", fill: "currentColor", view_box: "0 0 24 24",
+                            path { d: "M8 5v14l11-7z" }
+                        }
+                    }
                 }
                 button {
                     class: "btn btn-ghost",
+                    "aria-label": "Next track",
                     onclick: move |_| on_control.call((zone_id_next.clone(), "next".to_string())),
-                    "▶▶"
+                    svg { class: "w-5 h-5", fill: "currentColor", view_box: "0 0 24 24",
+                        path { d: "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" }
+                    }
                 }
 
                 VolumeControlsCompact {

@@ -316,7 +316,6 @@ async fn create_test_app() -> Router {
         // Web UI routes (MUST return HTML) - using stubs for testing
         .route("/", get(ui_stubs::stub_page))
         .route("/ui/zones", get(ui_stubs::stub_page))
-        .route("/zone", get(ui_stubs::stub_page))
         .route("/hqplayer", get(ui_stubs::stub_page))
         .route("/lms", get(ui_stubs::stub_page))
         .route("/knobs", get(ui_stubs::stub_page))

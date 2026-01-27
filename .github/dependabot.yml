@@ -1,0 +1,38 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      dioxus:
+        patterns:
+          - "dioxus*"
+      tokio:
+        patterns:
+          - "tokio*"
+      tower:
+        patterns:
+          - "tower*"
+          - "axum*"
+      serde:
+        patterns:
+          - "serde*"
+      tracing:
+        patterns:
+          - "tracing*"
+      wasm:
+        patterns:
+          - "wasm-bindgen*"
+          - "web-sys"
+          - "js-sys"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"

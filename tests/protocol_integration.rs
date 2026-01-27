@@ -161,7 +161,6 @@ async fn create_test_app() -> Router {
         // Web UI routes (MUST return HTML) - using stubs for testing
         .route("/", get(ui_stubs::stub_page))
         .route("/ui/zones", get(ui_stubs::stub_page))
-        .route("/zone", get(ui_stubs::stub_page))
         .route("/hqplayer", get(ui_stubs::stub_page))
         .route("/lms", get(ui_stubs::stub_page))
         .route("/knobs", get(ui_stubs::stub_page))
@@ -456,14 +455,6 @@ mod ui_endpoints {
         let (status, body) = get_body(&app, "/ui/zones").await;
         assert_eq!(status, StatusCode::OK);
         assert_html("/ui/zones", &body);
-    }
-
-    #[tokio::test]
-    async fn zone_page_returns_html() {
-        let app = create_test_app().await;
-        let (status, body) = get_body(&app, "/zone").await;
-        assert_eq!(status, StatusCode::OK);
-        assert_html("/zone", &body);
     }
 
     #[tokio::test]
