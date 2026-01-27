@@ -655,7 +655,7 @@ fn StateCascadePreview(
                             if i == states.len() - 1 {
                                 if *is_off { "bg-red-500/20 text-red-700 dark:text-red-200 font-medium" } else { "bg-green-500/20 text-green-700 dark:text-green-200 font-medium" }
                             } else {
-                                "bg-black/5 dark:bg-white/10"
+                                "bg-black/5 dark:bg-white/10 text-gray-700 dark:text-gray-200"
                             }
                         ),
                         span { class: "text-base", "{icon}" }
