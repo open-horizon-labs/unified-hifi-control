@@ -17,5 +17,19 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "node-fetch": "^2.7.0"
+  },
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/open-horizon-labs/unified-hifi-control/issues"
+  },
+  "homepage": "https://github.com/open-horizon-labs/unified-hifi-control#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.58.0"
   }
 }
