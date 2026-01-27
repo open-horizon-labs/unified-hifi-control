@@ -489,7 +489,7 @@ jobs:
           find target/dx -name "*.wasm" -o -name "*.js" | head -5
 
       - name: Upload WASM assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: wasm-assets
           path: target/dx/
@@ -643,7 +643,7 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/unified-hifi-control dist/bin/unified-hifi-linux-x64
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binary-x86_64-unknown-linux-musl
           path: dist/bin/
@@ -874,7 +874,7 @@ jobs:
           cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binary-${{ matrix.target }}
           path: dist/bin/
@@ -930,7 +930,7 @@ jobs:
           cargo build --release --target x86_64-apple-darwin
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binary-macos-x64
           path: target/x86_64-apple-darwin/release/unified-hifi-control
@@ -986,7 +986,7 @@ jobs:
           cargo build --release --target aarch64-apple-darwin
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binary-macos-arm64
           path: target/aarch64-apple-darwin/release/unified-hifi-control
@@ -1024,7 +1024,7 @@ jobs:
           file dist/bin/unified-hifi-macos-universal
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binary-macos-universal
           path: dist/bin/
@@ -1089,7 +1089,7 @@ jobs:
           cp target/release/unified-hifi-control.exe dist/bin/unified-hifi-win64.exe
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: binary-windows
           path: dist/bin/
@@ -1214,7 +1214,7 @@ jobs:
           rm -rf repack
 
       - name: Upload LMS plugin
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: lms-plugin
           path: dist/lms-unified-hifi-control-*.zip
@@ -1292,7 +1292,7 @@ jobs:
             package.tgz scripts conf
 
       - name: Upload Synology package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: synology-${{ matrix.cpu_arch }}
           path: dist/installers/*.spk
@@ -1341,7 +1341,7 @@ jobs:
           mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ needs.plan.outputs.version }}_x86_64.qpkg
 
       - name: Upload QNAP package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: qnap-x86_64
           path: dist/installers/*.qpkg
@@ -1393,7 +1393,7 @@ jobs:
           mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ needs.plan.outputs.version }}_arm_64.qpkg
 
       - name: Upload QNAP package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: qnap-arm_64
           path: dist/installers/*.qpkg
@@ -1515,7 +1515,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: docker-digest-${{ matrix.target }}
           path: /tmp/digests/*
@@ -1654,7 +1654,7 @@ jobs:
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Upload Linux packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: linux-packages
           path: |
