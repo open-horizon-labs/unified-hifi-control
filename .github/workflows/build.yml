@@ -339,7 +339,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -374,7 +374,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -452,7 +452,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-wasm.outputs.cache-hit != 'true'
@@ -542,7 +542,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-wasm.outputs.cache-hit != 'true'
@@ -617,7 +617,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -842,7 +842,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -907,7 +907,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -963,7 +963,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
@@ -1055,7 +1055,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/tailwind.css
-          key: css-v4.1.18-${{ hashFiles('src/input.css') }}
+          key: css-v4.1.18-${{ hashFiles('src/input.css', 'src/app/pages/*.rs', 'src/app/components/*.rs') }}
 
       - name: Build Tailwind CSS
         if: steps.cache-css.outputs.cache-hit != 'true'
