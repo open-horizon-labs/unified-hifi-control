@@ -901,12 +901,11 @@ fn ZoneLinkTable(
     let linked_zone_id = linked_zone.as_ref().map(|l| l.zone_id.clone());
     let linked_instance = linked_zone.as_ref().map(|l| l.instance.clone());
 
-    // Default instance for new links
-    let default_instance = if instances.is_empty() {
-        "default".to_string()
-    } else {
-        instances[0].name.clone()
-    };
+    // Default instance for new links (empty string if none configured)
+    let default_instance = instances
+        .first()
+        .map(|i| i.name.clone())
+        .unwrap_or_default();
 
     // Selected zone signal - default to first zone or linked zone
     let initial_zone = linked_zone_id
