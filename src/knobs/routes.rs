@@ -252,12 +252,14 @@ pub async fn knob_now_playing_handler(
         Some(id) => id,
         None => {
             let zone_infos = get_zone_infos(&state).await;
+            let zones_sha = compute_zones_sha(&zone_infos);
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": "zone_id required",
                     "error_code": "MISSING_ZONE_ID",
-                    "zones": zone_infos
+                    "zones": zone_infos,
+                    "zones_sha": zones_sha
                 })),
             ));
         }
@@ -303,12 +305,14 @@ pub async fn knob_now_playing_handler(
     let zone = match state.aggregator.get_zone(&prefixed_zone_id).await {
         Some(z) => z,
         None => {
+            let zones_sha = compute_zones_sha(&zone_infos);
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
                     "error": "zone not found",
                     "error_code": "ZONE_NOT_FOUND",
-                    "zones": zone_infos
+                    "zones": zone_infos,
+                    "zones_sha": zones_sha
                 })),
             ));
         }
@@ -327,12 +331,14 @@ pub async fn knob_now_playing_handler(
     };
 
     if !adapter_enabled {
+        let zones_sha = compute_zones_sha(&zone_infos);
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "error": "zone not found",
                 "error_code": "ZONE_NOT_FOUND",
-                "zones": zone_infos
+                "zones": zone_infos,
+                "zones_sha": zones_sha
             })),
         ));
     }
