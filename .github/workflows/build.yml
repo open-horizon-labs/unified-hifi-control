@@ -472,7 +472,8 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: wasm-assets
-          path: target/dx/
+          # Only upload release web assets, not entire target/dx/ (avoids 30MB+ bloat)
+          path: target/dx/unified-hifi-control/release/web/
           if-no-files-found: error
           retention-days: 1
 
@@ -595,7 +596,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: wasm-assets
-          path: target/dx/
+          path: target/dx/unified-hifi-control/release/web/
 
       - name: Cache generated CSS
         id: cache-css
@@ -820,7 +821,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: wasm-assets
-          path: target/dx/
+          path: target/dx/unified-hifi-control/release/web/
 
       - name: Cache generated CSS
         id: cache-css
@@ -885,7 +886,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: wasm-assets
-          path: target/dx/
+          path: target/dx/unified-hifi-control/release/web/
 
       - name: Cache generated CSS
         id: cache-css
@@ -941,7 +942,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: wasm-assets
-          path: target/dx/
+          path: target/dx/unified-hifi-control/release/web/
 
       - name: Cache generated CSS
         id: cache-css
@@ -1033,7 +1034,7 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: wasm-assets
-          path: target/dx/
+          path: target/dx/unified-hifi-control/release/web/
 
       - name: Cache generated CSS
         id: cache-css
