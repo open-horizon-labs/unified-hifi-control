@@ -893,27 +893,16 @@ fn ZoneLinkTable(
         .map(|i| i.name.clone())
         .unwrap_or_default();
 
-    // First zone ID - memoized for effect tracking
-    let zones_for_memo = zones.clone();
-    let first_zone_id = use_memo(move || {
-        zones_for_memo
-            .first()
-            .map(|z| z.zone_id.clone())
-            .unwrap_or_default()
-    });
+    // First zone ID (computed each render from props)
+    let first_zone_id = zones.first().map(|z| z.zone_id.clone()).unwrap_or_default();
 
-    // Selected zone signal - synced when zones load
-    let mut selected_zone = use_signal(String::new);
+    // Selected zone - initialize to first zone if available
+    let mut selected_zone = use_signal(|| first_zone_id.clone());
     let mut selected_instance =
         use_signal(|| linked_instance.clone().unwrap_or(default_instance.clone()));
 
-    // Sync selected_zone when zones load (signal only captures initial value at mount)
-    use_effect(move || {
-        let first = first_zone_id();
-        if selected_zone().is_empty() && !first.is_empty() {
-            selected_zone.set(first);
-        }
-    });
+    // Clone for onclick closure
+    let first_zone_for_click = first_zone_id.clone();
 
     let has_multiple_instances = instances.len() > 1;
 
@@ -983,7 +972,7 @@ fn ZoneLinkTable(
                         let zone_id = {
                             let sel = selected_zone();
                             if sel.is_empty() {
-                                first_zone_id()
+                                first_zone_for_click.clone()
                             } else {
                                 sel
                             }
