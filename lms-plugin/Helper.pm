@@ -41,15 +41,10 @@ sub init {
     }
 
     # On macOS, clear quarantine flag to prevent Gatekeeper blocking unsigned binary
-    if (Slim::Utils::OSDetect::OS() eq 'mac' && (my $binary = $class->bin())) {
+    if (main::ISMAC && (my $binary = $class->bin())) {
         system('xattr', '-cr', $binary);
         $? && $log->error("Failed to clear quarantine attribute on $binary: $!");
     }
-}
-
-# Get plugin version from install.xml
-sub pluginVersion {
-    return Plugins::UnifiedHiFi::Plugin->_pluginDataFor('version') || '0.0.0';
 }
 
 # Get path to the binary using LMS's built-in findbin
@@ -135,8 +130,10 @@ sub stop {
     Slim::Utils::Timers::killTimers($class, \&_healthCheck);
     Slim::Utils::Timers::killTimers($class, \&_resetRestarts);
 
+    main::idleStreams(); # Ensure LMS main loop is running
     $helperProc && $helperProc->die;
     $helperProc && $helperProc->wait;  # Reap zombie process
+    main::idle();
     $restarts = 0;
 }
 
@@ -198,54 +195,6 @@ sub _healthCheck {
 sub _resetRestarts {
     $restartResetTimer = undef;
     $restarts = 0;
-}
-
-# Get knob status from running helper (if available)
-sub knobStatus {
-    my ($class, $cb) = @_;
-    _helperAPICall('knob/devices', sub {
-        my ($data) = @_;
-
-        # Return first knob status (single knob mode)
-        if ($data->{knobs} && @{$data->{knobs}}) {
-            $cb->($data);
-            return;
-        }
-        $cb->({});
-    });
-}
-
-sub _helperAPICall {
-    my ($endpoint, $cb) = @_;
-
-    return $cb->({}) unless __PACKAGE__->running();
-
-    my $port = $prefs->get('port') || 8088;
-    my $url = "http://localhost:$port/$endpoint";
-
-    main::DEBUGLOG && $log->is_debug && $log->debug("Calling bridge: $url");
-
-    Slim::Networking::SimpleAsyncHTTP->new(
-        sub {
-            my $response = shift;
-
-            if ($response->code == 200) {
-                my $data = eval { decode_json($response->content) };
-                $log->error("JSON decode error: $@ " . $response->content) if $@;
-                main::DEBUGLOG && $log->is_debug && $log->debug("Received response from bridge: " . encode_json($data)) unless $@;
-                return $cb->($data) if $data;
-            }
-
-            $log->warn("Unexpected response from bridge: " . $response->code);
-            $cb->({});
-        },
-        sub {
-            my ($response, $error) = @_;
-            $log->error($error);
-            $cb->({ error => $error });
-        },
-        { timeout => 2 }
-    )->get($url);
 }
 
 1;

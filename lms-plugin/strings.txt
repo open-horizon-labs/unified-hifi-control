@@ -1,56 +1,124 @@
 PLUGIN_UNIFIED_HIFI
+	DE	Unified Hi-Fi Steuerung
 	EN	Unified Hi-Fi Control
+	FR	Contrôle Hi-Fi Unifié
+	NL	Unified Hi-Fi Bediening
 
 PLUGIN_UNIFIED_HIFI_DESC
+	DE	Quellenunabhängige Hi-Fi-Steuerungsbrücke für Roon, LMS, HQPlayer und Hardware-Drehregler. Bietet HTTP-APIs, MQTT-Integration und Web-Oberfläche.
 	EN	Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer, and hardware knobs. Provides HTTP APIs, MQTT integration, and web UI.
+	FR	Passerelle de contrôle hi-fi indépendante de la source pour Roon, LMS, HQPlayer et boutons matériels. Fournit des API HTTP, une intégration MQTT et une interface web.
+	NL	Brononafhankelijke hi-fi-bedieningsbrug voor Roon, LMS, HQPlayer en hardwareknoppen. Biedt HTTP-API's, MQTT-integratie en webinterface.
 
 PLUGIN_UNIFIED_HIFI_AUTORUN
+	DE	Bridge automatisch starten
 	EN	Auto-start bridge
+	FR	Démarrage automatique du pont
+	NL	Bridge automatisch starten
 
 PLUGIN_UNIFIED_HIFI_AUTORUN_DESC
+	DE	Startet die Unified Hi-Fi Control Bridge automatisch mit LMS.
 	EN	Automatically start the Unified Hi-Fi Control bridge when LMS starts.
+	FR	Démarre automatiquement la passerelle Unified Hi-Fi Control au démarrage de LMS.
+	NL	Start de Unified Hi-Fi Control bridge automatisch bij het starten van LMS.
+
+PLUGIN_UNIFIED_HIFI_AUTORUN_ENABLE
+	DE	Autostart aktivieren
+	EN	Enable auto-start
+	FR	Activer le démarrage automatique
+	NL	Automatisch starten inschakelen
 
 PLUGIN_UNIFIED_HIFI_START_BRIDGE
+	DE	Bridge starten
 	EN	Start Bridge
+	FR	Démarrer le pont
+	NL	Bridge starten
 
 PLUGIN_UNIFIED_HIFI_STOP_BRIDGE
+	DE	Bridge stoppen
 	EN	Stop Bridge
+	FR	Arrêter le pont
+	NL	Bridge stoppen
 
 PLUGIN_UNIFIED_HIFI_PORT
+	DE	Bridge-Port
 	EN	Bridge port
+	FR	Port du pont
+	NL	Bridge-poort
 
 PLUGIN_UNIFIED_HIFI_PORT_DESC
+	DE	HTTP-Port für die Bridge-Weboberfläche und API (Standard: 8088). Ändern, falls Konflikt mit HQPlayer.
 	EN	HTTP port for the bridge web UI and API (default: 8088). Change if conflicting with HQPlayer.
+	FR	Port HTTP pour l'interface web et l'API du pont (par défaut : 8088). À modifier en cas de conflit avec HQPlayer.
+	NL	HTTP-poort voor de bridge webinterface en API (standaard: 8088). Wijzig bij conflict met HQPlayer.
 
 PLUGIN_UNIFIED_HIFI_BINARY_MISSING
-	EN	<b>&#9888; Binary Missing:</b> No binary found for this platform. Please reinstall the plugin.
+	DE	<b>&#9888; Helferanwendung fehlt:</b> Für diese Plattform wurde keine Programmdatei gefunden. Bitte Plugin neu installieren.
+	EN	<b>&#9888; Helper Application Missing:</b> No binary found for this platform. Please reinstall the plugin.
+	FR	<b>&#9888; Application d'aide manquante :</b> Aucun binaire trouvé pour cette plateforme. Veuillez réinstaller le plugin.
+	NL	<b>&#9888; Helper-applicatie ontbreekt:</b> Geen binary gevonden voor dit platform. Installeer de plugin opnieuw.
 
 PLUGIN_UNIFIED_HIFI_RUNNING
+	DE	Läuft
 	EN	Running
+	FR	En cours
+	NL	Actief
 
 PLUGIN_UNIFIED_HIFI_STOPPED
+	DE	Gestoppt
 	EN	Stopped
+	FR	Arrêté
+	NL	Gestopt
 
 PLUGIN_UNIFIED_HIFI_OPENUI
+	DE	Web-Oberfläche öffnen
 	EN	Open Web UI
+	FR	Ouvrir l'interface web
+	NL	Open webinterface
 
 PLUGIN_UNIFIED_HIFI_STATUS
 	EN	Status
+	FR	Statut
 
 PLUGIN_UNIFIED_HIFI_KNOB
+	DE	Drehregler-Konfiguration
 	EN	Knob Configuration
+	FR	Configuration du bouton
+	NL	Knopconfiguratie
 
 PLUGIN_UNIFIED_HIFI_KNOB_NAME
+	DE	Name des Drehreglers
 	EN	Knob name
+	FR	Nom du bouton
+	NL	Knopnaam
+
+PLUGIN_UNIFIED_HIFI_CONTROLLED_PLAYER
+	DE	Gesteuerter Player
+	EN	Controlled player
+	FR	Lecteur contrôlé
+	NL	Aangestuurde speler
+
+PLUGIN_UNIFIED_HIFI_IP_ADDRESS
+	DE	IP-Adresse
+	EN	IP Address
+	FR	Adresse IP
+	NL	IP-adres
 
 PLUGIN_UNIFIED_HIFI_KNOB_FIRMWARE
 	EN	Firmware
+	FR	Micrologiciel
 
 PLUGIN_UNIFIED_HIFI_KNOB_BATTERY
+	DE	Batterie
 	EN	Battery
+	FR	Batterie
+	NL	Batterij
 
 PLUGIN_UNIFIED_HIFI_KNOB_BATTERY_CHARGING
+	DE	(lädt)
 	EN	(charging)
+	FR	(en charge)
+	NL	(aan het laden)
 
 PLUGIN_UNIFIED_HIFI_KNOB_ID
 	EN	ID

@@ -1,5 +1,110 @@
+[% IF useExtJS; extJsScripts = BLOCK %]
+    <script TYPE="text/javascript">
+        Ext.onReady(function() {
+            new Ext.util.TaskRunner().start({
+                run: function() {
+                    Ext.Ajax.request({
+                        url: knobDevicesUrl,
+                        success: function(response, options){
+                            response = Ext.util.JSON.decode(response.responseText);
+                            getKnobList(response.knobs);
+                            Ext.get('helperRunning').show();
+                            Ext.get('helperStopped').setDisplayed(false);
+                        },
+                        failure: function(a, b, c) {
+                            Ext.get('helperRunning').setDisplayed(false);
+                            Ext.get('helperStopped').show();
+                        }
+                    });
+                },
+                interval: 5000
+            });
+        });
+    </script>
+[% END; ELSE %]
+    <script TYPE="text/javascript" language="JavaScript">
+        window.setInterval(function () {
+            new Ajax.Request(knobDevicesUrl, {
+                method:'get',
+                onSuccess: function(response) {
+                    getKnobList(response?.responseJSON?.knobs);
+                    setIsRunning(response?.status == 200);
+                },
+                onFailure: function() {
+                    setIsRunning(false);
+                }
+            });
+        }, 2000);
+
+        function setIsRunning(isRunning) {
+            if (isRunning) {
+                $('helperRunning').style.display = 'inline';
+                $('helperStopped').style.display = 'none';
+            } else {
+                $('helperRunning').style.display = 'none';
+                $('helperStopped').style.display = 'inline';
+            }
+        }
+    </script>
+[% END %]
 [% PROCESS settings/header.html %]
     [% title = "PLUGIN_UNIFIED_HIFI" %]
+
+    <script TYPE="text/javascript" language="JavaScript">
+        const knobDevicesUrl = '[% webUrl %]/knob/devices';
+        const charging = '[% "PLUGIN_UNIFIED_HIFI_KNOB_BATTERY_CHARGING" | string %]';
+        const playerIdNameMap = JSON.parse('[% playerIdNameMap | replace("'", "\\'") %]');
+
+        function getKnobList(knobs) {
+            if (!(knobs && knobs.length)) {
+                return;
+            }
+
+            let table = document.getElementById('knobList');
+            // Clear existing rows except header
+            while (table.rows.length > 1) {
+                table.deleteRow(1);
+            }
+
+            knobs.sort(function(a, b) {
+                return (a.name || a.knob_id).localeCompare(b.name || b.knob_id);
+            }).forEach(function(knob) {
+                let row = table.insertRow();
+
+                let cellName = row.insertCell(0);
+                cellName.textContent = knob.name || 'Knob';
+
+                let cellAction = row.insertCell(1);
+                cellAction.textContent = playerIdNameMap[knob.status?.zone_id?.replace('lms:', '')] || knob.status?.zone_id?.replace('lms:', '') || 'Unknown Player';
+
+                let cellIP = row.insertCell(2);
+                let ipAddress = knob.status?.ip;
+                if (ipAddress) {
+                    let link = document.createElement('a');
+                    link.href = 'http://' + ipAddress;
+                    link.target = '_blank';
+                    link.textContent = ipAddress;
+                    cellIP.appendChild(link);
+                }
+                else {
+                    cellIP.textContent = 'N/A';
+                }
+
+                let cellVersion = row.insertCell(3);
+                cellVersion.textContent = knob.version;
+
+                let cellBattery = row.insertCell(4);
+                if (knob.status?.battery_level !== undefined) {
+                    cellBattery.textContent = (knob.status.battery_level || 0) + '%';
+                    if (knob.status.battery_charging) {
+                        cellBattery.textContent += ' ' + charging;
+                    }
+                } else {
+                    cellBattery.textContent = 'N/A';
+                }
+            });
+        }
+    </script>
 
     [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI" desc="" %]
     <!-- Binary status warning -->
@@ -12,31 +117,28 @@
     <!-- Status indicator -->
     <div class="prefDesc">
         <b>[% "PLUGIN_UNIFIED_HIFI_STATUS" | string %]:</b>
-        [% IF running %]
+        <span id="helperRunning" [% IF !running %]style="display: none;"[% END %]>
             <span style="color: #28a745; font-weight: bold;">
                 &#9679; [% "PLUGIN_UNIFIED_HIFI_RUNNING" | string %]
             </span>
-            &nbsp;&nbsp;
             <input type="submit" value="[% "PLUGIN_UNIFIED_HIFI_OPENUI" | string %] &#8594;" onclick="window.open('[% webUrl %]', '_blank'); return false;" />
-        [% ELSE %]
+            <br/>
+            <input type="submit" name="stop" value="[% "PLUGIN_UNIFIED_HIFI_STOP_BRIDGE" | string %]" />
+        </span>
+        <span id="helperStopped" [% IF running %]style="display: none;"[% END %]>
             <span style="color: #dc3545; font-weight: bold;">
                 &#9679; [% "PLUGIN_UNIFIED_HIFI_STOPPED" | string %]
             </span>
-        [% END %]
-    </div>
-
-    <!-- Manual start/stop -->
-        [% IF running %]
-            <input type="submit" name="stop" value="[% "PLUGIN_UNIFIED_HIFI_STOP_BRIDGE" | string %]" />
-        [% ELSE %]
+            <br/>
             <input type="submit" name="start" value="[% "PLUGIN_UNIFIED_HIFI_START_BRIDGE" | string %]" />
-        [% END %]
+        </span>
+    </div>
     [% END %]
 
     [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI_AUTORUN" desc="PLUGIN_UNIFIED_HIFI_AUTORUN_DESC" %]
         <input type="checkbox" name="pref_autorun" id="pref_autorun"
                value="1" [% IF prefs.autorun %]checked[% END %] />
-        <label for="pref_autorun">Enable auto-start</label>
+        <label for="pref_autorun">[% "PLUGIN_UNIFIED_HIFI_AUTORUN_ENABLE" | string %]</label>
     [% END %]
 
     [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI_PORT" desc="PLUGIN_UNIFIED_HIFI_PORT_DESC" %]
@@ -49,38 +151,24 @@
     <hr/>
     [% WRAPPER setting title="PLUGIN_UNIFIED_HIFI_KNOB" desc="" %]
         <style>
-            .knob-list th {
+            #knobList th {
                 text-align: left;
                 padding-right: 15px;
                 font-weight: bold;
             }
+            #knobList td {
+                vertical-align: middle;
+                padding-right: 10px;
+            }
         </style>
-        <table>
-            <tr class="knob-list">
+        <table id="knobList">
+            <tr>
                 <th>[% "PLUGIN_UNIFIED_HIFI_KNOB_NAME" | string %]</th>
-                <th>[% "PLUGIN_UNIFIED_HIFI_KNOB_ID"| string %]</th>
-                <th>[% "PLUGIN_UNIFIED_HIFI_KNOB_FIRMWARE"| string %]</th>
-                <th>[% "PLUGIN_UNIFIED_HIFI_KNOB_BATTERY"| string %]</th>
-                <th></th>
+                <th>[% "PLUGIN_UNIFIED_HIFI_CONTROLLED_PLAYER" | string %]</th>
+                <th>[% "PLUGIN_UNIFIED_HIFI_IP_ADDRESS" | string %]</th>
+                <th>[% "PLUGIN_UNIFIED_HIFI_KNOB_FIRMWARE" | string %]</th>
+                <th>[% "PLUGIN_UNIFIED_HIFI_KNOB_BATTERY" | string %]</th>
             </tr>
-            [% FOREACH knob = knobStatus.knobs %]
-                <tr>
-                    <td style="vertical-align: middle; padding-right: 10px">[% knob.name | html %]</td>
-                    <td style="vertical-align: middle; padding-right: 10px">[% knob.knob_id | html %]</td>
-                    <td style="vertical-align: middle; padding-right: 10px">[% knob.version | html %]</td>
-                    <td style="vertical-align: middle; padding-right: 10px">
-                        [% IF knob.status.battery_level %]
-                            [% knob.status.battery_level %]%
-                            [% IF knob.status.battery_charging; "PLUGIN_UNIFIED_HIFI_KNOB_BATTERY_CHARGING" FILTER string; END %]
-                        [% ELSE %]
-                            N/A
-                        [% END %]
-                    </td>
-                    <td>
-                        <input type="submit" value="[% "EDIT" | string %] &#8594;" onclick="window.open('[% webUrl %]/knobs', '_blank'); return false;" />
-                    </td>
-                </tr>
-            [% END %]
         </table>
     [% END %]
 [% PROCESS settings/footer.html %]

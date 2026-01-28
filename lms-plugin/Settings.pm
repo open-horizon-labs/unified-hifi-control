@@ -6,6 +6,7 @@ use strict;
 use warnings;
 
 use base qw(Slim::Web::Settings);
+use JSON::XS;
 
 use Slim::Utils::Prefs;
 use Slim::Utils::Log;
@@ -29,7 +30,7 @@ sub prefs {
 }
 
 sub handler {
-    my ($class, $client, $params) = @_;
+    my ($class, $client, $params, @args) = @_;
 
     # Handle start/stop actions
     if ($params->{'start'}) {
@@ -48,14 +49,12 @@ sub handler {
 
         # Restart if running and settings changed
         if ($needsRestart && Plugins::UnifiedHiFi::Helper->running()) {
+            Plugins::UnifiedHiFi::Helper->stop();
             $params->{needsRestart} = 1;
         }
     }
 
-    # Knob status will be fetched via JavaScript on the page if needed
-    $params->{'knobStatus'} = { knobs => [] };
-
-    return $class->SUPER::handler($client, $params);
+    return $class->SUPER::handler($client, $params, @args);
 }
 
 sub beforeRender {
@@ -63,20 +62,17 @@ sub beforeRender {
 
     if ( $params->{saveSettings} && $params->{needsRestart} ) {
         $log->info("Settings changed, restarting helper");
-        Plugins::UnifiedHiFi::Helper->stop();
-        # Always attempt start after stop to ensure service is running
-        # Small delay to allow process to fully terminate
-        Slim::Utils::Timers::setTimer(undef, time() + 1, sub {
-            Plugins::UnifiedHiFi::Helper->start();
-        });
+        Plugins::UnifiedHiFi::Helper->start();
     }
 
-    # Add template variables (wrapped in eval for safety)
-    $params->{'running'}      = eval { Plugins::UnifiedHiFi::Helper->running() } || 0;
-    $params->{'webUrl'}       = eval { Plugins::UnifiedHiFi::Helper->webUrl() } || '';
-    $params->{'binaryStatus'} = eval { Plugins::UnifiedHiFi::Helper->binaryStatus() } || 'unknown';
+    # Add template variables
+    $params->{'running'}      = Plugins::UnifiedHiFi::Helper->running();
+    $params->{'webUrl'}       = Plugins::UnifiedHiFi::Helper->webUrl();
+    $params->{'binaryStatus'} = Plugins::UnifiedHiFi::Helper->binaryStatus();
 
-    $log->error("Error in beforeRender: $@") if $@;
+    $params->{'playerIdNameMap'} = encode_json({
+        map { $_->id => $_->name } Slim::Player::Client::clients()
+    });
 
     return $class->SUPER::beforeRender($params, $client);
 }
