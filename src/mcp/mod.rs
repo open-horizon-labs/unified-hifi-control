@@ -53,7 +53,7 @@ pub struct NowPlayingArgs {
 pub struct ControlArgs {
     /// The zone ID to control
     pub zone_id: String,
-    /// Action: play, pause, next, previous, volume_set, volume_up, volume_down
+    /// Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down
     pub action: String,
     /// For volume actions: the level (0-100 for volume_set) or amount to change
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -233,8 +233,10 @@ impl HifiMcpServer {
         }
     }
 
-    /// Control playback: play, pause, next, previous, or adjust volume
-    #[tool(description = "Control playback: play, pause, next, previous, or adjust volume")]
+    /// Control playback: play, pause, playpause (toggle), next, previous, or adjust volume
+    #[tool(
+        description = "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume"
+    )]
     async fn hifi_control(
         &self,
         Parameters(args): Parameters<ControlArgs>,
