@@ -421,9 +421,9 @@ jobs:
           # Version is baked in at compile time, but we accept stale version display
           # for PRs in exchange for cache efficiency. Releases change Cargo.toml anyway.
           # Note: Tailwind version pinned in Makefile - update cache key when upgrading
-          key: wasm-v2-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'src/input.css', 'public/dx-components-theme.css') }}
+          key: wasm-v3-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'src/input.css', 'public/dx-components-theme.css') }}
           restore-keys: |
-            wasm-v2-
+            wasm-v3-
 
       - name: Setup Rust
         if: steps.cache-wasm.outputs.cache-hit != 'true'
@@ -514,9 +514,9 @@ jobs:
             target/dx/
             target/wasm32-unknown-unknown/
           # Same cache key as build-wasm job - shares cached artifacts
-          key: wasm-v2-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'src/input.css', 'public/dx-components-theme.css') }}
+          key: wasm-v3-tw4.1.18-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'Dioxus.toml', 'src/**/*.rs', 'assets/**', 'src/input.css', 'public/dx-components-theme.css') }}
           restore-keys: |
-            wasm-v2-
+            wasm-v3-
 
       - name: Setup Rust
         if: steps.cache-wasm.outputs.cache-hit != 'true'
