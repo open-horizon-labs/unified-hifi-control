@@ -541,7 +541,13 @@ impl RoonAdapter {
     }
 
     /// Browse the Roon library hierarchy
-    pub async fn browse(&self, opts: BrowseOpts) -> Result<BrowseResult> {
+    pub async fn browse(&self, mut opts: BrowseOpts) -> Result<BrowseResult> {
+        // Strip "roon:" prefix from zone IDs so callers can pass API-returned IDs directly
+        if let Some(zone) = opts.zone_or_output_id.as_deref() {
+            if let Some(stripped) = zone.strip_prefix("roon:") {
+                opts.zone_or_output_id = Some(stripped.to_string());
+            }
+        }
         let (tx, rx) = oneshot::channel();
         let session_key = opts.multi_session_key.clone();
 

@@ -684,7 +684,15 @@ pub async fn roon_browse_handler(
                         }
                     })
                     .collect(),
-                Err(_) => vec![],
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Browse load error: {}", e),
+                        }),
+                    )
+                        .into_response();
+                }
             }
         } else {
             vec![]

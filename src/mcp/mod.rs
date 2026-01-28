@@ -139,7 +139,7 @@ pub struct McpBrowseResult {
 /// Arguments for hifi_hqplayer_set_pipeline
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HqpSetPipelineArgs {
-    /// Setting to change: mode, samplerate, filter1x, filterNx, shaper, dither
+    /// Setting to change: mode, samplerate, filter1x, filterNx, shaper
     pub setting: String,
     /// New value for the setting
     pub value: String,
