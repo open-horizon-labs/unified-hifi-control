@@ -574,7 +574,9 @@ impl HifiMcpServer {
     }
 
     /// Change an HQPlayer pipeline setting
-    #[tool(description = "Change an HQPlayer pipeline setting (filter, shaper, dither, etc)")]
+    #[tool(
+        description = "Change an HQPlayer pipeline setting (mode, samplerate, filter1x, filterNx, shaper)"
+    )]
     async fn hifi_hqplayer_set_pipeline(
         &self,
         Parameters(args): Parameters<HqpSetPipelineArgs>,
