@@ -6,7 +6,8 @@
 #[cfg(feature = "server")]
 mod server {
     use unified_hifi_control::{
-        adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mdns,
+        adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
+        mdns,
     };
 
     // Import Startable trait for adapter lifecycle methods
@@ -264,6 +265,9 @@ mod server {
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();
 
+        // Create MCP extension (state for MCP handlers)
+        let mcp_extension = mcp::create_mcp_extension(state.clone());
+
         // Build API routes
         let router = Router::new()
             // Health check
@@ -275,6 +279,12 @@ mod server {
             .route("/roon/control", post(api::roon_control_handler))
             .route("/roon/volume", post(api::roon_volume_handler))
             .route("/roon/image", get(api::roon_image_handler))
+            // Roon Browse routes (AI DJ Phase 1)
+            .route("/roon/search", get(api::roon_search_handler))
+            .route("/roon/play", post(api::roon_play_handler))
+            .route("/roon/play_item", post(api::roon_play_item_handler))
+            .route("/roon/browse", post(api::roon_browse_handler))
+            .route("/roon/browse/status", get(api::roon_browse_status_handler))
             // HQPlayer routes
             .route("/hqplayer/status", get(api::hqp_status_handler))
             .route("/hqplayer/pipeline", get(api::hqp_pipeline_handler))
@@ -430,7 +440,12 @@ mod server {
                     ))
                 }),
             )
+            // MCP routes (same port as main app)
+            .route("/mcp", get(mcp::handle_mcp_get))
+            .route("/mcp", post(mcp::handle_mcp_post))
+            .route("/mcp", delete(mcp::handle_mcp_delete))
             // Middleware
+            .layer(mcp_extension)
             .layer(CorsLayer::permissive())
             .layer(CompressionLayer::new())
             .layer(TraceLayer::new_for_http())

@@ -359,6 +359,383 @@ pub async fn roon_image_handler(
 }
 
 // =============================================================================
+// Roon Browse handlers (AI DJ Phase 1)
+// =============================================================================
+
+/// Query params for search request
+#[derive(Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Search source: "library" (default), "tidal", or "qobuz"
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Request body for play action
+#[derive(Deserialize)]
+pub struct PlayRequest {
+    pub query: String,
+    pub zone_id: String,
+    /// Source: "library" (default), "tidal", or "qobuz"
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Action: "play" (default), "queue", or "radio"
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+/// Search result item (simplified from roon_api::browse::Item)
+#[derive(Serialize)]
+pub struct SearchResultItem {
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub item_key: Option<String>,
+    pub hint: Option<String>,
+}
+
+impl From<roon_api::browse::Item> for SearchResultItem {
+    fn from(item: roon_api::browse::Item) -> Self {
+        use roon_api::browse::ItemHint;
+        Self {
+            title: item.title,
+            subtitle: item.subtitle,
+            item_key: item.item_key,
+            hint: item.hint.map(|h| {
+                match h {
+                    ItemHint::None => "none",
+                    ItemHint::Action => "action",
+                    ItemHint::ActionList => "action_list",
+                    ItemHint::List => "list",
+                    ItemHint::Header => "header",
+                }
+                .to_string()
+            }),
+        }
+    }
+}
+
+/// GET /roon/search - Search the Roon library, TIDAL, or Qobuz
+pub async fn roon_search_handler(
+    State(state): State<AppState>,
+    Query(params): Query<SearchQuery>,
+) -> impl IntoResponse {
+    use crate::adapters::roon::SearchSource;
+
+    if !state.roon.is_browse_connected().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Roon Browse not connected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let source = match params.source.as_deref() {
+        Some("tidal") => SearchSource::Tidal,
+        Some("qobuz") => SearchSource::Qobuz,
+        _ => SearchSource::Library,
+    };
+
+    match state
+        .roon
+        .search(&params.q, params.zone_id.as_deref(), params.limit, source)
+        .await
+    {
+        Ok(items) => {
+            let results: Vec<SearchResultItem> = items.into_iter().map(|i| i.into()).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "results": results })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /roon/play - Search and play music
+pub async fn roon_play_handler(
+    State(state): State<AppState>,
+    Json(req): Json<PlayRequest>,
+) -> impl IntoResponse {
+    use crate::adapters::roon::{PlayAction, SearchSource};
+
+    if !state.roon.is_browse_connected().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Roon Browse not connected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let source = match req.source.as_deref() {
+        Some("tidal") => SearchSource::Tidal,
+        Some("qobuz") => SearchSource::Qobuz,
+        _ => SearchSource::Library,
+    };
+
+    let action = PlayAction::parse(req.action.as_deref().unwrap_or("play"));
+
+    match state
+        .roon
+        .search_and_play(&req.query, &req.zone_id, source, action)
+        .await
+    {
+        Ok(message) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "message": message })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Play item request body
+#[derive(Deserialize)]
+pub struct PlayItemRequest {
+    pub item_key: String,
+    pub zone_id: String,
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+/// POST /roon/play_item - Play a specific item by its key
+pub async fn roon_play_item_handler(
+    State(state): State<AppState>,
+    Json(req): Json<PlayItemRequest>,
+) -> impl IntoResponse {
+    use crate::adapters::roon::PlayAction;
+
+    if !state.roon.is_browse_connected().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Roon Browse not connected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let action = PlayAction::parse(req.action.as_deref().unwrap_or("play"));
+
+    match state
+        .roon
+        .play_item(&req.item_key, &req.zone_id, action)
+        .await
+    {
+        Ok(message) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "message": message })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Browse request body
+#[derive(Deserialize)]
+pub struct BrowseRequest {
+    #[serde(default)]
+    pub item_key: Option<String>,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default)]
+    pub pop_all: bool,
+    #[serde(default)]
+    pub input: Option<String>,
+    /// Session key for maintaining browse state across requests
+    #[serde(default)]
+    pub session_key: Option<String>,
+}
+
+/// Browse result converted to serializable format
+#[derive(Serialize)]
+pub struct BrowseResultResponse {
+    pub action: String,
+    pub list: Option<BrowseListInfo>,
+    pub is_error: Option<bool>,
+    pub message: Option<String>,
+    /// Session key to use for subsequent browse calls
+    pub session_key: String,
+    /// Items at the current browse level
+    pub items: Vec<BrowseItemResponse>,
+}
+
+#[derive(Serialize)]
+pub struct BrowseListInfo {
+    pub title: String,
+    pub count: u32,
+    pub level: u32,
+    pub subtitle: Option<String>,
+    pub image_key: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct BrowseItemResponse {
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub item_key: Option<String>,
+    pub hint: Option<String>,
+    pub image_key: Option<String>,
+}
+
+/// POST /roon/browse - Browse the Roon library hierarchy
+pub async fn roon_browse_handler(
+    State(state): State<AppState>,
+    Json(req): Json<BrowseRequest>,
+) -> impl IntoResponse {
+    use roon_api::browse::{BrowseOpts, ItemHint, LoadOpts};
+
+    if !state.roon.is_browse_connected().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Roon Browse not connected".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Use provided session_key or generate a new one
+    let session_key = req.session_key.unwrap_or_else(|| {
+        format!(
+            "browse_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
+    });
+
+    let opts = BrowseOpts {
+        item_key: req.item_key,
+        zone_or_output_id: req.zone_id,
+        pop_all: req.pop_all,
+        input: req.input,
+        multi_session_key: Some(session_key.clone()),
+        ..Default::default()
+    };
+
+    // Browse to the level
+    let browse_result = match state.roon.browse(opts).await {
+        Ok(result) => result,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response()
+        }
+    };
+
+    // Load items at this level
+    let items = if let Some(ref list) = browse_result.list {
+        if list.count > 0 {
+            let load_opts = LoadOpts {
+                multi_session_key: Some(session_key.clone()),
+                count: Some(50), // Load up to 50 items
+                ..Default::default()
+            };
+            match state.roon.load(load_opts).await {
+                Ok(load_result) => load_result
+                    .items
+                    .into_iter()
+                    .map(|item| {
+                        let hint_str = item.hint.map(|h| match h {
+                            ItemHint::Action => "action",
+                            ItemHint::ActionList => "action_list",
+                            ItemHint::List => "list",
+                            ItemHint::Header => "header",
+                            ItemHint::None => "none",
+                        });
+                        BrowseItemResponse {
+                            title: item.title,
+                            subtitle: item.subtitle,
+                            item_key: item.item_key,
+                            hint: hint_str.map(|s| s.to_string()),
+                            image_key: item.image_key,
+                        }
+                    })
+                    .collect(),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Browse load error: {}", e),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
+    use roon_api::browse::Action;
+    let action_str = match browse_result.action {
+        Action::None => "none",
+        Action::Message => "message",
+        Action::List => "list",
+        Action::ReplaceItem => "replace_item",
+        Action::RemoveItem => "remove_item",
+    };
+
+    let response = BrowseResultResponse {
+        action: action_str.to_string(),
+        list: browse_result.list.map(|l| BrowseListInfo {
+            title: l.title,
+            count: l.count as u32,
+            level: l.level,
+            subtitle: l.subtitle,
+            image_key: l.image_key,
+        }),
+        is_error: browse_result.is_error,
+        message: browse_result.message,
+        session_key,
+        items,
+    };
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// GET /roon/browse/status - Check if browse service is connected
+pub async fn roon_browse_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let connected = state.roon.is_browse_connected().await;
+    Json(serde_json::json!({
+        "connected": connected
+    }))
+}
+
+// =============================================================================
 // HQPlayer handlers
 // =============================================================================
 

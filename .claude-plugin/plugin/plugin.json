@@ -1,0 +1,12 @@
+{
+  "name": "hifi-control",
+  "version": "2.5.1",
+  "description": "Unified Hi-Fi Control - Control Roon and HQPlayer",
+  "skills": [
+    {
+      "name": "sync-upstream",
+      "description": "Sync saas main branch with open source upstream v3 branch. Fetches, merges, resolves Docker conflicts, and pushes.",
+      "path": "skills/sync-upstream.md"
+    }
+  ]
+}

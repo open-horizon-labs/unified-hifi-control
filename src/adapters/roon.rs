@@ -5,6 +5,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use roon_api::{
+    browse::{
+        Browse, BrowseOpts, BrowseResult, Item as BrowseItem, ItemHint, LoadOpts, LoadResult,
+    },
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
     transport::{self, volume, Control, Transport, Zone as RoonZone},
@@ -32,8 +35,90 @@ use crate::knobs::KnobStore;
 
 const ROON_STATE_FILE: &str = "roon_state.json";
 
+/// Timeout for browse/load requests
+const BROWSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default search result limit
+const DEFAULT_SEARCH_LIMIT: usize = 50;
+
+/// Category names returned by Roon search - these are containers, not playable items
+const CATEGORY_NAMES: &[&str] = &[
+    "Albums",
+    "Tracks",
+    "Artists",
+    "Works",
+    "Composers",
+    "Genres",
+    "Tags",
+];
+
+/// Search source - where to search
+#[derive(Debug, Clone, Copy, Default)]
+pub enum SearchSource {
+    #[default]
+    Library,
+    Tidal,
+    Qobuz,
+}
+
+/// Play action - what to do with the selected item
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlayAction {
+    #[default]
+    Play,
+    Queue,
+    Radio,
+}
+
+impl PlayAction {
+    /// Parse from string, defaulting to Play for unknown values
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "queue" | "add" => Self::Queue,
+            "radio" | "start_radio" => Self::Radio,
+            _ => Self::Play,
+        }
+    }
+
+    /// Get the Roon action title
+    fn action_title(&self) -> &'static str {
+        match self {
+            Self::Play => "Play Now",
+            Self::Queue => "Queue",
+            Self::Radio => "Start Radio",
+        }
+    }
+}
+
+/// Find the first playable item in a list (hint is Action or ActionList)
+fn find_playable_item(items: &[BrowseItem]) -> Option<&BrowseItem> {
+    items.iter().find(|item| {
+        matches!(
+            item.hint,
+            Some(ItemHint::Action) | Some(ItemHint::ActionList)
+        )
+    })
+}
+
+/// Check if an item is a category (Albums, Tracks, etc.) rather than playable content
+fn is_category(item: &BrowseItem) -> bool {
+    CATEGORY_NAMES.contains(&item.title.as_str())
+}
+
+/// Strip "roon:" prefix from zone/output IDs.
+/// MCP and aggregator use prefixed IDs (e.g., "roon:zone_123"), but Roon API expects bare IDs.
+fn strip_roon_prefix(id: &str) -> &str {
+    id.strip_prefix("roon:").unwrap_or(id)
+}
+
 /// Pending image request - stores the oneshot sender to deliver the result
 type ImageRequest = oneshot::Sender<Option<ImageData>>;
+
+/// Pending browse request - stores the oneshot sender to deliver the result
+type BrowseRequest = oneshot::Sender<Result<BrowseResult>>;
+
+/// Pending load request - stores the oneshot sender to deliver the result
+type LoadRequest = oneshot::Sender<Result<LoadResult>>;
 
 /// Image data returned from Roon
 #[derive(Debug, Clone)]
@@ -152,8 +237,13 @@ struct RoonState {
     zones: HashMap<String, Zone>,
     transport: Option<Transport>,
     image: Option<Image>,
+    browse: Option<Browse>,
     /// Pending image requests: request_id -> (image_key, oneshot sender)
     pending_images: HashMap<usize, (String, ImageRequest)>,
+    /// Pending browse requests: request_id -> (session_key, oneshot sender)
+    pending_browses: HashMap<usize, (Option<String>, BrowseRequest)>,
+    /// Pending load requests: request_id -> (session_key, oneshot sender)
+    pending_loads: HashMap<usize, (Option<String>, LoadRequest)>,
 }
 
 /// Roon adapter
@@ -287,6 +377,8 @@ impl RoonAdapter {
 
     /// Control playback
     pub async fn control(&self, zone_id: &str, action: &str) -> Result<()> {
+        let zone_id = strip_roon_prefix(zone_id);
+
         // Clone transport while holding lock, then release before await
         let transport = {
             let state = self.state.read().await;
@@ -317,6 +409,8 @@ impl RoonAdapter {
     /// Naively clamping to 0-100 would send -12 dB → 0 (MAX VOLUME), risking
     /// equipment damage. See tests/volume_safety.rs for regression protection.
     pub async fn change_volume(&self, output_id: &str, value: f32, relative: bool) -> Result<()> {
+        let output_id = strip_roon_prefix(output_id);
+
         // Clone transport and gather volume info while holding lock, then release before await
         let (transport, mode, final_value) = {
             let state = self.state.read().await;
@@ -369,6 +463,8 @@ impl RoonAdapter {
 
     /// Mute/unmute
     pub async fn mute(&self, output_id: &str, mute: bool) -> Result<()> {
+        let output_id = strip_roon_prefix(output_id);
+
         // Clone transport while holding lock, then release before await
         let transport = {
             let state = self.state.read().await;
@@ -445,6 +541,721 @@ impl RoonAdapter {
             Err(_) => Err(anyhow::anyhow!("Image request timed out")),
         }
     }
+
+    // =========================================================================
+    // Browse API methods (consolidated from RoonBrowseAdapter)
+    // =========================================================================
+
+    /// Check if browse service is connected
+    pub async fn is_browse_connected(&self) -> bool {
+        let state = self.state.read().await;
+        state.connected && state.browse.is_some()
+    }
+
+    /// Browse the Roon library hierarchy
+    pub async fn browse(&self, mut opts: BrowseOpts) -> Result<BrowseResult> {
+        // Require session key to avoid concurrent request collisions
+        let session_key = opts
+            .multi_session_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("multi_session_key is required for browse requests"))?;
+
+        if let Some(zone) = opts.zone_or_output_id.as_deref() {
+            opts.zone_or_output_id = Some(strip_roon_prefix(zone).to_string());
+        }
+        let (tx, rx) = oneshot::channel();
+
+        let browse = {
+            let state = self.state.read().await;
+            state.browse.clone().ok_or_else(|| {
+                anyhow::anyhow!("Browse service not available - not connected to Roon")
+            })?
+        };
+
+        let req_id = browse.browse(&opts).await;
+
+        let req_id = match req_id {
+            Some(id) => {
+                let mut state = self.state.write().await;
+                state
+                    .pending_browses
+                    .insert(id, (Some(session_key.clone()), tx));
+                id
+            }
+            None => return Err(anyhow::anyhow!("Failed to initiate browse request")),
+        };
+
+        tracing::debug!("Browse request initiated with req_id {}", req_id);
+
+        let result = tokio::time::timeout(BROWSE_TIMEOUT, rx).await;
+
+        if result.is_err() {
+            let mut state = self.state.write().await;
+            state.pending_browses.remove(&req_id);
+        }
+
+        match result {
+            Ok(Ok(data)) => data,
+            Ok(Err(_)) => Err(anyhow::anyhow!("Browse request cancelled")),
+            Err(_) => Err(anyhow::anyhow!("Browse request timed out")),
+        }
+    }
+
+    /// Load items from the current browse position (for pagination)
+    pub async fn load(&self, opts: LoadOpts) -> Result<LoadResult> {
+        // Require session key to avoid concurrent request collisions
+        let session_key = opts
+            .multi_session_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("multi_session_key is required for load requests"))?;
+
+        let (tx, rx) = oneshot::channel();
+
+        let browse = {
+            let state = self.state.read().await;
+            state.browse.clone().ok_or_else(|| {
+                anyhow::anyhow!("Browse service not available - not connected to Roon")
+            })?
+        };
+
+        let req_id = browse.load(&opts).await;
+
+        let req_id = match req_id {
+            Some(id) => {
+                let mut state = self.state.write().await;
+                state
+                    .pending_loads
+                    .insert(id, (Some(session_key.clone()), tx));
+                id
+            }
+            None => return Err(anyhow::anyhow!("Failed to initiate load request")),
+        };
+
+        tracing::debug!("Load request initiated with req_id {}", req_id);
+
+        let result = tokio::time::timeout(BROWSE_TIMEOUT, rx).await;
+
+        if result.is_err() {
+            let mut state = self.state.write().await;
+            state.pending_loads.remove(&req_id);
+        }
+
+        match result {
+            Ok(Ok(data)) => data,
+            Ok(Err(_)) => Err(anyhow::anyhow!("Load request cancelled")),
+            Err(_) => Err(anyhow::anyhow!("Load request timed out")),
+        }
+    }
+
+    /// Search the Roon library, TIDAL, or Qobuz
+    pub async fn search(
+        &self,
+        query: &str,
+        zone_id: Option<&str>,
+        limit: Option<usize>,
+        source: SearchSource,
+    ) -> Result<Vec<BrowseItem>> {
+        let session_key = format!(
+            "search_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        let source_name = match source {
+            SearchSource::Library => "Library",
+            SearchSource::Tidal => "TIDAL",
+            SearchSource::Qobuz => "Qobuz",
+        };
+
+        // Step 1: Navigate to root
+        let root_opts = BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            zone_or_output_id: zone_id.map(|z| z.to_string()),
+            pop_all: true,
+            ..Default::default()
+        };
+        self.browse(root_opts).await?;
+
+        let root_load = LoadOpts {
+            multi_session_key: Some(session_key.clone()),
+            count: Some(10),
+            ..Default::default()
+        };
+        let root_items = self.load(root_load).await?;
+
+        // Find source item
+        let source_item = root_items
+            .items
+            .iter()
+            .find(|item| item.title == source_name)
+            .ok_or_else(|| anyhow::anyhow!("{} not found in browse root", source_name))?;
+
+        let source_key = source_item
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("{} has no item_key", source_name))?;
+
+        // Step 2: Browse into source
+        let source_opts = BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            item_key: Some(source_key),
+            zone_or_output_id: zone_id.map(|z| z.to_string()),
+            ..Default::default()
+        };
+        self.browse(source_opts).await?;
+
+        let source_load = LoadOpts {
+            multi_session_key: Some(session_key.clone()),
+            count: Some(10),
+            ..Default::default()
+        };
+        let source_items = self.load(source_load).await?;
+
+        // Find Search item
+        let search_item = source_items
+            .items
+            .iter()
+            .find(|item| item.title == "Search")
+            .ok_or_else(|| anyhow::anyhow!("Search not found in {}", source_name))?;
+
+        let search_key = search_item
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Search has no item_key"))?;
+
+        // Step 3: Search with query
+        let search_opts = BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            item_key: Some(search_key),
+            input: Some(query.to_string()),
+            zone_or_output_id: zone_id.map(|z| z.to_string()),
+            ..Default::default()
+        };
+        let search_result = self.browse(search_opts).await?;
+
+        // Step 4: Load search results
+        if let Some(list) = &search_result.list {
+            if list.count > 0 {
+                let load_opts = LoadOpts {
+                    multi_session_key: Some(session_key),
+                    count: Some(limit.unwrap_or(DEFAULT_SEARCH_LIMIT)),
+                    ..Default::default()
+                };
+                let load_result = self.load(load_opts).await?;
+                return Ok(load_result.items);
+            }
+        }
+
+        Ok(vec![])
+    }
+
+    /// Search and play the first matching result
+    pub async fn search_and_play(
+        &self,
+        query: &str,
+        zone_id: &str,
+        source: SearchSource,
+        action: PlayAction,
+    ) -> Result<String> {
+        let session_key = format!(
+            "play_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        let source_name = match source {
+            SearchSource::Library => "Library",
+            SearchSource::Tidal => "TIDAL",
+            SearchSource::Qobuz => "Qobuz",
+        };
+
+        let bare_zone_id = strip_roon_prefix(zone_id);
+
+        // Navigate to root
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            zone_or_output_id: Some(bare_zone_id.to_string()),
+            pop_all: true,
+            ..Default::default()
+        })
+        .await?;
+
+        let root_items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.clone()),
+                count: Some(10),
+                ..Default::default()
+            })
+            .await?;
+
+        // Find source
+        let source_item = root_items
+            .items
+            .iter()
+            .find(|item| item.title == source_name)
+            .ok_or_else(|| anyhow::anyhow!("{} not found", source_name))?;
+
+        let source_key = source_item
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("{} has no item_key", source_name))?;
+
+        // Browse into source
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            item_key: Some(source_key),
+            zone_or_output_id: Some(bare_zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        let source_items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.clone()),
+                count: Some(10),
+                ..Default::default()
+            })
+            .await?;
+
+        // Find Search
+        let search_item = source_items
+            .items
+            .iter()
+            .find(|item| item.title == "Search")
+            .ok_or_else(|| anyhow::anyhow!("Search not found in {}", source_name))?;
+
+        let search_key = search_item
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Search has no item_key"))?;
+
+        // Search with query
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            item_key: Some(search_key),
+            input: Some(query.to_string()),
+            zone_or_output_id: Some(bare_zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        let search_results = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.clone()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
+
+        // Find first playable item
+        if let Some(playable) = find_playable_item(&search_results.items) {
+            let playable_title = playable.title.clone();
+            let playable_key = playable
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Playable item has no item_key"))?;
+
+            return self
+                .execute_play_action(
+                    &session_key,
+                    bare_zone_id,
+                    &playable_title,
+                    &playable_key,
+                    action,
+                )
+                .await;
+        }
+
+        // Try navigating deeper
+        if let Some(result) = self
+            .try_navigate_to_playable(&session_key, bare_zone_id, &search_results.items, action)
+            .await?
+        {
+            return Ok(result);
+        }
+
+        // Try category fallback
+        if let Some(result) = self
+            .try_category_playable(&session_key, bare_zone_id, &search_results.items, action)
+            .await?
+        {
+            return Ok(result);
+        }
+
+        Err(anyhow::anyhow!("No playable results found for '{}'", query))
+    }
+
+    /// Try to navigate into the first non-category item to find playable content
+    async fn try_navigate_to_playable(
+        &self,
+        session_key: &str,
+        zone_id: &str,
+        items: &[BrowseItem],
+        action: PlayAction,
+    ) -> Result<Option<String>> {
+        let first = match items.first() {
+            Some(item) if !is_category(item) && item.item_key.is_some() => item,
+            _ => return Ok(None),
+        };
+
+        let first_title = first.title.clone();
+        let first_key = first
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(first_key),
+            zone_or_output_id: Some(zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        let inner_items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.to_string()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
+
+        if let Some(playable) = find_playable_item(&inner_items.items) {
+            let play_key = playable
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+            return Ok(Some(
+                self.execute_play_action(session_key, zone_id, &first_title, &play_key, action)
+                    .await?,
+            ));
+        }
+
+        // Try one more level
+        if let Some(inner_first) = inner_items.items.first() {
+            if matches!(inner_first.hint, Some(ItemHint::List)) {
+                if let Some(inner_key) = &inner_first.item_key {
+                    self.browse(BrowseOpts {
+                        multi_session_key: Some(session_key.to_string()),
+                        item_key: Some(inner_key.clone()),
+                        zone_or_output_id: Some(zone_id.to_string()),
+                        ..Default::default()
+                    })
+                    .await?;
+
+                    let deeper = self
+                        .load(LoadOpts {
+                            multi_session_key: Some(session_key.to_string()),
+                            count: Some(20),
+                            ..Default::default()
+                        })
+                        .await?;
+
+                    if let Some(playable) = find_playable_item(&deeper.items) {
+                        let play_key = playable
+                            .item_key
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+                        return Ok(Some(
+                            self.execute_play_action(
+                                session_key,
+                                zone_id,
+                                &first_title,
+                                &play_key,
+                                action,
+                            )
+                            .await?,
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Try to find playable content in Albums or Tracks category
+    async fn try_category_playable(
+        &self,
+        session_key: &str,
+        zone_id: &str,
+        items: &[BrowseItem],
+        action: PlayAction,
+    ) -> Result<Option<String>> {
+        let category = items
+            .iter()
+            .find(|item| item.title == "Albums" || item.title == "Tracks");
+
+        let cat = match category {
+            Some(c) if c.item_key.is_some() => c,
+            _ => return Ok(None),
+        };
+
+        let cat_key = cat
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Category has no key"))?;
+
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(cat_key),
+            zone_or_output_id: Some(zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        let category_items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.to_string()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
+
+        if let Some(playable) = find_playable_item(&category_items.items) {
+            let title = playable.title.clone();
+            let key = playable
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Playable item has no item_key"))?;
+
+            return Ok(Some(
+                self.execute_play_action(session_key, zone_id, &title, &key, action)
+                    .await?,
+            ));
+        }
+
+        // Try first item in category
+        if let Some(first_item) = category_items.items.first() {
+            if let Some(first_key) = &first_item.item_key {
+                let first_title = first_item.title.clone();
+
+                self.browse(BrowseOpts {
+                    multi_session_key: Some(session_key.to_string()),
+                    item_key: Some(first_key.clone()),
+                    zone_or_output_id: Some(zone_id.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+
+                let deeper_items = self
+                    .load(LoadOpts {
+                        multi_session_key: Some(session_key.to_string()),
+                        count: Some(20),
+                        ..Default::default()
+                    })
+                    .await?;
+
+                if let Some(playable) = find_playable_item(&deeper_items.items) {
+                    let key = playable
+                        .item_key
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+                    return Ok(Some(
+                        self.execute_play_action(session_key, zone_id, &first_title, &key, action)
+                            .await?,
+                    ));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Play an item by its item_key
+    pub async fn play_item(
+        &self,
+        item_key: &str,
+        zone_id: &str,
+        action: PlayAction,
+    ) -> Result<String> {
+        if item_key.is_empty() {
+            return Err(anyhow::anyhow!("item_key cannot be empty"));
+        }
+        if item_key.len() > 500 {
+            return Err(anyhow::anyhow!("item_key appears malformed (too long)"));
+        }
+
+        let session_key = format!(
+            "play_item_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        let bare_zone_id = strip_roon_prefix(zone_id);
+
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.clone()),
+            item_key: Some(item_key.to_string()),
+            zone_or_output_id: Some(bare_zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        let items = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.clone()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
+
+        if let Some(playable) = find_playable_item(&items.items) {
+            let title = playable.title.clone();
+            let key = playable
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+            return self
+                .execute_play_action(&session_key, bare_zone_id, &title, &key, action)
+                .await;
+        }
+
+        // Try "Play Album" action
+        if let Some(play_album) = items.items.iter().find(|i| i.title == "Play Album") {
+            let key = play_album
+                .item_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
+            return self
+                .execute_play_action(&session_key, bare_zone_id, "Album", &key, action)
+                .await;
+        }
+
+        // Try navigating into first item
+        if let Some(first) = items.items.first() {
+            if let Some(key) = &first.item_key {
+                self.browse(BrowseOpts {
+                    multi_session_key: Some(session_key.clone()),
+                    item_key: Some(key.clone()),
+                    zone_or_output_id: Some(bare_zone_id.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+
+                let deeper = self
+                    .load(LoadOpts {
+                        multi_session_key: Some(session_key.clone()),
+                        count: Some(20),
+                        ..Default::default()
+                    })
+                    .await?;
+
+                if let Some(playable) = find_playable_item(&deeper.items) {
+                    let title = playable.title.clone();
+                    let item_key = playable
+                        .item_key
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+                    return self
+                        .execute_play_action(&session_key, bare_zone_id, &title, &item_key, action)
+                        .await;
+                }
+
+                if let Some(play_album) = deeper.items.iter().find(|i| i.title == "Play Album") {
+                    let key = play_album
+                        .item_key
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
+                    return self
+                        .execute_play_action(&session_key, bare_zone_id, &first.title, &key, action)
+                        .await;
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Could not find playable content for item_key '{}'",
+            item_key
+        ))
+    }
+
+    /// Execute a play action on a specific item
+    async fn execute_play_action(
+        &self,
+        session_key: &str,
+        zone_id: &str,
+        item_title: &str,
+        item_key: &str,
+        action: PlayAction,
+    ) -> Result<String> {
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(item_key.to_string()),
+            zone_or_output_id: Some(zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        let mut actions = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.to_string()),
+                count: Some(10),
+                ..Default::default()
+            })
+            .await?;
+
+        // Handle double-nested action_list
+        if actions.items.len() == 1 {
+            if let Some(item) = actions.items.first() {
+                if matches!(item.hint, Some(ItemHint::ActionList)) {
+                    if let Some(key) = &item.item_key {
+                        self.browse(BrowseOpts {
+                            multi_session_key: Some(session_key.to_string()),
+                            item_key: Some(key.clone()),
+                            zone_or_output_id: Some(zone_id.to_string()),
+                            ..Default::default()
+                        })
+                        .await?;
+
+                        actions = self
+                            .load(LoadOpts {
+                                multi_session_key: Some(session_key.to_string()),
+                                count: Some(10),
+                                ..Default::default()
+                            })
+                            .await?;
+                    }
+                }
+            }
+        }
+
+        let action_title = action.action_title();
+
+        let action_item = actions
+            .items
+            .iter()
+            .find(|item| item.title == action_title)
+            .ok_or_else(|| {
+                let available: Vec<_> = actions.items.iter().map(|i| &i.title).collect();
+                anyhow::anyhow!(
+                    "Action '{}' not available. Available: {:?}",
+                    action_title,
+                    available
+                )
+            })?;
+
+        let action_key = action_item
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
+
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(action_key),
+            zone_or_output_id: Some(zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        Ok(format!("{}: {}", action_title, item_title))
+    }
 }
 
 #[async_trait]
@@ -475,8 +1286,7 @@ impl AdapterLogic for RoonAdapter {
         zone_id: &str,
         command: AdapterCommand,
     ) -> Result<AdapterCommandResponse> {
-        // Strip "roon:" prefix if present (bus/aggregator uses prefixed IDs)
-        let zone_id = zone_id.strip_prefix("roon:").unwrap_or(zone_id);
+        let zone_id = strip_roon_prefix(zone_id);
 
         let result = match command {
             AdapterCommand::Play => self.control(zone_id, "play").await,
@@ -703,6 +1513,7 @@ async fn run_roon_loop(
     let services = vec![
         Services::Transport(Transport::new()),
         Services::Image(Image::new()),
+        Services::Browse(Browse::new()),
         Services::Status(status),
     ];
 
@@ -784,6 +1595,7 @@ async fn run_roon_loop(
                     // Get transport and image services BEFORE acquiring lock
                     let transport = core.get_transport().cloned();
                     let image = core.get_image().cloned();
+                    let browse = core.get_browse().cloned();
 
                     // Subscribe to zones BEFORE acquiring lock (async operation)
                     if let Some(ref t) = transport {
@@ -798,10 +1610,15 @@ async fn run_roon_loop(
                         s.core_version = Some(core_version.clone());
                         s.transport = transport;
                         s.image = image.clone();
+                        s.browse = browse.clone();
                     }
 
                     if image.is_some() {
                         tracing::info!("Roon Image service available");
+                    }
+
+                    if browse.is_some() {
+                        tracing::info!("Roon Browse service available");
                     }
 
                     // Publish connected event (after lock released)
@@ -835,7 +1652,10 @@ async fn run_roon_loop(
                         s.zones.clear();
                         s.transport = None;
                         s.image = None;
+                        s.browse = None;
                         s.pending_images.clear();
+                        s.pending_browses.clear();
+                        s.pending_loads.clear();
                     }
 
                     // Publish disconnected event
@@ -1049,6 +1869,52 @@ async fn run_roon_loop(
                             }
                         }
                     }
+                    Parsed::BrowseResult(result, session_key) => {
+                        tracing::debug!(
+                            "Roon BrowseResult action={:?}, session_key={:?}",
+                            result.action,
+                            session_key
+                        );
+                        let mut s = state_for_events.write().await;
+                        if let Some(req_id) = s
+                            .pending_browses
+                            .iter()
+                            .find(|(_, (key, _))| key == &session_key)
+                            .map(|(k, _)| *k)
+                        {
+                            if let Some((_key, sender)) = s.pending_browses.remove(&req_id) {
+                                if sender.send(Ok(result)).is_err() {
+                                    tracing::debug!(
+                                        "Browse request cancelled (receiver dropped): {:?}",
+                                        session_key
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Parsed::LoadResult(result, session_key) => {
+                        tracing::debug!(
+                            "Roon LoadResult {} items, session_key={:?}",
+                            result.items.len(),
+                            session_key
+                        );
+                        let mut s = state_for_events.write().await;
+                        if let Some(req_id) = s
+                            .pending_loads
+                            .iter()
+                            .find(|(_, (key, _))| key == &session_key)
+                            .map(|(k, _)| *k)
+                        {
+                            if let Some((_key, sender)) = s.pending_loads.remove(&req_id) {
+                                if sender.send(Ok(result)).is_err() {
+                                    tracing::debug!(
+                                        "Load request cancelled (receiver dropped): {:?}",
+                                        session_key
+                                    );
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1071,8 +1937,11 @@ async fn run_roon_loop(
         s.connected = false;
         s.transport = None;
         s.image = None;
+        s.browse = None;
         s.zones.clear();
         s.pending_images.clear();
+        s.pending_browses.clear();
+        s.pending_loads.clear();
     }
 
     // Check if restart is needed
