@@ -371,6 +371,9 @@ impl RoonAdapter {
 
     /// Control playback
     pub async fn control(&self, zone_id: &str, action: &str) -> Result<()> {
+        // Strip "roon:" prefix if present (MCP/aggregator uses prefixed IDs)
+        let zone_id = zone_id.strip_prefix("roon:").unwrap_or(zone_id);
+
         // Clone transport while holding lock, then release before await
         let transport = {
             let state = self.state.read().await;
