@@ -1,22 +1,26 @@
 //! MCP (Model Context Protocol) server for AI assistant integration
 //!
 //! Provides HTTP endpoints for MCP clients with both Streamable HTTP and SSE transports.
-//! Uses rust-mcp-sdk with HyperServer for backward compatibility with older clients.
+//! Routes are integrated into the main Axum app on port 8088 at /mcp endpoint.
 
 use crate::api::AppState;
 use async_trait::async_trait;
+use axum::http::{HeaderMap, Method, Uri};
+use axum::{body::Body, extract::Extension, response::IntoResponse};
 use rust_mcp_sdk::{
+    id_generator::{FastIdGenerator, UuidGenerator},
     macros::{mcp_tool, JsonSchema},
-    mcp_server::{hyper_server, HyperServerOptions, ServerHandler, ToMcpServerHandler},
+    mcp_server::{McpAppState, McpHttpHandler, ServerHandler, ToMcpServerHandler},
     schema::{
         schema_utils::CallToolError, CallToolRequestParams, CallToolResult, Implementation,
         InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, RpcError,
         ServerCapabilities, ServerCapabilitiesTools, TextContent,
     },
-    tool_box, McpServer,
+    session_store::InMemorySessionStore,
+    tool_box, McpServer, TransportOptions,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 // ============================================================================
 // Tool Definitions
@@ -722,16 +726,101 @@ impl ServerHandler for HifiMcpHandler {
 }
 
 // ============================================================================
-// Server Startup
+// MCP State Container (for Extension layer)
 // ============================================================================
 
-/// Start the MCP server on the specified port
+/// Container for MCP-specific state, passed via Extension
+#[derive(Clone)]
+pub struct McpExtState {
+    pub mcp_state: Arc<McpAppState>,
+    pub http_handler: Arc<McpHttpHandler>,
+}
+
+// ============================================================================
+// Axum Route Handlers (mirrors rust-mcp-sdk's internal handlers)
+// ============================================================================
+
+pub async fn handle_mcp_get(
+    headers: HeaderMap,
+    uri: Uri,
+    Extension(ext): Extension<McpExtState>,
+) -> impl IntoResponse {
+    let request = McpHttpHandler::create_request(Method::GET, uri, headers, None);
+    match ext
+        .http_handler
+        .handle_streamable_http(request, ext.mcp_state)
+        .await
+    {
+        Ok(res) => {
+            let (parts, body) = res.into_parts();
+            axum::response::Response::from_parts(parts, Body::new(body))
+        }
+        // Response builder with valid status/body cannot fail
+        #[allow(clippy::unwrap_used)]
+        Err(e) => axum::response::Response::builder()
+            .status(500)
+            .body(Body::from(format!("MCP error: {}", e)))
+            .unwrap(),
+    }
+}
+
+pub async fn handle_mcp_post(
+    headers: HeaderMap,
+    uri: Uri,
+    Extension(ext): Extension<McpExtState>,
+    payload: String,
+) -> impl IntoResponse {
+    let request = McpHttpHandler::create_request(Method::POST, uri, headers, Some(&payload));
+    match ext
+        .http_handler
+        .handle_streamable_http(request, ext.mcp_state)
+        .await
+    {
+        Ok(res) => {
+            let (parts, body) = res.into_parts();
+            axum::response::Response::from_parts(parts, Body::new(body))
+        }
+        // Response builder with valid status/body cannot fail
+        #[allow(clippy::unwrap_used)]
+        Err(e) => axum::response::Response::builder()
+            .status(500)
+            .body(Body::from(format!("MCP error: {}", e)))
+            .unwrap(),
+    }
+}
+
+pub async fn handle_mcp_delete(
+    headers: HeaderMap,
+    uri: Uri,
+    Extension(ext): Extension<McpExtState>,
+) -> impl IntoResponse {
+    let request = McpHttpHandler::create_request(Method::DELETE, uri, headers, None);
+    match ext
+        .http_handler
+        .handle_streamable_http(request, ext.mcp_state)
+        .await
+    {
+        Ok(res) => {
+            let (parts, body) = res.into_parts();
+            axum::response::Response::from_parts(parts, Body::new(body))
+        }
+        // Response builder with valid status/body cannot fail
+        #[allow(clippy::unwrap_used)]
+        Err(e) => axum::response::Response::builder()
+            .status(500)
+            .body(Body::from(format!("MCP error: {}", e)))
+            .unwrap(),
+    }
+}
+
+// ============================================================================
+// Router Creation
+// ============================================================================
+
+/// Create MCP extension layer for the main Axum app
 ///
-/// Runs a HyperServer with both Streamable HTTP and SSE transports for maximum compatibility.
-pub async fn start_mcp_server(
-    state: AppState,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// Call this to get the extension layer, then add MCP routes and the layer to your router.
+pub fn create_mcp_extension(state: AppState) -> axum::Extension<McpExtState> {
     let server_details = InitializeResult {
         server_info: Implementation {
             name: "unified-hifi-control".into(),
@@ -757,25 +846,31 @@ pub async fn start_mcp_server(
 
     let handler = HifiMcpHandler::new(state);
 
-    let server = hyper_server::create_server(
-        server_details,
-        handler.to_mcp_server_handler(),
-        HyperServerOptions {
-            host: "0.0.0.0".into(),
-            port,
-            sse_support: true, // Enable SSE transport for backward compatibility
-            custom_streamable_http_endpoint: Some("/mcp".into()),
-            custom_sse_endpoint: Some("/sse".into()),
-            custom_messages_endpoint: Some("/messages".into()),
-            ..Default::default()
-        },
-    );
+    // Create MCP app state (mirrors what HyperServer does internally)
+    let mcp_state: Arc<McpAppState> = Arc::new(McpAppState {
+        session_store: Arc::new(InMemorySessionStore::new()),
+        id_generator: Arc::new(UuidGenerator {}),
+        stream_id_gen: Arc::new(FastIdGenerator::new(Some("s_"))),
+        server_details: Arc::new(server_details),
+        handler: handler.to_mcp_server_handler(),
+        ping_interval: Duration::from_secs(12),
+        transport_options: Arc::new(TransportOptions::default()),
+        enable_json_response: false,
+        event_store: None,
+        task_store: None,
+        client_task_store: None,
+    });
 
-    tracing::info!("MCP server starting on port {}", port);
-    tracing::info!("  Streamable HTTP: http://0.0.0.0:{}/mcp", port);
-    tracing::info!("  SSE (legacy):    http://0.0.0.0:{}/sse", port);
+    // Create HTTP handler (no auth, no middleware)
+    let http_handler = Arc::new(McpHttpHandler::new(vec![]));
 
-    server.start().await?;
+    // Bundle into extension state
+    let ext_state = McpExtState {
+        mcp_state,
+        http_handler,
+    };
 
-    Ok(())
+    tracing::info!("MCP endpoint available at /mcp (Streamable HTTP)");
+
+    Extension(ext_state)
 }
