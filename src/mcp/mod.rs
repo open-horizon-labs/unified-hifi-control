@@ -343,10 +343,17 @@ impl ServerHandler for HifiMcpHandler {
         _params: Option<PaginatedRequestParams>,
         _runtime: Arc<dyn McpServer>,
     ) -> Result<ListToolsResult, RpcError> {
+        let mut tools = HifiTools::tools();
+
+        // Filter out HQPlayer tools if not configured
+        if !self.state.hqplayer.is_configured().await {
+            tools.retain(|t| !t.name.starts_with("hifi_hqplayer"));
+        }
+
         Ok(ListToolsResult {
             meta: None,
             next_cursor: None,
-            tools: HifiTools::tools(),
+            tools,
         })
     }
 
