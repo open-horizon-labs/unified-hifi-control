@@ -18,6 +18,7 @@ DELETE /mcp
 GET /admin
 GET /api/config/license
 GET /api/settings
+GET /api/zones
 GET /assets/{*path}
 GET /config/{knob_id}
 GET /control

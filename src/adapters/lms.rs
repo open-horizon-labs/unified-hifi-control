@@ -1154,12 +1154,13 @@ impl LmsAdapter {
 
             if is_audio {
                 // Top-level playable item — add under "direct" provider
-                providers
+                if let Some(arr) = providers
                     .entry("direct")
                     .or_insert_with(|| json!([]))
                     .as_array_mut()
-                    .unwrap()
-                    .push(item.clone());
+                {
+                    arr.push(item.clone());
+                }
                 continue;
             }
 

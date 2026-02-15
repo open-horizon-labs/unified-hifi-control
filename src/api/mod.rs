@@ -7,7 +7,7 @@ use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
 use crate::adapters::Startable;
 use crate::aggregator::ZoneAggregator;
-use crate::bus::SharedBus;
+use crate::bus::{SharedBus, Zone};
 use crate::coordinator::AdapterCoordinator;
 use crate::event_reporter::EventReporter;
 use crate::knobs::KnobStore;
@@ -247,6 +247,11 @@ pub async fn roon_zones_handler(
     Json(ZonesWrapper {
         zones: state.roon.get_zones().await,
     })
+}
+
+/// GET /api/zones - All zones from all adapters
+pub async fn all_zones_handler(State(state): State<AppState>) -> Json<Vec<Zone>> {
+    Json(state.aggregator.get_zones().await)
 }
 
 /// GET /roon/zone/:zone_id - Get specific zone

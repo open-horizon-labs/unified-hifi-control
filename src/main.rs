@@ -292,6 +292,8 @@ mod server {
         let router = Router::new()
             // Health check
             .route("/status", get(api::status_handler))
+            // Unified zone endpoint
+            .route("/api/zones", get(api::all_zones_handler))
             // Roon routes
             .route("/roon/status", get(api::roon_status_handler))
             .route("/roon/zones", get(api::roon_zones_handler))
