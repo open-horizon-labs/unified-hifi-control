@@ -203,7 +203,6 @@ struct McpSearchResult {
     subtitle: Option<String>,
 }
 
-
 #[derive(Debug, Serialize)]
 struct McpHqpStatus {
     connected: bool,

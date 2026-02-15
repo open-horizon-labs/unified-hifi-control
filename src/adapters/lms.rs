@@ -1143,7 +1143,10 @@ impl LmsAdapter {
         let mut providers = serde_json::Map::new();
 
         for item in items {
-            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             let item_id = item.get("id").and_then(|v| v.as_str());
             let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
             let is_audio = item.get("isaudio").and_then(|v| v.as_i64()).unwrap_or(0) == 1
@@ -1163,14 +1166,12 @@ impl LmsAdapter {
             // Drill one level into each provider
             if let Some(item_id) = item_id {
                 if has_items {
-                    if let Ok(sub_result) =
-                        self.globalsearch_items(&player_id, query, Some(item_id)).await
+                    if let Ok(sub_result) = self
+                        .globalsearch_items(&player_id, query, Some(item_id))
+                        .await
                     {
                         if let Some(sub_items) = Self::get_items_from_result(&sub_result) {
-                            providers.insert(
-                                name.to_string(),
-                                json!(sub_items),
-                            );
+                            providers.insert(name.to_string(), json!(sub_items));
                         }
                     }
                 }
