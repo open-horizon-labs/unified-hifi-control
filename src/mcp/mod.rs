@@ -203,6 +203,25 @@ struct McpSearchResult {
     subtitle: Option<String>,
 }
 
+/// Convert an LMS search result to the MCP response format
+fn lms_to_mcp_result(item: crate::adapters::lms::LmsSearchResult) -> McpSearchResult {
+    let subtitle = match item.result_type {
+        crate::adapters::lms::LmsSearchResultType::Album => {
+            item.artist.map(|a| format!("Album by {}", a))
+        }
+        crate::adapters::lms::LmsSearchResultType::Artist => Some("Artist".to_string()),
+        crate::adapters::lms::LmsSearchResultType::Track => match (&item.artist, &item.album) {
+            (Some(a), Some(al)) => Some(format!("{} - {}", a, al)),
+            (Some(a), None) => Some(a.clone()),
+            _ => None,
+        },
+    };
+    McpSearchResult {
+        title: item.title,
+        subtitle,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct McpHqpStatus {
     connected: bool,
@@ -420,9 +439,12 @@ impl ServerHandler for HifiMcpHandler {
             }
 
             HifiTools::HifiSearchTool(args) => {
-                // Route based on zone_id prefix
-                if args.zone_id.as_ref().is_some_and(|z| z.starts_with("lms:")) {
-                    // LMS search - uses globalsearch for all providers (library, TIDAL, Qobuz, etc.)
+                // Route: explicit lms: prefix → LMS, else try Roon, fall back to LMS if Roon browse unavailable
+                let use_lms = args.zone_id.as_ref().is_some_and(|z| z.starts_with("lms:"))
+                    || !self.state.roon.is_browse_connected().await;
+
+                if use_lms {
+                    // LMS search via globalsearch (all providers: library, TIDAL, Qobuz, etc.)
                     match self
                         .state
                         .lms
@@ -430,47 +452,21 @@ impl ServerHandler for HifiMcpHandler {
                         .await
                     {
                         Ok(results) => {
-                            let mcp_results: Vec<McpSearchResult> = results
-                                .into_iter()
-                                .map(|item| {
-                                    let subtitle = match item.result_type {
-                                        crate::adapters::lms::LmsSearchResultType::Album => {
-                                            item.artist.map(|a| format!("Album by {}", a))
-                                        }
-                                        crate::adapters::lms::LmsSearchResultType::Artist => {
-                                            Some("Artist".to_string())
-                                        }
-                                        crate::adapters::lms::LmsSearchResultType::Track => {
-                                            match (&item.artist, &item.album) {
-                                                (Some(a), Some(al)) => {
-                                                    Some(format!("{} - {}", a, al))
-                                                }
-                                                (Some(a), None) => Some(a.clone()),
-                                                _ => None,
-                                            }
-                                        }
-                                    };
-                                    McpSearchResult {
-                                        title: item.title,
-                                        subtitle,
-                                    }
-                                })
-                                .collect();
+                            let mcp_results: Vec<McpSearchResult> =
+                                results.into_iter().map(lms_to_mcp_result).collect();
                             Ok(Self::json_result(&mcp_results))
                         }
                         Err(e) => Self::error_result(format!("Search error: {}", e)),
                     }
                 } else {
-                    // Roon search (default)
+                    // Roon search
                     use crate::adapters::roon::SearchSource;
-
                     let source = match args.source.as_deref() {
                         Some("tidal") => SearchSource::Tidal,
                         Some("qobuz") => SearchSource::Qobuz,
                         _ => SearchSource::Library,
                     };
                     let zone_id = args.zone_id.as_deref();
-
                     match self
                         .state
                         .roon
@@ -493,39 +489,53 @@ impl ServerHandler for HifiMcpHandler {
             }
 
             HifiTools::HifiPlayTool(args) => {
-                // Route based on zone_id prefix
-                if args.zone_id.starts_with("lms:") {
-                    use crate::adapters::lms::LmsPlayAction;
+                // Route: explicit lms: prefix → LMS, else try Roon, fall back to LMS if Roon browse unavailable
+                let use_lms = args.zone_id.starts_with("lms:")
+                    || !self.state.roon.is_browse_connected().await;
 
-                    // LMS: source param ignored (library only), radio not supported
+                if use_lms {
+                    use crate::adapters::lms::LmsPlayAction;
                     if args.action.as_deref() == Some("radio") {
                         return Self::error_result(
                             "Radio mode not supported for LMS. Use 'play' or 'queue'.".into(),
                         );
                     }
 
+                    // If zone_id doesn't have lms: prefix (fallback case), pick any LMS player
+                    let zone_id = if args.zone_id.starts_with("lms:") {
+                        args.zone_id.clone()
+                    } else {
+                        let players = self.state.lms.get_cached_players().await;
+                        match players.first() {
+                            Some(p) => format!("lms:{}", p.playerid),
+                            None => {
+                                return Self::error_result(
+                                    "No playback adapters available (Roon browse not connected, no LMS players)".into(),
+                                );
+                            }
+                        }
+                    };
+
                     let action = LmsPlayAction::parse(args.action.as_deref());
 
                     match self
                         .state
                         .lms
-                        .search_and_play(&args.query, &args.zone_id, action)
+                        .search_and_play(&args.query, &zone_id, action)
                         .await
                     {
                         Ok(message) => Ok(Self::text_result(message)),
                         Err(e) => Self::error_result(format!("Play error: {}", e)),
                     }
                 } else {
-                    // Roon play (default)
+                    // Roon play
                     use crate::adapters::roon::{PlayAction, SearchSource};
-
                     let source = match args.source.as_deref() {
                         Some("tidal") => SearchSource::Tidal,
                         Some("qobuz") => SearchSource::Qobuz,
                         _ => SearchSource::Library,
                     };
                     let action = PlayAction::parse(args.action.as_deref().unwrap_or("play"));
-
                     match self
                         .state
                         .roon
