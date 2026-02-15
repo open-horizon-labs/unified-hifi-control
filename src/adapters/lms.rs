@@ -1105,6 +1105,87 @@ impl LmsAdapter {
         Ok(results)
     }
 
+    /// Raw globalsearch returning unprocessed JSON for LLM consumption.
+    ///
+    /// Unlike `search()` which parses results into typed structs, this returns the raw
+    /// globalsearch responses from all providers (My Music, TIDAL, Qobuz, etc.).
+    /// The LLM can interpret field variations, category names, and metadata directly —
+    /// no information is lost to struct parsing.
+    ///
+    /// Returns a JSON object with provider names as keys and their raw item lists as values.
+    pub async fn search_raw(
+        &self,
+        query: &str,
+        player_id: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        // Same player_id resolution as search()
+        let player_id = match player_id.map(strip_lms_prefix) {
+            Some(id) => id.to_string(),
+            None => {
+                let any_player = {
+                    let state = self.state.read().await;
+                    state.players.keys().next().cloned()
+                };
+                match any_player {
+                    Some(id) => id,
+                    None => return Ok(json!({"error": "No players connected"})),
+                }
+            }
+        };
+
+        // Get top-level providers
+        let result = self.globalsearch_items(&player_id, query, None).await?;
+        let items = match Self::get_items_from_result(&result) {
+            Some(items) => items,
+            None => return Ok(json!({"results": []})),
+        };
+
+        let mut providers = serde_json::Map::new();
+
+        for item in items {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let item_id = item.get("id").and_then(|v| v.as_str());
+            let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+            let is_audio = item.get("isaudio").and_then(|v| v.as_i64()).unwrap_or(0) == 1
+                || item.get("type").and_then(|v| v.as_str()) == Some("audio");
+
+            if is_audio {
+                // Top-level playable item — add under "direct" provider
+                providers
+                    .entry("direct")
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut()
+                    .unwrap()
+                    .push(item.clone());
+                continue;
+            }
+
+            // Drill one level into each provider
+            if let Some(item_id) = item_id {
+                if has_items {
+                    if let Ok(sub_result) =
+                        self.globalsearch_items(&player_id, query, Some(item_id)).await
+                    {
+                        if let Some(sub_items) = Self::get_items_from_result(&sub_result) {
+                            providers.insert(
+                                name.to_string(),
+                                json!(sub_items),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!(
+            query = query,
+            providers = providers.len(),
+            "LMS raw globalsearch completed"
+        );
+
+        Ok(json!({ "providers": providers }))
+    }
+
     /// Execute a globalsearch items query
     async fn globalsearch_items(
         &self,

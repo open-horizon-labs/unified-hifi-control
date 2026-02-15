@@ -203,24 +203,6 @@ struct McpSearchResult {
     subtitle: Option<String>,
 }
 
-/// Convert an LMS search result to the MCP response format
-fn lms_to_mcp_result(item: crate::adapters::lms::LmsSearchResult) -> McpSearchResult {
-    let subtitle = match item.result_type {
-        crate::adapters::lms::LmsSearchResultType::Album => {
-            item.artist.map(|a| format!("Album by {}", a))
-        }
-        crate::adapters::lms::LmsSearchResultType::Artist => Some("Artist".to_string()),
-        crate::adapters::lms::LmsSearchResultType::Track => match (&item.artist, &item.album) {
-            (Some(a), Some(al)) => Some(format!("{} - {}", a, al)),
-            (Some(a), None) => Some(a.clone()),
-            _ => None,
-        },
-    };
-    McpSearchResult {
-        title: item.title,
-        subtitle,
-    }
-}
 
 #[derive(Debug, Serialize)]
 struct McpHqpStatus {
@@ -444,18 +426,16 @@ impl ServerHandler for HifiMcpHandler {
                     || !self.state.roon.is_browse_connected().await;
 
                 if use_lms {
-                    // LMS search via globalsearch (all providers: library, TIDAL, Qobuz, etc.)
+                    // LMS search: return raw globalsearch JSON for LLM interpretation.
+                    // The LLM handles field variations, category names, and metadata
+                    // across providers (library, TIDAL, Qobuz) better than hand-parsing.
                     match self
                         .state
                         .lms
-                        .search(&args.query, args.zone_id.as_deref(), Some(10))
+                        .search_raw(&args.query, args.zone_id.as_deref())
                         .await
                     {
-                        Ok(results) => {
-                            let mcp_results: Vec<McpSearchResult> =
-                                results.into_iter().map(lms_to_mcp_result).collect();
-                            Ok(Self::json_result(&mcp_results))
-                        }
+                        Ok(raw) => Ok(Self::json_result(&raw)),
                         Err(e) => Self::error_result(format!("Search error: {}", e)),
                     }
                 } else {
