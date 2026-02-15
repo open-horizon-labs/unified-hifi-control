@@ -565,14 +565,14 @@ impl BusEvent {
                 image_key,
             } => Some(MuseEvent::NowPlayingChanged {
                 zone_id: zone_id.as_str().to_string(),
+                zone_name: None, // SSE consumers get this from ZoneDiscovered
+                source: None,    // SSE consumers get this from ZoneDiscovered
                 now_playing: title.as_ref().map(|t| NowPlaying {
                     title: t.clone(),
                     artist: artist.clone().unwrap_or_default(),
                     album: album.clone().unwrap_or_default(),
                     image_key: image_key.clone(),
                     seek_position: None,
-                    // Duration enrichment would require async aggregator lookup
-                    // Left as None for now; could be enhanced in future
                     duration: None,
                     metadata: None,
                 }),

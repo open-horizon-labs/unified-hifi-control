@@ -40,6 +40,12 @@ pub enum MuseEvent {
     NowPlayingChanged {
         /// Zone identifier (prefixed, e.g., "roon:xxx")
         zone_id: String,
+        /// Human-readable zone name (enriched from aggregator, None over SSE)
+        #[serde(default)]
+        zone_name: Option<String>,
+        /// Source adapter (e.g., "roon", "lms") (enriched from aggregator, None over SSE)
+        #[serde(default)]
+        source: Option<String>,
         /// Updated now playing info
         now_playing: Option<NowPlaying>,
     },

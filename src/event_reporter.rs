@@ -11,8 +11,9 @@
 //! - Batch: buffer up to 10 events or 5s, then POST as array
 
 use crate::aggregator::ZoneAggregator;
-use crate::bus::{BusEvent, SharedBus, Zone};
+use crate::bus::{BusEvent, SharedBus};
 use muse_events::ingest::{IngestEvent, IngestRequest};
+use muse_events::{MuseEvent, NowPlaying};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -197,7 +198,7 @@ impl EventReporter {
                                     let now = Instant::now();
                                     if let Some(last_seen) = cache.get(&key) {
                                         if now.duration_since(*last_seen) < Duration::from_secs(DEBOUNCE_WINDOW_SECS) {
-                                            debug!("Debounced event: {}", ingest_event.event_type);
+                                            debug!("Debounced event: {}", ingest_event.event.event_type());
                                             false
                                         } else {
                                             cache.insert(key, now);
@@ -238,7 +239,10 @@ impl EventReporter {
         info!("EventReporter stopped");
     }
 
-    /// Convert a BusEvent to an IngestEvent, enriching NowPlayingChanged events
+    /// Convert a BusEvent to an IngestEvent.
+    ///
+    /// Only forwards NowPlayingChanged and HqpPipelineChanged — these are the only
+    /// events with listening memory value. Everything else returns None.
     async fn convert_event(
         &self,
         event: &BusEvent,
@@ -248,11 +252,7 @@ impl EventReporter {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
             .as_secs();
-
-        let event_type = event.event_type().to_string();
-
-        // Build payload based on event type
-        let payload = match event {
+        let muse_event = match event {
             BusEvent::NowPlayingChanged {
                 zone_id,
                 title,
@@ -262,191 +262,62 @@ impl EventReporter {
             } => {
                 // Enrich with zone metadata from aggregator
                 let zone = aggregator.get_zone(zone_id.as_str()).await;
-                let (zone_name, source, format, sample_rate, bit_depth, duration) =
-                    if let Some(ref z) = zone {
-                        let np = z.now_playing.as_ref();
-                        let md = np.and_then(|n| n.metadata.as_ref());
-                        (
-                            Some(z.zone_name.clone()),
-                            Some(z.source.clone()),
-                            md.and_then(|m| m.format.clone()),
-                            md.and_then(|m| m.sample_rate),
-                            md.and_then(|m| m.bit_depth),
-                            np.and_then(|n| n.duration),
-                        )
-                    } else {
-                        (None, None, None, None, None, None)
-                    };
+                let (zone_name, source) = zone
+                    .as_ref()
+                    .map(|z| (Some(z.zone_name.clone()), Some(z.source.clone())))
+                    .unwrap_or((None, None));
 
-                serde_json::json!({
-                    "zone_id": zone_id.as_str(),
-                    "zone_name": zone_name,
-                    "title": title,
-                    "artist": artist,
-                    "album": album,
-                    "image_key": image_key,
-                    "source": source,
-                    "format": format,
-                    "sample_rate": sample_rate,
-                    "bit_depth": bit_depth,
-                    "duration_secs": duration,
-                })
+                let now_playing = title.as_ref().map(|t| {
+                    let (duration, metadata) = zone
+                        .as_ref()
+                        .and_then(|z| z.now_playing.as_ref())
+                        .map(|np| (np.duration, np.metadata.clone()))
+                        .unwrap_or((None, None));
+
+                    NowPlaying {
+                        title: t.clone(),
+                        artist: artist.clone().unwrap_or_default(),
+                        album: album.clone().unwrap_or_default(),
+                        image_key: image_key.clone(),
+                        seek_position: None,
+                        duration,
+                        metadata,
+                    }
+                });
+
+                MuseEvent::NowPlayingChanged {
+                    zone_id: zone_id.as_str().to_string(),
+                    zone_name,
+                    source,
+                    now_playing,
+                }
             }
-
             BusEvent::HqpPipelineChanged {
                 host,
                 filter,
                 shaper,
                 rate,
-            } => {
-                serde_json::json!({
-                    "host": host,
-                    "filter": filter,
-                    "shaper": shaper,
-                    "rate": rate,
-                })
-            }
+            } => MuseEvent::HqpPipelineChanged {
+                host: host.clone(),
+                filter: filter.clone(),
+                shaper: shaper.clone(),
+                rate: rate.clone(),
+            },
 
-            BusEvent::ZoneDiscovered { zone } => Self::zone_to_json(zone),
-
-            BusEvent::ZoneUpdated {
-                zone_id,
-                display_name,
-                state,
-            } => {
-                serde_json::json!({
-                    "zone_id": zone_id.as_str(),
-                    "display_name": display_name,
-                    "state": state,
-                })
-            }
-
-            BusEvent::VolumeChanged {
-                output_id,
-                value,
-                is_muted,
-            } => {
-                serde_json::json!({
-                    "output_id": output_id,
-                    "value": value,
-                    "is_muted": is_muted,
-                })
-            }
-
-            BusEvent::AdapterConnected { adapter, details } => {
-                serde_json::json!({
-                    "adapter": adapter,
-                    "details": details,
-                })
-            }
-
-            BusEvent::AdapterDisconnected { adapter, reason } => {
-                serde_json::json!({
-                    "adapter": adapter,
-                    "reason": reason,
-                })
-            }
-
-            BusEvent::ZoneRemoved { zone_id } => {
-                serde_json::json!({
-                    "zone_id": zone_id.as_str(),
-                })
-            }
-
-            // Legacy events - forward with their payloads
-            BusEvent::RoonConnected { core_name, version } => {
-                serde_json::json!({
-                    "core_name": core_name,
-                    "version": version,
-                })
-            }
-
-            BusEvent::RoonDisconnected => {
-                serde_json::json!({})
-            }
-
-            BusEvent::HqpConnected { host } => {
-                serde_json::json!({
-                    "host": host,
-                })
-            }
-
-            BusEvent::HqpDisconnected { host } => {
-                serde_json::json!({
-                    "host": host,
-                })
-            }
-
-            BusEvent::HqpStateChanged { host, state } => {
-                serde_json::json!({
-                    "host": host,
-                    "state": state,
-                })
-            }
-
-            BusEvent::LmsConnected { host } => {
-                serde_json::json!({
-                    "host": host,
-                })
-            }
-
-            BusEvent::LmsDisconnected { host } => {
-                serde_json::json!({
-                    "host": host,
-                })
-            }
-
-            BusEvent::LmsPlayerStateChanged { player_id, state } => {
-                serde_json::json!({
-                    "player_id": player_id,
-                    "state": state,
-                })
-            }
-
-            // Skip internal/system events that shouldn't be forwarded:
-            // - SeekPositionChanged: fires every ~1s during playback, position in payload
-            //   defeats debounce (unique hash each time), no listening memory value
-            // - ShuttingDown, HealthCheck, etc.: internal system events
-            // - CommandReceived/Result: internal command routing
-            // - AdapterStopping/Stopped, ZonesFlushed: internal lifecycle
-            // - ControlCommand: internal control routing
-            BusEvent::SeekPositionChanged { .. }
-            | BusEvent::ShuttingDown { .. }
-            | BusEvent::HealthCheck { .. }
-            | BusEvent::CommandReceived { .. }
-            | BusEvent::CommandResult { .. }
-            | BusEvent::AdapterStopping { .. }
-            | BusEvent::AdapterStopped { .. }
-            | BusEvent::ZonesFlushed { .. }
-            | BusEvent::ControlCommand { .. } => {
-                return None;
-            }
+            // All other events have no listening memory value
+            _ => return None,
         };
-
         Some(IngestEvent {
-            event_type,
+            event: muse_event,
             timestamp,
-            payload,
         })
     }
 
-    /// Convert a Zone to a JSON value for forwarding
-    fn zone_to_json(zone: &Zone) -> serde_json::Value {
-        serde_json::json!({
-            "zone_id": zone.zone_id,
-            "zone_name": zone.zone_name,
-            "state": zone.state.to_string(),
-            "source": zone.source,
-            "is_controllable": zone.is_controllable,
-            "is_seekable": zone.is_seekable,
-        })
-    }
-
-    /// Generate a debounce key for an event
+    /// Generate a debounce key for an event.
+    ///
+    /// Uses the event's serde serialization for content-based dedup.
     fn debounce_key(event: &IngestEvent) -> String {
-        // Create a hash of event_type + relevant payload fields
-        let content = format!("{}:{}", event.event_type, event.payload);
-        // Use a simple hash for the key
+        let content = serde_json::to_string(&event.event).unwrap_or_default();
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();

@@ -3,27 +3,25 @@
 //! These types define the format expected by the muse-ingest proxy
 //! when UHC's EventReporter forwards events.
 
+use crate::MuseEvent;
 use serde::{Deserialize, Serialize};
 
 /// Event payload sent to the ingest proxy.
 ///
-/// This is a generic envelope that wraps any event type with
-/// metadata needed for processing.
+/// Wraps a typed `MuseEvent` with a timestamp. The event is the single
+/// source of truth — no string event types, no untyped JSON payloads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IngestEvent {
-    /// Event type identifier (e.g., "now_playing_changed")
-    pub event_type: String,
+    /// The typed event (NowPlayingChanged, HqpPipelineChanged, etc.)
+    pub event: MuseEvent,
 
     /// Unix timestamp in seconds
     pub timestamp: u64,
-
-    /// Event-specific payload as JSON
-    pub payload: serde_json::Value,
 }
 
 /// Request body for the ingest endpoint.
 ///
-/// Events are batched for efficiency - UHC buffers events
+/// Events are batched for efficiency — UHC buffers events
 /// and sends them in batches to reduce network overhead.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IngestRequest {
@@ -51,17 +49,35 @@ impl IngestRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zone::{NowPlaying, TrackMetadata};
 
     #[test]
-    fn test_ingest_event_serialization() {
+    fn test_ingest_event_roundtrip() {
         let event = IngestEvent {
-            event_type: "now_playing_changed".to_string(),
-            timestamp: 1234567890,
-            payload: serde_json::json!({
-                "zone_id": "roon:123",
-                "title": "Test Song",
-                "artist": "Test Artist"
-            }),
+            event: MuseEvent::NowPlayingChanged {
+                zone_id: "lms:dc:a6:32:5c:34:bc".to_string(),
+                zone_name: Some("Kitchen".to_string()),
+                source: Some("lms".to_string()),
+                now_playing: Some(NowPlaying {
+                    title: "Blue 7".to_string(),
+                    artist: "Sonny Rollins".to_string(),
+                    album: "Saxophone Colossus".to_string(),
+                    image_key: None,
+                    seek_position: None,
+                    duration: Some(693.0),
+                    metadata: Some(TrackMetadata {
+                        format: Some("FLAC".to_string()),
+                        sample_rate: Some(44100),
+                        bit_depth: Some(16),
+                        bitrate: None,
+                        genre: None,
+                        composer: None,
+                        track_number: None,
+                        disc_number: None,
+                    }),
+                }),
+            },
+            timestamp: 1771183341,
         };
 
         let json = serde_json::to_string(&event).unwrap();
@@ -70,27 +86,25 @@ mod tests {
     }
 
     #[test]
-    fn test_ingest_request_serialization() {
-        let request = IngestRequest {
-            events: vec![
-                IngestEvent {
-                    event_type: "zone_discovered".to_string(),
-                    timestamp: 1234567890,
-                    payload: serde_json::json!({"zone_id": "roon:1"}),
+    fn test_ingest_request() {
+        let request = IngestRequest::new(vec![
+            IngestEvent {
+                event: MuseEvent::HqpPipelineChanged {
+                    host: "192.168.1.100".to_string(),
+                    filter: Some("poly-sinc-gauss-hires-lp".to_string()),
+                    shaper: Some("NS9".to_string()),
+                    rate: Some("DSD256".to_string()),
                 },
-                IngestEvent {
-                    event_type: "now_playing_changed".to_string(),
-                    timestamp: 1234567891,
-                    payload: serde_json::json!({"zone_id": "roon:1", "title": "Song"}),
-                },
-            ],
-        };
+                timestamp: 1771183342,
+            },
+        ]);
+
+        assert_eq!(request.len(), 1);
+        assert!(!request.is_empty());
 
         let json = serde_json::to_string(&request).unwrap();
         let deserialized: IngestRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(request, deserialized);
-        assert_eq!(request.len(), 2);
-        assert!(!request.is_empty());
     }
 
     #[test]
