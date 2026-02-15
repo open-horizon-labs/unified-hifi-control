@@ -87,17 +87,15 @@ mod tests {
 
     #[test]
     fn test_ingest_request() {
-        let request = IngestRequest::new(vec![
-            IngestEvent {
-                event: MuseEvent::HqpPipelineChanged {
-                    host: "192.168.1.100".to_string(),
-                    filter: Some("poly-sinc-gauss-hires-lp".to_string()),
-                    shaper: Some("NS9".to_string()),
-                    rate: Some("DSD256".to_string()),
-                },
-                timestamp: 1771183342,
+        let request = IngestRequest::new(vec![IngestEvent {
+            event: MuseEvent::HqpPipelineChanged {
+                host: "192.168.1.100".to_string(),
+                filter: Some("poly-sinc-gauss-hires-lp".to_string()),
+                shaper: Some("NS9".to_string()),
+                rate: Some("DSD256".to_string()),
             },
-        ]);
+            timestamp: 1771183342,
+        }]);
 
         assert_eq!(request.len(), 1);
         assert!(!request.is_empty());
