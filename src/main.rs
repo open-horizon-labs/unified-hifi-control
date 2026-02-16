@@ -414,9 +414,18 @@ mod server {
             .route("/knob/config", post(knobs::knob_config_update_handler))
             .route("/knob/devices", get(knobs::knob_devices_handler))
             // Manifest-driven knob protocol (ADR-0003)
-            .route("/knob/manifest", get(knobs::manifest_routes::knob_manifest_handler))
-            .route("/knob/manifest", post(knobs::manifest_routes::knob_manifest_push_handler))
-            .route("/knob/manifest", delete(knobs::manifest_routes::knob_manifest_clear_handler))
+            .route(
+                "/knob/manifest",
+                get(knobs::manifest_routes::knob_manifest_handler),
+            )
+            .route(
+                "/knob/manifest",
+                post(knobs::manifest_routes::knob_manifest_push_handler),
+            )
+            .route(
+                "/knob/manifest",
+                delete(knobs::manifest_routes::knob_manifest_clear_handler),
+            )
             // Knob protocol routes (firmware uses these paths directly)
             .route("/now_playing", get(knobs::knob_now_playing_handler))
             .route("/now_playing/image", get(knobs::knob_image_handler))

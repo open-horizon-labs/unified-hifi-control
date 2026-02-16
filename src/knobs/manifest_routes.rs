@@ -178,18 +178,13 @@ pub async fn knob_manifest_push_handler(
     State(state): State<AppState>,
     Json(body): Json<PushManifestBody>,
 ) -> StatusCode {
-    tracing::info!(
-        screens = body.screens.len(),
-        "Manifest pushed by Memex"
-    );
+    tracing::info!(screens = body.screens.len(), "Manifest pushed by Memex");
     state.manifests.set(body.screens, body.nav).await;
     StatusCode::NO_CONTENT
 }
 
 /// DELETE /knob/manifest — Clear pushed manifest (Memex disconnecting).
-pub async fn knob_manifest_clear_handler(
-    State(state): State<AppState>,
-) -> StatusCode {
+pub async fn knob_manifest_clear_handler(State(state): State<AppState>) -> StatusCode {
     tracing::info!("Manifest cleared (Memex disconnected)");
     state.manifests.clear().await;
     StatusCode::NO_CONTENT
