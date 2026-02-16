@@ -10,10 +10,14 @@
 //! - Device store (registration, config, status tracking)
 //! - Hardware API endpoints (/now_playing, /control, /config)
 //! - RGB565 image conversion for LCD display
+//! - Manifest-driven protocol for ambient UI surfaces
 
 pub mod image;
+pub mod manifest;
+pub mod manifest_routes;
 pub mod routes;
 pub mod store;
 
+pub use manifest_routes::ManifestStore;
 pub use routes::*;
 pub use store::KnobStore;

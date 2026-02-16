@@ -14,6 +14,7 @@
 # with build configuration.
 
 DELETE /api/config/license
+DELETE /knob/manifest
 DELETE /mcp
 GET /admin
 GET /api/config/license
@@ -37,6 +38,7 @@ GET /hqplayer/profiles
 GET /hqplayer/status
 GET /knob/config
 GET /knob/devices
+GET /knob/manifest
 GET /knob/now_playing
 GET /knob/now_playing/image
 GET /knob/zones
@@ -78,6 +80,7 @@ POST /hqplayer/setting
 POST /hqplayer/volume
 POST /knob/config
 POST /knob/control
+POST /knob/manifest
 POST /lms/configure
 POST /lms/control
 POST /lms/volume

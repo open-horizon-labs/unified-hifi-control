@@ -10,7 +10,7 @@ use crate::aggregator::ZoneAggregator;
 use crate::bus::{SharedBus, Zone};
 use crate::coordinator::AdapterCoordinator;
 use crate::event_reporter::EventReporter;
-use crate::knobs::KnobStore;
+use crate::knobs::{KnobStore, ManifestStore};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -52,6 +52,7 @@ pub struct AppState {
     pub sse_connections: Arc<AtomicUsize>,
     /// EventReporter for forwarding events to Memex muse-ingest proxy (Issue #49)
     pub event_reporter: Arc<EventReporter>,
+    pub manifests: ManifestStore,
 }
 
 impl AppState {
@@ -90,6 +91,7 @@ impl AppState {
             shutdown,
             sse_connections: Arc::new(AtomicUsize::new(0)),
             event_reporter,
+            manifests: ManifestStore::new(),
         }
     }
 
