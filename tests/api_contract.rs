@@ -28,41 +28,64 @@ fn load_golden_routes() -> BTreeSet<String> {
 /// Extract routes from main.rs source
 fn extract_routes_from_source() -> BTreeSet<String> {
     let content = fs::read_to_string("src/main.rs").expect("Failed to read main.rs");
-
     let mut routes = BTreeSet::new();
 
-    for line in content.lines() {
-        let line = line.trim();
+    // Join all lines into one string with spaces, then find .route() calls
+    // This handles both single-line and multi-line formatted routes
+    let joined = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.starts_with("//"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Normalize whitespace so .route( "/path" becomes .route("/path"
+    let joined = joined.replace(".route( ", ".route(");
 
-        // Skip comments
-        if line.starts_with("//") {
-            continue;
-        }
+    // Find all .route("path", handler) patterns
+    let mut search_from = 0;
+    while let Some(pos) = joined[search_from..].find(".route(\"") {
+        let abs_pos = search_from + pos + 8; // skip .route("
+        if let Some(end) = joined[abs_pos..].find('"') {
+            let path = &joined[abs_pos..abs_pos + end];
 
-        // Match .route("/path", method(handler))
-        if let Some(start) = line.find(".route(\"") {
-            let rest = &line[start + 8..];
-            if let Some(end) = rest.find('"') {
-                let path = &rest[..end];
-
-                // Determine HTTP method from the handler
-                let method = if line.contains("get(") {
-                    "GET"
-                } else if line.contains("post(") {
-                    "POST"
-                } else if line.contains("put(") {
-                    "PUT"
-                } else if line.contains("delete(") {
-                    "DELETE"
-                } else {
-                    continue; // Unknown method
-                };
-
-                routes.insert(format!("{} {}", method, path));
+            // Find the matching closing ) for this .route() call
+            // Look at the handler expression between the path and the closing )
+            let after_path = abs_pos + end;
+            // Find the balanced closing paren
+            let mut depth = 1; // we're inside .route(
+            let handler_start = after_path;
+            let mut handler_end = handler_start;
+            for (i, ch) in joined[handler_start..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            handler_end = handler_start + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
             }
+
+            let handler_text = &joined[handler_start..handler_end];
+            for (pattern, method) in [
+                ("get(", "GET"),
+                ("post(", "POST"),
+                ("put(", "PUT"),
+                ("delete(", "DELETE"),
+            ] {
+                if handler_text.contains(pattern) {
+                    routes.insert(format!("{} {}", method, path));
+                }
+            }
+
+            search_from = handler_end;
+        } else {
+            break;
         }
     }
-
     routes
 }
 
