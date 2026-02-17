@@ -5,7 +5,7 @@
 
 use axum::{
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -153,10 +153,15 @@ pub async fn knob_manifest_handler(
         (screens, nav, sha)
     };
 
-    // 304 Not Modified if client SHA matches
+    // SHA match: screens unchanged, return only fast state + sha (smaller payload)
     if let Some(ref client_sha) = params.sha {
         if *client_sha == sha {
-            return Ok((StatusCode::NOT_MODIFIED, HeaderMap::new(), String::new()).into_response());
+            let fast_only = serde_json::json!({
+                "version": MANIFEST_VERSION,
+                "sha": sha,
+                "fast": fast,
+            });
+            return Ok(Json(fast_only).into_response());
         }
     }
 
