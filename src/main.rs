@@ -285,6 +285,9 @@ mod server {
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();
 
+        // Clone state for UDP fast-path listener
+        let udp_state = state.clone();
+
         // Create MCP extension (state for MCP handlers)
         let mcp_extension = mcp::create_mcp_extension(state.clone());
 
@@ -547,6 +550,15 @@ mod server {
         };
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
+
+        // Spawn UDP fast-path listener for knob polling (port = HTTP port + 1)
+        let udp_port = config.port + 1;
+        tokio::spawn(async move {
+            if let Err(e) = knobs::udp::run_udp_fast_path(udp_state, udp_port).await {
+                tracing::error!("UDP fast-path listener failed: {}", e);
+            }
+        });
+        tracing::info!("UDP fast-path on port {}", udp_port);
 
         // Create shutdown future that cancels token before graceful shutdown (fixes #73)
         let graceful_shutdown = {

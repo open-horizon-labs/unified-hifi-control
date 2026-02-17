@@ -56,6 +56,11 @@ impl ManifestStore {
     async fn get(&self) -> Option<PushedManifest> {
         self.pushed.read().await.clone()
     }
+
+    /// Get the SHA of the pushed manifest (if any). Used by UDP fast-path.
+    pub async fn get_pushed_sha(&self) -> Option<String> {
+        self.pushed.read().await.as_ref().map(|p| p.sha.clone())
+    }
 }
 
 // ── Query params ────────────────────────────────────────────────────────────

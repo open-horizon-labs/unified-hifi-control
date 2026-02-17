@@ -17,6 +17,7 @@ pub mod manifest;
 pub mod manifest_routes;
 pub mod routes;
 pub mod store;
+pub mod udp;
 
 pub use manifest_routes::ManifestStore;
 pub use routes::*;
