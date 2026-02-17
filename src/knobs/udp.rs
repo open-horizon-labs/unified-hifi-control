@@ -1,13 +1,15 @@
-//! UDP fast-path listener for knob polling.
+//! UDP fast-path listener for knob polling and commands.
 //!
 //! Provides a compact binary protocol for the knob's fast-path state updates,
 //! avoiding HTTP + JSON overhead for the ~2s poll cycle.
 //!
 //! Wire format:
-//! - Request (54 bytes): `[magic:u16 LE][sha:20 bytes][zone_id:32 bytes]`
-//! - Response (48 bytes): `[magic:u16 LE][version:u8][flags:u8][sha:20 bytes]`
+//! - Poll request (54 bytes): `[magic:u16 LE][sha:20 bytes][zone_id:32 bytes]`
+//! - Poll response (48 bytes): `[magic:u16 LE][version:u8][flags:u8][sha:20 bytes]`
 //!   `[volume:f32 LE][volume_min:f32 LE][volume_max:f32 LE][volume_step:f32 LE]`
 //!   `[seek_position:i32 LE][length:u32 LE]`
+//! - Command (40 bytes): `[magic:u16 LE][cmd:u8][_pad:u8][zone_id:32 bytes][value:f32 LE]`
+//!   cmd=5: volume_set (value is absolute volume as f32)
 
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
@@ -18,9 +20,15 @@ use crate::knobs::manifest::compute_manifest_sha;
 
 /// "RK" in little-endian
 const MAGIC: u16 = 0x524B;
-const REQUEST_SIZE: usize = 54;
+const POLL_REQUEST_SIZE: usize = 54;
 const RESPONSE_SIZE: usize = 48;
 const WIRE_VERSION: u8 = 1;
+/// Minimum command packet size: magic(2) + cmd(1) + pad(1) + zone_id(32)
+const CMD_SIZE: usize = 36;
+/// Command packet with f32 value appended
+const CMD_VOL_SIZE: usize = 40;
+/// Command code: set absolute volume
+const CMD_VOLUME_SET: u8 = 5;
 
 /// Run the UDP fast-path listener. Never returns unless the socket fails to bind.
 pub async fn run_udp_fast_path(state: AppState, port: u16) -> std::io::Result<()> {
@@ -28,7 +36,7 @@ pub async fn run_udp_fast_path(state: AppState, port: u16) -> std::io::Result<()
     let socket = UdpSocket::bind(addr).await?;
     tracing::info!("UDP fast-path listening on {}", addr);
 
-    let mut buf = [0u8; REQUEST_SIZE];
+    let mut buf = [0u8; POLL_REQUEST_SIZE];
 
     loop {
         let (len, peer) = match socket.recv_from(&mut buf).await {
@@ -39,11 +47,10 @@ pub async fn run_udp_fast_path(state: AppState, port: u16) -> std::io::Result<()
             }
         };
 
-        if len < REQUEST_SIZE {
+        if len < CMD_SIZE {
             tracing::debug!("UDP packet too short ({} bytes) from {}", len, peer);
             continue;
         }
-
         // Validate magic
         let magic = u16::from_le_bytes([buf[0], buf[1]]);
         if magic != MAGIC {
@@ -51,16 +58,92 @@ pub async fn run_udp_fast_path(state: AppState, port: u16) -> std::io::Result<()
             continue;
         }
 
-        // Extract client SHA (null-terminated string in 20-byte field)
-        let client_sha = extract_null_terminated(&buf[2..22]);
+        if len >= POLL_REQUEST_SIZE {
+            // Poll request (54 bytes) — existing behavior
+            let client_sha = extract_null_terminated(&buf[2..22]);
+            let zone_id = extract_null_terminated(&buf[22..54]);
+            let response = build_response(&state, &client_sha, &zone_id).await;
+            if let Err(e) = socket.send_to(&response, peer).await {
+                tracing::warn!("UDP send error to {}: {}", peer, e);
+            }
+        } else if len >= CMD_SIZE {
+            // Command packet (36-40 bytes)
+            let cmd = buf[2];
+            let zone_id = extract_null_terminated(&buf[4..36]);
+            let value = if len >= CMD_VOL_SIZE {
+                Some(f32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]))
+            } else {
+                None
+            };
 
-        // Extract zone_id (null-terminated string in 32-byte field)
-        let zone_id = extract_null_terminated(&buf[22..54]);
+            let cmd_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_command(&cmd_state, cmd, &zone_id, value).await {
+                    tracing::debug!("UDP command error: {}", e);
+                }
+            });
+        }
+    }
+}
 
-        let response = build_response(&state, &client_sha, &zone_id).await;
+/// Handle a UDP command packet. Fire-and-forget — errors are logged, not returned to sender.
+async fn handle_command(
+    state: &AppState,
+    cmd: u8,
+    zone_id: &str,
+    value: Option<f32>,
+) -> Result<(), String> {
+    match cmd {
+        CMD_VOLUME_SET => {
+            let vol = value.ok_or_else(|| "volume_set command missing value".to_string())?;
 
-        if let Err(e) = socket.send_to(&response, peer).await {
-            tracing::warn!("UDP send error to {}: {}", peer, e);
+            // Normalize zone_id (legacy without prefix = Roon)
+            let prefixed = if zone_id.is_empty() {
+                return Err("empty zone_id".to_string());
+            } else if !zone_id.contains(':') {
+                format!("roon:{}", zone_id)
+            } else {
+                zone_id.to_string()
+            };
+
+            // Route by prefix to the correct adapter
+            if prefixed.starts_with("lms:") {
+                let player_id = prefixed.trim_start_matches("lms:");
+                state
+                    .lms
+                    .change_volume(player_id, vol, false)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else if prefixed.starts_with("openhome:") {
+                let udn = prefixed.trim_start_matches("openhome:");
+                state
+                    .openhome
+                    .control(udn, "vol_abs", Some(vol as i32))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else if prefixed.starts_with("upnp:") {
+                let udn = prefixed.trim_start_matches("upnp:");
+                state
+                    .upnp
+                    .control(udn, "vol_abs", Some(vol as i32))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                // Roon (default)
+                let roon_id = prefixed.trim_start_matches("roon:");
+                state
+                    .roon
+                    .change_volume(roon_id, vol, false)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+
+            tracing::debug!("UDP volume_set zone={} vol={}", zone_id, vol);
+            Ok(())
+        }
+        _ => {
+            tracing::debug!("UDP unknown command code {} from zone={}", cmd, zone_id);
+            Ok(())
         }
     }
 }
