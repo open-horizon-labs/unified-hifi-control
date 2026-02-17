@@ -151,7 +151,10 @@ async fn build_default_screens(
     state: &AppState,
     zone: &crate::bus::Zone,
     zone_id: &str,
-) -> (Vec<crate::knobs::manifest::Screen>, crate::knobs::manifest::Nav) {
+) -> (
+    Vec<crate::knobs::manifest::Screen>,
+    crate::knobs::manifest::Nav,
+) {
     use crate::knobs::manifest::*;
     use crate::knobs::routes::get_all_zones_internal;
 
