@@ -4,10 +4,10 @@
 //! avoiding HTTP + JSON overhead for the ~2s poll cycle.
 //!
 //! Wire format:
-//! - Request (54 bytes): [magic:u16 LE][sha:20 bytes][zone_id:32 bytes]
-//! - Response (48 bytes): [magic:u16 LE][version:u8][flags:u8][sha:20 bytes]
-//!     [volume:f32 LE][volume_min:f32 LE][volume_max:f32 LE][volume_step:f32 LE]
-//!     [seek_position:i32 LE][length:u32 LE]
+//! - Request (54 bytes): `[magic:u16 LE][sha:20 bytes][zone_id:32 bytes]`
+//! - Response (48 bytes): `[magic:u16 LE][version:u8][flags:u8][sha:20 bytes]`
+//!   `[volume:f32 LE][volume_min:f32 LE][volume_max:f32 LE][volume_step:f32 LE]`
+//!   `[seek_position:i32 LE][length:u32 LE]`
 
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
