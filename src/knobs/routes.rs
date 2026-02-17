@@ -415,6 +415,8 @@ pub struct ImageQuery {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub format: Option<String>,
+    /// Clip to circle of this radius (pixels from center). Pixels outside become black.
+    pub clip_radius: Option<u32>,
 }
 
 // Image conversion is now handled by state.get_image()
@@ -497,11 +499,19 @@ pub async fn knob_image_handler(
                 return placeholder_response();
             }
 
+            // Apply circular clip if requested (for round displays)
+            let body_data = if let Some(radius) = params.clip_radius {
+                if format == Some("rgb565") {
+                    clip_rgb565_circle(&image_data.data, target_width, target_height, radius)
+                } else {
+                    image_data.data
+                }
+            } else {
+                image_data.data
+            };
             let mut response = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, &image_data.content_type);
-
-            // Add RGB565 metadata headers for ESP32 clients
             if format == Some("rgb565") {
                 response = response
                     .header("X-Image-Format", "rgb565")
@@ -509,10 +519,34 @@ pub async fn knob_image_handler(
                     .header("X-Image-Height", target_height.to_string());
             }
 
-            response.body(Body::from(image_data.data)).unwrap()
+            response.body(Body::from(body_data)).unwrap()
         }
         Err(_) => placeholder_response(),
     }
+}
+
+/// Zero out RGB565 pixels outside a circle of the given radius (from center).
+/// Pixels outside become black (0x0000). Operates on little-endian RGB565 pairs.
+fn clip_rgb565_circle(data: &[u8], width: u32, height: u32, radius: u32) -> Vec<u8> {
+    let mut out = data.to_vec();
+    let cx = width as f32 / 2.0;
+    let cy = height as f32 / 2.0;
+    let r_sq = (radius as f32) * (radius as f32);
+
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx * dx + dy * dy > r_sq {
+                let idx = ((y * width + x) * 2) as usize;
+                if idx + 1 < out.len() {
+                    out[idx] = 0;
+                    out[idx + 1] = 0;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Control request body
