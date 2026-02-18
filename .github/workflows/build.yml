@@ -439,8 +439,8 @@ jobs:
           else
             echo "WASM cache miss or partial restore — will rebuild"
             echo "needs_build=true" >> $GITHUB_OUTPUT
-            # Clear stale dx output but keep Rust deps (wasm32-unknown-unknown)
-            rm -rf target/dx/
+            # Clear stale dx OUTPUT but keep compilation cache for incremental builds
+            rm -rf target/dx/unified-hifi-control/release/web/public
           fi
 
       - name: Setup Rust
