@@ -810,15 +810,13 @@ impl RoonAdapter {
             if results.len() >= limit {
                 break;
             }
-            if !is_category(item) || item.item_key.is_none() {
-                continue;
-            }
-            if !matches!(item.hint, Some(ItemHint::List)) {
-                continue;
-            }
-
+            let cat_key = match &item.item_key {
+                Some(k) if is_category(item) && matches!(item.hint, Some(ItemHint::List)) => {
+                    k.clone()
+                }
+                _ => continue,
+            };
             let cat_name = item.title.clone();
-            let cat_key = item.item_key.clone().unwrap();
 
             // Browse into category
             if self
