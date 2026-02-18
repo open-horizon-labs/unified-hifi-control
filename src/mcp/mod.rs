@@ -571,13 +571,34 @@ impl ServerHandler for HifiMcpHandler {
                     match self
                         .state
                         .lms
-                        .search_raw(&args.query, Some(&args.zone_id))
+                        .search(&args.query, Some(&args.zone_id), Some(20))
                         .await
                     {
-                        Ok(raw) => Ok(Self::json_result(&serde_json::json!({
-                            "adapter": "lms",
-                            "results": raw
-                        }))),
+                        Ok(items) => {
+                            let results: Vec<serde_json::Value> = items
+                                .into_iter()
+                                .map(|item| {
+                                    let play = serde_json::json!({
+                                        "adapter": "lms",
+                                        "item_id": item.item_id,
+                                        "url": item.url,
+                                        "id": item.id,
+                                        "result_type": item.result_type.to_string(),
+                                    });
+                                    serde_json::json!({
+                                        "title": item.title,
+                                        "subtitle": item.artist,
+                                        "category": item.result_type.to_string(),
+                                        "source": if item.item_id.is_some() { "streaming" } else { "library" },
+                                        "album": item.album,
+                                        "_play": play,
+                                    })
+                                })
+                                .collect();
+                            Ok(Self::json_result(&serde_json::json!({
+                                "results": results
+                            })))
+                        }
                         Err(e) => Self::error_result(format!("Search error: {}", e)),
                     }
                 } else {
@@ -591,17 +612,27 @@ impl ServerHandler for HifiMcpHandler {
                     match self
                         .state
                         .roon
-                        .search(&args.query, zone_id, Some(20), source)
+                        .search_playable(&args.query, zone_id, Some(20), source)
                         .await
                     {
                         Ok((session_key, items)) => {
-                            // Serialize full BrowseItems via the existing SearchResultItem conversion
-                            // which preserves item_key and hint
-                            let results: Vec<crate::api::SearchResultItem> =
-                                items.into_iter().map(|i| i.into()).collect();
+                            let results: Vec<serde_json::Value> = items
+                                .into_iter()
+                                .map(|(category, item)| {
+                                    let play = serde_json::json!({
+                                        "adapter": "roon",
+                                        "session_key": session_key,
+                                        "item_key": item.item_key,
+                                    });
+                                    serde_json::json!({
+                                        "title": item.title,
+                                        "subtitle": item.subtitle,
+                                        "category": category,
+                                        "_play": play,
+                                    })
+                                })
+                                .collect();
                             Ok(Self::json_result(&serde_json::json!({
-                                "adapter": "roon",
-                                "session_key": session_key,
                                 "results": results
                             })))
                         }
@@ -609,57 +640,64 @@ impl ServerHandler for HifiMcpHandler {
                     }
                 }
             }
-
             HifiTools::HifiPlayItemTool(args) => {
-                let use_lms = args.zone_id.starts_with("lms:")
-                    || !self.state.roon.is_browse_connected().await;
+                // Extract _play blob — the opaque token from search results
+                let play = match args.item.get("_play").or(Some(&args.item)) {
+                    Some(p) => p,
+                    None => return Self::error_result("missing _play in item".into()),
+                };
+                let adapter = play.get("adapter").and_then(|v| v.as_str()).unwrap_or("");
 
-                if use_lms {
-                    use crate::adapters::lms::LmsPlayAction;
-                    let action = LmsPlayAction::parse(args.action.as_deref());
-                    match self
-                        .state
-                        .lms
-                        .play_item(&args.zone_id, &args.item, action)
-                        .await
-                    {
-                        Ok(message) => Ok(Self::text_result(message)),
-                        Err(e) => Self::error_result(format!("Play error: {}", e)),
+                match adapter {
+                    "lms" => {
+                        use crate::adapters::lms::LmsPlayAction;
+                        let action = LmsPlayAction::parse(args.action.as_deref());
+                        // Pass the _play blob directly — play_item reads item_id/url/id from it
+                        match self.state.lms.play_item(&args.zone_id, play, action).await {
+                            Ok(message) => Ok(Self::text_result(message)),
+                            Err(e) => Self::error_result(format!("Play error: {}", e)),
+                        }
                     }
-                } else {
-                    // Roon: extract session_key and item_key from the raw item JSON
-                    let session_key = match args.item.get("session_key").and_then(|v| v.as_str()) {
-                        Some(k) => k,
-                        None => return Self::error_result("missing session_key in item".into()),
-                    };
-                    let item_key = match args.item.get("item_key").and_then(|v| v.as_str()) {
-                        Some(k) => k,
-                        None => return Self::error_result("missing item_key in item".into()),
-                    };
-                    let action = {
-                        use crate::adapters::roon::PlayAction;
-                        PlayAction::parse(args.action.as_deref().unwrap_or("play"))
-                    };
-                    let item_title = args
-                        .item
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let bare_zone_id = args.zone_id.strip_prefix("roon:").unwrap_or(&args.zone_id);
-                    match self
-                        .state
-                        .roon
-                        .execute_play_action(
-                            session_key,
-                            bare_zone_id,
-                            item_title,
-                            item_key,
-                            action,
-                        )
-                        .await
-                    {
-                        Ok(message) => Ok(Self::text_result(message)),
-                        Err(e) => Self::error_result(format!("Play error: {}", e)),
+                    "roon" => {
+                        let session_key = match play.get("session_key").and_then(|v| v.as_str()) {
+                            Some(k) => k,
+                            None => {
+                                return Self::error_result("missing session_key in _play".into())
+                            }
+                        };
+                        let item_key = match play.get("item_key").and_then(|v| v.as_str()) {
+                            Some(k) => k,
+                            None => return Self::error_result("missing item_key in _play".into()),
+                        };
+                        let action = {
+                            use crate::adapters::roon::PlayAction;
+                            PlayAction::parse(args.action.as_deref().unwrap_or("play"))
+                        };
+                        let item_title = args
+                            .item
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let bare_zone_id =
+                            args.zone_id.strip_prefix("roon:").unwrap_or(&args.zone_id);
+                        match self
+                            .state
+                            .roon
+                            .execute_play_action(
+                                session_key,
+                                bare_zone_id,
+                                item_title,
+                                item_key,
+                                action,
+                            )
+                            .await
+                        {
+                            Ok(message) => Ok(Self::text_result(message)),
+                            Err(e) => Self::error_result(format!("Play error: {}", e)),
+                        }
+                    }
+                    _ => {
+                        Self::error_result(format!("Unknown adapter '{}' in _play token", adapter))
                     }
                 }
             }

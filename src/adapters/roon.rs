@@ -775,6 +775,93 @@ impl RoonAdapter {
         Ok((session_key, vec![]))
     }
 
+    /// Search and return playable items (drills into categories).
+    /// Returns (session_key, Vec<(category_name, BrowseItem)>) where each item
+    /// has hint Action or ActionList — ready to pass to execute_play_action.
+    pub async fn search_playable(
+        &self,
+        query: &str,
+        zone_id: Option<&str>,
+        limit: Option<usize>,
+        source: SearchSource,
+    ) -> Result<(String, Vec<(String, BrowseItem)>)> {
+        let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+        let (session_key, top_items) = self.search(query, zone_id, Some(50), source).await?;
+
+        let mut results: Vec<(String, BrowseItem)> = Vec::new();
+
+        // Check if top-level items are already playable (non-category)
+        for item in &top_items {
+            if results.len() >= limit {
+                break;
+            }
+            if !is_category(item)
+                && matches!(
+                    item.hint,
+                    Some(ItemHint::Action) | Some(ItemHint::ActionList)
+                )
+            {
+                results.push(("Top Results".to_string(), item.clone()));
+            }
+        }
+
+        // Drill into category nodes (Albums, Tracks, Artists, etc.)
+        for item in &top_items {
+            if results.len() >= limit {
+                break;
+            }
+            if !is_category(item) || item.item_key.is_none() {
+                continue;
+            }
+            if !matches!(item.hint, Some(ItemHint::List)) {
+                continue;
+            }
+
+            let cat_name = item.title.clone();
+            let cat_key = item.item_key.clone().unwrap();
+
+            // Browse into category
+            if self
+                .browse(BrowseOpts {
+                    multi_session_key: Some(session_key.clone()),
+                    item_key: Some(cat_key),
+                    zone_or_output_id: zone_id.map(|z| z.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            let cat_items = match self
+                .load(LoadOpts {
+                    multi_session_key: Some(session_key.clone()),
+                    count: Some(20),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(r) => r.items,
+                Err(_) => continue,
+            };
+
+            for cat_item in cat_items {
+                if results.len() >= limit {
+                    break;
+                }
+                if matches!(
+                    cat_item.hint,
+                    Some(ItemHint::Action) | Some(ItemHint::ActionList)
+                ) {
+                    results.push((cat_name.clone(), cat_item));
+                }
+            }
+        }
+
+        Ok((session_key, results))
+    }
+
     /// Search and play the first matching result
     pub async fn search_and_play(
         &self,
