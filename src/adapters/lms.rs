@@ -1546,6 +1546,77 @@ impl LmsAdapter {
 
         Ok(format!("{} {}", action_verb, what))
     }
+
+    /// Play a specific item by raw JSON fields from search results.
+    /// Accepts item_id, url, or id+result_type — whatever the search returned.
+    pub async fn play_item(
+        &self,
+        player_id: &str,
+        item: &serde_json::Value,
+        action: LmsPlayAction,
+    ) -> Result<String> {
+        let player_id = strip_lms_prefix(player_id);
+
+        let method_gs = match action {
+            LmsPlayAction::Play => "play",
+            LmsPlayAction::Queue => "add",
+            LmsPlayAction::Insert => "insert",
+        };
+        let method_pl = match action {
+            LmsPlayAction::Play => "load",
+            LmsPlayAction::Queue => "add",
+            LmsPlayAction::Insert => "insert",
+        };
+
+        // Try item_id (globalsearch streaming)
+        if let Some(item_id) = item.get("item_id").and_then(|v| v.as_str()) {
+            self.rpc
+                .execute(
+                    Some(player_id),
+                    vec![
+                        json!("globalsearch"),
+                        json!("playlist"),
+                        json!(method_gs),
+                        json!(format!("item_id:{}", item_id)),
+                    ],
+                )
+                .await?;
+            return Ok(format!("Playing item {}", item_id));
+        }
+
+        // Try url (direct URL)
+        if let Some(url) = item.get("url").and_then(|v| v.as_str()) {
+            self.rpc
+                .execute(
+                    Some(player_id),
+                    vec![json!("playlist"), json!(method_pl), json!(url)],
+                )
+                .await?;
+            return Ok(format!("Playing URL {}", url));
+        }
+
+        // Try id + result_type (library entity)
+        if let Some(id) = item.get("id").and_then(|v| v.as_i64()) {
+            if id > 0 {
+                let result_type = item.get("result_type").and_then(|v| v.as_str()).unwrap_or("track");
+                let id_param = match result_type {
+                    "album" => format!("album_id:{}", id),
+                    "artist" => format!("artist_id:{}", id),
+                    _ => format!("track_id:{}", id),
+                };
+                let cmd_param = format!("cmd:{}", action.to_lms_cmd());
+                self.rpc
+                    .execute(
+                        Some(player_id),
+                        vec![json!("playlistcontrol"), json!(cmd_param), json!(id_param)],
+                    )
+                    .await?;
+                return Ok(format!("Playing {} {}", result_type, id));
+            }
+        }
+
+        Err(anyhow!("No playable handle in item: missing item_id, url, or valid id"))
+    }
 }
 
 /// Convert an LMS player to a unified Zone representation

@@ -678,7 +678,7 @@ impl RoonAdapter {
         zone_id: Option<&str>,
         limit: Option<usize>,
         source: SearchSource,
-    ) -> Result<Vec<BrowseItem>> {
+    ) -> Result<(String, Vec<BrowseItem>)> {
         let session_key = format!(
             "search_{}",
             std::time::SystemTime::now()
@@ -763,16 +763,16 @@ impl RoonAdapter {
         if let Some(list) = &search_result.list {
             if list.count > 0 {
                 let load_opts = LoadOpts {
-                    multi_session_key: Some(session_key),
+                    multi_session_key: Some(session_key.clone()),
                     count: Some(limit.unwrap_or(DEFAULT_SEARCH_LIMIT)),
                     ..Default::default()
                 };
                 let load_result = self.load(load_opts).await?;
-                return Ok(load_result.items);
+                return Ok((session_key, load_result.items));
             }
         }
 
-        Ok(vec![])
+        Ok((session_key, vec![]))
     }
 
     /// Search and play the first matching result
@@ -1201,7 +1201,7 @@ impl RoonAdapter {
     }
 
     /// Execute a play action on a specific item
-    async fn execute_play_action(
+    pub async fn execute_play_action(
         &self,
         session_key: &str,
         zone_id: &str,

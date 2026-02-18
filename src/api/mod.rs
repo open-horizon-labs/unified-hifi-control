@@ -460,7 +460,7 @@ pub async fn roon_search_handler(
         .search(&params.q, params.zone_id.as_deref(), params.limit, source)
         .await
     {
-        Ok(items) => {
+        Ok((_session_key, items)) => {
             let results: Vec<SearchResultItem> = items.into_iter().map(|i| i.into()).collect();
             (
                 StatusCode::OK,
