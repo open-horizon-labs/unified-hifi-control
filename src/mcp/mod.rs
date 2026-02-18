@@ -640,14 +640,22 @@ impl ServerHandler for HifiMcpHandler {
                         use crate::adapters::roon::PlayAction;
                         PlayAction::parse(args.action.as_deref().unwrap_or("play"))
                     };
-                    let item_title = args.item.get("title")
+                    let item_title = args
+                        .item
+                        .get("title")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown");
                     let bare_zone_id = args.zone_id.strip_prefix("roon:").unwrap_or(&args.zone_id);
                     match self
                         .state
                         .roon
-                        .execute_play_action(session_key, bare_zone_id, item_title, item_key, action)
+                        .execute_play_action(
+                            session_key,
+                            bare_zone_id,
+                            item_title,
+                            item_key,
+                            action,
+                        )
                         .await
                     {
                         Ok(message) => Ok(Self::text_result(message)),

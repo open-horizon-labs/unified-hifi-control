@@ -1598,7 +1598,10 @@ impl LmsAdapter {
         // Try id + result_type (library entity)
         if let Some(id) = item.get("id").and_then(|v| v.as_i64()) {
             if id > 0 {
-                let result_type = item.get("result_type").and_then(|v| v.as_str()).unwrap_or("track");
+                let result_type = item
+                    .get("result_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("track");
                 let id_param = match result_type {
                     "album" => format!("album_id:{}", id),
                     "artist" => format!("artist_id:{}", id),
@@ -1615,7 +1618,9 @@ impl LmsAdapter {
             }
         }
 
-        Err(anyhow!("No playable handle in item: missing item_id, url, or valid id"))
+        Err(anyhow!(
+            "No playable handle in item: missing item_id, url, or valid id"
+        ))
     }
 }
 
