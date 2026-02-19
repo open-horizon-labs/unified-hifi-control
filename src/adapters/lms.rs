@@ -917,16 +917,30 @@ impl LmsAdapter {
         let player_id = player_id.to_string();
         let state = self.state.clone();
         let rpc = self.rpc.clone();
-
+        let bus = self.bus.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if let Ok(status) = rpc.get_player_status(&player_id).await {
-                let mut state = state.write().await;
-                if let Some(player) = state.players.get_mut(&player_id) {
+                let old_volume = {
+                    let s = state.read().await;
+                    s.players.get(&player_id).map(|p| p.volume)
+                };
+                let mut s = state.write().await;
+                if let Some(player) = s.players.get_mut(&player_id) {
                     player.state = status.state;
                     player.mode = status.mode;
                     player.volume = status.volume;
                     player.time = status.time;
+                }
+                drop(s);
+
+                // Emit bus events so aggregator updates immediately
+                if old_volume != Some(status.volume) {
+                    bus.publish(BusEvent::VolumeChanged {
+                        output_id: PrefixedZoneId::lms(&player_id).to_string(),
+                        value: status.volume as f32,
+                        is_muted: false,
+                    });
                 }
             }
         });
