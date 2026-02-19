@@ -337,9 +337,9 @@ impl LmsRpc {
             .and_then(|v| v.as_str())
             .unwrap_or("stop");
         let state = match mode {
-            "play" => "playing",
-            "pause" => "paused",
-            _ => "stopped",
+            "play" => PlaybackState::Playing,
+            "pause" => PlaybackState::Paused,
+            _ => PlaybackState::Stopped,
         };
 
         // Handle artwork URL
@@ -367,7 +367,7 @@ impl LmsRpc {
 
         Ok(LmsPlayer {
             playerid: player_id.to_string(),
-            state: state.to_string(),
+            state,
             mode: mode.to_string(),
             power: result.get("power").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
             volume: result
@@ -382,7 +382,13 @@ impl LmsRpc {
                 .get("playlist_cur_index")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
-            time: result.get("time").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            time: result
+                .get("time")
+                .and_then(|v| {
+                    v.as_f64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(0.0),
             duration: playlist_loop
                 .get("duration")
                 .and_then(|v| {
@@ -460,7 +466,7 @@ pub struct LmsPlayer {
     pub power: bool,
     pub ip: Option<String>,
     // Status fields
-    pub state: String,
+    pub state: PlaybackState,
     pub mode: String,
     pub volume: i32,
     pub playlist_tracks: u32,
@@ -484,7 +490,7 @@ impl Default for LmsPlayer {
             connected: false,
             power: false,
             ip: None,
-            state: "stopped".to_string(),
+            state: PlaybackState::Stopped,
             mode: "stop".to_string(),
             volume: 0,
             playlist_tracks: 0,
@@ -523,7 +529,7 @@ pub struct LmsPlayerInfo {
     /// Display name of the player
     pub name: String,
     /// Current playback state (playing, paused, stopped)
-    pub state: String,
+    pub state: PlaybackState,
     /// Whether the player is connected to LMS
     pub connected: bool,
 }
@@ -806,7 +812,7 @@ impl LmsAdapter {
                 .map(|p| LmsPlayerInfo {
                     playerid: p.playerid.clone(),
                     name: p.name.clone(),
-                    state: p.state.clone(),
+                    state: p.state,
                     connected: p.connected,
                 })
                 .collect(),
@@ -911,16 +917,30 @@ impl LmsAdapter {
         let player_id = player_id.to_string();
         let state = self.state.clone();
         let rpc = self.rpc.clone();
-
+        let bus = self.bus.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if let Ok(status) = rpc.get_player_status(&player_id).await {
-                let mut state = state.write().await;
-                if let Some(player) = state.players.get_mut(&player_id) {
+                let old_volume = {
+                    let s = state.read().await;
+                    s.players.get(&player_id).map(|p| p.volume)
+                };
+                let mut s = state.write().await;
+                if let Some(player) = s.players.get_mut(&player_id) {
                     player.state = status.state;
                     player.mode = status.mode;
                     player.volume = status.volume;
                     player.time = status.time;
+                }
+                drop(s);
+
+                // Emit bus events so aggregator updates immediately
+                if old_volume != Some(status.volume) {
+                    bus.publish(BusEvent::VolumeChanged {
+                        output_id: PrefixedZoneId::lms(&player_id).to_string(),
+                        value: status.volume as f32,
+                        is_muted: false,
+                    });
                 }
             }
         });
@@ -1633,7 +1653,7 @@ fn lms_player_to_zone(player: &LmsPlayer) -> Zone {
     Zone {
         zone_id: zone_id.clone(),
         zone_name: player.name.clone(),
-        state: PlaybackState::from(player.state.as_str()),
+        state: player.state,
         volume_control: Some(VolumeControl {
             value: player.volume as f32,
             min: 0.0,
@@ -1667,8 +1687,8 @@ fn lms_player_to_zone(player: &LmsPlayer) -> Zone {
             .unwrap_or_default()
             .as_millis() as u64,
         // LMS always allows playback controls when powered and connected
-        is_play_allowed: player.state != "playing",
-        is_pause_allowed: player.state == "playing",
+        is_play_allowed: player.state != PlaybackState::Playing,
+        is_pause_allowed: player.state == PlaybackState::Playing,
         is_next_allowed: true,
         is_previous_allowed: true,
     }
@@ -1689,7 +1709,7 @@ async fn update_players_internal(
     // Collect updates to emit after releasing the lock
     let mut now_playing_updates: Vec<NowPlayingUpdate> = Vec::new();
     // State updates: (player_id, player_name, state)
-    let mut state_updates: Vec<(String, String, String)> = Vec::new();
+    let mut state_updates: Vec<(String, String, PlaybackState)> = Vec::new();
     // VolumeChanged: (player_id, volume)
     let mut volume_updates: Vec<(String, i32)> = Vec::new();
     let mut seek_updates: Vec<(String, f64, f64)> = Vec::new();
@@ -1756,11 +1776,7 @@ async fn update_players_internal(
         }
 
         if state_changed {
-            state_updates.push((
-                player.playerid.clone(),
-                player.name.clone(),
-                player.state.clone(),
-            ));
+            state_updates.push((player.playerid.clone(), player.name.clone(), player.state));
         }
 
         if volume_changed {
@@ -1768,7 +1784,7 @@ async fn update_players_internal(
         }
 
         // Emit seek position when playing (LMS doesn't push seek events)
-        if player.state == "play" && player.time > 0.0 {
+        if player.state == PlaybackState::Playing && player.time > 0.0 {
             seek_updates.push((player.playerid.clone(), player.time, player.duration));
         }
 
@@ -1799,7 +1815,7 @@ async fn update_players_internal(
         bus.publish(BusEvent::ZoneUpdated {
             zone_id: PrefixedZoneId::lms(&player_id),
             display_name: player_name,
-            state,
+            state: state.to_string(),
         });
     }
 
@@ -2033,7 +2049,7 @@ async fn handle_cli_event(
                     let player_name = {
                         let mut s = state.write().await;
                         if let Some(player) = s.players.get_mut(&player_id) {
-                            player.state = status.state.clone();
+                            player.state = status.state;
                             player.mode = status.mode.clone();
                             player.volume = status.volume;
                             player.time = status.time;
@@ -2053,7 +2069,7 @@ async fn handle_cli_event(
                     bus.publish(BusEvent::ZoneUpdated {
                         zone_id: zone_id.clone(),
                         display_name: player_name,
-                        state: status.state.clone(),
+                        state: status.state.to_string(),
                     });
 
                     if !status.title.is_empty() {
@@ -2171,7 +2187,7 @@ async fn handle_cli_event(
                 bus.publish(BusEvent::ZoneUpdated {
                     zone_id,
                     display_name: player_name,
-                    state: "stopped".to_string(),
+                    state: PlaybackState::Stopped.to_string(),
                 });
             }
         }

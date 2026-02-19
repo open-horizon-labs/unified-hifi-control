@@ -3,3 +3,6 @@
 # sccache: Shared compilation cache - caches compiled crates across projects
 # Install: brew install sccache (macOS) or cargo install sccache
 # Enable: add to your shell profile: export RUSTC_WRAPPER=sccache
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "armv7-unknown-linux-musleabihf-gcc"
