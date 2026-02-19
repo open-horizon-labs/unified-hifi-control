@@ -43,7 +43,7 @@ pub fn jpeg_to_rgb565(
     // Auto-detect format and decode (works with JPEG, PNG, GIF, BMP, etc.)
     let img = image::load_from_memory(image_data)?;
     let img = if img.width() != target_width || img.height() != target_height {
-        img.resize_exact(target_width, target_height, FilterType::Triangle)
+        img.resize_to_fill(target_width, target_height, FilterType::Triangle)
     } else {
         img
     };
@@ -163,7 +163,7 @@ pub fn image_to_rgb565(img: &DynamicImage, target_width: u32, target_height: u32
     // Avoid clone when dimensions already match
     let resized;
     let img_ref = if img.width() != target_width || img.height() != target_height {
-        resized = img.resize_exact(target_width, target_height, FilterType::Triangle);
+        resized = img.resize_to_fill(target_width, target_height, FilterType::Triangle);
         &resized
     } else {
         img
@@ -212,7 +212,7 @@ pub fn resize_jpeg(
     let img = image::load_from_memory_with_format(jpeg_data, ImageFormat::Jpeg)?;
 
     let resized = if img.width() != target_width || img.height() != target_height {
-        img.resize_exact(target_width, target_height, FilterType::Triangle)
+        img.resize_to_fill(target_width, target_height, FilterType::Triangle)
     } else {
         img
     };
