@@ -115,11 +115,18 @@ impl ZoneAggregator {
                     }
                 }
 
-                BusEvent::SeekPositionChanged { zone_id, position } => {
+                BusEvent::SeekPositionChanged {
+                    zone_id,
+                    position,
+                    duration,
+                } => {
                     debug!("Seek position changed: {} = {}", zone_id, position);
                     if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
                         if let Some(ref mut np) = zone.now_playing {
                             np.seek_position = Some(position as f64);
+                            if let Some(dur) = duration {
+                                np.duration = Some(dur);
+                            }
                         }
                     }
                 }

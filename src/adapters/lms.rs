@@ -1692,6 +1692,7 @@ async fn update_players_internal(
     let mut state_updates: Vec<(String, String, String)> = Vec::new();
     // VolumeChanged: (player_id, volume)
     let mut volume_updates: Vec<(String, i32)> = Vec::new();
+    let mut seek_updates: Vec<(String, f64, f64)> = Vec::new();
 
     // Helper to convert empty strings to None (metadata cleared)
     let to_option = |s: &str| {
@@ -1766,6 +1767,11 @@ async fn update_players_internal(
             volume_updates.push((player.playerid.clone(), player.volume));
         }
 
+        // Emit seek position when playing (LMS doesn't push seek events)
+        if player.state == "play" && player.time > 0.0 {
+            seek_updates.push((player.playerid.clone(), player.time, player.duration));
+        }
+
         let mut s = state.write().await;
         s.players.insert(player.playerid.clone(), player);
     }
@@ -1807,6 +1813,15 @@ async fn update_players_internal(
             output_id: PrefixedZoneId::lms(&player_id).to_string(),
             value: volume as f32,
             is_muted: false, // LMS doesn't expose mute via JSON-RPC
+        });
+    }
+
+    // Emit SeekPositionChanged for playing zones (LMS doesn't push seek events like Roon)
+    for (player_id, time, duration) in seek_updates {
+        bus.publish(BusEvent::SeekPositionChanged {
+            zone_id: PrefixedZoneId::lms(&player_id),
+            position: time as i64,
+            duration: Some(duration),
         });
     }
 

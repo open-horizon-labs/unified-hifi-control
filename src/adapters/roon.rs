@@ -1872,6 +1872,7 @@ async fn run_roon_loop(
                                         bus_for_events.publish(BusEvent::SeekPositionChanged {
                                             zone_id: PrefixedZoneId::roon(&seek.zone_id),
                                             position: pos,
+                                            duration: None, // Roon sets duration via ZoneDiscovered
                                         });
                                     }
                                 }

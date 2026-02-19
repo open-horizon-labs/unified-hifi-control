@@ -310,6 +310,8 @@ pub enum BusEvent {
         /// Zone identifier (must be prefixed, e.g., "roon:xxx")
         zone_id: PrefixedZoneId,
         position: i64,
+        /// Track duration in seconds (optional — LMS sends it, Roon doesn't need to)
+        duration: Option<f64>,
     },
 
     /// Volume changed
@@ -578,12 +580,12 @@ impl BusEvent {
                 }),
             }),
 
-            Self::SeekPositionChanged { zone_id, position } => {
-                Some(MuseEvent::SeekPositionChanged {
-                    zone_id: zone_id.as_str().to_string(),
-                    position: *position,
-                })
-            }
+            Self::SeekPositionChanged {
+                zone_id, position, ..
+            } => Some(MuseEvent::SeekPositionChanged {
+                zone_id: zone_id.as_str().to_string(),
+                position: *position,
+            }),
 
             Self::VolumeChanged {
                 output_id,
