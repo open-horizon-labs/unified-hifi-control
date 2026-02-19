@@ -22,10 +22,12 @@ use axum::{
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -53,6 +55,8 @@ pub struct AppState {
     /// EventReporter for forwarding events to Memex muse-ingest proxy (Issue #49)
     pub event_reporter: Arc<EventReporter>,
     pub manifests: ManifestStore,
+    /// Cached album art edge colors: image_key → hex color string (e.g. "#1a2b3c")
+    pub art_colors: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl AppState {
@@ -92,6 +96,7 @@ impl AppState {
             sse_connections: Arc::new(AtomicUsize::new(0)),
             event_reporter,
             manifests: ManifestStore::new(),
+            art_colors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -123,12 +128,17 @@ impl AppState {
         // Fetch raw image from appropriate adapter
         let raw_image = if zone_id.starts_with("lms:") {
             let (content_type, data) = self.lms.get_artwork(image_key, width, height).await?;
-            ImageData { content_type, data }
+            ImageData {
+                content_type,
+                data,
+                edge_color: None,
+            }
         } else if zone_id.starts_with("openhome:") {
             let img = self.openhome.get_image(image_key).await?;
             ImageData {
                 content_type: img.content_type,
                 data: img.data,
+                edge_color: None,
             }
         } else if zone_id.starts_with("upnp:") {
             anyhow::bail!(
@@ -139,6 +149,7 @@ impl AppState {
             ImageData {
                 content_type: img.content_type,
                 data: img.data,
+                edge_color: None,
             }
         } else {
             anyhow::bail!("Unknown zone type for image: {}", zone_id)
@@ -158,6 +169,7 @@ impl AppState {
                 Ok(rgb565) => Ok(ImageData {
                     content_type: "application/octet-stream".to_string(),
                     data: rgb565.data,
+                    edge_color: Some(rgb565.edge_color),
                 }),
                 Err(_) => {
                     // Fall back to original on conversion error

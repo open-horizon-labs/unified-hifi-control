@@ -15,6 +15,7 @@ pub struct Rgb565Image {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    pub edge_color: [u8; 3],
 }
 
 /// Convert any image buffer (JPEG, PNG, SVG, etc.) to RGB565 format for ESP32 LCD
@@ -41,22 +42,50 @@ pub fn jpeg_to_rgb565(
 
     // Auto-detect format and decode (works with JPEG, PNG, GIF, BMP, etc.)
     let img = image::load_from_memory(image_data)?;
-
-    // Resize if needed
     let img = if img.width() != target_width || img.height() != target_height {
         img.resize_exact(target_width, target_height, FilterType::Triangle)
     } else {
         img
     };
 
+    // Extract edge color before RGB565 conversion
+    let edge_color = extract_edge_color(&img);
     // Convert to RGB565
     let rgb565_data = rgba_to_rgb565(&img);
-
     Ok(Rgb565Image {
         data: rgb565_data,
         width: target_width,
         height: target_height,
+        edge_color,
     })
+}
+
+/// Extract the average color from the outer ~15% border strip of an image.
+/// This gives the color at the art's edge — the natural transition into the background.
+pub fn extract_edge_color(img: &DynamicImage) -> [u8; 3] {
+    let (w, h) = (img.width(), img.height());
+    let border = (w.min(h) / 7).max(1); // ~15%
+    let rgba = img.to_rgba8();
+    let (mut r_sum, mut g_sum, mut b_sum, mut count) = (0u64, 0u64, 0u64, 0u64);
+    for y in 0..h {
+        for x in 0..w {
+            if x < border || x >= w - border || y < border || y >= h - border {
+                let p = rgba.get_pixel(x, y);
+                r_sum += p[0] as u64;
+                g_sum += p[1] as u64;
+                b_sum += p[2] as u64;
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return [0, 0, 0];
+    }
+    [
+        (r_sum / count) as u8,
+        (g_sum / count) as u8,
+        (b_sum / count) as u8,
+    ]
 }
 
 /// Rasterize SVG to RGB565 format
@@ -116,6 +145,7 @@ pub fn svg_to_rgb565(
         data: rgb565,
         width: target_width,
         height: target_height,
+        edge_color: [0, 0, 0],
     })
 }
 
@@ -139,12 +169,13 @@ pub fn image_to_rgb565(img: &DynamicImage, target_width: u32, target_height: u32
         img
     };
 
+    let edge_color = extract_edge_color(img_ref);
     let rgb565_data = rgba_to_rgb565(img_ref);
-
     Rgb565Image {
         data: rgb565_data,
         width: target_width,
         height: target_height,
+        edge_color,
     }
 }
 

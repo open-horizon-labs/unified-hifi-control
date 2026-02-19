@@ -267,6 +267,12 @@ async fn build_default_screens(
     );
     let image_key = np.and_then(|n| n.image_key.clone());
 
+    let background_color = if let Some(ref key) = image_key {
+        state.art_colors.read().await.get(key).cloned()
+    } else {
+        None
+    };
+
     let mut lines = vec![
         TextLine {
             text: line1,
@@ -288,6 +294,7 @@ async fn build_default_screens(
         id: "now_playing".to_string(),
         image_url: Some(image_url),
         image_key,
+        background_color,
         lines,
     });
 

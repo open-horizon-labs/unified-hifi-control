@@ -126,6 +126,9 @@ pub struct MediaScreen {
     /// Opaque key for image change detection (avoids re-fetching same artwork)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_key: Option<String>,
+    /// Background color extracted from album art edges (hex, e.g. "#1a2b3c")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_color: Option<String>,
     /// Display lines: title, subtitle, detail (firmware renders in order)
     pub lines: Vec<TextLine>,
 }

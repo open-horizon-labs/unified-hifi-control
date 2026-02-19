@@ -119,6 +119,9 @@ pub struct ImageData {
 
     /// Raw image bytes
     pub data: Vec<u8>,
+
+    /// Edge-average color extracted during RGB565 conversion (for background tinting)
+    pub edge_color: Option<[u8; 3]>,
 }
 
 /// Zone update payload for partial updates (internal only).

@@ -499,6 +499,16 @@ pub async fn knob_image_handler(
                 return placeholder_response();
             }
 
+            // Cache edge color for manifest background_color
+            if let Some(ec) = image_data.edge_color {
+                let hex = format!("#{:02x}{:02x}{:02x}", ec[0], ec[1], ec[2]);
+                state
+                    .art_colors
+                    .write()
+                    .await
+                    .insert(image_key.clone(), hex);
+            }
+
             // Apply circular clip if requested (for round displays)
             let body_data = if let Some(radius) = params.clip_radius {
                 if format == Some("rgb565") {
