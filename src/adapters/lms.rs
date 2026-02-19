@@ -382,7 +382,7 @@ impl LmsRpc {
                 .get("playlist_cur_index")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32),
-            time: result.get("time").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            time: result.get("time").and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(0.0),
             duration: playlist_loop
                 .get("duration")
                 .and_then(|v| {
