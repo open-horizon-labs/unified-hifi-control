@@ -14,8 +14,21 @@ No SSH, no Docker, no Linux knowledge required.
 | Pi 5 | arm64 | Supported |
 
 ## Quick Start
+### 1. Download or build the image
 
-### 1. Build the image
+**Option A: Download pre-built image from GitHub Releases** (recommended)
+
+Download from [Releases](https://github.com/open-horizon-labs/unified-hifi-control/releases):
+- `unified-hifi-control-{version}-pi-arm64.img.gz` — Pi 3, Pi 4, Pi 5
+- `unified-hifi-control-{version}-pi-armhf.img.gz` — Pi Zero 2 W, Pi 2, Pi 3
+
+Each image has a corresponding `.sha256` checksum file. Verify after download:
+
+```bash
+sha256sum -c unified-hifi-control-*-pi-arm64.img.gz.sha256
+```
+
+**Option B: Build locally**
 
 ```bash
 # arm64 (Pi 3/4/5) - default

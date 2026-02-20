@@ -1,0 +1,177 @@
+name: Pi Image
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v4.1.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: pi-image-${{ github.event.workflow_run.head_branch || inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  # =============================================================================
+  # Build flashable Raspberry Pi images using pi-gen
+  # =============================================================================
+  # Triggered automatically after a successful release Build, or manually.
+  # Downloads pre-built ARM binaries (from Build artifacts or release assets),
+  # runs pi-gen in Docker to produce .img.gz files, uploads to GitHub Release.
+
+  build-pi-image:
+    name: Build Pi Image (${{ matrix.arch }})
+    # workflow_run: only when Build succeeded on a release event
+    # workflow_dispatch: always
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'release')
+    runs-on: namespace-profile-default
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            binary_name: unified-hifi-linux-arm64
+            artifact_name: binary-aarch64-unknown-linux-musl
+            build_arch: arm64
+          - arch: armhf
+            binary_name: unified-hifi-linux-armv7
+            artifact_name: binary-armv7-unknown-linux-musleabihf
+            build_arch: armv7
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            # Ensure tag starts with v
+            [[ "$TAG" != v* ]] && TAG="v$TAG"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          echo "::notice::Building Pi ${{ matrix.arch }} image for $TAG"
+
+      - name: Download binary from Build workflow
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download ${{ github.event.workflow_run.id }} \
+            --name ${{ matrix.artifact_name }} \
+            --dir binary/
+
+      - name: Download binary from release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            --pattern "${{ matrix.binary_name }}" \
+            --dir binary/
+
+      - name: Verify binary
+        run: |
+          ls -la binary/
+          chmod +x binary/${{ matrix.binary_name }}
+          file binary/${{ matrix.binary_name }}
+
+      - name: Set up QEMU user-mode emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64,arm
+
+      - name: Build Pi image
+        run: |
+          ./image/build.sh \
+            --arch ${{ matrix.build_arch }} \
+            --binary binary/${{ matrix.binary_name }}
+
+      - name: Rename and generate SHA256 checksum
+        id: output
+        run: |
+          IMG=$(find image/deploy \( -name '*.img.gz' -o -name '*.img.xz' \) | sort | tail -1)
+          if [ -z "$IMG" ]; then
+            echo "::error::No image file found in image/deploy/"
+            ls -la image/deploy/ 2>/dev/null || echo "deploy dir missing"
+            exit 1
+          fi
+
+          EXT="${IMG##*.img.}"
+          VERSION="${{ steps.tag.outputs.version }}"
+          FINAL="unified-hifi-control-${VERSION}-pi-${{ matrix.arch }}.img.${EXT}"
+          cp "$IMG" "$FINAL"
+
+          SHA256=$(sha256sum "$FINAL" | cut -d' ' -f1)
+          echo "$SHA256  $FINAL" > "${FINAL}.sha256"
+          echo "file=$FINAL" >> $GITHUB_OUTPUT
+          echo "checksum=${FINAL}.sha256" >> $GITHUB_OUTPUT
+
+          echo "::notice::Image: $FINAL ($(du -h "$FINAL" | cut -f1))"
+          echo "::notice::SHA256: $SHA256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: pi-image-${{ matrix.arch }}
+          path: |
+            ${{ steps.output.outputs.file }}
+            ${{ steps.output.outputs.checksum }}
+          retention-days: 5
+
+      - name: Upload to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" \
+            "${{ steps.output.outputs.file }}" \
+            "${{ steps.output.outputs.checksum }}" \
+            --clobber
+
+  # =============================================================================
+  # Summary
+  # =============================================================================
+
+  summary:
+    name: Pi Image Summary
+    needs: [build-pi-image]
+    if: always()
+    runs-on: namespace-profile-default
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts/
+        continue-on-error: true
+
+      - name: Display summary
+        run: |
+          echo "## Pi Image Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | Size | SHA256 |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|------|--------|" >> $GITHUB_STEP_SUMMARY
+          find artifacts -name '*.img.*' ! -name '*.sha256' -type f 2>/dev/null | while read f; do
+            size=$(du -h "$f" | cut -f1)
+            name=$(basename "$f")
+            sha_file="${f}.sha256"
+            if [ -f "$sha_file" ]; then
+              sha=$(cut -d' ' -f1 "$sha_file")
+              sha_short="${sha:0:16}..."
+            else
+              sha_short="(not found)"
+            fi
+            echo "| $name | $size | \`$sha_short\` |" >> $GITHUB_STEP_SUMMARY
+          done || echo "| (none) | - | - |" >> $GITHUB_STEP_SUMMARY

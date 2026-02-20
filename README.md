@@ -49,6 +49,16 @@ Then install "Unified Hi-Fi Control" from the plugin list. The plugin automatica
 
 Pre-built binaries available for Linux (x64, arm64, armv7), macOS (x64, arm64), and Windows from [Releases](https://github.com/open-horizon-labs/unified-hifi-control/releases).
 
+### Raspberry Pi
+
+Flashable SD card images turn any Raspberry Pi into a UHC bridge appliance with zero configuration.
+Download from [Releases](https://github.com/open-horizon-labs/unified-hifi-control/releases):
+- `unified-hifi-control-*-pi-arm64.img.gz` — Pi 3, Pi 4, Pi 5
+- `unified-hifi-control-*-pi-armhf.img.gz` — Pi Zero 2 W, Pi 2, Pi 3
+
+Flash with [Raspberry Pi Imager](https://www.raspberrypi.com/software/) (Use custom → select the .img.gz file).
+See [image/README.md](image/README.md) for details.
+
 ## Quick Start (Docker)
 
 ```yaml
