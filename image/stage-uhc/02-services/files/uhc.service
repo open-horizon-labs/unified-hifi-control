@@ -1,0 +1,22 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  Avahi/mDNS service advertisement for UHC.
+  Advertises uhc.local and the _uhc._tcp service for discovery.
+-->
+<service-group>
+  <name replace-wildcards="yes">UHC on %h</name>
+
+  <service>
+    <type>_uhc._tcp</type>
+    <port>8088</port>
+    <txt-record>version=1</txt-record>
+    <txt-record>path=/api</txt-record>
+  </service>
+
+  <service>
+    <type>_http._tcp</type>
+    <port>8088</port>
+    <txt-record>path=/</txt-record>
+  </service>
+</service-group>

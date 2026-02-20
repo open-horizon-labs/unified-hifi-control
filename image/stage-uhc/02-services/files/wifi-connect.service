@@ -1,0 +1,26 @@
+[Unit]
+Description=WiFi Connect - Captive Portal Provisioning
+Documentation=https://github.com/balena-os/wifi-connect
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+# Only start if no network is available (ethernet or WiFi)
+ExecStartPre=/usr/local/bin/wifi-connect-check
+ExecStart=/usr/local/bin/wifi-connect \
+    --portal-ssid UHC-Setup \
+    --portal-gateway 192.168.42.1 \
+    --portal-listening-port 80 \
+    --activity-timeout 300
+Restart=on-failure
+RestartSec=30
+# Don't restart forever if network is up
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# Environment
+Environment=DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
+
+[Install]
+WantedBy=multi-user.target
