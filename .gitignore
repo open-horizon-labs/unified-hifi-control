@@ -24,3 +24,7 @@ dist/
 public/tailwind.css
 # Note: public/dx-components-theme.css is hand-authored, NOT generated
 .worktrees/
+
+# Pi image build artifacts
+image/pi-gen/
+image/deploy/
