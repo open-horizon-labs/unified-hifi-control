@@ -822,7 +822,7 @@ jobs:
     name: Build macOS (x86_64)
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_macos == 'true'
-    runs-on: macos-latest
+    runs-on: namespace-profile-tahoe
     steps:
       - uses: actions/checkout@v6
 
@@ -878,7 +878,7 @@ jobs:
     name: Build macOS (arm64)
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_macos == 'true'
-    runs-on: macos-latest
+    runs-on: namespace-profile-tahoe
     steps:
       - uses: actions/checkout@v6
 
@@ -938,7 +938,7 @@ jobs:
       needs.plan.outputs.build_macos == 'true' &&
       needs.build-macos-x64.result == 'success' &&
       needs.build-macos-arm64.result == 'success'
-    runs-on: macos-latest
+    runs-on: namespace-profile-tahoe
     steps:
       - name: Download x86_64 binary
         uses: actions/download-artifact@v7
