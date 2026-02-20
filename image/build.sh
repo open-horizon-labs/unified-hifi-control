@@ -215,9 +215,11 @@ mkdir -p "$DEPLOY_DIR"
 PIGEN_DEPLOY="$PIGEN_DIR/deploy"
 if [[ -d "$PIGEN_DEPLOY" ]]; then
     # Find the most recent image
-    BUILT_IMAGE=$(find "$PIGEN_DEPLOY" -name "*.img.gz" -o -name "*.img.xz" | sort | tail -1)
+    BUILT_IMAGE=$(find "$PIGEN_DEPLOY" \( -name "*.img.gz" -o -name "*.img.xz" \) | sort | tail -1)
     if [[ -n "$BUILT_IMAGE" ]]; then
-        FINAL_NAME="uhc-pi-${ARCH}.img.gz"
+        # Preserve original compression extension
+        IMG_EXT="${BUILT_IMAGE##*.img.}"
+        FINAL_NAME="uhc-pi-${ARCH}.img.${IMG_EXT}"
         cp "$BUILT_IMAGE" "$DEPLOY_DIR/$FINAL_NAME"
         echo ""
         echo "==> Build complete!"

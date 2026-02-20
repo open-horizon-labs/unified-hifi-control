@@ -7,7 +7,7 @@ Wants=NetworkManager.service
 [Service]
 Type=simple
 # Only start if no network is available (ethernet or WiFi)
-ExecStartPre=/usr/local/bin/wifi-connect-check
+ExecCondition=/usr/local/bin/wifi-connect-check
 ExecStart=/usr/local/bin/wifi-connect \
     --portal-ssid UHC-Setup \
     --portal-gateway 192.168.42.1 \
