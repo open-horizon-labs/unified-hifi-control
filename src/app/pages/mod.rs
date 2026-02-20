@@ -5,11 +5,13 @@
 mod hqplayer;
 mod knobs;
 mod lms;
+mod onboarding;
 mod settings;
 mod zones;
 
 pub use hqplayer::HqPlayer;
 pub use knobs::Knobs;
 pub use lms::Lms;
+pub use onboarding::Onboarding;
 pub use settings::Settings;
 pub use zones::Zones;

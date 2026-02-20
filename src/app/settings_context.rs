@@ -18,6 +18,8 @@ pub struct SettingsContext {
     lms_enabled: Signal<bool>,
     /// Whether settings have been loaded from server
     loaded: Signal<bool>,
+    /// Whether first-run onboarding has been completed
+    onboarding_completed: Signal<bool>,
 }
 
 impl SettingsContext {
@@ -41,14 +43,27 @@ impl SettingsContext {
         !(self.lms_enabled)()
     }
 
+    /// Check if onboarding has been completed
+    pub fn onboarding_completed(&self) -> bool {
+        (self.onboarding_completed)()
+    }
+
+    /// Mark onboarding as completed (updates local signal)
+    pub fn complete_onboarding(&self) {
+        let mut oc = self.onboarding_completed;
+        oc.set(true);
+    }
+
     /// Update settings - now takes adapter enabled states
-    pub fn update(&self, hide_knobs: bool, hqp_enabled: bool, lms_enabled: bool) {
+    pub fn update(&self, hide_knobs: bool, hqp_enabled: bool, lms_enabled: bool, onboarding_completed: bool) {
         let mut hk = self.hide_knobs;
         let mut he = self.hqp_enabled;
         let mut le = self.lms_enabled;
         hk.set(hide_knobs);
         he.set(hqp_enabled);
         le.set(lms_enabled);
+        let mut oc = self.onboarding_completed;
+        oc.set(onboarding_completed);
     }
 
     /// Mark settings as loaded
@@ -64,12 +79,14 @@ pub fn use_settings_provider() {
     let hqp_enabled = use_signal(|| false);
     let lms_enabled = use_signal(|| false);
     let loaded = use_signal(|| false);
+    let onboarding_completed = use_signal(|| false);
 
     let ctx = SettingsContext {
         hide_knobs,
         hqp_enabled,
         lms_enabled,
         loaded,
+        onboarding_completed,
     };
 
     use_context_provider(|| ctx);
@@ -87,6 +104,7 @@ pub fn use_settings_provider() {
                         settings.hide_knobs_page,
                         settings.adapters.hqplayer,
                         settings.adapters.lms,
+                        settings.onboarding_completed,
                     );
                     ctx.mark_loaded();
                 }

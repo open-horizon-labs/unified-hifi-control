@@ -62,6 +62,8 @@ pub struct AppSettings {
     pub hide_hqp_page: bool,
     #[serde(default)]
     pub hide_lms_page: bool,
+    #[serde(default)]
+    pub onboarding_completed: bool,
 }
 
 // =============================================================================

@@ -56,7 +56,7 @@ pub fn Settings() -> Element {
             hqplayer_enabled.set(s.adapters.hqplayer);
             hide_knobs.set(s.hide_knobs_page);
             // Sync to shared context for Nav reactivity (page visibility follows adapter state)
-            settings_ctx.update(s.hide_knobs_page, s.adapters.hqplayer, s.adapters.lms);
+            settings_ctx.update(s.hide_knobs_page, s.adapters.hqplayer, s.adapters.lms, s.onboarding_completed);
             settings_ctx.mark_loaded();
         }
     });
@@ -108,7 +108,7 @@ pub fn Settings() -> Element {
         let lms = lms_enabled();
 
         // Update shared context immediately for reactive Nav updates
-        settings_ctx.update(hk, hqp, lms);
+        settings_ctx.update(hk, hqp, lms, settings_ctx.onboarding_completed());
 
         let settings = AppSettings {
             adapters: AdapterSettings {
@@ -122,6 +122,7 @@ pub fn Settings() -> Element {
             // These are now derived from adapter state but we keep them for API compat
             hide_hqp_page: !hqp,
             hide_lms_page: !lms,
+            onboarding_completed: settings_ctx.onboarding_completed(),
         };
         spawn(async move {
             let _ = crate::app::api::post_json_no_response("/api/settings", &settings).await;

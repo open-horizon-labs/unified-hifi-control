@@ -2039,6 +2039,8 @@ pub struct AppSettings {
     #[serde(default, alias = "hideLmsPage")]
     pub hide_lms_page: bool,
     #[serde(default)]
+    pub onboarding_completed: bool,
+    #[serde(default)]
     pub adapters: AdapterSettings,
 }
 
@@ -2066,6 +2068,7 @@ impl Default for AppSettings {
             hide_knobs_page: false,
             hide_hqp_page: false,
             hide_lms_page: false,
+            onboarding_completed: false,
             adapters: AdapterSettings {
                 roon: true,
                 upnp: false,

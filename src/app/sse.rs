@@ -13,6 +13,12 @@ use std::rc::Rc;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+/// Payload for adapter-level events
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct AdapterPayload {
+    pub adapter: String,
+}
+
 /// Payload for zone-related events
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct ZonePayload {
@@ -38,6 +44,17 @@ pub struct VolumePayload {
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(tag = "type")]
 pub enum SseEvent {
+    // Zone lifecycle events (from server MuseEvent)
+    ZoneDiscovered {},
+
+    // Generic adapter events (server sends these for all adapters)
+    AdapterConnected {
+        payload: AdapterPayload,
+    },
+    AdapterDisconnected {
+        payload: AdapterPayload,
+    },
+
     // Roon events
     RoonConnected,
     RoonDisconnected,
