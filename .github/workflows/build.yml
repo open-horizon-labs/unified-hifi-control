@@ -63,7 +63,7 @@ jobs:
 
   plan:
     name: Plan
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     outputs:
       is_release: ${{ steps.decide.outputs.is_release }}
       build_linux_arm: ${{ steps.decide.outputs.build_linux_arm }}
@@ -335,7 +335,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -370,7 +370,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -407,7 +407,7 @@ jobs:
   # Uses content-based caching to skip build when source unchanged
   build-wasm:
     name: Build WASM Assets
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -518,7 +518,7 @@ jobs:
   build-linux-x64:
     name: Build Linux x64
     needs: [plan, build-wasm]
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -591,7 +591,7 @@ jobs:
   smoke-test:
     name: Smoke Test Binary
     needs: [plan, build-linux-x64]
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - name: Download binary
         uses: actions/download-artifact@v7
@@ -734,7 +734,7 @@ jobs:
     name: Build Linux ARM (${{ matrix.arch }})
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_linux_arm == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     strategy:
       matrix:
         include:
@@ -1043,7 +1043,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_lms == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -1170,7 +1170,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_synology == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     strategy:
       fail-fast: false
       matrix:
@@ -1241,7 +1241,7 @@ jobs:
     name: Build QNAP (x64)
     needs: [plan, build-linux-x64]
     if: needs.plan.outputs.build_qnap == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -1293,7 +1293,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_qnap_arm == 'true' &&
       needs.build-linux-arm.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -1347,7 +1347,7 @@ jobs:
       needs.plan.outputs.build_docker == 'true' &&
       needs.plan.outputs.is_release != 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     permissions:
       packages: write
     steps:
@@ -1424,7 +1424,7 @@ jobs:
     name: Build Docker (${{ matrix.arch }})
     needs: [plan, build-linux-x64, build-linux-arm]
     if: needs.plan.outputs.is_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     strategy:
       matrix:
         include:
@@ -1491,7 +1491,7 @@ jobs:
     name: Create Docker Manifest
     needs: [plan, build-docker-release]
     if: needs.plan.outputs.is_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - name: Download digests
         uses: actions/download-artifact@v7
@@ -1545,7 +1545,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_linux_packages == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -1637,7 +1637,7 @@ jobs:
     name: Upload to Release
     needs: [plan, build-linux-x64, build-linux-arm, build-macos-universal, build-windows, build-linux-packages, build-lms-universal, build-synology, build-qnap-x64, build-qnap-arm]
     if: needs.plan.outputs.is_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     permissions:
       contents: write
     steps:
@@ -1701,7 +1701,7 @@ jobs:
     name: Update LMS repo.xml
     needs: [plan, upload-release]
     if: needs.plan.outputs.is_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     permissions:
       contents: write
       pull-requests: write
@@ -1787,7 +1787,7 @@ jobs:
     name: Publish to AUR
     needs: [plan, upload-release]
     if: needs.plan.outputs.is_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -1838,7 +1838,7 @@ jobs:
       - build-docker-release
       - build-linux-packages
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v7
@@ -1878,7 +1878,7 @@ jobs:
     name: Post Artifact Links
     needs: [summary]
     if: always() && github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     permissions:
       pull-requests: write
     steps:
