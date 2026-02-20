@@ -543,7 +543,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-zigbuild
-          key: cargo-zigbuild-0.20
+          key: cargo-zigbuild-0.20.2
 
       - name: Install cargo-zigbuild
         if: steps.cache-zigbuild.outputs.cache-hit != 'true'
@@ -768,7 +768,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-zigbuild
-          key: cargo-zigbuild-0.20
+          key: cargo-zigbuild-0.20.2
 
       - name: Install cargo-zigbuild
         if: steps.cache-zigbuild.outputs.cache-hit != 'true'

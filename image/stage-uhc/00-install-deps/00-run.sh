@@ -5,11 +5,7 @@
 #
 
 # Determine architecture inside the chroot
-DPKG_ARCH=$(on_chroot printenv DPKG_ARCH 2>/dev/null || echo "")
-if [ -z "$DPKG_ARCH" ]; then
-    # Detect from the rootfs
-    DPKG_ARCH=$(chroot "${ROOTFS_DIR}" dpkg --print-architecture)
-fi
+DPKG_ARCH=$(chroot "${ROOTFS_DIR}" dpkg --print-architecture)
 
 WIFI_CONNECT_VERSION="4.4.6"
 case "$DPKG_ARCH" in

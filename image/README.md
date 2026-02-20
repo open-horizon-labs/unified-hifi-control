@@ -97,7 +97,7 @@ settings before flashing, the Pi connects automatically. Browse to http://uhc.lo
 
 ## Architecture
 
-```
+```text
 Power on
   -> Ethernet? -> UHC starts -> uhc.local:8088 ready
   -> WiFi pre-configured? -> Connect -> UHC starts -> uhc.local:8088 ready

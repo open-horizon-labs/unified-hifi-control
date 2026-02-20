@@ -24,11 +24,11 @@ install -m 644 "${STAGE_DIR}/02-services/files/uhc.service" \
 # Configure Avahi to advertise uhc.local
 if [ -f "${ROOTFS_DIR}/etc/avahi/avahi-daemon.conf" ]; then
     # Enable hostname publishing
-    sed -i 's/^#*host-name=.*/host-name=uhc/' \
+    sed -i 's/^[[:space:]]*#*[[:space:]]*host-name=.*/host-name=uhc/' \
         "${ROOTFS_DIR}/etc/avahi/avahi-daemon.conf"
-    sed -i 's/^#*publish-hinfo=.*/publish-hinfo=yes/' \
+    sed -i 's/^[[:space:]]*#*[[:space:]]*publish-hinfo=.*/publish-hinfo=yes/' \
         "${ROOTFS_DIR}/etc/avahi/avahi-daemon.conf"
-    sed -i 's/^#*publish-workstation=.*/publish-workstation=no/' \
+    sed -i 's/^[[:space:]]*#*[[:space:]]*publish-workstation=.*/publish-workstation=no/' \
         "${ROOTFS_DIR}/etc/avahi/avahi-daemon.conf"
 fi
 

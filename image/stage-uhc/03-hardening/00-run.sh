@@ -13,16 +13,20 @@ echo "==> Applying SD card wear mitigation"
 
 # --- noatime on root filesystem ---
 # Add noatime to existing root partition entry (before we append tmpfs lines)
-sed -i '/^[^#].*\/.*defaults/ s|defaults|defaults,noatime|' "${ROOTFS_DIR}/etc/fstab"
+if ! grep -qE '^[^#].*\s+/\s+.*\bnoatime\b' "${ROOTFS_DIR}/etc/fstab"; then
+    sed -i '/^[^#].*\/.*defaults/ s|defaults|defaults,noatime|' "${ROOTFS_DIR}/etc/fstab"
+fi
 
 # --- tmpfs for volatile directories ---
 
+if ! grep -q 'tmpfs /var/log' "${ROOTFS_DIR}/etc/fstab"; then
 cat >> "${ROOTFS_DIR}/etc/fstab" <<'FSTAB'
 # SD card wear mitigation - volatile data in RAM
 tmpfs /var/log     tmpfs defaults,noatime,nosuid,nodev,noexec,mode=0755,size=50M 0 0
 tmpfs /var/tmp     tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=50M 0 0
 tmpfs /tmp         tmpfs defaults,noatime,nosuid,nodev,noexec,mode=1777,size=100M 0 0
 FSTAB
+fi
 
 # --- journald: log to RAM only, limit size ---
 
