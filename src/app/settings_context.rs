@@ -55,7 +55,13 @@ impl SettingsContext {
     }
 
     /// Update settings - now takes adapter enabled states
-    pub fn update(&self, hide_knobs: bool, hqp_enabled: bool, lms_enabled: bool, onboarding_completed: bool) {
+    pub fn update(
+        &self,
+        hide_knobs: bool,
+        hqp_enabled: bool,
+        lms_enabled: bool,
+        onboarding_completed: bool,
+    ) {
         let mut hk = self.hide_knobs;
         let mut he = self.hqp_enabled;
         let mut le = self.lms_enabled;

@@ -56,7 +56,12 @@ pub fn Settings() -> Element {
             hqplayer_enabled.set(s.adapters.hqplayer);
             hide_knobs.set(s.hide_knobs_page);
             // Sync to shared context for Nav reactivity (page visibility follows adapter state)
-            settings_ctx.update(s.hide_knobs_page, s.adapters.hqplayer, s.adapters.lms, s.onboarding_completed);
+            settings_ctx.update(
+                s.hide_knobs_page,
+                s.adapters.hqplayer,
+                s.adapters.lms,
+                s.onboarding_completed,
+            );
             settings_ctx.mark_loaded();
         }
     });

@@ -71,12 +71,9 @@ pub fn Onboarding() -> Element {
     // Shared completion logic: save flag to server and update local signal
     let do_complete = move || {
         spawn(async move {
-            if let Ok(mut s) =
-                crate::app::api::fetch_json::<AppSettings>("/api/settings").await
-            {
+            if let Ok(mut s) = crate::app::api::fetch_json::<AppSettings>("/api/settings").await {
                 s.onboarding_completed = true;
-                let _ =
-                    crate::app::api::post_json_no_response("/api/settings", &s).await;
+                let _ = crate::app::api::post_json_no_response("/api/settings", &s).await;
             }
             settings_ctx.complete_onboarding();
         });
@@ -354,8 +351,7 @@ fn ConnectionCard(icon: &'static str, title: &'static str, description: String) 
 
 /// Group zones by source, sorted (Roon, LMS, OpenHome, UPnP, Other).
 fn group_zones_by_source(zones: &[Zone]) -> Vec<(String, Vec<Zone>)> {
-    let mut groups: std::collections::HashMap<String, Vec<Zone>> =
-        std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<String, Vec<Zone>> = std::collections::HashMap::new();
     for zone in zones {
         let source = zone.source.clone().unwrap_or_else(|| "Other".to_string());
         groups.entry(source).or_default().push(zone.clone());
