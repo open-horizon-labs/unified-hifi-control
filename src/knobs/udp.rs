@@ -3,12 +3,12 @@
 //! Provides a compact binary protocol for the knob's fast-path state updates,
 //! avoiding HTTP + JSON overhead for the ~2s poll cycle.
 //!
-//! Wire format:
-//! - Poll request (54 bytes): `[magic:u16 LE][sha:20 bytes][zone_id:32 bytes]`
+//! Wire format (v2 — 64-byte zone_id):
+//! - Poll request (86 bytes): `[magic:u16 LE][sha:20 bytes][zone_id:64 bytes]`
 //! - Poll response (48 bytes): `[magic:u16 LE][version:u8][flags:u8][sha:20 bytes]`
 //!   `[volume:f32 LE][volume_min:f32 LE][volume_max:f32 LE][volume_step:f32 LE]`
 //!   `[seek_position:i32 LE][length:u32 LE]`
-//! - Command (40 bytes): `[magic:u16 LE][cmd:u8][_pad:u8][zone_id:32 bytes][value:f32 LE]`
+//! - Command (72 bytes): `[magic:u16 LE][cmd:u8][_pad:u8][zone_id:64 bytes][value:f32 LE]`
 //!   cmd=5: volume_set (value is absolute volume as f32)
 
 use std::net::SocketAddr;
@@ -20,13 +20,17 @@ use crate::knobs::manifest::compute_manifest_sha;
 
 /// "RK" in little-endian
 const MAGIC: u16 = 0x524B;
-const POLL_REQUEST_SIZE: usize = 54;
+/// Poll request: magic(2) + sha(20) + zone_id(64) = 86
+const POLL_REQUEST_SIZE: usize = 86;
 const RESPONSE_SIZE: usize = 48;
 const WIRE_VERSION: u8 = 1;
-/// Minimum command packet size: magic(2) + cmd(1) + pad(1) + zone_id(32)
-const CMD_SIZE: usize = 36;
-/// Command packet with f32 value appended
-const CMD_VOL_SIZE: usize = 40;
+/// Minimum command packet size: magic(2) + cmd(1) + pad(1) + zone_id(64)
+const CMD_SIZE: usize = 68;
+/// Command packet with f32 value appended: CMD_SIZE + f32(4) = 72
+const CMD_VOL_SIZE: usize = 72;
+/// Size of the zone_id field in wire structs (accommodates 41-char Roon IDs)
+#[cfg(test)]
+const ZONE_ID_FIELD_SIZE: usize = 64;
 /// Command code: set absolute volume
 const CMD_VOLUME_SET: u8 = 5;
 
@@ -59,19 +63,19 @@ pub async fn run_udp_fast_path(state: AppState, port: u16) -> std::io::Result<()
         }
 
         if len >= POLL_REQUEST_SIZE {
-            // Poll request (54 bytes) — existing behavior
+            // Poll request (86 bytes): [magic:2][sha:20][zone_id:64]
             let client_sha = extract_null_terminated(&buf[2..22]);
-            let zone_id = extract_null_terminated(&buf[22..54]);
+            let zone_id = extract_null_terminated(&buf[22..86]);
             let response = build_response(&state, &client_sha, &zone_id).await;
             if let Err(e) = socket.send_to(&response, peer).await {
                 tracing::warn!("UDP send error to {}: {}", peer, e);
             }
         } else if len >= CMD_SIZE {
-            // Command packet (36-40 bytes)
+            // Command packet (68-72 bytes): [magic:2][cmd:1][pad:1][zone_id:64][value:4]
             let cmd = buf[2];
-            let zone_id = extract_null_terminated(&buf[4..36]);
+            let zone_id = extract_null_terminated(&buf[4..68]);
             let value = if len >= CMD_VOL_SIZE {
-                Some(f32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]))
+                Some(f32::from_le_bytes([buf[68], buf[69], buf[70], buf[71]]))
             } else {
                 None
             };
@@ -344,4 +348,156 @@ fn make_empty_response() -> [u8; RESPONSE_SIZE] {
     // seek_position = -1
     resp[40..44].copy_from_slice(&(-1i32).to_le_bytes());
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Wire format size assertions ──────────────────────────────────
+
+    #[test]
+    fn wire_sizes_are_self_consistent() {
+        // Poll: magic(2) + sha(20) + zone_id(64)
+        assert_eq!(POLL_REQUEST_SIZE, 2 + 20 + ZONE_ID_FIELD_SIZE);
+        // Command minimum: magic(2) + cmd(1) + pad(1) + zone_id(64)
+        assert_eq!(CMD_SIZE, 2 + 1 + 1 + ZONE_ID_FIELD_SIZE);
+        // Command with value: CMD_SIZE + f32(4)
+        assert_eq!(CMD_VOL_SIZE, CMD_SIZE + 4);
+    }
+
+    #[test]
+    fn zone_id_field_fits_roon_ids() {
+        // Roon zone IDs are 41 chars: "roon:" (5) + 32-char hex = 37, or with longer hashes
+        // Real example: "roon:160170c84d9088ec6e42b34500d67e60c231" = 41 chars
+        let roon_id = "roon:160170c84d9088ec6e42b34500d67e60c231";
+        assert_eq!(roon_id.len(), 41);
+        assert!(
+            roon_id.len() < ZONE_ID_FIELD_SIZE,
+            "Roon zone ID ({} bytes) must fit in zone_id field ({} bytes) with null terminator",
+            roon_id.len(),
+            ZONE_ID_FIELD_SIZE
+        );
+    }
+
+    // ── extract_null_terminated ──────────────────────────────────────
+
+    #[test]
+    fn extract_null_terminated_basic() {
+        let mut field = [0u8; 64];
+        let id = b"roon:abc123";
+        field[..id.len()].copy_from_slice(id);
+        assert_eq!(extract_null_terminated(&field), "roon:abc123");
+    }
+
+    #[test]
+    fn extract_null_terminated_full_field() {
+        // Field completely filled, no null terminator
+        let field = [b'x'; 64];
+        assert_eq!(extract_null_terminated(&field).len(), 64);
+    }
+
+    #[test]
+    fn extract_null_terminated_empty() {
+        let field = [0u8; 64];
+        assert_eq!(extract_null_terminated(&field), "");
+    }
+
+    #[test]
+    fn extract_null_terminated_roon_zone_id() {
+        let mut field = [0u8; 64];
+        let id = b"roon:160170c84d9088ec6e42b34500d67e60c231";
+        field[..id.len()].copy_from_slice(id);
+        assert_eq!(
+            extract_null_terminated(&field),
+            "roon:160170c84d9088ec6e42b34500d67e60c231"
+        );
+    }
+
+    // ── Poll request packet layout ──────────────────────────────────
+
+    #[test]
+    fn poll_request_layout() {
+        let mut pkt = [0u8; POLL_REQUEST_SIZE];
+        let zone_id = b"roon:160170c84d9088ec6e42b34500d67e60c231";
+
+        // Pack: [magic:2][sha:20][zone_id:64]
+        pkt[0..2].copy_from_slice(&MAGIC.to_le_bytes());
+        pkt[2..22].copy_from_slice(&[0xAA; 20]); // dummy sha
+        pkt[22..22 + zone_id.len()].copy_from_slice(zone_id);
+
+        // Verify magic
+        assert_eq!(u16::from_le_bytes([pkt[0], pkt[1]]), MAGIC);
+        // Verify zone_id extraction at correct offset
+        assert_eq!(
+            extract_null_terminated(&pkt[22..86]),
+            "roon:160170c84d9088ec6e42b34500d67e60c231"
+        );
+    }
+
+    // ── Command packet layout ───────────────────────────────────────
+
+    #[test]
+    fn command_packet_layout_with_value() {
+        let mut pkt = [0u8; CMD_VOL_SIZE];
+        let zone_id = b"roon:160170c84d9088ec6e42b34500d67e60c231";
+        let volume: f32 = -12.5;
+
+        // Pack: [magic:2][cmd:1][pad:1][zone_id:64][value:4]
+        pkt[0..2].copy_from_slice(&MAGIC.to_le_bytes());
+        pkt[2] = CMD_VOLUME_SET;
+        pkt[3] = 0; // pad
+        pkt[4..4 + zone_id.len()].copy_from_slice(zone_id);
+        pkt[68..72].copy_from_slice(&volume.to_le_bytes());
+
+        // Verify fields at correct offsets
+        assert_eq!(u16::from_le_bytes([pkt[0], pkt[1]]), MAGIC);
+        assert_eq!(pkt[2], CMD_VOLUME_SET);
+        assert_eq!(
+            extract_null_terminated(&pkt[4..68]),
+            "roon:160170c84d9088ec6e42b34500d67e60c231"
+        );
+        assert_eq!(
+            f32::from_le_bytes([pkt[68], pkt[69], pkt[70], pkt[71]]),
+            -12.5
+        );
+    }
+
+    #[test]
+    fn command_packet_layout_without_value() {
+        let mut pkt = [0u8; CMD_SIZE];
+        let zone_id = b"lms:ab:cd:ef:12:34:56";
+
+        pkt[0..2].copy_from_slice(&MAGIC.to_le_bytes());
+        pkt[2] = 0xFF; // hypothetical future command
+        pkt[4..4 + zone_id.len()].copy_from_slice(zone_id);
+
+        assert_eq!(
+            extract_null_terminated(&pkt[4..68]),
+            "lms:ab:cd:ef:12:34:56"
+        );
+        // No value field in CMD_SIZE packet
+        assert_eq!(pkt.len(), CMD_SIZE);
+    }
+
+    // ── Response packet (unchanged) ─────────────────────────────────
+
+    #[test]
+    fn empty_response_has_correct_magic_and_seek() {
+        let resp = make_empty_response();
+        assert_eq!(u16::from_le_bytes([resp[0], resp[1]]), MAGIC);
+        assert_eq!(resp[2], WIRE_VERSION);
+        assert_eq!(resp[3], 0); // flags = 0
+        assert_eq!(
+            i32::from_le_bytes([resp[40], resp[41], resp[42], resp[43]]),
+            -1
+        );
+        assert_eq!(resp.len(), RESPONSE_SIZE);
+    }
+
+    #[test]
+    fn response_size_unchanged() {
+        // Response has no zone_id field — must remain 48 bytes
+        assert_eq!(RESPONSE_SIZE, 48);
+    }
 }
