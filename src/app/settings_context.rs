@@ -102,18 +102,24 @@ pub fn use_settings_provider() {
     {
         use_effect(move || {
             spawn(async move {
-                if let Ok(settings) =
-                    crate::app::api::fetch_json::<AppSettings>("/api/settings").await
+                match crate::app::api::fetch_json::<AppSettings>("/api/settings").await
                 {
-                    // Page visibility now derived from adapter enabled state
-                    ctx.update(
-                        settings.hide_knobs_page,
-                        settings.adapters.hqplayer,
-                        settings.adapters.lms,
-                        settings.onboarding_completed,
-                    );
-                    ctx.mark_loaded();
+                    Ok(settings) => {
+                        // Page visibility now derived from adapter enabled state
+                        ctx.update(
+                            settings.hide_knobs_page,
+                            settings.adapters.hqplayer,
+                            settings.adapters.lms,
+                            settings.onboarding_completed,
+                        );
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("Failed to fetch settings: {}", e).into(),
+                        );
+                    }
                 }
+                ctx.mark_loaded();
             });
         });
     }

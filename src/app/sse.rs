@@ -130,7 +130,10 @@ impl SseContext {
         matches!(
             self.last_event.read().as_ref(),
             Some(
-                SseEvent::ZoneUpdated { .. }
+                SseEvent::ZoneDiscovered { .. }
+                    | SseEvent::AdapterConnected { .. }
+                    | SseEvent::AdapterDisconnected { .. }
+                    | SseEvent::ZoneUpdated { .. }
                     | SseEvent::ZoneRemoved { .. }
                     | SseEvent::NowPlayingChanged { .. }
                     | SseEvent::SeekPositionChanged { .. }

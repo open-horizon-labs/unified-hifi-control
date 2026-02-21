@@ -2038,7 +2038,7 @@ pub struct AppSettings {
     pub hide_hqp_page: bool,
     #[serde(default, alias = "hideLmsPage")]
     pub hide_lms_page: bool,
-    #[serde(default)]
+    #[serde(default, alias = "onboardingCompleted")]
     pub onboarding_completed: bool,
     #[serde(default)]
     pub adapters: AdapterSettings,

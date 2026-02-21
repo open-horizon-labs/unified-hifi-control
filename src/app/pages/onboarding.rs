@@ -269,7 +269,8 @@ fn ReadyStep(
     bridge_host: String,
     on_complete: EventHandler<MouseEvent>,
 ) -> Element {
-    let mcp_url = format!("http://{}/mcp", bridge_host);
+    let bridge_origin = get_bridge_origin();
+    let mcp_url = format!("{}/mcp", bridge_origin);
 
     rsx! {
         div { class: "space-y-6",
@@ -380,6 +381,22 @@ fn plural(n: usize) -> &'static str {
     } else {
         "s"
     }
+}
+
+/// Get bridge origin (scheme + host) from window.location (WASM) or fallback.
+fn get_bridge_origin() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            let location = window.location();
+            if let (Ok(protocol), Ok(host)) = (location.protocol(), location.host()) {
+                if !host.is_empty() {
+                    return format!("{}//{}", protocol, host);
+                }
+            }
+        }
+    }
+    "http://uhc.local:8088".to_string()
 }
 
 /// Get bridge host (hostname:port) from window.location (WASM) or fallback.
