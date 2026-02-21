@@ -1281,7 +1281,7 @@ jobs:
       - name: Upload QNAP package
         uses: actions/upload-artifact@v6
         with:
-          name: qnap-x86_64
+          name: qnap-x86_64.qpkg
           path: dist/installers/*.qpkg
           retention-days: 5
 
@@ -1333,7 +1333,7 @@ jobs:
       - name: Upload QNAP package
         uses: actions/upload-artifact@v6
         with:
-          name: qnap-arm_64
+          name: qnap-arm_64.qpkg
           path: dist/installers/*.qpkg
           retention-days: 5
 
