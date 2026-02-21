@@ -1688,6 +1688,12 @@ jobs:
 
           ### LMS Plugin
           - `lms-unified-hifi-control-*.zip` - Install via LMS Settings > Plugins
+
+          ### Raspberry Pi Images
+          Flashable SD card images (uploaded separately by the Pi Image workflow):
+          - `unified-hifi-control-*-pi-arm64.img.gz` — Pi 3, Pi 4, Pi 5
+          - `unified-hifi-control-*-pi-armhf.img.gz` — Pi Zero 2 W, Pi 2, Pi 3
+          - `.sha256` checksum files included
           EOF
 
       - name: Upload to release
