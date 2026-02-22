@@ -1284,16 +1284,15 @@ impl LmsAdapter {
         });
         let drill_id = songs_id.or(everything_id);
 
-        // Also collect any directly playable items (non-container tracks)
+        // Collect any directly playable items (tracks and album containers alike).
+        // parse_single_item classifies them correctly — callers use category to decide.
         for item in items {
             if results.len() >= limit {
                 break;
             }
             let is_audio = item.get("isaudio").and_then(|v| v.as_i64()).unwrap_or(0) == 1
                 || item.get("type").and_then(|v| v.as_str()) == Some("audio");
-            let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
-            // Skip containers — they're albums/playlists, not individual tracks
-            if is_audio && !has_items {
+            if is_audio {
                 if let Some(result) = self.parse_single_item(item) {
                     results.push(result);
                 }
