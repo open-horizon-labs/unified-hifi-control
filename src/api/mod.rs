@@ -193,7 +193,15 @@ impl AppState {
                     data: eink.data,
                     edge_color: None,
                 }),
-                Err(_) => Ok(raw_image),
+                Err(e) => {
+                    tracing::warn!(
+                        "E-ink dithering failed ({}x{}): {}, falling back to raw image",
+                        target_w,
+                        target_h,
+                        e
+                    );
+                    Ok(raw_image)
+                }
             }
         } else {
             Ok(raw_image)

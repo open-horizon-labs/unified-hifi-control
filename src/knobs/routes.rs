@@ -429,9 +429,14 @@ pub async fn knob_image_handler(
     State(state): State<AppState>,
     Query(params): Query<ImageQuery>,
 ) -> Response {
-    let target_width = params.width.unwrap_or(240);
-    let target_height = params.height.unwrap_or(240);
     let format = params.format.as_deref();
+    let (default_w, default_h) = if format == Some("eink_acep6") {
+        (800, 480)
+    } else {
+        (240, 240)
+    };
+    let target_width = params.width.unwrap_or(default_w);
+    let target_height = params.height.unwrap_or(default_h);
 
     // Helper to return placeholder image in appropriate format
     let placeholder_response = || -> Response {

@@ -8,8 +8,8 @@
 //! - RGB565 conversion (little-endian for ESP32)
 
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, ImageFormat};
+use once_cell::sync::Lazy;
 use std::io::Cursor;
-use std::sync::LazyLock;
 
 /// RGB565 image data for LCD display
 pub struct Rgb565Image {
@@ -258,7 +258,7 @@ struct AcepColor {
 }
 
 /// sRGB-to-linear lookup table, computed once (avoids pow() per pixel)
-static SRGB_LUT: LazyLock<[f32; 256]> = LazyLock::new(|| {
+static SRGB_LUT: Lazy<[f32; 256]> = Lazy::new(|| {
     let mut lut = [0.0f32; 256];
     for (i, entry) in lut.iter_mut().enumerate() {
         let c = i as f32 / 255.0;
