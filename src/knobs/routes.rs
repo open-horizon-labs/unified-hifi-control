@@ -453,6 +453,16 @@ pub async fn knob_image_handler(
                     .body(Body::from(svg))
                     .unwrap(),
             }
+        } else if format == Some("eink_acep6") {
+            let eink = crate::knobs::image::placeholder_eink(target_width, target_height);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header("X-Image-Format", "eink_acep6")
+                .header("X-Image-Width", eink.width.to_string())
+                .header("X-Image-Height", eink.height.to_string())
+                .body(Body::from(eink.data))
+                .unwrap()
         } else {
             Response::builder()
                 .status(StatusCode::OK)
@@ -493,9 +503,11 @@ pub async fn knob_image_handler(
         .await
     {
         Ok(image_data) => {
-            // If RGB565 was requested but conversion failed (content_type != octet-stream),
+            // If a device format was requested but conversion failed (content_type != octet-stream),
             // return the placeholder instead of misleading headers
-            if format == Some("rgb565") && image_data.content_type != "application/octet-stream" {
+            if (format == Some("rgb565") || format == Some("eink_acep6"))
+                && image_data.content_type != "application/octet-stream"
+            {
                 return placeholder_response();
             }
 
@@ -525,6 +537,11 @@ pub async fn knob_image_handler(
             if format == Some("rgb565") {
                 response = response
                     .header("X-Image-Format", "rgb565")
+                    .header("X-Image-Width", target_width.to_string())
+                    .header("X-Image-Height", target_height.to_string());
+            } else if format == Some("eink_acep6") {
+                response = response
+                    .header("X-Image-Format", "eink_acep6")
                     .header("X-Image-Width", target_width.to_string())
                     .header("X-Image-Height", target_height.to_string());
             }

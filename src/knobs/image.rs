@@ -239,6 +239,271 @@ pub fn placeholder_svg(width: u32, height: u32) -> String {
     )
 }
 
+// ============================================================================
+// E-ink ACeP 6-color dithering (Stucki + serpentine + CIELAB)
+// ============================================================================
+
+/// E-ink image data (4-bit packed palette indices)
+pub struct EinkImage {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// ACeP 6-color palette entry
+struct AcepColor {
+    hw_index: u8,
+    lab: [f32; 3],
+}
+
+/// Build sRGB-to-linear lookup table (avoids pow() per pixel)
+fn srgb_lut() -> [f32; 256] {
+    let mut lut = [0.0f32; 256];
+    for (i, entry) in lut.iter_mut().enumerate() {
+        let c = i as f32 / 255.0;
+        *entry = if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        };
+    }
+    lut
+}
+
+/// Convert sRGB to CIELAB (D65 illuminant)
+fn rgb_to_lab(r: u8, g: u8, b: u8, lut: &[f32; 256]) -> [f32; 3] {
+    let rl = lut[r as usize];
+    let gl = lut[g as usize];
+    let bl = lut[b as usize];
+
+    // Linear RGB to XYZ (sRGB primaries, D65 white)
+    let x = rl * 0.412_456_4 + gl * 0.357_576_1 + bl * 0.180_437_5;
+    let y = rl * 0.212_672_9 + gl * 0.715_152_2 + bl * 0.072_175_0;
+    let z = rl * 0.019_333_9 + gl * 0.119_192 + bl * 0.950_304_1;
+
+    // XYZ to CIELAB
+    const XN: f32 = 0.950_47;
+    const YN: f32 = 1.0;
+    const ZN: f32 = 1.088_83;
+
+    let f = |t: f32| -> f32 {
+        if t > 0.008_856 {
+            t.cbrt()
+        } else {
+            t * 7.787_037 + 16.0 / 116.0
+        }
+    };
+
+    let fx = f(x / XN);
+    let fy = f(y / YN);
+    let fz = f(z / ZN);
+
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// Build the ACeP 6-color palette with pre-computed CIELAB values.
+///
+/// Hardware indices match the panel controller specification (Issue #263).
+/// For improved accuracy, calibrate RGB values against your specific panel.
+fn acep6_palette(lut: &[f32; 256]) -> [AcepColor; 6] {
+    // (hardware_index, R, G, B)
+    let entries: [(u8, u8, u8, u8); 6] = [
+        (0, 0, 0, 0),       // Black
+        (1, 255, 255, 255), // White
+        (2, 255, 255, 0),   // Yellow
+        (3, 255, 0, 0),     // Red
+        (5, 0, 0, 255),     // Blue  (index 4 unused by panel)
+        (6, 0, 255, 0),     // Green
+    ];
+
+    entries.map(|(idx, r, g, b)| AcepColor {
+        hw_index: idx,
+        lab: rgb_to_lab(r, g, b, lut),
+    })
+}
+
+/// Find nearest palette color by CIELAB Euclidean distance.
+/// Returns (hardware_index, palette_lab).
+fn nearest_acep_color(lab: &[f32; 3], palette: &[AcepColor; 6]) -> (u8, [f32; 3]) {
+    let mut best = 0;
+    let mut best_dist = f32::MAX;
+
+    for (i, c) in palette.iter().enumerate() {
+        let dl = lab[0] - c.lab[0];
+        let da = lab[1] - c.lab[1];
+        let db = lab[2] - c.lab[2];
+        let dist = dl * dl + da * da + db * db;
+        if dist < best_dist {
+            best_dist = dist;
+            best = i;
+        }
+    }
+
+    (palette[best].hw_index, palette[best].lab)
+}
+
+/// Stucki error-diffusion kernel: (dx, row_offset, weight)
+///
+/// ```text
+///             *   8   4
+///     2   4   8   4   2
+///     1   2   4   2   1
+/// ```
+/// Divisor: 42
+const STUCKI_KERNEL: [(i32, usize, i32); 12] = [
+    // Current row (ahead of pixel)
+    (1, 0, 8),
+    (2, 0, 4),
+    // Next row
+    (-2, 1, 2),
+    (-1, 1, 4),
+    (0, 1, 8),
+    (1, 1, 4),
+    (2, 1, 2),
+    // Row after next
+    (-2, 2, 1),
+    (-1, 2, 2),
+    (0, 2, 4),
+    (1, 2, 2),
+    (2, 2, 1),
+];
+const STUCKI_DIVISOR: f32 = 42.0;
+
+/// Dither a decoded image to ACeP 6-color e-ink format.
+///
+/// Uses Stucki error-diffusion with serpentine scanning and CIELAB color matching
+/// for best visual quality on limited-palette e-ink panels.
+///
+/// Returns 4-bit packed data (2 pixels per byte, high nibble first).
+pub fn image_to_eink_acep6(img: &DynamicImage, target_width: u32, target_height: u32) -> EinkImage {
+    let resized;
+    let img_ref = if img.width() != target_width || img.height() != target_height {
+        resized = img.resize_to_fill(target_width, target_height, FilterType::Triangle);
+        &resized
+    } else {
+        img
+    };
+
+    let rgb = img_ref.to_rgb8();
+    let width = target_width as usize;
+    let height = target_height as usize;
+
+    let lut = srgb_lut();
+    let palette = acep6_palette(&lut);
+
+    // Error accumulation buffers: 3 rows in CIELAB space
+    let mut err: [Vec<[f32; 3]>; 3] = [
+        vec![[0.0; 3]; width],
+        vec![[0.0; 3]; width],
+        vec![[0.0; 3]; width],
+    ];
+
+    // Output: one palette index per pixel
+    let mut indices = vec![0u8; width * height];
+
+    for y in 0..height {
+        let serpentine = y % 2 == 1;
+
+        let x_range: Box<dyn Iterator<Item = usize>> = if serpentine {
+            Box::new((0..width).rev())
+        } else {
+            Box::new(0..width)
+        };
+
+        for x in x_range {
+            let pixel = rgb.get_pixel(x as u32, y as u32);
+            let mut lab = rgb_to_lab(pixel[0], pixel[1], pixel[2], &lut);
+
+            // Add accumulated diffusion error
+            lab[0] += err[0][x][0];
+            lab[1] += err[0][x][1];
+            lab[2] += err[0][x][2];
+
+            // Find nearest palette color in CIELAB space
+            let (hw_index, chosen_lab) = nearest_acep_color(&lab, &palette);
+            indices[y * width + x] = hw_index;
+
+            // Quantization error in CIELAB
+            let qerr = [
+                lab[0] - chosen_lab[0],
+                lab[1] - chosen_lab[1],
+                lab[2] - chosen_lab[2],
+            ];
+
+            // Distribute error via Stucki kernel (mirror dx for serpentine)
+            for &(dx, dy, weight) in &STUCKI_KERNEL {
+                let nx = if serpentine {
+                    x as i32 - dx
+                } else {
+                    x as i32 + dx
+                };
+
+                if nx >= 0 && (nx as usize) < width && y + dy < height {
+                    let nx = nx as usize;
+                    let w = weight as f32 / STUCKI_DIVISOR;
+                    err[dy][nx][0] += qerr[0] * w;
+                    err[dy][nx][1] += qerr[1] * w;
+                    err[dy][nx][2] += qerr[2] * w;
+                }
+            }
+        }
+
+        // Shift error buffers: recycle current row for row+2
+        let mut recycled = std::mem::take(&mut err[0]);
+        err[0] = std::mem::take(&mut err[1]);
+        err[1] = std::mem::take(&mut err[2]);
+        for v in recycled.iter_mut() {
+            *v = [0.0; 3];
+        }
+        err[2] = recycled;
+    }
+
+    // Pack into 4-bit (2 pixels per byte, high nibble = first pixel)
+    let bytes_per_row = width.div_ceil(2);
+    let mut packed = vec![0u8; bytes_per_row * height];
+
+    for y in 0..height {
+        for x in (0..width).step_by(2) {
+            let high = indices[y * width + x];
+            let low = if x + 1 < width {
+                indices[y * width + x + 1]
+            } else {
+                0
+            };
+            packed[y * bytes_per_row + x / 2] = (high << 4) | low;
+        }
+    }
+
+    EinkImage {
+        data: packed,
+        width: target_width,
+        height: target_height,
+    }
+}
+
+/// Decode any image and dither to ACeP 6-color e-ink format.
+///
+/// Accepts JPEG, PNG, GIF, BMP, WebP. SVG placeholders are handled
+/// separately in the route layer.
+pub fn dither_to_eink_acep6(
+    image_data: &[u8],
+    target_width: u32,
+    target_height: u32,
+) -> Result<EinkImage, image::ImageError> {
+    let img = image::load_from_memory(image_data)?;
+    Ok(image_to_eink_acep6(&img, target_width, target_height))
+}
+
+/// Generate a placeholder e-ink image (solid black).
+pub fn placeholder_eink(width: u32, height: u32) -> EinkImage {
+    let bytes_per_row = (width as usize).div_ceil(2);
+    EinkImage {
+        data: vec![0u8; bytes_per_row * height as usize],
+        width,
+        height,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +620,167 @@ mod tests {
         for i in 0..4 {
             assert_eq!(rgb565.data[i * 2], 0x00, "Red low byte at pixel {}", i);
             assert_eq!(rgb565.data[i * 2 + 1], 0xF8, "Red high byte at pixel {}", i);
+        }
+    }
+
+    // ========== E-ink dithering tests ==========
+
+    #[test]
+    fn test_rgb_to_lab_black() {
+        let lut = srgb_lut();
+        let lab = rgb_to_lab(0, 0, 0, &lut);
+        assert!(
+            (lab[0]).abs() < 0.01,
+            "Black L* should be ~0, got {}",
+            lab[0]
+        );
+        assert!(
+            (lab[1]).abs() < 0.5,
+            "Black a* should be ~0, got {}",
+            lab[1]
+        );
+        assert!(
+            (lab[2]).abs() < 0.5,
+            "Black b* should be ~0, got {}",
+            lab[2]
+        );
+    }
+
+    #[test]
+    fn test_rgb_to_lab_white() {
+        let lut = srgb_lut();
+        let lab = rgb_to_lab(255, 255, 255, &lut);
+        assert!(
+            (lab[0] - 100.0).abs() < 0.1,
+            "White L* should be ~100, got {}",
+            lab[0]
+        );
+        assert!(
+            (lab[1]).abs() < 0.5,
+            "White a* should be ~0, got {}",
+            lab[1]
+        );
+        assert!(
+            (lab[2]).abs() < 0.5,
+            "White b* should be ~0, got {}",
+            lab[2]
+        );
+    }
+
+    #[test]
+    fn test_nearest_acep_color_exact_match() {
+        let lut = srgb_lut();
+        let palette = acep6_palette(&lut);
+
+        // Each palette color should map to itself
+        let test_cases: [(u8, u8, u8, u8); 6] = [
+            (0, 0, 0, 0),       // Black → index 0
+            (255, 255, 255, 1), // White → index 1
+            (255, 255, 0, 2),   // Yellow → index 2
+            (255, 0, 0, 3),     // Red → index 3
+            (0, 0, 255, 5),     // Blue → index 5
+            (0, 255, 0, 6),     // Green → index 6
+        ];
+
+        for (r, g, b, expected_idx) in test_cases {
+            let lab = rgb_to_lab(r, g, b, &lut);
+            let (idx, _) = nearest_acep_color(&lab, &palette);
+            assert_eq!(
+                idx, expected_idx,
+                "({},{},{}) should map to index {}",
+                r, g, b, expected_idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_dither_solid_black() {
+        let mut img = image::RgbaImage::new(4, 4);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgba([0, 0, 0, 255]);
+        }
+        let dynamic = DynamicImage::ImageRgba8(img);
+        let result = image_to_eink_acep6(&dynamic, 4, 4);
+
+        assert_eq!(result.width, 4);
+        assert_eq!(result.height, 4);
+        // 4 pixels wide → 2 bytes per row, 4 rows → 8 bytes
+        assert_eq!(result.data.len(), 8);
+        for byte in &result.data {
+            assert_eq!(*byte, 0x00, "Black image should be all index 0");
+        }
+    }
+
+    #[test]
+    fn test_dither_solid_white() {
+        let mut img = image::RgbaImage::new(4, 4);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgba([255, 255, 255, 255]);
+        }
+        let dynamic = DynamicImage::ImageRgba8(img);
+        let result = image_to_eink_acep6(&dynamic, 4, 4);
+
+        // All should be index 1: high nibble = 1, low nibble = 1 → 0x11
+        for byte in &result.data {
+            assert_eq!(*byte, 0x11, "White image should be all index 1");
+        }
+    }
+
+    #[test]
+    fn test_eink_output_size() {
+        // Verify 4-bit packing with odd width
+        let mut img = image::RgbaImage::new(5, 3);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgba([128, 128, 128, 255]);
+        }
+        let dynamic = DynamicImage::ImageRgba8(img);
+        let result = image_to_eink_acep6(&dynamic, 5, 3);
+
+        assert_eq!(result.width, 5);
+        assert_eq!(result.height, 3);
+        // ceil(5/2) = 3 bytes per row, 3 rows → 9 bytes
+        assert_eq!(result.data.len(), 9);
+    }
+
+    #[test]
+    fn test_placeholder_eink() {
+        let result = placeholder_eink(800, 480);
+        assert_eq!(result.width, 800);
+        assert_eq!(result.height, 480);
+        assert_eq!(result.data.len(), 400 * 480);
+        assert!(result.data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_dither_from_png() {
+        // End-to-end: create red PNG, dither it
+        let mut img = image::RgbaImage::new(10, 10);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgba([255, 0, 0, 255]);
+        }
+
+        let mut png_data = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+        encoder
+            .write_image(&img, 10, 10, image::ExtendedColorType::Rgba8)
+            .expect("PNG encoding should work");
+
+        let result = dither_to_eink_acep6(&png_data, 10, 10);
+        assert!(result.is_ok(), "Should dither PNG: {:?}", result.err());
+
+        let eink = result.unwrap();
+        assert_eq!(eink.width, 10);
+        assert_eq!(eink.height, 10);
+        // 10/2 = 5 bytes per row, 10 rows = 50 bytes
+        assert_eq!(eink.data.len(), 50);
+
+        // Solid red → all index 3 (no error to diffuse)
+        for byte in &eink.data {
+            assert_eq!(
+                *byte, 0x33,
+                "Solid red should be index 3: got 0x{:02x}",
+                byte
+            );
         }
     }
 }
