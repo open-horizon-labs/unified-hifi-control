@@ -4583,6 +4583,7 @@ dependencies = [
  "mdns-sd",
  "mime_guess",
  "muse-events",
+ "once_cell",
  "quick-xml",
  "rand 0.8.5",
  "regex",
