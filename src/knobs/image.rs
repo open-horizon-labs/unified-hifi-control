@@ -9,6 +9,7 @@
 
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, ImageFormat};
 use std::io::Cursor;
+use std::sync::LazyLock;
 
 /// RGB565 image data for LCD display
 pub struct Rgb565Image {
@@ -256,8 +257,8 @@ struct AcepColor {
     lab: [f32; 3],
 }
 
-/// Build sRGB-to-linear lookup table (avoids pow() per pixel)
-fn srgb_lut() -> [f32; 256] {
+/// sRGB-to-linear lookup table, computed once (avoids pow() per pixel)
+static SRGB_LUT: LazyLock<[f32; 256]> = LazyLock::new(|| {
     let mut lut = [0.0f32; 256];
     for (i, entry) in lut.iter_mut().enumerate() {
         let c = i as f32 / 255.0;
@@ -268,7 +269,7 @@ fn srgb_lut() -> [f32; 256] {
         };
     }
     lut
-}
+});
 
 /// Convert sRGB to CIELAB (D65 illuminant)
 fn rgb_to_lab(r: u8, g: u8, b: u8, lut: &[f32; 256]) -> [f32; 3] {
@@ -304,16 +305,22 @@ fn rgb_to_lab(r: u8, g: u8, b: u8, lut: &[f32; 256]) -> [f32; 3] {
 /// Build the ACeP 6-color palette with pre-computed CIELAB values.
 ///
 /// Hardware indices match the panel controller specification (Issue #263).
-/// For improved accuracy, calibrate RGB values against your specific panel.
+/// Display RGB values are calibrated to approximate actual e-ink panel output
+/// rather than ideal sRGB primaries. Sources:
+/// - PhotoPainter Spectra 6 converter (red, blue calibration)
+/// - Common e-ink colorimetry measurements (yellow, green)
+///
+/// Tune these values per-panel for optimal results.
 fn acep6_palette(lut: &[f32; 256]) -> [AcepColor; 6] {
-    // (hardware_index, R, G, B)
+    // (hardware_index, display_R, display_G, display_B)
+    // These are calibrated to what the panel actually renders, not ideal sRGB.
     let entries: [(u8, u8, u8, u8); 6] = [
-        (0, 0, 0, 0),       // Black
-        (1, 255, 255, 255), // White
-        (2, 255, 255, 0),   // Yellow
-        (3, 255, 0, 0),     // Red
-        (5, 0, 0, 255),     // Blue  (index 4 unused by panel)
-        (6, 0, 255, 0),     // Green
+        (0, 0, 0, 0),       // Black — e-ink black is near-perfect
+        (1, 255, 255, 255), // White — e-ink white is close to paper-white
+        (2, 236, 213, 44),  // Yellow — warm, less saturated than sRGB yellow
+        (3, 160, 32, 32),   // Red — calibrated from PhotoPainter (#a02020)
+        (5, 80, 128, 184),  // Blue — calibrated from PhotoPainter (#5080b8)
+        (6, 60, 160, 60),   // Green — muted compared to sRGB green
     ];
 
     entries.map(|(idx, r, g, b)| AcepColor {
@@ -388,8 +395,8 @@ pub fn image_to_eink_acep6(img: &DynamicImage, target_width: u32, target_height:
     let width = target_width as usize;
     let height = target_height as usize;
 
-    let lut = srgb_lut();
-    let palette = acep6_palette(&lut);
+    let lut = &*SRGB_LUT;
+    let palette = acep6_palette(lut);
 
     // Error accumulation buffers: 3 rows in CIELAB space
     let mut err: [Vec<[f32; 3]>; 3] = [
@@ -404,15 +411,10 @@ pub fn image_to_eink_acep6(img: &DynamicImage, target_width: u32, target_height:
     for y in 0..height {
         let serpentine = y % 2 == 1;
 
-        let x_range: Box<dyn Iterator<Item = usize>> = if serpentine {
-            Box::new((0..width).rev())
-        } else {
-            Box::new(0..width)
-        };
-
-        for x in x_range {
+        for xi in 0..width {
+            let x = if serpentine { width - 1 - xi } else { xi };
             let pixel = rgb.get_pixel(x as u32, y as u32);
-            let mut lab = rgb_to_lab(pixel[0], pixel[1], pixel[2], &lut);
+            let mut lab = rgb_to_lab(pixel[0], pixel[1], pixel[2], lut);
 
             // Add accumulated diffusion error
             lab[0] += err[0][x][0];
@@ -627,8 +629,8 @@ mod tests {
 
     #[test]
     fn test_rgb_to_lab_black() {
-        let lut = srgb_lut();
-        let lab = rgb_to_lab(0, 0, 0, &lut);
+        let lut = &*SRGB_LUT;
+        let lab = rgb_to_lab(0, 0, 0, lut);
         assert!(
             (lab[0]).abs() < 0.01,
             "Black L* should be ~0, got {}",
@@ -648,8 +650,8 @@ mod tests {
 
     #[test]
     fn test_rgb_to_lab_white() {
-        let lut = srgb_lut();
-        let lab = rgb_to_lab(255, 255, 255, &lut);
+        let lut = &*SRGB_LUT;
+        let lab = rgb_to_lab(255, 255, 255, lut);
         assert!(
             (lab[0] - 100.0).abs() < 0.1,
             "White L* should be ~100, got {}",
@@ -669,25 +671,49 @@ mod tests {
 
     #[test]
     fn test_nearest_acep_color_exact_match() {
-        let lut = srgb_lut();
-        let palette = acep6_palette(&lut);
+        let lut = &*SRGB_LUT;
+        let palette = acep6_palette(lut);
 
-        // Each palette color should map to itself
+        // Calibrated palette RGB values should map to their own indices
         let test_cases: [(u8, u8, u8, u8); 6] = [
             (0, 0, 0, 0),       // Black → index 0
             (255, 255, 255, 1), // White → index 1
-            (255, 255, 0, 2),   // Yellow → index 2
-            (255, 0, 0, 3),     // Red → index 3
-            (0, 0, 255, 5),     // Blue → index 5
-            (0, 255, 0, 6),     // Green → index 6
+            (236, 213, 44, 2),  // Calibrated yellow → index 2
+            (160, 32, 32, 3),   // Calibrated red → index 3
+            (80, 128, 184, 5),  // Calibrated blue → index 5
+            (60, 160, 60, 6),   // Calibrated green → index 6
         ];
 
         for (r, g, b, expected_idx) in test_cases {
-            let lab = rgb_to_lab(r, g, b, &lut);
+            let lab = rgb_to_lab(r, g, b, lut);
             let (idx, _) = nearest_acep_color(&lab, &palette);
             assert_eq!(
                 idx, expected_idx,
                 "({},{},{}) should map to index {}",
+                r, g, b, expected_idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_nearest_acep_color_ideal_primaries() {
+        let lut = &*SRGB_LUT;
+        let palette = acep6_palette(lut);
+
+        // Ideal sRGB primaries should still map to the correct palette entries
+        let test_cases: [(u8, u8, u8, u8); 4] = [
+            (255, 255, 0, 2), // sRGB yellow → calibrated yellow
+            (255, 0, 0, 3),   // sRGB red → calibrated red
+            (0, 0, 255, 5),   // sRGB blue → calibrated blue
+            (0, 255, 0, 6),   // sRGB green → calibrated green
+        ];
+
+        for (r, g, b, expected_idx) in test_cases {
+            let lab = rgb_to_lab(r, g, b, lut);
+            let (idx, _) = nearest_acep_color(&lab, &palette);
+            assert_eq!(
+                idx, expected_idx,
+                "ideal ({},{},{}) should map to index {}",
                 r, g, b, expected_idx
             );
         }
@@ -774,13 +800,57 @@ mod tests {
         // 10/2 = 5 bytes per row, 10 rows = 50 bytes
         assert_eq!(eink.data.len(), 50);
 
-        // Solid red → all index 3 (no error to diffuse)
+        // Solid sRGB red dithered with calibrated palette — overwhelmingly index 3,
+        // but error diffusion may produce a few non-red pixels at edges.
+        let mut counts = [0usize; 8];
         for byte in &eink.data {
-            assert_eq!(
-                *byte, 0x33,
-                "Solid red should be index 3: got 0x{:02x}",
-                byte
-            );
+            counts[(byte >> 4) as usize] += 1;
+            counts[(byte & 0x0F) as usize] += 1;
         }
+        let total = (10 * 10) as usize;
+        let red_count = counts[3];
+        assert!(
+            red_count > total * 90 / 100,
+            "Solid red should be >90% index 3, got {}/{} ({:.0}%)",
+            red_count,
+            total,
+            red_count as f64 / total as f64 * 100.0
+        );
+    }
+
+    #[test]
+    fn test_dither_gradient_exercises_diffusion() {
+        // A gradient image forces error diffusion across many colors.
+        // Verify output is well-formed and uses multiple palette indices.
+        let width = 64u32;
+        let height = 32u32;
+        let mut img = image::RgbImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let r = ((x as f32 / width as f32) * 255.0) as u8;
+                let g = ((y as f32 / height as f32) * 255.0) as u8;
+                let b = 128u8;
+                img.put_pixel(x, y, image::Rgb([r, g, b]));
+            }
+        }
+
+        let dynamic = DynamicImage::ImageRgb8(img);
+        let result = image_to_eink_acep6(&dynamic, width, height);
+
+        let bytes_per_row = (width as usize).div_ceil(2);
+        assert_eq!(result.data.len(), bytes_per_row * height as usize);
+
+        // Collect unique palette indices used
+        let mut seen = std::collections::HashSet::new();
+        for byte in &result.data {
+            seen.insert(byte >> 4);
+            seen.insert(byte & 0x0F);
+        }
+        // A gradient should produce at least 3 distinct palette colors
+        assert!(
+            seen.len() >= 3,
+            "Gradient should use ≥3 palette colors, got {:?}",
+            seen
+        );
     }
 }
