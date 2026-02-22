@@ -66,65 +66,28 @@ pub struct HifiControlTool {
     pub value: Option<f64>,
 }
 
-/// Search for music
+/// Search for music across library and streaming services.
 #[mcp_tool(
     name = "hifi_search",
-    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins (zone_id recommended as different players may have different sources configured).",
+    description = "Search for music across library and streaming services. Returns items with rich metadata (title, artist, album, year, genre, duration, image_url, source) and a _play token for playback via hifi_play_item. Library results include local files with full metadata. Streaming results include TIDAL/Qobuz items. Results are ready to evaluate and play.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiSearchTool {
     /// Search query (e.g., "Hotel California", "Eagles", "jazz piano")
     pub query: String,
-    /// Zone ID for context-aware results. Recommended for LMS (different players may have different sources).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub zone_id: Option<String>,
-    /// Where to search: "library" (default), "tidal", or "qobuz". Roon only; LMS searches all providers.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-}
-
-/// Search and play music in one command
-#[mcp_tool(
-    name = "hifi_play",
-    description = "Search and play music. Searches and plays, queues, or starts radio from the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; LMS searches all providers."
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiPlayTool {
-    /// What to play (e.g., "early Michael Jackson", "Dark Side of the Moon")
-    pub query: String,
-    /// Zone ID to play on (get from hifi_zones)
-    pub zone_id: String,
-    /// Where to search: "library" (default), "tidal", or "qobuz". Roon only; LMS searches all providers.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// What to do: "play" (default), "queue", or "radio". radio is Roon-only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-}
-
-/// Search and return raw adapter results for LLM interpretation.
-#[mcp_tool(
-    name = "hifi_search_raw",
-    description = "Search for music and return raw unprocessed results. Returns adapter-native data including all keys needed to play a specific result via hifi_play_item. For Roon: returns browse items with item_key, hint, session_key. For LMS: returns results with id, item_id, url, result_type. The LLM interprets the results and picks what to play.",
-    read_only_hint = true
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiSearchRawTool {
-    /// Search query
-    pub query: String,
-    /// Zone ID (determines which adapter to search)
+    /// Zone ID (determines which adapter to search). Required.
     pub zone_id: String,
     /// Search source: "library" (default), "tidal", "qobuz". Roon only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
 
-/// Play a specific item by passing back keys from hifi_search_raw results.
+/// Play a specific item by passing back keys from hifi_search results.
 /// The caller (LLM) decides what to play; the bridge just executes.
 #[mcp_tool(
     name = "hifi_play_item",
-    description = "Play a specific item using keys from a prior hifi_search_raw call. Pass the raw JSON fields back as-is. For Roon: session_key + item_key. For LMS: item_id, url, or id + result_type. The bridge routes to the correct adapter based on zone_id prefix."
+    description = "Play a specific item using keys from a prior hifi_search call. Pass the _play token from search results as the item parameter — do not modify it. The bridge routes to the correct adapter based on zone_id prefix."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiPlayItemTool {
@@ -197,8 +160,6 @@ tool_box!(
         HifiNowPlayingTool,
         HifiControlTool,
         HifiSearchTool,
-        HifiPlayTool,
-        HifiSearchRawTool,
         HifiPlayItemTool,
         HifiStatusTool,
         HifiHqplayerStatusTool,
@@ -233,11 +194,6 @@ struct McpNowPlaying {
     is_muted: Option<bool>,
 }
 
-#[derive(Debug, Serialize)]
-struct McpSearchResult {
-    title: String,
-    subtitle: Option<String>,
-}
 
 #[derive(Debug, Serialize)]
 struct McpHqpStatus {
@@ -456,114 +412,6 @@ impl ServerHandler for HifiMcpHandler {
             }
 
             HifiTools::HifiSearchTool(args) => {
-                // Route: explicit lms: prefix → LMS, else try Roon, fall back to LMS if Roon browse unavailable
-                let use_lms = args.zone_id.as_ref().is_some_and(|z| z.starts_with("lms:"))
-                    || !self.state.roon.is_browse_connected().await;
-
-                if use_lms {
-                    // LMS search: return raw globalsearch JSON for LLM interpretation.
-                    // The LLM handles field variations, category names, and metadata
-                    // across providers (library, TIDAL, Qobuz) better than hand-parsing.
-                    match self
-                        .state
-                        .lms
-                        .search_raw(&args.query, args.zone_id.as_deref())
-                        .await
-                    {
-                        Ok(raw) => Ok(Self::json_result(&raw)),
-                        Err(e) => Self::error_result(format!("Search error: {}", e)),
-                    }
-                } else {
-                    // Roon search
-                    use crate::adapters::roon::SearchSource;
-                    let source = match args.source.as_deref() {
-                        Some("tidal") => SearchSource::Tidal,
-                        Some("qobuz") => SearchSource::Qobuz,
-                        _ => SearchSource::Library,
-                    };
-                    let zone_id = args.zone_id.as_deref();
-                    match self
-                        .state
-                        .roon
-                        .search(&args.query, zone_id, Some(10), source)
-                        .await
-                    {
-                        Ok((_session_key, results)) => {
-                            let mcp_results: Vec<McpSearchResult> = results
-                                .into_iter()
-                                .map(|item| McpSearchResult {
-                                    title: item.title,
-                                    subtitle: item.subtitle,
-                                })
-                                .collect();
-                            Ok(Self::json_result(&mcp_results))
-                        }
-                        Err(e) => Self::error_result(format!("Search error: {}", e)),
-                    }
-                }
-            }
-
-            HifiTools::HifiPlayTool(args) => {
-                // Route: explicit lms: prefix → LMS, else try Roon, fall back to LMS if Roon browse unavailable
-                let use_lms = args.zone_id.starts_with("lms:")
-                    || !self.state.roon.is_browse_connected().await;
-
-                if use_lms {
-                    use crate::adapters::lms::LmsPlayAction;
-                    if args.action.as_deref() == Some("radio") {
-                        return Self::error_result(
-                            "Radio mode not supported for LMS. Use 'play' or 'queue'.".into(),
-                        );
-                    }
-
-                    // If zone_id doesn't have lms: prefix (fallback case), pick any LMS player
-                    let zone_id = if args.zone_id.starts_with("lms:") {
-                        args.zone_id.clone()
-                    } else {
-                        let players = self.state.lms.get_cached_players().await;
-                        match players.first() {
-                            Some(p) => format!("lms:{}", p.playerid),
-                            None => {
-                                return Self::error_result(
-                                    "No playback adapters available (Roon browse not connected, no LMS players)".into(),
-                                );
-                            }
-                        }
-                    };
-
-                    let action = LmsPlayAction::parse(args.action.as_deref());
-
-                    match self
-                        .state
-                        .lms
-                        .search_and_play(&args.query, &zone_id, action)
-                        .await
-                    {
-                        Ok(message) => Ok(Self::text_result(message)),
-                        Err(e) => Self::error_result(format!("Play error: {}", e)),
-                    }
-                } else {
-                    // Roon play
-                    use crate::adapters::roon::{PlayAction, SearchSource};
-                    let source = match args.source.as_deref() {
-                        Some("tidal") => SearchSource::Tidal,
-                        Some("qobuz") => SearchSource::Qobuz,
-                        _ => SearchSource::Library,
-                    };
-                    let action = PlayAction::parse(args.action.as_deref().unwrap_or("play"));
-                    match self
-                        .state
-                        .roon
-                        .search_and_play(&args.query, &args.zone_id, source, action)
-                        .await
-                    {
-                        Ok(message) => Ok(Self::text_result(message)),
-                        Err(e) => Self::error_result(format!("Play error: {}", e)),
-                    }
-                }
-            }
-
-            HifiTools::HifiSearchRawTool(args) => {
                 let use_lms = args.zone_id.starts_with("lms:")
                     || !self.state.roon.is_browse_connected().await;
 
@@ -571,7 +419,7 @@ impl ServerHandler for HifiMcpHandler {
                     match self
                         .state
                         .lms
-                        .search(&args.query, Some(&args.zone_id), Some(20))
+                        .search_unified(&args.query, Some(&args.zone_id), Some(20))
                         .await
                     {
                         Ok(items) => {
@@ -587,10 +435,14 @@ impl ServerHandler for HifiMcpHandler {
                                     });
                                     serde_json::json!({
                                         "title": item.title,
-                                        "subtitle": item.artist,
-                                        "category": item.result_type.to_string(),
-                                        "source": if item.item_id.is_some() { "streaming" } else { "library" },
+                                        "artist": item.artist,
                                         "album": item.album,
+                                        "category": item.result_type.to_string(),
+                                        "year": item.year,
+                                        "genre": item.genre,
+                                        "duration": item.duration,
+                                        "image_url": item.image_url,
+                                        "source": if item.item_id.is_some() { "streaming" } else { "library" },
                                         "_play": play,
                                     })
                                 })
@@ -977,10 +829,10 @@ pub fn create_mcp_extension(state: AppState) -> axum::Extension<McpExtState> {
         instructions: Some(
             "Unified Hi-Fi Control MCP Server - Control Your Music System\n\n\
             Use hifi_zones to list available zones, hifi_now_playing to see what's playing, \
-            hifi_control for playback control, hifi_search to find music, and hifi_play to play it.\n\n\
-            Note: hifi_search and hifi_play currently work with Roon and LMS zones only. \
+            hifi_control for playback control, hifi_search to find music, and hifi_play_item to play it.\n\n\
+            Note: hifi_search and hifi_play_item currently work with Roon and LMS zones only. \
             Transport controls (play/pause/next/volume) work with all zones (Roon, LMS, OpenHome, UPnP).\n\n\
-            To build a playlist: call hifi_play multiple times with action='queue'. The first track \
+            To build a playlist: call hifi_search to find tracks, then hifi_play_item for each. The first track \
             can use action='play' to start playback, then subsequent tracks use action='queue' to add to the queue."
                 .into(),
         ),

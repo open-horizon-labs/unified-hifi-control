@@ -569,6 +569,16 @@ pub struct LmsSearchResult {
     pub url: Option<String>,
     /// String-based item_id for globalsearch results (used with globalsearch playlist)
     pub item_id: Option<String>,
+    /// Release year
+    pub year: Option<u32>,
+    /// Genre
+    pub genre: Option<String>,
+    /// Duration in seconds
+    pub duration: Option<f64>,
+    /// Full image URL (for streaming items or resolved library cover art)
+    pub image_url: Option<String>,
+    /// Cover ID for library items (used to build cover art URL)
+    pub coverid: Option<String>,
 }
 
 /// Action to take when playing search results
@@ -1033,21 +1043,30 @@ impl LmsAdapter {
             .await
     }
 
-    /// Search using LMS globalsearch which includes all providers (library, TIDAL, Qobuz, etc.)
+    /// Build a cover art URL for a library item from its cover ID.
+    async fn library_cover_url(&self, coverid: &str) -> Option<String> {
+        let state = self.state.read().await;
+        let host = state.host.as_ref()?;
+        Some(format!("http://{}:{}/music/{}/cover.jpg", host, state.port, coverid))
+    }
+
+    /// Resolve an image URL: absolute URLs pass through, relative paths get the LMS base prepended.
+    async fn resolve_image_url(&self, url: &str) -> Option<String> {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return Some(url.to_string());
+        }
+        let state = self.state.read().await;
+        let host = state.host.as_ref()?;
+        Some(format!("http://{}:{}{}", host, state.port, url))
+    }
+
+    /// Unified search across library and streaming services.
     ///
-    /// Uses the LMS JSON-RPC `globalsearch items` command which searches across all
-    /// registered search providers including streaming service plugins.
-    ///
-    /// Globalsearch returns a hierarchy:
-    /// 1. Providers (My Music, TIDAL, Qobuz)
-    /// 2. Categories (Everything, Playlists, Artists, Albums, Songs)
-    /// 3. Actual playable items
-    ///
-    /// This method drills into streaming providers to find playable tracks.
-    ///
-    /// NOTE: globalsearch requires a player_id to determine which apps/providers are available.
-    /// Fallback chain: passed player_id -> any connected player -> library-only search.
-    pub async fn search(
+    /// Returns rich metadata for all results: artist, album, year, genre, duration, image_url.
+    /// Library results come from dedicated `albums`, `tracks`, `artists` endpoints with tags.
+    /// Streaming results come from globalsearch with drill-down into Albums and Songs.
+    /// Results are deduplicated: if a library and streaming result share title+artist, library wins.
+    pub async fn search_unified(
         &self,
         query: &str,
         player_id: Option<&str>,
@@ -1055,66 +1074,226 @@ impl LmsAdapter {
     ) -> Result<Vec<LmsSearchResult>> {
         let limit = limit.unwrap_or(20);
 
-        // globalsearch requires a player_id to work - without it, LMS returns empty response
-        // Fallback chain: passed player_id -> any connected player -> library-only
-        let player_id = match player_id.map(strip_lms_prefix) {
-            Some(id) => id.to_string(),
+        // --- Library search with rich tags ---
+        let mut library_results = Vec::new();
+
+        // Albums: tags a=artist, l=album, y=year, j=artwork_track_id
+        let albums_result = self
+            .rpc
+            .execute(
+                None,
+                vec![
+                    json!("albums"),
+                    json!(0),
+                    json!(10),
+                    json!(format!("search:{}", query)),
+                    json!("tags:alyj"),
+                ],
+            )
+            .await;
+
+        if let Ok(result) = albums_result {
+            if let Some(albums) = result.get("albums_loop").and_then(|v| v.as_array()) {
+                for album in albums.iter().take(10) {
+                    let id = album.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let title = album.get("album").and_then(|v| v.as_str()).unwrap_or_default();
+                    let artist = album.get("artist").and_then(|v| v.as_str()).map(String::from);
+                    let year = album.get("year").and_then(|v| v.as_u64()).map(|y| y as u32);
+                    let artwork_track_id = album.get("artwork_track_id")
+                        .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string())));
+                    let image_url = if let Some(ref cid) = artwork_track_id {
+                        self.library_cover_url(cid).await
+                    } else {
+                        None
+                    };
+                    library_results.push(LmsSearchResult {
+                        result_type: LmsSearchResultType::Album,
+                        id,
+                        title: title.to_string(),
+                        artist,
+                        album: None,
+                        url: None,
+                        item_id: None,
+                        year,
+                        genre: None,
+                        duration: None,
+                        image_url,
+                        coverid: artwork_track_id,
+                    });
+                }
+            }
+        }
+
+        // Tracks: tags a=artist, A=albumartist, l=album, s=duration, e=album_id,
+        //         d=duration, t=tracknum, y=year, g=genre, i=disc, j=artwork_track_id, o=type
+        let tracks_result = self
+            .rpc
+            .execute(
+                None,
+                vec![
+                    json!("tracks"),
+                    json!(0),
+                    json!(10),
+                    json!(format!("search:{}", query)),
+                    json!("tags:aAlsedtygijo"),
+                ],
+            )
+            .await;
+
+        if let Ok(result) = tracks_result {
+            if let Some(tracks) = result.get("titles_loop").and_then(|v| v.as_array()) {
+                for track in tracks.iter().take(10) {
+                    let id = track.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let title = track.get("title").and_then(|v| v.as_str()).unwrap_or_default();
+                    let artist = track.get("artist").and_then(|v| v.as_str()).map(String::from);
+                    let album = track.get("album").and_then(|v| v.as_str()).map(String::from);
+                    let year = track.get("year").and_then(|v| v.as_u64()).map(|y| y as u32);
+                    let genre = track.get("genre").and_then(|v| v.as_str()).map(String::from);
+                    let duration = track.get("duration").and_then(|v| v.as_f64());
+                    let coverid = track.get("coverid")
+                        .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string())))
+                        .or_else(|| track.get("artwork_track_id")
+                            .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string()))));
+                    let image_url = if let Some(ref cid) = coverid {
+                        self.library_cover_url(cid).await
+                    } else {
+                        None
+                    };
+                    library_results.push(LmsSearchResult {
+                        result_type: LmsSearchResultType::Track,
+                        id,
+                        title: title.to_string(),
+                        artist,
+                        album,
+                        url: None,
+                        item_id: None,
+                        year,
+                        genre,
+                        duration,
+                        image_url,
+                        coverid,
+                    });
+                }
+            }
+        }
+
+        // Artists
+        let artists_result = self
+            .rpc
+            .execute(
+                None,
+                vec![
+                    json!("artists"),
+                    json!(0),
+                    json!(5),
+                    json!(format!("search:{}", query)),
+                ],
+            )
+            .await;
+
+        if let Ok(result) = artists_result {
+            if let Some(artists) = result.get("contributors_loop").and_then(|v| v.as_array()) {
+                for artist in artists.iter().take(5) {
+                    let id = artist.get("contributor_id")
+                        .or_else(|| artist.get("id"))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let name = artist.get("contributor")
+                        .or_else(|| artist.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    library_results.push(LmsSearchResult {
+                        result_type: LmsSearchResultType::Artist,
+                        id,
+                        title: name.to_string(),
+                        artist: None,
+                        album: None,
+                        url: None,
+                        item_id: None,
+                        year: None,
+                        genre: None,
+                        duration: None,
+                        image_url: None,
+                        coverid: None,
+                    });
+                }
+            }
+        }
+
+        // --- Streaming search via globalsearch ---
+        let mut streaming_results = Vec::new();
+
+        // Resolve player_id for globalsearch (requires one)
+        let player_id_resolved = match player_id.map(strip_lms_prefix) {
+            Some(id) => Some(id.to_string()),
             None => {
-                // Try to get any connected player (drop lock before any await)
-                let any_player = {
-                    let state = self.state.read().await;
-                    state.players.keys().next().cloned()
-                };
-                match any_player {
-                    Some(id) => id,
-                    None => return self.search_library(query, limit).await,
-                }
+                let state = self.state.read().await;
+                state.players.keys().next().cloned()
             }
         };
 
-        // Get top-level providers
-        let result = self.globalsearch_items(&player_id, query, None).await?;
+        if let Some(ref pid) = player_id_resolved {
+            // Get top-level providers
+            if let Ok(result) = self.globalsearch_items(pid, query, None).await {
+                if let Some(items) = Self::get_items_from_result(&result) {
+                    for item in items {
+                        let item_id = item.get("id").and_then(|v| v.as_str());
+                        let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+                        let is_audio = item.get("isaudio").and_then(|v| v.as_i64()).unwrap_or(0) == 1
+                            || item.get("type").and_then(|v| v.as_str()) == Some("audio");
 
-        let items = match Self::get_items_from_result(&result) {
-            Some(items) => items,
-            None => return self.search_library(query, limit).await,
-        };
+                        if is_audio {
+                            if let Some(mut r) = self.parse_single_item(item) {
+                                // Resolve relative image URLs
+                                if let Some(ref url) = r.image_url {
+                                    r.image_url = self.resolve_image_url(url).await;
+                                }
+                                streaming_results.push(r);
+                            }
+                            continue;
+                        }
 
-        let mut results = Vec::new();
-
-        // Look for providers and drill into them to find playable items
-        for item in items {
-            if results.len() >= limit {
-                break;
-            }
-
-            let item_id = item.get("id").and_then(|v| v.as_str());
-            let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
-            let is_audio = item.get("isaudio").and_then(|v| v.as_i64()).unwrap_or(0) == 1
-                || item.get("type").and_then(|v| v.as_str()) == Some("audio");
-
-            // If it's a playable item, add it directly
-            if is_audio {
-                if let Some(result) = self.parse_single_item(item) {
-                    results.push(result);
-                }
-                continue;
-            }
-
-            // Drill into any provider that has sub-items (TIDAL, Qobuz, Spotify, Deezer, etc.)
-            if let Some(item_id) = item_id {
-                if has_items {
-                    if let Ok(songs) = self
-                        .drill_into_songs(&player_id, query, item_id, limit - results.len())
-                        .await
-                    {
-                        results.extend(songs);
+                        // Drill into providers for Albums and Songs categories
+                        if let Some(provider_id) = item_id {
+                            if has_items {
+                                if let Ok(songs) = self
+                                    .drill_into_songs_and_albums(pid, query, provider_id, limit)
+                                    .await
+                                {
+                                    for mut r in songs {
+                                        if let Some(ref url) = r.image_url {
+                                            r.image_url = self.resolve_image_url(url).await;
+                                        }
+                                        streaming_results.push(r);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Fallback to library search if no streaming results
+        // --- Merge: library first, then streaming, with dedup ---
+        let mut results = library_results;
+
+        // Deduplicate: skip streaming items whose title+artist match a library item (case-insensitive)
+        for sr in streaming_results {
+            let dominated = results.iter().any(|lr| {
+                lr.title.eq_ignore_ascii_case(&sr.title)
+                    && match (&lr.artist, &sr.artist) {
+                        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                        _ => false,
+                    }
+            });
+            if !dominated {
+                results.push(sr);
+            }
+        }
+
+        results.truncate(limit);
+
+        // If no results at all, fall back to simple library search
         if results.is_empty() {
             return self.search_library(query, limit).await;
         }
@@ -1122,94 +1301,12 @@ impl LmsAdapter {
         debug!(
             query = query,
             results = results.len(),
-            "LMS globalsearch completed"
+            "LMS unified search completed"
         );
 
         Ok(results)
     }
 
-    /// Raw globalsearch returning unprocessed JSON for LLM consumption.
-    ///
-    /// Unlike `search()` which parses results into typed structs, this returns the raw
-    /// globalsearch responses from all providers (My Music, TIDAL, Qobuz, etc.).
-    /// The LLM can interpret field variations, category names, and metadata directly —
-    /// no information is lost to struct parsing.
-    ///
-    /// Returns a JSON object with provider names as keys and their raw item lists as values.
-    pub async fn search_raw(
-        &self,
-        query: &str,
-        player_id: Option<&str>,
-    ) -> Result<serde_json::Value> {
-        // Same player_id resolution as search()
-        let player_id = match player_id.map(strip_lms_prefix) {
-            Some(id) => id.to_string(),
-            None => {
-                let any_player = {
-                    let state = self.state.read().await;
-                    state.players.keys().next().cloned()
-                };
-                match any_player {
-                    Some(id) => id,
-                    None => return Ok(json!({"error": "No players connected"})),
-                }
-            }
-        };
-
-        // Get top-level providers
-        let result = self.globalsearch_items(&player_id, query, None).await?;
-        let items = match Self::get_items_from_result(&result) {
-            Some(items) => items,
-            None => return Ok(json!({"results": []})),
-        };
-
-        let mut providers = serde_json::Map::new();
-
-        for item in items {
-            let name = item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let item_id = item.get("id").and_then(|v| v.as_str());
-            let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
-            let is_audio = item.get("isaudio").and_then(|v| v.as_i64()).unwrap_or(0) == 1
-                || item.get("type").and_then(|v| v.as_str()) == Some("audio");
-
-            if is_audio {
-                // Top-level playable item — add under "direct" provider
-                if let Some(arr) = providers
-                    .entry("direct")
-                    .or_insert_with(|| json!([]))
-                    .as_array_mut()
-                {
-                    arr.push(item.clone());
-                }
-                continue;
-            }
-
-            // Drill one level into each provider
-            if let Some(item_id) = item_id {
-                if has_items {
-                    if let Ok(sub_result) = self
-                        .globalsearch_items(&player_id, query, Some(item_id))
-                        .await
-                    {
-                        if let Some(sub_items) = Self::get_items_from_result(&sub_result) {
-                            providers.insert(name.to_string(), json!(sub_items));
-                        }
-                    }
-                }
-            }
-        }
-
-        debug!(
-            query = query,
-            providers = providers.len(),
-            "LMS raw globalsearch completed"
-        );
-
-        Ok(json!({ "providers": providers }))
-    }
 
     /// Execute a globalsearch items query
     async fn globalsearch_items(
@@ -1241,15 +1338,15 @@ impl LmsAdapter {
             .and_then(|v| v.as_array())
     }
 
-    /// Drill into a provider to find the Songs category and return playable items
-    async fn drill_into_songs(
+    /// Drill into a provider to find both Albums and Songs categories.
+    /// Returns albums with hasitems=1 and individual tracks.
+    async fn drill_into_songs_and_albums(
         &self,
         player_id: &str,
         query: &str,
         provider_item_id: &str,
         limit: usize,
     ) -> Result<Vec<LmsSearchResult>> {
-        // Get the provider's categories (Everything, Playlists, Artists, Albums, Songs)
         let result = self
             .globalsearch_items(player_id, query, Some(provider_item_id))
             .await?;
@@ -1261,9 +1358,16 @@ impl LmsAdapter {
 
         let mut results = Vec::new();
 
-        // Prefer "Songs" category over "Everything" — "Everything" contains album
-        // containers (isaudio=1, hasitems=1) that queue entire albums when played.
-        // Try "Songs" first, fall back to "Everything" if no Songs category exists.
+        // Find Albums and Songs category IDs
+        let albums_id = items.iter().find_map(|item| {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let has = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+            if has && name == "Albums" {
+                item.get("id").and_then(|v| v.as_str())
+            } else {
+                None
+            }
+        });
         let songs_id = items.iter().find_map(|item| {
             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let has = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
@@ -1282,10 +1386,8 @@ impl LmsAdapter {
                 None
             }
         });
-        let drill_id = songs_id.or(everything_id);
 
-        // Collect any directly playable items (tracks and album containers alike).
-        // parse_single_item classifies them correctly — callers use category to decide.
+        // Collect directly playable items at this level
         for item in items {
             if results.len() >= limit {
                 break;
@@ -1293,14 +1395,49 @@ impl LmsAdapter {
             let is_audio = item.get("isaudio").and_then(|v| v.as_i64()).unwrap_or(0) == 1
                 || item.get("type").and_then(|v| v.as_str()) == Some("audio");
             if is_audio {
-                if let Some(result) = self.parse_single_item(item) {
-                    results.push(result);
+                if let Some(r) = self.parse_single_item(item) {
+                    results.push(r);
                 }
             }
         }
 
-        // Drill into Songs (or Everything) for more tracks
-        if let Some(drill) = drill_id {
+        // Drill into Albums category
+        if let Some(aid) = albums_id {
+            if let Ok(album_result) = self.globalsearch_items(player_id, query, Some(aid)).await {
+                if let Some(album_items) = Self::get_items_from_result(&album_result) {
+                    for item in album_items.iter().take(5) {
+                        if results.len() >= limit { break; }
+                        let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+                        if has_items {
+                            // This is an album container
+                            let string_item_id = item.get("id").and_then(|v| v.as_str()).map(String::from);
+                            let title = item.get("name").or_else(|| item.get("title"))
+                                .and_then(|v| v.as_str()).unwrap_or_default();
+                            let artist = item.get("artist").and_then(|v| v.as_str()).map(String::from);
+                            let image = item.get("image").and_then(|v| v.as_str()).map(String::from);
+                            results.push(LmsSearchResult {
+                                result_type: LmsSearchResultType::Album,
+                                id: 0,
+                                title: title.to_string(),
+                                artist,
+                                album: None,
+                                url: None,
+                                item_id: string_item_id,
+                                year: None,
+                                genre: None,
+                                duration: None,
+                                image_url: image,
+                                coverid: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drill into Songs (or Everything) for tracks
+        let songs_drill = songs_id.or(everything_id);
+        if let Some(drill) = songs_drill {
             let songs_result = self
                 .globalsearch_items(player_id, query, Some(drill))
                 .await?;
@@ -1309,8 +1446,8 @@ impl LmsAdapter {
                     if results.len() >= limit {
                         break;
                     }
-                    if let Some(result) = self.parse_single_item(song) {
-                        results.push(result);
+                    if let Some(r) = self.parse_single_item(song) {
+                        results.push(r);
                     }
                 }
             }
@@ -1370,6 +1507,9 @@ impl LmsAdapter {
             LmsSearchResultType::Track
         };
 
+        // Extract image URL for streaming items (globalsearch provides `image` field)
+        let image_url = item.get("image").and_then(|v| v.as_str()).map(String::from);
+
         Some(LmsSearchResult {
             result_type,
             id: numeric_id,
@@ -1381,6 +1521,11 @@ impl LmsAdapter {
             album: item.get("album").and_then(|v| v.as_str()).map(String::from),
             url,
             item_id: string_item_id,
+            year: None,
+            genre: None,
+            duration: item.get("duration").and_then(|v| v.as_f64()),
+            image_url,
+            coverid: None,
         })
     }
 
@@ -1419,6 +1564,11 @@ impl LmsAdapter {
                         album: None,
                         url: None,
                         item_id: None,
+                        year: None,
+                        genre: None,
+                        duration: None,
+                        image_url: None,
+                        coverid: None,
                     });
                 }
             }
@@ -1439,6 +1589,11 @@ impl LmsAdapter {
                         album: None,
                         url: None,
                         item_id: None,
+                        year: None,
+                        genre: None,
+                        duration: None,
+                        image_url: None,
+                        coverid: None,
                     });
                 }
             }
@@ -1465,6 +1620,11 @@ impl LmsAdapter {
                             .map(String::from),
                         url: None,
                         item_id: None,
+                        year: None,
+                        genre: None,
+                        duration: None,
+                        image_url: None,
+                        coverid: None,
                     });
                 }
             }
@@ -1477,125 +1637,6 @@ impl LmsAdapter {
         );
 
         Ok(results)
-    }
-
-    /// Search and play the first matching result
-    ///
-    /// Searches using globalsearch (includes streaming services), finds the first
-    /// playable result, and executes the specified action (play, queue, or insert).
-    /// Uses URL-based playback for streaming items, playlistcontrol for library items.
-    pub async fn search_and_play(
-        &self,
-        query: &str,
-        player_id: &str,
-        action: LmsPlayAction,
-    ) -> Result<String> {
-        let player_id = strip_lms_prefix(player_id);
-
-        // Search for content (uses globalsearch which includes all providers)
-        let results = self.search(query, Some(player_id), Some(10)).await?;
-
-        if results.is_empty() {
-            return Err(anyhow!("No results found for '{}'", query));
-        }
-
-        // Take the first result
-        let result = &results[0];
-
-        // Determine playback method based on item type:
-        // 1. item_id present (globalsearch streaming) -> use "globalsearch playlist play item_id:XXX"
-        // 2. url present (direct URL) -> use "playlist load/add URL"
-        // 3. otherwise (library item) -> use "playlistcontrol" with entity ID
-        if let Some(ref item_id) = result.item_id {
-            // Globalsearch streaming item - use globalsearch playlist command
-            let method = match action {
-                LmsPlayAction::Play => "play",
-                LmsPlayAction::Queue => "add",
-                LmsPlayAction::Insert => "insert",
-            };
-            let item_id_param = format!("item_id:{}", item_id);
-            self.rpc
-                .execute(
-                    Some(player_id),
-                    vec![
-                        json!("globalsearch"),
-                        json!("playlist"),
-                        json!(method),
-                        json!(item_id_param),
-                    ],
-                )
-                .await?;
-        } else if let Some(ref url) = result.url {
-            // Direct URL item - use playlist command with URL
-            let method = match action {
-                LmsPlayAction::Play => "load",
-                LmsPlayAction::Queue => "add",
-                LmsPlayAction::Insert => "insert",
-            };
-            self.rpc
-                .execute(
-                    Some(player_id),
-                    vec![json!("playlist"), json!(method), json!(url)],
-                )
-                .await?;
-        } else if result.id > 0 {
-            // Library item - use playlistcontrol with entity ID
-            let id_param = match result.result_type {
-                LmsSearchResultType::Album => format!("album_id:{}", result.id),
-                LmsSearchResultType::Artist => format!("artist_id:{}", result.id),
-                LmsSearchResultType::Track => format!("track_id:{}", result.id),
-            };
-
-            let cmd_param = format!("cmd:{}", action.to_lms_cmd());
-
-            self.rpc
-                .execute(
-                    Some(player_id),
-                    vec![json!("playlistcontrol"), json!(cmd_param), json!(id_param)],
-                )
-                .await?;
-        } else {
-            // No valid playback handle - this shouldn't happen if parse_single_item works correctly
-            return Err(anyhow!(
-                "No playable result found for '{}' (missing item_id, url, and valid id)",
-                query
-            ));
-        }
-
-        // Build response message
-        let action_verb = match action {
-            LmsPlayAction::Play => "Playing",
-            LmsPlayAction::Queue => "Queued",
-            LmsPlayAction::Insert => "Playing next",
-        };
-
-        let what = match result.result_type {
-            LmsSearchResultType::Album => {
-                if let Some(ref artist) = result.artist {
-                    format!("album \"{}\" by {}", result.title, artist)
-                } else {
-                    format!("album \"{}\"", result.title)
-                }
-            }
-            LmsSearchResultType::Artist => format!("music by {}", result.title),
-            LmsSearchResultType::Track => {
-                if let Some(ref artist) = result.artist {
-                    format!("\"{}\" by {}", result.title, artist)
-                } else {
-                    format!("\"{}\"", result.title)
-                }
-            }
-        };
-
-        info!(
-            action = action_verb,
-            what = what,
-            player_id = player_id,
-            url = result.url.as_deref().unwrap_or("library"),
-            "LMS search_and_play"
-        );
-
-        Ok(format!("{} {}", action_verb, what))
     }
 
     /// Play a specific item by raw JSON fields from search results.

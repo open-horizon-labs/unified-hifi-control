@@ -214,8 +214,8 @@ MCP (Model Context Protocol) enables AI assistants (Claude, ChatGPT, BoltAI, etc
 | `hifi_zones` | List all playback zones |
 | `hifi_now_playing` | Get current track info |
 | `hifi_control` | Play, pause, next, previous, volume |
-| `hifi_search` | Search library/TIDAL/Qobuz (Roon, LMS) |
-| `hifi_play` | Search and play/queue/radio (Roon, LMS) |
+| `hifi_search` | Search library/streaming with rich metadata (title, artist, album, year, genre, duration, image_url) and _play token |
+| `hifi_play_item` | Play a search result via _play token from hifi_search |
 | `hifi_status` | Bridge connection status |
 | `hifi_hqplayer_status` | HQPlayer pipeline status |
 | `hifi_hqplayer_profiles` | List HQPlayer configs |
