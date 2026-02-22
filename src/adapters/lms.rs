@@ -1302,7 +1302,9 @@ impl LmsAdapter {
 
         // Drill into Songs (or Everything) for more tracks
         if let Some(drill) = drill_id {
-            let songs_result = self.globalsearch_items(player_id, query, Some(drill)).await?;
+            let songs_result = self
+                .globalsearch_items(player_id, query, Some(drill))
+                .await?;
             if let Some(songs) = Self::get_items_from_result(&songs_result) {
                 for song in songs {
                     if results.len() >= limit {
