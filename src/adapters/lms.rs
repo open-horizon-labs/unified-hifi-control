@@ -1047,7 +1047,10 @@ impl LmsAdapter {
     async fn library_cover_url(&self, coverid: &str) -> Option<String> {
         let state = self.state.read().await;
         let host = state.host.as_ref()?;
-        Some(format!("http://{}:{}/music/{}/cover.jpg", host, state.port, coverid))
+        Some(format!(
+            "http://{}:{}/music/{}/cover.jpg",
+            host, state.port, coverid
+        ))
     }
 
     /// Resolve an image URL: absolute URLs pass through, relative paths get the LMS base prepended.
@@ -1096,11 +1099,20 @@ impl LmsAdapter {
             if let Some(albums) = result.get("albums_loop").and_then(|v| v.as_array()) {
                 for album in albums.iter().take(10) {
                     let id = album.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let title = album.get("album").and_then(|v| v.as_str()).unwrap_or_default();
-                    let artist = album.get("artist").and_then(|v| v.as_str()).map(String::from);
+                    let title = album
+                        .get("album")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let artist = album
+                        .get("artist")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                     let year = album.get("year").and_then(|v| v.as_u64()).map(|y| y as u32);
-                    let artwork_track_id = album.get("artwork_track_id")
-                        .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string())));
+                    let artwork_track_id = album.get("artwork_track_id").and_then(|v| {
+                        v.as_str()
+                            .map(String::from)
+                            .or_else(|| v.as_i64().map(|n| n.to_string()))
+                    });
                     let image_url = if let Some(ref cid) = artwork_track_id {
                         self.library_cover_url(cid).await
                     } else {
@@ -1144,16 +1156,38 @@ impl LmsAdapter {
             if let Some(tracks) = result.get("titles_loop").and_then(|v| v.as_array()) {
                 for track in tracks.iter().take(10) {
                     let id = track.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let title = track.get("title").and_then(|v| v.as_str()).unwrap_or_default();
-                    let artist = track.get("artist").and_then(|v| v.as_str()).map(String::from);
-                    let album = track.get("album").and_then(|v| v.as_str()).map(String::from);
+                    let title = track
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let artist = track
+                        .get("artist")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let album = track
+                        .get("album")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                     let year = track.get("year").and_then(|v| v.as_u64()).map(|y| y as u32);
-                    let genre = track.get("genre").and_then(|v| v.as_str()).map(String::from);
+                    let genre = track
+                        .get("genre")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
                     let duration = track.get("duration").and_then(|v| v.as_f64());
-                    let coverid = track.get("coverid")
-                        .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string())))
-                        .or_else(|| track.get("artwork_track_id")
-                            .and_then(|v| v.as_str().map(String::from).or_else(|| v.as_i64().map(|n| n.to_string()))));
+                    let coverid = track
+                        .get("coverid")
+                        .and_then(|v| {
+                            v.as_str()
+                                .map(String::from)
+                                .or_else(|| v.as_i64().map(|n| n.to_string()))
+                        })
+                        .or_else(|| {
+                            track.get("artwork_track_id").and_then(|v| {
+                                v.as_str()
+                                    .map(String::from)
+                                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+                            })
+                        });
                     let image_url = if let Some(ref cid) = coverid {
                         self.library_cover_url(cid).await
                     } else {
@@ -1194,11 +1228,13 @@ impl LmsAdapter {
         if let Ok(result) = artists_result {
             if let Some(artists) = result.get("contributors_loop").and_then(|v| v.as_array()) {
                 for artist in artists.iter().take(5) {
-                    let id = artist.get("contributor_id")
+                    let id = artist
+                        .get("contributor_id")
                         .or_else(|| artist.get("id"))
                         .and_then(|v| v.as_i64())
                         .unwrap_or(0);
-                    let name = artist.get("contributor")
+                    let name = artist
+                        .get("contributor")
                         .or_else(|| artist.get("name"))
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
@@ -1238,8 +1274,10 @@ impl LmsAdapter {
                 if let Some(items) = Self::get_items_from_result(&result) {
                     for item in items {
                         let item_id = item.get("id").and_then(|v| v.as_str());
-                        let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
-                        let is_audio = item.get("isaudio").and_then(|v| v.as_i64()).unwrap_or(0) == 1
+                        let has_items =
+                            item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+                        let is_audio = item.get("isaudio").and_then(|v| v.as_i64()).unwrap_or(0)
+                            == 1
                             || item.get("type").and_then(|v| v.as_str()) == Some("audio");
 
                         if is_audio {
@@ -1306,7 +1344,6 @@ impl LmsAdapter {
 
         Ok(results)
     }
-
 
     /// Execute a globalsearch items query
     async fn globalsearch_items(
@@ -1406,15 +1443,26 @@ impl LmsAdapter {
             if let Ok(album_result) = self.globalsearch_items(player_id, query, Some(aid)).await {
                 if let Some(album_items) = Self::get_items_from_result(&album_result) {
                     for item in album_items.iter().take(5) {
-                        if results.len() >= limit { break; }
-                        let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+                        if results.len() >= limit {
+                            break;
+                        }
+                        let has_items =
+                            item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
                         if has_items {
                             // This is an album container
-                            let string_item_id = item.get("id").and_then(|v| v.as_str()).map(String::from);
-                            let title = item.get("name").or_else(|| item.get("title"))
-                                .and_then(|v| v.as_str()).unwrap_or_default();
-                            let artist = item.get("artist").and_then(|v| v.as_str()).map(String::from);
-                            let image = item.get("image").and_then(|v| v.as_str()).map(String::from);
+                            let string_item_id =
+                                item.get("id").and_then(|v| v.as_str()).map(String::from);
+                            let title = item
+                                .get("name")
+                                .or_else(|| item.get("title"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let artist = item
+                                .get("artist")
+                                .and_then(|v| v.as_str())
+                                .map(String::from);
+                            let image =
+                                item.get("image").and_then(|v| v.as_str()).map(String::from);
                             results.push(LmsSearchResult {
                                 result_type: LmsSearchResultType::Album,
                                 id: 0,

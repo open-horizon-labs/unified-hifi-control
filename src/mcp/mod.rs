@@ -194,7 +194,6 @@ struct McpNowPlaying {
     is_muted: Option<bool>,
 }
 
-
 #[derive(Debug, Serialize)]
 struct McpHqpStatus {
     connected: bool,
