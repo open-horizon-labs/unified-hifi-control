@@ -1261,38 +1261,57 @@ impl LmsAdapter {
 
         let mut results = Vec::new();
 
-        // Look for "Songs" or "Everything" category, or playable items directly
+        // Prefer "Songs" category over "Everything" — "Everything" contains album
+        // containers (isaudio=1, hasitems=1) that queue entire albums when played.
+        // Try "Songs" first, fall back to "Everything" if no Songs category exists.
+        let songs_id = items.iter().find_map(|item| {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let has = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+            if has && name == "Songs" {
+                item.get("id").and_then(|v| v.as_str())
+            } else {
+                None
+            }
+        });
+        let everything_id = items.iter().find_map(|item| {
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let has = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+            if has && name == "Everything" {
+                item.get("id").and_then(|v| v.as_str())
+            } else {
+                None
+            }
+        });
+        let drill_id = songs_id.or(everything_id);
+
+        // Also collect any directly playable items (non-container tracks)
         for item in items {
             if results.len() >= limit {
                 break;
             }
-
-            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let item_id = item.get("id").and_then(|v| v.as_str());
-            let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
             let is_audio = item.get("isaudio").and_then(|v| v.as_i64()).unwrap_or(0) == 1
                 || item.get("type").and_then(|v| v.as_str()) == Some("audio");
-
-            // If it's a playable item, add it directly
-            if is_audio {
+            let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+            // Skip containers — they're albums/playlists, not individual tracks
+            if is_audio && !has_items {
                 if let Some(result) = self.parse_single_item(item) {
                     results.push(result);
                 }
-                continue;
             }
+        }
 
-            // Drill into "Songs" or "Everything" to get actual tracks
-            if has_items && item_id.is_some() && (name == "Songs" || name == "Everything") {
-                let songs_result = self.globalsearch_items(player_id, query, item_id).await?;
-
-                if let Some(songs) = Self::get_items_from_result(&songs_result) {
-                    for song in songs {
-                        if results.len() >= limit {
-                            break;
-                        }
-                        if let Some(result) = self.parse_single_item(song) {
-                            results.push(result);
-                        }
+        // Drill into Songs (or Everything) for more tracks
+        if let Some(drill) = drill_id {
+            let songs_result = self
+                .globalsearch_items(player_id, query, Some(drill))
+                .await?;
+            if let Some(songs) = Self::get_items_from_result(&songs_result) {
+                for song in songs {
+                    if results.len() >= limit {
+                        break;
+                    }
+                    if let Some(result) = self.parse_single_item(song) {
+                        results.push(result);
                     }
                 }
             }
@@ -1342,8 +1361,18 @@ impl LmsAdapter {
             return None;
         }
 
+        // Items with hasitems=1 are containers (albums/playlists), not individual tracks.
+        // LMS globalsearch marks them isaudio=1 because they're playable, but playing them
+        // queues the entire album. Classify correctly so callers can distinguish.
+        let has_items = item.get("hasitems").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+        let result_type = if has_items {
+            LmsSearchResultType::Album
+        } else {
+            LmsSearchResultType::Track
+        };
+
         Some(LmsSearchResult {
-            result_type: LmsSearchResultType::Track,
+            result_type,
             id: numeric_id,
             title: title.to_string(),
             artist: item
