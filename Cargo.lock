@@ -1482,7 +1482,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2025,7 +2025,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2",
+ "socket2 0.6.1",
  "system-configuration",
  "tokio",
  "tower-layer",
@@ -2512,7 +2512,7 @@ dependencies = [
  "log",
  "mio",
  "socket-pktinfo",
- "socket2",
+ "socket2 0.6.1",
 ]
 
 [[package]]
@@ -2972,7 +2972,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls",
- "socket2",
+ "socket2 0.6.1",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3009,9 +3009,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2",
+ "socket2 0.6.1",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3233,7 +3233,7 @@ dependencies = [
 [[package]]
 name = "roon-api"
 version = "0.3.1"
-source = "git+https://github.com/open-horizon-labs/rust-roon-api.git?branch=fix%2Ffractional-volume#01713b0fdc5ca265a30e4a7ae53daa674903d070"
+source = "git+https://github.com/open-horizon-labs/rust-roon-api.git?branch=fix%2Ffractional-volume#06dd807f2b9c09274cc679710e9175d97ca09adf"
 dependencies = [
  "futures-util",
  "if-addrs 0.13.4",
@@ -3241,6 +3241,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "tokio",
  "tokio-tungstenite 0.21.0",
  "typetag",
@@ -3409,7 +3410,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3794,8 +3795,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "927136cc2ae6a1b0e66ac6b1210902b75c3f726db004a73bc18686dcd0dcd22f"
 dependencies = [
  "libc",
- "socket2",
+ "socket2 0.6.1",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3950,7 +3961,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4107,7 +4118,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.1",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
@@ -4872,7 +4883,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
