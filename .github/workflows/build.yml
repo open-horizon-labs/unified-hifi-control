@@ -135,11 +135,11 @@ jobs:
           INPUT_LINUX_PACKAGES: ${{ inputs.build_linux_packages }}
         run: |
           # Skip if triggered by a non-build label (e.g., arch, coderabbit)
-          # Only the 'build-me' label should trigger builds via labeled event
-          if [[ "$EVENT_ACTION" == "labeled" && "$LABEL_ADDED" != "build-me" ]]; then
-            echo "::notice::Skipping: labeled event for '$LABEL_ADDED' (only 'build-me' triggers builds)"
+          # Allow 'build-me' (all builds) and 'build:*' (specific builds) labels
+          if [[ "$EVENT_ACTION" == "labeled" && "$LABEL_ADDED" != "build-me" && "$LABEL_ADDED" != build:* ]]; then
+            echo "::notice::Skipping: labeled event for '$LABEL_ADDED' (only 'build-me' and 'build:*' trigger builds)"
             echo "### ⏭️ Skipped" >> $GITHUB_STEP_SUMMARY
-            echo "Label \`$LABEL_ADDED\` added - only \`build-me\` triggers builds." >> $GITHUB_STEP_SUMMARY
+            echo "Label \`$LABEL_ADDED\` added - only \`build-me\` and \`build:*\` labels trigger builds." >> $GITHUB_STEP_SUMMARY
             # Set all outputs to false/empty so dependent jobs skip
             echo "is_release=false" >> $GITHUB_OUTPUT
             echo "build_linux_arm=false" >> $GITHUB_OUTPUT
@@ -326,7 +326,7 @@ jobs:
             echo "|-------|--------------|" >> $GITHUB_STEP_SUMMARY
             printf "%s" "$TABLE_ROWS" >> $GITHUB_STEP_SUMMARY
           else
-            echo "_No optional builds enabled. Add \`build:*\` labels then \`build-me\` to trigger._" >> $GITHUB_STEP_SUMMARY
+            echo "_No optional builds enabled. Add \`build:*\` labels to trigger specific builds, or \`build-me\` for defaults._" >> $GITHUB_STEP_SUMMARY
           fi
 
   # =============================================================================
@@ -1844,7 +1844,7 @@ jobs:
             echo "| $name | $size |" >> $GITHUB_STEP_SUMMARY
           done || echo "| (none) | - |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "_Add \`build:*\` labels to configure builds, then add \`build-me\` to trigger. Labels: build:lms, build:synology, build:qnap-arm, build:linux-arm, build:macos, build:windows, build:all_" >> $GITHUB_STEP_SUMMARY
+          echo "_Add \`build:*\` labels to trigger specific builds, or \`build-me\` for defaults. Labels: build:lms, build:synology, build:qnap-arm, build:linux-arm, build:macos, build:windows, build:docker, build:all_" >> $GITHUB_STEP_SUMMARY
 
   # =============================================================================
   # PR Comment with Artifact Links
