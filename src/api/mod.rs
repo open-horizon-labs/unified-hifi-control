@@ -155,7 +155,7 @@ impl AppState {
             anyhow::bail!("Unknown zone type for image: {}", zone_id)
         };
 
-        // Convert to RGB565 if requested (for ESP32 LCD displays)
+        // Convert to device-specific format if requested
         if format == Some("rgb565") {
             // Use square dimensions when only one side specified (matches adapter behavior)
             let (target_w, target_h) = match (width, height) {
@@ -173,6 +173,33 @@ impl AppState {
                 }),
                 Err(_) => {
                     // Fall back to original on conversion error
+                    Ok(raw_image)
+                }
+            }
+        } else if format == Some("eink_acep6") {
+            // Dither to ACeP 6-color palette for e-ink panels (Issue #263)
+            use crate::knobs::image::dither_to_eink_acep6;
+
+            let (target_w, target_h) = match (width, height) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, w),
+                (None, Some(h)) => (h, h),
+                (None, None) => (800, 480),
+            };
+
+            match dither_to_eink_acep6(&raw_image.data, target_w, target_h) {
+                Ok(eink) => Ok(ImageData {
+                    content_type: "application/octet-stream".to_string(),
+                    data: eink.data,
+                    edge_color: None,
+                }),
+                Err(e) => {
+                    tracing::warn!(
+                        "E-ink dithering failed ({}x{}): {}, falling back to raw image",
+                        target_w,
+                        target_h,
+                        e
+                    );
                     Ok(raw_image)
                 }
             }
