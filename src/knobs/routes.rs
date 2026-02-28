@@ -686,6 +686,41 @@ async fn control_roon(
                 })?;
             return Ok(Json(serde_json::json!({"ok": true})));
         }
+        "mute" => {
+            state.roon.mute(zone_id, true).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
+        "unmute" => {
+            state.roon.mute(zone_id, false).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
+        "toggle_mute" => {
+            // Look up current mute state from aggregator, then toggle
+            let is_muted = state
+                .aggregator
+                .get_zone(&format!("roon:{}", zone_id))
+                .await
+                .and_then(|z| z.volume_control)
+                .map(|vc| vc.is_muted)
+                .unwrap_or(false);
+            state.roon.mute(zone_id, !is_muted).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -768,6 +803,12 @@ async fn control_lms(
                 })?;
             return Ok(Json(serde_json::json!({"ok": true})));
         }
+        "mute" | "unmute" | "toggle_mute" => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Mute not yet supported for LMS — coming soon"})),
+            ));
+        }
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -798,6 +839,14 @@ async fn control_openhome(
         "next" => "next",
         "previous" | "prev" => "previous",
         "stop" => "stop",
+        "mute" | "unmute" | "toggle_mute" => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(
+                    serde_json::json!({"error": "Mute not yet supported for OpenHome — coming soon"}),
+                ),
+            ));
+        }
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -828,6 +877,12 @@ async fn control_upnp(
         "next" => "next",
         "previous" | "prev" => "previous",
         "stop" => "stop",
+        "mute" | "unmute" | "toggle_mute" => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Mute not yet supported for UPnP — coming soon"})),
+            ));
+        }
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
