@@ -11,8 +11,10 @@
 //! - Hardware API endpoints (/now_playing, /control, /config)
 //! - RGB565 image conversion for LCD display
 //! - Manifest-driven protocol for ambient UI surfaces
+//! - LLM-driven manifest generation via cloud proxy
 
 pub mod image;
+pub mod llm_manifest;
 pub mod manifest;
 pub mod manifest_routes;
 pub mod routes;
