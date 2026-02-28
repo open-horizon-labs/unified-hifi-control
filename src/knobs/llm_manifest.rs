@@ -18,6 +18,8 @@ use crate::knobs::manifest::*;
 pub struct GenerateManifestRequest {
     /// Natural language prompt describing desired changes.
     pub prompt: String,
+    /// Zone to apply the generated manifest to.
+    pub zone_id: String,
     /// Device type (e.g., "knob", "frame"). Defaults to "knob".
     #[serde(default = "default_device_type")]
     pub device_type: String,
@@ -290,7 +292,11 @@ pub async fn generate_manifest_handler(
     })?;
 
     // 2. Get current manifest (pushed or generate a default representation)
-    let current_manifest_json = match state.manifests.get_current_manifest_json().await {
+    let current_manifest_json = match state
+        .manifests
+        .get_current_manifest_json(&req.zone_id)
+        .await
+    {
         Some(json) => serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string()),
         None => {
             // No pushed manifest — build a minimal default for context
@@ -338,10 +344,22 @@ pub async fn generate_manifest_handler(
         )
     })?;
 
-    // 6. Store the new manifest
+    // 6. Validate the parsed manifest
+    validate_manifest(&parsed).map_err(|e| {
+        tracing::warn!("LLM manifest failed validation: {}", e);
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!("Manifest validation failed: {}", e)
+            })),
+        )
+    })?;
+
+    // 7. Store the new manifest for the requested zone
     state
         .manifests
         .set_full(
+            &req.zone_id,
             parsed.screens.clone(),
             parsed.nav.clone(),
             parsed.interactions.clone(),
@@ -349,12 +367,13 @@ pub async fn generate_manifest_handler(
         .await;
 
     tracing::info!(
+        zone_id = %req.zone_id,
         screens = parsed.screens.len(),
         device_type = %req.device_type,
         "LLM-generated manifest stored"
     );
 
-    // 7. Return the stored manifest (without fast state — caller can GET /knob/manifest for full)
+    // 8. Return the stored manifest (without fast state — caller can GET /knob/manifest for full)
     let sha = compute_manifest_sha_full(&parsed.screens, &parsed.nav, &parsed.interactions);
     let manifest = serde_json::json!({
         "version": MANIFEST_VERSION,
@@ -365,6 +384,88 @@ pub async fn generate_manifest_handler(
     });
 
     Ok(Json(manifest))
+}
+
+// ── Validation ───────────────────────────────────────────────────────────────
+
+/// Validate a parsed manifest against known controls, actions, and inputs.
+/// Returns `Ok(())` if valid, `Err(message)` describing the first problem found.
+pub fn validate_manifest(parsed: &ParsedManifest) -> Result<(), String> {
+    let valid_controls = ["prev", "play", "next", "mute"];
+    let valid_actions = [
+        "toggle_playback",
+        "play",
+        "pause",
+        "next",
+        "previous",
+        "stop",
+        "volume_up",
+        "volume_down",
+        "mute",
+        "unmute",
+        "toggle_mute",
+    ];
+    let valid_inputs = [
+        "encoder_cw",
+        "encoder_ccw",
+        "encoder_press",
+        "encoder_long_press",
+        "button_prev",
+        "button_play",
+        "button_next",
+        "swipe_left",
+        "swipe_right",
+    ];
+
+    // Validate controls on media screens
+    for screen in &parsed.screens {
+        if let Screen::Media(media) = screen {
+            if let Some(controls) = &media.controls {
+                for c in controls {
+                    if !valid_controls.contains(&c.as_str()) {
+                        return Err(format!(
+                            "Unknown control: '{}'. Valid: {:?}",
+                            c, valid_controls
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Validate interactions
+    if let Some(interactions) = &parsed.interactions {
+        for (input, action) in interactions {
+            if !valid_inputs.contains(&input.as_str()) {
+                return Err(format!(
+                    "Unknown input: '{}'. Valid: {:?}",
+                    input, valid_inputs
+                ));
+            }
+            if !valid_actions.contains(&action.as_str()) {
+                return Err(format!(
+                    "Unknown action: '{}'. Valid: {:?}",
+                    action, valid_actions
+                ));
+            }
+        }
+
+        // Safety: volume controls must be preserved
+        let has_vol_up = interactions
+            .get("encoder_cw")
+            .is_some_and(|a| a == "volume_up");
+        let has_vol_down = interactions
+            .get("encoder_ccw")
+            .is_some_and(|a| a == "volume_down");
+        if !has_vol_up || !has_vol_down {
+            return Err(
+                "Safety: encoder_cw must map to volume_up and encoder_ccw must map to volume_down"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -614,6 +715,124 @@ mod tests {
         assert_ne!(
             sha_without, sha_with,
             "SHA should change when interactions are added"
+        );
+    }
+
+    // ── Validation tests ─────────────────────────────────────────────
+
+    /// Helper: build a valid ParsedManifest with standard controls and safe interactions.
+    fn make_valid_parsed_manifest() -> ParsedManifest {
+        let mut interactions = HashMap::new();
+        interactions.insert("encoder_cw".to_string(), "volume_up".to_string());
+        interactions.insert("encoder_ccw".to_string(), "volume_down".to_string());
+        interactions.insert("encoder_press".to_string(), "toggle_mute".to_string());
+
+        ParsedManifest {
+            screens: vec![Screen::Media(MediaScreen {
+                id: "now_playing".to_string(),
+                image_url: None,
+                image_key: None,
+                background_color: None,
+                lines: vec![TextLine {
+                    text: "Title".to_string(),
+                    style: "title".to_string(),
+                }],
+                controls: Some(vec![
+                    "prev".to_string(),
+                    "play".to_string(),
+                    "next".to_string(),
+                ]),
+            })],
+            nav: Nav {
+                order: vec!["now_playing".to_string()],
+                default: "now_playing".to_string(),
+            },
+            interactions: Some(interactions),
+        }
+    }
+
+    #[test]
+    fn test_validate_manifest_valid_passes() {
+        let parsed = make_valid_parsed_manifest();
+        assert!(
+            validate_manifest(&parsed).is_ok(),
+            "Valid manifest should pass validation"
+        );
+    }
+
+    #[test]
+    fn test_validate_manifest_unknown_control_fails() {
+        let mut parsed = make_valid_parsed_manifest();
+        if let Screen::Media(ref mut media) = parsed.screens[0] {
+            media.controls = Some(vec!["prev".to_string(), "shuffle".to_string()]);
+        }
+        let result = validate_manifest(&parsed);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("Unknown control: 'shuffle'"),
+            "Should identify the unknown control"
+        );
+    }
+
+    #[test]
+    fn test_validate_manifest_unknown_input_fails() {
+        let mut parsed = make_valid_parsed_manifest();
+        let interactions = parsed.interactions.as_mut().unwrap();
+        interactions.insert("triple_tap".to_string(), "play".to_string());
+        let result = validate_manifest(&parsed);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("Unknown input: 'triple_tap'"),
+            "Should identify the unknown input"
+        );
+    }
+
+    #[test]
+    fn test_validate_manifest_unknown_action_fails() {
+        let mut parsed = make_valid_parsed_manifest();
+        let interactions = parsed.interactions.as_mut().unwrap();
+        interactions.insert("encoder_press".to_string(), "rewind".to_string());
+        let result = validate_manifest(&parsed);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("Unknown action: 'rewind'"),
+            "Should identify the unknown action"
+        );
+    }
+
+    #[test]
+    fn test_validate_manifest_missing_volume_safety_fails() {
+        let mut parsed = make_valid_parsed_manifest();
+        // Remove encoder_cw → volume_up mapping
+        let interactions = parsed.interactions.as_mut().unwrap();
+        interactions.insert("encoder_cw".to_string(), "next".to_string());
+        let result = validate_manifest(&parsed);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("Safety:"),
+            "Should flag missing volume safety"
+        );
+    }
+
+    #[test]
+    fn test_validate_manifest_no_interactions_passes() {
+        let mut parsed = make_valid_parsed_manifest();
+        parsed.interactions = None;
+        assert!(
+            validate_manifest(&parsed).is_ok(),
+            "Manifest without interactions should pass (interactions are optional)"
+        );
+    }
+
+    #[test]
+    fn test_validate_manifest_no_controls_passes() {
+        let mut parsed = make_valid_parsed_manifest();
+        if let Screen::Media(ref mut media) = parsed.screens[0] {
+            media.controls = None;
+        }
+        assert!(
+            validate_manifest(&parsed).is_ok(),
+            "Manifest without controls should pass (controls are optional)"
         );
     }
 }

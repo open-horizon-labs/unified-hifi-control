@@ -21,12 +21,12 @@ use crate::knobs::routes::{get_all_zones_internal, ZoneInfo};
 
 // ── Manifest store ──────────────────────────────────────────────────────────
 
-/// Holds the Memex-pushed manifest (if any). When None, GET handler generates
-/// a default manifest from aggregator state.
+/// Holds per-zone Memex-pushed manifests. When a zone has no entry, the GET
+/// handler generates a default manifest from aggregator state.
 #[derive(Debug, Clone, Default)]
 pub struct ManifestStore {
-    /// Manifest pushed by Memex via POST. None = use default.
-    pushed: Arc<RwLock<Option<PushedManifest>>>,
+    /// Manifests pushed by Memex via POST, keyed by zone_id. Missing = use default.
+    pushed: Arc<RwLock<HashMap<String, PushedManifest>>>,
 }
 
 /// A manifest pushed by Memex, with its screens + nav + interactions.
@@ -44,47 +44,60 @@ impl ManifestStore {
         Self::default()
     }
 
-    /// Store a Memex-pushed manifest. Bridge will serve this instead of the default.
-    pub async fn set(&self, screens: Vec<Screen>, nav: Nav) {
-        self.set_full(screens, nav, None).await;
+    /// Store a Memex-pushed manifest for a specific zone. Bridge will serve
+    /// this instead of the default for that zone.
+    pub async fn set(&self, zone_id: &str, screens: Vec<Screen>, nav: Nav) {
+        self.set_full(zone_id, screens, nav, None).await;
     }
 
-    /// Store a manifest with interactions (used by LLM generation).
+    /// Store a manifest with interactions for a specific zone (used by LLM generation).
     pub async fn set_full(
         &self,
+        zone_id: &str,
         screens: Vec<Screen>,
         nav: Nav,
         interactions: Option<HashMap<String, String>>,
     ) {
         let sha = compute_manifest_sha_full(&screens, &nav, &interactions);
-        *self.pushed.write().await = Some(PushedManifest {
-            screens,
-            nav,
-            interactions,
-            sha,
-        });
+        self.pushed.write().await.insert(
+            zone_id.to_string(),
+            PushedManifest {
+                screens,
+                nav,
+                interactions,
+                sha,
+            },
+        );
     }
 
-    /// Clear the pushed manifest (Memex disconnected). Bridge falls back to default.
-    pub async fn clear(&self) {
-        *self.pushed.write().await = None;
+    /// Clear the pushed manifest for a specific zone, or all zones if `zone_id` is None.
+    pub async fn clear(&self, zone_id: Option<&str>) {
+        let mut map = self.pushed.write().await;
+        match zone_id {
+            Some(id) => {
+                map.remove(id);
+            }
+            None => {
+                map.clear();
+            }
+        }
     }
 
-    /// Get the pushed manifest if present.
-    async fn get(&self) -> Option<PushedManifest> {
-        self.pushed.read().await.clone()
+    /// Get the pushed manifest for a specific zone (if present).
+    async fn get(&self, zone_id: &str) -> Option<PushedManifest> {
+        self.pushed.read().await.get(zone_id).cloned()
     }
 
-    /// Get the SHA of the pushed manifest (if any). Used by UDP fast-path.
-    pub async fn get_pushed_sha(&self) -> Option<String> {
-        self.pushed.read().await.as_ref().map(|p| p.sha.clone())
+    /// Get the SHA of the pushed manifest for a specific zone (if any). Used by UDP fast-path.
+    pub async fn get_pushed_sha(&self, zone_id: &str) -> Option<String> {
+        self.pushed.read().await.get(zone_id).map(|p| p.sha.clone())
     }
 
-    /// Get the current full manifest as a Manifest struct (for LLM context).
-    /// Returns None if no manifest has been pushed and no zone_id is provided.
-    pub async fn get_current_manifest_json(&self) -> Option<serde_json::Value> {
+    /// Get the current full manifest for a specific zone as JSON (for LLM context).
+    /// Returns None if no manifest has been pushed for the zone.
+    pub async fn get_current_manifest_json(&self, zone_id: &str) -> Option<serde_json::Value> {
         let pushed = self.pushed.read().await;
-        pushed.as_ref().map(|p| {
+        pushed.get(zone_id).map(|p| {
             serde_json::json!({
                 "screens": p.screens,
                 "nav": p.nav,
@@ -106,10 +119,18 @@ pub struct ManifestQuery {
 /// POST body from Memex pushing a composed manifest.
 #[derive(Deserialize)]
 pub struct PushManifestBody {
+    pub zone_id: String,
     pub screens: Vec<Screen>,
     pub nav: Nav,
     #[serde(default)]
     pub interactions: Option<HashMap<String, String>>,
+}
+
+/// Query params for DELETE /knob/manifest.
+#[derive(Deserialize)]
+pub struct ClearManifestQuery {
+    /// Zone to clear. If absent, clears all zones.
+    pub zone_id: Option<String>,
 }
 
 // ── GET /knob/manifest ──────────────────────────────────────────────────────
@@ -179,8 +200,8 @@ pub async fn knob_manifest_handler(
         },
     };
 
-    // Check if Memex has pushed a manifest
-    let pushed = state.manifests.get().await;
+    // Check if Memex has pushed a manifest for this zone
+    let pushed = state.manifests.get(&prefixed_zone_id).await;
 
     let (screens, nav, interactions, sha) = if let Some(pushed) = pushed {
         (pushed.screens, pushed.nav, pushed.interactions, pushed.sha)
@@ -217,23 +238,30 @@ pub async fn knob_manifest_handler(
 
 // ── POST /knob/manifest ─────────────────────────────────────────────────────
 
-/// Accept a manifest push from Memex. Replaces the default manifest.
+/// Accept a manifest push from Memex. Replaces the default manifest for the given zone.
 pub async fn knob_manifest_push_handler(
     State(state): State<AppState>,
     Json(body): Json<PushManifestBody>,
 ) -> StatusCode {
-    tracing::info!(screens = body.screens.len(), "Manifest pushed by Memex");
+    tracing::info!(zone_id = %body.zone_id, screens = body.screens.len(), "Manifest pushed by Memex");
     state
         .manifests
-        .set_full(body.screens, body.nav, body.interactions)
+        .set_full(&body.zone_id, body.screens, body.nav, body.interactions)
         .await;
     StatusCode::NO_CONTENT
 }
 
 /// DELETE /knob/manifest — Clear pushed manifest (Memex disconnecting).
-pub async fn knob_manifest_clear_handler(State(state): State<AppState>) -> StatusCode {
-    tracing::info!("Manifest cleared (Memex disconnected)");
-    state.manifests.clear().await;
+/// If zone_id query param is provided, clears only that zone. Otherwise clears all.
+pub async fn knob_manifest_clear_handler(
+    State(state): State<AppState>,
+    Query(params): Query<ClearManifestQuery>,
+) -> StatusCode {
+    match &params.zone_id {
+        Some(id) => tracing::info!(zone_id = %id, "Manifest cleared for zone"),
+        None => tracing::info!("All manifests cleared (Memex disconnected)"),
+    }
+    state.manifests.clear(params.zone_id.as_deref()).await;
     StatusCode::NO_CONTENT
 }
 

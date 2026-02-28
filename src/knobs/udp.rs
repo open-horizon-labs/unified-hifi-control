@@ -203,7 +203,7 @@ async fn build_response(state: &AppState, _client_sha: &str, zone_id: &str) -> [
         | ((zone.is_previous_allowed as u8) << 4);
 
     // Compute current SHA
-    let pushed_sha = state.manifests.get_pushed_sha().await;
+    let pushed_sha = state.manifests.get_pushed_sha(&prefixed_zone_id).await;
     let sha = if let Some(sha) = pushed_sha {
         sha
     } else {
