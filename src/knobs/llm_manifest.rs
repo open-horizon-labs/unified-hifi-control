@@ -615,7 +615,7 @@ mod tests {
 
         assert!(prompt.contains("HiPhi Dial manifest generator"));
         assert!(prompt.contains(manifest_json));
-        assert!(prompt.contains("encoder_cw"));
+        assert!(prompt.contains("command-pattern"));
         assert!(prompt.contains("toggle_mute"));
         assert!(prompt.contains("mute"));
     }

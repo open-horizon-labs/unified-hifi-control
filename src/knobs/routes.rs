@@ -637,7 +637,7 @@ async fn control_roon(
         "stop" => "stop",
         "seek_forward" => {
             let seconds = value
-                .and_then(|v| v.get("seconds").or_else(|| Some(v)))
+                .and_then(|v| v.get("seconds").or(Some(v)))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(30.0) as i32;
             state
@@ -654,7 +654,7 @@ async fn control_roon(
         }
         "seek_backward" => {
             let seconds = value
-                .and_then(|v| v.get("seconds").or_else(|| Some(v)))
+                .and_then(|v| v.get("seconds").or(Some(v)))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(30.0) as i32;
             state
@@ -789,7 +789,7 @@ async fn control_lms(
         "stop" => "stop",
         "seek_forward" => {
             let seconds = value
-                .and_then(|v| v.get("seconds").or_else(|| Some(v)))
+                .and_then(|v| v.get("seconds").or(Some(v)))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(30.0) as i32;
             state
@@ -806,7 +806,7 @@ async fn control_lms(
         }
         "seek_backward" => {
             let seconds = value
-                .and_then(|v| v.get("seconds").or_else(|| Some(v)))
+                .and_then(|v| v.get("seconds").or(Some(v)))
                 .and_then(|v| v.as_f64())
                 .unwrap_or(30.0) as i32;
             state
