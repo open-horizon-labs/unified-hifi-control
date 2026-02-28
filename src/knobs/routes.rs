@@ -586,6 +586,7 @@ fn clip_rgb565_circle(data: &[u8], width: u32, height: u32, radius: u32) -> Vec<
 pub struct KnobControlRequest {
     pub zone_id: String,
     pub action: String,
+    #[serde(alias = "params")]
     pub value: Option<serde_json::Value>,
 }
 
@@ -630,10 +631,44 @@ async fn control_roon(
     let roon_action = match action {
         "play" => "play",
         "pause" => "pause",
-        "play_pause" | "playpause" => "play_pause",
+        "play_pause" | "playpause" | "toggle_playback" => "play_pause",
         "next" => "next",
         "previous" | "prev" => "previous",
         "stop" => "stop",
+        "seek_forward" => {
+            let seconds = value
+                .and_then(|v| v.get("seconds").or_else(|| Some(v)))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(30.0) as i32;
+            state
+                .roon
+                .seek_relative(zone_id, seconds)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
+        "seek_backward" => {
+            let seconds = value
+                .and_then(|v| v.get("seconds").or_else(|| Some(v)))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(30.0) as i32;
+            state
+                .roon
+                .seek_relative(zone_id, -seconds)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
         "vol_up" | "volume_up" => {
             // Use provided value, or look up zone's actual step from aggregator
             let step = match value.and_then(|v| v.as_f64()) {
@@ -748,10 +783,44 @@ async fn control_lms(
     let lms_action = match action {
         "play" => "play",
         "pause" => "pause",
-        "play_pause" | "playpause" => "pause", // LMS uses pause to toggle
+        "play_pause" | "playpause" | "toggle_playback" => "pause", // LMS uses pause to toggle
         "next" => "next",
         "previous" | "prev" => "prev",
         "stop" => "stop",
+        "seek_forward" => {
+            let seconds = value
+                .and_then(|v| v.get("seconds").or_else(|| Some(v)))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(30.0) as i32;
+            state
+                .lms
+                .control(player_id, "seek_forward", Some(seconds))
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
+        "seek_backward" => {
+            let seconds = value
+                .and_then(|v| v.get("seconds").or_else(|| Some(v)))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(30.0) as i32;
+            state
+                .lms
+                .control(player_id, "seek_backward", Some(seconds))
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
         "vol_up" | "volume_up" => {
             // Use provided value, or look up zone's actual step from aggregator
             let step = match value.and_then(|v| v.as_f64()) {
@@ -835,10 +904,18 @@ async fn control_openhome(
     let oh_action = match action {
         "play" => "play",
         "pause" => "pause",
-        "play_pause" | "playpause" => "pause", // OpenHome uses pause to toggle
+        "play_pause" | "playpause" | "toggle_playback" => "pause", // OpenHome uses pause to toggle
         "next" => "next",
         "previous" | "prev" => "previous",
         "stop" => "stop",
+        "seek_forward" | "seek_backward" => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(
+                    serde_json::json!({"error": "Seek not yet supported for OpenHome — coming soon"}),
+                ),
+            ));
+        }
         "mute" | "unmute" | "toggle_mute" => {
             return Err((
                 StatusCode::NOT_IMPLEMENTED,
@@ -873,10 +950,16 @@ async fn control_upnp(
     let upnp_action = match action {
         "play" => "play",
         "pause" => "pause",
-        "play_pause" | "playpause" => "pause",
+        "play_pause" | "playpause" | "toggle_playback" => "pause",
         "next" => "next",
         "previous" | "prev" => "previous",
         "stop" => "stop",
+        "seek_forward" | "seek_backward" => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Seek not yet supported for UPnP — coming soon"})),
+            ));
+        }
         "mute" | "unmute" | "toggle_mute" => {
             return Err((
                 StatusCode::NOT_IMPLEMENTED,
@@ -1059,9 +1142,19 @@ struct FirmwareVersionInfo {
     file: Option<String>,
 }
 
-/// GET /firmware/version - Get available firmware version
+/// GET /firmware/version - Get available firmware version (license-gated)
 #[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
-pub async fn firmware_version_handler() -> Response {
+pub async fn firmware_version_handler(State(state): State<AppState>) -> Response {
+    if !state.event_reporter.is_enabled().await {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":"License required for firmware updates","error_code":"LICENSE_REQUIRED"}"#,
+            ))
+            .unwrap();
+    }
+
     let fw_dir = firmware_dir();
 
     if !fw_dir.exists() {
@@ -1149,9 +1242,19 @@ pub async fn firmware_version_handler() -> Response {
         .unwrap()
 }
 
-/// GET /firmware/download - Download firmware binary
+/// GET /firmware/download - Download firmware binary (license-gated)
 #[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
-pub async fn firmware_download_handler() -> Response {
+pub async fn firmware_download_handler(State(state): State<AppState>) -> Response {
+    if !state.event_reporter.is_enabled().await {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":"License required for firmware downloads","error_code":"LICENSE_REQUIRED"}"#,
+            ))
+            .unwrap();
+    }
+
     let fw_dir = firmware_dir();
 
     if !fw_dir.exists() {

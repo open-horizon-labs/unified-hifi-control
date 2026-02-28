@@ -4,11 +4,17 @@
 
 use dioxus::prelude::*;
 
-use crate::app::api::{AdapterSettings, AppSettings, HqpStatus, LmsConfig, RoonStatus};
+use crate::app::api::{self, AdapterSettings, AppSettings, HqpStatus, LmsConfig, RoonStatus};
 use crate::app::components::Layout;
 use crate::app::settings_context::use_settings;
 use crate::app::sse::use_sse;
 use crate::app::theme::{use_theme, Theme};
+
+/// License status from GET /api/config/license
+#[derive(Clone, Debug, Default, serde::Deserialize, PartialEq)]
+struct LicenseStatus {
+    configured: bool,
+}
 
 /// OpenHome status response
 #[derive(Clone, Debug, Default, serde::Deserialize, PartialEq)]
@@ -38,6 +44,26 @@ pub fn Settings() -> Element {
 
     // Hide knobs signal (LMS/HQPlayer visibility follows adapter enabled state)
     let mut hide_knobs = use_signal(|| false);
+
+    // License state
+    let mut license_configured = use_signal(|| false);
+    let mut license_input = use_signal(String::new);
+    let mut license_saving = use_signal(|| false);
+    let mut license_message = use_signal(|| None::<String>);
+
+    // Load license status
+    let license_status = use_resource(|| async {
+        api::fetch_json::<LicenseStatus>("/api/config/license")
+            .await
+            .ok()
+    });
+
+    // Sync license status to signal
+    use_effect(move || {
+        if let Some(Some(s)) = license_status.read().as_ref() {
+            license_configured.set(s.configured);
+        }
+    });
 
     // Load settings resource
     let settings = use_resource(|| async {
@@ -339,6 +365,101 @@ pub fn Settings() -> Element {
                                 td { class: "py-2 px-3 text-muted", "-" }
                             }
                         }
+                    }
+                }
+            }
+
+            // Memex License section
+            section { class: "mb-8",
+                div { class: "mb-4",
+                    h2 { class: "text-xl font-semibold", "Memex License" }
+                    p { class: "text-muted text-sm", "Required for AI Configurator and paid-tier features" }
+                }
+
+                div { class: "card p-6",
+                    if license_configured() {
+                        // Licensed — show status + remove button
+                        div { class: "flex items-center justify-between",
+                            div { class: "flex items-center gap-2",
+                                span { class: "status-ok", "✓ License configured" }
+                            }
+                            button {
+                                class: "btn btn-outline text-sm",
+                                onclick: move |_| {
+                                    license_saving.set(true);
+                                    license_message.set(None);
+                                    spawn(async move {
+                                        // DELETE via wasm fetch or ignore on server
+                                        #[cfg(target_arch = "wasm32")]
+                                        {
+                                            use wasm_bindgen_futures::JsFuture;
+                                            use web_sys::{Request, RequestInit};
+                                            let window = web_sys::window().unwrap();
+                                            let opts = RequestInit::new();
+                                            opts.set_method("DELETE");
+                                            if let Ok(request) = Request::new_with_str_and_init("/api/config/license", &opts) {
+                                                let _ = JsFuture::from(window.fetch_with_request(&request)).await;
+                                            }
+                                        }
+                                        license_configured.set(false);
+                                        license_saving.set(false);
+                                        license_message.set(Some("License removed".to_string()));
+                                    });
+                                },
+                                "Remove"
+                            }
+                        }
+                    } else {
+                        // Not licensed — show input
+                        form {
+                            onsubmit: move |e| {
+                                e.prevent_default();
+                                let key = license_input();
+                                if key.trim().is_empty() {
+                                    return;
+                                }
+                                license_saving.set(true);
+                                license_message.set(None);
+                                spawn(async move {
+                                    let body = serde_json::json!({ "license": key.trim() });
+                                    match api::post_json::<_, LicenseStatus>("/api/config/license", &body).await {
+                                        Ok(resp) => {
+                                            license_configured.set(resp.configured);
+                                            if resp.configured {
+                                                license_input.set(String::new());
+                                                license_message.set(Some("License saved".to_string()));
+                                            } else {
+                                                license_message.set(Some("License not accepted".to_string()));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            license_message.set(Some(format!("Error: {}", e)));
+                                        }
+                                    }
+                                    license_saving.set(false);
+                                });
+                            },
+                            div { class: "flex gap-3",
+                                input {
+                                    class: "input flex-1 font-mono text-sm",
+                                    r#type: "password",
+                                    placeholder: "Paste your Memex license key",
+                                    value: "{license_input}",
+                                    disabled: license_saving(),
+                                    oninput: move |e| license_input.set(e.value()),
+                                }
+                                button {
+                                    class: "btn btn-primary",
+                                    r#type: "submit",
+                                    disabled: license_saving() || license_input().trim().is_empty(),
+                                    if license_saving() { "Saving..." } else { "Configure" }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(ref msg) = license_message() {
+                        p { class: "text-sm text-muted mt-3", "{msg}" }
                     }
                 }
             }

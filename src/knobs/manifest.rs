@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Manifest protocol version
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 
 // ── Top-level manifest ──────────────────────────────────────────────────────
 
@@ -24,7 +24,7 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// the knob only reads `fast` and skips re-parsing `screens`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    /// Schema version (currently 1)
+    /// Schema version (currently 2)
     pub version: u32,
 
     /// SHA256 prefix (8 hex chars) of screens + nav content.
@@ -40,9 +40,8 @@ pub struct Manifest {
     /// Navigation order and default screen.
     pub nav: Nav,
 
-    /// Input-to-action mapping. Keys are physical inputs (e.g., "encoder_cw"),
-    /// values are action names (e.g., "volume_up"). Optional — when absent,
-    /// firmware uses hardcoded defaults (backward compatible).
+    /// DEPRECATED: v1 global input-to-action mapping. Use per-screen `encoder` instead.
+    /// When absent, firmware uses hardcoded defaults (backward compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interactions: Option<HashMap<String, String>>,
 }
@@ -138,10 +137,17 @@ pub struct MediaScreen {
     pub background_color: Option<String>,
     /// Display lines: title, subtitle, detail (firmware renders in order)
     pub lines: Vec<TextLine>,
-    /// Which transport controls to show. e.g., ["prev", "play", "next", "mute"].
+    /// DEPRECATED: v1 flat control names. Use `elements` instead.
     /// When absent, firmware shows all default buttons (backward compatible).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controls: Option<Vec<String>>,
+    /// Command-pattern elements — each carries {display, on_tap, on_long_press}.
+    /// When present, firmware renders these instead of controls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elements: Option<Vec<Element>>,
+    /// Per-screen encoder configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<Encoder>,
 }
 
 /// Scrollable list screen.
@@ -151,6 +157,9 @@ pub struct ListScreen {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub items: Vec<ListItem>,
+    /// Per-screen encoder configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoder: Option<Encoder>,
 }
 
 /// Text card screen — for Memex context, notes, status.
@@ -206,6 +215,63 @@ pub struct ListItem {
     /// Optional icon name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Action when this list item is tapped
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_tap: Option<Action>,
+}
+
+// ── Command-pattern types (v2) ───────────────────────────────────────────────
+
+/// Display properties for a command-pattern element.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Display {
+    /// Material Symbols icon name (e.g., "skip_previous", "play_arrow")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Text label (alternative to icon)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Visual active state (highlighted when true, e.g., mute active)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+}
+
+/// An action triggered by user interaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Action {
+    /// Abstract action name resolved by bridge (e.g., "toggle_playback", "previous")
+    pub action: String,
+    /// Optional parameters (e.g., {"seconds": 30} for seek_forward)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// A command-pattern element — self-contained {display, behavior} unit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Element {
+    /// What to show (icon, label, active state)
+    pub display: Display,
+    /// Action on tap/click
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_tap: Option<Action>,
+    /// Action on long press
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_long_press: Option<Action>,
+}
+
+/// Per-screen encoder configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Encoder {
+    /// Clockwise rotation action
+    pub cw: Action,
+    /// Counter-clockwise rotation action
+    pub ccw: Action,
+    /// Encoder press action
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub press: Option<Action>,
+    /// Encoder long press action
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub long_press: Option<Action>,
 }
 
 // ── Navigation ──────────────────────────────────────────────────────────────

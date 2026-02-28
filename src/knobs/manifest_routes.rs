@@ -267,8 +267,103 @@ pub async fn knob_manifest_clear_handler(
 
 // ── Default manifest builder ────────────────────────────────────────────────
 
+/// Build context-aware elements for the media screen based on zone state.
+///
+/// - Omits prev/next elements when the zone doesn't allow those actions.
+/// - Uses pause icon when playing, play_arrow when not.
+/// - Adds a forward_30 seek element for long content (>600 seconds = podcast/audiobook heuristic).
+fn build_default_elements(zone: &crate::bus::Zone) -> Vec<Element> {
+    let mut elements = Vec::new();
+
+    // Previous — only if allowed
+    if zone.is_previous_allowed {
+        elements.push(Element {
+            display: Display {
+                icon: Some("skip_previous".into()),
+                label: None,
+                active: None,
+            },
+            on_tap: Some(Action {
+                action: "previous".into(),
+                params: None,
+            }),
+            on_long_press: None,
+        });
+    }
+
+    // Play/Pause — always present, icon reflects current state
+    let is_playing = zone.state == crate::bus::PlaybackState::Playing;
+    elements.push(Element {
+        display: Display {
+            icon: Some(if is_playing { "pause" } else { "play_arrow" }.into()),
+            label: None,
+            active: None,
+        },
+        on_tap: Some(Action {
+            action: "toggle_playback".into(),
+            params: None,
+        }),
+        on_long_press: Some(Action {
+            action: "stop".into(),
+            params: None,
+        }),
+    });
+
+    // Next — only if allowed
+    if zone.is_next_allowed {
+        elements.push(Element {
+            display: Display {
+                icon: Some("skip_next".into()),
+                label: None,
+                active: None,
+            },
+            on_tap: Some(Action {
+                action: "next".into(),
+                params: None,
+            }),
+            on_long_press: None,
+        });
+    }
+
+    // Podcast/audiobook heuristic: tracks longer than 10 minutes get a seek-forward button
+    if let Some(ref np) = zone.now_playing {
+        if let Some(length) = np.duration {
+            if length > 600.0 {
+                elements.push(Element {
+                    display: Display {
+                        icon: Some("forward_30".into()),
+                        label: None,
+                        active: None,
+                    },
+                    on_tap: Some(Action {
+                        action: "seek_forward".into(),
+                        params: Some(HashMap::from([("seconds".into(), serde_json::json!(30))])),
+                    }),
+                    on_long_press: None,
+                });
+            }
+        }
+    }
+
+    elements
+}
+
+/// Build backward-compatible controls list that mirrors the transport-permission-aware elements.
+fn build_default_controls(zone: &crate::bus::Zone) -> Vec<String> {
+    let mut controls = Vec::new();
+    if zone.is_previous_allowed {
+        controls.push("prev".into());
+    }
+    controls.push("play".into()); // always
+    if zone.is_next_allowed {
+        controls.push("next".into());
+    }
+    controls
+}
+
 /// Build the default manifest from aggregator state. This produces screens
-/// that are pixel-identical to what the current hardcoded firmware renders.
+/// that are pixel-identical to what the current hardcoded firmware renders,
+/// but now context-aware: transport elements are only included when allowed.
 async fn build_default_manifest(
     state: &AppState,
     zone: &crate::bus::Zone,
@@ -325,13 +420,40 @@ async fn build_default_manifest(
         });
     }
 
+    // Context-aware elements and backward-compat controls
+    let elements = build_default_elements(zone);
+    let controls = build_default_controls(zone);
+
+    // v2 encoder for media screen
+    let encoder = Encoder {
+        cw: Action {
+            action: "volume_up".into(),
+            params: None,
+        },
+        ccw: Action {
+            action: "volume_down".into(),
+            params: None,
+        },
+        press: Some(Action {
+            action: "toggle_playback".into(),
+            params: None,
+        }),
+        long_press: Some(Action {
+            action: "show_zone_picker".into(),
+            params: None,
+        }),
+    };
+
     let media = Screen::Media(MediaScreen {
         id: "now_playing".to_string(),
         image_url: Some(image_url),
         image_key,
         background_color,
         lines,
-        controls: None,
+        // Backward-compat v1 controls (transport-permission-aware)
+        controls: Some(controls),
+        elements: Some(elements),
+        encoder: Some(encoder),
     });
 
     // Zones list screen
@@ -348,6 +470,7 @@ async fn build_default_manifest(
 }
 
 /// Build the zones list screen from zone info.
+/// Each list item includes an on_tap action to select that zone.
 fn build_zones_screen(zones: &[ZoneInfo], current_zone_id: &str) -> Screen {
     let items = zones
         .iter()
@@ -357,12 +480,280 @@ fn build_zones_screen(zones: &[ZoneInfo], current_zone_id: &str) -> Screen {
             sublabel: Some(z.state.clone()),
             selected: z.zone_id == current_zone_id,
             icon: None,
+            on_tap: Some(Action {
+                action: "select_zone".into(),
+                params: Some(HashMap::from([(
+                    "zone_id".into(),
+                    serde_json::json!(z.zone_id),
+                )])),
+            }),
         })
         .collect();
+
+    // v2 encoder for zones list screen
+    let zones_encoder = Encoder {
+        cw: Action {
+            action: "list_scroll_down".into(),
+            params: None,
+        },
+        ccw: Action {
+            action: "list_scroll_up".into(),
+            params: None,
+        },
+        press: Some(Action {
+            action: "list_select".into(),
+            params: None,
+        }),
+        long_press: None,
+    };
 
     Screen::List(ListScreen {
         id: "zones".to_string(),
         title: Some("Zones".to_string()),
         items,
+        encoder: Some(zones_encoder),
     })
+}
+
+// ── GET /api/actions ────────────────────────────────────────────────────────
+
+/// Metadata for a single available action.
+#[derive(serde::Serialize)]
+pub struct ActionInfo {
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub has_params: bool,
+}
+
+/// Return the list of available actions with metadata.
+///
+/// Used by the Configurator (Phase 4) and LLM generation to know what actions
+/// can be wired to elements, encoders, and list items.
+pub async fn actions_handler() -> Json<Vec<ActionInfo>> {
+    Json(vec![
+        ActionInfo {
+            name: "toggle_playback".into(),
+            description: "Play if paused, pause if playing".into(),
+            category: "transport".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "play".into(),
+            description: "Start playback".into(),
+            category: "transport".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "pause".into(),
+            description: "Pause playback".into(),
+            category: "transport".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "stop".into(),
+            description: "Stop playback".into(),
+            category: "transport".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "next".into(),
+            description: "Skip to next track".into(),
+            category: "transport".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "previous".into(),
+            description: "Go to previous track".into(),
+            category: "transport".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "seek_forward".into(),
+            description: "Seek forward by seconds".into(),
+            category: "transport".into(),
+            has_params: true,
+        },
+        ActionInfo {
+            name: "seek_backward".into(),
+            description: "Seek backward by seconds".into(),
+            category: "transport".into(),
+            has_params: true,
+        },
+        ActionInfo {
+            name: "volume_up".into(),
+            description: "Increase volume by one step".into(),
+            category: "volume".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "volume_down".into(),
+            description: "Decrease volume by one step".into(),
+            category: "volume".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "toggle_mute".into(),
+            description: "Toggle mute on/off".into(),
+            category: "volume".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "mute".into(),
+            description: "Mute the zone".into(),
+            category: "volume".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "unmute".into(),
+            description: "Unmute the zone".into(),
+            category: "volume".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "show_zone_picker".into(),
+            description: "Show the zone selection screen".into(),
+            category: "navigation".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "select_zone".into(),
+            description: "Switch to a specific zone".into(),
+            category: "zone".into(),
+            has_params: true,
+        },
+        ActionInfo {
+            name: "list_scroll_up".into(),
+            description: "Scroll list up by one item".into(),
+            category: "navigation".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "list_scroll_down".into(),
+            description: "Scroll list down by one item".into(),
+            category: "navigation".into(),
+            has_params: false,
+        },
+        ActionInfo {
+            name: "list_select".into(),
+            description: "Select the focused list item".into(),
+            category: "navigation".into(),
+            has_params: false,
+        },
+    ])
+}
+
+// ── GET /api/icons ─────────────────────────────────────────────────────────
+
+/// Metadata for an available icon.
+#[derive(serde::Serialize)]
+pub struct IconInfo {
+    /// Icon name as used in element display.icon (Material Symbols name)
+    pub name: String,
+    /// Human-readable label
+    pub label: String,
+    /// Category for grouping in UI
+    pub category: String,
+}
+
+/// Return the list of icons the firmware can render.
+///
+/// Used by the Configurator icon picker and LLM generation prompt
+/// to know which icons are available on the device.
+pub async fn icons_handler() -> Json<Vec<IconInfo>> {
+    Json(vec![
+        // Media transport
+        IconInfo {
+            name: "play_arrow".into(),
+            label: "Play".into(),
+            category: "transport".into(),
+        },
+        IconInfo {
+            name: "pause".into(),
+            label: "Pause".into(),
+            category: "transport".into(),
+        },
+        IconInfo {
+            name: "stop".into(),
+            label: "Stop".into(),
+            category: "transport".into(),
+        },
+        IconInfo {
+            name: "skip_previous".into(),
+            label: "Previous".into(),
+            category: "transport".into(),
+        },
+        IconInfo {
+            name: "skip_next".into(),
+            label: "Next".into(),
+            category: "transport".into(),
+        },
+        IconInfo {
+            name: "shuffle".into(),
+            label: "Shuffle".into(),
+            category: "transport".into(),
+        },
+        IconInfo {
+            name: "repeat".into(),
+            label: "Repeat".into(),
+            category: "transport".into(),
+        },
+        IconInfo {
+            name: "repeat_one".into(),
+            label: "Repeat One".into(),
+            category: "transport".into(),
+        },
+        // Seek / skip
+        IconInfo {
+            name: "forward_5".into(),
+            label: "Forward 5s".into(),
+            category: "seek".into(),
+        },
+        IconInfo {
+            name: "forward_10".into(),
+            label: "Forward 10s".into(),
+            category: "seek".into(),
+        },
+        IconInfo {
+            name: "forward_30".into(),
+            label: "Forward 30s".into(),
+            category: "seek".into(),
+        },
+        IconInfo {
+            name: "replay_5".into(),
+            label: "Replay 5s".into(),
+            category: "seek".into(),
+        },
+        IconInfo {
+            name: "replay_10".into(),
+            label: "Replay 10s".into(),
+            category: "seek".into(),
+        },
+        IconInfo {
+            name: "replay_30".into(),
+            label: "Replay 30s".into(),
+            category: "seek".into(),
+        },
+        // Volume
+        IconInfo {
+            name: "volume_up".into(),
+            label: "Volume Up".into(),
+            category: "volume".into(),
+        },
+        IconInfo {
+            name: "volume_down".into(),
+            label: "Volume Down".into(),
+            category: "volume".into(),
+        },
+        IconInfo {
+            name: "volume_mute".into(),
+            label: "Volume Mute".into(),
+            category: "volume".into(),
+        },
+        IconInfo {
+            name: "volume_off".into(),
+            label: "Volume Off".into(),
+            category: "volume".into(),
+        },
+    ])
 }

@@ -423,6 +423,9 @@ mod server {
                     .post(knobs::manifest_routes::knob_manifest_push_handler)
                     .delete(knobs::manifest_routes::knob_manifest_clear_handler),
             )
+            // Available actions and icons metadata (used by Configurator and LLM generation)
+            .route("/api/actions", get(knobs::manifest_routes::actions_handler))
+            .route("/api/icons", get(knobs::manifest_routes::icons_handler))
             // LLM-driven manifest generation (license-gated, Issue #290)
             .route(
                 "/api/manifest/generate",

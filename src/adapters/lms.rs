@@ -918,6 +918,14 @@ impl LmsAdapter {
                     json!(format!("{}{}", prefix, v)),
                 ]
             }
+            "seek_forward" => {
+                let secs = value.unwrap_or(30);
+                vec![json!("time"), json!(format!("+{}", secs))]
+            }
+            "seek_backward" => {
+                let secs = value.unwrap_or(30);
+                vec![json!("time"), json!(format!("-{}", secs))]
+            }
             _ => return Err(anyhow!("Unknown command: {}", command)),
         };
 

@@ -233,6 +233,101 @@ async fn build_response(state: &AppState, _client_sha: &str, zone_id: &str) -> [
     resp
 }
 
+/// Build context-aware elements for the media screen (mirrors manifest_routes.rs logic).
+fn build_default_elements_for_zone(
+    zone: &crate::bus::Zone,
+) -> Vec<crate::knobs::manifest::Element> {
+    use crate::knobs::manifest::*;
+    use std::collections::HashMap;
+
+    let mut elements = Vec::new();
+
+    // Previous — only if allowed
+    if zone.is_previous_allowed {
+        elements.push(Element {
+            display: Display {
+                icon: Some("skip_previous".into()),
+                label: None,
+                active: None,
+            },
+            on_tap: Some(Action {
+                action: "previous".into(),
+                params: None,
+            }),
+            on_long_press: None,
+        });
+    }
+
+    // Play/Pause — always present, icon reflects current state
+    let is_playing = zone.state == crate::bus::PlaybackState::Playing;
+    elements.push(Element {
+        display: Display {
+            icon: Some(if is_playing { "pause" } else { "play_arrow" }.into()),
+            label: None,
+            active: None,
+        },
+        on_tap: Some(Action {
+            action: "toggle_playback".into(),
+            params: None,
+        }),
+        on_long_press: Some(Action {
+            action: "stop".into(),
+            params: None,
+        }),
+    });
+
+    // Next — only if allowed
+    if zone.is_next_allowed {
+        elements.push(Element {
+            display: Display {
+                icon: Some("skip_next".into()),
+                label: None,
+                active: None,
+            },
+            on_tap: Some(Action {
+                action: "next".into(),
+                params: None,
+            }),
+            on_long_press: None,
+        });
+    }
+
+    // Podcast/audiobook heuristic: tracks longer than 10 minutes get a seek-forward button
+    if let Some(ref np) = zone.now_playing {
+        if let Some(length) = np.duration {
+            if length > 600.0 {
+                elements.push(Element {
+                    display: Display {
+                        icon: Some("forward_30".into()),
+                        label: None,
+                        active: None,
+                    },
+                    on_tap: Some(Action {
+                        action: "seek_forward".into(),
+                        params: Some(HashMap::from([("seconds".into(), serde_json::json!(30))])),
+                    }),
+                    on_long_press: None,
+                });
+            }
+        }
+    }
+
+    elements
+}
+
+/// Build backward-compatible controls list that mirrors the transport-permission-aware elements.
+fn build_default_controls_for_zone(zone: &crate::bus::Zone) -> Vec<String> {
+    let mut controls = Vec::new();
+    if zone.is_previous_allowed {
+        controls.push("prev".into());
+    }
+    controls.push("play".into()); // always
+    if zone.is_next_allowed {
+        controls.push("next".into());
+    }
+    controls
+}
+
 /// Build default screens for SHA computation (mirrors manifest_routes.rs build_default_manifest).
 async fn build_default_screens(
     state: &AppState,
@@ -294,13 +389,39 @@ async fn build_default_screens(
         });
     }
 
+    // Context-aware elements and backward-compat controls (mirrors manifest_routes.rs)
+    let elements = build_default_elements_for_zone(zone);
+    let controls = build_default_controls_for_zone(zone);
+
+    // v2 encoder for media screen
+    let encoder = Encoder {
+        cw: Action {
+            action: "volume_up".into(),
+            params: None,
+        },
+        ccw: Action {
+            action: "volume_down".into(),
+            params: None,
+        },
+        press: Some(Action {
+            action: "toggle_playback".into(),
+            params: None,
+        }),
+        long_press: Some(Action {
+            action: "show_zone_picker".into(),
+            params: None,
+        }),
+    };
+
     let media = Screen::Media(MediaScreen {
         id: "now_playing".to_string(),
         image_url: Some(image_url),
         image_key,
         background_color,
         lines,
-        controls: None,
+        controls: Some(controls),
+        elements: Some(elements),
+        encoder: Some(encoder),
     });
 
     let zone_infos = get_all_zones_internal(state).await;
@@ -316,11 +437,13 @@ async fn build_default_screens(
 }
 
 /// Build zones list screen (mirrors manifest_routes.rs).
+/// Each list item includes an on_tap action to select that zone.
 fn build_zones_screen(
     zones: &[crate::knobs::routes::ZoneInfo],
     current_zone_id: &str,
 ) -> crate::knobs::manifest::Screen {
     use crate::knobs::manifest::*;
+    use std::collections::HashMap;
 
     let items = zones
         .iter()
@@ -330,13 +453,38 @@ fn build_zones_screen(
             sublabel: Some(z.state.clone()),
             selected: z.zone_id == current_zone_id,
             icon: None,
+            on_tap: Some(Action {
+                action: "select_zone".into(),
+                params: Some(HashMap::from([(
+                    "zone_id".into(),
+                    serde_json::json!(z.zone_id),
+                )])),
+            }),
         })
         .collect();
+
+    // v2 encoder for zones list screen
+    let zones_encoder = Encoder {
+        cw: Action {
+            action: "list_scroll_down".into(),
+            params: None,
+        },
+        ccw: Action {
+            action: "list_scroll_up".into(),
+            params: None,
+        },
+        press: Some(Action {
+            action: "list_select".into(),
+            params: None,
+        }),
+        long_press: None,
+    };
 
     Screen::List(ListScreen {
         id: "zones".to_string(),
         title: Some("Zones".to_string()),
         items,
+        encoder: Some(zones_encoder),
     })
 }
 

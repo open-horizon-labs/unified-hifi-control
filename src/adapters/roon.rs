@@ -10,7 +10,7 @@ use roon_api::{
     },
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
-    transport::{self, volume, Control, Transport, Zone as RoonZone},
+    transport::{self, volume, Control, Seek, Transport, Zone as RoonZone},
     CoreEvent, Info, Parsed, RoonApi, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
@@ -504,6 +504,23 @@ impl RoonAdapter {
             volume::Mute::Unmute
         };
         transport.mute(&output_id, &how).await;
+        Ok(())
+    }
+
+    /// Seek relative to current position (positive = forward, negative = backward)
+    pub async fn seek_relative(&self, zone_id: &str, seconds: i32) -> Result<()> {
+        let zone_id = strip_roon_prefix(zone_id);
+
+        // Clone transport while holding lock, then release before await
+        let transport = {
+            let state = self.state.read().await;
+            state
+                .transport
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Not connected to Roon"))?
+        };
+
+        transport.seek(zone_id, &Seek::Relative, seconds).await;
         Ok(())
     }
 

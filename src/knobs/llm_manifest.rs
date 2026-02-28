@@ -156,39 +156,69 @@ pub fn build_system_prompt(current_manifest_json: &str) -> String {
     format!(
         r#"You are a HiPhi Dial manifest generator. You produce JSON manifests that configure what a physical audio control device displays and how its inputs behave.
 
-## Manifest JSON Schema
+## Manifest JSON Schema (v2 command-pattern)
 
 A manifest has these top-level fields:
 - screens: array of screen objects (types: media, list, card, progress, status)
 - nav: {{ order: [screen_ids], default: screen_id }}
-- interactions: object mapping physical input names to action names (optional)
 
-A media screen has:
+A media screen uses the command-pattern schema:
 - type: "media"
 - id: string
-- controls: array of button names to show (optional — absent means show all defaults)
-- image_url: string (optional)
 - lines: array of {{ text, style }} where style is "title", "subtitle", or "detail"
+- elements: array of element objects (see below) — determines which buttons appear
+- encoder: object with cw, ccw, press, long_press fields
 
-## Available Controls (buttons on media screen)
-prev, play, next, mute
+## Element Schema
+Each element is a self-contained {{display, behavior}} unit:
+```json
+{{
+  "display": {{
+    "icon": "skip_previous",   // Material Symbols icon name
+    "label": null,             // optional text label
+    "active": null             // optional boolean highlight
+  }},
+  "on_tap": {{ "action": "previous", "params": null }},
+  "on_long_press": null
+}}
+```
+
+## Encoder Schema
+```json
+{{
+  "cw": {{ "action": "volume_up" }},
+  "ccw": {{ "action": "volume_down" }},
+  "press": {{ "action": "toggle_playback" }},
+  "long_press": {{ "action": "show_zone_picker" }}
+}}
+```
 
 ## Available Actions
-toggle_playback, play, pause, next, previous, stop, volume_up, volume_down, mute, unmute, toggle_mute
+toggle_playback, play, pause, next, previous, stop,
+volume_up, volume_down, toggle_mute, mute, unmute,
+show_zone_picker, list_scroll_up, list_scroll_down, list_select,
+seek_forward (skip ahead in track), seek_backward (skip back in track),
+select_zone (select the highlighted zone in the zone picker list)
 
-## Physical Inputs (Knob device)
-encoder_cw, encoder_ccw, encoder_press, encoder_long_press, button_prev, button_play, button_next, swipe_left, swipe_right
+## Available Icon Names (Material Symbols)
+Transport: skip_previous, play_arrow, pause, stop, skip_next, shuffle, repeat, repeat_one
+Seek: forward_5, forward_10, forward_30, replay_5, replay_10, replay_30
+Volume: volume_up, volume_down, volume_mute, volume_off
+Other: music_note, settings
+
+## Maximum Elements
+Up to 6 elements per media screen.
 
 ## Current Manifest
 {current_manifest_json}
 
 ## Rules
-1. Preserve all screens and fields the user didn't mention
-2. controls[] on the media screen determines which buttons appear. Omit a button to hide it.
-3. interactions{{}} maps physical inputs to actions. Unmapped inputs do nothing.
-4. Always keep encoder_cw→volume_up and encoder_ccw→volume_down (safety)
-5. If adding a mute button, map it in controls AND map a physical input to toggle_mute in interactions
-6. Return ONLY valid JSON — no explanation, no markdown fences, just the JSON object"#
+1. Preserve all screens and fields the user didn't mention.
+2. The elements[] array on the media screen determines which buttons appear. Remove an element to hide that button.
+3. SAFETY GUARDRAIL: encoder.cw must always be volume_up and encoder.ccw must always be volume_down. Never change these.
+4. encoder.press and encoder.long_press are configurable.
+5. Do not include "controls" or "interactions" fields — those are deprecated v1 fields. Use elements + encoder only.
+6. Return ONLY valid JSON — no explanation, no markdown fences, just the JSON object."#
     )
 }
 
@@ -388,6 +418,8 @@ pub async fn generate_manifest_handler(
 
 // ── Validation ───────────────────────────────────────────────────────────────
 
+const MAX_ELEMENTS: usize = 6;
+
 /// Validate a parsed manifest against known controls, actions, and inputs.
 /// Returns `Ok(())` if valid, `Err(message)` describing the first problem found.
 pub fn validate_manifest(parsed: &ParsedManifest) -> Result<(), String> {
@@ -404,6 +436,13 @@ pub fn validate_manifest(parsed: &ParsedManifest) -> Result<(), String> {
         "mute",
         "unmute",
         "toggle_mute",
+        "show_zone_picker",
+        "list_scroll_up",
+        "list_scroll_down",
+        "list_select",
+        "seek_forward",
+        "seek_backward",
+        "select_zone",
     ];
     let valid_inputs = [
         "encoder_cw",
@@ -417,9 +456,9 @@ pub fn validate_manifest(parsed: &ParsedManifest) -> Result<(), String> {
         "swipe_right",
     ];
 
-    // Validate controls on media screens
     for screen in &parsed.screens {
         if let Screen::Media(media) = screen {
+            // Validate v1 controls (backward compat)
             if let Some(controls) = &media.controls {
                 for c in controls {
                     if !valid_controls.contains(&c.as_str()) {
@@ -430,10 +469,105 @@ pub fn validate_manifest(parsed: &ParsedManifest) -> Result<(), String> {
                     }
                 }
             }
+
+            // Validate v2 elements
+            if let Some(elements) = &media.elements {
+                if elements.len() > MAX_ELEMENTS {
+                    return Err(format!(
+                        "Too many elements: {} (max {})",
+                        elements.len(),
+                        MAX_ELEMENTS
+                    ));
+                }
+                for (i, elem) in elements.iter().enumerate() {
+                    if let Some(ref tap) = elem.on_tap {
+                        if !valid_actions.contains(&tap.action.as_str()) {
+                            return Err(format!(
+                                "Element[{}].on_tap: unknown action '{}'. Valid: {:?}",
+                                i, tap.action, valid_actions
+                            ));
+                        }
+                    }
+                    if let Some(ref lp) = elem.on_long_press {
+                        if !valid_actions.contains(&lp.action.as_str()) {
+                            return Err(format!(
+                                "Element[{}].on_long_press: unknown action '{}'. Valid: {:?}",
+                                i, lp.action, valid_actions
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Validate v2 encoder
+            if let Some(ref encoder) = media.encoder {
+                // Safety guardrail: CW must be volume_up, CCW must be volume_down
+                if encoder.cw.action != "volume_up" {
+                    return Err(format!(
+                        "Safety: encoder.cw must be 'volume_up', got '{}'",
+                        encoder.cw.action
+                    ));
+                }
+                if encoder.ccw.action != "volume_down" {
+                    return Err(format!(
+                        "Safety: encoder.ccw must be 'volume_down', got '{}'",
+                        encoder.ccw.action
+                    ));
+                }
+                if let Some(ref press) = encoder.press {
+                    if !valid_actions.contains(&press.action.as_str()) {
+                        return Err(format!(
+                            "encoder.press: unknown action '{}'. Valid: {:?}",
+                            press.action, valid_actions
+                        ));
+                    }
+                }
+                if let Some(ref lp) = encoder.long_press {
+                    if !valid_actions.contains(&lp.action.as_str()) {
+                        return Err(format!(
+                            "encoder.long_press: unknown action '{}'. Valid: {:?}",
+                            lp.action, valid_actions
+                        ));
+                    }
+                }
+            }
+        } else if let Screen::List(list) = screen {
+            // Validate list screen encoder actions against the whitelist.
+            // No volume lock here — list screens use list_scroll_down/list_scroll_up for CW/CCW.
+            if let Some(ref encoder) = list.encoder {
+                if !valid_actions.contains(&encoder.cw.action.as_str()) {
+                    return Err(format!(
+                        "list encoder.cw: unknown action '{}'. Valid: {:?}",
+                        encoder.cw.action, valid_actions
+                    ));
+                }
+                if !valid_actions.contains(&encoder.ccw.action.as_str()) {
+                    return Err(format!(
+                        "list encoder.ccw: unknown action '{}'. Valid: {:?}",
+                        encoder.ccw.action, valid_actions
+                    ));
+                }
+                if let Some(ref press) = encoder.press {
+                    if !valid_actions.contains(&press.action.as_str()) {
+                        return Err(format!(
+                            "list encoder.press: unknown action '{}'. Valid: {:?}",
+                            press.action, valid_actions
+                        ));
+                    }
+                }
+                if let Some(ref lp) = encoder.long_press {
+                    if !valid_actions.contains(&lp.action.as_str()) {
+                        return Err(format!(
+                            "list encoder.long_press: unknown action '{}'. Valid: {:?}",
+                            lp.action, valid_actions
+                        ));
+                    }
+                }
+            }
         }
     }
 
-    // Validate interactions
+    // Validate interactions (v1 backward compat)
     if let Some(interactions) = &parsed.interactions {
         for (input, action) in interactions {
             if !valid_inputs.contains(&input.as_str()) {
@@ -450,7 +584,7 @@ pub fn validate_manifest(parsed: &ParsedManifest) -> Result<(), String> {
             }
         }
 
-        // Safety: volume controls must be preserved
+        // Safety: volume controls must be preserved when interactions present
         let has_vol_up = interactions
             .get("encoder_cw")
             .is_some_and(|a| a == "volume_up");
@@ -596,6 +730,8 @@ mod tests {
                 style: "title".to_string(),
             }],
             controls: Some(vec!["next".to_string(), "mute".to_string()]),
+            elements: None,
+            encoder: None,
         };
 
         let json = serde_json::to_value(&media).expect("should serialize");
@@ -612,6 +748,8 @@ mod tests {
             background_color: None,
             lines: vec![],
             controls: None,
+            elements: None,
+            encoder: None,
         };
 
         let json = serde_json::to_value(&media).expect("should serialize");
@@ -742,6 +880,8 @@ mod tests {
                     "play".to_string(),
                     "next".to_string(),
                 ]),
+                elements: None,
+                encoder: None,
             })],
             nav: Nav {
                 order: vec!["now_playing".to_string()],
