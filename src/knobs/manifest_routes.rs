@@ -13,6 +13,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use std::collections::HashMap;
+
 use crate::api::AppState;
 use crate::knobs::manifest::*;
 use crate::knobs::routes::{get_all_zones_internal, ZoneInfo};
@@ -27,12 +29,13 @@ pub struct ManifestStore {
     pushed: Arc<RwLock<Option<PushedManifest>>>,
 }
 
-/// A manifest pushed by Memex, with its screens + nav.
+/// A manifest pushed by Memex, with its screens + nav + interactions.
 /// The bridge merges real-time `fast` state from the aggregator at serve time.
 #[derive(Debug, Clone)]
 struct PushedManifest {
     screens: Vec<Screen>,
     nav: Nav,
+    interactions: Option<HashMap<String, String>>,
     sha: String,
 }
 
@@ -43,8 +46,23 @@ impl ManifestStore {
 
     /// Store a Memex-pushed manifest. Bridge will serve this instead of the default.
     pub async fn set(&self, screens: Vec<Screen>, nav: Nav) {
-        let sha = compute_manifest_sha(&screens, &nav);
-        *self.pushed.write().await = Some(PushedManifest { screens, nav, sha });
+        self.set_full(screens, nav, None).await;
+    }
+
+    /// Store a manifest with interactions (used by LLM generation).
+    pub async fn set_full(
+        &self,
+        screens: Vec<Screen>,
+        nav: Nav,
+        interactions: Option<HashMap<String, String>>,
+    ) {
+        let sha = compute_manifest_sha_full(&screens, &nav, &interactions);
+        *self.pushed.write().await = Some(PushedManifest {
+            screens,
+            nav,
+            interactions,
+            sha,
+        });
     }
 
     /// Clear the pushed manifest (Memex disconnected). Bridge falls back to default.
@@ -60,6 +78,19 @@ impl ManifestStore {
     /// Get the SHA of the pushed manifest (if any). Used by UDP fast-path.
     pub async fn get_pushed_sha(&self) -> Option<String> {
         self.pushed.read().await.as_ref().map(|p| p.sha.clone())
+    }
+
+    /// Get the current full manifest as a Manifest struct (for LLM context).
+    /// Returns None if no manifest has been pushed and no zone_id is provided.
+    pub async fn get_current_manifest_json(&self) -> Option<serde_json::Value> {
+        let pushed = self.pushed.read().await;
+        pushed.as_ref().map(|p| {
+            serde_json::json!({
+                "screens": p.screens,
+                "nav": p.nav,
+                "interactions": p.interactions,
+            })
+        })
     }
 }
 
@@ -77,6 +108,8 @@ pub struct ManifestQuery {
 pub struct PushManifestBody {
     pub screens: Vec<Screen>,
     pub nav: Nav,
+    #[serde(default)]
+    pub interactions: Option<HashMap<String, String>>,
 }
 
 // ── GET /knob/manifest ──────────────────────────────────────────────────────
@@ -149,13 +182,13 @@ pub async fn knob_manifest_handler(
     // Check if Memex has pushed a manifest
     let pushed = state.manifests.get().await;
 
-    let (screens, nav, sha) = if let Some(pushed) = pushed {
-        (pushed.screens, pushed.nav, pushed.sha)
+    let (screens, nav, interactions, sha) = if let Some(pushed) = pushed {
+        (pushed.screens, pushed.nav, pushed.interactions, pushed.sha)
     } else {
         // Generate default manifest from aggregator state
         let (screens, nav) = build_default_manifest(&state, &zone, &zone_id).await;
         let sha = compute_manifest_sha(&screens, &nav);
-        (screens, nav, sha)
+        (screens, nav, None, sha)
     };
 
     // SHA match: screens unchanged, return only fast state + sha (smaller payload)
@@ -176,6 +209,7 @@ pub async fn knob_manifest_handler(
         fast,
         screens,
         nav,
+        interactions,
     };
 
     Ok(Json(manifest).into_response())
@@ -189,7 +223,10 @@ pub async fn knob_manifest_push_handler(
     Json(body): Json<PushManifestBody>,
 ) -> StatusCode {
     tracing::info!(screens = body.screens.len(), "Manifest pushed by Memex");
-    state.manifests.set(body.screens, body.nav).await;
+    state
+        .manifests
+        .set_full(body.screens, body.nav, body.interactions)
+        .await;
     StatusCode::NO_CONTENT
 }
 
@@ -266,6 +303,7 @@ async fn build_default_manifest(
         image_key,
         background_color,
         lines,
+        controls: None,
     });
 
     // Zones list screen

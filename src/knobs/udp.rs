@@ -300,6 +300,7 @@ async fn build_default_screens(
         image_key,
         background_color,
         lines,
+        controls: None,
     });
 
     let zone_infos = get_all_zones_internal(state).await;
