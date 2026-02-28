@@ -423,6 +423,11 @@ mod server {
                     .post(knobs::manifest_routes::knob_manifest_push_handler)
                     .delete(knobs::manifest_routes::knob_manifest_clear_handler),
             )
+            // LLM-driven manifest generation (license-gated, Issue #290)
+            .route(
+                "/api/manifest/generate",
+                post(knobs::llm_manifest::generate_manifest_handler),
+            )
             // Knob protocol routes (firmware uses these paths directly)
             .route("/now_playing", get(knobs::knob_now_playing_handler))
             .route("/now_playing/image", get(knobs::knob_image_handler))

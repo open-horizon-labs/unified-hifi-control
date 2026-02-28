@@ -77,6 +77,7 @@ GET /upnp/zones
 GET /zones
 POST /admin/fetch-firmware
 POST /api/config/license
+POST /api/manifest/generate
 POST /api/settings
 POST /control
 POST /hqp/detect
