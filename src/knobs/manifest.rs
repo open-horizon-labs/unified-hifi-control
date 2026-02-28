@@ -10,6 +10,7 @@
 //! - `version` enables future schema evolution without breaking old firmware
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Manifest protocol version
 pub const MANIFEST_VERSION: u32 = 1;
@@ -38,6 +39,12 @@ pub struct Manifest {
 
     /// Navigation order and default screen.
     pub nav: Nav,
+
+    /// Input-to-action mapping. Keys are physical inputs (e.g., "encoder_cw"),
+    /// values are action names (e.g., "volume_up"). Optional — when absent,
+    /// firmware uses hardcoded defaults (backward compatible).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interactions: Option<HashMap<String, String>>,
 }
 
 // ── Fast-path state ─────────────────────────────────────────────────────────
@@ -131,6 +138,10 @@ pub struct MediaScreen {
     pub background_color: Option<String>,
     /// Display lines: title, subtitle, detail (firmware renders in order)
     pub lines: Vec<TextLine>,
+    /// Which transport controls to show. e.g., ["prev", "play", "next", "mute"].
+    /// When absent, firmware shows all default buttons (backward compatible).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controls: Option<Vec<String>>,
 }
 
 /// Scrollable list screen.
@@ -215,15 +226,24 @@ fn default_screen() -> String {
 
 // ── SHA computation ─────────────────────────────────────────────────────────
 
-/// Compute SHA for manifest content (screens + nav).
+/// Compute SHA for manifest content (screens + nav + interactions).
 /// Uses the same 8-hex-char prefix convention as zones_sha.
 pub fn compute_manifest_sha(screens: &[Screen], nav: &Nav) -> String {
+    compute_manifest_sha_full(screens, nav, &None)
+}
+
+/// Compute SHA for manifest content including interactions.
+pub fn compute_manifest_sha_full(
+    screens: &[Screen],
+    nav: &Nav,
+    interactions: &Option<HashMap<String, String>>,
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    // Serialize screens + nav deterministically via serde_json
+    // Serialize screens + nav + interactions deterministically via serde_json
     // This is fine for change detection — exact bytes don't matter,
     // only that the same content produces the same hash.
-    if let Ok(json) = serde_json::to_string(&(screens, nav)) {
+    if let Ok(json) = serde_json::to_string(&(screens, nav, interactions)) {
         hasher.update(json.as_bytes());
     }
     let result = hasher.finalize();
