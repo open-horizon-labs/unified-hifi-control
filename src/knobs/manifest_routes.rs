@@ -220,7 +220,7 @@ pub async fn knob_manifest_handler(
         (pushed.screens, pushed.nav, pushed.interactions, pushed.sha)
     } else {
         // Generate default manifest from aggregator state
-        let (screens, nav) = build_default_manifest(&state, &zone, &zone_id).await;
+        let (screens, nav) = build_default_manifest(&state, &zone, &prefixed_zone_id).await;
         let sha = compute_manifest_sha(&screens, &nav);
         (screens, nav, None, sha)
     };

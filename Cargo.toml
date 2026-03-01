@@ -35,6 +35,7 @@ server = [
     "dep:mime_guess",
     "dep:http-body-util",
     "dep:rust-mcp-sdk",
+    "dep:once_cell",
 ]
 web = ["dioxus/web"]
 
@@ -129,7 +130,7 @@ resvg = { version = "0.46.0", features = ["default"], optional = true }
 
 # MCP server (server only)
 rust-mcp-sdk = { version = "0.8", default-features = false, features = ["server", "macros", "hyper-server", "sse"], optional = true }
-once_cell = "1.21.3"
+once_cell = { version = "1.21.3", optional = true }
 
 # ============ WEB-ONLY DEPENDENCIES ============
 [target.'cfg(target_arch = "wasm32")'.dependencies]

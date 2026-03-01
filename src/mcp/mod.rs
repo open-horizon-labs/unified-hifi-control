@@ -109,6 +109,49 @@ pub struct HifiPlayItemTool {
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiStatusTool {}
 
+/// Get the current ESP device manifest (layout) for a zone
+#[mcp_tool(
+    name = "esp_get_manifest",
+    description = "Get the current manifest (layout) for a zone's ESP device. Returns screens, elements, and encoder bindings. Returns a message if no custom manifest exists (zone is using default layout). Call before esp_configure to inspect existing layout.",
+    read_only_hint = true
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct EspGetManifestTool {
+    /// Zone ID to query (get from hifi_zones)
+    pub zone_id: String,
+}
+
+/// Configure an ESP device's layout via natural language
+#[mcp_tool(
+    name = "esp_configure",
+    description = "Configure a zone's ESP device layout using natural language. Sends your prompt to an LLM which generates a new manifest and applies it immediately. Requires a Memex license. Example prompts: 'Add a mute button', 'Show 30-second skip for podcasts', 'Remove the previous button'."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct EspConfigureTool {
+    /// Natural language description of the desired layout change
+    pub prompt: String,
+    /// Zone ID to configure (get from hifi_zones)
+    pub zone_id: String,
+}
+
+/// List all actions that can be assigned to ESP device elements
+#[mcp_tool(
+    name = "esp_get_actions",
+    description = "List all actions available for ESP device elements (tap, long-press, encoder turn/press). Use when building an esp_configure prompt that refers to specific actions.",
+    read_only_hint = true
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct EspGetActionsTool {}
+
+/// List all icons available on the ESP device firmware
+#[mcp_tool(
+    name = "esp_get_icons",
+    description = "List all icons the ESP device firmware can render. Use when building an esp_configure prompt that refers to specific icons.",
+    read_only_hint = true
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct EspGetIconsTool {}
+
 /// Get HQPlayer status
 #[mcp_tool(
     name = "hifi_hqplayer_status",
@@ -165,7 +208,11 @@ tool_box!(
         HifiHqplayerStatusTool,
         HifiHqplayerProfilesTool,
         HifiHqplayerLoadProfileTool,
-        HifiHqplayerSetPipelineTool
+        HifiHqplayerSetPipelineTool,
+        EspGetManifestTool,
+        EspConfigureTool,
+        EspGetActionsTool,
+        EspGetIconsTool
     ]
 );
 
@@ -411,8 +458,7 @@ impl ServerHandler for HifiMcpHandler {
             }
 
             HifiTools::HifiSearchTool(args) => {
-                let use_lms = args.zone_id.starts_with("lms:")
-                    || !self.state.roon.is_browse_connected().await;
+                let use_lms = args.zone_id.starts_with("lms:");
 
                 if use_lms {
                     match self
@@ -601,6 +647,102 @@ impl ServerHandler for HifiMcpHandler {
                     ))),
                     Err(e) => Self::error_result(format!("Failed to load profile: {}", e)),
                 }
+            }
+
+            HifiTools::EspGetManifestTool(args) => {
+                match self
+                    .state
+                    .manifests
+                    .get_current_manifest_json(&args.zone_id)
+                    .await
+                {
+                    Some(json) => {
+                        let text = serde_json::to_string_pretty(&json)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        Ok(Self::text_result(text))
+                    }
+                    None => Ok(Self::text_result(format!(
+                        "No custom manifest for zone '{}' — using default layout.",
+                        args.zone_id
+                    ))),
+                }
+            }
+
+            HifiTools::EspConfigureTool(args) => {
+                use crate::knobs::llm_manifest::{
+                    build_system_prompt, parse_manifest_from_llm_text, LlmProxyClient,
+                    RealLlmProxyClient,
+                };
+
+                let license = match self.state.event_reporter.get_license().await {
+                    Some(l) => l,
+                    None => {
+                        return Self::error_result(
+                            "Memex license required for knob_configure".into(),
+                        )
+                    }
+                };
+
+                let current_manifest_json = match self
+                    .state
+                    .manifests
+                    .get_current_manifest_json(&args.zone_id)
+                    .await
+                {
+                    Some(json) => {
+                        serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
+                    }
+                    None => serde_json::to_string_pretty(&serde_json::json!({
+                        "screens": [{"type": "media", "id": "now_playing", "lines": [
+                            {"text": "Now Playing", "style": "title"},
+                            {"text": "Artist", "style": "subtitle"}
+                        ]}],
+                        "nav": {"order": ["now_playing"], "default": "now_playing"}
+                    }))
+                    .unwrap_or_else(|_| "{}".to_string()),
+                };
+
+                let system_prompt = build_system_prompt(&current_manifest_json, "dial");
+                let llm_client = RealLlmProxyClient::new();
+                let llm_response = match llm_client
+                    .call(&system_prompt, &args.prompt, &license)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => return Self::error_result(format!("LLM proxy error: {}", e)),
+                };
+
+                let parsed = match parse_manifest_from_llm_text(&llm_response) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Self::error_result(format!("Failed to parse LLM output: {}", e))
+                    }
+                };
+
+                self.state
+                    .manifests
+                    .set_full(
+                        &args.zone_id,
+                        parsed.screens,
+                        parsed.nav,
+                        parsed.interactions,
+                    )
+                    .await;
+
+                Ok(Self::text_result(format!(
+                    "Manifest updated for zone '{}'. The knob will show the new layout on next poll.",
+                    args.zone_id
+                )))
+            }
+
+            HifiTools::EspGetActionsTool(_) => {
+                let actions = crate::knobs::manifest_routes::actions_handler().await.0;
+                Ok(Self::json_result(&actions))
+            }
+
+            HifiTools::EspGetIconsTool(_) => {
+                let icons = crate::knobs::manifest_routes::icons_handler().await.0;
+                Ok(Self::json_result(&icons))
             }
 
             HifiTools::HifiHqplayerSetPipelineTool(args) => {

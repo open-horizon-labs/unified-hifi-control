@@ -47,33 +47,31 @@ Use GitHub for all task tracking:
 
 ## Building & Running Locally
 
-### Single-binary build (production mode)
-The server embeds WASM/JS assets for single-binary distribution. Build in 3 steps:
+### Single-binary build (production packaging mode)
+The server embeds WASM/JS assets so the released binary is self-contained. Two separate steps because `dx` compiles WASM and `cargo` embeds those assets into the server binary:
 
 ```bash
-# 1. Build WASM assets (only needed when frontend code changes)
+# 1. Compile WASM/JS assets into target/dx/ (re-run only when frontend code changes)
 dx build --fullstack --release '@client' --no-default-features --features web '@server' --features server
 
-# 2. Build server binary with embedded assets
+# 2. Build server binary — embeds the assets produced in step 1
 SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk cargo build --release --bin unified-hifi-control --features server --no-default-features
 
-# 3. Run
+# 3. Run the packaged binary (serves UI + API + mDNS + UDP on port 8088)
 ./target/release/unified-hifi-control
 ```
 
-The binary serves everything on port 8088 — web UI, API, manifest endpoints, mDNS, UDP fast-path.
-
 ### Development mode (hot reload)
-For iterating on the web UI without full rebuilds:
+For iterating on the web UI without a full two-step build:
 
 ```bash
 dx serve
 ```
 
-This compiles both WASM and server with hot-reload. Faster than the single-binary flow but not how we deploy.
+`dx serve` compiles both WASM and server together with live reload. Use this for frontend development — **do not use `dx serve` output for deployment** as assets are served from disk, not embedded.
 
 ### NEVER use `cargo run` alone
-`cargo run --bin unified-hifi-control` builds the server WITHOUT embedded WASM assets. It will crash looking for a `public/` directory. Always use either `dx serve` for development or the 3-step single-binary build above.
+`cargo run --bin unified-hifi-control` builds the server WITHOUT embedded WASM assets. It will crash looking for a `public/` directory. Always use `dx serve` for development or the two-step build above for production.
 
 ### Setting the license (for Configurator)
 ```bash
@@ -253,13 +251,17 @@ MCP (Model Context Protocol) enables AI assistants (Claude, ChatGPT, BoltAI, etc
 | `hifi_zones` | List all playback zones |
 | `hifi_now_playing` | Get current track info |
 | `hifi_control` | Play, pause, next, previous, volume |
-| `hifi_search` | Search library/streaming with rich metadata (title, artist, album, year, genre, duration, image_url) and _play token |
-| `hifi_play_item` | Play a search result via _play token from hifi_search |
+| `hifi_search` | Search library/streaming with rich metadata (title, artist, album, year, genre, duration, image_url) and `_play` token |
+| `hifi_play_item` | Play a search result via `_play` token from hifi_search |
 | `hifi_status` | Bridge connection status |
 | `hifi_hqplayer_status` | HQPlayer pipeline status |
 | `hifi_hqplayer_profiles` | List HQPlayer configs |
 | `hifi_hqplayer_load_profile` | Load HQPlayer config |
 | `hifi_hqplayer_set_pipeline` | Change HQPlayer setting |
+| `esp_get_manifest` | Get current manifest for a zone's ESP device |
+| `esp_configure` | Configure device layout via natural language (license-gated) |
+| `esp_get_actions` | List all available element actions |
+| `esp_get_icons` | List all firmware-renderable icons |
 
 ---
 

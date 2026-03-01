@@ -394,11 +394,12 @@ pub fn Settings() -> Element {
                                         {
                                             use wasm_bindgen_futures::JsFuture;
                                             use web_sys::{Request, RequestInit};
-                                            let window = web_sys::window().unwrap();
-                                            let opts = RequestInit::new();
-                                            opts.set_method("DELETE");
-                                            if let Ok(request) = Request::new_with_str_and_init("/api/config/license", &opts) {
-                                                let _ = JsFuture::from(window.fetch_with_request(&request)).await;
+                                            if let Some(window) = web_sys::window() {
+                                                let opts = RequestInit::new();
+                                                opts.set_method("DELETE");
+                                                if let Ok(request) = Request::new_with_str_and_init("/api/config/license", &opts) {
+                                                    let _ = JsFuture::from(window.fetch_with_request(&request)).await;
+                                                }
                                             }
                                         }
                                         license_configured.set(false);

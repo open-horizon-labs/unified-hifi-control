@@ -4,6 +4,7 @@
 Usage: python3 diagnose_knob.py <bridge_ip> [zone_id]
 """
 import socket, struct, sys, json, urllib.request
+from urllib.parse import quote
 
 BRIDGE_IP = sys.argv[1] if len(sys.argv) > 1 else "192.168.50.225"
 ZONE_ID = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -61,7 +62,7 @@ if test_zone:
     print("=" * 60)
     print(f"2. MANIFEST FOR: {test_zone}")
     print("=" * 60)
-    manifest = fetch_json(f"/knob/manifest?zone_id={test_zone}")
+    manifest = fetch_json(f"/knob/manifest?zone_id={quote(test_zone)}")
     if "_error" in manifest:
         print(f"  ❌ Manifest error: {manifest['_error']}")
     else:

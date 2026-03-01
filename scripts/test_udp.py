@@ -29,7 +29,7 @@ def main():
     if zone_id:
         print(f"  zone_id: {zone_id}")
     else:
-        print(f"  zone_id: (empty — bridge picks first zone)")
+        print("  zone_id: (empty — bridge picks first zone)")
 
     sock.sendto(req, (host, port))
 

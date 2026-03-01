@@ -152,10 +152,15 @@ pub fn extract_text_from_response(response: &serde_json::Value) -> Result<String
 
 // ── System prompt ────────────────────────────────────────────────────────────
 
-/// Build the LLM system prompt with the current manifest embedded.
-pub fn build_system_prompt(current_manifest_json: &str) -> String {
+/// Build the LLM system prompt with the current manifest and device type embedded.
+pub fn build_system_prompt(current_manifest_json: &str, device_type: &str) -> String {
+    let device_desc = match device_type {
+        "frame" => "a rectangular frame display with a touchscreen and physical buttons",
+        "tough" => "a ruggedized rectangular touchscreen device with swipe and tap inputs",
+        _ => "a circular dial device with a rotary encoder, album art display, and up to 6 button elements",
+    };
     format!(
-        r#"You are a HiPhi Dial manifest generator. You produce JSON manifests that configure what a physical audio control device displays and how its inputs behave.
+        r#"You are a HiPhi ESP device manifest generator. You produce JSON manifests that configure what a physical audio control device displays and how its inputs behave. The target device is {device_desc}.
 
 ## Manifest JSON Schema (v2 command-pattern)
 
@@ -356,7 +361,7 @@ pub async fn generate_manifest_handler(
     };
 
     // 3. Build system prompt
-    let system_prompt = build_system_prompt(&current_manifest_json);
+    let system_prompt = build_system_prompt(&current_manifest_json, &req.device_type);
 
     // 4. Call the LLM proxy
     let llm_client = RealLlmProxyClient::new();
@@ -576,6 +581,18 @@ pub fn validate_manifest(parsed: &ParsedManifest) -> Result<(), String> {
                 }
             }
         } else if let Screen::List(list) = screen {
+            // Validate list item on_tap actions
+            for (i, item) in list.items.iter().enumerate() {
+                if let Some(ref tap) = item.on_tap {
+                    if !valid_actions.contains(&tap.action.as_str()) {
+                        return Err(format!(
+                            "list.items[{}].on_tap: unknown action '{}'. Valid: {:?}",
+                            i, tap.action, valid_actions
+                        ));
+                    }
+                }
+            }
+
             // Validate list screen encoder actions against the whitelist.
             // No volume lock here — list screens use list_scroll_down/list_scroll_up for CW/CCW.
             if let Some(ref encoder) = list.encoder {
@@ -655,9 +672,9 @@ mod tests {
     #[test]
     fn test_build_system_prompt_includes_current_manifest() {
         let manifest_json = r#"{"screens":[],"nav":{"order":[],"default":"now_playing"}}"#;
-        let prompt = build_system_prompt(manifest_json);
+        let prompt = build_system_prompt(manifest_json, "dial");
 
-        assert!(prompt.contains("HiPhi Dial manifest generator"));
+        assert!(prompt.contains("HiPhi ESP device manifest generator"));
         assert!(prompt.contains(manifest_json));
         assert!(prompt.contains("command-pattern"));
         assert!(prompt.contains("toggle_mute"));
@@ -814,7 +831,7 @@ mod tests {
             version: MANIFEST_VERSION,
             sha: "abcd1234".to_string(),
             fast: FastState {
-                zone_id: Some("test".to_string()),
+                zone_id: "test".to_string(),
                 is_playing: false,
                 volume: None,
                 volume_min: None,
@@ -849,7 +866,7 @@ mod tests {
             version: MANIFEST_VERSION,
             sha: "abcd1234".to_string(),
             fast: FastState {
-                zone_id: Some("test".to_string()),
+                zone_id: "test".to_string(),
                 is_playing: false,
                 volume: None,
                 volume_min: None,
