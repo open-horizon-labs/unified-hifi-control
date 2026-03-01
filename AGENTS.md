@@ -45,6 +45,45 @@ Use GitHub for all task tracking:
 
 ---
 
+## Building & Running Locally
+
+### Single-binary build (production mode)
+The server embeds WASM/JS assets for single-binary distribution. Build in 3 steps:
+
+```bash
+# 1. Build WASM assets (only needed when frontend code changes)
+dx build --fullstack --release '@client' --no-default-features --features web '@server' --features server
+
+# 2. Build server binary with embedded assets
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk cargo build --release --bin unified-hifi-control --features server --no-default-features
+
+# 3. Run
+./target/release/unified-hifi-control
+```
+
+The binary serves everything on port 8088 — web UI, API, manifest endpoints, mDNS, UDP fast-path.
+
+### Development mode (hot reload)
+For iterating on the web UI without full rebuilds:
+
+```bash
+dx serve
+```
+
+This compiles both WASM and server with hot-reload. Faster than the single-binary flow but not how we deploy.
+
+### NEVER use `cargo run` alone
+`cargo run --bin unified-hifi-control` builds the server WITHOUT embedded WASM assets. It will crash looking for a `public/` directory. Always use either `dx serve` for development or the 3-step single-binary build above.
+
+### Setting the license (for Configurator)
+```bash
+curl -X POST http://localhost:8088/api/config/license \
+  -H "Content-Type: application/json" \
+  -d '{"license":"<JWT>"}'
+```
+
+---
+
 ## Code Review
 
 This project uses two complementary review tools:
