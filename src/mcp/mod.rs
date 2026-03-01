@@ -55,7 +55,7 @@ pub struct HifiNowPlayingTool {
     name = "hifi_control",
     description = "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume"
 )]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct HifiControlTool {
     /// The zone ID to control
     pub zone_id: String,
@@ -66,13 +66,52 @@ pub struct HifiControlTool {
     pub value: Option<f64>,
 }
 
+// Manual json_schema() — derive macro emits "nullable":true which is not JSON Schema 2020-12.
+impl HifiControlTool {
+    pub fn json_schema() -> serde_json::Map<String, serde_json::Value> {
+        let mut schema = serde_json::Map::new();
+        let mut properties = serde_json::Map::new();
+
+        let mut zone_id = serde_json::Map::new();
+        zone_id.insert("type".into(), serde_json::json!("string"));
+        zone_id.insert(
+            "description".into(),
+            serde_json::json!("The zone ID to control"),
+        );
+        properties.insert("zone_id".into(), serde_json::Value::Object(zone_id));
+
+        let mut action = serde_json::Map::new();
+        action.insert("type".into(), serde_json::json!("string"));
+        action.insert(
+            "description".into(),
+            serde_json::json!("Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down"),
+        );
+        properties.insert("action".into(), serde_json::Value::Object(action));
+
+        let mut value = serde_json::Map::new();
+        value.insert("type".into(), serde_json::json!(["number", "null"]));
+        value.insert(
+            "description".into(),
+            serde_json::json!(
+                "For volume actions: the level (0-100 for volume_set) or amount to change"
+            ),
+        );
+        properties.insert("value".into(), serde_json::Value::Object(value));
+
+        schema.insert("type".into(), serde_json::json!("object"));
+        schema.insert("properties".into(), serde_json::Value::Object(properties));
+        schema.insert("required".into(), serde_json::json!(["zone_id", "action"]));
+        schema
+    }
+}
+
 /// Search for music across library and streaming services.
 #[mcp_tool(
     name = "hifi_search",
     description = "Search for music across library and streaming services. Returns items with rich metadata (title, artist, album, year, genre, duration, image_url, source) and a _play token for playback via hifi_play_item. Library results include local files with full metadata. Streaming results include TIDAL/Qobuz items. Results are ready to evaluate and play.",
     read_only_hint = true
 )]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct HifiSearchTool {
     /// Search query (e.g., "Hotel California", "Eagles", "jazz piano")
     pub query: String,
@@ -83,13 +122,54 @@ pub struct HifiSearchTool {
     pub source: Option<String>,
 }
 
+// Manual json_schema() — derive macro emits "nullable":true which is not JSON Schema 2020-12.
+impl HifiSearchTool {
+    pub fn json_schema() -> serde_json::Map<String, serde_json::Value> {
+        let mut schema = serde_json::Map::new();
+        let mut properties = serde_json::Map::new();
+
+        let mut query = serde_json::Map::new();
+        query.insert("type".into(), serde_json::json!("string"));
+        query.insert(
+            "description".into(),
+            serde_json::json!(
+                "Search query (e.g., \"Hotel California\", \"Eagles\", \"jazz piano\")"
+            ),
+        );
+        properties.insert("query".into(), serde_json::Value::Object(query));
+
+        let mut zone_id = serde_json::Map::new();
+        zone_id.insert("type".into(), serde_json::json!("string"));
+        zone_id.insert(
+            "description".into(),
+            serde_json::json!("Zone ID (determines which adapter to search). Required."),
+        );
+        properties.insert("zone_id".into(), serde_json::Value::Object(zone_id));
+
+        let mut source = serde_json::Map::new();
+        source.insert("type".into(), serde_json::json!(["string", "null"]));
+        source.insert(
+            "description".into(),
+            serde_json::json!(
+                "Search source: \"library\" (default), \"tidal\", \"qobuz\". Roon only."
+            ),
+        );
+        properties.insert("source".into(), serde_json::Value::Object(source));
+
+        schema.insert("type".into(), serde_json::json!("object"));
+        schema.insert("properties".into(), serde_json::Value::Object(properties));
+        schema.insert("required".into(), serde_json::json!(["query", "zone_id"]));
+        schema
+    }
+}
+
 /// Play a specific item by passing back keys from hifi_search results.
 /// The caller (LLM) decides what to play; the bridge just executes.
 #[mcp_tool(
     name = "hifi_play_item",
     description = "Play a specific item using keys from a prior hifi_search call. Pass the _play token from search results as the item parameter — do not modify it. The bridge routes to the correct adapter based on zone_id prefix."
 )]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct HifiPlayItemTool {
     /// Zone ID to play on
     pub zone_id: String,
@@ -98,6 +178,44 @@ pub struct HifiPlayItemTool {
     /// Action: "play" (default), "queue", "radio" (Roon only)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+}
+
+// Manual json_schema() — the derive macro maps serde_json::Value to "type":"unknown"
+// which is invalid JSON Schema. We emit "type":"object" instead.
+impl HifiPlayItemTool {
+    pub fn json_schema() -> serde_json::Map<String, serde_json::Value> {
+        let mut schema = serde_json::Map::new();
+        let mut properties = serde_json::Map::new();
+
+        let mut zone_id = serde_json::Map::new();
+        zone_id.insert("type".into(), serde_json::json!("string"));
+        zone_id.insert(
+            "description".into(),
+            serde_json::json!("Zone ID to play on"),
+        );
+        properties.insert("zone_id".into(), serde_json::Value::Object(zone_id));
+
+        let mut item = serde_json::Map::new();
+        item.insert("type".into(), serde_json::json!("object"));
+        item.insert(
+            "description".into(),
+            serde_json::json!("All item fields from search results — pass back as-is"),
+        );
+        properties.insert("item".into(), serde_json::Value::Object(item));
+
+        let mut action = serde_json::Map::new();
+        action.insert("type".into(), serde_json::json!(["string", "null"]));
+        action.insert(
+            "description".into(),
+            serde_json::json!("Action: \"play\" (default), \"queue\", \"radio\" (Roon only)"),
+        );
+        properties.insert("action".into(), serde_json::Value::Object(action));
+
+        schema.insert("type".into(), serde_json::json!("object"));
+        schema.insert("properties".into(), serde_json::Value::Object(properties));
+        schema.insert("required".into(), serde_json::json!(["zone_id", "item"]));
+        schema
+    }
 }
 
 /// Get overall bridge status

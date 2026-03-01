@@ -20,5 +20,9 @@
       "Bash(gh pr comment:*)",
       "Bash(cargo check:*)"
     ]
-  }
+  },
+  "enabledMcpjsonServers": [
+    "unified-hifi-control"
+  ],
+  "enableAllProjectMcpServers": true
 }

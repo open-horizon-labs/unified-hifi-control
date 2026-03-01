@@ -78,6 +78,7 @@ pub fn Nav(props: NavProps) -> Element {
                     }
                     if !hide_knobs {
                         Link { class: nav_link_class("knobs"), to: Route::Knobs {}, "Knobs" }
+                        Link { class: nav_link_class("configurator"), to: Route::Configurator {}, "Configure" }
                     }
                     Link { class: nav_link_class("settings"), to: Route::Settings {}, "Settings" }
                 }
@@ -116,6 +117,7 @@ pub fn Nav(props: NavProps) -> Element {
                     }
                     if !hide_knobs {
                         Link { class: nav_link_class("knobs"), to: Route::Knobs {}, onclick: move |_| menu_open.set(false), "Knobs" }
+                        Link { class: nav_link_class("configurator"), to: Route::Configurator {}, onclick: move |_| menu_open.set(false), "Configure" }
                     }
                     Link { class: nav_link_class("settings"), to: Route::Settings {}, onclick: move |_| menu_open.set(false), "Settings" }
                 }
