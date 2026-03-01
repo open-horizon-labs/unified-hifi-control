@@ -18,8 +18,9 @@ use crate::knobs::manifest::*;
 pub struct GenerateManifestRequest {
     /// Natural language prompt describing desired changes.
     pub prompt: String,
-    /// Zone to apply the generated manifest to.
-    pub zone_id: String,
+    /// Zone to apply the generated manifest to. Optional — uses first available zone if absent.
+    #[serde(default)]
+    pub zone_id: Option<String>,
     /// Device type (e.g., "knob", "frame"). Defaults to "knob".
     #[serde(default = "default_device_type")]
     pub device_type: String,
@@ -321,12 +322,21 @@ pub async fn generate_manifest_handler(
         )
     })?;
 
-    // 2. Get current manifest (pushed or generate a default representation)
-    let current_manifest_json = match state
-        .manifests
-        .get_current_manifest_json(&req.zone_id)
-        .await
-    {
+    // 2. Resolve zone_id — use provided or pick the first available zone
+    let zone_id = match req.zone_id.clone() {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            // Pick first zone from aggregator
+            let zones = state.aggregator.get_zones().await;
+            zones
+                .first()
+                .map(|z| z.zone_id.clone())
+                .unwrap_or_else(|| "default".to_string())
+        }
+    };
+
+    // 3. Get current manifest (pushed or generate a default representation)
+    let current_manifest_json = match state.manifests.get_current_manifest_json(&zone_id).await {
         Some(json) => serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string()),
         None => {
             // No pushed manifest — build a minimal default for context
@@ -389,7 +399,7 @@ pub async fn generate_manifest_handler(
     state
         .manifests
         .set_full(
-            &req.zone_id,
+            &zone_id,
             parsed.screens.clone(),
             parsed.nav.clone(),
             parsed.interactions.clone(),
@@ -397,7 +407,7 @@ pub async fn generate_manifest_handler(
         .await;
 
     tracing::info!(
-        zone_id = %req.zone_id,
+        zone_id = %zone_id,
         screens = parsed.screens.len(),
         device_type = %req.device_type,
         "LLM-generated manifest stored"
@@ -804,7 +814,7 @@ mod tests {
             version: MANIFEST_VERSION,
             sha: "abcd1234".to_string(),
             fast: FastState {
-                zone_id: "test".to_string(),
+                zone_id: Some("test".to_string()),
                 is_playing: false,
                 volume: None,
                 volume_min: None,
@@ -839,7 +849,7 @@ mod tests {
             version: MANIFEST_VERSION,
             sha: "abcd1234".to_string(),
             fast: FastState {
-                zone_id: "test".to_string(),
+                zone_id: Some("test".to_string()),
                 is_playing: false,
                 volume: None,
                 volume_min: None,
