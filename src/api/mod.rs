@@ -2255,7 +2255,7 @@ pub async fn license_handler(
     State(state): State<AppState>,
     Json(req): Json<LicenseRequest>,
 ) -> impl IntoResponse {
-    if req.license.is_empty() {
+    if req.license.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {

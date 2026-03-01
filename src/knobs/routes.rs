@@ -621,6 +621,16 @@ pub async fn knob_control_handler(
     control_roon(&state, &roon_zone_id, &req.action, req.value.as_ref()).await
 }
 
+/// Parse and bound-check seek seconds from an action value.
+/// Defaults to 30 seconds if not specified; clamps to the range [1, 300].
+fn parse_seek_seconds(value: Option<&serde_json::Value>) -> i32 {
+    let secs = value
+        .and_then(|v| v.get("seconds").or(Some(v)))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(30.0) as i32;
+    secs.clamp(1, 300)
+}
+
 /// Control Roon zone
 async fn control_roon(
     state: &AppState,
@@ -636,10 +646,7 @@ async fn control_roon(
         "previous" | "prev" => "previous",
         "stop" => "stop",
         "seek_forward" => {
-            let seconds = value
-                .and_then(|v| v.get("seconds").or(Some(v)))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(30.0) as i32;
+            let seconds = parse_seek_seconds(value);
             state
                 .roon
                 .seek_relative(zone_id, seconds)
@@ -653,10 +660,7 @@ async fn control_roon(
             return Ok(Json(serde_json::json!({"ok": true})));
         }
         "seek_backward" => {
-            let seconds = value
-                .and_then(|v| v.get("seconds").or(Some(v)))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(30.0) as i32;
+            let seconds = parse_seek_seconds(value);
             state
                 .roon
                 .seek_relative(zone_id, -seconds)
@@ -788,10 +792,7 @@ async fn control_lms(
         "previous" | "prev" => "prev",
         "stop" => "stop",
         "seek_forward" => {
-            let seconds = value
-                .and_then(|v| v.get("seconds").or(Some(v)))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(30.0) as i32;
+            let seconds = parse_seek_seconds(value);
             state
                 .lms
                 .control(player_id, "seek_forward", Some(seconds))
@@ -805,10 +806,7 @@ async fn control_lms(
             return Ok(Json(serde_json::json!({"ok": true})));
         }
         "seek_backward" => {
-            let seconds = value
-                .and_then(|v| v.get("seconds").or(Some(v)))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(30.0) as i32;
+            let seconds = parse_seek_seconds(value);
             state
                 .lms
                 .control(player_id, "seek_backward", Some(seconds))

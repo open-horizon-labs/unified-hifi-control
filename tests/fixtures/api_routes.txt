@@ -18,7 +18,9 @@ DELETE /hqp/instances/{name}
 DELETE /knob/manifest
 DELETE /mcp
 GET /admin
+GET /api/actions
 GET /api/config/license
+GET /api/icons
 GET /api/settings
 GET /api/zones
 GET /apple-touch-icon.png

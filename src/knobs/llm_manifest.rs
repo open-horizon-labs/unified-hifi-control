@@ -424,6 +424,32 @@ const MAX_ELEMENTS: usize = 6;
 /// Returns `Ok(())` if valid, `Err(message)` describing the first problem found.
 pub fn validate_manifest(parsed: &ParsedManifest) -> Result<(), String> {
     let valid_controls = ["prev", "play", "next", "mute"];
+    let valid_icons = [
+        // Transport
+        "skip_previous",
+        "play_arrow",
+        "pause",
+        "stop",
+        "skip_next",
+        "shuffle",
+        "repeat",
+        "repeat_one",
+        // Seek
+        "forward_5",
+        "forward_10",
+        "forward_30",
+        "replay_5",
+        "replay_10",
+        "replay_30",
+        // Volume
+        "volume_up",
+        "volume_down",
+        "volume_mute",
+        "volume_off",
+        // Other
+        "music_note",
+        "settings",
+    ];
     let valid_actions = [
         "toggle_playback",
         "play",
@@ -480,6 +506,14 @@ pub fn validate_manifest(parsed: &ParsedManifest) -> Result<(), String> {
                     ));
                 }
                 for (i, elem) in elements.iter().enumerate() {
+                    if let Some(ref icon) = elem.display.icon {
+                        if !valid_icons.contains(&icon.as_str()) {
+                            return Err(format!(
+                                "Element[{}].display.icon: unknown icon '{}'. Valid: {:?}",
+                                i, icon, valid_icons
+                            ));
+                        }
+                    }
                     if let Some(ref tap) = elem.on_tap {
                         if !valid_actions.contains(&tap.action.as_str()) {
                             return Err(format!(

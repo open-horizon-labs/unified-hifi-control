@@ -44,6 +44,15 @@ impl ManifestStore {
         Self::default()
     }
 
+    /// Normalize a zone_id: bare IDs without a colon prefix are assumed to be Roon zones.
+    fn normalize_zone_id(zone_id: &str) -> String {
+        if !zone_id.contains(':') {
+            format!("roon:{}", zone_id)
+        } else {
+            zone_id.to_string()
+        }
+    }
+
     /// Store a Memex-pushed manifest for a specific zone. Bridge will serve
     /// this instead of the default for that zone.
     pub async fn set(&self, zone_id: &str, screens: Vec<Screen>, nav: Nav) {
@@ -58,9 +67,10 @@ impl ManifestStore {
         nav: Nav,
         interactions: Option<HashMap<String, String>>,
     ) {
+        let key = Self::normalize_zone_id(zone_id);
         let sha = compute_manifest_sha_full(&screens, &nav, &interactions);
         self.pushed.write().await.insert(
-            zone_id.to_string(),
+            key,
             PushedManifest {
                 screens,
                 nav,
@@ -75,7 +85,7 @@ impl ManifestStore {
         let mut map = self.pushed.write().await;
         match zone_id {
             Some(id) => {
-                map.remove(id);
+                map.remove(&Self::normalize_zone_id(id));
             }
             None => {
                 map.clear();
@@ -85,19 +95,22 @@ impl ManifestStore {
 
     /// Get the pushed manifest for a specific zone (if present).
     async fn get(&self, zone_id: &str) -> Option<PushedManifest> {
-        self.pushed.read().await.get(zone_id).cloned()
+        let key = Self::normalize_zone_id(zone_id);
+        self.pushed.read().await.get(&key).cloned()
     }
 
     /// Get the SHA of the pushed manifest for a specific zone (if any). Used by UDP fast-path.
     pub async fn get_pushed_sha(&self, zone_id: &str) -> Option<String> {
-        self.pushed.read().await.get(zone_id).map(|p| p.sha.clone())
+        let key = Self::normalize_zone_id(zone_id);
+        self.pushed.read().await.get(&key).map(|p| p.sha.clone())
     }
 
     /// Get the current full manifest for a specific zone as JSON (for LLM context).
     /// Returns None if no manifest has been pushed for the zone.
     pub async fn get_current_manifest_json(&self, zone_id: &str) -> Option<serde_json::Value> {
+        let key = Self::normalize_zone_id(zone_id);
         let pushed = self.pushed.read().await;
-        pushed.get(zone_id).map(|p| {
+        pushed.get(&key).map(|p| {
             serde_json::json!({
                 "screens": p.screens,
                 "nav": p.nav,
@@ -754,6 +767,17 @@ pub async fn icons_handler() -> Json<Vec<IconInfo>> {
             name: "volume_off".into(),
             label: "Volume Off".into(),
             category: "volume".into(),
+        },
+        // Other
+        IconInfo {
+            name: "music_note".into(),
+            label: "Music Note".into(),
+            category: "other".into(),
+        },
+        IconInfo {
+            name: "settings".into(),
+            label: "Settings".into(),
+            category: "other".into(),
         },
     ])
 }
