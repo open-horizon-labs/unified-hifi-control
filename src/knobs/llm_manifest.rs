@@ -796,6 +796,8 @@ mod tests {
             controls: Some(vec!["next".to_string(), "mute".to_string()]),
             elements: None,
             encoder: None,
+            volume_ring: None,
+            progress_ring: None,
         };
 
         let json = serde_json::to_value(&media).expect("should serialize");
@@ -814,6 +816,8 @@ mod tests {
             controls: None,
             elements: None,
             encoder: None,
+            volume_ring: None,
+            progress_ring: None,
         };
 
         let json = serde_json::to_value(&media).expect("should serialize");
@@ -946,6 +950,8 @@ mod tests {
                 ]),
                 elements: None,
                 encoder: None,
+                volume_ring: None,
+                progress_ring: None,
             })],
             nav: Nav {
                 order: vec!["now_playing".to_string()],

@@ -1005,6 +1005,19 @@ fn palette_elements() -> Vec<PaletteElement> {
             description: "Show the zone name",
             category: "Display",
         },
+        // Rings (configurable: color, width, visibility)
+        PaletteElement {
+            icon: "\u{1F535}",
+            label: "Volume Ring",
+            description: "Add a volume ring (configurable color and thickness)",
+            category: "Rings",
+        },
+        PaletteElement {
+            icon: "\u{1F7E0}",
+            label: "Progress Ring",
+            description: "Add a track progress ring (configurable color and thickness)",
+            category: "Rings",
+        },
     ]
 }
 
@@ -1185,17 +1198,11 @@ fn DialPreview(
                     fill: "#1a1a24",
                 }
 
-                // Track rings (dim)
+                // Outer ring — Volume
                 circle {
                     cx: "{cx}", cy: "{cy}", r: "134",
                     fill: "none", stroke: "#2a2a3a", stroke_width: "4",
                 }
-                circle {
-                    cx: "{cx}", cy: "{cy}", r: "124",
-                    fill: "none", stroke: "#2a2a3a", stroke_width: "3",
-                }
-
-                // Volume arc (outer, blue)
                 if let Some(ref path) = vol_arc {
                     path {
                         d: "{path}",
@@ -1203,14 +1210,32 @@ fn DialPreview(
                         stroke_width: "4", stroke_linecap: "round",
                     }
                 }
+                text {
+                    x: "{cx - 90.0}", y: "{cy - 90.0}",
+                    fill: "#4a9eff", font_size: "8",
+                    font_family: "system-ui, sans-serif",
+                    opacity: "0.5",
+                    "Vol"
+                }
 
-                // Seek arc (inner, amber)
+                // Inner ring — Progress
+                circle {
+                    cx: "{cx}", cy: "{cy}", r: "124",
+                    fill: "none", stroke: "#2a2a3a", stroke_width: "3",
+                }
                 if let Some(ref path) = seek_arc {
                     path {
                         d: "{path}",
                         fill: "none", stroke: "#f59e0b",
                         stroke_width: "3", stroke_linecap: "round",
                     }
+                }
+                text {
+                    x: "{cx + 62.0}", y: "{cy - 82.0}",
+                    fill: "#f59e0b", font_size: "8",
+                    font_family: "system-ui, sans-serif",
+                    opacity: "0.5",
+                    "Prog"
                 }
 
                 // LCD display area background

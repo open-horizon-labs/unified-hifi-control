@@ -604,6 +604,8 @@ pub(crate) async fn build_default_manifest(
         controls: Some(controls),
         elements: Some(elements),
         encoder: Some(encoder),
+        volume_ring: None,
+        progress_ring: None,
     });
 
     // Zones list screen

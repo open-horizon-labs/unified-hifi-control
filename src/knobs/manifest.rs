@@ -148,6 +148,12 @@ pub struct MediaScreen {
     /// Per-screen encoder configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoder: Option<Encoder>,
+    /// Volume ring configuration. Absent = default (blue, 8px).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_ring: Option<RingConfig>,
+    /// Progress ring configuration. Absent = default (amber, 6px).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_ring: Option<RingConfig>,
 }
 
 /// Scrollable list screen.
@@ -189,6 +195,20 @@ pub struct StatusScreen {
 }
 
 // ── Shared primitives ───────────────────────────────────────────────────────
+
+/// Configuration for an encoder ring (volume or progress arc).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RingConfig {
+    /// Hex color (e.g. "#4a9eff"). Absent = default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Ring width in pixels. Absent = default (8 for volume, 6 for progress).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u8>,
+    /// Whether the ring is visible. Absent or true = visible. False = hidden.
+    #[serde(default = "crate::knobs::layout_store::default_true")]
+    pub visible: bool,
+}
 
 /// A styled text line within a screen.
 #[derive(Debug, Clone, Serialize, Deserialize)]
