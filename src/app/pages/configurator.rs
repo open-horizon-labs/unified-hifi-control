@@ -992,6 +992,31 @@ fn palette_elements() -> Vec<PaletteElement> {
             description: "Add a mute toggle",
             category: "Volume",
         },
+        // Display
+        PaletteElement {
+            icon: "\u{266B}",
+            label: "Song Title",
+            description: "Show the current song title",
+            category: "Display",
+        },
+        PaletteElement {
+            icon: "\u{1F3A4}",
+            label: "Artist",
+            description: "Show the artist name",
+            category: "Display",
+        },
+        PaletteElement {
+            icon: "\u{1F4BF}",
+            label: "Album",
+            description: "Show the album name",
+            category: "Display",
+        },
+        PaletteElement {
+            icon: "\u{1F3E0}",
+            label: "Zone",
+            description: "Show the zone name",
+            category: "Display",
+        },
     ]
 }
 
