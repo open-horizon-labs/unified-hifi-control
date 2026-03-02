@@ -848,8 +848,18 @@ pub fn Configurator() -> Element {
                 div { class: "card p-4",
                     h3 { class: "text-sm font-semibold mb-3", "Describe your layout" }
                     p { class: "text-xs text-muted mb-3",
-                        "Examples: \"Add a mute button\", \"Show only play/pause for podcasts\", \"Add 30-second skip for long tracks\""
+                        "Describe what you want, or tap an element below to add it."
                     }
+
+                    // ── Element Palette ──────────────────────────────────
+                    ElementPalette { on_select: move |desc: String| {
+                        let current = chat_input().trim().to_string();
+                        if current.is_empty() {
+                            chat_input.set(desc);
+                        } else {
+                            chat_input.set(format!("{}, {}", current, desc.to_lowercase()));
+                        }
+                    }}
 
                     // Chat history
                     div { class: "space-y-2 mb-4 max-h-64 overflow-y-auto",
@@ -896,6 +906,146 @@ pub fn Configurator() -> Element {
             }
 
             } // end licensed
+        }
+    }
+}
+
+// ── Element Palette ──────────────────────────────────────────────────────────
+
+/// Available element definition for the palette.
+struct PaletteElement {
+    icon: &'static str,
+    label: &'static str,
+    description: &'static str,
+    category: &'static str,
+}
+
+/// Returns the available elements grouped by category.
+fn palette_elements() -> Vec<PaletteElement> {
+    vec![
+        // Transport
+        PaletteElement {
+            icon: "\u{25B6}",
+            label: "Play/Pause",
+            description: "Add a play/pause toggle",
+            category: "Transport",
+        },
+        PaletteElement {
+            icon: "\u{23EE}",
+            label: "Previous",
+            description: "Add a previous track button",
+            category: "Transport",
+        },
+        PaletteElement {
+            icon: "\u{23ED}",
+            label: "Next",
+            description: "Add a next track button",
+            category: "Transport",
+        },
+        PaletteElement {
+            icon: "\u{23F9}",
+            label: "Stop",
+            description: "Add a stop button",
+            category: "Transport",
+        },
+        PaletteElement {
+            icon: "\u{1F500}",
+            label: "Shuffle",
+            description: "Add a shuffle toggle",
+            category: "Transport",
+        },
+        PaletteElement {
+            icon: "\u{1F501}",
+            label: "Repeat",
+            description: "Add a repeat toggle",
+            category: "Transport",
+        },
+        // Seek
+        PaletteElement {
+            icon: "30\u{00BB}",
+            label: "+30s",
+            description: "Add a 30-second forward skip",
+            category: "Seek",
+        },
+        PaletteElement {
+            icon: "10\u{00BB}",
+            label: "+10s",
+            description: "Add a 10-second forward skip",
+            category: "Seek",
+        },
+        PaletteElement {
+            icon: "\u{00AB}30",
+            label: "-30s",
+            description: "Add a 30-second replay",
+            category: "Seek",
+        },
+        PaletteElement {
+            icon: "\u{00AB}10",
+            label: "-10s",
+            description: "Add a 10-second replay",
+            category: "Seek",
+        },
+        // Volume
+        PaletteElement {
+            icon: "\u{1F507}",
+            label: "Mute",
+            description: "Add a mute toggle",
+            category: "Volume",
+        },
+    ]
+}
+
+/// Compact element palette — shows available elements the user can tap to add to their prompt.
+#[component]
+fn ElementPalette(on_select: EventHandler<String>) -> Element {
+    let mut expanded = use_signal(|| false);
+
+    let elements = palette_elements();
+    let categories: Vec<&str> = {
+        let mut cats: Vec<&str> = elements.iter().map(|e| e.category).collect();
+        cats.dedup();
+        cats
+    };
+
+    rsx! {
+        div { class: "mb-4",
+            button {
+                class: "text-xs text-muted hover:text-white transition-colors flex items-center gap-1",
+                onclick: move |_| expanded.toggle(),
+                if expanded() {
+                    span { "\u{25BE} Available elements" }
+                } else {
+                    span { "\u{25B8} Available elements" }
+                }
+            }
+
+            if expanded() {
+                div { class: "mt-2 space-y-2",
+                    for cat in categories.iter() {
+                        div {
+                            p { class: "text-xs text-muted mb-1 font-medium", "{cat}" }
+                            div { class: "flex flex-wrap gap-1",
+                                for elem in elements.iter().filter(|e| e.category == *cat) {
+                                    {
+                                        let desc = elem.description.to_string();
+                                        let label = elem.label;
+                                        let icon = elem.icon;
+                                        rsx! {
+                                            button {
+                                                class: "group flex items-center gap-1 px-2 py-1 rounded text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 hover:border-gray-500 transition-all",
+                                                title: "{label}",
+                                                onclick: move |_| on_select.call(desc.clone()),
+                                                span { class: "text-sm", "{icon}" }
+                                                span { class: "text-muted group-hover:text-white transition-colors", "{label}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
