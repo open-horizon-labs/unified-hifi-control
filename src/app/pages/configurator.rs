@@ -948,31 +948,7 @@ fn palette_elements() -> Vec<PaletteElement> {
             description: "Add a stop button",
             category: "Transport",
         },
-        PaletteElement {
-            icon: "\u{1F500}",
-            label: "Shuffle",
-            description: "Add a shuffle toggle",
-            category: "Transport",
-        },
-        PaletteElement {
-            icon: "\u{1F501}",
-            label: "Repeat",
-            description: "Add a repeat toggle",
-            category: "Transport",
-        },
         // Seek
-        PaletteElement {
-            icon: "30\u{00BB}",
-            label: "+30s",
-            description: "Add a 30-second forward skip",
-            category: "Seek",
-        },
-        PaletteElement {
-            icon: "10\u{00BB}",
-            label: "+10s",
-            description: "Add a 10-second forward skip",
-            category: "Seek",
-        },
         PaletteElement {
             icon: "\u{00AB}30",
             label: "-30s",
@@ -983,6 +959,18 @@ fn palette_elements() -> Vec<PaletteElement> {
             icon: "\u{00AB}10",
             label: "-10s",
             description: "Add a 10-second replay",
+            category: "Seek",
+        },
+        PaletteElement {
+            icon: "10\u{00BB}",
+            label: "+10s",
+            description: "Add a 10-second forward skip",
+            category: "Seek",
+        },
+        PaletteElement {
+            icon: "30\u{00BB}",
+            label: "+30s",
+            description: "Add a 30-second forward skip",
             category: "Seek",
         },
         // Volume
