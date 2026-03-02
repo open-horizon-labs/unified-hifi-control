@@ -315,7 +315,6 @@ pub async fn knob_manifest_clear_handler(
 /// - Album art URL and image_key
 /// - Toggle icon/active state (play/pause, mute/unmute)
 pub fn merge_live_state(screens: Vec<Screen>, zone: &crate::bus::Zone) -> Vec<Screen> {
-    let is_playing = zone.state == crate::bus::PlaybackState::Playing;
     let is_muted = zone
         .volume_control
         .as_ref()
@@ -327,7 +326,8 @@ pub fn merge_live_state(screens: Vec<Screen>, zone: &crate::bus::Zone) -> Vec<Sc
         .into_iter()
         .map(|screen| match screen {
             Screen::Media(mut media) => {
-                // Replace text lines with live now_playing data
+                // Inject live now_playing into standard text lines (title/subtitle/detail).
+                // Preserve any extra custom lines the layout template defines beyond these.
                 let title = np
                     .map(|n| {
                         if n.title.is_empty() {
@@ -338,29 +338,44 @@ pub fn merge_live_state(screens: Vec<Screen>, zone: &crate::bus::Zone) -> Vec<Sc
                     })
                     .unwrap_or_else(|| "Idle".to_string());
                 let artist = np.map(|n| n.artist.clone()).unwrap_or_default();
-                let mut lines = vec![
-                    TextLine {
-                        text: title,
-                        style: "title".to_string(),
-                    },
-                    TextLine {
-                        text: artist,
-                        style: "subtitle".to_string(),
-                    },
-                ];
-                if let Some(album) = np.and_then(|n| {
+                let album = np.and_then(|n| {
                     if n.album.is_empty() {
                         None
                     } else {
                         Some(n.album.clone())
                     }
-                }) {
-                    lines.push(TextLine {
-                        text: album,
-                        style: "detail".to_string(),
-                    });
+                });
+
+                // Replace standard lines by style, preserve custom lines
+                for line in media.lines.iter_mut() {
+                    match line.style.as_str() {
+                        "title" => line.text = title.clone(),
+                        "subtitle" => line.text = artist.clone(),
+                        "detail" => {
+                            if let Some(ref a) = album {
+                                line.text = a.clone();
+                            }
+                        }
+                        _ => {} // custom styles preserved as-is
+                    }
                 }
-                media.lines = lines;
+                // If template had no lines at all, add the standard set
+                if media.lines.is_empty() {
+                    media.lines.push(TextLine {
+                        text: title,
+                        style: "title".to_string(),
+                    });
+                    media.lines.push(TextLine {
+                        text: artist,
+                        style: "subtitle".to_string(),
+                    });
+                    if let Some(a) = album {
+                        media.lines.push(TextLine {
+                            text: a,
+                            style: "detail".to_string(),
+                        });
+                    }
+                }
 
                 // Set live image URL and key
                 media.image_url = Some(format!(
@@ -369,16 +384,14 @@ pub fn merge_live_state(screens: Vec<Screen>, zone: &crate::bus::Zone) -> Vec<Sc
                 ));
                 media.image_key = np.and_then(|n| n.image_key.clone());
 
-                // Merge element toggle states
+                // Merge element toggle states.
+                // Note: toggle_playback is NOT merged here — firmware handles
+                // play/pause icon swaps locally via s_toggle_playback_slot,
+                // avoiding unnecessary SHA changes on every play/pause.
                 if let Some(ref mut elements) = media.elements {
                     for elem in elements.iter_mut() {
                         if let Some(ref action) = elem.on_tap {
                             match action.action.as_str() {
-                                "toggle_playback" => {
-                                    elem.display.icon = Some(
-                                        if is_playing { "pause" } else { "play_arrow" }.into(),
-                                    );
-                                }
                                 "toggle_mute" | "mute" => {
                                     elem.display.icon = Some(
                                         if is_muted {
@@ -389,12 +402,6 @@ pub fn merge_live_state(screens: Vec<Screen>, zone: &crate::bus::Zone) -> Vec<Sc
                                         .into(),
                                     );
                                     elem.display.active = Some(is_muted);
-                                }
-                                "play" => {
-                                    elem.display.active = Some(is_playing);
-                                }
-                                "pause" => {
-                                    elem.display.active = Some(!is_playing);
                                 }
                                 _ => {}
                             }
