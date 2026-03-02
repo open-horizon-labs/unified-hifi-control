@@ -114,6 +114,12 @@ pub fn Dials() -> Element {
             let url = format!("/knob/config?knob_id={}", urlencoding::encode(&knob_id));
             match api::fetch_json::<KnobConfigResponse>(&url).await {
                 Ok(resp) => {
+                    // Guard against stale response: only update state if the
+                    // user hasn't opened a different knob while the fetch was
+                    // in flight.
+                    if current_knob_id().as_deref() != Some(knob_id.as_str()) {
+                        return;
+                    }
                     if let Some(cfg) = resp.config {
                         config_name.set(cfg.name.unwrap_or_default());
                         config_rotation_charging.set(cfg.rotation_charging.unwrap_or(180));
@@ -203,10 +209,14 @@ pub fn Dials() -> Element {
                     }
                 }
                 Err(e) => {
-                    save_status.set(Some(format!("Error: {}", e)));
+                    if current_knob_id().as_deref() == Some(knob_id.as_str()) {
+                        save_status.set(Some(format!("Error: {}", e)));
+                    }
                 }
             }
-            config_loading.set(false);
+            if current_knob_id().as_deref() == Some(knob_id.as_str()) {
+                config_loading.set(false);
+            }
         });
     };
 

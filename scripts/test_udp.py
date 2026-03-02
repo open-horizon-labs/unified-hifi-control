@@ -51,7 +51,7 @@ def main():
     volume, vol_min, vol_max, vol_step = struct.unpack_from("<ffff", data, 24)
     seek_pos, length = struct.unpack_from("<iI", data, 40)
 
-    print(f"\n--- Response ---")
+    print("\n--- Response ---")
     print(f"  magic:    0x{magic:04X} {'✓' if magic == MAGIC else '✗ WRONG'}")
     print(f"  version:  {version}")
     print(f"  flags:    0b{flags:08b}")
@@ -69,7 +69,7 @@ def main():
     else:
         print(f"  display:  {volume:.0f}%")
 
-    print(f"\n✓ UDP fast-path working")
+    print("\n✓ UDP fast-path working")
 
 if __name__ == "__main__":
     main()

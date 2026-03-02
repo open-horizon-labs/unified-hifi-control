@@ -2264,11 +2264,12 @@ pub async fn license_handler(
     }
 
     // Set the license on the EventReporter and persist to disk
+    let license = req.license.trim().to_string();
     state
         .event_reporter
-        .set_license(Some(req.license.clone()))
+        .set_license(Some(license.clone()))
         .await;
-    crate::config::save_license(&req.license);
+    crate::config::save_license(&license);
 
     tracing::info!("Memex license configured via API");
 

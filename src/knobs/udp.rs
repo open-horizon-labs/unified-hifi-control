@@ -129,14 +129,16 @@ async fn handle_command(
                     .control(udn, "vol_abs", Some(vol as i32))
                     .await
                     .map_err(|e| e.to_string())?;
-            } else {
-                // Roon (default)
+            } else if prefixed.starts_with("roon:") || !prefixed.contains(':') {
+                // Roon (explicit prefix or unprefixed legacy ID)
                 let roon_id = prefixed.trim_start_matches("roon:");
                 state
                     .roon
                     .change_volume(roon_id, vol, false)
                     .await
                     .map_err(|e| e.to_string())?;
+            } else {
+                return Err(format!("Unknown zone prefix in '{}'", prefixed));
             }
 
             tracing::debug!("UDP volume_set zone={} vol={}", zone_id, vol);

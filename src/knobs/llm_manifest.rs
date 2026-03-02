@@ -77,7 +77,10 @@ impl Default for RealLlmProxyClient {
 impl RealLlmProxyClient {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .unwrap_or_default(),
             proxy_url: "https://llm-proxy.ohlabs.ai/v1/messages".to_string(),
         }
     }

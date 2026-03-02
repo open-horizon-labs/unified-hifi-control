@@ -278,7 +278,18 @@ pub fn save_license(license: &str) {
     }
     let json = serde_json::json!({ "license": license });
     match std::fs::write(&path, json.to_string()) {
-        Ok(()) => tracing::info!("Saved Memex license to disk"),
+        Ok(()) => {
+            // Restrict permissions to owner-only on Unix (contains credential)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o600);
+                if let Err(e) = std::fs::set_permissions(&path, perms) {
+                    tracing::warn!("Failed to set license file permissions: {}", e);
+                }
+            }
+            tracing::info!("Saved Memex license to disk");
+        }
         Err(e) => tracing::error!("Failed to save Memex license: {}", e),
     }
 }
@@ -289,6 +300,12 @@ pub fn delete_saved_license() {
     if path.exists() {
         let _ = std::fs::remove_file(&path);
         tracing::info!("Removed saved Memex license from disk");
+    }
+    // Also remove from legacy root path if it exists
+    let legacy_path = get_config_dir().join(LICENSE_FILE);
+    if legacy_path.exists() {
+        let _ = std::fs::remove_file(&legacy_path);
+        tracing::info!("Removed legacy Memex license from root config dir");
     }
 }
 

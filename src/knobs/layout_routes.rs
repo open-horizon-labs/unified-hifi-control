@@ -208,14 +208,20 @@ pub async fn add_stack_entry(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
     Json(body): Json<AddStackEntryRequest>,
-) -> StatusCode {
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    if state.layouts.get_layout(&body.layout_id).await.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            error_json(format!("layout '{}' not found", body.layout_id)),
+        ));
+    }
     let entry = StackEntry {
         layout_id: body.layout_id,
         conditions: body.conditions,
         enabled: body.enabled,
     };
     state.layouts.push_stack_entry(&device_id, entry).await;
-    StatusCode::CREATED
+    Ok(StatusCode::CREATED)
 }
 
 /// DELETE /api/devices/{device_id}/stack/entries/{index} — Remove stack entry by index

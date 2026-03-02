@@ -334,6 +334,10 @@ async fn wasm_fetch<R: for<'de> Deserialize<'de>>(
 
     let resp: Response = resp_value.dyn_into().map_err(|_| "Not a Response")?;
 
+    if !resp.ok() {
+        return Err(format!("HTTP {} {}", resp.status(), resp.status_text()));
+    }
+
     // If the caller expects a response body, parse it as JSON.
     // We use `resp.json()` which returns a JS Promise — only call it when
     // the caller actually needs a deserialized value.  For `()` callers we
@@ -353,6 +357,7 @@ async fn wasm_fetch_no_response(
     url: &str,
     body: Option<String>,
 ) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
     use web_sys::{Headers, Request, RequestInit};
 
@@ -371,9 +376,17 @@ async fn wasm_fetch_no_response(
 
     let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
 
-    JsFuture::from(window.fetch_with_request(&request))
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
         .await
         .map_err(|e| format!("{:?}", e))?;
+
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|_| "Not a Response".to_string())?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP {} {}", resp.status(), resp.status_text()));
+    }
 
     Ok(())
 }

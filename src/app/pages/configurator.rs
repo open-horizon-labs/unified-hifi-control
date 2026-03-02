@@ -256,8 +256,19 @@ pub fn Configurator() -> Element {
                 stack_loading.set(true);
                 let url = format!("/api/devices/{}/stack", did);
                 match api::fetch_json::<DeviceStackResponse>(&url).await {
-                    Ok(resp) => stack_entries.set(resp.entries),
-                    Err(_) => stack_entries.set(vec![]),
+                    Ok(resp) => {
+                        // Guard against stale response: only update if the
+                        // user hasn't switched to a different device while
+                        // the fetch was in flight.
+                        if selected_device_id().as_deref() == Some(did.as_str()) {
+                            stack_entries.set(resp.entries);
+                        }
+                    }
+                    Err(_) => {
+                        if selected_device_id().as_deref() == Some(did.as_str()) {
+                            stack_entries.set(vec![]);
+                        }
+                    }
                 }
                 stack_loading.set(false);
             } else {

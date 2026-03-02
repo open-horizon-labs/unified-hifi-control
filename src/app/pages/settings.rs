@@ -389,22 +389,16 @@ pub fn Settings() -> Element {
                                     license_saving.set(true);
                                     license_message.set(None);
                                     spawn(async move {
-                                        // DELETE via wasm fetch or ignore on server
-                                        #[cfg(target_arch = "wasm32")]
-                                        {
-                                            use wasm_bindgen_futures::JsFuture;
-                                            use web_sys::{Request, RequestInit};
-                                            if let Some(window) = web_sys::window() {
-                                                let opts = RequestInit::new();
-                                                opts.set_method("DELETE");
-                                                if let Ok(request) = Request::new_with_str_and_init("/api/config/license", &opts) {
-                                                    let _ = JsFuture::from(window.fetch_with_request(&request)).await;
-                                                }
+                                        match api::delete_no_response("/api/config/license").await {
+                                            Ok(()) => {
+                                                license_configured.set(false);
+                                                license_message.set(Some("License removed".to_string()));
+                                            }
+                                            Err(e) => {
+                                                license_message.set(Some(format!("Error removing license: {}", e)));
                                             }
                                         }
-                                        license_configured.set(false);
                                         license_saving.set(false);
-                                        license_message.set(Some("License removed".to_string()));
                                     });
                                 },
                                 "Remove"

@@ -3,7 +3,7 @@
 
 Usage: python3 diagnose_knob.py <bridge_ip> [zone_id]
 """
-import socket, struct, sys, json, urllib.request
+import socket, struct, sys, json, urllib.request, urllib.error
 from urllib.parse import quote
 
 BRIDGE_IP = sys.argv[1] if len(sys.argv) > 1 else "192.168.50.225"
@@ -17,7 +17,7 @@ def fetch_json(path):
     try:
         with urllib.request.urlopen(url, timeout=5) as r:
             return json.loads(r.read())
-    except Exception as e:
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
         return {"_error": str(e)}
 
 # 1. Check zones

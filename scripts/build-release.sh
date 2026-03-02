@@ -37,8 +37,10 @@ fi
 
 # Step 2: Server binary with embedded assets
 echo "==> Step 2/2: Building server binary (cargo build)..."
-SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
-  cargo build --release --bin unified-hifi-control \
+if [ "$(uname -s)" = "Darwin" ]; then
+  export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+fi
+cargo build --release --bin unified-hifi-control \
   --features server --no-default-features
 
 echo ""

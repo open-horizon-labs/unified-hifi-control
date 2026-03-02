@@ -576,9 +576,14 @@ impl ServerHandler for HifiMcpHandler {
             }
 
             HifiTools::HifiSearchTool(args) => {
-                let use_lms = args.zone_id.starts_with("lms:");
+                if !args.zone_id.starts_with("roon:") && !args.zone_id.starts_with("lms:") {
+                    return Self::error_result(format!(
+                        "Unsupported zone prefix in '{}'. Expected 'roon:' or 'lms:'.",
+                        args.zone_id
+                    ));
+                }
 
-                if use_lms {
+                if args.zone_id.starts_with("lms:") {
                     match self
                         .state
                         .lms
@@ -796,7 +801,7 @@ impl ServerHandler for HifiMcpHandler {
                     Some(l) => l,
                     None => {
                         return Self::error_result(
-                            "Memex license required for knob_configure".into(),
+                            "Memex license required for esp_configure".into(),
                         )
                     }
                 };
@@ -836,6 +841,10 @@ impl ServerHandler for HifiMcpHandler {
                         return Self::error_result(format!("Failed to parse LLM output: {}", e))
                     }
                 };
+
+                if let Err(e) = crate::knobs::llm_manifest::validate_manifest(&parsed) {
+                    return Self::error_result(format!("Manifest validation failed: {}", e));
+                }
 
                 self.state
                     .manifests

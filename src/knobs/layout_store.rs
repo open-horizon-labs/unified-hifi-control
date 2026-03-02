@@ -383,7 +383,14 @@ impl LayoutStore {
             let all_match =
                 entry.conditions.is_empty() || entry.conditions.iter().all(|c| c.matches(zone));
             if all_match {
-                return data.layouts.get(&entry.layout_id).cloned();
+                if let Some(layout) = data.layouts.get(&entry.layout_id).cloned() {
+                    return Some(layout);
+                }
+                tracing::warn!(
+                    layout_id = %entry.layout_id,
+                    device_id = %device_id,
+                    "Stack entry matched but layout_id not found — skipping"
+                );
             }
         }
         None
