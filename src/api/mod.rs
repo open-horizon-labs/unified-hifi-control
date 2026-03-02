@@ -2073,7 +2073,7 @@ pub struct AppSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdapterSettings {
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::knobs::layout_store::default_true")]
     pub roon: bool,
     #[serde(default)]
     pub upnp: bool,
@@ -2083,10 +2083,6 @@ pub struct AdapterSettings {
     pub lms: bool,
     #[serde(default)]
     pub hqplayer: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl Default for AppSettings {

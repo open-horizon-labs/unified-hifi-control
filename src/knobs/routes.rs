@@ -316,11 +316,7 @@ pub async fn knob_now_playing_handler(
     let zone_infos = get_zone_infos(&state).await;
 
     // Handle legacy zone_id without prefix (assume Roon)
-    let prefixed_zone_id = if !zone_id.contains(':') {
-        format!("roon:{}", zone_id)
-    } else {
-        zone_id.clone()
-    };
+    let prefixed_zone_id = super::normalize_zone_id(&zone_id);
 
     // Get zone from aggregator (single source of truth)
     let zone = match state.aggregator.get_zone(&prefixed_zone_id).await {
@@ -497,11 +493,7 @@ pub async fn knob_image_handler(
     };
 
     // Handle legacy zone_id without prefix (assume Roon)
-    let zone_id = if !params.zone_id.contains(':') {
-        format!("roon:{}", params.zone_id)
-    } else {
-        params.zone_id.clone()
-    };
+    let zone_id = super::normalize_zone_id(&params.zone_id);
 
     // Get zone from aggregator to find image_key
     let zone = match state.aggregator.get_zone(&zone_id).await {
@@ -702,7 +694,7 @@ async fn control_roon(
             // Use provided value, or look up zone's actual step from aggregator
             let step = match value.and_then(|v| v.as_f64()) {
                 Some(v) => v as f32,
-                None => get_zone_step(state, &format!("roon:{}", zone_id)).await,
+                None => get_zone_step(state, &super::normalize_zone_id(zone_id)).await,
             };
             state
                 .roon
@@ -720,7 +712,7 @@ async fn control_roon(
             // Use provided value, or look up zone's actual step from aggregator
             let step = match value.and_then(|v| v.as_f64()) {
                 Some(v) => v as f32,
-                None => get_zone_step(state, &format!("roon:{}", zone_id)).await,
+                None => get_zone_step(state, &super::normalize_zone_id(zone_id)).await,
             };
             state
                 .roon
@@ -772,7 +764,7 @@ async fn control_roon(
             // Look up current mute state from aggregator, then toggle
             let is_muted = state
                 .aggregator
-                .get_zone(&format!("roon:{}", zone_id))
+                .get_zone(&super::normalize_zone_id(zone_id))
                 .await
                 .and_then(|z| z.volume_control)
                 .map(|vc| vc.is_muted)

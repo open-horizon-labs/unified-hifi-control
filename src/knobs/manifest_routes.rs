@@ -45,13 +45,9 @@ impl ManifestStore {
         Self::default()
     }
 
-    /// Normalize a zone_id: bare IDs without a colon prefix are assumed to be Roon zones.
+    /// Normalize a zone_id: delegates to the shared `normalize_zone_id` in the parent module.
     fn normalize_zone_id(zone_id: &str) -> String {
-        if !zone_id.contains(':') {
-            format!("roon:{}", zone_id)
-        } else {
-            zone_id.to_string()
-        }
+        super::normalize_zone_id(zone_id)
     }
 
     /// Store a Memex-pushed manifest for a specific zone. Bridge will serve
@@ -179,11 +175,7 @@ pub async fn knob_manifest_handler(
     tracing::debug!(device_id = ?device_id, "Manifest request device resolution");
 
     // Normalize zone_id (legacy without prefix = Roon)
-    let prefixed_zone_id = if !zone_id.contains(':') {
-        format!("roon:{}", zone_id)
-    } else {
-        zone_id.clone()
-    };
+    let prefixed_zone_id = super::normalize_zone_id(&zone_id);
 
     // Get zone from aggregator
     let zone = match state.aggregator.get_zone(&prefixed_zone_id).await {
@@ -322,7 +314,6 @@ pub async fn knob_manifest_clear_handler(
 /// - Text lines from now_playing (title, artist, album)
 /// - Album art URL and image_key
 /// - Toggle icon/active state (play/pause, mute/unmute)
-/// - Background color from art cache
 pub fn merge_live_state(screens: Vec<Screen>, zone: &crate::bus::Zone) -> Vec<Screen> {
     let is_playing = zone.state == crate::bus::PlaybackState::Playing;
     let is_muted = zone
@@ -424,7 +415,7 @@ pub fn merge_live_state(screens: Vec<Screen>, zone: &crate::bus::Zone) -> Vec<Sc
 /// - Omits prev/next elements when the zone doesn't allow those actions.
 /// - Uses pause icon when playing, play_arrow when not.
 /// - Adds a forward_30 seek element for long content (>600 seconds = podcast/audiobook heuristic).
-fn build_default_elements(zone: &crate::bus::Zone) -> Vec<Element> {
+pub(crate) fn build_default_elements(zone: &crate::bus::Zone) -> Vec<Element> {
     let mut elements = Vec::new();
 
     // Previous — only if allowed
@@ -501,7 +492,7 @@ fn build_default_elements(zone: &crate::bus::Zone) -> Vec<Element> {
 }
 
 /// Build backward-compatible controls list that mirrors the transport-permission-aware elements.
-fn build_default_controls(zone: &crate::bus::Zone) -> Vec<String> {
+pub(crate) fn build_default_controls(zone: &crate::bus::Zone) -> Vec<String> {
     let mut controls = Vec::new();
     if zone.is_previous_allowed {
         controls.push("prev".into());
@@ -516,7 +507,7 @@ fn build_default_controls(zone: &crate::bus::Zone) -> Vec<String> {
 /// Build the default manifest from aggregator state. This produces screens
 /// that are pixel-identical to what the current hardcoded firmware renders,
 /// but now context-aware: transport elements are only included when allowed.
-async fn build_default_manifest(
+pub(crate) async fn build_default_manifest(
     state: &AppState,
     zone: &crate::bus::Zone,
     zone_id: &str,
@@ -623,7 +614,7 @@ async fn build_default_manifest(
 
 /// Build the zones list screen from zone info.
 /// Each list item includes an on_tap action to select that zone.
-fn build_zones_screen(zones: &[ZoneInfo], current_zone_id: &str) -> Screen {
+pub(crate) fn build_zones_screen(zones: &[ZoneInfo], current_zone_id: &str) -> Screen {
     let items = zones
         .iter()
         .map(|z| ListItem {

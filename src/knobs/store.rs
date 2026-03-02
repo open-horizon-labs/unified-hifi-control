@@ -170,10 +170,20 @@ impl KnobStore {
         HashMap::new()
     }
 
-    /// Save knobs to disk in the config subdirectory
-    /// Issue #76: Always writes to unified-hifi/ subdirectory
+    /// Save knobs to disk in the config subdirectory.
+    /// Issue #76: Always writes to unified-hifi/ subdirectory.
+    /// Serializes under the lock, then drops the lock before blocking I/O.
     async fn save_to_disk(&self) {
-        let knobs = self.knobs.read().await;
+        let json = {
+            let knobs = self.knobs.read().await;
+            match serde_json::to_string_pretty(&*knobs) {
+                Ok(json) => json,
+                Err(e) => {
+                    tracing::error!("Failed to serialize knobs: {}", e);
+                    return;
+                }
+            }
+        };
         let path = get_config_file_path(KNOBS_FILE);
 
         // Ensure directory exists
@@ -181,8 +191,8 @@ impl KnobStore {
             let _ = fs::create_dir_all(parent);
         }
 
-        if let Ok(json) = serde_json::to_string_pretty(&*knobs) {
-            let _ = fs::write(path, json);
+        if let Err(e) = fs::write(&path, json) {
+            tracing::error!("Failed to write {}: {}", KNOBS_FILE, e);
         }
     }
 
@@ -229,28 +239,44 @@ impl KnobStore {
         knob
     }
 
-    /// Update knob status (battery, zone, IP)
+    /// Update knob status (battery, zone, IP).
+    /// Only persists to disk if something meaningful changed (not just `last_seen`).
     pub async fn update_status(&self, knob_id: &str, updates: KnobStatusUpdate) {
         let mut knobs = self.knobs.write().await;
+        let mut meaningful_change = false;
 
         if let Some(knob) = knobs.get_mut(knob_id) {
             if let Some(level) = updates.battery_level {
-                knob.status.battery_level = Some(level);
+                if knob.status.battery_level != Some(level) {
+                    knob.status.battery_level = Some(level);
+                    meaningful_change = true;
+                }
             }
             if let Some(charging) = updates.battery_charging {
-                knob.status.battery_charging = Some(charging);
+                if knob.status.battery_charging != Some(charging) {
+                    knob.status.battery_charging = Some(charging);
+                    meaningful_change = true;
+                }
             }
             if let Some(zone_id) = updates.zone_id {
-                knob.status.zone_id = Some(zone_id);
+                if knob.status.zone_id.as_deref() != Some(&zone_id) {
+                    knob.status.zone_id = Some(zone_id);
+                    meaningful_change = true;
+                }
             }
             if let Some(ip) = updates.ip {
-                knob.status.ip = Some(ip);
+                if knob.status.ip.as_deref() != Some(&ip) {
+                    knob.status.ip = Some(ip);
+                    meaningful_change = true;
+                }
             }
             knob.last_seen = Utc::now();
         }
 
         drop(knobs);
-        self.save_to_disk().await;
+        if meaningful_change {
+            self.save_to_disk().await;
+        }
     }
 
     /// Update knob configuration

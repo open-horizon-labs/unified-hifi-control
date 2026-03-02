@@ -90,7 +90,7 @@ pub struct StackEntry {
     pub enabled: bool,
 }
 
-fn default_true() -> bool {
+pub fn default_true() -> bool {
     true
 }
 
@@ -116,11 +116,17 @@ impl Condition {
                     .unwrap_or(false)
             }
             ConditionOp::GreaterThan => {
-                let target: f64 = self
-                    .value
-                    .as_deref()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.0);
+                let target: f64 = match self.value.as_deref().and_then(|v| v.parse().ok()) {
+                    Some(t) => t,
+                    None => {
+                        tracing::warn!(
+                            field = %self.field,
+                            value = ?self.value,
+                            "GreaterThan condition has missing or unparseable value"
+                        );
+                        return false;
+                    }
+                };
                 field_value
                     .and_then(|v| v.parse::<f64>().ok())
                     .map(|v| v > target)
@@ -150,7 +156,10 @@ impl Condition {
             "sample_rate" => meta_field(zone, |m| m.sample_rate.map(|sr| sr.to_string())),
             "bit_depth" => meta_field(zone, |m| m.bit_depth.map(|bd| bd.to_string())),
             "composer" => meta_field(zone, |m| m.composer.clone()),
-            _ => None,
+            other => {
+                tracing::warn!(field = %other, "Unknown condition field — condition will not match");
+                None
+            }
         }
     }
 }

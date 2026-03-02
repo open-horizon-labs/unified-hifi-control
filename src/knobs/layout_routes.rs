@@ -57,12 +57,8 @@ pub struct AddStackEntryRequest {
     pub layout_id: String,
     #[serde(default)]
     pub conditions: Vec<Condition>,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::knobs::layout_store::default_true")]
     pub enabled: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Body for POST /api/devices/{device_id}/stack/reorder
@@ -77,12 +73,6 @@ pub struct ReorderStackRequest {
 #[derive(Debug, Serialize)]
 pub struct LayoutListResponse {
     pub layouts: Vec<Layout>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CreatedLayoutResponse {
-    pub id: String,
-    pub layout: Layout,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,22 +168,21 @@ pub async fn update_layout(
 
 // ── Device stack handlers ───────────────────────────────────────────────────
 
-/// GET /api/devices/{device_id}/stack — Get a device's condition stack
+/// GET /api/devices/{device_id}/stack — Get a device's condition stack.
+/// Returns 200 with empty entries if no stack exists yet.
 pub async fn get_device_stack(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
-) -> Result<Json<crate::knobs::layout_store::DeviceStack>, (StatusCode, Json<ErrorResponse>)> {
-    state
+) -> Json<crate::knobs::layout_store::DeviceStack> {
+    let stack = state
         .layouts
         .get_stack(&device_id)
         .await
-        .map(Json)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                error_json(format!("no stack for device '{}'", device_id)),
-            )
-        })
+        .unwrap_or_else(|| crate::knobs::layout_store::DeviceStack {
+            device_id: device_id.clone(),
+            entries: vec![],
+        });
+    Json(stack)
 }
 
 /// PUT /api/devices/{device_id}/stack — Set (replace) a device's entire stack
