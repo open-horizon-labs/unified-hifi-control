@@ -415,3 +415,77 @@ pub async fn post_json_no_response<T: Serialize>(url: &str, body: &T) -> Result<
 pub async fn post_json_no_response<T: Serialize>(_url: &str, _body: &T) -> Result<(), String> {
     Err("post_json_no_response is only available in browser".to_string())
 }
+
+/// PUT JSON to a URL (client-side only)
+#[cfg(target_arch = "wasm32")]
+pub async fn put_json<T: Serialize, R: for<'de> Deserialize<'de>>(
+    url: &str,
+    body: &T,
+) -> Result<R, String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{Headers, Request, RequestInit, Response};
+
+    let window = web_sys::window().ok_or("No window")?;
+
+    let headers = Headers::new().map_err(|e| format!("{:?}", e))?;
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|e| format!("{:?}", e))?;
+
+    let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
+
+    let opts = RequestInit::new();
+    opts.set_method("PUT");
+    opts.set_headers(&headers);
+    opts.set_body(&wasm_bindgen::JsValue::from_str(&body_str));
+
+    let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
+
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("{:?}", e))?;
+
+    let resp: Response = resp_value.dyn_into().map_err(|_| "Not a Response")?;
+
+    let json = JsFuture::from(resp.json().map_err(|e| format!("{:?}", e))?)
+        .await
+        .map_err(|e| format!("{:?}", e))?;
+
+    serde_wasm_bindgen::from_value(json).map_err(|e| format!("{:?}", e))
+}
+
+/// SSR stub - returns error (should not be called during SSR)
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn put_json<T: Serialize, R: for<'de> Deserialize<'de>>(
+    _url: &str,
+    _body: &T,
+) -> Result<R, String> {
+    Err("put_json is only available in browser".to_string())
+}
+
+/// DELETE a URL without expecting response body (client-side only)
+#[cfg(target_arch = "wasm32")]
+pub async fn delete_no_response(url: &str) -> Result<(), String> {
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{Request, RequestInit};
+
+    let window = web_sys::window().ok_or("No window")?;
+
+    let opts = RequestInit::new();
+    opts.set_method("DELETE");
+
+    let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
+
+    JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("{:?}", e))?;
+
+    Ok(())
+}
+
+/// SSR stub - returns error (should not be called during SSR)
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn delete_no_response(_url: &str) -> Result<(), String> {
+    Err("delete_no_response is only available in browser".to_string())
+}

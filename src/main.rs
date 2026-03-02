@@ -245,9 +245,13 @@ mod server {
         let shutdown_token = CancellationToken::new();
 
         // Issue #49: Initialize EventReporter for Memex muse-ingest integration
-        // Uses license from config if present, can also be provisioned via API
+        // Uses license from config/env if present, falls back to saved license on disk
+        let license = config
+            .memex_license
+            .clone()
+            .or_else(config::load_saved_license);
         let event_reporter = Arc::new(event_reporter::EventReporter::new(
-            config.memex_license.clone(),
+            license,
             zone_aggregator.clone(),
             shutdown_token.clone(),
         ));
@@ -416,6 +420,10 @@ mod server {
             .route("/knob/config", get(knobs::knob_config_handler))
             .route("/knob/config", post(knobs::knob_config_update_handler))
             .route("/knob/devices", get(knobs::knob_devices_handler))
+            .route(
+                "/knob/devices/{id}",
+                delete(knobs::knob_device_delete_handler),
+            )
             // Manifest-driven knob protocol (ADR-0003)
             .route(
                 "/knob/manifest",
@@ -430,6 +438,34 @@ mod server {
             .route(
                 "/api/manifest/generate",
                 post(knobs::llm_manifest::generate_manifest_handler),
+            )
+            // Layout + device stack API routes
+            .route(
+                "/api/layouts",
+                get(knobs::layout_routes::list_layouts).post(knobs::layout_routes::create_layout),
+            )
+            .route(
+                "/api/layouts/{id}",
+                get(knobs::layout_routes::get_layout)
+                    .put(knobs::layout_routes::update_layout)
+                    .delete(knobs::layout_routes::delete_layout),
+            )
+            .route(
+                "/api/devices/{device_id}/stack",
+                get(knobs::layout_routes::get_device_stack)
+                    .put(knobs::layout_routes::set_device_stack),
+            )
+            .route(
+                "/api/devices/{device_id}/stack/entries",
+                post(knobs::layout_routes::add_stack_entry),
+            )
+            .route(
+                "/api/devices/{device_id}/stack/entries/{index}",
+                delete(knobs::layout_routes::remove_stack_entry),
+            )
+            .route(
+                "/api/devices/{device_id}/stack/reorder",
+                post(knobs::layout_routes::reorder_stack),
             )
             // Knob protocol routes (firmware uses these paths directly)
             .route("/now_playing", get(knobs::knob_now_playing_handler))

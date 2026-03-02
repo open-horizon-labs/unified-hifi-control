@@ -13,7 +13,7 @@ pub mod settings_context;
 pub mod sse;
 pub mod theme;
 
-use pages::{Configurator, HqPlayer, Knobs, Lms, Settings, Zones};
+use pages::{Configurator, Dials, HqPlayer, Lms, Settings, Zones};
 use settings_context::use_settings_provider;
 use sse::use_sse_provider;
 use theme::use_theme_provider;
@@ -44,8 +44,8 @@ pub enum Route {
     HqPlayer {},
     #[route("/lms")]
     Lms {},
-    #[route("/knobs")]
-    Knobs {},
+    #[route("/dials")]
+    Dials {},
     #[route("/configurator")]
     Configurator {},
     #[route("/settings")]

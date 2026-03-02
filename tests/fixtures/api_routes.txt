@@ -14,13 +14,19 @@
 # with build configuration.
 
 DELETE /api/config/license
+DELETE /api/devices/{device_id}/stack/entries/{index}
+DELETE /api/layouts/{id}
 DELETE /hqp/instances/{name}
+DELETE /knob/devices/{id}
 DELETE /knob/manifest
 DELETE /mcp
 GET /admin
 GET /api/actions
 GET /api/config/license
+GET /api/devices/{device_id}/stack
 GET /api/icons
+GET /api/layouts
+GET /api/layouts/{id}
 GET /api/settings
 GET /api/zones
 GET /apple-touch-icon.png
@@ -79,6 +85,9 @@ GET /upnp/zones
 GET /zones
 POST /admin/fetch-firmware
 POST /api/config/license
+POST /api/devices/{device_id}/stack/entries
+POST /api/devices/{device_id}/stack/reorder
+POST /api/layouts
 POST /api/manifest/generate
 POST /api/settings
 POST /control
@@ -110,4 +119,6 @@ POST /roon/play
 POST /roon/play_item
 POST /roon/volume
 POST /upnp/control
+PUT /api/devices/{device_id}/stack
+PUT /api/layouts/{id}
 PUT /config/{knob_id}

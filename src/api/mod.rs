@@ -10,7 +10,7 @@ use crate::aggregator::ZoneAggregator;
 use crate::bus::{SharedBus, Zone};
 use crate::coordinator::AdapterCoordinator;
 use crate::event_reporter::EventReporter;
-use crate::knobs::{KnobStore, ManifestStore};
+use crate::knobs::{KnobStore, LayoutStore, ManifestStore};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -55,6 +55,7 @@ pub struct AppState {
     /// EventReporter for forwarding events to Memex muse-ingest proxy (Issue #49)
     pub event_reporter: Arc<EventReporter>,
     pub manifests: ManifestStore,
+    pub layouts: LayoutStore,
     /// Cached album art edge colors: image_key → hex color string (e.g. "#1a2b3c")
     pub art_colors: Arc<RwLock<HashMap<String, String>>>,
 }
@@ -96,6 +97,7 @@ impl AppState {
             sse_connections: Arc::new(AtomicUsize::new(0)),
             event_reporter,
             manifests: ManifestStore::new(),
+            layouts: LayoutStore::new(),
             art_colors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -2265,11 +2267,12 @@ pub async fn license_handler(
             .into_response();
     }
 
-    // Set the license on the EventReporter
+    // Set the license on the EventReporter and persist to disk
     state
         .event_reporter
         .set_license(Some(req.license.clone()))
         .await;
+    crate::config::save_license(&req.license);
 
     tracing::info!("Memex license configured via API");
 
@@ -2285,6 +2288,7 @@ pub async fn license_status_handler(State(state): State<AppState>) -> impl IntoR
 /// DELETE /api/config/license - Remove the Memex license
 pub async fn license_delete_handler(State(state): State<AppState>) -> impl IntoResponse {
     state.event_reporter.set_license(None).await;
+    crate::config::delete_saved_license();
 
     tracing::info!("Memex license removed via API");
 

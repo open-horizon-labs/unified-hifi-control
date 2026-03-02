@@ -16,7 +16,7 @@ use tokio::net::UdpSocket;
 
 use crate::api::AppState;
 use crate::bus::PlaybackState;
-use crate::knobs::manifest::compute_manifest_sha;
+use crate::knobs::manifest::{compute_manifest_sha, compute_manifest_sha_full};
 
 /// "RK" in little-endian
 const MAGIC: u16 = 0x524B;
@@ -66,7 +66,7 @@ pub async fn run_udp_fast_path(state: AppState, port: u16) -> std::io::Result<()
             // Poll request (86 bytes): [magic:2][sha:20][zone_id:64]
             let client_sha = extract_null_terminated(&buf[2..22]);
             let zone_id = extract_null_terminated(&buf[22..86]);
-            let response = build_response(&state, &client_sha, &zone_id).await;
+            let response = build_response(&state, &client_sha, &zone_id, peer).await;
             if let Err(e) = socket.send_to(&response, peer).await {
                 tracing::warn!("UDP send error to {}: {}", peer, e);
             }
@@ -159,7 +159,12 @@ fn extract_null_terminated(field: &[u8]) -> String {
 }
 
 /// Build the 48-byte UDP response.
-async fn build_response(state: &AppState, _client_sha: &str, zone_id: &str) -> [u8; RESPONSE_SIZE] {
+async fn build_response(
+    state: &AppState,
+    _client_sha: &str,
+    zone_id: &str,
+    addr: SocketAddr,
+) -> [u8; RESPONSE_SIZE] {
     let mut resp = [0u8; RESPONSE_SIZE];
 
     // Normalize zone_id (legacy without prefix = Roon)
@@ -205,11 +210,30 @@ async fn build_response(state: &AppState, _client_sha: &str, zone_id: &str) -> [
     // Compute current SHA
     let pushed_sha = state.manifests.get_pushed_sha(&prefixed_zone_id).await;
     let sha = if let Some(sha) = pushed_sha {
+        // Memex push takes priority
         sha
     } else {
-        // Build default manifest to compute SHA (mirrors manifest_routes.rs logic)
-        let (screens, nav) = build_default_screens(state, &zone, &prefixed_zone_id).await;
-        compute_manifest_sha(&screens, &nav)
+        // Look up device_id by source IP for layout condition-stack check
+        let peer_ip = addr.ip().to_string();
+        let device_id = state.knobs.find_by_ip(&peer_ip).await;
+        tracing::debug!(peer_ip = %peer_ip, device_id = ?device_id, "UDP device resolution");
+
+        if let Some(ref dev_id) = device_id {
+            // Check layout condition stack for this device
+            if let Some(layout) = state.layouts.resolve_layout(dev_id, &zone).await {
+                let screens =
+                    crate::knobs::manifest_routes::merge_live_state(layout.screens, &zone);
+                compute_manifest_sha_full(&screens, &layout.nav, &layout.interactions)
+            } else {
+                // No matching layout — fall through to default
+                let (screens, nav) = build_default_screens(state, &zone, &prefixed_zone_id).await;
+                compute_manifest_sha(&screens, &nav)
+            }
+        } else {
+            // No device_id known — build default manifest to compute SHA
+            let (screens, nav) = build_default_screens(state, &zone, &prefixed_zone_id).await;
+            compute_manifest_sha(&screens, &nav)
+        }
     };
 
     // Pack response

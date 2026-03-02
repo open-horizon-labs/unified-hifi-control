@@ -28,7 +28,7 @@ use crate::knobs::image::placeholder_svg;
 use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
 
 /// Extract knob ID from headers or query params
-fn extract_knob_id(headers: &HeaderMap, query_knob_id: Option<&str>) -> Option<String> {
+pub fn extract_knob_id(headers: &HeaderMap, query_knob_id: Option<&str>) -> Option<String> {
     headers
         .get("x-knob-id")
         .or_else(|| headers.get("x-device-id"))
@@ -108,10 +108,29 @@ pub struct ZonesResponse {
 }
 
 /// GET /knob/zones - List all zones from all adapters
+///
+/// Also registers the device if a knob_id is present (header or query param).
 pub async fn knob_zones_handler(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
+    connect_info: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<ZonesResponse> {
+    // Register/update the device if knob_id present
+    let knob_id = extract_knob_id(&headers, params.get("knob_id").map(|s| s.as_str()));
+    if let Some(ref id) = knob_id {
+        let version = extract_knob_version(&headers);
+        state.knobs.get_or_create(id, version.as_deref()).await;
+        let client_ip = connect_info.ok().map(|ci| ci.0.ip().to_string());
+        let status_update = KnobStatusUpdate {
+            zone_id: None,
+            battery_level: None,
+            battery_charging: None,
+            ip: client_ip,
+        };
+        state.knobs.update_status(id, status_update).await;
+    }
+
     let zones = get_all_zones_internal(&state).await;
     Json(ZonesResponse { zones })
 }
@@ -593,9 +612,15 @@ pub struct KnobControlRequest {
 /// POST /knob/control - Send control command (routes by zone_id prefix)
 pub async fn knob_control_handler(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(req): Json<KnobControlRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Register device if knob_id present in headers
+    if let Some(id) = extract_knob_id(&headers, None) {
+        let version = extract_knob_version(&headers);
+        state.knobs.get_or_create(&id, version.as_deref()).await;
+    }
+
     // Route based on zone_id prefix
     if req.zone_id.starts_with("lms:") {
         // LMS player control
@@ -1004,12 +1029,12 @@ pub async fn knob_config_handler(
         )
     })?;
 
-    let knob = state.knobs.get(&knob_id).await.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "knob not found"})),
-        )
-    })?;
+    // Use get_or_create so new devices are implicitly registered
+    let version = extract_knob_version(&headers);
+    let knob = state
+        .knobs
+        .get_or_create(&knob_id, version.as_deref())
+        .await;
 
     // Build config response with name included in config object (matches frontend expected format)
     let mut config = serde_json::to_value(&knob.config).unwrap_or_default();
@@ -1044,6 +1069,13 @@ pub async fn knob_config_update_handler(
         )
     })?;
 
+    // Ensure device exists (implicit registration)
+    let version = extract_knob_version(&headers);
+    state
+        .knobs
+        .get_or_create(&knob_id, version.as_deref())
+        .await;
+
     let knob = state
         .knobs
         .update_config(&knob_id, updates)
@@ -1065,6 +1097,18 @@ pub async fn knob_config_update_handler(
 pub async fn knob_devices_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let knobs = state.knobs.list().await;
     Json(serde_json::json!({ "knobs": knobs }))
+}
+
+/// DELETE /knob/devices/{id} - Remove a registered device
+pub async fn knob_device_delete_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(knob_id): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    if state.knobs.remove(&knob_id).await {
+        Json(serde_json::json!({"ok": true}))
+    } else {
+        Json(serde_json::json!({"ok": false, "error": "not found"}))
+    }
 }
 
 /// GET /config/{knob_id} - Get knob configuration (path parameter format)

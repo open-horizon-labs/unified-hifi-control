@@ -322,6 +322,18 @@ impl KnobStore {
         Some(result)
     }
 
+    /// Remove a knob by ID. Returns true if it existed.
+    pub async fn remove(&self, knob_id: &str) -> bool {
+        let mut knobs = self.knobs.write().await;
+        let existed = knobs.remove(knob_id).is_some();
+        drop(knobs);
+        if existed {
+            self.save_to_disk().await;
+            tracing::info!("Removed knob: {}", knob_id);
+        }
+        existed
+    }
+
     /// List all registered knobs
     pub async fn list(&self) -> Vec<KnobSummary> {
         let knobs = self.knobs.read().await;
@@ -341,6 +353,17 @@ impl KnobStore {
     pub async fn get_config_sha(&self, knob_id: &str) -> Option<String> {
         let knobs = self.knobs.read().await;
         knobs.get(knob_id).map(|k| k.config_sha.clone())
+    }
+
+    /// Find a knob by its IP address. Returns the knob_id if found.
+    pub async fn find_by_ip(&self, ip: &str) -> Option<String> {
+        let knobs = self.knobs.read().await;
+        for (id, knob) in knobs.iter() {
+            if knob.status.ip.as_deref() == Some(ip) {
+                return Some(id.clone());
+            }
+        }
+        None
     }
 }
 

@@ -2,12 +2,12 @@
 //!
 //! Simple interface: device preview + natural language input.
 //! The LLM generates command-pattern manifests from your description.
+//! Includes layout save/load and per-device condition stack management.
 
 use dioxus::prelude::*;
 
-use crate::app::api;
+use crate::app::api::{self, KnobDevice, KnobDevicesResponse};
 use crate::app::components::Layout;
-use crate::app::sse::use_sse;
 use crate::app::Route;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -109,31 +109,7 @@ struct TransportState {
 struct GenerateRequest {
     prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    zone_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     device_type: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, serde::Deserialize)]
-struct GenerateResponse {
-    #[serde(default)]
-    status: String,
-    error: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, serde::Deserialize)]
-struct ZonesResponse {
-    zones: Vec<ZoneInfo>,
-}
-
-#[derive(Clone, Debug, Default, serde::Deserialize)]
-struct ZoneInfo {
-    zone_id: String,
-    zone_name: String,
-    // Deserialized from server response but not displayed in this component
-    #[serde(default)]
-    #[allow(dead_code)]
-    state: String,
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
@@ -141,12 +117,78 @@ struct LicenseStatus {
     configured: bool,
 }
 
+// ── Layout save/load types ──────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+struct LayoutSummary {
+    id: String,
+    name: String,
+    #[serde(default)]
+    screens: Vec<ScreenDef>,
+    #[serde(default)]
+    nav: Option<NavDef>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+struct NavDef {
+    #[serde(default)]
+    order: Vec<String>,
+    #[serde(default)]
+    default: String,
+}
+
+/// Request body for POST /api/layouts
+#[derive(Clone, Debug, Default, serde::Serialize)]
+struct SaveLayoutRequest {
+    name: String,
+    screens: Vec<ScreenDef>,
+    nav: NavDef,
+}
+
+/// Wrapper for GET /api/layouts response
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct LayoutsListResponse {
+    #[serde(default)]
+    layouts: Vec<LayoutSummary>,
+}
+
+// ── Condition stack types ───────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+struct ConditionDef {
+    field: String,
+    op: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+struct StackEntryDef {
+    layout_id: String,
+    conditions: Vec<ConditionDef>,
+    #[serde(default = "default_true_val")]
+    enabled: bool,
+}
+fn default_true_val() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct DeviceStackResponse {
+    device_id: String,
+    entries: Vec<StackEntryDef>,
+}
+
+/// Request body for PUT /api/devices/{id}/stack
+#[derive(Clone, Debug, Default, serde::Serialize)]
+struct SetStackRequest {
+    entries: Vec<StackEntryDef>,
+}
+
 // ── Page ─────────────────────────────────────────────────────────────────────
 
 #[component]
 pub fn Configurator() -> Element {
-    let sse = use_sse();
-
     // License check
     let license_status = use_resource(|| async {
         api::fetch_json::<LicenseStatus>("/api/config/license")
@@ -160,45 +202,69 @@ pub fn Configurator() -> Element {
         .map(|s| s.configured)
         .unwrap_or(false);
 
-    // Device selector
-    let mut device_type = use_signal(|| "Dial".to_string());
+    // Device selector — shows actual registered ESP devices
+    let devices = use_resource(|| async {
+        api::fetch_json::<KnobDevicesResponse>("/knob/devices")
+            .await
+            .ok()
+    });
+    let mut selected_device_id = use_signal(|| None::<String>);
 
-    // Zone selector (optional — for previewing a specific zone's manifest)
-    let mut selected_zone = use_signal(|| None::<String>);
-    let zones = use_resource(|| async { api::fetch_json::<ZonesResponse>("/zones").await.ok() });
+    // Preview shape — default to Dial (device_type not yet in KnobDevice)
+    let device_type = "Dial";
 
-    // Manifest preview — fetched when zone changes or SSE event arrives
+    // Layout preview — set directly from generate response (no zone fetch needed).
+    // The configurator creates layout templates; zones are a runtime condition, not an input.
     let mut manifest = use_signal(|| None::<ManifestResponse>);
-
-    let fetch_manifest = move |zid: String| {
-        spawn(async move {
-            let url = format!("/knob/manifest?zone_id={}", urlencoding::encode(&zid));
-            if let Ok(m) = api::fetch_json::<ManifestResponse>(&url).await {
-                manifest.set(Some(m));
-            }
-        });
-    };
-
-    let zone_for_fetch = selected_zone();
-    use_effect(move || {
-        if let Some(zid) = zone_for_fetch.clone() {
-            fetch_manifest(zid);
-        }
-    });
-
-    // Refresh manifest on SSE events (only when a zone is selected)
-    let event_count = sse.event_count;
-    use_effect(move || {
-        let _ = event_count();
-        if let Some(zid) = selected_zone() {
-            fetch_manifest(zid);
-        }
-    });
 
     // LLM chat
     let mut chat_input = use_signal(String::new);
     let mut chat_messages = use_signal(Vec::<(bool, String)>::new); // (is_user, text)
     let mut llm_loading = use_signal(|| false);
+
+    // ── Save Layout state ───────────────────────────────────────────────
+    let mut show_save_input = use_signal(|| false);
+    let mut save_name_input = use_signal(String::new);
+
+    // ── Saved layouts list ──────────────────────────────────────────────
+    let mut saved_layouts = use_signal(Vec::<LayoutSummary>::new);
+
+    // Fetch layouts on mount
+    let _layouts_loader = use_resource(move || async move {
+        if let Ok(resp) = api::fetch_json::<LayoutsListResponse>("/api/layouts").await {
+            saved_layouts.set(resp.layouts);
+        }
+    });
+
+    // ── Condition stack state ───────────────────────────────────────────
+    let mut stack_entries = use_signal(Vec::<StackEntryDef>::new);
+    let mut stack_loading = use_signal(|| false);
+    let mut show_add_entry = use_signal(|| false);
+    // New entry form fields
+    let mut new_entry_layout_id = use_signal(String::new);
+    let mut new_entry_conditions = use_signal(Vec::<ConditionDef>::new);
+    // Condition form fields for the "add condition" sub-form
+    let mut new_cond_field = use_signal(|| "zone_name".to_string());
+    let mut new_cond_op = use_signal(|| "equals".to_string());
+    let mut new_cond_value = use_signal(String::new);
+
+    // Fetch stack when device changes
+    use_effect(move || {
+        let dev_id = selected_device_id();
+        spawn(async move {
+            if let Some(ref did) = dev_id {
+                stack_loading.set(true);
+                let url = format!("/api/devices/{}/stack", did);
+                match api::fetch_json::<DeviceStackResponse>(&url).await {
+                    Ok(resp) => stack_entries.set(resp.entries),
+                    Err(_) => stack_entries.set(vec![]),
+                }
+                stack_loading.set(false);
+            } else {
+                stack_entries.set(vec![]);
+            }
+        });
+    });
 
     let mut send_handler = move |_| {
         let input = chat_input().trim().to_string();
@@ -209,46 +275,24 @@ pub fn Configurator() -> Element {
         chat_input.set(String::new());
         llm_loading.set(true);
 
-        // Capture zone_id and device_type at dispatch time so post-generate refresh
-        // targets the same zone even if the user changes selection mid-flight.
-        let zone_id = selected_zone();
-        let dt = device_type().to_lowercase();
+        let dt = device_type.to_lowercase();
         spawn(async move {
             let req = GenerateRequest {
                 prompt: input,
-                zone_id: zone_id.clone(),
                 device_type: Some(dt),
             };
-            match api::post_json::<_, GenerateResponse>("/api/manifest/generate", &req).await {
-                Ok(resp) => {
-                    let failed =
-                        resp.error.is_some() || (resp.status != "ok" && !resp.status.is_empty());
-                    if failed {
-                        let msg = resp
-                            .error
-                            .unwrap_or_else(|| format!("server status: {}", resp.status));
-                        chat_messages
-                            .write()
-                            .push((false, format!("error:{}", msg)));
-                    } else {
-                        chat_messages.write().push((
-                            false,
-                            "ok:Layout updated. Device will refresh on next poll.".to_string(),
-                        ));
-                        // Refresh manifest preview for the same zone the request targeted
-                        if let Some(ref zid) = zone_id {
-                            let url =
-                                format!("/knob/manifest?zone_id={}", urlencoding::encode(zid));
-                            if let Ok(m) = api::fetch_json::<ManifestResponse>(&url).await {
-                                manifest.set(Some(m));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
+            // Server returns the generated manifest directly on success.
+            // On error it returns {"error": "..."} which won't deserialize as ManifestResponse
+            // but will fail in post_json (non-2xx) or produce empty screens.
+            match api::post_json::<_, ManifestResponse>("/api/manifest/generate", &req).await {
+                Ok(m) => {
+                    manifest.set(Some(m));
                     chat_messages
                         .write()
-                        .push((false, format!("error:Request failed: {}", e)));
+                        .push((false, "ok:Layout updated.".to_string()));
+                }
+                Err(e) => {
+                    chat_messages.write().push((false, format!("error:{}", e)));
                 }
             }
             llm_loading.set(false);
@@ -277,7 +321,7 @@ pub fn Configurator() -> Element {
     let fast = manifest().as_ref().and_then(|m| m.fast.clone());
     let is_playing = fast.as_ref().map(|f| f.is_playing).unwrap_or(false);
 
-    // Volume fraction (0.0–1.0) for the outer arc
+    // Volume fraction (0.0-1.0) for the outer arc
     let volume_fraction = fast.as_ref().and_then(|f| {
         let v = f.volume?;
         let max = f.volume_max.unwrap_or(100.0);
@@ -289,7 +333,7 @@ pub fn Configurator() -> Element {
         }
     });
 
-    // Seek fraction (0.0–1.0) for the inner arc
+    // Seek fraction (0.0-1.0) for the inner arc
     let seek_fraction = fast.as_ref().and_then(|f| {
         let pos = f.seek_position? as f64;
         let len = f.length? as f64;
@@ -300,58 +344,150 @@ pub fn Configurator() -> Element {
         }
     });
 
-    // Zone name for the preview header
-    let selected_zone_name: Option<String> = selected_zone().and_then(|zid| {
-        zones
-            .read()
-            .as_ref()
-            .and_then(|r| r.as_ref())
-            .and_then(|zr| {
-                zr.zones
-                    .iter()
-                    .find(|z| z.zone_id == zid)
-                    .map(|z| z.zone_name.clone())
-            })
-    });
-
-    // Reset handler
+    // Reset handler — clears the local preview
     let reset_handler = move |_| {
-        if let Some(ref zid) = selected_zone() {
-            let zid = zid.clone();
-            spawn(async move {
-                let url = format!("/knob/manifest?zone_id={}", urlencoding::encode(&zid));
-                #[cfg(target_arch = "wasm32")]
-                {
-                    use wasm_bindgen_futures::JsFuture;
-                    use web_sys::{Request, RequestInit};
-                    let delete_result: Result<(), String> = (|| {
-                        let window = web_sys::window().ok_or("no window context")?;
-                        let opts = RequestInit::new();
-                        opts.set_method("DELETE");
-                        let request = Request::new_with_str_and_init(&url, &opts)
-                            .map_err(|e| format!("{:?}", e))?;
-                        let _ = window.fetch_with_request(&request);
-                        Ok(())
-                    })();
-                    if let Err(e) = delete_result {
-                        chat_messages
-                            .write()
-                            .push((false, format!("error:Reset failed: {}", e)));
-                        return;
-                    }
-                    // Give the DELETE a tick to complete before re-fetching
-                    let _ = JsFuture::from(js_sys::Promise::resolve(&wasm_bindgen::JsValue::NULL))
-                        .await;
-                }
-                if let Ok(m) = api::fetch_json::<ManifestResponse>(&url).await {
-                    manifest.set(Some(m));
-                }
-                chat_messages
-                    .write()
-                    .push((false, "ok:Reset to default layout.".to_string()));
-            });
-        }
+        manifest.set(None);
+        chat_messages
+            .write()
+            .push((false, "ok:Layout cleared.".to_string()));
     };
+
+    // Save layout handler
+    let mut save_layout_handler = move |_| {
+        let name = save_name_input().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let screens = manifest()
+            .as_ref()
+            .map(|m| m.screens.clone())
+            .unwrap_or_default();
+        if screens.is_empty() {
+            chat_messages
+                .write()
+                .push((false, "error:No manifest to save.".to_string()));
+            return;
+        }
+        let nav = NavDef {
+            order: screens.iter().map(|s| s.id.clone()).collect(),
+            default: screens.first().map(|s| s.id.clone()).unwrap_or_default(),
+        };
+        spawn(async move {
+            let req = SaveLayoutRequest {
+                name: name.clone(),
+                screens,
+                nav,
+            };
+            match api::post_json::<_, LayoutSummary>("/api/layouts", &req).await {
+                Ok(layout) => {
+                    chat_messages
+                        .write()
+                        .push((false, format!("ok:Layout \"{}\" saved.", layout.name)));
+                    // Add to local list
+                    saved_layouts.write().push(layout);
+                    show_save_input.set(false);
+                    save_name_input.set(String::new());
+                }
+                Err(e) => {
+                    chat_messages
+                        .write()
+                        .push((false, format!("error:Save failed: {}", e)));
+                }
+            }
+        });
+    };
+
+    // Delete layout handler
+    let delete_layout = move |id: String| {
+        spawn(async move {
+            let url = format!("/api/layouts/{}", id);
+            match api::delete_no_response(&url).await {
+                Ok(()) => {
+                    saved_layouts.write().retain(|l| l.id != id);
+                    chat_messages
+                        .write()
+                        .push((false, "ok:Layout deleted.".to_string()));
+                }
+                Err(e) => {
+                    chat_messages
+                        .write()
+                        .push((false, format!("error:Delete failed: {}", e)));
+                }
+            }
+        });
+    };
+
+    // Load layout handler — sets preview to layout's screens
+    let mut load_layout = move |layout: LayoutSummary| {
+        manifest.set(Some(ManifestResponse {
+            screens: layout.screens,
+            ..Default::default()
+        }));
+        chat_messages
+            .write()
+            .push((false, format!("ok:Loaded layout \"{}\".", layout.name)));
+    };
+
+    // Save stack handler
+    let save_stack_handler = move |_| {
+        let Some(did) = selected_device_id() else {
+            return;
+        };
+        let entries = stack_entries().clone();
+        spawn(async move {
+            let url = format!("/api/devices/{}/stack", did);
+            let req = SetStackRequest { entries };
+            match api::put_json::<_, DeviceStackResponse>(&url, &req).await {
+                Ok(_) => {
+                    chat_messages
+                        .write()
+                        .push((false, "ok:Condition stack saved.".to_string()));
+                }
+                Err(e) => {
+                    chat_messages
+                        .write()
+                        .push((false, format!("error:Stack save failed: {}", e)));
+                }
+            }
+        });
+    };
+
+    // Add condition to new entry form
+    let mut add_condition_to_entry = move |_| {
+        let field = new_cond_field();
+        let op = new_cond_op();
+        let value_str = new_cond_value().trim().to_string();
+        let value = if field == "default" || value_str.is_empty() {
+            None
+        } else {
+            Some(value_str)
+        };
+        new_entry_conditions
+            .write()
+            .push(ConditionDef { field, op, value });
+        new_cond_value.set(String::new());
+    };
+
+    // Add entry to stack
+    let mut add_entry_to_stack = move |_| {
+        let layout_id = new_entry_layout_id();
+        if layout_id.is_empty() {
+            return;
+        }
+        let conditions = new_entry_conditions().clone();
+        stack_entries.write().push(StackEntryDef {
+            layout_id,
+            conditions,
+            enabled: true,
+        });
+        // Reset form
+        new_entry_layout_id.set(String::new());
+        new_entry_conditions.set(vec![]);
+        show_add_entry.set(false);
+    };
+
+    // Build a quick lookup: layout_id -> name for the stack display
+    let layouts_snapshot = saved_layouts();
 
     rsx! {
         Layout {
@@ -380,40 +516,27 @@ pub fn Configurator() -> Element {
 
             div { class: "grid grid-cols-1 lg:grid-cols-2 gap-6",
 
-                // Left column: preview
+                // Left column: preview + layouts + stack
                 div {
-                    // Controls row: zone selector + device selector
-                    div { class: "flex gap-3 mb-4 items-end flex-wrap",
-                        div {
-                            label { class: "block text-xs text-muted mb-1", "Zone (optional)" }
-                            select {
-                                class: "input text-sm",
-                                value: selected_zone().unwrap_or_default(),
-                                onchange: move |e| {
-                                    let v = e.value();
-                                    selected_zone.set(if v.is_empty() { None } else { Some(v) });
-                                },
-                                option { value: "", "All zones (default)" }
-                                if let Some(Some(ref zr)) = *zones.read() {
-                                    for z in zr.zones.iter() {
-                                        option {
-                                            value: "{z.zone_id}",
-                                            selected: selected_zone() == Some(z.zone_id.clone()),
-                                            "{z.zone_name}"
-                                        }
+                    // Device selector
+                    div { class: "mb-4",
+                        label { class: "block text-xs text-muted mb-1", "Device" }
+                        select {
+                            class: "input text-sm",
+                            value: selected_device_id().unwrap_or_default(),
+                            onchange: move |e| {
+                                let v = e.value();
+                                selected_device_id.set(if v.is_empty() { None } else { Some(v) });
+                            },
+                            option { value: "", "Select a device..." }
+                            if let Some(Some(ref dr)) = *devices.read() {
+                                for knob in dr.knobs.iter() {
+                                    option {
+                                        value: "{knob.knob_id}",
+                                        selected: selected_device_id() == Some(knob.knob_id.clone()),
+                                        {device_display_name(knob)}
                                     }
                                 }
-                            }
-                        }
-                        div {
-                            label { class: "block text-xs text-muted mb-1", "Device" }
-                            select {
-                                class: "input text-sm",
-                                value: "{device_type}",
-                                onchange: move |e| device_type.set(e.value()),
-                                option { value: "Dial", "Dial" }
-                                option { value: "Frame", "Frame" }
-                                option { value: "Tough", "Tough" }
                             }
                         }
                     }
@@ -423,19 +546,289 @@ pub fn Configurator() -> Element {
                         lines: preview_lines,
                         elements: preview_elements,
                         is_playing,
-                        device_type: device_type(),
-                        zone_name: selected_zone_name,
+                        device_type: device_type.to_string(),
+                        zone_name: None,
                         background_color: preview_bg_color,
                         volume_fraction,
                         seek_fraction,
                     }
 
-                    // Reset button
-                    if selected_zone().is_some() {
-                        button {
-                            class: "btn btn-sm text-xs mt-3 opacity-60 hover:opacity-100",
-                            onclick: reset_handler,
-                            "Reset to default"
+                    // Reset + Save Layout buttons
+                    if manifest().is_some() {
+                        div { class: "flex gap-2 mt-3 items-center flex-wrap",
+                            button {
+                                class: "btn btn-sm text-xs opacity-60 hover:opacity-100",
+                                onclick: reset_handler,
+                                "Reset to default"
+                            }
+                            if !show_save_input() {
+                                button {
+                                    class: "btn btn-primary btn-sm text-xs",
+                                    onclick: move |_| show_save_input.set(true),
+                                    "Save Layout"
+                                }
+                            }
+                        }
+
+                        // Inline save name input
+                        if show_save_input() {
+                            div { class: "flex gap-2 mt-2 items-center",
+                                input {
+                                    class: "input text-sm flex-1",
+                                    placeholder: "Layout name...",
+                                    value: "{save_name_input}",
+                                    oninput: move |e| save_name_input.set(e.value()),
+                                    onkeypress: move |e| {
+                                        if e.key() == Key::Enter {
+                                            save_layout_handler(());
+                                        }
+                                    },
+                                }
+                                button {
+                                    class: "btn btn-primary btn-sm text-xs",
+                                    disabled: save_name_input().trim().is_empty(),
+                                    onclick: move |_| save_layout_handler(()),
+                                    "Save"
+                                }
+                                button {
+                                    class: "btn btn-sm text-xs opacity-60 hover:opacity-100",
+                                    onclick: move |_| {
+                                        show_save_input.set(false);
+                                        save_name_input.set(String::new());
+                                    },
+                                    "Cancel"
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Saved Layouts ────────────────────────────────────
+                    div { class: "card p-3 mt-4",
+                        h4 { class: "text-xs font-semibold mb-2", "Saved Layouts" }
+                        if saved_layouts().is_empty() {
+                            p { class: "text-xs text-muted", "No saved layouts yet." }
+                        } else {
+                            div { class: "space-y-1",
+                                for layout in saved_layouts().iter() {
+                                    {
+                                        let layout_for_load = layout.clone();
+                                        let layout_id_for_delete = layout.id.clone();
+                                        let layout_name = layout.name.clone();
+                                        rsx! {
+                                            div { class: "flex items-center justify-between gap-2 py-1",
+                                                span { class: "text-sm truncate flex-1", "{layout_name}" }
+                                                button {
+                                                    class: "btn btn-sm text-xs",
+                                                    onclick: move |_| load_layout(layout_for_load.clone()),
+                                                    "Load"
+                                                }
+                                                button {
+                                                    class: "btn btn-sm text-xs text-red-400 hover:text-red-300 opacity-60 hover:opacity-100",
+                                                    onclick: move |_| delete_layout(layout_id_for_delete.clone()),
+                                                    "X"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Condition Stack ──────────────────────────────────
+                    if selected_device_id().is_some() {
+                        div { class: "card p-3 mt-4",
+                            div { class: "flex items-center justify-between mb-2",
+                                h4 { class: "text-xs font-semibold", "Condition Stack" }
+                                button {
+                                    class: "btn btn-primary btn-sm text-xs",
+                                    onclick: move |_| save_stack_handler(()),
+                                    "Save Stack"
+                                }
+                            }
+
+                            if stack_loading() {
+                                p { class: "text-xs text-muted animate-pulse", "Loading..." }
+                            } else if stack_entries().is_empty() && !show_add_entry() {
+                                p { class: "text-xs text-muted", "No stack entries. Add one to define conditional layouts." }
+                            }
+
+                            // Existing entries
+                            if !stack_entries().is_empty() {
+                                div { class: "space-y-2 mb-3",
+                                    for (idx, entry) in stack_entries().iter().enumerate() {
+                                        {
+                                            // Resolve layout name from saved layouts
+                                            let entry_layout_name = layouts_snapshot
+                                                .iter()
+                                                .find(|l| l.id == entry.layout_id)
+                                                .map(|l| l.name.clone())
+                                                .unwrap_or_else(|| entry.layout_id.clone());
+                                            let conditions_summary = if entry.conditions.is_empty() {
+                                                "No conditions".to_string()
+                                            } else {
+                                                entry
+                                                    .conditions
+                                                    .iter()
+                                                    .map(|c| {
+                                                        if let Some(ref v) = c.value {
+                                                            format!("{} {} {}", c.field, c.op, v)
+                                                        } else {
+                                                            format!("{} {}", c.field, c.op)
+                                                        }
+                                                    })
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ")
+                                            };
+                                            let entry_enabled = entry.enabled;
+                                            rsx! {
+                                                div { class: "flex items-center gap-2 py-1 border-b border-gray-700",
+                                                    // Enabled toggle
+                                                    input {
+                                                        r#type: "checkbox",
+                                                        checked: entry_enabled,
+                                                        onchange: move |e: Event<FormData>| {
+                                                            let checked = e.value() == "true";
+                                                            stack_entries.write()[idx].enabled = checked;
+                                                        },
+                                                    }
+                                                    div { class: "flex-1 min-w-0",
+                                                        div { class: "text-sm truncate", "{entry_layout_name}" }
+                                                        div { class: "text-xs text-muted truncate", "{conditions_summary}" }
+                                                    }
+                                                    // Remove entry
+                                                    button {
+                                                        class: "btn btn-sm text-xs text-red-400 hover:text-red-300 opacity-60 hover:opacity-100",
+                                                        onclick: move |_| {
+                                                            stack_entries.write().remove(idx);
+                                                        },
+                                                        "X"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Add Entry button / form
+                            if !show_add_entry() {
+                                button {
+                                    class: "btn btn-sm text-xs mt-1",
+                                    onclick: move |_| show_add_entry.set(true),
+                                    "+ Add Entry"
+                                }
+                            } else {
+                                div { class: "border border-gray-700 rounded p-2 mt-2 space-y-2",
+                                    // Layout dropdown
+                                    div {
+                                        label { class: "block text-xs text-muted mb-1", "Layout" }
+                                        select {
+                                            class: "input text-sm",
+                                            value: "{new_entry_layout_id}",
+                                            onchange: move |e| new_entry_layout_id.set(e.value()),
+                                            option { value: "", "Select layout..." }
+                                            for layout in saved_layouts().iter() {
+                                                option {
+                                                    value: "{layout.id}",
+                                                    "{layout.name}"
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Current conditions for this entry
+                                    if !new_entry_conditions().is_empty() {
+                                        div { class: "space-y-1",
+                                            for (ci, cond) in new_entry_conditions().iter().enumerate() {
+                                                {
+                                                    let cond_display = if let Some(ref v) = cond.value {
+                                                        format!("{} {} {}", cond.field, cond.op, v)
+                                                    } else {
+                                                        format!("{} {}", cond.field, cond.op)
+                                                    };
+                                                    rsx! {
+                                                        div { class: "flex items-center gap-1 text-xs",
+                                                            span { class: "flex-1 truncate", "{cond_display}" }
+                                                            button {
+                                                                class: "text-red-400 hover:text-red-300 text-xs",
+                                                                onclick: move |_| {
+                                                                    new_entry_conditions.write().remove(ci);
+                                                                },
+                                                                "x"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Add condition sub-form
+                                    div { class: "flex gap-1 items-end flex-wrap",
+                                        div {
+                                            label { class: "block text-xs text-muted", "Field" }
+                                            select {
+                                                class: "input text-xs",
+                                                value: "{new_cond_field}",
+                                                onchange: move |e| new_cond_field.set(e.value()),
+                                                option { value: "zone_name", "zone_name" }
+                                                option { value: "source", "source" }
+                                                option { value: "genre", "genre" }
+                                                option { value: "artist", "artist" }
+                                                option { value: "duration", "duration" }
+                                                option { value: "default", "default" }
+                                            }
+                                        }
+                                        div {
+                                            label { class: "block text-xs text-muted", "Op" }
+                                            select {
+                                                class: "input text-xs",
+                                                value: "{new_cond_op}",
+                                                onchange: move |e| new_cond_op.set(e.value()),
+                                                option { value: "equals", "equals" }
+                                                option { value: "contains", "contains" }
+                                                option { value: "greater_than", "greater_than" }
+                                                option { value: "always", "always" }
+                                            }
+                                        }
+                                        div { class: "flex-1",
+                                            label { class: "block text-xs text-muted", "Value" }
+                                            input {
+                                                class: "input text-xs w-full",
+                                                placeholder: "value",
+                                                value: "{new_cond_value}",
+                                                oninput: move |e| new_cond_value.set(e.value()),
+                                            }
+                                        }
+                                        button {
+                                            class: "btn btn-sm text-xs",
+                                            onclick: move |_| add_condition_to_entry(()),
+                                            "+ Cond"
+                                        }
+                                    }
+
+                                    // Add entry / cancel buttons
+                                    div { class: "flex gap-2 pt-1",
+                                        button {
+                                            class: "btn btn-primary btn-sm text-xs",
+                                            disabled: new_entry_layout_id().is_empty(),
+                                            onclick: move |_| add_entry_to_stack(()),
+                                            "Add Entry"
+                                        }
+                                        button {
+                                            class: "btn btn-sm text-xs opacity-60 hover:opacity-100",
+                                            onclick: move |_| {
+                                                show_add_entry.set(false);
+                                                new_entry_layout_id.set(String::new());
+                                                new_entry_conditions.set(vec![]);
+                                                new_cond_value.set(String::new());
+                                            },
+                                            "Cancel"
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -534,7 +927,10 @@ fn ScreenPreview(
     }
 }
 
-/// Circular knob preview (Dial device)
+/// Circular knob preview (Dial device) — pure SVG rendering.
+///
+/// Layout mirrors the physical HiPhi Dial: a circular body with encoder
+/// ring arcs surrounding a square LCD display area, all in one SVG.
 #[component]
 fn DialPreview(
     lines: Vec<LineDef>,
@@ -545,121 +941,148 @@ fn DialPreview(
     volume_fraction: Option<f64>,
     seek_fraction: Option<f64>,
 ) -> Element {
-    let cx = 120.0_f64;
-    let cy = 120.0_f64;
+    let size = 280.0_f64;
+    let cx = size / 2.0;
+    let cy = size / 2.0;
     let vol_arc = volume_fraction
-        .map(|f| arc_path(cx, cy, 112.0, f))
+        .map(|f| arc_path(cx, cy, 134.0, f))
         .filter(|s| !s.is_empty());
     let seek_arc = seek_fraction
-        .map(|f| arc_path(cx, cy, 96.0, f))
+        .map(|f| arc_path(cx, cy, 124.0, f))
         .filter(|s| !s.is_empty());
 
     let art_color = background_color.as_deref().unwrap_or("#1a1a2e");
 
+    // Build transport button text: collect icon chars + active state
+    let transport_icons: Vec<(&str, bool)> = if elements.is_empty() {
+        vec![
+            ("\u{23EE}", false),
+            (if is_playing { "\u{23F8}" } else { "\u{25B6}" }, true),
+            ("\u{23ED}", false),
+        ]
+    } else {
+        elements
+            .iter()
+            .filter_map(|e| {
+                e.display
+                    .icon
+                    .as_ref()
+                    .map(|icon| (icon_char(icon), e.display.active == Some(true)))
+            })
+            .collect()
+    };
+
+    // Build text lines for SVG — up to 3 lines
+    let display_lines: Vec<(&str, &str)> = if lines.is_empty() {
+        vec![("No manifest", "#6b7280")]
+    } else {
+        lines
+            .iter()
+            .take(3)
+            .map(|l| {
+                let color = match l.style.as_str() {
+                    "title" => "#ffffff",
+                    "subtitle" => "#9ca3af",
+                    _ => "#6b7280",
+                };
+                (l.text.as_str(), color)
+            })
+            .collect()
+    };
+
+    // LCD display area: 170x170 centered
+    let lcd_half = 85.0;
+
     rsx! {
         div { class: "flex flex-col items-center",
-            // Zone name above preview
             if let Some(ref name) = zone_name {
                 div { class: "text-xs text-muted mb-2 truncate max-w-xs", "{name}" }
             }
 
-            div {
-                class: "relative mx-auto",
-                style: "width: 240px; height: 240px;",
+            svg {
+                width: "280",
+                height: "280",
+                view_box: "0 0 280 280",
+                style: "display: block;",
 
-                // SVG layer — arcs
-                svg {
-                    class: "absolute inset-0",
-                    width: "240",
-                    height: "240",
-                    view_box: "0 0 240 240",
+                // Circular body
+                circle {
+                    cx: "{cx}", cy: "{cy}", r: "139",
+                    fill: "#1a1a24",
+                }
 
-                    // Track rings (dim background)
-                    circle {
-                        cx: "120", cy: "120", r: "112",
-                        fill: "none",
-                        stroke: "#2a2a3a",
-                        stroke_width: "4",
-                    }
-                    circle {
-                        cx: "120", cy: "120", r: "96",
-                        fill: "none",
-                        stroke: "#2a2a3a",
-                        stroke_width: "3",
-                    }
+                // Track rings (dim)
+                circle {
+                    cx: "{cx}", cy: "{cy}", r: "134",
+                    fill: "none", stroke: "#2a2a3a", stroke_width: "4",
+                }
+                circle {
+                    cx: "{cx}", cy: "{cy}", r: "124",
+                    fill: "none", stroke: "#2a2a3a", stroke_width: "3",
+                }
 
-                    // Volume arc (outer, blue)
-                    if let Some(ref path) = vol_arc {
-                        path {
-                            d: "{path}",
-                            fill: "none",
-                            stroke: "#4a9eff",
-                            stroke_width: "4",
-                            stroke_linecap: "round",
-                        }
-                    }
-
-                    // Seek arc (inner, amber)
-                    if let Some(ref path) = seek_arc {
-                        path {
-                            d: "{path}",
-                            fill: "none",
-                            stroke: "#f59e0b",
-                            stroke_width: "3",
-                            stroke_linecap: "round",
-                        }
+                // Volume arc (outer, blue)
+                if let Some(ref path) = vol_arc {
+                    path {
+                        d: "{path}",
+                        fill: "none", stroke: "#4a9eff",
+                        stroke_width: "4", stroke_linecap: "round",
                     }
                 }
 
-                // Circular knob background
-                div {
-                    class: "absolute rounded-full",
-                    style: "left: 16px; top: 16px; width: 208px; height: 208px; background: #111118; border: 1px solid #333;",
-
-                    // Album art placeholder (colored circle in center)
-                    div {
-                        class: "absolute rounded-full",
-                        style: "left: 54px; top: 28px; width: 100px; height: 100px; background: {art_color}; opacity: 0.7;",
+                // Seek arc (inner, amber)
+                if let Some(ref path) = seek_arc {
+                    path {
+                        d: "{path}",
+                        fill: "none", stroke: "#f59e0b",
+                        stroke_width: "3", stroke_linecap: "round",
                     }
+                }
 
-                    // Text lines
-                    div {
-                        class: "absolute flex flex-col items-center justify-end px-6",
-                        style: "left: 0; right: 0; top: 100px; bottom: 40px;",
-                        for line in lines.iter() {
-                            p {
-                                class: match line.style.as_str() {
-                                    "title" => "text-white text-xs font-semibold text-center w-full truncate",
-                                    "subtitle" => "text-gray-400 text-xs text-center w-full truncate",
-                                    _ => "text-gray-500 text-xs text-center w-full truncate",
-                                },
-                                "{line.text}"
-                            }
-                        }
-                        if lines.is_empty() {
-                            p { class: "text-gray-500 text-xs", "No manifest" }
-                        }
+                // LCD display area background
+                rect {
+                    x: "{cx - lcd_half}", y: "{cy - lcd_half}",
+                    width: "{lcd_half * 2.0}", height: "{lcd_half * 2.0}",
+                    fill: "#111118",
+                }
+
+                // Album art placeholder
+                rect {
+                    x: "{cx - 40.0}", y: "{cy - lcd_half + 12.0}",
+                    width: "80", height: "80",
+                    fill: "{art_color}", opacity: "0.7",
+                }
+
+                // Text lines — positioned below art area
+                for (i, (text, color)) in display_lines.iter().enumerate() {
+                    text {
+                        x: "{cx}", y: "{cy + 20.0 + (i as f64 * 16.0)}",
+                        text_anchor: "middle",
+                        fill: "{color}",
+                        font_size: if i == 0 { "12" } else { "10" },
+                        font_weight: if i == 0 { "600" } else { "400" },
+                        font_family: "system-ui, sans-serif",
+                        "{text}"
                     }
+                }
 
-                    // Transport buttons at bottom
-                    div {
-                        class: "absolute flex justify-center gap-3",
-                        style: "bottom: 16px; left: 0; right: 0;",
-                        for elem in elements.iter() {
-                            if let Some(ref icon) = elem.display.icon {
-                                span {
-                                    class: if elem.display.active == Some(true) { "text-base text-blue-400" } else { "text-base text-gray-300" },
-                                    title: elem.on_tap.as_ref().map(|a| a.action.as_str()).unwrap_or(""),
-                                    {icon_char(icon)}
-                                }
+                // Transport buttons at bottom of LCD
+                for (i, (icon, active)) in transport_icons.iter().enumerate() {
+                    {
+                        let total = transport_icons.len() as f64;
+                        let spacing = 28.0;
+                        let start_x = cx - (total - 1.0) * spacing / 2.0;
+                        let bx = start_x + (i as f64) * spacing;
+                        let by = cy + lcd_half - 16.0;
+                        let fill = if *active { "#60a5fa" } else { "#d1d5db" };
+                        rsx! {
+                            text {
+                                x: "{bx}", y: "{by}",
+                                text_anchor: "middle",
+                                fill: "{fill}",
+                                font_size: "18",
+                                "{icon}"
                             }
-                        }
-                        if elements.is_empty() {
-                            span { class: "text-base text-gray-500", "\u{23EE}" }
-                            span { class: "text-base text-gray-300",
-                                if is_playing { "\u{23F8}" } else { "\u{25B6}" }
-                            }
-                            span { class: "text-base text-gray-500", "\u{23ED}" }
                         }
                     }
                 }
@@ -771,6 +1194,29 @@ fn arc_path(cx: f64, cy: f64, r: f64, fraction: f64) -> String {
         x2 = x2,
         y2 = y2
     )
+}
+
+/// Display name for a device in the dropdown: name, IP, or knob_id fallback.
+fn device_display_name(knob: &KnobDevice) -> String {
+    if let Some(ref name) = knob.name {
+        if !name.is_empty() {
+            return name.clone();
+        }
+    }
+    // Fall back to IP if available
+    if let Some(ref status) = knob.status {
+        if let Some(ref ip) = status.ip {
+            if !ip.is_empty() {
+                return format!("Device @ {}", ip);
+            }
+        }
+    }
+    // Last resort: truncated knob_id
+    if knob.knob_id.len() > 12 {
+        format!("{}...", &knob.knob_id[..12])
+    } else {
+        knob.knob_id.clone()
+    }
 }
 
 fn icon_char(name: &str) -> &'static str {

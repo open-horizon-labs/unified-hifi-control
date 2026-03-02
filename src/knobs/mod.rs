@@ -14,6 +14,8 @@
 //! - LLM-driven manifest generation via cloud proxy
 
 pub mod image;
+pub mod layout_routes;
+pub mod layout_store;
 pub mod llm_manifest;
 pub mod manifest;
 pub mod manifest_routes;
@@ -21,6 +23,7 @@ pub mod routes;
 pub mod store;
 pub mod udp;
 
+pub use layout_store::LayoutStore;
 pub use manifest_routes::ManifestStore;
 pub use routes::*;
 pub use store::KnobStore;

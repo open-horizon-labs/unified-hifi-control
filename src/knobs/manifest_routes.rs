@@ -4,12 +4,13 @@
 //! POST /knob/manifest  — Accept manifest push from Memex
 
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Query, State},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -17,7 +18,7 @@ use std::collections::HashMap;
 
 use crate::api::AppState;
 use crate::knobs::manifest::*;
-use crate::knobs::routes::{get_all_zones_internal, ZoneInfo};
+use crate::knobs::routes::{extract_knob_id, get_all_zones_internal, ZoneInfo};
 
 // ── Manifest store ──────────────────────────────────────────────────────────
 
@@ -153,6 +154,8 @@ pub struct ClearManifestQuery {
 /// manifest that reproduces the current `NowPlayingResponse` semantics.
 pub async fn knob_manifest_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    connect_info: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
     Query(params): Query<ManifestQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let zone_id = match params.zone_id {
@@ -164,6 +167,16 @@ pub async fn knob_manifest_handler(
             ));
         }
     };
+
+    // Extract device_id from headers, or fall back to source IP lookup.
+    // Firmware doesn't send x-knob-id on /manifest, so IP is the primary resolution path.
+    let mut device_id = extract_knob_id(&headers, None);
+    if device_id.is_none() {
+        if let Ok(ConnectInfo(addr)) = connect_info {
+            device_id = state.knobs.find_by_ip(&addr.ip().to_string()).await;
+        }
+    }
+    tracing::debug!(device_id = ?device_id, "Manifest request device resolution");
 
     // Normalize zone_id (legacy without prefix = Roon)
     let prefixed_zone_id = if !zone_id.contains(':') {
@@ -217,9 +230,31 @@ pub async fn knob_manifest_handler(
     let pushed = state.manifests.get(&prefixed_zone_id).await;
 
     let (screens, nav, interactions, sha) = if let Some(pushed) = pushed {
+        // Memex push takes priority
         (pushed.screens, pushed.nav, pushed.interactions, pushed.sha)
+    } else if let Some(ref dev_id) = device_id {
+        // Check layout condition stack for this device
+        if let Some(layout) = state.layouts.resolve_layout(dev_id, &zone).await {
+            let mut screens = merge_live_state(layout.screens, &zone);
+            // Always include a zones list screen for the zone picker
+            if !screens.iter().any(|s| matches!(s, Screen::List(_))) {
+                let zone_infos = get_all_zones_internal(&state).await;
+                screens.push(build_zones_screen(&zone_infos, &prefixed_zone_id));
+            }
+            let mut nav = layout.nav;
+            if !nav.order.contains(&"zones".to_string()) {
+                nav.order.push("zones".to_string());
+            }
+            let sha = compute_manifest_sha_full(&screens, &nav, &layout.interactions);
+            (screens, nav, layout.interactions, sha)
+        } else {
+            // No matching layout — fall through to default
+            let (screens, nav) = build_default_manifest(&state, &zone, &prefixed_zone_id).await;
+            let sha = compute_manifest_sha(&screens, &nav);
+            (screens, nav, None, sha)
+        }
     } else {
-        // Generate default manifest from aggregator state
+        // No device_id known — generate default manifest from aggregator state
         let (screens, nav) = build_default_manifest(&state, &zone, &prefixed_zone_id).await;
         let sha = compute_manifest_sha(&screens, &nav);
         (screens, nav, None, sha)
@@ -276,6 +311,110 @@ pub async fn knob_manifest_clear_handler(
     }
     state.manifests.clear(params.zone_id.as_deref()).await;
     StatusCode::NO_CONTENT
+}
+
+// ── Live state merge ────────────────────────────────────────────────────────
+
+/// Merge live zone state into layout template screens.
+///
+/// Layout templates define *structure* (which elements, encoder config).
+/// This function fills in *live data*:
+/// - Text lines from now_playing (title, artist, album)
+/// - Album art URL and image_key
+/// - Toggle icon/active state (play/pause, mute/unmute)
+/// - Background color from art cache
+pub fn merge_live_state(screens: Vec<Screen>, zone: &crate::bus::Zone) -> Vec<Screen> {
+    let is_playing = zone.state == crate::bus::PlaybackState::Playing;
+    let is_muted = zone
+        .volume_control
+        .as_ref()
+        .map(|vc| vc.is_muted)
+        .unwrap_or(false);
+    let np = zone.now_playing.as_ref();
+
+    screens
+        .into_iter()
+        .map(|screen| match screen {
+            Screen::Media(mut media) => {
+                // Replace text lines with live now_playing data
+                let title = np
+                    .map(|n| {
+                        if n.title.is_empty() {
+                            "Idle".to_string()
+                        } else {
+                            n.title.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| "Idle".to_string());
+                let artist = np.map(|n| n.artist.clone()).unwrap_or_default();
+                let mut lines = vec![
+                    TextLine {
+                        text: title,
+                        style: "title".to_string(),
+                    },
+                    TextLine {
+                        text: artist,
+                        style: "subtitle".to_string(),
+                    },
+                ];
+                if let Some(album) = np.and_then(|n| {
+                    if n.album.is_empty() {
+                        None
+                    } else {
+                        Some(n.album.clone())
+                    }
+                }) {
+                    lines.push(TextLine {
+                        text: album,
+                        style: "detail".to_string(),
+                    });
+                }
+                media.lines = lines;
+
+                // Set live image URL and key
+                media.image_url = Some(format!(
+                    "/knob/now_playing/image?zone_id={}",
+                    urlencoding::encode(&zone.zone_id)
+                ));
+                media.image_key = np.and_then(|n| n.image_key.clone());
+
+                // Merge element toggle states
+                if let Some(ref mut elements) = media.elements {
+                    for elem in elements.iter_mut() {
+                        if let Some(ref action) = elem.on_tap {
+                            match action.action.as_str() {
+                                "toggle_playback" => {
+                                    elem.display.icon = Some(
+                                        if is_playing { "pause" } else { "play_arrow" }.into(),
+                                    );
+                                }
+                                "toggle_mute" | "mute" => {
+                                    elem.display.icon = Some(
+                                        if is_muted {
+                                            "volume_off"
+                                        } else {
+                                            "volume_mute"
+                                        }
+                                        .into(),
+                                    );
+                                    elem.display.active = Some(is_muted);
+                                }
+                                "play" => {
+                                    elem.display.active = Some(is_playing);
+                                }
+                                "pause" => {
+                                    elem.display.active = Some(!is_playing);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Screen::Media(media)
+            }
+            other => other,
+        })
+        .collect()
 }
 
 // ── Default manifest builder ────────────────────────────────────────────────

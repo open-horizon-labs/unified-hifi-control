@@ -71,6 +71,7 @@ const MIGRATABLE_CONFIG_FILES: &[&str] = &[
     "hqp-zone-links.json",
     "roon_state.json",
     "knobs.json",
+    "memex-license.json",
 ];
 
 /// Get config directory (XDG_CONFIG_HOME or platform default)
@@ -265,6 +266,40 @@ pub fn get_data_dir() -> std::path::PathBuf {
 
     // Fallback to ./data
     std::path::PathBuf::from("./data")
+}
+
+const LICENSE_FILE: &str = "memex-license.json";
+
+/// Save Memex license to disk so it persists across restarts.
+pub fn save_license(license: &str) {
+    let path = get_config_file_path(LICENSE_FILE);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::json!({ "license": license });
+    match std::fs::write(&path, json.to_string()) {
+        Ok(()) => tracing::info!("Saved Memex license to disk"),
+        Err(e) => tracing::error!("Failed to save Memex license: {}", e),
+    }
+}
+
+/// Remove saved license from disk.
+pub fn delete_saved_license() {
+    let path = get_config_file_path(LICENSE_FILE);
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+        tracing::info!("Removed saved Memex license from disk");
+    }
+}
+
+/// Load saved license from disk (fallback when not in env/config).
+pub fn load_saved_license() -> Option<String> {
+    let content = read_config_file(LICENSE_FILE)?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    v.get("license")?
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Check if started from LMS UnifiedHiFi plugin (explicit signal)
