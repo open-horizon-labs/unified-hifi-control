@@ -31,7 +31,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'release')
-    runs-on: namespace-profile-default
+    runs-on: namespace-profile-cached
     timeout-minutes: 90
     permissions:
       contents: write
@@ -149,7 +149,7 @@ jobs:
     name: Pi Image Summary
     needs: [build-pi-image]
     if: always()
-    runs-on: namespace-profile-default
+    runs-on: namespace-profile-cached
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v7
