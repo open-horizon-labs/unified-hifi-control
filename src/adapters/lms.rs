@@ -372,8 +372,9 @@ impl LmsRpc {
             power: result.get("power").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
             volume: result
                 .get("mixer volume")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32,
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .round() as i32,
             playlist_tracks: result
                 .get("playlist_tracks")
                 .and_then(|v| v.as_u64())
@@ -1860,6 +1861,7 @@ async fn update_players_internal(
             }
             Err(e) => {
                 tracing::warn!("Failed to get status for player {}: {}", player.playerid, e);
+                continue;
             }
         }
 
@@ -2928,5 +2930,39 @@ mod tests {
             }
             _ => panic!("Expected Mixer event, got {:?}", event),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Volume Parsing Tests (Issue #299)
+    // -------------------------------------------------------------------------
+
+    /// Helper: extract volume from a JSON "mixer volume" value the same way
+    /// get_player_status does.
+    fn parse_volume(json_value: serde_json::Value) -> i32 {
+        json_value.as_f64().unwrap_or(0.0).round() as i32
+    }
+
+    #[test]
+    fn test_volume_parsing_integer() {
+        assert_eq!(parse_volume(json!(75)), 75);
+        assert_eq!(parse_volume(json!(0)), 0);
+        assert_eq!(parse_volume(json!(100)), 100);
+    }
+
+    #[test]
+    fn test_volume_parsing_float() {
+        // LMS with 2.5-step increments produces these values
+        assert_eq!(parse_volume(json!(52.5)), 53);
+        assert_eq!(parse_volume(json!(57.5)), 58);
+        assert_eq!(parse_volume(json!(50.0)), 50);
+        assert_eq!(parse_volume(json!(99.9)), 100);
+        assert_eq!(parse_volume(json!(0.4)), 0);
+    }
+
+    #[test]
+    fn test_volume_parsing_null_defaults_to_zero() {
+        let val: Option<serde_json::Value> = None;
+        let volume = val.and_then(|v| v.as_f64()).unwrap_or(0.0).round() as i32;
+        assert_eq!(volume, 0);
     }
 }
