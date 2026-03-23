@@ -48,6 +48,8 @@ pub mod coordinator;
 #[cfg(feature = "server")]
 pub mod embedded;
 #[cfg(feature = "server")]
+pub mod event_reporter;
+#[cfg(feature = "server")]
 pub mod firmware;
 #[cfg(feature = "server")]
 pub mod knobs;

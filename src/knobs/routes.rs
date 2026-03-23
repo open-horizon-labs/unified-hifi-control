@@ -28,7 +28,7 @@ use crate::knobs::image::placeholder_svg;
 use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
 
 /// Extract knob ID from headers or query params
-fn extract_knob_id(headers: &HeaderMap, query_knob_id: Option<&str>) -> Option<String> {
+pub fn extract_knob_id(headers: &HeaderMap, query_knob_id: Option<&str>) -> Option<String> {
     headers
         .get("x-knob-id")
         .or_else(|| headers.get("x-device-id"))
@@ -108,10 +108,29 @@ pub struct ZonesResponse {
 }
 
 /// GET /knob/zones - List all zones from all adapters
+///
+/// Also registers the device if a knob_id is present (header or query param).
 pub async fn knob_zones_handler(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
+    connect_info: Result<ConnectInfo<SocketAddr>, axum::extract::rejection::ExtensionRejection>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Json<ZonesResponse> {
+    // Register/update the device if knob_id present
+    let knob_id = extract_knob_id(&headers, params.get("knob_id").map(|s| s.as_str()));
+    if let Some(ref id) = knob_id {
+        let version = extract_knob_version(&headers);
+        state.knobs.get_or_create(id, version.as_deref()).await;
+        let client_ip = connect_info.ok().map(|ci| ci.0.ip().to_string());
+        let status_update = KnobStatusUpdate {
+            zone_id: None,
+            battery_level: None,
+            battery_charging: None,
+            ip: client_ip,
+        };
+        state.knobs.update_status(id, status_update).await;
+    }
+
     let zones = get_all_zones_internal(&state).await;
     Json(ZonesResponse { zones })
 }
@@ -297,11 +316,7 @@ pub async fn knob_now_playing_handler(
     let zone_infos = get_zone_infos(&state).await;
 
     // Handle legacy zone_id without prefix (assume Roon)
-    let prefixed_zone_id = if !zone_id.contains(':') {
-        format!("roon:{}", zone_id)
-    } else {
-        zone_id.clone()
-    };
+    let prefixed_zone_id = super::normalize_zone_id(&zone_id);
 
     // Get zone from aggregator (single source of truth)
     let zone = match state.aggregator.get_zone(&prefixed_zone_id).await {
@@ -415,6 +430,8 @@ pub struct ImageQuery {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub format: Option<String>,
+    /// Clip to circle of this radius (pixels from center). Pixels outside become black.
+    pub clip_radius: Option<u32>,
 }
 
 // Image conversion is now handled by state.get_image()
@@ -427,9 +444,14 @@ pub async fn knob_image_handler(
     State(state): State<AppState>,
     Query(params): Query<ImageQuery>,
 ) -> Response {
-    let target_width = params.width.unwrap_or(240);
-    let target_height = params.height.unwrap_or(240);
     let format = params.format.as_deref();
+    let (default_w, default_h) = if format == Some("eink_acep6") {
+        (800, 480)
+    } else {
+        (240, 240)
+    };
+    let target_width = params.width.unwrap_or(default_w);
+    let target_height = params.height.unwrap_or(default_h);
 
     // Helper to return placeholder image in appropriate format
     let placeholder_response = || -> Response {
@@ -451,6 +473,16 @@ pub async fn knob_image_handler(
                     .body(Body::from(svg))
                     .unwrap(),
             }
+        } else if format == Some("eink_acep6") {
+            let eink = crate::knobs::image::placeholder_eink(target_width, target_height);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header("X-Image-Format", "eink_acep6")
+                .header("X-Image-Width", eink.width.to_string())
+                .header("X-Image-Height", eink.height.to_string())
+                .body(Body::from(eink.data))
+                .unwrap()
         } else {
             Response::builder()
                 .status(StatusCode::OK)
@@ -461,11 +493,7 @@ pub async fn knob_image_handler(
     };
 
     // Handle legacy zone_id without prefix (assume Roon)
-    let zone_id = if !params.zone_id.contains(':') {
-        format!("roon:{}", params.zone_id)
-    } else {
-        params.zone_id.clone()
-    };
+    let zone_id = super::normalize_zone_id(&params.zone_id);
 
     // Get zone from aggregator to find image_key
     let zone = match state.aggregator.get_zone(&zone_id).await {
@@ -491,28 +519,77 @@ pub async fn knob_image_handler(
         .await
     {
         Ok(image_data) => {
-            // If RGB565 was requested but conversion failed (content_type != octet-stream),
+            // If a device format was requested but conversion failed (content_type != octet-stream),
             // return the placeholder instead of misleading headers
-            if format == Some("rgb565") && image_data.content_type != "application/octet-stream" {
+            if (format == Some("rgb565") || format == Some("eink_acep6"))
+                && image_data.content_type != "application/octet-stream"
+            {
                 return placeholder_response();
             }
 
+            // Cache edge color for manifest background_color
+            if let Some(ec) = image_data.edge_color {
+                let hex = format!("#{:02x}{:02x}{:02x}", ec[0], ec[1], ec[2]);
+                state
+                    .art_colors
+                    .write()
+                    .await
+                    .insert(image_key.clone(), hex);
+            }
+
+            // Apply circular clip if requested (for round displays)
+            let body_data = if let Some(radius) = params.clip_radius {
+                if format == Some("rgb565") {
+                    clip_rgb565_circle(&image_data.data, target_width, target_height, radius)
+                } else {
+                    image_data.data
+                }
+            } else {
+                image_data.data
+            };
             let mut response = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, &image_data.content_type);
-
-            // Add RGB565 metadata headers for ESP32 clients
             if format == Some("rgb565") {
                 response = response
                     .header("X-Image-Format", "rgb565")
                     .header("X-Image-Width", target_width.to_string())
                     .header("X-Image-Height", target_height.to_string());
+            } else if format == Some("eink_acep6") {
+                response = response
+                    .header("X-Image-Format", "eink_acep6")
+                    .header("X-Image-Width", target_width.to_string())
+                    .header("X-Image-Height", target_height.to_string());
             }
 
-            response.body(Body::from(image_data.data)).unwrap()
+            response.body(Body::from(body_data)).unwrap()
         }
         Err(_) => placeholder_response(),
     }
+}
+
+/// Zero out RGB565 pixels outside a circle of the given radius (from center).
+/// Pixels outside become black (0x0000). Operates on little-endian RGB565 pairs.
+fn clip_rgb565_circle(data: &[u8], width: u32, height: u32, radius: u32) -> Vec<u8> {
+    let mut out = data.to_vec();
+    let cx = width as f32 / 2.0;
+    let cy = height as f32 / 2.0;
+    let r_sq = (radius as f32) * (radius as f32);
+
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx * dx + dy * dy > r_sq {
+                let idx = ((y * width + x) * 2) as usize;
+                if idx + 1 < out.len() {
+                    out[idx] = 0;
+                    out[idx + 1] = 0;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Control request body
@@ -520,15 +597,22 @@ pub async fn knob_image_handler(
 pub struct KnobControlRequest {
     pub zone_id: String,
     pub action: String,
+    #[serde(alias = "params")]
     pub value: Option<serde_json::Value>,
 }
 
 /// POST /knob/control - Send control command (routes by zone_id prefix)
 pub async fn knob_control_handler(
     State(state): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(req): Json<KnobControlRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Register device if knob_id present in headers
+    if let Some(id) = extract_knob_id(&headers, None) {
+        let version = extract_knob_version(&headers);
+        state.knobs.get_or_create(&id, version.as_deref()).await;
+    }
+
     // Route based on zone_id prefix
     if req.zone_id.starts_with("lms:") {
         // LMS player control
@@ -554,6 +638,16 @@ pub async fn knob_control_handler(
     control_roon(&state, &roon_zone_id, &req.action, req.value.as_ref()).await
 }
 
+/// Parse and bound-check seek seconds from an action value.
+/// Defaults to 30 seconds if not specified; clamps to the range [1, 300].
+fn parse_seek_seconds(value: Option<&serde_json::Value>) -> i32 {
+    let secs = value
+        .and_then(|v| v.get("seconds").or(Some(v)))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(30.0) as i32;
+    secs.clamp(1, 300)
+}
+
 /// Control Roon zone
 async fn control_roon(
     state: &AppState,
@@ -564,15 +658,43 @@ async fn control_roon(
     let roon_action = match action {
         "play" => "play",
         "pause" => "pause",
-        "play_pause" | "playpause" => "play_pause",
+        "play_pause" | "playpause" | "toggle_playback" => "play_pause",
         "next" => "next",
         "previous" | "prev" => "previous",
         "stop" => "stop",
+        "seek_forward" => {
+            let seconds = parse_seek_seconds(value);
+            state
+                .roon
+                .seek_relative(zone_id, seconds)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
+        "seek_backward" => {
+            let seconds = parse_seek_seconds(value);
+            state
+                .roon
+                .seek_relative(zone_id, -seconds)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
         "vol_up" | "volume_up" => {
             // Use provided value, or look up zone's actual step from aggregator
             let step = match value.and_then(|v| v.as_f64()) {
                 Some(v) => v as f32,
-                None => get_zone_step(state, &format!("roon:{}", zone_id)).await,
+                None => get_zone_step(state, &super::normalize_zone_id(zone_id)).await,
             };
             state
                 .roon
@@ -590,7 +712,7 @@ async fn control_roon(
             // Use provided value, or look up zone's actual step from aggregator
             let step = match value.and_then(|v| v.as_f64()) {
                 Some(v) => v as f32,
-                None => get_zone_step(state, &format!("roon:{}", zone_id)).await,
+                None => get_zone_step(state, &super::normalize_zone_id(zone_id)).await,
             };
             state
                 .roon
@@ -620,6 +742,41 @@ async fn control_roon(
                 })?;
             return Ok(Json(serde_json::json!({"ok": true})));
         }
+        "mute" => {
+            state.roon.mute(zone_id, true).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
+        "unmute" => {
+            state.roon.mute(zone_id, false).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
+        "toggle_mute" => {
+            // Look up current mute state from aggregator, then toggle
+            let is_muted = state
+                .aggregator
+                .get_zone(&super::normalize_zone_id(zone_id))
+                .await
+                .and_then(|z| z.volume_control)
+                .map(|vc| vc.is_muted)
+                .unwrap_or(false);
+            state.roon.mute(zone_id, !is_muted).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -647,10 +804,38 @@ async fn control_lms(
     let lms_action = match action {
         "play" => "play",
         "pause" => "pause",
-        "play_pause" | "playpause" => "pause", // LMS uses pause to toggle
+        "play_pause" | "playpause" | "toggle_playback" => "pause", // LMS uses pause to toggle
         "next" => "next",
         "previous" | "prev" => "prev",
         "stop" => "stop",
+        "seek_forward" => {
+            let seconds = parse_seek_seconds(value);
+            state
+                .lms
+                .control(player_id, "seek_forward", Some(seconds))
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
+        "seek_backward" => {
+            let seconds = parse_seek_seconds(value);
+            state
+                .lms
+                .control(player_id, "seek_backward", Some(seconds))
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?;
+            return Ok(Json(serde_json::json!({"ok": true})));
+        }
         "vol_up" | "volume_up" => {
             // Use provided value, or look up zone's actual step from aggregator
             let step = match value.and_then(|v| v.as_f64()) {
@@ -702,6 +887,12 @@ async fn control_lms(
                 })?;
             return Ok(Json(serde_json::json!({"ok": true})));
         }
+        "mute" | "unmute" | "toggle_mute" => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Mute not yet supported for LMS — coming soon"})),
+            ));
+        }
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -728,10 +919,26 @@ async fn control_openhome(
     let oh_action = match action {
         "play" => "play",
         "pause" => "pause",
-        "play_pause" | "playpause" => "pause", // OpenHome uses pause to toggle
+        "play_pause" | "playpause" | "toggle_playback" => "pause", // OpenHome uses pause to toggle
         "next" => "next",
         "previous" | "prev" => "previous",
         "stop" => "stop",
+        "seek_forward" | "seek_backward" => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(
+                    serde_json::json!({"error": "Seek not yet supported for OpenHome — coming soon"}),
+                ),
+            ));
+        }
+        "mute" | "unmute" | "toggle_mute" => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(
+                    serde_json::json!({"error": "Mute not yet supported for OpenHome — coming soon"}),
+                ),
+            ));
+        }
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -758,10 +965,22 @@ async fn control_upnp(
     let upnp_action = match action {
         "play" => "play",
         "pause" => "pause",
-        "play_pause" | "playpause" => "pause",
+        "play_pause" | "playpause" | "toggle_playback" => "pause",
         "next" => "next",
         "previous" | "prev" => "previous",
         "stop" => "stop",
+        "seek_forward" | "seek_backward" => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Seek not yet supported for UPnP — coming soon"})),
+            ));
+        }
+        "mute" | "unmute" | "toggle_mute" => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Mute not yet supported for UPnP — coming soon"})),
+            ));
+        }
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -802,12 +1021,12 @@ pub async fn knob_config_handler(
         )
     })?;
 
-    let knob = state.knobs.get(&knob_id).await.ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "knob not found"})),
-        )
-    })?;
+    // Use get_or_create so new devices are implicitly registered
+    let version = extract_knob_version(&headers);
+    let knob = state
+        .knobs
+        .get_or_create(&knob_id, version.as_deref())
+        .await;
 
     // Build config response with name included in config object (matches frontend expected format)
     let mut config = serde_json::to_value(&knob.config).unwrap_or_default();
@@ -842,6 +1061,13 @@ pub async fn knob_config_update_handler(
         )
     })?;
 
+    // Ensure device exists (implicit registration)
+    let version = extract_knob_version(&headers);
+    state
+        .knobs
+        .get_or_create(&knob_id, version.as_deref())
+        .await;
+
     let knob = state
         .knobs
         .update_config(&knob_id, updates)
@@ -863,6 +1089,18 @@ pub async fn knob_config_update_handler(
 pub async fn knob_devices_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
     let knobs = state.knobs.list().await;
     Json(serde_json::json!({ "knobs": knobs }))
+}
+
+/// DELETE /knob/devices/{id} - Remove a registered device
+pub async fn knob_device_delete_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(knob_id): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    if state.knobs.remove(&knob_id).await {
+        Json(serde_json::json!({"ok": true}))
+    } else {
+        Json(serde_json::json!({"ok": false, "error": "not found"}))
+    }
 }
 
 /// GET /config/{knob_id} - Get knob configuration (path parameter format)
@@ -938,9 +1176,19 @@ struct FirmwareVersionInfo {
     file: Option<String>,
 }
 
-/// GET /firmware/version - Get available firmware version
+/// GET /firmware/version - Get available firmware version (license-gated)
 #[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
-pub async fn firmware_version_handler() -> Response {
+pub async fn firmware_version_handler(State(state): State<AppState>) -> Response {
+    if !state.event_reporter.is_enabled().await {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":"License required for firmware updates","error_code":"LICENSE_REQUIRED"}"#,
+            ))
+            .unwrap();
+    }
+
     let fw_dir = firmware_dir();
 
     if !fw_dir.exists() {
@@ -1028,9 +1276,19 @@ pub async fn firmware_version_handler() -> Response {
         .unwrap()
 }
 
-/// GET /firmware/download - Download firmware binary
+/// GET /firmware/download - Download firmware binary (license-gated)
 #[allow(clippy::unwrap_used)] // Response::builder().body().unwrap() cannot fail with valid inputs
-pub async fn firmware_download_handler() -> Response {
+pub async fn firmware_download_handler(State(state): State<AppState>) -> Response {
+    if !state.event_reporter.is_enabled().await {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":"License required for firmware downloads","error_code":"LICENSE_REQUIRED"}"#,
+            ))
+            .unwrap();
+    }
+
     let fw_dir = firmware_dir();
 
     if !fw_dir.exists() {

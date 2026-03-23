@@ -10,7 +10,7 @@ use roon_api::{
     },
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
-    transport::{self, volume, Control, Transport, Zone as RoonZone},
+    transport::{self, volume, Control, Seek, Transport, Zone as RoonZone},
     CoreEvent, Info, Parsed, RoonApi, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
@@ -507,6 +507,23 @@ impl RoonAdapter {
         Ok(())
     }
 
+    /// Seek relative to current position (positive = forward, negative = backward)
+    pub async fn seek_relative(&self, zone_id: &str, seconds: i32) -> Result<()> {
+        let zone_id = strip_roon_prefix(zone_id);
+
+        // Clone transport while holding lock, then release before await
+        let transport = {
+            let state = self.state.read().await;
+            state
+                .transport
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Not connected to Roon"))?
+        };
+
+        transport.seek(zone_id, &Seek::Relative, seconds).await;
+        Ok(())
+    }
+
     /// Get album art image
     pub async fn get_image(
         &self,
@@ -678,7 +695,7 @@ impl RoonAdapter {
         zone_id: Option<&str>,
         limit: Option<usize>,
         source: SearchSource,
-    ) -> Result<Vec<BrowseItem>> {
+    ) -> Result<(String, Vec<BrowseItem>)> {
         let session_key = format!(
             "search_{}",
             std::time::SystemTime::now()
@@ -763,16 +780,101 @@ impl RoonAdapter {
         if let Some(list) = &search_result.list {
             if list.count > 0 {
                 let load_opts = LoadOpts {
-                    multi_session_key: Some(session_key),
+                    multi_session_key: Some(session_key.clone()),
                     count: Some(limit.unwrap_or(DEFAULT_SEARCH_LIMIT)),
                     ..Default::default()
                 };
                 let load_result = self.load(load_opts).await?;
-                return Ok(load_result.items);
+                return Ok((session_key, load_result.items));
             }
         }
 
-        Ok(vec![])
+        Ok((session_key, vec![]))
+    }
+
+    /// Search and return playable items (drills into categories).
+    /// Returns (session_key, Vec<(category_name, BrowseItem)>) where each item
+    /// has hint Action or ActionList — ready to pass to execute_play_action.
+    pub async fn search_playable(
+        &self,
+        query: &str,
+        zone_id: Option<&str>,
+        limit: Option<usize>,
+        source: SearchSource,
+    ) -> Result<(String, Vec<(String, BrowseItem)>)> {
+        let limit = limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+        let (session_key, top_items) = self.search(query, zone_id, Some(50), source).await?;
+
+        let mut results: Vec<(String, BrowseItem)> = Vec::new();
+
+        // Check if top-level items are already playable (non-category)
+        for item in &top_items {
+            if results.len() >= limit {
+                break;
+            }
+            if !is_category(item)
+                && matches!(
+                    item.hint,
+                    Some(ItemHint::Action) | Some(ItemHint::ActionList)
+                )
+            {
+                results.push(("Top Results".to_string(), item.clone()));
+            }
+        }
+
+        // Drill into category nodes (Albums, Tracks, Artists, etc.)
+        for item in &top_items {
+            if results.len() >= limit {
+                break;
+            }
+            let cat_key = match &item.item_key {
+                Some(k) if is_category(item) && matches!(item.hint, Some(ItemHint::List)) => {
+                    k.clone()
+                }
+                _ => continue,
+            };
+            let cat_name = item.title.clone();
+
+            // Browse into category
+            if self
+                .browse(BrowseOpts {
+                    multi_session_key: Some(session_key.clone()),
+                    item_key: Some(cat_key),
+                    zone_or_output_id: zone_id.map(|z| z.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            let cat_items = match self
+                .load(LoadOpts {
+                    multi_session_key: Some(session_key.clone()),
+                    count: Some(20),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(r) => r.items,
+                Err(_) => continue,
+            };
+
+            for cat_item in cat_items {
+                if results.len() >= limit {
+                    break;
+                }
+                if matches!(
+                    cat_item.hint,
+                    Some(ItemHint::Action) | Some(ItemHint::ActionList)
+                ) {
+                    results.push((cat_name.clone(), cat_item));
+                }
+            }
+        }
+
+        Ok((session_key, results))
     }
 
     /// Search and play the first matching result
@@ -1201,7 +1303,7 @@ impl RoonAdapter {
     }
 
     /// Execute a play action on a specific item
-    async fn execute_play_action(
+    pub async fn execute_play_action(
         &self,
         session_key: &str,
         zone_id: &str,
@@ -1787,6 +1889,7 @@ async fn run_roon_loop(
                                         bus_for_events.publish(BusEvent::SeekPositionChanged {
                                             zone_id: PrefixedZoneId::roon(&seek.zone_id),
                                             position: pos,
+                                            duration: None, // Roon sets duration via ZoneDiscovered
                                         });
                                     }
                                 }

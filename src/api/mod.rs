@@ -7,9 +7,10 @@ use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
 use crate::adapters::Startable;
 use crate::aggregator::ZoneAggregator;
-use crate::bus::SharedBus;
+use crate::bus::{SharedBus, Zone};
 use crate::coordinator::AdapterCoordinator;
-use crate::knobs::KnobStore;
+use crate::event_reporter::EventReporter;
+use crate::knobs::{KnobStore, LayoutStore, ManifestStore};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -21,10 +22,12 @@ use axum::{
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -49,6 +52,12 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     /// Count of active SSE connections (for shutdown diagnostics)
     pub sse_connections: Arc<AtomicUsize>,
+    /// EventReporter for forwarding events to Memex muse-ingest proxy (Issue #49)
+    pub event_reporter: Arc<EventReporter>,
+    pub manifests: ManifestStore,
+    pub layouts: LayoutStore,
+    /// Cached album art edge colors: image_key → hex color string (e.g. "#1a2b3c")
+    pub art_colors: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl AppState {
@@ -68,6 +77,7 @@ impl AppState {
         startable_adapters: Vec<Arc<dyn Startable>>,
         start_time: Instant,
         shutdown: CancellationToken,
+        event_reporter: Arc<EventReporter>,
     ) -> Self {
         Self {
             roon,
@@ -85,6 +95,10 @@ impl AppState {
             start_time,
             shutdown,
             sse_connections: Arc::new(AtomicUsize::new(0)),
+            event_reporter,
+            manifests: ManifestStore::new(),
+            layouts: LayoutStore::new(),
+            art_colors: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -116,12 +130,17 @@ impl AppState {
         // Fetch raw image from appropriate adapter
         let raw_image = if zone_id.starts_with("lms:") {
             let (content_type, data) = self.lms.get_artwork(image_key, width, height).await?;
-            ImageData { content_type, data }
+            ImageData {
+                content_type,
+                data,
+                edge_color: None,
+            }
         } else if zone_id.starts_with("openhome:") {
             let img = self.openhome.get_image(image_key).await?;
             ImageData {
                 content_type: img.content_type,
                 data: img.data,
+                edge_color: None,
             }
         } else if zone_id.starts_with("upnp:") {
             anyhow::bail!(
@@ -132,12 +151,13 @@ impl AppState {
             ImageData {
                 content_type: img.content_type,
                 data: img.data,
+                edge_color: None,
             }
         } else {
             anyhow::bail!("Unknown zone type for image: {}", zone_id)
         };
 
-        // Convert to RGB565 if requested (for ESP32 LCD displays)
+        // Convert to device-specific format if requested
         if format == Some("rgb565") {
             // Use square dimensions when only one side specified (matches adapter behavior)
             let (target_w, target_h) = match (width, height) {
@@ -151,9 +171,37 @@ impl AppState {
                 Ok(rgb565) => Ok(ImageData {
                     content_type: "application/octet-stream".to_string(),
                     data: rgb565.data,
+                    edge_color: Some(rgb565.edge_color),
                 }),
                 Err(_) => {
                     // Fall back to original on conversion error
+                    Ok(raw_image)
+                }
+            }
+        } else if format == Some("eink_acep6") {
+            // Dither to ACeP 6-color palette for e-ink panels (Issue #263)
+            use crate::knobs::image::dither_to_eink_acep6;
+
+            let (target_w, target_h) = match (width, height) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, w),
+                (None, Some(h)) => (h, h),
+                (None, None) => (800, 480),
+            };
+
+            match dither_to_eink_acep6(&raw_image.data, target_w, target_h) {
+                Ok(eink) => Ok(ImageData {
+                    content_type: "application/octet-stream".to_string(),
+                    data: eink.data,
+                    edge_color: None,
+                }),
+                Err(e) => {
+                    tracing::warn!(
+                        "E-ink dithering failed ({}x{}): {}, falling back to raw image",
+                        target_w,
+                        target_h,
+                        e
+                    );
                     Ok(raw_image)
                 }
             }
@@ -242,6 +290,11 @@ pub async fn roon_zones_handler(
     Json(ZonesWrapper {
         zones: state.roon.get_zones().await,
     })
+}
+
+/// GET /api/zones - All zones from all adapters
+pub async fn all_zones_handler(State(state): State<AppState>) -> Json<Vec<Zone>> {
+    Json(state.aggregator.get_zones().await)
 }
 
 /// GET /roon/zone/:zone_id - Get specific zone
@@ -448,7 +501,7 @@ pub async fn roon_search_handler(
         .search(&params.q, params.zone_id.as_deref(), params.limit, source)
         .await
     {
-        Ok(items) => {
+        Ok((_session_key, items)) => {
             let results: Vec<SearchResultItem> = items.into_iter().map(|i| i.into()).collect();
             (
                 StatusCode::OK,
@@ -1205,11 +1258,16 @@ pub async fn events_handler(
 
     let stream = with_shutdown
         .filter_map(|result| match result {
-            Ok(event) => {
-                // Serialize event to JSON
-                match serde_json::to_string(&event) {
-                    Ok(json) => Some(Ok(Event::default().data(json))),
-                    Err(_) => None,
+            Ok(bus_event) => {
+                // Convert BusEvent to MuseEvent for wire transmission
+                // Internal events (commands, system events) return None and are filtered out
+                if let Some(muse_event) = bus_event.to_muse_event(None) {
+                    match serde_json::to_string(&muse_event) {
+                        Ok(json) => Some(Ok(Event::default().data(json))),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
                 }
             }
             Err(_) => None, // Skip lagged messages
@@ -2015,7 +2073,7 @@ pub struct AppSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdapterSettings {
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::knobs::layout_store::default_true")]
     pub roon: bool,
     #[serde(default)]
     pub upnp: bool,
@@ -2025,10 +2083,6 @@ pub struct AdapterSettings {
     pub lms: bool,
     #[serde(default)]
     pub hqplayer: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl Default for AppSettings {
@@ -2170,6 +2224,70 @@ pub async fn api_settings_post_handler(
             }
         }
     }
+
+    Json(serde_json::json!({"ok": true}))
+}
+
+// =============================================================================
+// License provisioning handlers (Issue #49: Memex integration)
+// =============================================================================
+
+/// License provisioning request body
+#[derive(Deserialize)]
+pub struct LicenseRequest {
+    pub license: String,
+}
+
+/// License provisioning response
+#[derive(Serialize)]
+pub struct LicenseResponse {
+    pub configured: bool,
+}
+
+/// POST /api/config/license - Provision a Memex license
+///
+/// This endpoint allows Memex to push a license JWT on first connect.
+/// The license activates the EventReporter to forward bus events to the
+/// muse-ingest proxy.
+pub async fn license_handler(
+    State(state): State<AppState>,
+    Json(req): Json<LicenseRequest>,
+) -> impl IntoResponse {
+    if req.license.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "License is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    // Set the license on the EventReporter and persist to disk
+    let license = req.license.trim().to_string();
+    state
+        .event_reporter
+        .set_license(Some(license.clone()))
+        .await;
+    crate::config::save_license(&license);
+
+    tracing::info!("Memex license configured via API");
+
+    (StatusCode::OK, Json(LicenseResponse { configured: true })).into_response()
+}
+
+/// GET /api/config/license - Get license status
+pub async fn license_status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let configured = state.event_reporter.is_enabled().await;
+    Json(LicenseResponse { configured })
+}
+
+/// DELETE /api/config/license - Remove the Memex license
+pub async fn license_delete_handler(State(state): State<AppState>) -> impl IntoResponse {
+    state.event_reporter.set_license(None).await;
+    crate::config::delete_saved_license();
+
+    tracing::info!("Memex license removed via API");
 
     Json(serde_json::json!({"ok": true}))
 }

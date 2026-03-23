@@ -28,6 +28,7 @@ use unified_hifi_control::api;
 use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
+use unified_hifi_control::event_reporter::EventReporter;
 use unified_hifi_control::knobs::{self, KnobStore};
 
 // Stub HTML handlers for UI route tests (replacing deleted ui module)
@@ -63,6 +64,12 @@ async fn create_test_app() -> Router {
         vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
     let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let shutdown_token = CancellationToken::new();
+    let event_reporter = Arc::new(EventReporter::new(
+        None,
+        aggregator.clone(),
+        shutdown_token.clone(),
+    ));
     let state = AppState::new(
         roon,
         hqplayer,
@@ -77,7 +84,8 @@ async fn create_test_app() -> Router {
         coordinator,
         startable_adapters,
         Instant::now(),
-        CancellationToken::new(),
+        shutdown_token,
+        event_reporter,
     );
 
     // Build router with all routes (same as main.rs)

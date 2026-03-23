@@ -3,9 +3,18 @@
 //! This module defines comprehensive event types that abstract across
 //! different audio sources (Roon, LMS, HQPlayer, etc.) into a unified
 //! zone-based model.
+//!
+//! Shared types are re-exported from muse-events crate for cross-wire
+//! compatibility with Memex and muse-ingest consumers.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+// Re-export shared types from muse-events crate
+pub use muse_events::zone::{
+    NowPlaying, PlaybackState, TrackMetadata, VolumeControl, VolumeScale, Zone, ZoneState,
+};
+pub use muse_events::MuseEvent;
 
 // =============================================================================
 // PrefixedZoneId - Type-safe zone identifier with source prefix
@@ -99,190 +108,10 @@ impl From<PrefixedZoneId> for String {
 }
 
 // =============================================================================
-// Core Data Structures
+// Internal-only types (not part of wire protocol)
 // =============================================================================
 
-/// Unified zone representation across all adapters.
-///
-/// A zone represents a logical playback destination (Roon zone, LMS player,
-/// HQPlayer instance, etc.) with a consistent interface regardless of source.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Zone {
-    /// Unique zone identifier (e.g., "roon:1234", "lms:00:11:22:33:44:55")
-    pub zone_id: String,
-
-    /// Human-readable zone name
-    pub zone_name: String,
-
-    /// Current playback state
-    pub state: PlaybackState,
-
-    /// Volume control information (if available)
-    pub volume_control: Option<VolumeControl>,
-
-    /// Currently playing track (if any)
-    pub now_playing: Option<NowPlaying>,
-
-    /// Source adapter identifier (e.g., "roon", "lms", "hqplayer")
-    pub source: String,
-
-    /// Whether playback controls are available
-    pub is_controllable: bool,
-
-    /// Whether the zone supports seeking
-    pub is_seekable: bool,
-
-    /// Last update timestamp (milliseconds since epoch)
-    pub last_updated: u64,
-
-    /// Whether play command is currently allowed
-    pub is_play_allowed: bool,
-
-    /// Whether pause command is currently allowed
-    pub is_pause_allowed: bool,
-
-    /// Whether next track command is allowed
-    pub is_next_allowed: bool,
-
-    /// Whether previous track command is allowed
-    pub is_previous_allowed: bool,
-}
-
-/// Playback state enumeration
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum PlaybackState {
-    Playing,
-    Paused,
-    Stopped,
-    Loading,
-    /// Buffering (used by streaming sources)
-    Buffering,
-    /// Unknown/unavailable state
-    #[default]
-    Unknown,
-}
-
-impl std::fmt::Display for PlaybackState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Playing => write!(f, "playing"),
-            Self::Paused => write!(f, "paused"),
-            Self::Stopped => write!(f, "stopped"),
-            Self::Loading => write!(f, "loading"),
-            Self::Buffering => write!(f, "buffering"),
-            Self::Unknown => write!(f, "unknown"),
-        }
-    }
-}
-
-impl From<&str> for PlaybackState {
-    fn from(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "playing" | "play" => Self::Playing,
-            "paused" | "pause" => Self::Paused,
-            "stopped" | "stop" => Self::Stopped,
-            "loading" => Self::Loading,
-            "buffering" => Self::Buffering,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-/// Volume control information for a zone or output.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct VolumeControl {
-    /// Current volume value (in the scale defined by min/max)
-    pub value: f32,
-
-    /// Minimum volume value (e.g., -64 for dB, 0 for percentage)
-    pub min: f32,
-
-    /// Maximum volume value (e.g., 0 for dB, 100 for percentage)
-    pub max: f32,
-
-    /// Volume step size (for relative adjustments)
-    pub step: f32,
-
-    /// Whether volume is currently muted
-    pub is_muted: bool,
-
-    /// Volume scale type
-    pub scale: VolumeScale,
-
-    /// Output ID for this volume control (for multi-output zones)
-    pub output_id: Option<String>,
-}
-
-/// Volume scale type
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum VolumeScale {
-    /// Decibels (typically -64 to 0)
-    Decibel,
-    /// Percentage (0 to 100)
-    Percentage,
-    /// Linear (0.0 to 1.0)
-    Linear,
-    /// Unknown/unspecified
-    #[default]
-    Unknown,
-}
-
-/// Now playing track information.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct NowPlaying {
-    /// Track title
-    pub title: String,
-
-    /// Artist name
-    pub artist: String,
-
-    /// Album name
-    pub album: String,
-
-    /// Image key or URL for album art
-    pub image_key: Option<String>,
-
-    /// Current seek position in seconds
-    pub seek_position: Option<f64>,
-
-    /// Total track duration in seconds
-    pub duration: Option<f64>,
-
-    /// Additional metadata (format, bitrate, etc.)
-    pub metadata: Option<TrackMetadata>,
-}
-
-/// Additional track metadata
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TrackMetadata {
-    /// Audio format (e.g., "FLAC", "DSD", "MQA")
-    pub format: Option<String>,
-
-    /// Sample rate in Hz (e.g., 44100, 192000)
-    pub sample_rate: Option<u32>,
-
-    /// Bit depth (e.g., 16, 24, 32)
-    pub bit_depth: Option<u8>,
-
-    /// Bitrate in kbps
-    pub bitrate: Option<u32>,
-
-    /// Genre
-    pub genre: Option<String>,
-
-    /// Composer
-    pub composer: Option<String>,
-
-    /// Track number
-    pub track_number: Option<u32>,
-
-    /// Disc number
-    pub disc_number: Option<u32>,
-}
-
-/// Image data returned from adapters
+/// Image data returned from adapters (internal only, not serialized over wire)
 #[derive(Debug, Clone)]
 pub struct ImageData {
     /// MIME content type (e.g., "image/jpeg", "image/png")
@@ -290,9 +119,12 @@ pub struct ImageData {
 
     /// Raw image bytes
     pub data: Vec<u8>,
+
+    /// Edge-average color extracted during RGB565 conversion (for background tinting)
+    pub edge_color: Option<[u8; 3]>,
 }
 
-/// Zone update payload for partial updates.
+/// Zone update payload for partial updates (internal only).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ZoneUpdate {
     /// Zone identifier
@@ -427,6 +259,9 @@ pub struct CommandResponse {
 /// - Adapter lifecycle: Adapter start/stop, cleanup
 /// - System: Shutdown, health checks
 /// - Legacy: Backward-compatible events for existing integrations
+///
+/// Note: For events that cross the wire (SSE, ingest), use `MuseEvent` from
+/// muse-events crate. `BusEvent::to_muse_event()` converts at the boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 #[allow(clippy::large_enum_variant)] // Zone is intentionally large for full state
@@ -478,6 +313,8 @@ pub enum BusEvent {
         /// Zone identifier (must be prefixed, e.g., "roon:xxx")
         zone_id: PrefixedZoneId,
         position: i64,
+        /// Track duration in seconds (optional — LMS sends it, Roon doesn't need to)
+        duration: Option<f64>,
     },
 
     /// Volume changed
@@ -694,6 +531,136 @@ impl BusEvent {
                 | Self::LmsPlayerStateChanged { .. }
         )
     }
+
+    /// Convert to MuseEvent for SSE transmission.
+    ///
+    /// Returns None for internal-only events that shouldn't cross the wire
+    /// (commands, system events, adapter lifecycle details).
+    ///
+    /// Note: The aggregator parameter is reserved for future enrichment of
+    /// NowPlayingChanged events with duration/metadata from zone state.
+    /// Currently not used as it would require async lookup.
+    #[allow(unused_variables)]
+    pub fn to_muse_event(
+        &self,
+        aggregator: Option<&crate::aggregator::ZoneAggregator>,
+    ) -> Option<MuseEvent> {
+        match self {
+            Self::ZoneDiscovered { zone } => Some(MuseEvent::ZoneDiscovered { zone: zone.clone() }),
+
+            Self::ZoneUpdated {
+                zone_id,
+                display_name,
+                state,
+            } => Some(MuseEvent::ZoneUpdated(ZoneState {
+                zone_id: zone_id.as_str().to_string(),
+                display_name: display_name.clone(),
+                state: PlaybackState::from(state.as_str()),
+            })),
+
+            Self::ZoneRemoved { zone_id } => Some(MuseEvent::ZoneRemoved {
+                zone_id: zone_id.as_str().to_string(),
+            }),
+
+            Self::NowPlayingChanged {
+                zone_id,
+                title,
+                artist,
+                album,
+                image_key,
+            } => Some(MuseEvent::NowPlayingChanged {
+                zone_id: zone_id.as_str().to_string(),
+                zone_name: None, // SSE consumers get this from ZoneDiscovered
+                source: None,    // SSE consumers get this from ZoneDiscovered
+                now_playing: title.as_ref().map(|t| NowPlaying {
+                    title: t.clone(),
+                    artist: artist.clone().unwrap_or_default(),
+                    album: album.clone().unwrap_or_default(),
+                    image_key: image_key.clone(),
+                    seek_position: None,
+                    duration: None,
+                    metadata: None,
+                }),
+            }),
+
+            Self::SeekPositionChanged {
+                zone_id, position, ..
+            } => Some(MuseEvent::SeekPositionChanged {
+                zone_id: zone_id.as_str().to_string(),
+                position: *position,
+            }),
+
+            Self::VolumeChanged {
+                output_id,
+                value,
+                is_muted,
+            } => Some(MuseEvent::VolumeChanged {
+                output_id: output_id.clone(),
+                value: *value,
+                is_muted: *is_muted,
+            }),
+
+            Self::AdapterConnected { adapter, details } => Some(MuseEvent::AdapterConnected {
+                adapter: adapter.clone(),
+                details: details.clone(),
+            }),
+
+            Self::AdapterDisconnected { adapter, reason } => Some(MuseEvent::AdapterDisconnected {
+                adapter: adapter.clone(),
+                reason: reason.clone(),
+            }),
+
+            Self::HqpPipelineChanged {
+                host,
+                filter,
+                shaper,
+                rate,
+            } => Some(MuseEvent::HqpPipelineChanged {
+                host: host.clone(),
+                filter: filter.clone(),
+                shaper: shaper.clone(),
+                rate: rate.clone(),
+            }),
+
+            // Internal events - don't cross the wire
+            Self::CommandReceived { .. }
+            | Self::CommandResult { .. }
+            | Self::AdapterStopping { .. }
+            | Self::AdapterStopped { .. }
+            | Self::ZonesFlushed { .. }
+            | Self::ShuttingDown { .. }
+            | Self::HealthCheck { .. }
+            | Self::ControlCommand { .. } => None,
+
+            // Legacy events - forward as adapter events
+            Self::RoonConnected { .. } => Some(MuseEvent::AdapterConnected {
+                adapter: "roon".to_string(),
+                details: None,
+            }),
+            Self::RoonDisconnected => Some(MuseEvent::AdapterDisconnected {
+                adapter: "roon".to_string(),
+                reason: None,
+            }),
+            Self::HqpConnected { host } => Some(MuseEvent::AdapterConnected {
+                adapter: "hqplayer".to_string(),
+                details: Some(host.clone()),
+            }),
+            Self::HqpDisconnected { host } => Some(MuseEvent::AdapterDisconnected {
+                adapter: "hqplayer".to_string(),
+                reason: Some(format!("Disconnected from {}", host)),
+            }),
+            Self::HqpStateChanged { .. } => None, // Internal state tracking
+            Self::LmsConnected { host } => Some(MuseEvent::AdapterConnected {
+                adapter: "lms".to_string(),
+                details: Some(host.clone()),
+            }),
+            Self::LmsDisconnected { host } => Some(MuseEvent::AdapterDisconnected {
+                adapter: "lms".to_string(),
+                reason: Some(format!("Disconnected from {}", host)),
+            }),
+            Self::LmsPlayerStateChanged { .. } => None, // Handled via ZoneUpdated
+        }
+    }
 }
 
 #[cfg(test)]
@@ -794,5 +761,53 @@ mod tests {
         // Invalid - no prefix
         assert!(PrefixedZoneId::parse("abc123").is_none());
         assert!(PrefixedZoneId::parse("unknown:abc").is_none());
+    }
+
+    #[test]
+    fn test_to_muse_event_zone_discovered() {
+        let zone = Zone {
+            zone_id: "roon:123".to_string(),
+            zone_name: "Test".to_string(),
+            state: PlaybackState::Stopped,
+            volume_control: None,
+            now_playing: None,
+            source: "roon".to_string(),
+            is_controllable: true,
+            is_seekable: true,
+            last_updated: 0,
+            is_play_allowed: true,
+            is_pause_allowed: false,
+            is_next_allowed: true,
+            is_previous_allowed: true,
+        };
+        let bus_event = BusEvent::ZoneDiscovered { zone: zone.clone() };
+        let muse_event = bus_event.to_muse_event(None);
+
+        assert!(muse_event.is_some());
+        match muse_event.unwrap() {
+            MuseEvent::ZoneDiscovered { zone: z } => assert_eq!(z, zone),
+            _ => panic!("Wrong event type"),
+        }
+    }
+
+    #[test]
+    fn test_to_muse_event_internal_events_none() {
+        let internal_events = vec![
+            BusEvent::CommandReceived {
+                zone_id: "test".to_string(),
+                command: Command::Play,
+                request_id: None,
+            },
+            BusEvent::ShuttingDown { reason: None },
+            BusEvent::HealthCheck { timestamp: 0 },
+        ];
+
+        for event in internal_events {
+            assert!(
+                event.to_muse_event(None).is_none(),
+                "Internal event {:?} should not convert to MuseEvent",
+                event.event_type()
+            );
+        }
     }
 }

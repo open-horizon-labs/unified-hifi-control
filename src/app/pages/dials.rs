@@ -1,6 +1,6 @@
-//! Knobs page component.
+//! Dials page component.
 //!
-//! Knob device management using Dioxus resources for async data fetching.
+//! Dial device management using Dioxus resources for async data fetching.
 
 use dioxus::prelude::*;
 
@@ -11,9 +11,9 @@ use crate::app::api::{
 use crate::app::components::Layout;
 use crate::app::sse::use_sse;
 
-/// Knobs page component.
+/// Dials page component.
 #[component]
-pub fn Knobs() -> Element {
+pub fn Dials() -> Element {
     let sse = use_sse();
 
     // Modal state
@@ -114,6 +114,12 @@ pub fn Knobs() -> Element {
             let url = format!("/knob/config?knob_id={}", urlencoding::encode(&knob_id));
             match api::fetch_json::<KnobConfigResponse>(&url).await {
                 Ok(resp) => {
+                    // Guard against stale response: only update state if the
+                    // user hasn't opened a different knob while the fetch was
+                    // in flight.
+                    if current_knob_id().as_deref() != Some(knob_id.as_str()) {
+                        return;
+                    }
                     if let Some(cfg) = resp.config {
                         config_name.set(cfg.name.unwrap_or_default());
                         config_rotation_charging.set(cfg.rotation_charging.unwrap_or(180));
@@ -203,10 +209,14 @@ pub fn Knobs() -> Element {
                     }
                 }
                 Err(e) => {
-                    save_status.set(Some(format!("Error: {}", e)));
+                    if current_knob_id().as_deref() == Some(knob_id.as_str()) {
+                        save_status.set(Some(format!("Error: {}", e)));
+                    }
                 }
             }
-            config_loading.set(false);
+            if current_knob_id().as_deref() == Some(knob_id.as_str()) {
+                config_loading.set(false);
+            }
         });
     };
 
@@ -307,10 +317,10 @@ pub fn Knobs() -> Element {
 
     rsx! {
         Layout {
-            title: "Knobs".to_string(),
-            nav_active: "knobs".to_string(),
+            title: "Dials".to_string(),
+            nav_active: "dials".to_string(),
 
-            h1 { class: "text-2xl font-bold mb-6", "Knob Devices" }
+            h1 { class: "text-2xl font-bold mb-6", "Dial Devices" }
 
             p { class: "mb-6 text-muted",
                 a {
@@ -318,7 +328,7 @@ pub fn Knobs() -> Element {
                     href: "https://community.roonlabs.com/t/50-esp32-s3-knob-roon-controller/311363",
                     target: "_blank",
                     rel: "noopener",
-                    "Knob Community Thread"
+                    "Dial Community Thread"
                 }
                 " - build info, firmware updates, discussion"
             }
@@ -326,9 +336,9 @@ pub fn Knobs() -> Element {
             // Knobs section
             section { id: "knobs-section", class: "mb-8",
                 if is_loading {
-                    div { class: "card p-6", aria_busy: "true", "Loading knobs..." }
+                    div { class: "card p-6", aria_busy: "true", "Loading dials..." }
                 } else if knobs_list.is_empty() {
-                    div { class: "card p-6 text-muted", "No knobs registered. Connect a knob to see it here." }
+                    div { class: "card p-6 text-muted", "No dials registered. Connect a dial to see it here." }
                 } else {
                     div { class: "card p-6 overflow-x-auto",
                         table { class: "w-full",
@@ -361,7 +371,7 @@ pub fn Knobs() -> Element {
             section { id: "firmware-section", class: "mb-8",
                 div { class: "mb-4",
                     h2 { class: "text-xl font-semibold", "Firmware" }
-                    p { class: "text-muted text-sm", "Manage knob firmware updates" }
+                    p { class: "text-muted text-sm", "Manage dial firmware updates" }
                 }
                 div { class: "card p-6",
                     p { class: "mb-4",
@@ -383,7 +393,7 @@ pub fn Knobs() -> Element {
                             onclick: fetch_firmware,
                             "Fetch Latest from GitHub"
                         }
-                        a { class: "link", href: "/knobs/flash", "Flash a new knob" }
+                        a { class: "link", href: "/knobs/flash", "Flash a new dial" }
                         if let Some((is_err, ref msg)) = fw_message() {
                             if is_err {
                                 span { class: "status-err", "{msg}" }
@@ -502,7 +512,7 @@ fn knob_display_name(knob: &KnobDevice) -> String {
     if suffix.is_empty() {
         "unnamed".to_string()
     } else {
-        format!("roon-knob-{}", suffix)
+        format!("dial-{}", suffix)
     }
 }
 
@@ -742,7 +752,7 @@ fn ConfigModal(
 
                 // Header
                 div { class: "flex items-center justify-between mb-6",
-                    h2 { class: "text-xl font-semibold", "Knob Configuration" }
+                    h2 { class: "text-xl font-semibold", "Dial Configuration" }
                     button {
                         class: "text-muted hover:text-white text-xl",
                         aria_label: "Close",
@@ -765,7 +775,7 @@ fn ConfigModal(
                             input {
                                 class: "input",
                                 r#type: "text",
-                                placeholder: "Living Room Knob",
+                                placeholder: "Living Room Dial",
                                 value: "{name}",
                                 oninput: move |e| on_name_change.call(e.value())
                             }
@@ -942,7 +952,7 @@ fn ConfigModal(
                                             }
                                         }
                                         p { class: "text-xs text-muted mt-2",
-                                            "The knob multiplies your base step by rotation speed. Faster turning = larger volume jumps."
+                                            "The dial multiplies your base step by rotation speed. Faster turning = larger volume jumps."
                                         }
                                     }
                                 } else {

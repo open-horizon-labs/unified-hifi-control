@@ -6,8 +6,8 @@
 #[cfg(feature = "server")]
 mod server {
     use unified_hifi_control::{
-        adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
-        mdns,
+        adapters, aggregator, api, app, bus, config, coordinator, embedded, event_reporter,
+        firmware, knobs, mcp, mdns,
     };
 
     // Import Startable trait for adapter lifecycle methods
@@ -244,6 +244,29 @@ mod server {
         // Create shutdown token for graceful SSE termination (fixes #73)
         let shutdown_token = CancellationToken::new();
 
+        // Issue #49: Initialize EventReporter for Memex muse-ingest integration
+        // Uses license from config/env if present, falls back to saved license on disk
+        let license = config
+            .memex_license
+            .clone()
+            .or_else(config::load_saved_license);
+        let event_reporter = Arc::new(event_reporter::EventReporter::new(
+            license,
+            zone_aggregator.clone(),
+            shutdown_token.clone(),
+        ));
+        // Start EventReporter in background
+        let reporter_for_spawn = event_reporter.clone();
+        let bus_for_reporter = bus.clone();
+        tokio::spawn(async move {
+            reporter_for_spawn.run(bus_for_reporter).await;
+        });
+        if config.memex_license.is_some() {
+            tracing::info!("EventReporter started with Memex license");
+        } else {
+            tracing::info!("EventReporter started (no license configured)");
+        }
+
         // Build application state (clone Arcs so we can access adapters for shutdown)
         let state = api::AppState::new(
             roon,
@@ -260,10 +283,14 @@ mod server {
             startable_adapters.clone(),
             Instant::now(),
             shutdown_token.clone(),
+            event_reporter,
         );
 
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();
+
+        // Clone state for UDP fast-path listener
+        let udp_state = state.clone();
 
         // Create MCP extension (state for MCP handlers)
         let mcp_extension = mcp::create_mcp_extension(state.clone());
@@ -272,6 +299,8 @@ mod server {
         let router = Router::new()
             // Health check
             .route("/status", get(api::status_handler))
+            // Unified zone endpoint
+            .route("/api/zones", get(api::all_zones_handler))
             // Roon routes
             .route("/roon/status", get(api::roon_status_handler))
             .route("/roon/zones", get(api::roon_zones_handler))
@@ -377,6 +406,10 @@ mod server {
             // App settings API
             .route("/api/settings", get(api::api_settings_get_handler))
             .route("/api/settings", post(api::api_settings_post_handler))
+            // License provisioning API (Issue #49: Memex integration)
+            .route("/api/config/license", post(api::license_handler))
+            .route("/api/config/license", get(api::license_status_handler))
+            .route("/api/config/license", delete(api::license_delete_handler))
             // Event stream (SSE)
             .route("/events", get(api::events_handler))
             // Knob hardware API routes
@@ -387,6 +420,53 @@ mod server {
             .route("/knob/config", get(knobs::knob_config_handler))
             .route("/knob/config", post(knobs::knob_config_update_handler))
             .route("/knob/devices", get(knobs::knob_devices_handler))
+            .route(
+                "/knob/devices/{id}",
+                delete(knobs::knob_device_delete_handler),
+            )
+            // Manifest-driven knob protocol (ADR-0003)
+            .route(
+                "/knob/manifest",
+                get(knobs::manifest_routes::knob_manifest_handler)
+                    .post(knobs::manifest_routes::knob_manifest_push_handler)
+                    .delete(knobs::manifest_routes::knob_manifest_clear_handler),
+            )
+            // Available actions and icons metadata (used by Configurator and LLM generation)
+            .route("/api/actions", get(knobs::manifest_routes::actions_handler))
+            .route("/api/icons", get(knobs::manifest_routes::icons_handler))
+            // LLM-driven manifest generation (license-gated, Issue #290)
+            .route(
+                "/api/manifest/generate",
+                post(knobs::llm_manifest::generate_manifest_handler),
+            )
+            // Layout + device stack API routes
+            .route(
+                "/api/layouts",
+                get(knobs::layout_routes::list_layouts).post(knobs::layout_routes::create_layout),
+            )
+            .route(
+                "/api/layouts/{id}",
+                get(knobs::layout_routes::get_layout)
+                    .put(knobs::layout_routes::update_layout)
+                    .delete(knobs::layout_routes::delete_layout),
+            )
+            .route(
+                "/api/devices/{device_id}/stack",
+                get(knobs::layout_routes::get_device_stack)
+                    .put(knobs::layout_routes::set_device_stack),
+            )
+            .route(
+                "/api/devices/{device_id}/stack/entries",
+                post(knobs::layout_routes::add_stack_entry),
+            )
+            .route(
+                "/api/devices/{device_id}/stack/entries/{index}",
+                delete(knobs::layout_routes::remove_stack_entry),
+            )
+            .route(
+                "/api/devices/{device_id}/stack/reorder",
+                post(knobs::layout_routes::reorder_stack),
+            )
             // Knob protocol routes (firmware uses these paths directly)
             .route("/now_playing", get(knobs::knob_now_playing_handler))
             .route("/now_playing/image", get(knobs::knob_image_handler))
@@ -514,6 +594,15 @@ mod server {
         };
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
+
+        // Spawn UDP fast-path listener for knob polling (port = HTTP port + 1)
+        let udp_port = config.port + 1;
+        tokio::spawn(async move {
+            if let Err(e) = knobs::udp::run_udp_fast_path(udp_state, udp_port).await {
+                tracing::error!("UDP fast-path listener failed: {}", e);
+            }
+        });
+        tracing::info!("UDP fast-path on port {}", udp_port);
 
         // Create shutdown future that cancels token before graceful shutdown (fixes #73)
         let graceful_shutdown = {

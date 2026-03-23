@@ -301,16 +301,30 @@ pub struct FetchFirmwareResponse {
 // Client-side fetch helpers (for use in effects/resources)
 // =============================================================================
 
-/// Fetch JSON from a URL (client-side only)
+/// Low-level WASM fetch helper. Sends an HTTP request and optionally parses
+/// the JSON response body.  All public fetch functions delegate to this.
 #[cfg(target_arch = "wasm32")]
-pub async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, String> {
+async fn wasm_fetch<R: for<'de> Deserialize<'de>>(
+    method: &str,
+    url: &str,
+    body: Option<String>,
+) -> Result<Option<R>, String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
-    use web_sys::{Request, RequestInit, Response};
+    use web_sys::{Headers, Request, RequestInit, Response};
 
     let window = web_sys::window().ok_or("No window")?;
     let opts = RequestInit::new();
-    opts.set_method("GET");
+    opts.set_method(method);
+
+    if let Some(body_str) = body {
+        let headers = Headers::new().map_err(|e| format!("{:?}", e))?;
+        headers
+            .set("Content-Type", "application/json")
+            .map_err(|e| format!("{:?}", e))?;
+        opts.set_headers(&headers);
+        opts.set_body(&wasm_bindgen::JsValue::from_str(&body_str));
+    }
 
     let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
 
@@ -320,17 +334,71 @@ pub async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, St
 
     let resp: Response = resp_value.dyn_into().map_err(|_| "Not a Response")?;
 
+    if !resp.ok() {
+        return Err(format!("HTTP {} {}", resp.status(), resp.status_text()));
+    }
+
+    // If the caller expects a response body, parse it as JSON.
+    // We use `resp.json()` which returns a JS Promise — only call it when
+    // the caller actually needs a deserialized value.  For `()` callers we
+    // use a separate code path via `_no_response` wrappers.
     let json = JsFuture::from(resp.json().map_err(|e| format!("{:?}", e))?)
         .await
         .map_err(|e| format!("{:?}", e))?;
 
-    serde_wasm_bindgen::from_value(json).map_err(|e| format!("{:?}", e))
+    let value: R = serde_wasm_bindgen::from_value(json).map_err(|e| format!("{:?}", e))?;
+    Ok(Some(value))
 }
 
-/// SSR stub - returns error (should not be called during SSR)
-#[cfg(not(target_arch = "wasm32"))]
-pub async fn fetch_json<T: for<'de> Deserialize<'de>>(_url: &str) -> Result<T, String> {
-    Err("fetch_json is only available in browser".to_string())
+/// Fire-and-forget variant: sends request, ignores response body.
+#[cfg(target_arch = "wasm32")]
+async fn wasm_fetch_no_response(
+    method: &str,
+    url: &str,
+    body: Option<String>,
+) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{Headers, Request, RequestInit};
+
+    let window = web_sys::window().ok_or("No window")?;
+    let opts = RequestInit::new();
+    opts.set_method(method);
+
+    if let Some(body_str) = body {
+        let headers = Headers::new().map_err(|e| format!("{:?}", e))?;
+        headers
+            .set("Content-Type", "application/json")
+            .map_err(|e| format!("{:?}", e))?;
+        opts.set_headers(&headers);
+        opts.set_body(&wasm_bindgen::JsValue::from_str(&body_str));
+    }
+
+    let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
+
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|e| format!("{:?}", e))?;
+
+    let resp: web_sys::Response = resp_value
+        .dyn_into()
+        .map_err(|_| "Not a Response".to_string())?;
+
+    if !resp.ok() {
+        return Err(format!("HTTP {} {}", resp.status(), resp.status_text()));
+    }
+
+    Ok(())
+}
+
+// ── Public wrappers (WASM) ──────────────────────────────────────────────────
+
+/// Fetch JSON from a URL (client-side only)
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, String> {
+    wasm_fetch::<T>("GET", url, None)
+        .await
+        .map(|opt| opt.unwrap_or_else(|| unreachable!()))
 }
 
 /// POST JSON to a URL (client-side only)
@@ -339,40 +407,44 @@ pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     url: &str,
     body: &T,
 ) -> Result<R, String> {
-    use wasm_bindgen::JsCast;
-    use wasm_bindgen_futures::JsFuture;
-    use web_sys::{Headers, Request, RequestInit, Response};
-
-    let window = web_sys::window().ok_or("No window")?;
-
-    let headers = Headers::new().map_err(|e| format!("{:?}", e))?;
-    headers
-        .set("Content-Type", "application/json")
-        .map_err(|e| format!("{:?}", e))?;
-
     let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
-
-    let opts = RequestInit::new();
-    opts.set_method("POST");
-    opts.set_headers(&headers);
-    opts.set_body(&wasm_bindgen::JsValue::from_str(&body_str));
-
-    let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
-
-    let resp_value = JsFuture::from(window.fetch_with_request(&request))
+    wasm_fetch::<R>("POST", url, Some(body_str))
         .await
-        .map_err(|e| format!("{:?}", e))?;
-
-    let resp: Response = resp_value.dyn_into().map_err(|_| "Not a Response")?;
-
-    let json = JsFuture::from(resp.json().map_err(|e| format!("{:?}", e))?)
-        .await
-        .map_err(|e| format!("{:?}", e))?;
-
-    serde_wasm_bindgen::from_value(json).map_err(|e| format!("{:?}", e))
+        .map(|opt| opt.unwrap_or_else(|| unreachable!()))
 }
 
-/// SSR stub - returns error (should not be called during SSR)
+/// POST JSON without expecting response body
+#[cfg(target_arch = "wasm32")]
+pub async fn post_json_no_response<T: Serialize>(url: &str, body: &T) -> Result<(), String> {
+    let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    wasm_fetch_no_response("POST", url, Some(body_str)).await
+}
+
+/// PUT JSON to a URL (client-side only)
+#[cfg(target_arch = "wasm32")]
+pub async fn put_json<T: Serialize, R: for<'de> Deserialize<'de>>(
+    url: &str,
+    body: &T,
+) -> Result<R, String> {
+    let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    wasm_fetch::<R>("PUT", url, Some(body_str))
+        .await
+        .map(|opt| opt.unwrap_or_else(|| unreachable!()))
+}
+
+/// DELETE a URL without expecting response body (client-side only)
+#[cfg(target_arch = "wasm32")]
+pub async fn delete_no_response(url: &str) -> Result<(), String> {
+    wasm_fetch_no_response("DELETE", url, None).await
+}
+
+// ── SSR stubs ───────────────────────────────────────────────────────────────
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn fetch_json<T: for<'de> Deserialize<'de>>(_url: &str) -> Result<T, String> {
+    Err("fetch_json is only available in browser".to_string())
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     _url: &str,
@@ -381,37 +453,20 @@ pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
     Err("post_json is only available in browser".to_string())
 }
 
-/// POST JSON without expecting response body
-#[cfg(target_arch = "wasm32")]
-pub async fn post_json_no_response<T: Serialize>(url: &str, body: &T) -> Result<(), String> {
-    use wasm_bindgen_futures::JsFuture;
-    use web_sys::{Headers, Request, RequestInit};
-
-    let window = web_sys::window().ok_or("No window")?;
-
-    let headers = Headers::new().map_err(|e| format!("{:?}", e))?;
-    headers
-        .set("Content-Type", "application/json")
-        .map_err(|e| format!("{:?}", e))?;
-
-    let body_str = serde_json::to_string(body).map_err(|e| e.to_string())?;
-
-    let opts = RequestInit::new();
-    opts.set_method("POST");
-    opts.set_headers(&headers);
-    opts.set_body(&wasm_bindgen::JsValue::from_str(&body_str));
-
-    let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
-
-    JsFuture::from(window.fetch_with_request(&request))
-        .await
-        .map_err(|e| format!("{:?}", e))?;
-
-    Ok(())
-}
-
-/// SSR stub - returns error (should not be called during SSR)
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn post_json_no_response<T: Serialize>(_url: &str, _body: &T) -> Result<(), String> {
     Err("post_json_no_response is only available in browser".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn put_json<T: Serialize, R: for<'de> Deserialize<'de>>(
+    _url: &str,
+    _body: &T,
+) -> Result<R, String> {
+    Err("put_json is only available in browser".to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn delete_no_response(_url: &str) -> Result<(), String> {
+    Err("delete_no_response is only available in browser".to_string())
 }

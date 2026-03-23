@@ -358,6 +358,7 @@ mod bus_integration {
             BusEvent::SeekPositionChanged {
                 zone_id: PrefixedZoneId::roon("zone-1"),
                 position: 120,
+                duration: None,
             },
             BusEvent::VolumeChanged {
                 output_id: "output-1".to_string(),

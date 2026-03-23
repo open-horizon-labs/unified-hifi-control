@@ -11,7 +11,7 @@ on:
 jobs:
   check-api-changes:
     name: Check API Changes
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
         with:

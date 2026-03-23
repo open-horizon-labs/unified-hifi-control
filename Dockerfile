@@ -21,12 +21,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Copy manifests first (for dependency caching)
 COPY Cargo.toml Cargo.lock Dioxus.toml Makefile ./
+COPY muse-events/Cargo.toml ./muse-events/
 
 # Create dummy source for dependency caching
 RUN mkdir -p src/app && \
     echo "fn main() {}" > src/main.rs && \
     echo "pub mod app;" > src/lib.rs && \
-    echo "// stub" > src/app/mod.rs
+    echo "// stub" > src/app/mod.rs && \
+    mkdir -p muse-events/src && \
+    echo "// stub" > muse-events/src/lib.rs
 
 # Build dependencies only (with cache mounts)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -36,12 +39,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Copy actual source
 COPY src/ ./src/
-COPY input.css tailwind.config.js ./
+COPY muse-events/ ./muse-events/
+COPY public/ ./public/
 
 # Build Tailwind CSS (downloads standalone CLI if needed)
+RUN apt-get update && apt-get install -y make && rm -rf /var/lib/apt/lists/*
 RUN make css
 
+# Version info for compile-time env!() macros
+ARG APP_VERSION=dev
+ENV UHC_VERSION=$APP_VERSION
+ENV UHC_GIT_SHA=docker
+
 # ADR 002: Build WASM assets first, then build server which embeds them
+# Force rebuild to pick up UHC_VERSION/UHC_GIT_SHA env vars
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \

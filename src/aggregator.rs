@@ -65,20 +65,16 @@ impl ZoneAggregator {
                 } => {
                     debug!("Now playing changed: {}", zone_id);
                     if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
-                        // Preserve seek_position and duration from existing now_playing
-                        let (seek_position, duration) = zone
-                            .now_playing
-                            .as_ref()
-                            .map(|np| (np.seek_position, np.duration))
-                            .unwrap_or((None, None));
-
+                        // Reset seek/duration — stale values from the previous track
+                        // cause progress bars to show wrong position. SeekPositionChanged
+                        // will fill in correct values on the next adapter poll.
                         zone.now_playing = Some(NowPlaying {
                             title: title.unwrap_or_default(),
                             artist: artist.unwrap_or_default(),
                             album: album.unwrap_or_default(),
                             image_key,
-                            seek_position,
-                            duration,
+                            seek_position: None,
+                            duration: None,
                             metadata: None,
                         });
                     }
@@ -115,11 +111,18 @@ impl ZoneAggregator {
                     }
                 }
 
-                BusEvent::SeekPositionChanged { zone_id, position } => {
+                BusEvent::SeekPositionChanged {
+                    zone_id,
+                    position,
+                    duration,
+                } => {
                     debug!("Seek position changed: {} = {}", zone_id, position);
                     if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
                         if let Some(ref mut np) = zone.now_playing {
                             np.seek_position = Some(position as f64);
+                            if let Some(dur) = duration {
+                                np.duration = Some(dur);
+                            }
                         }
                     }
                 }

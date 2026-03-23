@@ -1,3 +1,7 @@
+[workspace]
+members = ["muse-events"]
+resolver = "2"
+
 [package]
 name = "unified-hifi-control"
 version = "0.0.0"  # Injected from git tag at build time
@@ -31,10 +35,14 @@ server = [
     "dep:mime_guess",
     "dep:http-body-util",
     "dep:rust-mcp-sdk",
+    "dep:once_cell",
 ]
 web = ["dioxus/web"]
 
 [dependencies]
+# Shared wire protocol types for Muse ecosystem
+muse-events = { path = "muse-events" }
+
 # Dioxus UI framework (SSR + client hydration + router)
 dioxus = { version = "0.7.3", features = ["fullstack", "router"] }
 
@@ -122,6 +130,7 @@ resvg = { version = "0.46.0", features = ["default"], optional = true }
 
 # MCP server (server only)
 rust-mcp-sdk = { version = "0.8", default-features = false, features = ["server", "macros", "hyper-server", "sse"], optional = true }
+once_cell = { version = "1.21.3", optional = true }
 
 # ============ WEB-ONLY DEPENDENCIES ============
 [target.'cfg(target_arch = "wasm32")'.dependencies]

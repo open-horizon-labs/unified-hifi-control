@@ -30,6 +30,7 @@ use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
+use unified_hifi_control::event_reporter::EventReporter;
 use unified_hifi_control::knobs::{self, KnobStore};
 
 /// Response from /knob/now_playing - must include zones_sha
@@ -85,6 +86,12 @@ async fn create_test_app_with_lms(mock_addr: std::net::SocketAddr) -> Router {
     let startable_adapters: Vec<Arc<dyn Startable>> =
         vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
+    let shutdown_token = CancellationToken::new();
+    let event_reporter = Arc::new(EventReporter::new(
+        None,
+        aggregator.clone(),
+        shutdown_token.clone(),
+    ));
     let state = AppState::new(
         roon,
         hqplayer,
@@ -99,7 +106,8 @@ async fn create_test_app_with_lms(mock_addr: std::net::SocketAddr) -> Router {
         coordinator,
         startable_adapters,
         Instant::now(),
-        CancellationToken::new(),
+        shutdown_token,
+        event_reporter,
     );
 
     Router::new()

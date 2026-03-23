@@ -564,6 +564,7 @@ mod bus_event_schema {
         let event = BusEvent::SeekPositionChanged {
             zone_id: PrefixedZoneId::roon("zone-1"),
             position: 12345,
+            duration: None,
         };
 
         let json = serde_json::to_value(&event).unwrap();

@@ -2,10 +2,10 @@ name: Build
 
 on:
   pull_request:
-    branches: [master, v3]
+    branches: [master, v3, v4]
     types: [opened, synchronize, reopened, labeled]
   push:
-    branches: [v3, 'feature/**']
+    branches: [v3, v4, 'feature/**']
     tags:
       - 'v*'
   release:
@@ -63,7 +63,7 @@ jobs:
 
   plan:
     name: Plan
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     outputs:
       is_release: ${{ steps.decide.outputs.is_release }}
       build_linux_arm: ${{ steps.decide.outputs.build_linux_arm }}
@@ -335,7 +335,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -370,7 +370,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -407,7 +407,7 @@ jobs:
   # Uses content-based caching to skip build when source unchanged
   build-wasm:
     name: Build WASM Assets
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -439,8 +439,8 @@ jobs:
           else
             echo "WASM cache miss or partial restore — will rebuild"
             echo "needs_build=true" >> $GITHUB_OUTPUT
-            # Clear stale dx output but keep Rust deps (wasm32-unknown-unknown)
-            rm -rf target/dx/
+            # Clear stale dx OUTPUT but keep compilation cache for incremental builds
+            rm -rf target/dx/unified-hifi-control/release/web/public
           fi
 
       - name: Setup Rust
@@ -463,7 +463,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/dx
-          key: dx-cli-0.7.3
+          key: dx-cli-0.7.3-glibc2
 
       - name: Install Dioxus CLI
         if: steps.check-cache.outputs.needs_build == 'true' && steps.cache-dx.outputs.cache-hit != 'true'
@@ -518,7 +518,7 @@ jobs:
   build-linux-x64:
     name: Build Linux x64
     needs: [plan, build-wasm]
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -543,7 +543,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-zigbuild
-          key: cargo-zigbuild-0.20
+          key: cargo-zigbuild-0.20.2
 
       - name: Install cargo-zigbuild
         if: steps.cache-zigbuild.outputs.cache-hit != 'true'
@@ -591,7 +591,7 @@ jobs:
   smoke-test:
     name: Smoke Test Binary
     needs: [plan, build-linux-x64]
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - name: Download binary
         uses: actions/download-artifact@v7
@@ -734,7 +734,7 @@ jobs:
     name: Build Linux ARM (${{ matrix.arch }})
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_linux_arm == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     strategy:
       matrix:
         include:
@@ -768,7 +768,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-zigbuild
-          key: cargo-zigbuild-0.20
+          key: cargo-zigbuild-0.20.2
 
       - name: Install cargo-zigbuild
         if: steps.cache-zigbuild.outputs.cache-hit != 'true'
@@ -822,7 +822,7 @@ jobs:
     name: Build macOS (x86_64)
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_macos == 'true'
-    runs-on: macos-latest
+    runs-on: namespace-profile-tahoe
     steps:
       - uses: actions/checkout@v6
 
@@ -878,7 +878,7 @@ jobs:
     name: Build macOS (arm64)
     needs: [plan, build-wasm]
     if: needs.plan.outputs.build_macos == 'true'
-    runs-on: macos-latest
+    runs-on: namespace-profile-tahoe
     steps:
       - uses: actions/checkout@v6
 
@@ -938,7 +938,7 @@ jobs:
       needs.plan.outputs.build_macos == 'true' &&
       needs.build-macos-x64.result == 'success' &&
       needs.build-macos-arm64.result == 'success'
-    runs-on: macos-latest
+    runs-on: namespace-profile-tahoe
     steps:
       - name: Download x86_64 binary
         uses: actions/download-artifact@v7
@@ -1043,7 +1043,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_lms == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -1170,7 +1170,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_synology == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     strategy:
       fail-fast: false
       matrix:
@@ -1241,7 +1241,7 @@ jobs:
     name: Build QNAP (x64)
     needs: [plan, build-linux-x64]
     if: needs.plan.outputs.build_qnap == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -1281,7 +1281,7 @@ jobs:
       - name: Upload QNAP package
         uses: actions/upload-artifact@v6
         with:
-          name: qnap-x86_64
+          name: qnap-x86_64.qpkg.zip
           path: dist/installers/*.qpkg
           retention-days: 5
 
@@ -1293,7 +1293,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_qnap_arm == 'true' &&
       needs.build-linux-arm.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -1333,34 +1333,58 @@ jobs:
       - name: Upload QNAP package
         uses: actions/upload-artifact@v6
         with:
-          name: qnap-arm_64
+          name: qnap-arm_64.qpkg.zip
           path: dist/installers/*.qpkg
           retention-days: 5
 
   # Note: Web assets are embedded in the binary (ADR 002)
   build-docker-x64:
-    name: Build Docker (x64)
-    needs: [plan, build-linux-x64]
+    name: Build Docker
+    needs: [plan, build-linux-x64, build-linux-arm]
     # Only for PRs/branches - releases use build-docker-release
-    if: needs.plan.outputs.build_docker == 'true' && needs.plan.outputs.is_release != 'true'
-    runs-on: ubuntu-latest
+    if: |
+      always() &&
+      needs.plan.outputs.build_docker == 'true' &&
+      needs.plan.outputs.is_release != 'true' &&
+      needs.build-linux-x64.result == 'success'
+    runs-on: namespace-profile-default
     permissions:
       packages: write
     steps:
       - uses: actions/checkout@v6
 
-      - name: Download Linux binary
+      - name: Download x64 binary
         uses: actions/download-artifact@v7
         with:
           name: binary-x86_64-unknown-linux-musl
           path: binaries/
 
-      - name: Prepare binary
+      - name: Download arm64 binary
+        if: needs.build-linux-arm.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          name: binary-aarch64-unknown-linux-musl
+          path: binaries/
+
+      - name: Prepare binaries and determine platforms
+        id: prep
         run: |
           mv binaries/unified-hifi-linux-x64 binaries/unified-hifi-linux-amd64
+          PLATFORMS="linux/amd64"
+          if [ -f binaries/unified-hifi-linux-arm64 ]; then
+            PLATFORMS="${PLATFORMS},linux/arm64"
+          fi
           chmod +x binaries/*
+          echo "platforms=$PLATFORMS" >> $GITHUB_OUTPUT
+          echo "Docker platforms: $PLATFORMS"
           ls -la binaries/
 
+      - name: Set up QEMU
+        if: contains(steps.prep.outputs.platforms, 'arm64')
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -1386,7 +1410,7 @@ jobs:
         with:
           context: .
           file: Dockerfile.ci
-          platforms: linux/amd64
+          platforms: ${{ steps.prep.outputs.platforms }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -1400,7 +1424,7 @@ jobs:
     name: Build Docker (${{ matrix.arch }})
     needs: [plan, build-linux-x64, build-linux-arm]
     if: needs.plan.outputs.is_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     strategy:
       matrix:
         include:
@@ -1467,7 +1491,7 @@ jobs:
     name: Create Docker Manifest
     needs: [plan, build-docker-release]
     if: needs.plan.outputs.is_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - name: Download digests
         uses: actions/download-artifact@v7
@@ -1521,7 +1545,7 @@ jobs:
       always() &&
       needs.plan.outputs.build_linux_packages == 'true' &&
       needs.build-linux-x64.result == 'success'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -1613,7 +1637,7 @@ jobs:
     name: Upload to Release
     needs: [plan, build-linux-x64, build-linux-arm, build-macos-universal, build-windows, build-linux-packages, build-lms-universal, build-synology, build-qnap-x64, build-qnap-arm]
     if: needs.plan.outputs.is_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     permissions:
       contents: write
     steps:
@@ -1664,6 +1688,12 @@ jobs:
 
           ### LMS Plugin
           - `lms-unified-hifi-control-*.zip` - Install via LMS Settings > Plugins
+
+          ### Raspberry Pi Images
+          Flashable SD card images (uploaded separately by the Pi Image workflow):
+          - `unified-hifi-control-*-pi-arm64.img.gz` — Pi 3, Pi 4, Pi 5
+          - `unified-hifi-control-*-pi-armhf.img.gz` — Pi Zero 2 W, Pi 2, Pi 3
+          - `.sha256` checksum files included
           EOF
 
       - name: Upload to release
@@ -1677,7 +1707,7 @@ jobs:
     name: Update LMS repo.xml
     needs: [plan, upload-release]
     if: needs.plan.outputs.is_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     permissions:
       contents: write
       pull-requests: write
@@ -1763,7 +1793,7 @@ jobs:
     name: Publish to AUR
     needs: [plan, upload-release]
     if: needs.plan.outputs.is_release == 'true'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - uses: actions/checkout@v6
 
@@ -1814,7 +1844,7 @@ jobs:
       - build-docker-release
       - build-linux-packages
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v7
@@ -1854,7 +1884,7 @@ jobs:
     name: Post Artifact Links
     needs: [summary]
     if: always() && github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-default
     permissions:
       pull-requests: write
     steps:
