@@ -494,6 +494,300 @@ fn the_framer_ends_a_coalesced_buffer_at_the_first_document() {
 }
 
 // =============================================================================
+// AC3 - command outcomes: explicit error, syntactic OK without application,
+//       delayed application, and changes made by another controller
+// =============================================================================
+
+/// Verified daemon behaviour: "a setter can return `result="OK"` without the setting actually
+/// applying. Never trust `result="OK"` alone; confirm via `State` readback."
+///
+/// Client expectation: a setter must not report success it has not confirmed. Reporting success for
+/// a change that never happened is the false-success failure the epic forbids outright.
+#[tokio::test]
+async fn a_setter_accepted_but_not_applied_does_not_report_success() {
+    let h = Harness::verified().await;
+    h.model
+        .arm(|f| f.accept_but_ignore.push("SetFilter".to_string()));
+
+    let result = h.adapter.set_filter_1x("IIR").await;
+
+    assert!(
+        result.is_err(),
+        "the daemon answered result=OK but left the filter at index {}; a setter that cannot \
+         confirm its change must not report success",
+        h.model.state().filter_1x_index
+    );
+    h.stop();
+}
+
+/// The same verified behaviour seen from the other side: a change that lands a poll later is a
+/// success, not a failure. Readback must be patient enough to see it.
+#[tokio::test]
+async fn a_setter_whose_change_lands_after_a_poll_still_reports_success() {
+    let h = Harness::verified().await;
+    h.model
+        .arm(|f| f.apply_after_polls.push(("SetFilter".to_string(), 1)));
+
+    h.adapter
+        .set_filter_1x("IIR")
+        .await
+        .expect("a delayed-but-real change is a success");
+
+    let expected = corpus::index_of(
+        &corpus::document(VERIFIED_PROFILE, "filters_pcm"),
+        "FiltersItem",
+        "IIR",
+    )
+    .expect("IIR is in the observed list");
+    assert_eq!(
+        h.model.state().filter_1x_index,
+        expected,
+        "the delayed change must have landed on the daemon"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn an_explicitly_rejected_setter_reports_the_daemon_reason() {
+    let h = Harness::verified().await;
+    h.model.arm(|f| {
+        f.reject_next
+            .push(("SetShaping".to_string(), "invalid shaper".to_string()))
+    });
+
+    let err = h
+        .adapter
+        .set_shaper("NS5")
+        .await
+        .expect_err("an explicit result=Error is a failure");
+
+    assert!(
+        err.to_string().contains("invalid shaper"),
+        "the daemon's reason text must reach the caller, got: {err}"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_change_made_by_another_controller_is_visible_on_the_next_read() {
+    let h = Harness::verified().await;
+    let before = h.adapter.get_state().await.expect("State").shaper;
+    // Another HQPlayer controller moves the shaper behind our back.
+    h.model.external_change(|s| s.shaper_index = 7);
+    let after = h.adapter.get_state().await.expect("State");
+
+    assert_eq!(
+        (before, after.shaper),
+        (4, 7),
+        "state is read from the daemon, so an external change must show up without UHC being told"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn an_unknown_command_is_reported_as_an_error_without_dropping_the_connection() {
+    let h = Harness::verified().await;
+    // `control` rejects unknown actions locally, so drive an unknown element through a setter the
+    // daemon does not recognise by asking for a mode index the daemon will refuse.
+    let rejected = h.adapter.set_mode("99").await;
+    // The connection must still be usable afterwards.
+    let state_after = h.adapter.get_state().await;
+
+    assert_eq!(
+        (rejected.is_err(), state_after.is_ok()),
+        (true, true),
+        "an error response is reported but the connection survives it"
+    );
+    h.stop();
+}
+
+// =============================================================================
+// AC4 - volume: fractional negative dB, fixed volume, adaptive volume,
+//       min/max/step, mute
+// =============================================================================
+
+#[tokio::test]
+async fn a_fractional_negative_db_volume_round_trips() {
+    let h = Harness::verified().await;
+    h.adapter
+        .set_volume_db(-23.5)
+        .await
+        .expect("Volume accepts a double");
+
+    let state = h.adapter.get_state().await.expect("State");
+    assert_eq!(
+        (h.model.state().volume_db, state.volume_db),
+        (-23.5, -23.5),
+        "a fractional negative dB level must survive the round trip in both directions"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_whole_db_volume_is_not_turned_into_a_fraction_on_the_wire() {
+    let h = Harness::verified().await;
+    h.adapter.set_volume(-30).await.expect("Volume");
+    let sent = h
+        .model
+        .last_request("Volume")
+        .and_then(|line| request_attr(&line, "value"));
+    assert_eq!(
+        sent.as_deref(),
+        Some("-30"),
+        "a whole number of dB is sent without a decimal part, as the reference client does"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_rounded_volume_is_never_reported_as_zero_db() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| s.volume_db = -23.5);
+    let state = h.adapter.get_state().await.expect("State");
+    assert_eq!(
+        state.volume, -24,
+        "the integer projection of -23.5 dB must round, never fall back to 0 dB, which is maximum \
+         output"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_fixed_volume_daemon_rejects_a_volume_change() {
+    let h = Harness::verified().await;
+    h.model
+        .external_change(|s| s.volume_range.enabled = false);
+
+    let result = h.adapter.set_volume_db(-10.0).await;
+    assert!(
+        result.is_err(),
+        "a daemon with volume control disabled answers result=Error with no reason text, and the \
+         level is left unchanged, so the call must not report success"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_fixed_volume_daemon_reports_volume_as_unavailable() {
+    let h = Harness::verified().await;
+    h.model
+        .external_change(|s| s.volume_range.enabled = false);
+    let range = h.adapter.get_volume_range().await.expect("VolumeRange");
+    assert!(
+        !range.enabled,
+        "VolumeRange.enabled=0 is how a fixed-volume daemon advertises itself"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn an_adaptive_volume_daemon_reports_the_adaptive_flag() {
+    let h = Harness::verified().await;
+    h.model
+        .external_change(|s| s.volume_range.adaptive = true);
+    let range = h.adapter.get_volume_range().await.expect("VolumeRange");
+    assert!(
+        range.adaptive,
+        "adaptive volume is advertised on VolumeRange and must be surfaced"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_fractional_volume_step_is_preserved_rather_than_rounded_away() {
+    let h = Harness::verified().await;
+    let range = h.adapter.get_volume_range().await.expect("VolumeRange");
+    assert_eq!(
+        range.step_db,
+        Some(0.5),
+        "a 0.5 dB step must survive as a fraction; rounding it to 1 dB doubles every adjustment"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_volume_range_that_omits_step_reports_it_as_absent() {
+    let h = Harness::verified().await;
+    // The verified live sample carries no step attribute at all.
+    h.model.external_change(|s| s.volume_range.step_db = None);
+    let range = h.adapter.get_volume_range().await.expect("VolumeRange");
+    assert_eq!(
+        range.step_db, None,
+        "an absent step must be reported as absent, not invented"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_volume_below_the_daemon_floor_is_rejected() {
+    let h = Harness::verified().await;
+    let result = h.adapter.set_volume_db(-90.0).await;
+    assert!(
+        result.is_err(),
+        "the daemon's floor is -60 dB; a level below it is refused and must not read as success"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn mute_is_toggled_on_the_daemon() {
+    let h = Harness::verified().await;
+    h.adapter.volume_mute().await.expect("VolumeMute");
+    let muted = h.model.state().muted;
+    h.adapter.volume_mute().await.expect("VolumeMute");
+    assert_eq!(
+        (muted, h.model.state().muted),
+        (true, false),
+        "VolumeMute is a toggle on the daemon, not an absolute set"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_volume_step_moves_the_level_by_the_advertised_step() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| s.volume_db = -20.0);
+    h.adapter.volume_up().await.expect("VolumeUp");
+    assert_eq!(
+        h.model.state().volume_db,
+        -19.5,
+        "VolumeUp moves by the daemon's own 0.5 dB step"
+    );
+    h.stop();
+}
+
+// =============================================================================
+// Further State parsing the wire reference pins down
+// =============================================================================
+
+#[tokio::test]
+async fn the_stop_requested_playback_state_is_reported_faithfully() {
+    let h = Harness::verified().await;
+    // The reference documents four playback states: 0 stopped, 1 paused, 2 playing,
+    // 3 stop requested.
+    h.model.external_change(|s| s.playback = 3);
+    let state = h.adapter.get_state().await.expect("State");
+    assert_eq!(
+        state.state, 3,
+        "state=3 (stop requested) must reach the caller intact rather than collapsing to 0"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn the_junk_filter_is_read_as_a_list_index_not_a_boolean() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| s.filter_junk_index = 2);
+    let state = h.adapter.get_state().await.expect("State");
+    assert_eq!(
+        state.filter_junk, 2,
+        "State.filter_junk is an int index into GetJunkFilters, so a third option must be \
+         distinguishable from the first two"
+    );
+    h.stop();
+}
+
+// =============================================================================
 // AC5 - semantic name to native index, from observed list/state pairs
 // =============================================================================
 
