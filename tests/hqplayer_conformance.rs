@@ -1257,15 +1257,29 @@ fn the_legacy_profile_is_marked_unverified_so_it_cannot_pass_as_protocol_truth()
 
 #[test]
 fn the_verified_profile_marks_excerpts_honestly() {
-    let overclaimed: Vec<String> = corpus::all_in(VERIFIED_PROFILE)
+    // Words a fixture uses when it is admitting its content was constructed rather than captured.
+    const ADMISSIONS: [&str; 4] = [
+        "excerpt",
+        "representative",
+        "illustrative",
+        "not a byte-for-byte capture",
+    ];
+    let overclaimed: Vec<(String, String)> = corpus::all_in(VERIFIED_PROFILE)
         .into_iter()
-        .filter(|f| f.provenance.status == "verified" && f.provenance.notes.contains("excerpt"))
-        .map(|f| f.name)
+        .filter(|f| {
+            let notes = f.provenance.notes.to_lowercase();
+            // Guard everything `is_verified()` accepts, not just the bare `verified` status: any
+            // `verified*` label is read as a verification claim elsewhere in the corpus, so the
+            // honesty check has to cover the same set or a `verified-shape` fixture slips through.
+            f.provenance.is_verified() && ADMISSIONS.iter().any(|a| notes.contains(a))
+        })
+        .map(|f| (f.name, f.provenance.status))
         .collect();
     assert!(
         overclaimed.is_empty(),
-        "a fixture whose notes admit it is an excerpt must not claim bare `verified` status; \
-         overclaimed: {overclaimed:?}"
+        "a fixture whose notes admit its content was constructed must not claim any `verified` \
+         status — only a byte-for-byte capture may. Use a `derived-*` status and say in the notes \
+         which property is verified. Overclaimed: {overclaimed:?}"
     );
 }
 
