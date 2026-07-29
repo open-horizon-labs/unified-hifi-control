@@ -55,6 +55,9 @@ fn fast_timeouts() -> HqpTimeouts {
         response: Duration::from_millis(300),
         reconnect_delay: Duration::from_millis(10),
         max_attempts: 2,
+        // Production default, deliberately not shrunk: the burst expectation below is about the
+        // shipped ceiling, so overriding it here would test the harness instead of the client.
+        max_unsolicited: HqpTimeouts::default().max_unsolicited,
     }
 }
 
@@ -1373,6 +1376,47 @@ async fn a_setter_overridden_by_another_controller_fails_and_names_the_observed_
         err.to_string().contains('7'),
         "the error must name the value the daemon actually reports, so an override is \
          distinguishable from a dropped command; got: {err}"
+    );
+    h.stop();
+}
+
+/// The skip bound has to clear the daemon's real push cadence with margin, not by luck. Verified
+/// behaviour during active playback is a steady ~1-2 Hz of unsolicited `Status` frames; the shipped
+/// response timeout is 3 s, so one slow command can legitimately have ~6 frames land behind it. A
+/// bound of 8 leaves almost no margin.
+///
+/// Exceeding it is not fatal, because `send_command`'s retry loop reconnects and the fresh socket
+/// has no backlog — but that is recovery by accident, and it costs a dropped connection per burst.
+///
+/// Client expectation: a burst comfortably larger than one response window's worth of push frames is
+/// skipped **on the existing connection**, without reconnecting.
+#[tokio::test]
+async fn a_burst_of_unsolicited_frames_is_skipped_without_dropping_the_connection() {
+    // 12 frames ~ six seconds of 2 Hz push, i.e. twice a response window. Newline-separated, because
+    // several documents sharing ONE line cost a single skip - `response.clear()` drops the rest of
+    // the line with them - so `repeat` would not exercise the bound at all.
+    let burst = vec![PUSH_STATUS_FRAME; 12].join("\n");
+    let h = Harness::with_policy(WirePolicy {
+        coalesce_extra_for_element: Some(("State".to_string(), burst)),
+        ..WirePolicy::default()
+    })
+    .await;
+    let connections_before = h.server.stats().connections();
+
+    // Leaves 12 unsolicited <Status .../> documents buffered ahead of the next reply.
+    h.adapter.get_state().await.expect("State");
+    let range = h.adapter.get_volume_range().await.expect("VolumeRange");
+
+    assert_eq!(
+        (
+            range.min,
+            h.server.stats().connections() - connections_before
+        ),
+        (-60, 0),
+        "a 12-frame push burst must be skipped on the live connection; a new connection means the \
+         skip bound was exhausted and the retry loop papered over it. min={}, new connections={}",
+        range.min,
+        h.server.stats().connections() - connections_before
     );
     h.stop();
 }

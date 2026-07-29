@@ -366,9 +366,17 @@ pub mod framing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HqpTimeouts {
     pub connect: Duration,
+    /// Per-read ceiling while awaiting a reply.
     pub response: Duration,
+    /// Backoff between reconnect attempts. **Also** paces `verify_applied`'s readback polling: one
+    /// value covers both network retry backoff and daemon apply-latency backoff. That reuse avoids a
+    /// third knob, but the coupling is real — if #328/#329 need to tune apply latency independently
+    /// of reconnect backoff, split them then rather than discovering it the hard way.
     pub reconnect_delay: Duration,
     pub max_attempts: u32,
+    /// Ceiling on unsolicited documents skipped while awaiting a command's own reply. See
+    /// [`DEFAULT_MAX_UNSOLICITED`] for how the default is derived from the daemon's push cadence.
+    pub max_unsolicited: u32,
 }
 
 impl Default for HqpTimeouts {
@@ -378,6 +386,7 @@ impl Default for HqpTimeouts {
             response: RESPONSE_TIMEOUT,
             reconnect_delay: RECONNECT_DELAY,
             max_attempts: MAX_RECONNECT_ATTEMPTS,
+            max_unsolicited: DEFAULT_MAX_UNSOLICITED,
         }
     }
 }
@@ -391,10 +400,14 @@ const PROFILE_PATH: &str = "/config/profile/load";
 const MAX_RECONNECT_ATTEMPTS: u32 = 2;
 /// Delay between reconnection attempts (HQPlayer can be overwhelmed by rapid connections)
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-/// How many unsolicited documents to skip while awaiting a command's own reply before giving up.
-/// Bounds the failure mode: if a daemon ever answers with an element we do not expect, that surfaces
-/// as an error instead of a hang.
-const MAX_UNSOLICITED_DOCUMENTS: u32 = 8;
+/// Default ceiling on unsolicited documents skipped while awaiting a command's own reply.
+///
+/// Derived rather than guessed. During active playback the daemon pushes `Status` frames at a
+/// verified ~1-2 Hz, and the shipped response timeout is 3 s, so one slow command can legitimately
+/// have ~6 frames land behind it. An earlier value of 8 left almost no margin: exceeding it does not
+/// hang, because the retry loop reconnects, but it costs a dropped connection per burst. 64 is an
+/// order of magnitude above the plausible burst while still bounding a runaway.
+const DEFAULT_MAX_UNSOLICITED: u32 = 64;
 
 /// HQPlayer state information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1123,7 +1136,7 @@ impl HqpAdapter {
                                 // for the reply to the command actually sent, rather than answering
                                 // from someone else's document.
                                 skipped += 1;
-                                if skipped > MAX_UNSOLICITED_DOCUMENTS {
+                                if skipped > timeouts.max_unsolicited {
                                     return Err(anyhow!(
                                         "Gave up after {} unsolicited documents while awaiting a {} \
                                          reply (last was {:?})",
@@ -1253,6 +1266,12 @@ impl HqpAdapter {
     ///
     /// `"-23.5".parse::<i32>()` fails, and the old `unwrap_or(0)` turned a quiet -23.5 dB into
     /// 0 dB, i.e. maximum output. Rounding the double is the only safe reading.
+    ///
+    /// The unsigned sibling below clamps a negative double to 0. That is deliberate but narrow: no
+    /// documented `u32` attribute is signed or decimal, so a negative there is anomalous either way,
+    /// and both the clamp and the `unwrap_or(0)` fallback land on the same value. It is called out
+    /// because silently-wrong defaults are the bug class this whole boundary exists to remove — if a
+    /// signed `u32`-shaped attribute ever turns up, this needs to become an error rather than a 0.
     fn parse_attr_i32(xml: &str, attr: &str) -> i32 {
         Self::parse_attr(xml, attr)
             .and_then(|s| {
