@@ -170,40 +170,43 @@ pub mod framing {
             }
         }
 
+        // `check_end_names` stays off so quick_xml does not collapse a name mismatch into a generic
+        // parse error, which would be indistinguishable from "truncated mid-token". The stack of
+        // open element names below does that checking instead, so a mismatch reads as malformed
+        // while a truncation still reads as incomplete.
         let mut reader = Reader::from_str(buf);
         reader.config_mut().check_end_names = false;
-        let mut depth: i32 = 0;
-        let mut opened = false;
+        let mut open: Vec<String> = Vec::new();
 
         loop {
             match reader.read_event() {
-                Ok(Event::Start(_)) => {
-                    depth += 1;
-                    opened = true;
+                Ok(Event::Start(e)) => {
+                    open.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
                 }
-                Ok(Event::End(_)) => {
-                    depth -= 1;
-                    if depth < 0 {
+                Ok(Event::End(e)) => {
+                    let name = e.name();
+                    let closing = String::from_utf8_lossy(name.as_ref());
+                    match open.pop() {
+                        // Depth counting alone accepts `<State …></Status>`: one element opened and
+                        // one closed. Comparing names is what makes that a rejection.
+                        Some(expected) if expected.as_str() != closing.as_ref() => {
+                            return Framing::Malformed
+                        }
                         // A closing tag with nothing open: the leftover tail of a document that a
                         // previous read truncated. Never a valid document on its own.
-                        return Framing::Malformed;
-                    }
-                    if depth == 0 {
-                        return Framing::Complete;
+                        None => return Framing::Malformed,
+                        Some(_) if open.is_empty() => return Framing::Complete,
+                        Some(_) => {}
                     }
                 }
                 Ok(Event::Empty(_)) => {
-                    opened = true;
-                    if depth == 0 {
+                    if open.is_empty() {
                         return Framing::Complete;
                     }
                 }
                 // Ran out of bytes with an element still open, or with none opened yet (so far only
                 // a declaration or whitespace). Either way, more is coming.
-                Ok(Event::Eof) => {
-                    let _ = opened;
-                    return Framing::Incomplete;
-                }
+                Ok(Event::Eof) => return Framing::Incomplete,
                 // Declaration, text, comments and processing instructions carry no framing weight.
                 Ok(_) => {}
                 // quick_xml cannot distinguish "truncated mid-token" from "genuinely broken", so a
@@ -373,6 +376,10 @@ const PROFILE_PATH: &str = "/config/profile/load";
 const MAX_RECONNECT_ATTEMPTS: u32 = 2;
 /// Delay between reconnection attempts (HQPlayer can be overwhelmed by rapid connections)
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// How many unsolicited documents to skip while awaiting a command's own reply before giving up.
+/// Bounds the failure mode: if a daemon ever answers with an element we do not expect, that surfaces
+/// as an error instead of a hang.
+const MAX_UNSOLICITED_DOCUMENTS: u32 = 8;
 
 /// HQPlayer state information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1069,6 +1076,12 @@ impl HqpAdapter {
         conn.write_half.write_all(b"\n").await?;
         conn.write_half.flush().await?;
 
+        // The element the daemon must answer with. Setters echo the request element and queries
+        // return a container of the same name, so a reply's root element always matches its
+        // request's. That invariant is what lets an unsolicited document be skipped rather than
+        // mistaken for this command's reply.
+        let expected_element = framing::root_element(xml);
+
         // Read until a complete XML document parses. Documents are newline-terminated but may
         // contain internal newlines, so a line is a read hint and not a frame: stopping at the
         // first `/>` truncates any container with a self-closing child (notably
@@ -1076,6 +1089,7 @@ impl HqpAdapter {
         // command to consume. See the `framing` module.
         let mut response = String::new();
         let mut complete = false;
+        let mut skipped = 0u32;
 
         while !complete {
             let mut line = String::new();
@@ -1086,7 +1100,33 @@ impl HqpAdapter {
                 Ok(Ok(_)) => {
                     response.push_str(&line);
                     match framing::classify(&response) {
-                        framing::Framing::Complete => complete = true,
+                        framing::Framing::Complete => {
+                            let got = framing::root_element(&response);
+                            if expected_element.is_some() && got != expected_element {
+                                // An unsolicited document shared this read — the daemon emits
+                                // `Status` push frames of its own accord. Drop it and keep waiting
+                                // for the reply to the command actually sent, rather than answering
+                                // from someone else's document.
+                                skipped += 1;
+                                if skipped > MAX_UNSOLICITED_DOCUMENTS {
+                                    return Err(anyhow!(
+                                        "Gave up after {} unsolicited documents while awaiting a {} \
+                                         reply (last was {:?})",
+                                        skipped,
+                                        expected_element.unwrap_or_default(),
+                                        got
+                                    ));
+                                }
+                                tracing::debug!(
+                                    "Skipping unsolicited HQPlayer {:?} document while awaiting {:?}",
+                                    got,
+                                    expected_element
+                                );
+                                response.clear();
+                            } else {
+                                complete = true;
+                            }
+                        }
                         framing::Framing::Malformed => {
                             return Err(anyhow!(
                                 "Malformed response: {}",

@@ -870,10 +870,14 @@ fn the_persistent_config_form_carries_the_verified_field_names() {
 #[test]
 fn the_persistent_config_form_separates_the_unnamed_base_from_named_profiles() {
     let page = corpus::document(VERIFIED_PROFILE, "config_profile_form");
-    let offered: Vec<&str> = ["value=\"[default]\"", "value=\"Speakers\"", "value=\"Headphones\""]
-        .into_iter()
-        .filter(|needle| page.contains(needle))
-        .collect();
+    let offered: Vec<&str> = [
+        "value=\"[default]\"",
+        "value=\"Speakers\"",
+        "value=\"Headphones\"",
+    ]
+    .into_iter()
+    .filter(|needle| page.contains(needle))
+    .collect();
     assert_eq!(
         offered.len(),
         3,
