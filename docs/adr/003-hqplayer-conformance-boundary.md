@@ -105,6 +105,15 @@ Accepted costs, with the measured numbers rather than the estimates:
   name/enum-ID pairs and the verified `Set*` anchors, but their list *positions* are excerpt-local and
   say so in their provenance. Closing that gap needs the opt-in real-daemon run, which is recorded as
   pending for stage 3 rather than claimed.
+- **A setter overridden by another controller fails, and says what it saw.** `verify_applied`
+  compares a readback against the value *we* requested, so it cannot distinguish "the daemon dropped
+  our change" from "the daemon took it and another controller then moved it". Both are reported as
+  failures, because in both cases the client cannot confirm the state it was asked to produce — and
+  the error names the value the daemon actually reports, so an operator can tell the two apart. This
+  came out of stage-2 dissent rather than the tests, and is pinned by
+  `a_setter_overridden_by_another_controller_fails_and_names_the_observed_value`. If #329 later wants
+  divergence *reported* rather than *failed* — the model HQPTuner uses — that is a product decision
+  for the settings UX, and this primitive does not block it.
 - **`docs/hqplayer-protocol-reference.md` is demoted** from authority to reader's guide, and corrected
   where the corpus contradicts it.
 

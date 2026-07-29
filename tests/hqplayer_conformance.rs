@@ -1313,3 +1313,34 @@ fn no_production_code_retunes_the_timeout_seam() {
          constants. Called from {callers:?}"
     );
 }
+
+/// Found by stage-2 dissent, not by the tests: `verify_applied` compares a `State` readback against
+/// the value *we* asked for, so it cannot tell "the daemon dropped our change" from "the daemon took
+/// our change and another controller then moved it". Epic #311 requires both multi-controller
+/// operation and no false success, so the semantics have to be pinned rather than left to chance.
+///
+/// Decision pinned here: the setter **fails**, because it genuinely cannot confirm the state it was
+/// asked to produce — and the error names the value the daemon actually reports, so an operator can
+/// tell an override apart from a silently dropped command.
+#[tokio::test]
+async fn a_setter_overridden_by_another_controller_fails_and_names_the_observed_value() {
+    let h = Harness::verified().await;
+    // Our SetShaping is acknowledged but not applied...
+    h.model
+        .arm(|f| f.accept_but_ignore.push("SetShaping".to_string()));
+    // ...and another controller moves the same setting to something else entirely.
+    h.model.external_change(|s| s.shaper_index = 7);
+
+    let err = h
+        .adapter
+        .set_shaper("NS5")
+        .await
+        .expect_err("a setting we cannot confirm is not a success, however it came to differ");
+
+    assert!(
+        err.to_string().contains('7'),
+        "the error must name the value the daemon actually reports, so an override is \
+         distinguishable from a dropped command; got: {err}"
+    );
+    h.stop();
+}

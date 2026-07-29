@@ -837,3 +837,20 @@ most consequential sections did not have to hedge.
 
 `docs/hqplayer-protocol-reference.md` is demoted from authority to reader's guide, with a correction
 table naming each claim the corpus overturned and the expectation that pins the correction.
+
+### Stage-2 dissent adjustments
+
+`/dissent` on the implemented mechanism returned **ADJUST** with five modifications. One was
+implementable inside #322's scope and is implemented; the rest are recorded obligations.
+
+| # | Modification | Status |
+|---|---|---|
+| 1 | Pin what a verified setter does when another controller intervenes between acknowledgement and readback | **Implemented.** `a_setter_overridden_by_another_controller_fails_and_names_the_observed_value`. The behaviour turned out to be already correct — the setter fails and the error names the daemon's actual value — so no production change was needed. The gap was that it was *unspecified and untested*, which is the one thing a conformance boundary must not leave open. Now a contract, and recorded in ADR 003 |
+| 2 | Make the unsolicited-document skip path observable, and have stage 3 assert the counter stays zero across every command family | **Recorded for stage 3.** Deliberately not added now: it needs production surface whose only consumer would be a stage-3 assertion |
+| 3 | Bind stage 3 to the fidelity close-out — every `derived-excerpt`/`UNVERIFIED` fixture either re-provenanced from a live diff or shipped as a stated gap | **Recorded for stage 3** |
+| 4 | Require every new malformed-input expectation to cite a reference passage or an observed capture | **Recorded as a suite convention** |
+| 5 | Hand the failure-versus-divergence question to #329 in writing | **Recorded in ADR 003 Consequences** |
+
+The gap dissent found is worth naming plainly: the harness already had `external_change`, and no
+expectation combined it with a verified setter. The tests were green and blind at the same time.
+
