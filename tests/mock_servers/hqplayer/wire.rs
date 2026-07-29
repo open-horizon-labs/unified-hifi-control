@@ -61,6 +61,14 @@ pub struct WirePolicy {
     pub silent_for_element: Option<String>,
     /// Append these raw bytes instead of a reply for this element, to model a malformed document.
     pub malformed_for_element: Option<(String, String)>,
+    /// `(element, extra_document)` — after replying to that element, append a second, unsolicited
+    /// document to the **same TCP write**, so both land in the client's receive buffer together.
+    ///
+    /// This is how coalescing actually reaches a strictly serial client: the daemon emits a
+    /// document nobody asked for (its documented `Status` push frames) in the same segment as the
+    /// solicited reply. The reference client copes because it splits its receive buffer and feeds
+    /// each document to a streaming parser rather than assuming one read is one reply.
+    pub coalesce_extra_for_element: Option<(String, String)>,
 }
 
 impl Default for WirePolicy {
@@ -71,6 +79,7 @@ impl Default for WirePolicy {
             disruption: Disruption::None,
             silent_for_element: None,
             malformed_for_element: None,
+            coalesce_extra_for_element: None,
         }
     }
 }
@@ -299,6 +308,15 @@ async fn serve_connection(
         let mut bytes = reply.into_bytes();
         if !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
+        }
+
+        if let Some((ref element, ref extra)) = policy.coalesce_extra_for_element {
+            if mentions(&line, element) {
+                bytes.extend_from_slice(extra.as_bytes());
+                if !bytes.ends_with(b"\n") {
+                    bytes.push(b'\n');
+                }
+            }
         }
 
         let chunks = split(&bytes, &policy.chunking);

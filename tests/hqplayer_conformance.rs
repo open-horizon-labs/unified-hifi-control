@@ -459,6 +459,87 @@ async fn a_connection_dropped_mid_command_is_recovered_by_reconnecting() {
     h.stop();
 }
 
+/// An unsolicited `Status` push frame. The daemon emits these of its own accord during playback,
+/// which is how two documents come to share one TCP segment for a client that never pipelines.
+const PUSH_STATUS_FRAME: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+    "<Status state=\"2\" track=\"3\" position=\"43\" length=\"215\" volume=\"-23.5\"/>"
+);
+
+/// Coalescing as it actually reaches a serial client: the daemon emits an unsolicited `Status` push
+/// frame in the **same TCP write** as the reply we asked for, so both land in the receive buffer
+/// together. The current command must still be answered from its own reply.
+#[tokio::test]
+async fn a_reply_coalesced_with_an_unsolicited_frame_still_answers_the_current_command() {
+    let h = Harness::with_policy(WirePolicy {
+        coalesce_extra_for_element: Some(("State".to_string(), PUSH_STATUS_FRAME.to_string())),
+        ..WirePolicy::default()
+    })
+    .await;
+    h.model.external_change(|s| s.playback = 2);
+
+    let state = h.adapter.get_state().await.expect("State");
+    assert_eq!(
+        state.state, 2,
+        "the reply to State must be read from the State document, not from whatever else shared \
+         its TCP segment"
+    );
+    h.stop();
+}
+
+/// The other half of the same wire condition: the unsolicited frame is still buffered when the next
+/// command goes out. A reader that takes the next complete document as its reply answers the
+/// following command with the leftover — the same desynchronisation class as the metadata-child
+/// defect, arriving by a different route.
+///
+/// Client expectation: a command is answered by *its own* reply.
+#[tokio::test]
+async fn an_unsolicited_frame_coalesced_with_a_reply_does_not_corrupt_the_next_command() {
+    let h = Harness::with_policy(WirePolicy {
+        coalesce_extra_for_element: Some(("State".to_string(), PUSH_STATUS_FRAME.to_string())),
+        ..WirePolicy::default()
+    })
+    .await;
+
+    // Leaves an unsolicited <Status .../> in the client's receive buffer.
+    h.adapter.get_state().await.expect("State");
+    // A different command, whose reply shape is unmistakably not a Status document.
+    let range = h.adapter.get_volume_range().await.expect("VolumeRange");
+
+    assert_eq!(
+        range.min, -60,
+        "VolumeRange must be answered by the VolumeRange document; min={} is what reading the \
+         leftover Status frame produces",
+        range.min
+    );
+    h.stop();
+}
+
+/// Framing must not accept a document whose nesting does not close properly. Depth counting alone
+/// calls `<State …></Status>` complete, because one element opened and one closed, so a reader that
+/// only counts depth hands back a document it cannot vouch for — and may have stopped in the middle
+/// of a larger one.
+#[tokio::test]
+async fn a_document_with_mismatched_nesting_is_rejected_as_malformed() {
+    let h = Harness::with_policy(WirePolicy {
+        malformed_for_element: Some((
+            "State".to_string(),
+            "<?xml version=\"1.0\"?><State state=\"2\"></Status>".to_string(),
+        )),
+        ..WirePolicy::default()
+    })
+    .await;
+
+    let result = h.adapter.get_state().await;
+    assert!(
+        result.is_err(),
+        "a document whose end tag does not match its start tag must be rejected, not scanned for \
+         whatever attributes happen to be present; got state={:?}",
+        result.map(|s| s.state)
+    );
+    h.stop();
+}
+
 /// The pure framer, exercised without a socket. This is the layer a later sans-io extraction (#162)
 /// would keep, so it is worth pinning independently of the adapter.
 #[test]
@@ -754,6 +835,83 @@ async fn a_volume_step_moves_the_level_by_the_advertised_step() {
         "VolumeUp moves by the daemon's own 0.5 dB step"
     );
     h.stop();
+}
+
+// =============================================================================
+// AC7 (continued) - the persistent-configuration HTTP lane's response family
+// =============================================================================
+//
+// Covered as a **corpus contract** rather than by driving production parsing, deliberately:
+//
+// * The profile-list parse already has coverage through the public surface: the
+//   `GET /hqplayer/profiles` route is exercised in `tests/protocol_integration.rs`. Re-asserting the
+//   same behaviour here would duplicate that coverage and would mean widening production visibility
+//   purely for test reach, which #322 does not need and should not do.
+// * What #322 does owe this lane is an executable record of the verified response-family semantics:
+//   which fields the read side carries, and the fact that the write side's HTTP 200 carries no
+//   outcome at all. Both are properties of the documents, so the corpus is where they belong.
+// * The restore transport itself - multipart upload, daemon self-restart, `/backup` readback
+//   polling - is issue #330's, and nothing here implements or presumes it.
+
+#[test]
+fn the_persistent_config_form_carries_the_verified_field_names() {
+    let page = corpus::document(VERIFIED_PROFILE, "config_profile_form");
+    let missing: Vec<&str> = ["name=\"profile\"", "name=\"profile_name\""]
+        .into_iter()
+        .filter(|needle| !page.contains(needle))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the /config read side is identified by its verified field names: a `profile` select of \
+         existing configurations and a `profile_name` box for save-as-new; missing {missing:?}"
+    );
+}
+
+#[test]
+fn the_persistent_config_form_separates_the_unnamed_base_from_named_profiles() {
+    let page = corpus::document(VERIFIED_PROFILE, "config_profile_form");
+    let offered: Vec<&str> = ["value=\"[default]\"", "value=\"Speakers\"", "value=\"Headphones\""]
+        .into_iter()
+        .filter(|needle| page.contains(needle))
+        .collect();
+    assert_eq!(
+        offered.len(),
+        3,
+        "the profile select offers the unnamed base configuration `[default]` alongside the named \
+         ones, and the distinction matters: loading a NAMED profile restarts the daemon and empties \
+         /backup/settings.zip, while `[default]` does not. Found {offered:?}"
+    );
+}
+
+/// Verified rule for the persistent WRITE lane: "the 200 response body is the HTML restore page —
+/// success is confirmed by a `/backup` readback, never by the POST". A rejected `POST /config` also
+/// answers 200, with `Failed!` in the body and nothing written.
+///
+/// So this response family carries no machine-readable outcome, and pinning that is what stops a
+/// later implementation treating HTTP 200 as proof.
+#[test]
+fn the_restore_response_family_carries_no_outcome_signal() {
+    let page = corpus::document(VERIFIED_PROFILE, "restore_response");
+    let false_signals: Vec<&str> = ["result=", "name=\"profile\"", "Failed!", "Success"]
+        .into_iter()
+        .filter(|needle| page.contains(needle))
+        .collect();
+    assert!(
+        false_signals.is_empty(),
+        "a restore response is a form page, not a result: it carries no outcome a client could read, \
+         so success must come from a readback. Found {false_signals:?}"
+    );
+}
+
+#[test]
+fn the_restore_fixture_records_why_its_status_code_proves_nothing() {
+    let fixture = corpus::load(VERIFIED_PROFILE, "restore_response");
+    assert!(
+        fixture.provenance.notes.contains("readback"),
+        "the restore fixture must record why a 200 is not success, so the next reader does not have \
+         to rediscover it; notes: {:?}",
+        fixture.provenance.notes
+    );
 }
 
 // =============================================================================

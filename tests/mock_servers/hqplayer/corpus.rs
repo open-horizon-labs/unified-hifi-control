@@ -102,9 +102,23 @@ fn strip_provenance(raw: &str) -> String {
     }
 }
 
+/// Extensions the corpus recognises. `.html` covers the persistent HTTP lane's response family,
+/// whose documents are pages rather than XML.
+const EXTENSIONS: [&str; 2] = ["xml", "html"];
+
 /// Load one fixture by version profile and file stem, e.g. `("hqpd-6.0.4-opal", "status_playing")`.
 pub fn load(profile: &str, stem: &str) -> Fixture {
-    let path = fixtures_root().join(profile).join(format!("{stem}.xml"));
+    let dir = fixtures_root().join(profile);
+    let path = EXTENSIONS
+        .iter()
+        .map(|ext| dir.join(format!("{stem}.{ext}")))
+        .find(|p| p.exists())
+        .unwrap_or_else(|| {
+            panic!(
+                "no fixture named {stem} (.xml or .html) in {}",
+                dir.display()
+            )
+        });
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
     Fixture {
@@ -125,7 +139,11 @@ pub fn all_in(profile: &str) -> Vec<Fixture> {
     let mut stems: Vec<String> = fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("failed to list {}: {e}", dir.display()))
         .map(|entry| entry.expect("readable dir entry").path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("xml"))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| EXTENSIONS.contains(&ext))
+        })
         .map(|p| {
             p.file_stem()
                 .and_then(|s| s.to_str())
