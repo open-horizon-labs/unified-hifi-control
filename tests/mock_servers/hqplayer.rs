@@ -1,6 +1,14 @@
 //! Mock HQPlayer for testing
 //!
 //! Simulates the TCP/XML protocol on port 4321
+//!
+//! `MockHqpServer` below is the long-standing facade used by `tests/adapter_integration.rs` and
+//! `tests/zones_sha_integration.rs`; it is left untouched. The submodules are the issue #322
+//! conformance boundary, which separates the document layer ([`corpus`]) from the byte/timing
+//! layer ([`wire`]) so a test can vary one while pinning the other.
+
+pub mod corpus;
+pub mod wire;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
