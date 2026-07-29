@@ -84,11 +84,25 @@ Accepted costs, with the measured numbers rather than the estimates:
   and loosely. Amortised across #162, #208, #328, #329 and #330, all of which need a peer that can
   misbehave on demand.
 - **Every verified setter now costs an extra round trip.** `verify_applied` reads `State` back after
-  `set_mode`, `set_filter_1x`, `set_filter_nx`, `set_shaper` and `set_rate`, polling up to the retry
-  budget. This is deliberate: epic #311 forbids reporting success that was never confirmed, and the
-  daemon demonstrably answers `OK` without applying. The cost is one `State` document per setter on a
-  local TCP connection. If it ever proves too expensive on a loaded daemon, the lever is the retry
-  budget, not removing the readback.
+  `set_mode`, `set_filter_1x`, `set_filter_nx`, `set_shaper` and `set_rate`. This is deliberate: epic
+  #311 forbids reporting success that was never confirmed, and the daemon demonstrably answers `OK`
+  without applying. The latency envelope, with the shipped defaults of two attempts and a one-second
+  reconnect delay:
+
+  | Case | Added cost |
+  |---|---|
+  | The setting applied (the normal case) | one `State` round trip, **no sleep** — the first readback is immediate |
+  | The setting landed a poll later | two `State` round trips plus one `reconnect_delay` |
+  | The setting never applied | two `State` round trips plus one `reconnect_delay`, then an error |
+
+  So a successful UI action pays a single local round trip, not a second of delay; only the failing
+  and delayed paths pay the sleep. If it ever proves too expensive on a loaded daemon, the lever is
+  the retry budget, not removing the readback.
+- **Callers were already shaped for the new failure.** These setters always returned `Result`, so
+  every call site already had an `Err` arm; what changed is that the arm now fires in a case it
+  previously could not. Audited: `src/api/mod.rs:853` maps it to `400` with the error string,
+  `src/api/mod.rs:926` maps it to `500`, and `src/mcp/mod.rs:624` returns an MCP error result. No
+  caller silently discards it, and no call site needed changing.
 - **Volume is the documented asymmetry.** `set_volume_db` is result-checked but *not*
   readback-verified, because a fixed-volume daemon answers an explicit `result="Error"` (already
   surfaced) and an adaptive-volume daemon moves the level itself, so a readback comparison would
@@ -100,7 +114,18 @@ Accepted costs, with the measured numbers rather than the estimates:
 - **`HqpTimeouts::set_timeouts` must be `pub`** for an integration-test crate to reach it, which the
   type system cannot restrict further. `no_production_code_retunes_the_timeout_seam` lints `src/` for
   callers instead, in the same spirit as the repo's existing `architecture_lint` and
-  `arbitrary_find_lint` tests. Defaults remain the shipped constants.
+  `arbitrary_find_lint` tests. Defaults remain the shipped constants. That lint is a text scan and is
+  a first line of defence, **not** the API boundary: a differently-named wrapper would defeat it. It
+  is worth what it costs precisely because the defaults are unchanged, so the worst case if it is
+  bypassed is a caller opting into different retry behaviour deliberately.
+- **Only byte-for-byte captures may claim `verified`.** A second superego pass found that
+  `Provenance::is_verified()` accepts any `verified*` status while the honesty guard only checked the
+  exact string `verified`, so a `verified-shape` fixture whose own notes admitted it was an excerpt
+  was read as verified everywhere and caught nowhere. The guard now covers everything `is_verified()`
+  accepts, case-insensitively, across the whole family of construction admissions; and four fixtures
+  were relabelled to `derived-*` accordingly. Three fixtures now claim verification — `getinfo`,
+  `modes`, `rates_sdm` — and those three are the ones whose content is byte-for-byte from the
+  reference.
 - **The corpus is transcribed, not captured.** Enumeration excerpts preserve the verified
   name/enum-ID pairs and the verified `Set*` anchors, but their list *positions* are excerpt-local and
   say so in their provenance. Closing that gap needs the opt-in real-daemon run, which is recorded as

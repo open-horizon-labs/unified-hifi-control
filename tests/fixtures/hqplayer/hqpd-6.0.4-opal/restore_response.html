@@ -2,9 +2,9 @@
   provenance:
     source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 3.6, POST /restore and the POST /config submission contract)
     daemon: hqplayerd 6.0.4 (Opal), persistent HTTP lane on port 8088
-    status: verified-semantics
+    status: derived-semantics
     date: 2026-07-29
-    notes: The body a persistent WRITE answers with. Verified twice over: 'The 200 response body is the HTML restore page - success is confirmed by a /backup readback, never by the POST', and for POST /config 'a partial POST is silently rejected - the daemon answers HTTP 200 with Failed! in the body and writes nothing'. So an HTTP 200 here proves only that the request was received. This fixture exists so that rule is executable: the body carries no machine-readable outcome and no profile list, therefore a client must not infer success from it. The restore transport itself (multipart upload, daemon self-restart, readback polling) is issue #330's, not #322's.
+    notes: The body a persistent WRITE answers with. Verified twice over: 'The 200 response body is the HTML restore page - success is confirmed by a /backup readback, never by the POST', and for POST /config 'a partial POST is silently rejected - the daemon answers HTTP 200 with Failed! in the body and writes nothing'. So an HTTP 200 here proves only that the request was received. This fixture exists so that rule is executable: the body carries no machine-readable outcome and no profile list, therefore a client must not infer success from it. The restore transport itself (multipart upload, daemon self-restart, readback polling) is issue #330's, not #322's. The page markup is representative rather than captured: what is verified is the rule that this response family carries no outcome.
 -->
 <html>
 <head><title>HQPlayer Embedded</title></head>
