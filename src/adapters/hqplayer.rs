@@ -1757,12 +1757,11 @@ impl HqpAdapter {
     /// The wire form is `<Volume value="-23.5"/>`; whole numbers are sent without a decimal part so
     /// the request still looks like the reference client's.
     pub async fn set_volume_db(&self, db: f64) -> Result<()> {
-        let value = if (db - db.trunc()).abs() < f64::EPSILON {
-            format!("{}", db.trunc())
-        } else {
-            format!("{db}")
-        };
-        let xml = Self::build_request("Volume", &[("value", &value)]);
+        // `Display` for f64 already omits a trailing `.0`, so `-30.0` formats as `-30` and `-23.5`
+        // as `-23.5`. An earlier version branched on `trunc()` to force that, which was both
+        // redundant and a latent bug: had the guard ever mis-fired it would have sent `-0` for
+        // `-0.5`. Pinned by `a_whole_db_volume_is_not_turned_into_a_fraction_on_the_wire`.
+        let xml = Self::build_request("Volume", &[("value", &format!("{db}"))]);
         self.send_command(&xml).await?;
         Ok(())
     }
