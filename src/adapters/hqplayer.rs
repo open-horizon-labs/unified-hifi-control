@@ -4,10 +4,21 @@
 //! Also implements HTTP/Digest auth for web UI profile loading (port 8088).
 //! Based on Jussi Laako's hqp-control reference implementation.
 //!
-//! See `docs/hqplayer-protocol-audit.md` for:
-//! - State vs Status semantics (configured vs active values)
-//! - VALUE vs INDEX field usage for Set commands
-//! - Caching strategy to avoid overwhelming HQPlayer
+//! **Protocol authority is the executable corpus**, not this file and not prose: see
+//! `tests/fixtures/hqplayer/<version>/` driven by `tests/hqplayer_conformance.rs`, and
+//! `docs/adr/003-hqplayer-conformance-boundary.md` for why. `docs/hqplayer-protocol-reference.md`
+//! is a reader's guide with a table of the claims the corpus overturned.
+//!
+//! This comment previously pointed at `docs/hqplayer-protocol-audit.md`, which no longer exists —
+//! and the doc that replaced it was silent on the `result` attribute, which is how this client came
+//! to report success for commands the daemon had rejected. Hence the corpus.
+//!
+//! Semantics worth knowing before reading on:
+//! - `State` reports settings as **list indices**; `Status` reports the *active* filter/shaper/mode
+//!   as display strings. The two are different domains and must not be mixed.
+//! - `hqplayerd.xml` stores enum **IDs**, which are a third domain again.
+//! - Enumerations are mode-relative: a mode change swaps the filter/shaper/rate lists wholesale.
+//! - `result="OK"` is not proof a setting applied. See `verify_applied`.
 
 use anyhow::{anyhow, Result};
 use quick_xml::events::{BytesStart, Event};
