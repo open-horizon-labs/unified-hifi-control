@@ -17,6 +17,7 @@
 //! (§1 transport and framing, §6 `Status`).
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,12 +40,27 @@ pub enum Chunking {
     AfterMarker(String),
 }
 
+/// What the wire does to the connection instead of, or after, replying (AC2 reconnect boundaries).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Disruption {
+    #[default]
+    None,
+    /// Close the connection without replying to the next request, once. The client must reconnect
+    /// and retry to make progress.
+    DropNextReplyOnce,
+}
+
 /// The wire's byte-level policy.
 #[derive(Debug, Clone)]
 pub struct WirePolicy {
     pub chunking: Chunking,
     /// Ordering delay between chunks of a split reply. Never asserted on.
     pub chunk_delay: Duration,
+    pub disruption: Disruption,
+    /// Requests for this element draw no reply at all, so the client must hit its response timeout.
+    pub silent_for_element: Option<String>,
+    /// Append these raw bytes instead of a reply for this element, to model a malformed document.
+    pub malformed_for_element: Option<(String, String)>,
 }
 
 impl Default for WirePolicy {
@@ -52,8 +68,64 @@ impl Default for WirePolicy {
         Self {
             chunking: Chunking::Whole,
             chunk_delay: Duration::from_millis(20),
+            disruption: Disruption::None,
+            silent_for_element: None,
+            malformed_for_element: None,
         }
     }
+}
+
+/// Counters a test asserts on **instead of** measuring elapsed time.
+#[derive(Debug, Default)]
+pub struct WireStats {
+    connections: AtomicU32,
+    requests: AtomicU32,
+    replies: AtomicU32,
+    /// Request element names in arrival order, including requests the wire swallows before the
+    /// responder sees them. Lets a test count retries of one command.
+    elements: std::sync::Mutex<Vec<String>>,
+}
+
+impl WireStats {
+    /// How many TCP connections the client has opened. A reconnect shows up here.
+    pub fn connections(&self) -> u32 {
+        self.connections.load(Ordering::SeqCst)
+    }
+    pub fn requests(&self) -> u32 {
+        self.requests.load(Ordering::SeqCst)
+    }
+    pub fn replies(&self) -> u32 {
+        self.replies.load(Ordering::SeqCst)
+    }
+    /// How many times the client sent one element. This is the retry-count assertion.
+    pub fn element_count(&self, element: &str) -> u32 {
+        self.elements
+            .lock()
+            .expect("wire stats lock")
+            .iter()
+            .filter(|e| *e == element)
+            .count() as u32
+    }
+
+    fn record(&self, line: &str) {
+        if let Some(name) = element_name(line) {
+            self.elements.lock().expect("wire stats lock").push(name);
+        }
+    }
+}
+
+/// Element name of a request line such as `<?xml version="1.0"?><State/>`.
+fn element_name(line: &str) -> Option<String> {
+    let mut rest = line.trim();
+    if rest.starts_with("<?") {
+        rest = &rest[rest.find("?>")? + 2..];
+        rest = rest.trim_start();
+    }
+    let rest = rest.strip_prefix('<')?;
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
 }
 
 /// Produces the reply document for one request line. `None` means the daemon stayed silent.
@@ -73,6 +145,10 @@ where
 /// A listening fake HQPlayer endpoint.
 pub struct WireServer {
     addr: SocketAddr,
+    stats: Arc<WireStats>,
+    /// One-shot disruption budget shared across connections, so `DropNextReplyOnce` fires once for
+    /// the whole server rather than once per connection.
+    disruptions_left: Arc<AtomicU32>,
     accept_task: JoinHandle<()>,
 }
 
@@ -83,18 +159,32 @@ impl WireServer {
             .await
             .expect("bind loopback");
         let addr = listener.local_addr().expect("local_addr");
+        let stats = Arc::new(WireStats::default());
+        // Disruptions start unarmed so connection setup is never the thing under test; a test
+        // calls `arm_drop()` once it is connected.
+        let disruptions_left = Arc::new(AtomicU32::new(0));
 
+        let accept_stats = stats.clone();
+        let accept_budget = disruptions_left.clone();
         let accept_task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                accept_stats.connections.fetch_add(1, Ordering::SeqCst);
                 let responder = responder.clone();
                 let policy = policy.clone();
+                let stats = accept_stats.clone();
+                let budget = accept_budget.clone();
                 tokio::spawn(async move {
-                    serve_connection(stream, responder, policy).await;
+                    serve_connection(stream, responder, policy, stats, budget).await;
                 });
             }
         });
 
-        Self { addr, accept_task }
+        Self {
+            addr,
+            stats,
+            disruptions_left,
+            accept_task,
+        }
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -103,6 +193,21 @@ impl WireServer {
 
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    /// Observable counters. Assert on these rather than on elapsed time.
+    pub fn stats(&self) -> Arc<WireStats> {
+        self.stats.clone()
+    }
+
+    /// Arm the policy's one-shot disruption. Call after connecting, so setup is never disrupted.
+    pub fn arm_disruption(&self) {
+        self.disruptions_left.store(1, Ordering::SeqCst);
+    }
+
+    /// Whether an armed one-shot disruption has fired.
+    pub fn disruption_fired(&self) -> bool {
+        self.disruptions_left.load(Ordering::SeqCst) == 0
     }
 
     pub fn stop(self) {
@@ -126,7 +231,17 @@ fn split(document: &[u8], chunking: &Chunking) -> Vec<Vec<u8>> {
     }
 }
 
-async fn serve_connection(stream: TcpStream, responder: Arc<dyn Responder>, policy: WirePolicy) {
+fn mentions(line: &str, element: &str) -> bool {
+    line.contains(&format!("<{element}"))
+}
+
+async fn serve_connection(
+    stream: TcpStream,
+    responder: Arc<dyn Responder>,
+    policy: WirePolicy,
+    stats: Arc<WireStats>,
+    disruptions_left: Arc<AtomicU32>,
+) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -142,6 +257,37 @@ async fn serve_connection(stream: TcpStream, responder: Arc<dyn Responder>, poli
         // application keep-alive and draws no reply.
         if line.trim().is_empty() {
             continue;
+        }
+        stats.requests.fetch_add(1, Ordering::SeqCst);
+        stats.record(&line);
+
+        if policy.disruption == Disruption::DropNextReplyOnce
+            && disruptions_left
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            // Vanish mid-command. The client must notice and reconnect.
+            return;
+        }
+
+        if let Some(ref element) = policy.silent_for_element {
+            if mentions(&line, element) {
+                continue;
+            }
+        }
+
+        if let Some((ref element, ref garbage)) = policy.malformed_for_element {
+            if mentions(&line, element) {
+                let mut bytes = garbage.clone().into_bytes();
+                if !bytes.ends_with(b"\n") {
+                    bytes.push(b'\n');
+                }
+                if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                    return;
+                }
+                stats.replies.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
         }
 
         let Some(reply) = responder.respond(&line) else {
@@ -165,5 +311,6 @@ async fn serve_connection(stream: TcpStream, responder: Arc<dyn Responder>, poli
                 tokio::time::sleep(policy.chunk_delay).await;
             }
         }
+        stats.replies.fetch_add(1, Ordering::SeqCst);
     }
 }

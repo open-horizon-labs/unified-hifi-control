@@ -1,0 +1,11 @@
+<!--
+  provenance:
+    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 2 integration lanes; architecture.md section 2)
+    daemon: hqplayerd 6.0.4 (Opal), persistent hqplayerd.xml lane
+    status: verified-semantics
+    date: 2026-07-29
+    notes: CROSS-LANE FIXTURE. Verified: hqplayerd.xml stores numeric ENUM IDs while the Control API wire (State and Set*) speaks list INDICES, and the two domains must never be mixed. Every number here is an enum ID, resolvable against filters_pcm.xml / shapers_sdm.xml / modes.xml by the value attribute: filter=40 -> poly-sinc-gauss-long (list index 7), filter1x=6 -> poly-sinc-lp-2s (list index 5), shaper=5 -> ASDM5 (list index 4 in the SDM list), mode=0 -> PCM (list index 1). Feeding any of these to Set* verbatim selects the wrong setting or is rejected outright, which is the regression this fixture exists to catch.
+-->
+<Configuration>
+<output mode="0" filter="40" filter1x="6" shaper="5" rate="0"/>
+</Configuration>

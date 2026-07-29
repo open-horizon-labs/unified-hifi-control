@@ -1,0 +1,13 @@
+<!--
+  provenance:
+    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (Matrix commands; docs/matrix-spec.md)
+    daemon: hqplayerd 6.0.4 (Opal)
+    status: derived
+    date: 2026-07-29
+    notes: Container and child shape match the MatrixListProfiles family. One profile name contains an ampersand so entity handling on the read path is exercised. Profile names are illustrative.
+-->
+<MatrixListProfiles>
+<MatrixProfile index="0" name="Default"/>
+<MatrixProfile index="1" name="Speakers"/>
+<MatrixProfile index="2" name="Rock &amp; Roll"/>
+</MatrixListProfiles>

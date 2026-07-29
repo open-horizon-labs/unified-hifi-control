@@ -1,0 +1,19 @@
+<!--
+  provenance:
+    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 6, SetShaping / GetShapers)
+    daemon: hqplayerd 6.0.4 (Opal), PCM mode
+    status: derived-excerpt
+    date: 2026-07-29
+    notes: PCM mode dithers. Verified: the PCM list has 10 entries beginning none/NS1/NS4/NS5/NS9/LNS15 and ending TPDF/Gauss1/shaped. Enum IDs are derived, not live-observed.
+-->
+<GetShapers>
+<ShapersItem index="0" name="none" value="0"/>
+<ShapersItem index="1" name="NS1" value="1"/>
+<ShapersItem index="2" name="NS4" value="4"/>
+<ShapersItem index="3" name="NS5" value="5"/>
+<ShapersItem index="4" name="NS9" value="9"/>
+<ShapersItem index="5" name="LNS15" value="15"/>
+<ShapersItem index="6" name="TPDF" value="30"/>
+<ShapersItem index="7" name="Gauss1" value="31"/>
+<ShapersItem index="8" name="shaped" value="32"/>
+</GetShapers>

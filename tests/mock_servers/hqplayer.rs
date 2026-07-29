@@ -8,6 +8,7 @@
 //! layer ([`wire`]) so a test can vary one while pinning the other.
 
 pub mod corpus;
+pub mod model;
 pub mod wire;
 
 use std::net::SocketAddr;

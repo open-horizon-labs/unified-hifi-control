@@ -1,0 +1,19 @@
+<!--
+  provenance:
+    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 6, SetRate / GetRates)
+    daemon: hqplayerd 6.0.4 (Opal), SDM mode
+    status: verified
+    date: 2026-07-29
+    notes: Verified anchor preserved exactly: SetRate value=7 in SDM mode activated 22579200 Hz, which is index 7 here. Verified SDM span 2.8-24.6 MHz.
+-->
+<GetRates>
+<RatesItem index="0" rate="0"/>
+<RatesItem index="1" rate="2822400"/>
+<RatesItem index="2" rate="3072000"/>
+<RatesItem index="3" rate="5644800"/>
+<RatesItem index="4" rate="6144000"/>
+<RatesItem index="5" rate="11289600"/>
+<RatesItem index="6" rate="12288000"/>
+<RatesItem index="7" rate="22579200"/>
+<RatesItem index="8" rate="24576000"/>
+</GetRates>

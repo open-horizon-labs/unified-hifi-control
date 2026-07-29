@@ -1,0 +1,22 @@
+<!--
+  provenance:
+    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 6, SetFilter / GetFilters)
+    daemon: hqplayerd 6.0.4 (Opal), PCM mode
+    status: derived-excerpt
+    date: 2026-07-29
+    notes: Representative 12-entry excerpt of the 67-entry PCM list. Name-to-enum-ID pairs and the index != enum-ID relationship come from verified evidence; list POSITIONS are excerpt-local and contiguous, so absolute indices are not claimed as live-observed. Verified anchors preserved: SetFilter value=6 selects the entry at INDEX 6 (poly-sinc-lp), not the entry whose enum ID is 6 (poly-sinc-lp-2s, at index 5); and hqplayerd.xml filter=40 is the enum ID of poly-sinc-gauss-long. arg bit 0 = apodizing.
+-->
+<GetFilters>
+<FiltersItem index="0" name="none" value="0" arg="0"/>
+<FiltersItem index="1" name="IIR" value="1" arg="0"/>
+<FiltersItem index="2" name="IIR2" value="57" arg="0"/>
+<FiltersItem index="3" name="poly-sinc-short-lp" value="30" arg="0"/>
+<FiltersItem index="4" name="poly-sinc-short-mp" value="31" arg="0"/>
+<FiltersItem index="5" name="poly-sinc-lp-2s" value="6" arg="0"/>
+<FiltersItem index="6" name="poly-sinc-lp" value="29" arg="0"/>
+<FiltersItem index="7" name="poly-sinc-gauss-long" value="40" arg="0"/>
+<FiltersItem index="8" name="poly-sinc-ext2" value="16" arg="1"/>
+<FiltersItem index="9" name="poly-sinc-ext3" value="17" arg="1"/>
+<FiltersItem index="10" name="sinc-Lh" value="72" arg="0"/>
+<FiltersItem index="11" name="poly-sinc-xtr" value="61" arg="0"/>
+</GetFilters>

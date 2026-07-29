@@ -1,0 +1,13 @@
+<!--
+  provenance:
+    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 6, SetMode / GetModes)
+    daemon: hqplayerd 6.0.4 (Opal)
+    status: verified
+    date: 2026-07-29
+    notes: Complete list. Verified live: index 0 = [source] (enum ID -1), 1 = PCM (0), 2 = SDM (1). This is the canonical proof that list index and enum ID are different domains.
+-->
+<GetModes>
+<ModesItem index="0" name="[source]" value="-1"/>
+<ModesItem index="1" name="PCM" value="0"/>
+<ModesItem index="2" name="SDM (DSD)" value="1"/>
+</GetModes>

@@ -1,0 +1,21 @@
+<!--
+  provenance:
+    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 6, SetRate / GetRates)
+    daemon: hqplayerd 6.0.4 (Opal), PCM mode
+    status: derived-excerpt
+    date: 2026-07-29
+    notes: Verified: RatesItem carries index and rate (Hz) only, with NO value attribute, and index 0 is rate=0 meaning auto/source-based. Verified PCM span 44100-768000 Hz.
+-->
+<GetRates>
+<RatesItem index="0" rate="0"/>
+<RatesItem index="1" rate="44100"/>
+<RatesItem index="2" rate="48000"/>
+<RatesItem index="3" rate="88200"/>
+<RatesItem index="4" rate="96000"/>
+<RatesItem index="5" rate="176400"/>
+<RatesItem index="6" rate="192000"/>
+<RatesItem index="7" rate="352800"/>
+<RatesItem index="8" rate="384000"/>
+<RatesItem index="9" rate="705600"/>
+<RatesItem index="10" rate="768000"/>
+</GetRates>

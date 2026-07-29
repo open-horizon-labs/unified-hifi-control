@@ -1,0 +1,15 @@
+<!--
+  provenance:
+    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 6, SetFilter / GetFilters)
+    daemon: hqplayerd 6.0.4 (Opal), SDM mode
+    status: derived-excerpt
+    date: 2026-07-29
+    notes: Representative excerpt of the 77-entry SDM list. Encodes the verified fact that GetFilters returns the CURRENT mode's list only, that the PCM and SDM lists differ wholesale, that indices shift between modes, and that the SDM list has no leading none entry. Positions are excerpt-local.
+-->
+<GetFilters>
+<FiltersItem index="0" name="poly-sinc-short-lp" value="30" arg="0"/>
+<FiltersItem index="1" name="poly-sinc-gauss-long" value="40" arg="0"/>
+<FiltersItem index="2" name="poly-sinc-ext2" value="16" arg="1"/>
+<FiltersItem index="3" name="sinc-Lh" value="72" arg="0"/>
+<FiltersItem index="4" name="poly-sinc-xtr" value="61" arg="0"/>
+</GetFilters>
