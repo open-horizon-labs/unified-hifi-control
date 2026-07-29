@@ -422,7 +422,8 @@ impl Inner {
         self.tick_pending();
         let active_filter =
             self.name_at_index("GetFilters", "FiltersItem", self.state.filter_nx_index);
-        let active_shaper = self.name_at_index("GetShapers", "ShapersItem", self.state.shaper_index);
+        let active_shaper =
+            self.name_at_index("GetShapers", "ShapersItem", self.state.shaper_index);
         let active_mode = self.name_at_index("GetModes", "ModesItem", self.state.mode_index);
         let nl = self.newline();
         let s = self.state.clone();

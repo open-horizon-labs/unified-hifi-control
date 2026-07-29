@@ -122,12 +122,7 @@ async fn get_info_reports_the_verified_daemon_identity() {
             info.version.as_str(),
             info.engine.as_str()
         ),
-        (
-            "Opal",
-            "Signalyst HQPlayer Embedded",
-            "6",
-            "6.0.4"
-        ),
+        ("Opal", "Signalyst HQPlayer Embedded", "6", "6.0.4"),
         "GetInfo must surface name/product/version/engine as the daemon sends them"
     );
     h.stop();
@@ -349,7 +344,11 @@ async fn a_document_split_mid_attribute_across_tcp_writes_is_still_parsed() {
     })
     .await;
     h.model.external_change(|s| s.playback = 1);
-    let state = h.adapter.get_state().await.expect("State across a split read");
+    let state = h
+        .adapter
+        .get_state()
+        .await
+        .expect("State across a split read");
     assert_eq!(
         state.state, 1,
         "a reply split mid-attribute across TCP writes must be reassembled before parsing"
@@ -485,9 +484,13 @@ fn the_framer_finds_the_end_of_a_document_at_every_split_point() {
 
 #[test]
 fn the_framer_ends_a_coalesced_buffer_at_the_first_document() {
-    let two = "<?xml version=\"1.0\"?><State state=\"2\"/><?xml version=\"1.0\"?><State state=\"0\"/>";
+    let two =
+        "<?xml version=\"1.0\"?><State state=\"2\"/><?xml version=\"1.0\"?><State state=\"0\"/>";
     assert_eq!(
-        (framing::classify(two), framing::root_element(two).as_deref()),
+        (
+            framing::classify(two),
+            framing::root_element(two).as_deref()
+        ),
         (framing::Framing::Complete, Some("State")),
         "when two documents arrive together the framer must end at the first, not span both"
     );
@@ -655,8 +658,7 @@ async fn a_rounded_volume_is_never_reported_as_zero_db() {
 #[tokio::test]
 async fn a_fixed_volume_daemon_rejects_a_volume_change() {
     let h = Harness::verified().await;
-    h.model
-        .external_change(|s| s.volume_range.enabled = false);
+    h.model.external_change(|s| s.volume_range.enabled = false);
 
     let result = h.adapter.set_volume_db(-10.0).await;
     assert!(
@@ -670,8 +672,7 @@ async fn a_fixed_volume_daemon_rejects_a_volume_change() {
 #[tokio::test]
 async fn a_fixed_volume_daemon_reports_volume_as_unavailable() {
     let h = Harness::verified().await;
-    h.model
-        .external_change(|s| s.volume_range.enabled = false);
+    h.model.external_change(|s| s.volume_range.enabled = false);
     let range = h.adapter.get_volume_range().await.expect("VolumeRange");
     assert!(
         !range.enabled,
@@ -683,8 +684,7 @@ async fn a_fixed_volume_daemon_reports_volume_as_unavailable() {
 #[tokio::test]
 async fn an_adaptive_volume_daemon_reports_the_adaptive_flag() {
     let h = Harness::verified().await;
-    h.model
-        .external_change(|s| s.volume_range.adaptive = true);
+    h.model.external_change(|s| s.volume_range.adaptive = true);
     let range = h.adapter.get_volume_range().await.expect("VolumeRange");
     assert!(
         range.adaptive,
@@ -1037,14 +1037,19 @@ async fn real_daemon_conformance_when_opted_in() {
 
     isolate_config_dir();
     let adapter = HqpAdapter::new(create_bus());
-    adapter.configure(host.clone(), Some(port), None, None, None).await;
+    adapter
+        .configure(host.clone(), Some(port), None, None, None)
+        .await;
     adapter
         .connect()
         .await
         .unwrap_or_else(|e| panic!("connect to real HQPlayer at {host}:{port}: {e}"));
 
     let info = adapter.get_info().await.expect("GetInfo from real daemon");
-    let filters = adapter.get_filters().await.expect("GetFilters from real daemon");
+    let filters = adapter
+        .get_filters()
+        .await
+        .expect("GetFilters from real daemon");
     assert!(
         !info.product.is_empty() && filters.len() > 1,
         "a real daemon must identify itself and return a full filter list; product={:?} \

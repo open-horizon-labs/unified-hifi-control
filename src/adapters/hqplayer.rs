@@ -301,10 +301,12 @@ pub mod framing {
                 "apos" => Some('\''),
                 _ => entity
                     .strip_prefix('#')
-                    .and_then(|n| match n.strip_prefix('x').or_else(|| n.strip_prefix('X')) {
-                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                        None => n.parse::<u32>().ok(),
-                    })
+                    .and_then(
+                        |n| match n.strip_prefix('x').or_else(|| n.strip_prefix('X')) {
+                            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                            None => n.parse::<u32>().ok(),
+                        },
+                    )
                     .and_then(char::from_u32),
             };
             match decoded {
@@ -1209,11 +1211,9 @@ impl HqpAdapter {
     fn parse_attr_u32(xml: &str, attr: &str) -> u32 {
         Self::parse_attr(xml, attr)
             .and_then(|s| {
-                s.parse::<u32>().ok().or_else(|| {
-                    s.parse::<f64>()
-                        .ok()
-                        .map(|f| f.round().max(0.0) as u32)
-                })
+                s.parse::<u32>()
+                    .ok()
+                    .or_else(|| s.parse::<f64>().ok().map(|f| f.round().max(0.0) as u32))
             })
             .unwrap_or(0)
     }
@@ -1539,7 +1539,8 @@ impl HqpAdapter {
             "set_filter_1x: name='{}' resolved_index={}, state.filter_nx={:?}, state.filter={}, using current_nx={}",
             filter_name, filter_index, state.filter_nx, state.filter, current_nx_index
         );
-        self.set_filter(current_nx_index, Some(filter_index)).await?;
+        self.set_filter(current_nx_index, Some(filter_index))
+            .await?;
         self.verify_applied("filter1x", filter_index, |s| s.filter1x.or(Some(s.filter)))
             .await
     }
@@ -1555,7 +1556,8 @@ impl HqpAdapter {
             "set_filter_nx: name='{}' resolved_index={}, state.filter1x={:?}, state.filter={}, using current_1x={}",
             filter_name, filter_index, state.filter1x, state.filter, current_1x_index
         );
-        self.set_filter(filter_index, Some(current_1x_index)).await?;
+        self.set_filter(filter_index, Some(current_1x_index))
+            .await?;
         self.verify_applied("filterNx", filter_index, |s| s.filter_nx.or(Some(s.filter)))
             .await
     }
