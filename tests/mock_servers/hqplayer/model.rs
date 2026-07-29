@@ -246,14 +246,30 @@ impl DaemonModel {
     }
 
     pub fn with_profile(profile: &str) -> Self {
+        let mut inner = Inner {
+            state: DaemonState::default(),
+            faults: Faults::default(),
+            style: DocumentStyle::default(),
+            enums: Enumerations::load(profile),
+            requests: Vec::new(),
+        };
+        // A real daemon never reports an index outside its own lists, and list lengths differ per
+        // version profile and per mode. Clamp the defaults so the model stays self-consistent
+        // whichever corpus it is serving.
+        let clamp = |value: u32, count: u32| if count == 0 { 0 } else { value.min(count - 1) };
+        let filters = inner.entry_count("GetFilters", "FiltersItem");
+        let shapers = inner.entry_count("GetShapers", "ShapersItem");
+        let rates = inner.entry_count("GetRates", "RatesItem");
+        let modes = inner.entry_count("GetModes", "ModesItem");
+        let junk = inner.entry_count("GetJunkFilters", "JunkFiltersItem");
+        inner.state.filter_1x_index = clamp(inner.state.filter_1x_index, filters);
+        inner.state.filter_nx_index = clamp(inner.state.filter_nx_index, filters);
+        inner.state.shaper_index = clamp(inner.state.shaper_index, shapers);
+        inner.state.rate_index = clamp(inner.state.rate_index, rates);
+        inner.state.mode_index = clamp(inner.state.mode_index, modes);
+        inner.state.filter_junk_index = clamp(inner.state.filter_junk_index, junk);
         Self {
-            inner: Arc::new(Mutex::new(Inner {
-                state: DaemonState::default(),
-                faults: Faults::default(),
-                style: DocumentStyle::default(),
-                enums: Enumerations::load(profile),
-                requests: Vec::new(),
-            })),
+            inner: Arc::new(Mutex::new(inner)),
         }
     }
 

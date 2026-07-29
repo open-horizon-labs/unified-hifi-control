@@ -160,6 +160,16 @@ pub mod framing {
     /// Pure and cheap, so it can be exercised exhaustively at every byte offset of a document
     /// without a socket.
     pub fn classify(buf: &str) -> Framing {
+        // A buffer whose first element is a closing tag can never become a document, however much
+        // more arrives. This is exactly the leftover a truncating reader produces, so catching it
+        // here turns a silent desync into a reported error. quick_xml raises a generic parse error
+        // for it, which is indistinguishable from "truncated mid-token", hence the explicit check.
+        if let Some(rest) = skip_prologue(buf) {
+            if rest.starts_with("</") {
+                return Framing::Malformed;
+            }
+        }
+
         let mut reader = Reader::from_str(buf);
         reader.config_mut().check_end_names = false;
         let mut depth: i32 = 0;
@@ -201,6 +211,115 @@ pub mod framing {
                 Err(_) => return Framing::Incomplete,
             }
         }
+    }
+
+    /// Skip leading whitespace, XML declarations, comments and processing instructions.
+    /// Returns `None` when nothing but prologue has arrived yet.
+    fn skip_prologue(buf: &str) -> Option<&str> {
+        let mut rest = buf.trim_start();
+        loop {
+            if rest.is_empty() {
+                return None;
+            }
+            let closing = if rest.starts_with("<?") {
+                "?>"
+            } else if rest.starts_with("<!--") {
+                "-->"
+            } else if rest.starts_with("<!") {
+                ">"
+            } else {
+                return Some(rest);
+            };
+            let end = rest.find(closing)? + closing.len();
+            rest = rest[end..].trim_start();
+        }
+    }
+
+    /// The root element's opening tag, including its attributes.
+    ///
+    /// Attribute lookups must be scoped to this slice: a plain substring scan over the whole
+    /// document matches the XML declaration's `version="1.0"` before the root element's own
+    /// `version`, silently replacing the daemon's version with the XML spec's.
+    pub fn root_open_tag(buf: &str) -> Option<&str> {
+        let rest = skip_prologue(buf)?;
+        if !rest.starts_with('<') || rest.starts_with("</") {
+            return None;
+        }
+        let bytes = rest.as_bytes();
+        let mut in_quote = false;
+        for (i, b) in bytes.iter().enumerate() {
+            match b {
+                b'"' => in_quote = !in_quote,
+                b'>' if !in_quote => return Some(&rest[..=i]),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Text content of a document's root element, e.g. the reason in
+    /// `<SetFilter result="Error">invalid filter</SetFilter>`.
+    pub fn root_text(buf: &str) -> Option<String> {
+        let open = root_open_tag(buf)?;
+        let rest = skip_prologue(buf)?;
+        let after = &rest[open.len()..];
+        let end = after.find("</")?;
+        let text = after[..end].trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(decode_entities(text))
+        }
+    }
+
+    /// Decode the XML entities the daemon uses in attribute values and element text.
+    ///
+    /// The reference warns that string attributes can arrive entity-escaped, and that a bare `&`
+    /// has also been observed, so be lenient in both directions: an unrecognised `&…` sequence is
+    /// left exactly as it was rather than being dropped.
+    pub fn decode_entities(raw: &str) -> String {
+        if !raw.contains('&') {
+            return raw.to_string();
+        }
+        let mut out = String::with_capacity(raw.len());
+        let mut rest = raw;
+        while let Some(at) = rest.find('&') {
+            out.push_str(&rest[..at]);
+            let tail = &rest[at..];
+            let Some(semi) = tail.find(';').filter(|s| *s <= 10) else {
+                // Bare ampersand: keep it and move on.
+                out.push('&');
+                rest = &tail[1..];
+                continue;
+            };
+            let entity = &tail[1..semi];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => entity
+                    .strip_prefix('#')
+                    .and_then(|n| match n.strip_prefix('x').or_else(|| n.strip_prefix('X')) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => n.parse::<u32>().ok(),
+                    })
+                    .and_then(char::from_u32),
+            };
+            match decoded {
+                Some(c) => {
+                    out.push(c);
+                    rest = &tail[semi + 1..];
+                }
+                None => {
+                    out.push('&');
+                    rest = &tail[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
     }
 
     /// Name of the single top-level element of a complete document.
@@ -263,7 +382,15 @@ pub struct HqpState {
     pub filter_nx: Option<u32>,
     pub shaper: u32,
     pub rate: u32,
+    /// Rounded dB, kept for payload compatibility. Prefer `volume_db`.
     pub volume: i32,
+    /// Exact dB as the daemon sent it. Skipped by serde so no response payload changes.
+    #[serde(skip)]
+    pub volume_db: f64,
+    /// `filter_junk` list index. The wire attribute is an int index into `GetJunkFilters`, not the
+    /// boolean `filter_20k` below, which is retained only for payload compatibility.
+    #[serde(skip)]
+    pub filter_junk: u32,
     pub active_mode: u8,
     pub active_rate: u32,
     pub invert: bool,
@@ -293,7 +420,11 @@ pub struct HqpStatus {
     pub track_id: String,
     pub position: u32,
     pub length: u32,
+    /// Rounded dB, kept for payload compatibility. Prefer `volume_db`.
     pub volume: i32,
+    /// Exact dB as the daemon sent it. Skipped by serde so no response payload changes.
+    #[serde(skip)]
+    pub volume_db: f64,
     pub active_mode: String,
     pub active_filter: String,
     pub active_shaper: String,
@@ -307,11 +438,20 @@ pub struct HqpStatus {
 /// Volume range info
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VolumeRange {
+    /// Rounded dB, kept for payload compatibility. Prefer the `_db` fields.
     pub min: i32,
     pub max: i32,
     pub step: i32,
     pub enabled: bool,
     pub adaptive: bool,
+    /// Exact dB bounds as the daemon sent them. Skipped by serde so no payload changes.
+    #[serde(skip)]
+    pub min_db: f64,
+    #[serde(skip)]
+    pub max_db: f64,
+    /// `None` when the daemon sends no `step` attribute, which the verified sample does not.
+    #[serde(skip)]
+    pub step_db: Option<f64>,
 }
 
 /// Mode/Filter/Shaper item
@@ -846,6 +986,28 @@ impl HqpAdapter {
         }
     }
 
+    /// Fail when the daemon answered `result="Error"`.
+    ///
+    /// Setters and transport commands echo the request element with `result="OK"` or
+    /// `result="Error"`, the latter carrying a reason as element text. An **absent** `result` is a
+    /// third, legitimate case: queries never carry one, and `SetAdaptiveVolume` answers a bare
+    /// element. Only an explicit `Error` is a failure.
+    ///
+    /// This is the no-false-success primitive: `OK` still does not prove the setting applied — see
+    /// `verify_applied` — but an explicit rejection can no longer be reported as success.
+    fn check_result(response: &str) -> Result<()> {
+        match Self::parse_attr(response, "result").as_deref() {
+            Some("Error") => {
+                let element = framing::root_element(response).unwrap_or_else(|| "?".to_string());
+                match framing::root_text(response) {
+                    Some(reason) => Err(anyhow!("HQPlayer rejected {}: {}", element, reason)),
+                    None => Err(anyhow!("HQPlayer rejected {} (no reason given)", element)),
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Send command and get response with auto-reconnection
     async fn send_command(&self, xml: &str) -> Result<String> {
         let timeouts = self.timeouts().await;
@@ -867,7 +1029,12 @@ impl HqpAdapter {
 
             // Try to send command
             match self.send_command_inner(xml).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    // An explicit rejection is terminal: retrying an invalid value cannot help,
+                    // and the connection is still good.
+                    Self::check_result(&response)?;
+                    return Ok(response);
+                }
                 Err(e) => {
                     // Mark as disconnected so next attempt will reconnect
                     self.mark_disconnected().await;
@@ -972,6 +1139,7 @@ impl HqpAdapter {
             position: Self::parse_attr_u32(&response, "position"),
             length: Self::parse_attr_u32(&response, "length"),
             volume: Self::parse_attr_i32(&response, "volume"),
+            volume_db: Self::parse_attr_f64(&response, "volume").unwrap_or_default(),
             active_mode: Self::parse_attr(&response, "active_mode").unwrap_or_default(),
             active_filter: Self::parse_attr(&response, "active_filter").unwrap_or_default(),
             active_shaper: Self::parse_attr(&response, "active_shaper").unwrap_or_default(),
@@ -1001,29 +1169,52 @@ impl HqpAdapter {
         )
     }
 
-    /// Parse XML attribute
-    /// Uses space prefix to avoid matching attribute name suffixes
-    /// (e.g., searching for "mode" shouldn't match "active_mode")
+    /// Parse an attribute off a response's **root element**.
+    ///
+    /// Scoped to the root opening tag for two reasons. A whole-document scan matches the XML
+    /// declaration's `version="1.0"` before `<GetInfo … version="6"/>`, and it can also pick up a
+    /// child element's attribute (a `Status` document's `<metadata … samplerate="…"/>`) in
+    /// preference to the root's own. The leading space still guards against matching a longer
+    /// attribute name's suffix, e.g. `mode` inside `active_mode`.
     fn parse_attr(xml: &str, attr: &str) -> Option<String> {
+        let scope = framing::root_open_tag(xml).unwrap_or(xml);
         let pattern = format!(" {}=\"", attr);
-        if let Some(start) = xml.find(&pattern) {
-            let rest = &xml[start + pattern.len()..];
-            if let Some(end) = rest.find('"') {
-                return Some(rest[..end].to_string());
-            }
-        }
-        None
+        let start = scope.find(&pattern)? + pattern.len();
+        let rest = &scope[start..];
+        let end = rest.find('"')?;
+        Some(framing::decode_entities(&rest[..end]))
     }
 
+    /// Parse an attribute that the daemon sends as a double, e.g. any dB value.
+    ///
+    /// Accepts the integer form too, since the daemon sends `-60` and `-60.0` interchangeably.
+    fn parse_attr_f64(xml: &str, attr: &str) -> Option<f64> {
+        Self::parse_attr(xml, attr).and_then(|s| s.trim().parse().ok())
+    }
+
+    /// Integer view of an attribute the daemon may send as a double.
+    ///
+    /// `"-23.5".parse::<i32>()` fails, and the old `unwrap_or(0)` turned a quiet -23.5 dB into
+    /// 0 dB, i.e. maximum output. Rounding the double is the only safe reading.
     fn parse_attr_i32(xml: &str, attr: &str) -> i32 {
         Self::parse_attr(xml, attr)
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| {
+                s.parse::<i32>()
+                    .ok()
+                    .or_else(|| s.parse::<f64>().ok().map(|f| f.round() as i32))
+            })
             .unwrap_or(0)
     }
 
     fn parse_attr_u32(xml: &str, attr: &str) -> u32 {
         Self::parse_attr(xml, attr)
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| {
+                s.parse::<u32>().ok().or_else(|| {
+                    s.parse::<f64>()
+                        .ok()
+                        .map(|f| f.round().max(0.0) as u32)
+                })
+            })
             .unwrap_or(0)
     }
 
@@ -1061,6 +1252,8 @@ impl HqpAdapter {
             shaper: Self::parse_attr_u32(&response, "shaper"),
             rate: Self::parse_attr_u32(&response, "rate"),
             volume: Self::parse_attr_i32(&response, "volume"),
+            volume_db: Self::parse_attr_f64(&response, "volume").unwrap_or_default(),
+            filter_junk: Self::parse_attr_u32(&response, "filter_junk"),
             active_mode: Self::parse_attr_u32(&response, "active_mode") as u8,
             active_rate: Self::parse_attr_u32(&response, "active_rate"),
             invert: Self::parse_attr_bool(&response, "invert"),
@@ -1085,6 +1278,7 @@ impl HqpAdapter {
             position: Self::parse_attr_u32(&response, "position"),
             length: Self::parse_attr_u32(&response, "length"),
             volume: Self::parse_attr_i32(&response, "volume"),
+            volume_db: Self::parse_attr_f64(&response, "volume").unwrap_or_default(),
             active_mode: Self::parse_attr(&response, "active_mode").unwrap_or_default(),
             active_filter: Self::parse_attr(&response, "active_filter").unwrap_or_default(),
             active_shaper: Self::parse_attr(&response, "active_shaper").unwrap_or_default(),
@@ -1107,6 +1301,9 @@ impl HqpAdapter {
             step: Self::parse_attr_i32(&response, "step").max(1),
             enabled: Self::parse_attr_bool(&response, "enabled"),
             adaptive: Self::parse_attr_bool(&response, "adaptive"),
+            min_db: Self::parse_attr_f64(&response, "min").unwrap_or_default(),
+            max_db: Self::parse_attr_f64(&response, "max").unwrap_or_default(),
+            step_db: Self::parse_attr_f64(&response, "step"),
         })
     }
 
@@ -1449,9 +1646,25 @@ impl HqpAdapter {
         Ok(())
     }
 
-    /// Set volume
+    /// Set volume in whole dB.
+    ///
+    /// Kept for the existing `POST /hqplayer/volume` request payload, whose `value` is an integer.
+    /// Delegates to [`Self::set_volume_db`], which is the protocol-accurate form.
     pub async fn set_volume(&self, value: i32) -> Result<()> {
-        let xml = Self::build_request("Volume", &[("value", &value.to_string())]);
+        self.set_volume_db(f64::from(value)).await
+    }
+
+    /// Set volume in dB, which the daemon accepts as a double.
+    ///
+    /// The wire form is `<Volume value="-23.5"/>`; whole numbers are sent without a decimal part so
+    /// the request still looks like the reference client's.
+    pub async fn set_volume_db(&self, db: f64) -> Result<()> {
+        let value = if (db - db.trunc()).abs() < f64::EPSILON {
+            format!("{}", db.trunc())
+        } else {
+            format!("{db}")
+        };
+        let xml = Self::build_request("Volume", &[("value", &value)]);
         self.send_command(&xml).await?;
         Ok(())
     }
@@ -2210,10 +2423,11 @@ impl HqpAdapter {
 
         let volume_control = if vol_range.enabled {
             Some(BusVolumeControl {
-                value: status.volume as f32,
-                min: vol_range.min as f32,
-                max: vol_range.max as f32,
-                step: vol_range.step as f32,
+                // Exact dB, not the rounded payload projection.
+                value: status.volume_db as f32,
+                min: vol_range.min_db as f32,
+                max: vol_range.max_db as f32,
+                step: vol_range.step_db.unwrap_or(f64::from(vol_range.step)) as f32,
                 is_muted: false, // HQPlayer doesn't report mute separately
                 scale: VolumeScale::Decibel,
                 output_id: Some(zone_id.clone()),
