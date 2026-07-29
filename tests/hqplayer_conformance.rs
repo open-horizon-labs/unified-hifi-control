@@ -13,7 +13,8 @@
 //! * **No test asserts elapsed wall-clock time.** Timeout and reconnect behaviour is exercised
 //!   through the injectable [`HqpTimeouts`] seam and asserted on outcomes and attempt counts.
 //! * The suite is hermetic: it needs no HQPlayer. The opt-in real-daemon mode is
-//!   [`real_daemon_conformance_when_opted_in`].
+//!   [`real_daemon_smoke_check_when_opted_in`], and it is a connectivity/identity smoke check only —
+//!   diffing the corpus against live hardware is stage-3 work.
 //! * Protocol truth is the corpus under `tests/fixtures/hqplayer/`, cross-checked against
 //!   <https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md>.
 //!   Current Rust behaviour is never treated as the specification.
@@ -1170,25 +1171,41 @@ async fn the_matrix_profile_family_round_trips_a_name_containing_an_entity() {
 }
 
 // =============================================================================
-// AC8 - hermetic in CI, with a documented opt-in real-daemon mode
+// AC8 - hermetic in CI, with a documented opt-in real-daemon mode (a smoke check, by design)
 // =============================================================================
 
-/// Opt-in real-daemon conformance. Set `UHC_HQP_CONFORMANCE_HOST` (and optionally
-/// `UHC_HQP_CONFORMANCE_PORT`, default 4321) to run the read-only checks against a real HQPlayer:
+/// Opt-in real-daemon **smoke check** — deliberately narrow, and named so nobody mistakes it for
+/// more. Set `UHC_HQP_CONFORMANCE_HOST` (and optionally `UHC_HQP_CONFORMANCE_PORT`, default 4321):
 ///
 /// ```text
 /// UHC_HQP_CONFORMANCE_HOST=192.168.1.50 cargo test --test hqplayer_conformance
 /// ```
 ///
-/// Without the variable this reports that it was skipped and passes, so the default suite stays
-/// hermetic without leaving an acceptance test permanently ignored. Assertions here are **read-only**
-/// — nothing is ever written to a real daemon.
+/// Without the variable it prints that it skipped and passes, so the default suite stays hermetic
+/// without leaving an acceptance test permanently ignored. That existence-plus-documentation
+/// property is what issue #322 AC8 asks for, and it is all this test claims to deliver.
+///
+/// **What it checks:** that a real daemon accepts a connection, identifies itself through `GetInfo`,
+/// and returns a multi-entry `GetFilters` container that the framer parses whole. That is enough to
+/// prove the client can talk to real hardware at all, which is the failure this catches.
+///
+/// **What it does NOT check, and must not be cited as checking:** it does not read `State`,
+/// `Status`, `VolumeRange`, `GetModes`, `GetShapers`, `GetRates`, `GetJunkFilters` or the matrix
+/// family; it does not compare anything against the corpus; and it therefore settles none of the
+/// `derived-*` fixtures' list positions. Extending it into a verifier that captures and diffs the
+/// read-only protocol families is **stage 3** work and is the precondition for the real-daemon merge
+/// gate — see `docs/adr/003-hqplayer-conformance-boundary.md`.
+///
+/// **Read-only, always.** Nothing here writes to a real daemon. Any live verification of the
+/// `Set*` anchors is mutating by nature and belongs behind a separate opt-in against an expendable
+/// daemon, never against someone's listening room.
 #[tokio::test]
-async fn real_daemon_conformance_when_opted_in() {
+async fn real_daemon_smoke_check_when_opted_in() {
     let Ok(host) = std::env::var("UHC_HQP_CONFORMANCE_HOST") else {
         eprintln!(
-            "skipping real-daemon conformance: set UHC_HQP_CONFORMANCE_HOST to opt in \
-             (read-only checks)"
+            "skipping the real-daemon smoke check: set UHC_HQP_CONFORMANCE_HOST to opt in. \
+             This is a connectivity/identity check only - it does not diff the corpus, which is \
+             stage-3 work"
         );
         return;
     };
@@ -1214,8 +1231,9 @@ async fn real_daemon_conformance_when_opted_in() {
         .expect("GetFilters from real daemon");
     assert!(
         !info.product.is_empty() && filters.len() > 1,
-        "a real daemon must identify itself and return a full filter list; product={:?} \
-         filters={}",
+        "a real daemon must identify itself and return a multi-entry filter container; \
+         product={:?} filters={}. This is a smoke check: passing it says the client can talk to \
+         real hardware, NOT that the corpus matches it",
         info.product,
         filters.len()
     );

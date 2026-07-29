@@ -52,7 +52,9 @@ Consequences of that split, all load-bearing:
   (`WireStats::element_count`). This follows HQPTuner's testing policy, whose suite went from 84 s to
   7 s by removing real sleeps.
 - **The default suite is hermetic.** The opt-in real-daemon mode is `UHC_HQP_CONFORMANCE_HOST`,
-  read-only, and skips with a printed note rather than being permanently `#[ignore]`d.
+  read-only, and skips with a printed note rather than being permanently `#[ignore]`d. It is a
+  **connectivity/identity smoke check** and nothing more — see the stage-3 section below for what it
+  deliberately does not do.
 - **`MockHqpServer` survives untouched** as the facade for `tests/adapter_integration.rs` and
   `tests/zones_sha_integration.rs`.
 
@@ -153,3 +155,71 @@ live `hqplayerd` 6.0.4 (Opal), pinned at commit `6755793`:
 Written in stage 2 rather than stage 1, deliberately: the stage-1 dissent deferred it until the
 timing seam was settled and the cost was measured, so that its two most consequential sections would
 not have to hedge.
+
+## Stage 3: what the real-daemon merge gate actually requires
+
+The corpus is transcribed rather than captured, so a live comparison is the only thing that can
+settle it. This section exists because that comparison was previously described as "run the opt-in
+suite", which overstated what the opt-in suite does.
+
+### What exists today (stage 2)
+
+`real_daemon_smoke_check_when_opted_in` connects to `UHC_HQP_CONFORMANCE_HOST`, calls `GetInfo` and
+`GetFilters`, and asserts the daemon identifies itself and returns a multi-entry container the framer
+parses whole. That is a **smoke check**: it proves the client can talk to real hardware at all.
+
+It satisfies AC8, which asks that the harness *"can run in CI without HQPlayer and has a documented
+opt-in real-server conformance mode"* — an existence-and-documentation requirement. It does **not**
+read `State`, `Status`, `VolumeRange`, `GetModes`, `GetShapers`, `GetRates`, `GetJunkFilters` or the
+matrix family; it compares nothing against the corpus; and it settles none of the `derived-*`
+fixtures' list positions. It must not be cited as doing any of that.
+
+### Tier 1 — read-only live verification (the merge gate)
+
+Safe against any daemon, including someone's listening room. Extend the opt-in mode to **capture**
+and **diff against the corpus**:
+
+| Family | What the diff must compare |
+|---|---|
+| `GetInfo` | attribute set and value shapes |
+| `GetModes` | names, enum IDs, and **list positions** |
+| `GetFilters`, `GetShapers` | names, enum IDs, list positions, `arg` flags, `description` presence — **per mode**, since the lists are mode-relative |
+| `GetRates` | index-to-Hz mapping, and that index 0 is rate 0 |
+| `GetJunkFilters` | names, enum IDs, positions |
+| `State` | attribute set, numeric-vs-decimal types, `filter_junk` as an int, whether `filter1x`/`filterNx` are present |
+| `Status` | attribute set, the `metadata` child's presence and self-closing shape, active-\* fields as strings |
+| `VolumeRange` | whether `step` is sent at all, and that min/max are doubles |
+| `MatrixListProfiles` / `MatrixGetProfile` | container and child shape |
+| `GET /config` (8088) | the `profile` / `profile_name` field names and the `[default]`-versus-named distinction |
+
+Every mismatch either re-provenances a fixture from the capture or ships as a stated gap. A
+`derived-excerpt` or `UNVERIFIED` label surviving this pass unexamined is a finding, not a footnote.
+
+**This tier is what the real-daemon merge gate means.** It does not exist yet.
+
+### Tier 2 — mutating verification (never a merge gate, never unattended)
+
+Some corpus claims cannot be confirmed read-only, because the evidence *is* a state change. Chiefly
+the `Set*` anchors: that `<SetFilter value="6"/>` selects the entry at list index 6 rather than the
+entry whose enum ID is 6, and the equivalent for `SetShaping` and `SetRate`. Confirming those means
+moving a real daemon's settings.
+
+Requirements, all of them:
+
+- A **dedicated or expendable** daemon. Never a user's playback system, never a shared one.
+- A **separate** opt-in variable from tier 1, so nobody enables mutation by reusing a host name.
+- Capture-and-restore of every setting touched, with the restore verified.
+- Never in CI, never unattended.
+
+Because tier 2 needs hardware nobody should volunteer casually, the honest position is that the
+`Set*` anchors stay **derived** until someone runs it deliberately — and the fixtures say so.
+
+### Also outstanding for stage 3
+
+- Make the unsolicited-document skip count observable, so tier 1 can assert it stays at zero across
+  every command family. Deferred here because its only consumer is that assertion.
+- Confirm on GitHub runners, not this sandbox, the three known full-run failures: the two
+  deterministic `/hqp/discover` multicast 500s, and the pre-existing ~1-in-10
+  `error_handling::lms_fails_gracefully_when_unconfigured` concurrency flake in `adapter_integration`
+  (green 4/4 under `--test-threads=1`; the file is byte-identical to `v3`).
+

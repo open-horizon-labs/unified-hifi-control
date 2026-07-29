@@ -749,7 +749,7 @@ command and output for each RED is in that commit's message.
 | **AC5** | Name→native index asserted from observed list/state pairs, not hardcoded position | **Met** | `a_filter_name_is_sent_as_the_index_the_observed_list_gives_it`, `a_filter_name_is_not_sent_as_its_enum_id`, `the_same_filter_name_resolves_to_a_different_index_on_a_differently_ordered_daemon` |
 | **AC6** | Cross-lane fixture: live uses list indices, persistent config stores enum IDs; conversions independent and never shared | **Met** | `the_persistent_configuration_lane_stores_enum_ids_not_list_indices`, `the_two_lanes_give_the_same_filter_name_different_numbers`, `feeding_a_persistent_enum_id_to_the_live_lane_is_rejected`. `corpus::index_of` and `corpus::enum_id_of` are separate functions with no shared body, by construction |
 | **AC7** | Transport, seek, pipeline, persistent-restore response families have executable examples | **Met** | transport: `the_transport_family_moves_the_daemon_between_playback_states`, `the_track_change_family_advances_and_rewinds_the_queue`; seek: `the_seek_family_moves_the_playback_position`; pipeline: `the_pipeline_family_resolves_indices_back_to_display_names`, `the_matrix_profile_family_round_trips_a_name_containing_an_entity`; persistent-restore: `the_persistent_config_form_carries_the_verified_field_names`, `the_persistent_config_form_separates_the_unnamed_base_from_named_profiles`, `the_restore_response_family_carries_no_outcome_signal`, `the_restore_fixture_records_why_its_status_code_proves_nothing` |
-| **AC8** | Runs in CI without HQPlayer; documented opt-in real-server mode | **Met (hermetic); real-daemon run PENDING for stage 3** | The default suite needs no HQPlayer. `real_daemon_conformance_when_opted_in` documents `UHC_HQP_CONFORMANCE_HOST` / `UHC_HQP_CONFORMANCE_PORT`, asserts read-only, and *skips with a printed note* rather than being permanently `#[ignore]`d. No real HQPlayer was available in this environment, so no real-daemon result is claimed |
+| **AC8** | Runs in CI without HQPlayer; documented opt-in real-server mode | **Met** | The default suite needs no HQPlayer. `real_daemon_smoke_check_when_opted_in` documents `UHC_HQP_CONFORMANCE_HOST` / `UHC_HQP_CONFORMANCE_PORT`, is read-only, and *skips with a printed note* rather than being permanently `#[ignore]`d. AC8 asks for a documented opt-in mode to exist, and it does. **It is a connectivity/identity smoke check** — `GetInfo` plus `GetFilters` — and settles no fixture; the live corpus diff is stage-3 tier 1, specified in ADR 003. No real HQPlayer was available here, so no live result is claimed |
 | **AC9** | Evidence and version provenance documented alongside each fixture | **Met** | Every one of the 17 fixtures carries a `source` / `daemon` / `status` / `date` / `notes` header. Enforced by `every_corpus_fixture_records_its_provenance`, `the_legacy_profile_is_marked_unverified_so_it_cannot_pass_as_protocol_truth`, `the_verified_profile_marks_excerpts_honestly` |
 
 **No AC is deferred, ignored, or partially met beyond the one explicitly-pending item in AC8**, which
@@ -853,4 +853,28 @@ implementable inside #322's scope and is implemented; the rest are recorded obli
 
 The gap dissent found is worth naming plainly: the harness already had `external_change`, and no
 expectation combined it with a verified setter. The tests were green and blind at the same time.
+
+### Correction: what the opt-in real-daemon mode does and does not do
+
+An earlier draft of this artifact and of the Stage-2 reports described "running the opt-in suite" as
+the merge-gate verification that settles the corpus. That overstated it, and the gate caught it.
+
+`real_daemon_smoke_check_when_opted_in` (renamed from `real_daemon_conformance_when_opted_in`, which
+was itself part of the overclaim) calls `GetInfo` and `GetFilters` and asserts the daemon identifies
+itself and returns a multi-entry container. That is a smoke check. It satisfies AC8's
+existence-and-documentation requirement and nothing beyond it.
+
+The live corpus diff is **stage-3 work that does not exist yet**, and ADR 003 now specifies it in two
+tiers that must not be conflated:
+
+- **Tier 1, read-only** — capture and diff `GetInfo`, `GetModes`, `GetFilters`, `GetShapers`,
+  `GetRates`, `GetJunkFilters`, `State`, `Status`, `VolumeRange`, the matrix family and the `/config`
+  read side against the corpus, per mode. Safe against any daemon. **This is what the real-daemon
+  merge gate means.**
+- **Tier 2, mutating** — the `Set*` anchors, whose evidence is a state change and which therefore
+  need a dedicated or expendable daemon, a separate opt-in variable, capture-and-restore, and a human
+  present. Never a merge gate, never in CI.
+
+The consequence worth stating plainly: the `Set*` anchor claims stay **derived** until someone runs
+tier 2 deliberately. No read-only run, however thorough, can confirm them.
 
