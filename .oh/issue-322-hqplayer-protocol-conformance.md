@@ -3,7 +3,7 @@
 **OH:** 80222d6d
 **Program:** #310 · **Epic:** #311 · **Issue:** #322
 **Branch:** `feat/issue-322-hqplayer-protocol-conformance` · **Base:** `origin/v3`
-**Stage:** 1 (solution decision) — planning artifact only, no production or test behavior changed.
+**Stage:** 2 (execution, red checkpoint) — Stage 1 sections below are unchanged; Stage 2 evidence is appended at the end.
 
 ---
 
@@ -571,3 +571,135 @@ here so the stage-2 gate can check for it; `docs/adr/` already exists.
 
 No production or test behavior was changed in stage 1. No API route or payload was touched.
 `api-change-approved` was not applied. Nothing was merged. #322 remains open.
+
+---
+
+## Stage 2 red checkpoint
+
+**Updated:** 2026-07-29
+**Status:** RED observed and committed locally. Halted here for Codex review per the corrected
+gate instruction. No production code touched, no push.
+
+### Pre-flight
+
+| Check | Result |
+|---|---|
+| Aim clear | Yes — make the HQPlayer wire contract executable so a client defect is observable before it is fixed |
+| Constraints known | Codex Stage 1 Gate Review binding decisions 1–5; AGENTS.md TDD and API Stability; no wall-clock assertions |
+| Context loaded | `src/adapters/hqplayer.rs` framing loop (757-794), `connect()` (538-601), `configure()`/`save_config()` (404-513); `tests/mock_servers/hqplayer.rs`; `tests/adapter_integration.rs`; `src/config/mod.rs` `UHC_CONFIG_DIR` |
+| Scope bounded | This increment: corpus + wire + one failing framing expectation. **Not** in this increment: daemon model, any production change, remaining ACs |
+| Success criteria | The named test fails against the unmodified adapter *for the framing defect* — not for a compile error and not because the fake could not start |
+| Baseline | `cargo build --tests` green before any edit |
+
+A prior attempt in this session wrote `tests/mock_servers/hqplayer/model.rs` and 18 fixtures
+*before* observing red. That was a gate violation. Both were removed from the worktree before this
+checkpoint; `git diff --stat -- src/` was empty throughout.
+
+### Changed files (RED commit `9ac224c`)
+
+| File | Lines | Role |
+|---|---|---|
+| `tests/mock_servers/hqplayer/corpus.rs` | +116 | Document layer: loads provenance-carrying fixtures, parses the header, refuses a fixture without one |
+| `tests/mock_servers/hqplayer/wire.rs` | +169 | Byte layer: serves a responder over TCP, can split one reply across TCP writes at a marker |
+| `tests/fixtures/hqplayer/hqpd-6.0.4-opal/status_playing_with_metadata.xml` | +11 | The document under test, with provenance |
+| `tests/hqplayer_conformance.rs` | +135 | The expectation, driving the real `HqpAdapter` over a real socket |
+| `tests/mock_servers/hqplayer.rs` | +8 | Two `pub mod` declarations and a note. `MockHqpServer` itself untouched |
+
+`public/tailwind.css` had to be regenerated with `make css` for the lib to compile
+(`src/app/embedded_assets.rs:17` `include_str!`s it and it is gitignored). Not a code change.
+
+### Command and failing output
+
+```text
+$ cargo test --test hqplayer_conformance
+
+running 20 tests
+test mock_servers::hqplayer::tests::mock_hqp_responds_to_getinfo ... ok
+... (18 further mock_servers tests) ... ok
+test state_read_after_status_with_metadata_child_reports_the_daemon_state ... FAILED
+
+---- state_read_after_status_with_metadata_child_reports_the_daemon_state stdout ----
+thread '...' panicked at tests/hqplayer_conformance.rs:125:5:
+assertion `left == right` failed: State read after a Status document with a self-closing
+metadata child must report the daemon's playback state (2 = playing). Got 0, which means the
+Status read stopped at the metadata child's `/>` and left `</Status>` in the socket for this
+command to consume. Full state: HqpState { state: 0, mode: 0, filter: 0, filter1x: None,
+filter_nx: None, shaper: 0, rate: 0, volume: 0, active_mode: 0, active_rate: 0, invert: false,
+convolution: false, repeat: 0, random: false, adaptive: false, filter_20k: false,
+matrix_profile: "" }
+  left: 0
+ right: 2
+
+test result: FAILED. 19 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+**RED commit SHA:** `9ac224c8f852187ad00cb35cf06bebe38fae0959`
+
+Not pushed. `.github/workflows/build.yml` triggers on `pull_request` to `v3` with
+`types: [opened, synchronize, reopened, labeled]` and no draft filter, so pushing a red tip would
+run full CI against a deliberately failing commit. Per the gate instruction the SHA and output are
+recorded here instead; the branch will be pushed once the fix lands.
+
+### Why this proves the production defect
+
+1. **It is not a setup or compile failure.** The binary compiled and the other 19 tests in it
+   passed. `adapter.connect().await.expect("connect to fake daemon")` succeeded, so the fake bound,
+   accepted, and answered `GetInfo`. The single failure is the assertion.
+2. **The failure signature is the desync, uniquely.** Every field of `HqpState` is its default:
+   `state: 0`, `volume: 0`, `matrix_profile: ""`. The `State` document the fake sends carries
+   `state="2" mode="1" volume="-23.5" matrix_profile="Default"`. A wholly default struct is what
+   `parse_attr` returns when handed a document with no attributes at all — i.e. the bare
+   `</Status>` left over from the previous read. Any other explanation (wrong attribute name, bad
+   number parse) would corrupt some fields and not others.
+3. **The mechanism is in the source.** `src/adapters/hqplayer.rs:781-786` ends a read when
+   `trimmed.ends_with("/>")`. The verified `Status` shape puts a self-closing `<metadata …/>` child
+   before `</Status>`, so that condition is true one document too early. The reference explicitly
+   warns that a parser "must match the closing `</Status>` (not the first self-closing `/>`, which
+   is the `metadata` element)" —
+   <https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md>
+   §6.
+4. **The wire layer removes buffering luck.** `Chunking::AfterMarker("/>")` puts `</Status>` in a
+   separate TCP segment, so the client cannot pass by accident of a single large read.
+5. **The repo already knew and worked around it.** `connect()` carries the comment: *"Background
+   fetch was removed due to response desync bugs - it used single-line read_line() which corrupted
+   the TCP buffer when interleaved with multi-line responses."* A feature was deleted rather than
+   the framer fixed, because there was no executable expectation. There is one now.
+
+### Verification that the facade survived
+
+```text
+$ cargo test --test adapter_integration --test zones_sha_integration
+running 42 tests ... test result: ok. 42 passed; 0 failed
+running 20 tests ... test result: ok. 20 passed; 0 failed
+```
+
+Codex binding decision 3 is satisfied: `MockHqpServer` gained nothing but two module
+declarations, and both existing consumers are green.
+
+### Re-estimate of remaining work
+
+Stage-1 dissent put the fake at 700–900 lines and required a re-estimate here before building the
+model. Measured: the two layers that exist are **285 lines** (`wire.rs` 169, `corpus.rs` 116) and
+the wire layer is close to complete for the framing and split-read criteria. Revised estimate:
+
+| Remaining piece | Estimate | Note |
+|---|---|---|
+| `model.rs` — stateful daemon, mode-relative enumerations, `result` echo, fault injection (`reject_next`, `accept_but_ignore`, `apply_after_polls`, `external_change`) | 420–480 | Largest single piece. A working draft was written and discarded at this checkpoint; its shape is known, which is why this number is tighter than stage 1's |
+| `wire.rs` additions — coalesced replies, connection drop, idle close, refuse-then-rebind for the restart window, request counters | 120–150 | Counters exist so reconnect tests can assert attempt counts rather than elapsed time |
+| Corpus growth — ~17 further fixtures (enumerations per mode, volume-range variants, junk filters, matrix, persistent-config enum-ID document, UNVERIFIED 5.x profile) | ~200 (mostly data) | The discarded set is re-creatable directly |
+| `MockHqpServer` re-implemented as a facade over the layers | 60–80 | Deferred from this checkpoint deliberately: the facade is only worth rewriting once the model exists |
+| Conformance suite — remaining AC2/AC3/AC4/AC5/AC6/AC7/AC8 cases | 550–650 | |
+| Production fixes — framer, `result` verification on setters, decimal-dB parse, injectable timeout/retry seam | 180–230 | Payload types stay put: `PipelineVolume.value`, `HqpState.volume` and `HqpVolumeRequest.value` remain `i32`, with decimal dB carried on new `#[serde(skip)]` fields, so no public route or payload changes |
+| ADR `docs/adr/NNNN-hqplayer-conformance-boundary.md` | ~90 | Written once the timing seam is real, per the stage-1 dissent |
+
+Total remaining ≈ **1,620–1,880 lines**, against stage 1's 700–900 for the fake alone. The fake
+itself now looks like **825–995** (285 built + 540–710 remaining), which lands inside the stage-1
+estimate; the growth is in the assertion suite and the fixtures, which stage 1 costed separately
+and loosely. **The selected mechanism holds** — the framing defect was reproduced through the real
+client on the first attempt, with no production change and no timing assertion, which was the
+specific thing this checkpoint existed to test. Recommend continuing to the model.
+
+### Not done at this checkpoint, by instruction
+
+No `model.rs`, no production fix, no remaining ACs, no Stage 2 final reports, no `/review`,
+no `/dissent`, no `/ship`, no push, draft unchanged, #322 open.
