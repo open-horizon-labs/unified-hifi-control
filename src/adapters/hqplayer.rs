@@ -1405,6 +1405,46 @@ impl HqpAdapter {
         }))
     }
 
+    /// Confirm a setting actually applied, by reading `State` back.
+    ///
+    /// Verified daemon behaviour: "a setter can return `result=\"OK\"` without the setting actually
+    /// applying. Never trust `result=\"OK\"` alone; confirm via `State` readback." A change can also
+    /// land a poll later than the acknowledgement, so this polls rather than checking once, reusing
+    /// the injected retry policy instead of introducing another knob.
+    ///
+    /// Returns an error when the setting never appears, so a caller can never be told about a change
+    /// that did not happen.
+    async fn verify_applied<F>(&self, what: &str, expected_index: u32, matches: F) -> Result<()>
+    where
+        F: Fn(&HqpState) -> Option<u32>,
+    {
+        let timeouts = self.timeouts().await;
+        let mut last_seen = None;
+
+        for attempt in 0..timeouts.max_attempts.max(1) {
+            if attempt > 0 {
+                tokio::time::sleep(timeouts.reconnect_delay).await;
+            }
+            let state = self.get_state().await?;
+            let seen = matches(&state);
+            if seen == Some(expected_index) {
+                return Ok(());
+            }
+            last_seen = seen;
+        }
+
+        Err(anyhow!(
+            "HQPlayer accepted {} but {} still reads {} instead of {}; refusing to report an \
+             unverified change",
+            what,
+            what,
+            last_seen
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "nothing".to_string()),
+            expected_index
+        ))
+    }
+
     /// Set mode by name (e.g., "PCM", "DSD", "[source]")
     /// Resolves name to INDEX and sends to HQPlayer.
     /// CLI confirms: `--set-mode <index>`
@@ -1415,6 +1455,8 @@ impl HqpAdapter {
         let mode_index = self.resolve_mode_index(mode_name).await?;
         let xml = Self::build_request("SetMode", &[("value", &mode_index.to_string())]);
         self.send_command(&xml).await?;
+        self.verify_applied("mode", mode_index, |s| Some(u32::from(s.mode)))
+            .await?;
         // Mode change affects available filters/shapers/rates - refresh lists
         self.refresh_lists().await;
         Ok(())
@@ -1497,7 +1539,9 @@ impl HqpAdapter {
             "set_filter_1x: name='{}' resolved_index={}, state.filter_nx={:?}, state.filter={}, using current_nx={}",
             filter_name, filter_index, state.filter_nx, state.filter, current_nx_index
         );
-        self.set_filter(current_nx_index, Some(filter_index)).await
+        self.set_filter(current_nx_index, Some(filter_index)).await?;
+        self.verify_applied("filter1x", filter_index, |s| s.filter1x.or(Some(s.filter)))
+            .await
     }
 
     /// Set only the Nx filter, preserving current 1x filter index
@@ -1511,7 +1555,9 @@ impl HqpAdapter {
             "set_filter_nx: name='{}' resolved_index={}, state.filter1x={:?}, state.filter={}, using current_1x={}",
             filter_name, filter_index, state.filter1x, state.filter, current_1x_index
         );
-        self.set_filter(filter_index, Some(current_1x_index)).await
+        self.set_filter(filter_index, Some(current_1x_index)).await?;
+        self.verify_applied("filterNx", filter_index, |s| s.filter_nx.or(Some(s.filter)))
+            .await
     }
 
     /// Resolve filter name to INDEX, checking cache first then fetching if needed
@@ -1577,7 +1623,8 @@ impl HqpAdapter {
         let shaper_index = self.resolve_shaper_index(shaper_name).await?;
         let xml = Self::build_request("SetShaping", &[("value", &shaper_index.to_string())]);
         self.send_command(&xml).await?;
-        Ok(())
+        self.verify_applied("shaper", shaper_index, |s| Some(s.shaper))
+            .await
     }
 
     /// Resolve shaper name to INDEX, checking cache first then fetching if needed
@@ -1643,7 +1690,7 @@ impl HqpAdapter {
 
         let xml = Self::build_request("SetRate", &[("value", &index.to_string())]);
         self.send_command(&xml).await?;
-        Ok(())
+        self.verify_applied("rate", index, |s| Some(s.rate)).await
     }
 
     /// Set volume in whole dB.
@@ -1655,6 +1702,11 @@ impl HqpAdapter {
     }
 
     /// Set volume in dB, which the daemon accepts as a double.
+    ///
+    /// Deliberately result-checked but not readback-verified. A fixed-volume daemon answers an
+    /// explicit `result="Error"`, which `check_result` already surfaces, and with adaptive volume
+    /// engaged the daemon moves the level on its own, so a readback comparison would report a
+    /// spurious failure.
     ///
     /// The wire form is `<Volume value="-23.5"/>`; whole numbers are sent without a decimal part so
     /// the request still looks like the reference client's.
