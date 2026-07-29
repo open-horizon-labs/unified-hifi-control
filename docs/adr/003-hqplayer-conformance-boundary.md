@@ -1,0 +1,121 @@
+# ADR 003: HQPlayer conformance boundary — corpus + scriptable fake as protocol truth
+
+## Status
+
+Accepted (2026-07-29, issue #322, program #310 / epic #311)
+
+## Context
+
+HQPlayer's native control protocol had no executable specification in this repository. What it had
+instead was `docs/hqplayer-protocol-reference.md` — internally consistent, derived from `hqp-control`
+v5.2.30 sources, and silent on the single most consequential thing the client got wrong: the
+`result` attribute that tells you whether a command was accepted.
+
+The test double could not have caught that. `tests/mock_servers/hqplayer.rs` answered `<Ok/>` to
+every setter — a shape the daemon never sends — never mutated state, and returned an empty string
+for the exact single-line request shape `build_request` emits, so no test could drive `HqpAdapter`
+through it at all. `tests/adapter_integration.rs:603-604` says so in a comment: *"Use reqwest to test
+the mock directly (not through adapter) because HQP adapter uses a complex TCP protocol."*
+
+The consequences were not hypothetical. `State.volume` is a double on the wire; parsed as `i32`,
+`"-23.5"` failed to parse and `unwrap_or(0)` yielded **0 dB — maximum output**. A `Status` document's
+self-closing `<metadata …/>` child ended framing one document too early, leaving `</Status>` in the
+socket for the next command to consume as its own reply; the repo had already noticed the symptom and
+deleted a feature rather than fix it, per the comment in `connect()` about *"response desync bugs."*
+
+Something had to become the protocol authority. The choice was which thing.
+
+## Decision
+
+Protocol truth lives in a **versioned document corpus** under `tests/fixtures/hqplayer/<version>/`,
+exercised by a **scriptable fake daemon** that drives the real `HqpAdapter` over a real TCP socket.
+Three concerns stay separated, because fusing them is what made the old mock incapable of failing:
+
+| Layer | Owns | File |
+|---|---|---|
+| Corpus | *what* the daemon says, with provenance | `tests/mock_servers/hqplayer/corpus.rs` |
+| Wire | *how and when* it says it — chunk boundaries, drops, silence, coalescing | `tests/mock_servers/hqplayer/wire.rs` |
+| Model | how its *state* changes, and how it misbehaves on purpose | `tests/mock_servers/hqplayer/model.rs` |
+
+Consequences of that split, all load-bearing:
+
+- **Every fixture carries a provenance header** — source, daemon version, `verified` /
+  `derived-excerpt` / `UNVERIFIED`, date, and caveats — and tests enforce it
+  (`every_corpus_fixture_records_its_provenance`,
+  `the_legacy_profile_is_marked_unverified_so_it_cannot_pass_as_protocol_truth`,
+  `the_verified_profile_marks_excerpts_honestly`). A corpus that cannot distinguish a live
+  observation from a transcription would re-create the problem this ADR exists to end, one layer out.
+- **Assertions go through the adapter's public surface**, never a private helper, so the sans-io
+  extraction that #162 is likely to perform does not invalidate the suite.
+- **No test asserts elapsed wall-clock time.** Timeout and reconnect behaviour is driven through an
+  injectable `HqpTimeouts` seam and asserted on outcomes and attempt counts
+  (`WireStats::element_count`). This follows HQPTuner's testing policy, whose suite went from 84 s to
+  7 s by removing real sleeps.
+- **The default suite is hermetic.** The opt-in real-daemon mode is `UHC_HQP_CONFORMANCE_HOST`,
+  read-only, and skips with a printed note rather than being permanently `#[ignore]`d.
+- **`MockHqpServer` survives untouched** as the facade for `tests/adapter_integration.rs` and
+  `tests/zones_sha_integration.rs`.
+
+## Options considered
+
+Five candidates across four escalation levels were evaluated in
+`.oh/issue-322-hqplayer-protocol-conformance.md`:
+
+| Option | Level | Why not |
+|---|---|---|
+| A — extend the existing mock in place | Band-Aid | Its `read_line` → one-response loop cannot express fragmentation or coalescing; reaching #322's hard framing constraints turns it into option C anyway |
+| B — fixture corpus + pure framer unit tests, no sockets | Local Optimum | Cannot produce a red result first: the framer and decoder were private, so extracting one is a production change, inverting the TDD constraint. No time dimension, so no verification, reconnect or idle-close coverage |
+| **C — corpus + scriptable fake, asserted through the adapter** | **Reframe** | **Selected** |
+| D — record/replay golden transcripts | Reframe | Ordering-brittle against the client refactoring #322 exists to enable; cannot synthesize `result="Error"`, accept-but-ignore, or arbitrary chunk boundaries on demand; CI can never regenerate a stale transcript without hardware |
+| E — sans-io protocol state machine | Redesign | The right destination, the wrong starting point: nothing can go red until the rewrite exists, which inverts TDD on the program's first PR and consumes #162's scope |
+
+The binding constraint decided it. "Tests precede fixes" means the boundary must fail against the
+adapter *as it is*, and the adapter's only seam is a TCP socket. C was the only candidate that could
+go red on unmodified production code, and the only one covering verification, timing and framing in
+one boundary. B is not rejected so much as absorbed — the corpus *is* B's document layer.
+
+## Consequences
+
+Accepted costs, with the measured numbers rather than the estimates:
+
+- **We own real test infrastructure**: 1,434 lines across `corpus.rs`, `wire.rs` and `model.rs`, plus
+  a 1,316-line suite. The stage-1 dissent estimated 700–900 for the fake and was close (1,434 with
+  the model's fault injection); the growth is in the assertion suite, which stage 1 costed separately
+  and loosely. Amortised across #162, #208, #328, #329 and #330, all of which need a peer that can
+  misbehave on demand.
+- **Every verified setter now costs an extra round trip.** `verify_applied` reads `State` back after
+  `set_mode`, `set_filter_1x`, `set_filter_nx`, `set_shaper` and `set_rate`, polling up to the retry
+  budget. This is deliberate: epic #311 forbids reporting success that was never confirmed, and the
+  daemon demonstrably answers `OK` without applying. The cost is one `State` document per setter on a
+  local TCP connection. If it ever proves too expensive on a loaded daemon, the lever is the retry
+  budget, not removing the readback.
+- **Volume is the documented asymmetry.** `set_volume_db` is result-checked but *not*
+  readback-verified, because a fixed-volume daemon answers an explicit `result="Error"` (already
+  surfaced) and an adaptive-volume daemon moves the level itself, so a readback comparison would
+  report spurious failures. This is an intentional exception, stated in the method's doc comment.
+- **A setter the daemon silently ignores now returns an error** where it previously returned success,
+  so `POST /hqplayer/pipeline` setter routes can surface a failure they could not before. No route,
+  request schema or response schema changed: the new decimal-dB and `filter_junk` fields are
+  `#[serde(skip)]`, and `HqpVolumeRequest.value` stays an integer.
+- **`HqpTimeouts::set_timeouts` must be `pub`** for an integration-test crate to reach it, which the
+  type system cannot restrict further. `no_production_code_retunes_the_timeout_seam` lints `src/` for
+  callers instead, in the same spirit as the repo's existing `architecture_lint` and
+  `arbitrary_find_lint` tests. Defaults remain the shipped constants.
+- **The corpus is transcribed, not captured.** Enumeration excerpts preserve the verified
+  name/enum-ID pairs and the verified `Set*` anchors, but their list *positions* are excerpt-local and
+  say so in their provenance. Closing that gap needs the opt-in real-daemon run, which is recorded as
+  pending for stage 3 rather than claimed.
+- **`docs/hqplayer-protocol-reference.md` is demoted** from authority to reader's guide, and corrected
+  where the corpus contradicts it.
+
+## Notes
+
+Protocol evidence is HQPTuner's audit of `hqp-control` 6.0.1 sources with findings verified against a
+live `hqplayerd` 6.0.4 (Opal), pinned at commit `6755793`:
+
+- <https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md>
+- <https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/testing.md>
+
+Written in stage 2 rather than stage 1, deliberately: the stage-1 dissent deferred it until the
+timing seam was settled and the cost was measured, so that its two most consequential sections would
+not have to hedge.

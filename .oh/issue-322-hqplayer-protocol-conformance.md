@@ -3,7 +3,9 @@
 **OH:** 80222d6d
 **Program:** #310 · **Epic:** #311 · **Issue:** #322
 **Branch:** `feat/issue-322-hqplayer-protocol-conformance` · **Base:** `origin/v3`
-**Stage:** 2 (execution, red checkpoint) — Stage 1 sections below are unchanged; Stage 2 evidence is appended at the end.
+**Stage:** 2 (execution, complete pending Codex review) — Stage 1 sections are unchanged. Stage 2
+evidence is appended at the end; the *red checkpoint* section is an early snapshot, superseded by
+**Stage 2 execution record** below.
 
 ---
 
@@ -577,8 +579,9 @@ No production or test behavior was changed in stage 1. No API route or payload w
 ## Stage 2 red checkpoint
 
 **Updated:** 2026-07-29
-**Status:** RED observed and committed locally. Halted here for Codex review per the corrected
-gate instruction. No production code touched, no push.
+**Status:** superseded — this was the first checkpoint only. It describes the branch at `9ac224c`,
+before any production change. For the state of the branch now, read **Stage 2 execution record**
+below. Kept verbatim because the gate asked for the checkpoint evidence to be durable.
 
 ### Pre-flight
 
@@ -703,3 +706,134 @@ specific thing this checkpoint existed to test. Recommend continuing to the mode
 
 No `model.rs`, no production fix, no remaining ACs, no Stage 2 final reports, no `/review`,
 no `/dissent`, no `/ship`, no push, draft unchanged, #322 open.
+
+---
+
+## Stage 2 execution record
+
+**Updated:** 2026-07-29
+**Status:** complete, stopped for Codex review. Not shipped, not merged, draft unchanged.
+
+This section supersedes the *Stage 2 red checkpoint* snapshot above, which described the branch at
+`9ac224c` only. Superego flagged that mismatch as its first finding; this is the fix.
+
+### Commit chain (red before green, alternating, all local until this section was written)
+
+| SHA | Kind | What |
+|---|---|---|
+| `1425baa` | docs | Stage-1 solution decision |
+| `9ac224c` | **RED** | `Status` metadata child desynchronises the read stream |
+| `bb32165` | docs | Red checkpoint evidence |
+| `c7011cb` | **GREEN** | Frame by document, not by first `/>`; injectable `HqpTimeouts` |
+| `a34e26a` | **RED** | Five client protocol defects the corpus exposes |
+| `eb3d0b1` | **GREEN** | Scope attributes to the root tag, decode entities, decimal dB, verify `result` |
+| `28c5a73` | **RED** | A setter reports success it never confirmed |
+| `06cb40e` | **GREEN** | `verify_applied` readback primitive |
+| `ebd5f1c` | style | `cargo fmt` |
+| `5a261cb` | **RED** | Coalesced frames and mismatched nesting (no `src/` change: `git diff HEAD^..HEAD -- src` empty) |
+| `4d419d8` | **GREEN** | Answer each command from its own reply; reject mismatched nesting |
+
+Every production change is preceded by a failing expectation in an earlier commit. The exact failing
+command and output for each RED is in that commit's message.
+
+### Acceptance-criterion audit — all nine
+
+62 conformance expectations, 0 ignored, 0 skipped, 0 encoding a known defect as expected behaviour.
+
+| AC | Requirement | Status | Expectations |
+|---|---|---|---|
+| **AC1** | Stateful mock/fixtures cover GetInfo, State, Status with child metadata, VolumeRange, modes, rates, filters, shapers, representative advanced settings | **Met** | `get_info_reports_the_verified_daemon_identity`, `state_reports_settings_as_list_indices`, `state_carries_representative_advanced_settings`, `status_with_a_metadata_child_yields_the_playback_fields`, `status_reports_active_settings_as_display_names`, `volume_range_reports_bounds_and_flags`, `modes_list_distinguishes_list_index_from_enum_id`, `filters_list_is_parsed_in_full_from_a_multiline_container`, `shapers_list_is_parsed_in_full`, `rates_list_reports_hz_and_has_no_enum_id`, `enumerations_are_mode_relative_and_are_refetched_after_a_mode_change` |
+| **AC2** | Split reads, coalesced responses, self-closing children, malformed/truncated XML, timeouts, reconnect boundaries | **Met** | split: `a_document_split_mid_attribute_across_tcp_writes_is_still_parsed`; coalesced (through `HqpAdapter`): `a_reply_coalesced_with_an_unsolicited_frame_still_answers_the_current_command`, `an_unsolicited_frame_coalesced_with_a_reply_does_not_corrupt_the_next_command`, plus `the_framer_ends_a_coalesced_buffer_at_the_first_document`; self-closing child: `state_read_after_status_with_metadata_child_reports_the_daemon_state`, `the_framer_finds_the_end_of_a_document_at_every_split_point`; malformed/truncated: `a_truncated_document_fails_instead_of_returning_partial_state`, `a_stray_closing_tag_is_rejected_as_malformed`, `a_document_with_mismatched_nesting_is_rejected_as_malformed`; timeouts: `a_silent_daemon_surfaces_a_timeout_rather_than_hanging`, `a_silent_daemon_is_retried_exactly_the_configured_number_of_times`; reconnect: `a_connection_dropped_mid_command_is_recovered_by_reconnecting` |
+| **AC3** | Explicit `result=Error`, syntactic OK without state change, delayed state change, external changes | **Met** | `an_explicitly_rejected_setter_reports_the_daemon_reason`, `a_setter_accepted_but_not_applied_does_not_report_success`, `a_setter_whose_change_lands_after_a_poll_still_reports_success`, `a_change_made_by_another_controller_is_visible_on_the_next_read`, `an_unknown_command_is_reported_as_an_error_without_dropping_the_connection` |
+| **AC4** | Fractional negative dB, fixed volume, adaptive volume, min/max/step, mute | **Met** | `a_fractional_negative_db_volume_round_trips`, `a_whole_db_volume_is_not_turned_into_a_fraction_on_the_wire`, `a_rounded_volume_is_never_reported_as_zero_db`, `a_fixed_volume_daemon_rejects_a_volume_change`, `a_fixed_volume_daemon_reports_volume_as_unavailable`, `an_adaptive_volume_daemon_reports_the_adaptive_flag`, `a_fractional_volume_step_is_preserved_rather_than_rounded_away`, `a_volume_range_that_omits_step_reports_it_as_absent`, `a_volume_below_the_daemon_floor_is_rejected`, `mute_is_toggled_on_the_daemon`, `a_volume_step_moves_the_level_by_the_advertised_step` |
+| **AC5** | Name→native index asserted from observed list/state pairs, not hardcoded position | **Met** | `a_filter_name_is_sent_as_the_index_the_observed_list_gives_it`, `a_filter_name_is_not_sent_as_its_enum_id`, `the_same_filter_name_resolves_to_a_different_index_on_a_differently_ordered_daemon` |
+| **AC6** | Cross-lane fixture: live uses list indices, persistent config stores enum IDs; conversions independent and never shared | **Met** | `the_persistent_configuration_lane_stores_enum_ids_not_list_indices`, `the_two_lanes_give_the_same_filter_name_different_numbers`, `feeding_a_persistent_enum_id_to_the_live_lane_is_rejected`. `corpus::index_of` and `corpus::enum_id_of` are separate functions with no shared body, by construction |
+| **AC7** | Transport, seek, pipeline, persistent-restore response families have executable examples | **Met** | transport: `the_transport_family_moves_the_daemon_between_playback_states`, `the_track_change_family_advances_and_rewinds_the_queue`; seek: `the_seek_family_moves_the_playback_position`; pipeline: `the_pipeline_family_resolves_indices_back_to_display_names`, `the_matrix_profile_family_round_trips_a_name_containing_an_entity`; persistent-restore: `the_persistent_config_form_carries_the_verified_field_names`, `the_persistent_config_form_separates_the_unnamed_base_from_named_profiles`, `the_restore_response_family_carries_no_outcome_signal`, `the_restore_fixture_records_why_its_status_code_proves_nothing` |
+| **AC8** | Runs in CI without HQPlayer; documented opt-in real-server mode | **Met (hermetic); real-daemon run PENDING for stage 3** | The default suite needs no HQPlayer. `real_daemon_conformance_when_opted_in` documents `UHC_HQP_CONFORMANCE_HOST` / `UHC_HQP_CONFORMANCE_PORT`, asserts read-only, and *skips with a printed note* rather than being permanently `#[ignore]`d. No real HQPlayer was available in this environment, so no real-daemon result is claimed |
+| **AC9** | Evidence and version provenance documented alongside each fixture | **Met** | Every one of the 17 fixtures carries a `source` / `daemon` / `status` / `date` / `notes` header. Enforced by `every_corpus_fixture_records_its_provenance`, `the_legacy_profile_is_marked_unverified_so_it_cannot_pass_as_protocol_truth`, `the_verified_profile_marks_excerpts_honestly` |
+
+**No AC is deferred, ignored, or partially met beyond the one explicitly-pending item in AC8**, which
+requires hardware this environment does not have.
+
+### AC7's persistent-restore boundary, justified
+
+Codex directed that the restore example must not reach a private production parser. It is therefore a
+**corpus contract**: the fixtures assert the verified field names of the read side and the verified
+absence of any outcome signal on the write side. Reasoning, also recorded in the test file:
+
+- The profile-list *parse* already has public-surface coverage — `GET /hqplayer/profiles` is
+  exercised in `tests/protocol_integration.rs` — so asserting it again here would duplicate coverage
+  and would mean widening production visibility purely for test reach.
+- What #322 owes this lane is the *response-family semantics*, which are properties of the documents.
+- The restore transport — multipart upload, daemon self-restart, `/backup` readback polling — is
+  #330's and is untouched.
+
+### Production changes, and what they did not touch
+
+All inside the native protocol client in `src/adapters/hqplayer.rs`:
+
+| Change | Why |
+|---|---|
+| `pub mod framing` — `classify`, `root_open_tag`, `root_element`, `root_text`, `decode_entities` | Read until a document parses; reject mismatched nesting and stray closing tags; scope attribute lookups to the root element |
+| `HqpTimeouts` + `set_timeouts`/`timeouts` | Codex-mandated internal seam so timeout and reconnect boundaries are testable without wall-clock waits. Defaults are the shipped constants |
+| `check_result` | An explicit `result="Error"` is a failure; an absent `result` stays a success |
+| `verify_applied` | Readback confirmation for `set_mode`, `set_filter_1x`, `set_filter_nx`, `set_shaper`, `set_rate` |
+| `parse_attr_f64`, rounding fallbacks, `set_volume_db` | Decimal dB throughout |
+| Reply-element matching in `send_command_inner` | Answer each command from its own reply |
+
+**Not touched:** no route, no request schema, no response schema. The new decimal-dB and
+`filter_junk` fields are `#[serde(skip)]`, so serialized payloads are byte-identical;
+`HqpVolumeRequest.value` remains an integer. `tests/fixtures/api_routes.txt` is unchanged and
+`api-change-approved` was not applied. `MockHqpServer` gained only module declarations.
+
+One behaviour change is deliberate and worth naming: a setter the daemon silently ignores now returns
+an error where it previously returned success, so `POST /hqplayer/pipeline` setter routes can surface
+a failure they could not before. That is epic #311's no-false-success constraint, inside the
+"command result/readback verification primitives" scope Codex set.
+
+### Verification
+
+| Command | Result |
+|---|---|
+| `cargo test --test hqplayer_conformance` | **81 passed; 0 failed; 0 ignored** (62 conformance + 19 pre-existing mock_servers) |
+| `cargo test --test adapter_integration` | 42 passed — `MockHqpServer` facade intact |
+| `cargo test --test zones_sha_integration` | 20 passed — second facade consumer intact |
+| `cargo test --test api_contract` | 2 passed — no route drift |
+| `cargo test --no-fail-fast` | All green except the two pre-existing `/hqp/discover` tests |
+| `cargo fmt --check` | Clean |
+| `cargo clippy -- -D warnings` | Clean (this is CI's invocation, per `.github/workflows/build.yml:369`) |
+| `dx build --release --platform web --features web` | **Not run — `dx` is not installed here, and not applicable:** no file under `src/app/` changed |
+
+**Pre-existing, environmental, not a regression:**
+`client_harness::shared_endpoints::get_hqp_discover` and
+`protocol_integration::api_endpoints::hqp_discover_returns_json` both return 500 because UDP
+multicast to `239.192.0.199` is unavailable in this sandbox. A direct socket probe gives
+`OSError [Errno 65] No route to host`. Both fail identically with this branch's `src` changes
+stashed, and neither test file was modified.
+
+**`cargo clippy --all-targets` is not the gate and was already failing on `v3`:** it lints
+`#[cfg(test)]` modules inside the lib, which trip the crate's `deny(clippy::unwrap_used)` etc. The
+untouched `src/config/mod.rs:406` alone accounts for 25 findings. Per Codex's instruction, unrelated
+baseline lint was left alone.
+
+### Superego review disposition
+
+`sg review pr` (superego 0.9.4) against `v3`. Six findings, every one dispositioned:
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | The `.oh` doc claims a red checkpoint with no production code, but the diff has model, fixtures and production fixes — self-documentation not trustworthy | **Fixed.** This section supersedes the snapshot, which is now marked as such. The gate itself *was* respected: the commit chain above alternates RED and GREEN, and `5a261cb` contains no `src/` change |
+| 2 | ~2,700 lines of test infrastructure in one PR is hard to review | **Accepted, with mitigation.** The PR is not splittable — #310's contract is one PR per issue — but it is reviewable commit-by-commit, each RED naming its own failing output and each GREEN naming what it turns green |
+| 3 | `set_timeouts` is `pub` and callable from production | **Fixed.** An integration-test crate cannot reach `pub(crate)`, so the guard is a lint instead: `no_production_code_retunes_the_timeout_seam` fails if any `src/` file calls it, in the same spirit as the repo's existing `architecture_lint` |
+| 4 | `verify_applied` costs an extra round trip per setter in production | **Accepted and documented** in ADR 003 under Consequences. It is the point: #311 forbids unverified success. The lever if it ever hurts is the retry budget, not removing the readback |
+| 5 | Volume skips readback verification — intentional asymmetry, worth being explicit | **Confirmed, no change.** Already stated in `set_volume_db`'s doc comment and now in ADR 003 |
+| 6 | `decode_entities`' `semi <= 10` bound reads as arbitrary | **Fixed.** Comment added: named references reach 6 chars (`&apos;`), the longest numeric form is `&#x10FFFF;` at 10, so a `;` beyond that belongs to later text |
+
+### ADR
+
+`docs/adr/003-hqplayer-conformance-boundary.md`, written now rather than in stage 1 exactly as the
+stage-1 dissent required — after the timing seam was settled and the cost was measured, so its two
+most consequential sections did not have to hedge.
+
+`docs/hqplayer-protocol-reference.md` is demoted from authority to reader's guide, with a correction
+table naming each claim the corpus overturned and the expectation that pins the correction.

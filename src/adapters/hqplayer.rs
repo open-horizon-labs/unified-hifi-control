@@ -289,6 +289,10 @@ pub mod framing {
         while let Some(at) = rest.find('&') {
             out.push_str(&rest[..at]);
             let tail = &rest[at..];
+            // Only look for the terminating `;` within the longest a real reference can be: the
+            // named ones are at most `&apos;`/`&quot;` (6 chars) and the longest numeric form is
+            // `&#x10FFFF;` (10). Beyond that the `;` belongs to later text, not to this `&`, so
+            // treating it as an entity would swallow the words in between.
             let Some(semi) = tail.find(';').filter(|s| *s <= 10) else {
                 // Bare ampersand: keep it and move on.
                 out.push('&');

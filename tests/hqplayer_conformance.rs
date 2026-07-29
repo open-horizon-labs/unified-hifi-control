@@ -1286,3 +1286,30 @@ async fn a_compact_single_line_container_is_parsed_the_same_as_a_multiline_one()
     );
     h.stop();
 }
+
+// =============================================================================
+// Guards on the conformance seam itself
+// =============================================================================
+
+/// `set_timeouts` has to be `pub` for an integration-test crate to reach it, which means nothing in
+/// the type system stops production code from quietly retuning retry behaviour through it. This
+/// lint closes that gap the way the repo already closes similar ones (`tests/architecture_lint.rs`,
+/// `tests/arbitrary_find_lint.rs`): the seam exists for the suite, and `src/` must not use it.
+#[test]
+fn no_production_code_retunes_the_timeout_seam() {
+    let callers: Vec<String> = walkdir::WalkDir::new("src")
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
+        .filter_map(|e| {
+            let body = std::fs::read_to_string(e.path()).ok()?;
+            body.contains(".set_timeouts(")
+                .then(|| e.path().display().to_string())
+        })
+        .collect();
+    assert!(
+        callers.is_empty(),
+        "set_timeouts is the conformance suite's seam; production defaults must stay the shipped \
+         constants. Called from {callers:?}"
+    );
+}

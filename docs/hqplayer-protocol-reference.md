@@ -1,5 +1,39 @@
 # HQPlayer Control Protocol Reference
 
+> **This document is a reader's guide, not the authority.** Since issue #322 the authority is the
+> executable corpus under `tests/fixtures/hqplayer/<version>/`, driven by the conformance suite in
+> `tests/hqplayer_conformance.rs`. Where the two disagree, the corpus wins — it carries per-fixture
+> provenance and it fails the build. See [ADR 003](adr/003-hqplayer-conformance-boundary.md).
+>
+> This page was written from `hqp-control` v5.2.30 sources with no live verification, and it was
+> wrong by omission in ways that shipped defects: it never mentioned the `result` attribute, so the
+> implementation it authorised reported success for commands the daemon had rejected. The
+> corrections below are marked **[corrected #322]** and are cross-checked against HQPTuner's audit of
+> `hqp-control` 6.0.1 with findings verified on a live `hqplayerd` 6.0.4 (Opal):
+> <https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md>
+
+## Corrections from #322
+
+| Claim here | Correction | Where it is pinned |
+|---|---|---|
+| No mention of command outcomes | **[corrected #322]** Setters and transport commands echo the request element with `result="OK"` or `result="Error"`, the latter carrying a reason as element text. An **absent** `result` is a third legitimate case: queries never carry one, and `SetAdaptiveVolume` answers a bare element. `<Ok/>` is a shape the daemon never sends. | `an_explicitly_rejected_setter_reports_the_daemon_reason` |
+| No mention that `OK` can be a lie | **[corrected #322]** A setter can answer `result="OK"` without applying, and a change can land a poll later. `OK` alone is never proof; confirm by reading `State` back. | `a_setter_accepted_but_not_applied_does_not_report_success`, `a_setter_whose_change_lands_after_a_poll_still_reports_success` |
+| `volume` treated as an integer | **[corrected #322]** `State.volume`, `Status.volume` and `VolumeRange.min`/`max`/`step` are **doubles** in dB. `<Volume value="-23.5"/>` is normal. Parsing them as integers silently yielded 0 dB — maximum output. | `a_fractional_negative_db_volume_round_trips`, `a_rounded_volume_is_never_reported_as_zero_db` |
+| `State` fields listed without `filter_junk` | **[corrected #322]** The 20 kHz filter is `filter_junk`, an **int index** into `GetJunkFilters`, not a boolean `filter_20k`. The wire element is `SetJunkFilter`. | `the_junk_filter_is_read_as_a_list_index_not_a_boolean` |
+| `state` documented as 0/1/2 | **[corrected #322]** There is a fourth value: `3` = stop requested. | `the_stop_requested_playback_state_is_reported_faithfully` |
+| Nothing on framing | **[corrected #322]** Documents are newline-*terminated*, not newline-*framed*: a document may contain internal newlines, and containers normally do. Read until a complete document parses. A `Status` document's self-closing `<metadata …/>` child means the document ends at `</Status>`, not at the first `/>`. | `state_read_after_status_with_metadata_child_reports_the_daemon_state` |
+| Nothing on attribute escaping | **[corrected #322]** Attribute values arrive entity-escaped and a bare `&` has been observed in the wild, so decoding must be lenient in both directions. Attribute lookups must also be scoped to the root element: a whole-document scan matches the XML declaration's `version="1.0"` in preference to `<GetInfo … version="6"/>`. | `the_matrix_profile_family_round_trips_a_name_containing_an_entity`, `get_info_reports_the_verified_daemon_identity` |
+| Nothing on the persistent lane | **[corrected #322]** `hqplayerd.xml` stores enum **IDs** while `State`/`Set*` speak list **indices**; the domains must never be mixed. A persistent write's HTTP 200 proves receipt only — success comes from a readback, never from the POST. | `the_persistent_configuration_lane_stores_enum_ids_not_list_indices`, `the_restore_response_family_carries_no_outcome_signal` |
+| Enumerations treated as stable | **[corrected #322]** They are mode-relative: `GetFilters`/`GetShapers`/`GetRates` return the current mode's list only, the lists differ wholesale, and a mode change resets the rate to auto. Re-enumerate after every mode change. | `enumerations_are_mode_relative_and_are_refetched_after_a_mode_change` |
+
+The document's central claim **survives**: `Set*` and `State` speak the **list index**, not the enum
+ID. That is now independently confirmed live — `<SetFilter value="6"/>` selects list index 6
+(`poly-sinc-lp`) while enum ID 6 is a different filter (`poly-sinc-lp-2s`).
+
+---
+
+Original text follows, unchanged except for the note above.
+
 Authoritative protocol semantics for HQPlayer TCP control interface, derived from analysis of the official `hqp-control` v5.2.30 reference implementation.
 
 ## Protocol Overview
