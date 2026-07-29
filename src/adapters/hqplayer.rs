@@ -128,6 +128,121 @@ pub fn save_hqp_configs(configs: &[HqpInstanceConfig]) -> bool {
     }
 }
 
+/// Response framing for the native control protocol.
+///
+/// The daemon sends newline-*terminated* XML documents, not newline-*framed* ones: a document may
+/// contain internal newlines, and container responses normally do. The reference client therefore
+/// reads until a complete document parses, treating a premature end-of-document as "keep reading".
+///
+/// A reader that stops at the first `/>` misframes any container with a self-closing child — most
+/// importantly `<Status …><metadata …/></Status>` — and leaves the closing tag in the socket for
+/// the next command to consume as its own reply.
+///
+/// Reference: <https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md>
+/// §1 (transport and framing) and §6 (`Status`).
+pub mod framing {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    /// Whether the bytes read so far form a complete protocol document.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Framing {
+        /// A well-formed document has not ended yet — keep reading.
+        Incomplete,
+        /// Exactly one top-level element has opened and closed.
+        Complete,
+        /// The bytes cannot become a valid document however much more arrives.
+        Malformed,
+    }
+
+    /// Classify accumulated response bytes.
+    ///
+    /// Pure and cheap, so it can be exercised exhaustively at every byte offset of a document
+    /// without a socket.
+    pub fn classify(buf: &str) -> Framing {
+        let mut reader = Reader::from_str(buf);
+        reader.config_mut().check_end_names = false;
+        let mut depth: i32 = 0;
+        let mut opened = false;
+
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(_)) => {
+                    depth += 1;
+                    opened = true;
+                }
+                Ok(Event::End(_)) => {
+                    depth -= 1;
+                    if depth < 0 {
+                        // A closing tag with nothing open: the leftover tail of a document that a
+                        // previous read truncated. Never a valid document on its own.
+                        return Framing::Malformed;
+                    }
+                    if depth == 0 {
+                        return Framing::Complete;
+                    }
+                }
+                Ok(Event::Empty(_)) => {
+                    opened = true;
+                    if depth == 0 {
+                        return Framing::Complete;
+                    }
+                }
+                // Ran out of bytes with an element still open, or with none opened yet (so far only
+                // a declaration or whitespace). Either way, more is coming.
+                Ok(Event::Eof) => {
+                    let _ = opened;
+                    return Framing::Incomplete;
+                }
+                // Declaration, text, comments and processing instructions carry no framing weight.
+                Ok(_) => {}
+                // quick_xml cannot distinguish "truncated mid-token" from "genuinely broken", so a
+                // parse error means keep reading; the response timeout bounds the wait.
+                Err(_) => return Framing::Incomplete,
+            }
+        }
+    }
+
+    /// Name of the single top-level element of a complete document.
+    pub fn root_element(buf: &str) -> Option<String> {
+        let mut reader = Reader::from_str(buf);
+        reader.config_mut().check_end_names = false;
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                    return Some(String::from_utf8_lossy(e.name().as_ref()).into_owned())
+                }
+                Ok(Event::Eof) | Err(_) => return None,
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
+/// Timeout and retry policy for the native control connection.
+///
+/// Injectable so the conformance suite can exercise timeout and reconnect boundaries without
+/// waiting on a wall clock. Defaults reproduce the shipped constants exactly, so production
+/// behaviour is unchanged unless a caller opts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HqpTimeouts {
+    pub connect: Duration,
+    pub response: Duration,
+    pub reconnect_delay: Duration,
+    pub max_attempts: u32,
+}
+
+impl Default for HqpTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: CONNECT_TIMEOUT,
+            response: RESPONSE_TIMEOUT,
+            reconnect_delay: RECONNECT_DELAY,
+            max_attempts: MAX_RECONNECT_ATTEMPTS,
+        }
+    }
+}
+
 const DEFAULT_PORT: u16 = 4321;
 const DEFAULT_WEB_PORT: u16 = 8088;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -336,6 +451,8 @@ struct HqpAdapterState {
     config_title: Option<String>,
     digest_auth: Option<DigestAuth>,
     cookies: HashMap<String, String>,
+    /// Injectable timeout/retry policy. Defaults to the shipped constants.
+    timeouts: HqpTimeouts,
 }
 
 /// Digest authentication state
@@ -370,6 +487,7 @@ impl Default for HqpAdapterState {
             config_title: None,
             digest_auth: None,
             cookies: HashMap::new(),
+            timeouts: HqpTimeouts::default(),
         }
     }
 }
@@ -517,6 +635,20 @@ impl HqpAdapter {
         state.host.is_some() && state.web_username.is_some() && state.web_password.is_some()
     }
 
+    /// Current timeout/retry policy.
+    pub async fn timeouts(&self) -> HqpTimeouts {
+        self.state.read().await.timeouts
+    }
+
+    /// Override the timeout/retry policy.
+    ///
+    /// Internal seam for the conformance suite so timeout and reconnect boundaries can be
+    /// exercised without waiting on a wall clock. Not reachable over HTTP and not part of any
+    /// serialized payload.
+    pub async fn set_timeouts(&self, timeouts: HqpTimeouts) {
+        self.state.write().await.timeouts = timeouts;
+    }
+
     /// Check if configured
     pub async fn is_configured(&self) -> bool {
         self.state.read().await.host.is_some()
@@ -546,7 +678,8 @@ impl HqpAdapter {
         };
 
         let addr = format!("{}:{}", host, port);
-        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+        let connect_timeout = self.timeouts().await.connect;
+        let stream = timeout(connect_timeout, TcpStream::connect(&addr))
             .await
             .map_err(|_| anyhow!("Connection timeout"))?
             .map_err(|e| anyhow!("Connection failed: {}", e))?;
@@ -715,18 +848,19 @@ impl HqpAdapter {
 
     /// Send command and get response with auto-reconnection
     async fn send_command(&self, xml: &str) -> Result<String> {
+        let timeouts = self.timeouts().await;
         let mut last_error = None;
 
-        for attempt in 0..MAX_RECONNECT_ATTEMPTS {
+        for attempt in 0..timeouts.max_attempts {
             // Ensure we're connected
             if let Err(e) = self.ensure_connected().await {
                 last_error = Some(e);
-                if attempt < MAX_RECONNECT_ATTEMPTS - 1 {
+                if attempt + 1 < timeouts.max_attempts {
                     tracing::debug!(
                         "HQPlayer connection attempt {} failed, retrying...",
                         attempt + 1
                     );
-                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    tokio::time::sleep(timeouts.reconnect_delay).await;
                 }
                 continue;
             }
@@ -739,12 +873,12 @@ impl HqpAdapter {
                     self.mark_disconnected().await;
                     last_error = Some(e);
 
-                    if attempt < MAX_RECONNECT_ATTEMPTS - 1 {
+                    if attempt + 1 < timeouts.max_attempts {
                         tracing::debug!(
                             "HQPlayer command failed, reconnecting (attempt {})...",
                             attempt + 1
                         );
-                        tokio::time::sleep(RECONNECT_DELAY).await;
+                        tokio::time::sleep(timeouts.reconnect_delay).await;
                     }
                 }
             }
@@ -755,6 +889,7 @@ impl HqpAdapter {
 
     /// Inner send command (without retry logic)
     async fn send_command_inner(&self, xml: &str) -> Result<String> {
+        let timeouts = self.timeouts().await;
         let mut conn_guard = self.connection.lock().await;
         let conn = conn_guard
             .as_mut()
@@ -765,29 +900,43 @@ impl HqpAdapter {
         conn.write_half.write_all(b"\n").await?;
         conn.write_half.flush().await?;
 
-        // Read response - handle both single-line and multi-line XML
-        // HQPlayer sends responses that may span multiple lines for complex data
+        // Read until a complete XML document parses. Documents are newline-terminated but may
+        // contain internal newlines, so a line is a read hint and not a frame: stopping at the
+        // first `/>` truncates any container with a self-closing child (notably
+        // `<Status …><metadata …/></Status>`) and leaves its closing tag in the socket for the next
+        // command to consume. See the `framing` module.
         let mut response = String::new();
         let mut complete = false;
 
         while !complete {
             let mut line = String::new();
-            let read_result = timeout(RESPONSE_TIMEOUT, conn.stream.read_line(&mut line)).await;
+            let read_result = timeout(timeouts.response, conn.stream.read_line(&mut line)).await;
 
             match read_result {
                 Ok(Ok(0)) => break, // EOF
                 Ok(Ok(_)) => {
                     response.push_str(&line);
-                    // Check if response is complete (has closing XML tag or is self-closing)
-                    let trimmed = response.trim();
-                    if trimmed.ends_with("/>") || (trimmed.contains("</") && trimmed.ends_with(">"))
-                    {
-                        complete = true;
+                    match framing::classify(&response) {
+                        framing::Framing::Complete => complete = true,
+                        framing::Framing::Malformed => {
+                            return Err(anyhow!(
+                                "Malformed response: {}",
+                                response.trim().chars().take(120).collect::<String>()
+                            ))
+                        }
+                        framing::Framing::Incomplete => {}
                     }
                 }
                 Ok(Err(e)) => return Err(anyhow!("Read error: {}", e)),
                 Err(_) => return Err(anyhow!("Response timeout")),
             }
+        }
+
+        if !complete {
+            return Err(anyhow!(
+                "Connection closed mid-document after {} bytes",
+                response.len()
+            ));
         }
 
         Ok(response.trim().to_string())
