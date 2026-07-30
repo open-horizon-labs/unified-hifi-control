@@ -52,9 +52,12 @@ Consequences of that split, all load-bearing:
   (`WireStats::element_count`). This follows HQPTuner's testing policy, whose suite went from 84 s to
   7 s by removing real sleeps.
 - **The default suite is hermetic.** The opt-in real-daemon mode is `UHC_HQP_CONFORMANCE_HOST`,
-  read-only, and skips with a printed note rather than being permanently `#[ignore]`d. It is a
-  **connectivity/identity smoke check** and nothing more — see the stage-3 section below for what it
-  deliberately does not do.
+  read-only, and skips with a printed note rather than being permanently `#[ignore]`d. It is now the
+  **implemented tier-1 capture-and-diff merge gate** (`tier1_live_read_only_verification_when_opted_in`)
+  — it captures every read-only protocol family, diffs it against a corpus profile, and fails on
+  divergence or on any required ADR 003 claim it did not compare. It has not yet run against a real
+  daemon. It began as a connectivity/identity smoke check; see the tier-1 section below for what the
+  gate does and does not settle.
 - **`MockHqpServer` survives untouched** as the facade for `tests/adapter_integration.rs` and
   `tests/zones_sha_integration.rs`.
 
@@ -178,17 +181,25 @@ The corpus is transcribed rather than captured, so a live comparison is the only
 settle it. This section exists because that comparison was previously described as "run the opt-in
 suite", which overstated what the opt-in suite does.
 
-### What exists today (stage 2)
+### What the opt-in mode was first (superseded)
 
-`real_daemon_smoke_check_when_opted_in` connects to `UHC_HQP_CONFORMANCE_HOST`, calls `GetInfo` and
-`GetFilters`, and asserts the daemon identifies itself and returns a multi-entry container the framer
-parses whole. That is a **smoke check**: it proves the client can talk to real hardware at all.
+This section originally described `real_daemon_smoke_check_when_opted_in`: it connected to
+`UHC_HQP_CONFORMANCE_HOST`, called `GetInfo` and `GetFilters`, and asserted the daemon identified
+itself and returned a multi-entry container the framer parsed whole. That was a **smoke check** — it
+proved the client could talk to real hardware at all, read no other family, and compared nothing
+against the corpus. It satisfied AC8, which asks only that the harness *"can run in CI without
+HQPlayer and has a documented opt-in real-server conformance mode"*.
 
-It satisfies AC8, which asks that the harness *"can run in CI without HQPlayer and has a documented
-opt-in real-server conformance mode"* — an existence-and-documentation requirement. It does **not**
-read `State`, `Status`, `VolumeRange`, `GetModes`, `GetShapers`, `GetRates`, `GetJunkFilters` or the
-matrix family; it compares nothing against the corpus; and it settles none of the `derived-*`
-fixtures' list positions. It must not be cited as doing any of that.
+**That test no longer exists.** It was replaced by
+`tier1_live_read_only_verification_when_opted_in`, described in the tier-1 section below, which is the
+implemented capture-and-diff merge gate on the same `UHC_HQP_CONFORMANCE_HOST` opt-in. The paragraph
+above is kept only so the earlier description is not silently rewritten; the smoke-check limits it
+lists are **no longer** the limits of the opt-in mode.
+
+What still holds is the boundary the gate cannot cross on its own: being read-only, it settles no
+claim whose evidence is a state change (tier 2). Hardware-dependent tier-1 claims must be checked
+against a daemon configured with the hardware the fixture describes; a run against different
+hardware does not verify them.
 
 ### Tier 1 — read-only live verification (the merge gate)
 
@@ -227,6 +238,7 @@ UHC_HQP_CONFORMANCE_HOST=<daemon-ip> \
 | `UHC_HQP_CONFORMANCE_HOST` | **yes** | — | Daemon address. Absent ⇒ the gate prints that it skipped and passes, keeping CI hermetic |
 | `UHC_HQP_CONFORMANCE_PORT` | no | `4321` | Native control port |
 | `UHC_HQP_CONFORMANCE_PROFILE` | no | `hqpd-6.0.4-opal` | Corpus profile to diff against |
+| `UHC_HQP_CONFORMANCE_HARDWARE` | profile-dependent | — | Required when fixture provenance carries `hardware`; must match that semantic marker so profile selection cannot qualify the wrong attached device |
 | `UHC_HQP_CONFORMANCE_WEB_PORT` | no | `8088` | HTTP port for the `/config` read side |
 | `UHC_HQP_CONFORMANCE_WEB_USER` | no | — | Digest user. Supply with `_PASS` to include the persistent read lane |
 | `UHC_HQP_CONFORMANCE_WEB_PASS` | no | — | Digest password |
@@ -240,7 +252,8 @@ Both output forms are emitted: `render()` for whoever is in the room, and the ma
 `uhc-hqp-tier1/v1` JSON artifact for CI to store and a later run to diff against. The artifact embeds
 the full normalized capture — every enumeration entry's index/name/enum ID/rate, the scalar attribute
 maps, the config-profile observation as an explicit value — so a comparison never has to scrape human
-output. It carries **no host, port, user or password**, and a `MatrixGetProfile` read failure is
+output. Sanitised XML preserves parsed meaning but not byte-for-byte quoting, whitespace, or entity
+spelling; it must not be cited as a raw-wire byte capture. It carries **no host, port, user or password**, and a `MatrixGetProfile` read failure is
 recorded as a distinct fact rather than collapsed into "no selection".
 
 What the report carries: daemon identity (product/version/engine/platform/name), the active mode and

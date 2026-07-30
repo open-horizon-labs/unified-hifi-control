@@ -2200,3 +2200,106 @@ fire. **#339 remains unmerged**, so PR CI may still show the known Rust 1.97 bas
 **No production behaviour changed in this pass.** The focused byte-split RED exposed no defect in the
 carry design, so it stands as the gate directed. The only `src` edit is the consolidated `root_frame_end`
 documentation.
+
+---
+
+## Stage 2 remediation — CodeRabbit review 4816484338 (2026-07-30)
+
+Stage 3 was **HOLD** and Stage 2 reopened. The review landed at exact head `ea85fed` with
+`CHANGES_REQUESTED`: 10 inline actionable comments plus 5 review-body nitpicks. All 15 were fetched
+from the API and verified against the code at that head; none was accepted on the strength of the
+suggestion alone.
+
+### Disposition — all 15 accounted for
+
+| # | Site | Verdict | Resolution |
+|---|---|---|---|
+| I1 | `docs/adr/003…md:54-57` stage-2 smoke wording | valid, **wider than reported** | Both spots fixed. CodeRabbit's suggested wording names `real_daemon_smoke_check_when_opted_in`, which **no longer exists** — so the "describe the current mode" option was taken, and the stale ADR §"What exists today" that also names it was corrected rather than left |
+| I2 | `src/adapters/hqplayer.rs` `root_open_tag` single quotes | valid, **only production defect** | Quote-aware scan matching `root_frame_end`. RED-first in `parse_attr_scope_tests` |
+| I3 | two fixtures' `source_chain` prose | valid | Both now exactly `read-via-report`; explanations moved into `notes` verbatim. A later independent review caught and restored three facts accidentally shortened in the PCM-only fixture while moving them |
+| I4 | `hqpd-6.0.4-pcm-only-dac/modes.xml` `tier-2-only` | valid | Reclassified as `tier-1`; fixture provenance now carries `hardware: pcm-only-dac`, and the live gate refuses the profile without a separately supplied matching operator marker |
+| I5 | live gate asserts `is_clean()` | valid (**Major**) | Now `merge_gate_pass()`, with the unverified list in the message |
+| I6 | `parse_provenance` accepts a non-leading comment | valid | Leading-content requirement; RED-first, whitespace accepted, post-content and post-prologue rejected |
+| I7 | `Debug for Faults` omits `source_refuses_rate_pin` | valid | Field added; RED-first, armed **and** unarmed both asserted |
+| I8 | raw lane returns the whole buffer | valid | Drains frames via `framing::first_document_span`. RED-first: one shape timed out, the other returned two glued documents |
+| I9 | `render_start` does not escape values | valid | Decode → sensitivity check → escape. RED-first: the old output did not reparse |
+| I10 | self-closing `<option>` dropped | valid | `Start`/`Empty` split **and** the `End(option)` flush, which the suggestion did not mention — `<option value="X"></option>` was dropped by the unconditional clear on any end tag |
+| N1 | unused first harness | valid | Removed |
+| N2 | `assert_eq!(…, true)` | valid | `assert!` |
+| N3 | `has_child` matches any descendant | valid | Depth-tracked; direct child is depth 1, root is never its own child |
+| N4 | redundant `current_matrix_profile` re-read | valid | Bound in the `if let` pattern |
+| N5 | `AfterMarker` mixes lossy offsets with byte slicing | valid | One `find_bytes` shared by both arms. The empty marker is answered explicitly: `windows(0)` **panics**, so the naive fix trades a latent offset bug for a crash |
+
+### I4 — read-only tier, hardware-specific qualification
+
+CodeRabbit asked for `tier: tier-1` because `GetModes` is a read-only query. That is correct:
+`tier-2-only` is documented as "settling it requires a **mutating** run", and nothing here mutates.
+The fixture is now `tier-1`. Because its no-SDM list is a property of the attached DAC, qualification
+must point the tier-1 gate at a daemon configured with the PCM-only hardware the fixture describes; a
+run against a different DAC does not verify this claim. The constraint is now mechanical rather than
+prose-only: fixture provenance carries `hardware: pcm-only-dac`, and selecting that profile without
+`UHC_HQP_CONFORMANCE_HARDWARE=pcm-only-dac` is refused before connecting. The profile selects expected
+evidence; the independent operator marker attests to what is attached. No new verification tier was
+invented, and the existing vocabulary remains closed by
+`every_fixture_tier_is_a_known_classification`.
+
+### TDD record — RED before GREEN, against unmodified code
+
+12 focused tests failed at `ea85fed` with no production or harness edit in place:
+
+| Finding | Test | Observed RED |
+|---|---|---|
+| I2 | `a_gt_inside_a_single_quoted_value_does_not_truncate_the_root_scope` | scope was `<State song='a>` — `volume` read as absent |
+| I2 | `an_unterminated_single_quote_yields_no_root_scope` | returned a guessed scope instead of `None` |
+| I6 | `a_comment_after_other_content_is_not_provenance` | did not panic |
+| I6 | `a_comment_after_an_xml_declaration_is_not_provenance` | did not panic |
+| I7 | `the_debug_output_for_faults_names_the_rate_pin_refusal` | `Faults { … pending: 0 }` — flag absent |
+| I8 | `the_raw_lane_takes_one_frame_and_keeps_what_was_coalesced_behind_it` | `raw lane response timeout` — the reply was in the buffer and was discarded |
+| I8 | `the_raw_lane_does_not_return_a_push_frame_glued_behind_the_reply` | returned `<State …/><Status …/>` as one "document" |
+| I9 | `the_sanitiser_escapes_attribute_values_so_the_artifact_still_reparses` | `attribute key must be directly followed by \`=\` or space` — output did not reparse |
+| I10 | `a_self_closing_profile_option_is_still_a_named_profile` | only `[("Headphones", "Cans")]` survived of three |
+| I10 | `a_self_closing_option_outside_the_profile_select_is_still_ignored` | same defect |
+| N3 | `has_child_distinguishes_a_direct_child_from_a_deeper_descendant` | a grandchild satisfied the direct-child claim |
+| N5 | `after_marker_cuts_at_the_marker_even_after_an_invalid_byte` | cut landed 2 bytes late: `<Status>\u{FFFD}<metadata/></` |
+
+No client expectation was weakened to fit current code. One test I authored had a **wrong premise** —
+a sensitive attribute *key* makes the whole element hostile, so it never reaches `render_start` — and
+it was corrected to use a sensitive *value* under a harmless key before implementation, not after. It
+is a guard, and is described as one rather than counted as a red.
+
+Negative cases added alongside the happy paths: unterminated quote, apostrophe inside a double-quoted
+value, whitespace-prefixed provenance, no-comment-at-all keeping its own message, unarmed fault,
+redaction not weakened by escaping, root is not its own child, absent child, option outside the
+profile select, absent marker, marker longer than the document, empty marker, push and reply on
+separate lines, a missing or mismatched hardware marker, and explicit proof that sanitised XML
+preserves semantic values while normalizing entity spelling.
+
+### Verification at the remediation SHA
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy -- -D warnings` (the CI invocation) | clean, 0 findings |
+| `--test hqplayer_conformance` | **211 passed; 0 failed; 0 ignored** |
+| lib unit tests | 90 passed |
+| `--test api_contract` / `--test protocol_schema` | 2 / 41 — no route or payload drift |
+| `--test adapter_integration` / `--test zones_sha_integration` | 52 / 30 |
+| `cargo test --no-fail-fast` ×4 before independent review | **545 passed; 0 failed; 12 ignored** each time |
+| `cargo test --no-fail-fast` after independent-review fixes | **548 passed; 0 failed; 12 ignored** |
+| live tier 1 / tier 2 | **not run** — no HQPlayer daemon available |
+
+The earlier claim that `cargo clippy --all-targets -- -D warnings` had "77 identical errors" was
+wrong: 77 is only the `lib test` target, while shared mock modules make the command report hundreds
+of repeated `dead_code` diagnostics across integration-test targets. A detached comparison at
+`ea85fed` measured `hqplayer_conformance` 24 → 23, `adapter_integration` 106 → 103, and
+`zones_sha_integration` 109 → 106 after this remediation. The independent review also caught one new
+`items_after_test_module` diagnostic introduced by placing `split_tests` mid-file; moving it to the
+end removed that regression. The all-target command remains a non-CI red baseline; the actual CI
+invocation, `cargo clippy -- -D warnings`, is clean.
+
+**Flake, honestly.** The intermittent `/hqp/discover` pair passed in all four full-suite runs, and the
+LMS concurrency flake family did not fire. Four clean runs do **not** retire either flake — the flake
+is a property of those tests, not a tally, which is the correction `ea85fed` already made. What is
+newly recorded is only that this remediation did not make either worse.
+
+**No live claim is made anywhere in this pass.** No daemon was reachable.

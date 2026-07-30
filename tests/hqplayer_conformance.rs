@@ -1200,7 +1200,8 @@ async fn the_matrix_profile_family_round_trips_a_name_containing_an_entity() {
 }
 
 // =============================================================================
-// AC8 - hermetic in CI, with a documented opt-in real-daemon mode (a smoke check, by design)
+// AC8 - hermetic in CI, with a documented opt-in real-daemon mode (the tier-1 merge gate, not a
+// smoke check: it captures every read-only family and diffs it against the corpus)
 // =============================================================================
 
 /// Opt-in **tier-1 read-only live verification** — the real-daemon merge gate from ADR 003.
@@ -1213,6 +1214,8 @@ async fn the_matrix_profile_family_round_trips_a_name_containing_an_entity() {
 /// Optional environment:
 /// * `UHC_HQP_CONFORMANCE_PORT` — control port, default `4321`
 /// * `UHC_HQP_CONFORMANCE_PROFILE` — corpus profile to diff against, default the verified one
+/// * `UHC_HQP_CONFORMANCE_HARDWARE` — required when the selected profile carries a hardware marker;
+///   must match that marker so choosing a profile cannot masquerade as hardware evidence
 /// * `UHC_HQP_CONFORMANCE_WEB_PORT` — HTTP port, default `8088`
 /// * `UHC_HQP_CONFORMANCE_WEB_USER` / `_PASS` — Digest credentials; supply both to include the
 ///   `/config` read side. Omit them and that lane is recorded as not-captured
@@ -1241,6 +1244,13 @@ async fn tier1_live_read_only_verification_when_opted_in() {
         tier1_port("UHC_HQP_CONFORMANCE_WEB_PORT", 8088).unwrap_or_else(|e| panic!("{e}"));
     let profile = std::env::var("UHC_HQP_CONFORMANCE_PROFILE")
         .unwrap_or_else(|_| VERIFIED_PROFILE.to_string());
+    tier1_hardware_marker(
+        &profile,
+        std::env::var("UHC_HQP_CONFORMANCE_HARDWARE")
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     let (user, pass) = tier1_credentials(
         std::env::var("UHC_HQP_CONFORMANCE_WEB_USER").ok(),
         std::env::var("UHC_HQP_CONFORMANCE_WEB_PASS").ok(),
@@ -1276,12 +1286,19 @@ async fn tier1_live_read_only_verification_when_opted_in() {
         eprintln!("tier-1 artifact written to {path}");
     }
 
+    // `merge_gate_pass`, not `is_clean`. "Clean" only means the differ found nothing, which a differ
+    // that compared nothing also satisfies — a run where the raw lane observed nothing at all would
+    // `warn!` each family and report zero divergences. The gate additionally requires that every claim
+    // ADR 003 lists was actually compared and that nothing required is left unverified, which is the
+    // property this module's own header already claims for it.
     assert!(
-        report.is_clean(),
-        "tier-1 found {} divergence(s) between the daemon and corpus profile `{profile}`. Each one \
-         must be resolved by re-provenancing the fixture from this capture or by shipping it as a \
-         stated gap - not by loosening the differ.",
-        report.divergences.len()
+        report.merge_gate_pass(),
+        "tier-1 did not pass the merge gate against corpus profile `{profile}`: {} divergence(s) and \
+         {:?} unverified claim(s). Each divergence must be resolved by re-provenancing the fixture \
+         from this capture or by shipping it as a stated gap - not by loosening the differ. An \
+         unverified claim means the run never compared it, which is not a pass.",
+        report.divergences.len(),
+        report.unverified
     );
 }
 
@@ -3375,9 +3392,8 @@ fn a_stale_cross_chain_filter_index_lands_in_range_on_a_different_filter() {
             .iter()
             .find(|e| e.index == entry.index)
             .map(|e| e.name.as_str());
-        assert_eq!(
+        assert!(
             facing.is_some(),
-            true,
             "index {} must exist in the other chain, or a stale write would be rejected out of \
              range instead of silently selecting the wrong filter",
             entry.index
@@ -3479,6 +3495,84 @@ fn a_synthetic_profile_is_never_evidence() {
              evidence corpus by mistake"
         );
     }
+}
+
+/// The `tier` vocabulary is closed (CodeRabbit review 4816484338).
+///
+/// `tier` answers "which kind of run could promote this fixture's claims to evidence", and only one
+/// assertion consumes it today, so a typo or an invented value would sit unnoticed and a reader would
+/// draw a conclusion from a label that means nothing. Pinning the set is what makes the field
+/// auditable rather than decorative.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn every_fixture_tier_is_a_known_classification() {
+    // Kept here rather than in `corpus.rs` deliberately: the corpus must not be able to widen its own
+    // vocabulary, so the list a fixture is checked against lives outside the parser that reads it.
+    const KNOWN: [&str; 4] = [
+        "tier-1",
+        "tier-2-only",
+        "never-promotable",
+        // The default for fixtures written before the distinction existed.
+        "unspecified",
+    ];
+
+    let unknown: Vec<String> = corpus::profiles()
+        .iter()
+        .flat_map(|p| {
+            let p = p.clone();
+            corpus::all_in(&p)
+                .into_iter()
+                .map(move |f| (p.clone(), f.name, f.provenance.tier))
+        })
+        .filter(|(_, _, tier)| !KNOWN.contains(&tier.as_str()))
+        .map(|(profile, name, tier)| format!("{profile}/{name}: tier = {tier:?}"))
+        .collect();
+
+    assert!(
+        unknown.is_empty(),
+        "these fixtures carry a tier outside the documented vocabulary {KNOWN:?}: {unknown:#?}"
+    );
+}
+
+/// A device-dependent read-only claim is tier 1 (CodeRabbit review 4816484338).
+///
+/// `GetModes` is a query, so verifying a PCM-only device's mode list requires no mutation. The tier-1
+/// run must use a daemon configured with the hardware the fixture describes; a different DAC does not
+/// verify this hardware-dependent claim.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn a_device_dependent_modes_claim_is_tier_one() {
+    let fixture = corpus::load("hqpd-6.0.4-pcm-only-dac", "modes");
+    assert_eq!(
+        fixture.provenance.tier, "tier-1",
+        "GetModes is read-only; the qualifying tier-1 run must use the described hardware"
+    );
+    assert_eq!(
+        fixture.provenance.hardware, "pcm-only-dac",
+        "the fixture must carry a machine-checkable hardware requirement, not only prose"
+    );
+}
+
+/// Selecting a hardware-dependent profile is not proof that the matching device is attached.
+/// The live gate must require an independently supplied marker and refuse absent or mismatched ones.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn a_hardware_dependent_tier_one_profile_requires_a_matching_operator_marker() {
+    let profile = "hqpd-6.0.4-pcm-only-dac";
+    assert!(tier1_hardware_marker(VERIFIED_PROFILE, None).is_ok());
+
+    let absent =
+        tier1_hardware_marker(profile, None).expect_err("missing marker must refuse the run");
+    assert!(absent.contains("UHC_HQP_CONFORMANCE_HARDWARE=pcm-only-dac"));
+
+    let wrong = tier1_hardware_marker(profile, Some("dsd-capable-dac"))
+        .expect_err("a different marker must refuse the run");
+    assert!(wrong.contains("requires hardware `pcm-only-dac`"));
+
+    assert!(tier1_hardware_marker(profile, Some("pcm-only-dac")).is_ok());
 }
 
 // -----------------------------------------------------------------------------
@@ -4665,8 +4759,6 @@ async fn a_reconnect_starts_with_no_carried_bytes() {
 /// **Label: client-conformance.**
 #[tokio::test]
 async fn an_attribute_lookup_without_a_root_element_reports_nothing() {
-    let h = Harness::verified().await;
-
     // A reply preceded by an orphaned fragment carrying a conflicting `volume`. Served as a raw
     // malformed body so the shape is exact rather than incidental.
     let orphan_then_reply = concat!(
@@ -4674,7 +4766,6 @@ async fn an_attribute_lookup_without_a_root_element_reports_nothing() {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
         "<State state=\"1\" volume=\"-23.5\" mode=\"1\"/>"
     );
-    h.stop();
 
     let h = Harness::start(
         VERIFIED_PROFILE,
@@ -5051,6 +5142,44 @@ fn tier1_port(var: &str, default: u16) -> Result<u16, String> {
     }
 }
 
+/// Require an operator-supplied hardware marker when any fixture in a tier-1 profile is
+/// hardware-dependent.
+///
+/// The profile selects expected evidence; it cannot attest to what is physically attached. Keeping
+/// the requirement in fixture provenance makes the refusal travel with the claim instead of relying
+/// on a runbook warning that the gate cannot enforce.
+fn tier1_hardware_marker(profile: &str, supplied: Option<&str>) -> Result<(), String> {
+    let mut required: Vec<String> = corpus::all_in(profile)
+        .into_iter()
+        .map(|fixture| fixture.provenance.hardware)
+        .filter(|marker| !marker.is_empty())
+        .collect();
+    required.sort();
+    required.dedup();
+
+    if required.is_empty() {
+        return Ok(());
+    }
+    if required.len() > 1 {
+        return Err(format!(
+            "tier-1 profile `{profile}` carries conflicting hardware requirements: {required:?}"
+        ));
+    }
+
+    let expected = &required[0];
+    match supplied {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(format!(
+            "tier-1 profile `{profile}` requires hardware `{expected}`, but \
+             UHC_HQP_CONFORMANCE_HARDWARE was `{actual}`"
+        )),
+        None => Err(format!(
+            "tier-1 profile `{profile}` requires hardware `{expected}`; set \
+             UHC_HQP_CONFORMANCE_HARDWARE={expected} only after confirming the attached device"
+        )),
+    }
+}
+
 /// Both web credentials or neither.
 ///
 /// One-sided credentials are accepted by `configure` and then fail at request time, which the capture
@@ -5157,4 +5286,420 @@ async fn the_fake_config_web_routes_a_request_head_split_across_reads() {
         response.contains("PROFILE-PAGE-BODY"),
         "a split request head must still route to /config/profile/load; served {response:?}"
     );
+}
+
+// =============================================================================
+// CodeRabbit review 4816484338 — harness and client defects it caught
+//
+// Every expectation below was RED against the unmodified code at head ea85fed. The client defect
+// (`root_open_tag`'s single-quote blindness) is pinned in `src/adapters/hqplayer.rs`'s own
+// `parse_attr_scope_tests`, where the mechanism is reachable; the rest are **harness** defects, so
+// they carry the `model-fidelity` label — a harness that under-observes manufactures false absences,
+// which is the failure class this whole boundary exists to prevent.
+// =============================================================================
+
+/// `Debug` for `Faults` must name every armed misbehaviour, `source_refuses_rate_pin` included.
+///
+/// Faults are printed in assertion messages precisely so a failure says which misbehaviour was armed.
+/// A flag missing from that output makes the mode-conditional `SetRate` refusal invisible in exactly
+/// the message a maintainer reads when the test it governs fails.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn the_debug_output_for_faults_names_the_rate_pin_refusal() {
+    use mock_servers::hqplayer::model::Faults;
+
+    // Built by mutation rather than struct-update syntax: `Faults` keeps its `pending` queue private,
+    // so `..Default::default()` is not available from outside the model module.
+    let mut armed = Faults::default();
+    armed.source_refuses_rate_pin = true;
+    let shown = format!("{armed:?}");
+    assert!(
+        shown.contains("source_refuses_rate_pin"),
+        "an armed fault that Debug does not name cannot be diagnosed from a failure message; got \
+         {shown}"
+    );
+    assert!(
+        shown.contains("true"),
+        "the flag's value must be shown, not just its name; got {shown}"
+    );
+
+    // The negative side: an unarmed fault must still report itself as unarmed rather than vanish, so
+    // "not printed" can never be mistaken for "not armed".
+    let idle = format!("{:?}", Faults::default());
+    assert!(
+        idle.contains("source_refuses_rate_pin: false"),
+        "an unarmed flag must read as false rather than be absent; got {idle}"
+    );
+}
+
+/// The sanitiser must escape attribute values, not only element text.
+///
+/// `render_start` re-emitted the raw wire bytes of a value between double quotes. XML permits a `"`
+/// inside a single-quoted value, so `song='Gloria "G" Step'` came back out as `song="Gloria "G"
+/// Step"` and the artifact no longer reparsed — the same failure
+/// `the_sanitiser_emits_a_document_that_still_reparses` already guards for text. A stored artifact
+/// that cannot be reparsed is not evidence.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn the_sanitiser_escapes_attribute_values_so_the_artifact_still_reparses() {
+    use mock_servers::hqplayer::raw::sanitize;
+
+    // A double quote inside a single-quoted value, plus markup characters that must survive as data.
+    let doc = "<Status active_filter='say \"hi\" &amp; go' note='a &lt; b'/>";
+    let clean = sanitize(doc);
+
+    let mut reader = quick_xml::Reader::from_str(&clean);
+    let mut values: Vec<(String, String)> = Vec::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                for a in e.attributes() {
+                    let a = a.unwrap_or_else(|e| {
+                        panic!("sanitised attribute no longer parses: {e}\noutput was: {clean}")
+                    });
+                    values.push((
+                        String::from_utf8_lossy(a.key.as_ref()).into_owned(),
+                        a.unescape_value()
+                            .unwrap_or_else(|e| {
+                                panic!("sanitised value no longer unescapes: {e}\nfrom: {clean}")
+                            })
+                            .into_owned(),
+                    ));
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => panic!("sanitised output no longer reparses: {e}\noutput was: {clean}"),
+        }
+    }
+
+    assert_eq!(
+        values,
+        vec![
+            ("active_filter".to_string(), "say \"hi\" & go".to_string()),
+            ("note".to_string(), "a < b".to_string()),
+        ],
+        "attribute values must survive the round trip with their meaning intact; got {clean:?}"
+    );
+}
+
+/// Sanitised artifacts preserve XML meaning, not byte-for-byte entity spelling.
+///
+/// The sanitiser already normalizes quoting, whitespace, declarations, and element text while
+/// removing secrets. Attribute values follow the same contract: a numeric character reference may
+/// be emitted as a named entity, but reparsing must recover the exact semantic value. Recording this
+/// explicitly prevents a normalized artifact from later being cited as a raw-wire byte capture.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn the_sanitiser_normalizes_entity_spelling_but_preserves_attribute_meaning() {
+    use mock_servers::hqplayer::raw::sanitize;
+
+    let clean = sanitize("<Status song='Gloria&#39;s Step'/>");
+    assert!(
+        !clean.contains("&#39;"),
+        "the stored artifact is deliberately normalized rather than byte-faithful: {clean}"
+    );
+
+    let mut reader = quick_xml::Reader::from_str(&clean);
+    let value = loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                break e
+                    .attributes()
+                    .filter_map(Result::ok)
+                    .find(|a| a.key.as_ref() == b"song")
+                    .expect("song attribute")
+                    .unescape_value()
+                    .expect("normalized value reparses")
+                    .into_owned();
+            }
+            Ok(quick_xml::events::Event::Eof) => panic!("no Status element in {clean}"),
+            Ok(_) => {}
+            Err(e) => panic!("normalized artifact does not reparse: {e}; {clean}"),
+        }
+    };
+    assert_eq!(value, "Gloria's Step");
+}
+
+/// Redaction must not be weakened by the escaping fix: a sensitive *value* is still dropped.
+///
+/// A guard, not a red. The escape has to happen **after** the sensitivity check, or decoding a value
+/// in order to escape it becomes a way for a credential to come back out re-encoded. A sensitive
+/// attribute *key* is not the case to use here: `is_hostile_tag` drops that element whole before
+/// `render_start` is ever reached, so it would prove nothing about this path. A harmless key with a
+/// sensitive value is the shape that exercises it.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn escaping_attribute_values_does_not_weaken_redaction() {
+    use mock_servers::hqplayer::raw::sanitize;
+
+    // `note` is not a sensitive name, so the element survives; its value contains `password`, so the
+    // attribute must not. The `&quot;` is there so the value only *looks* clean before decoding.
+    let clean = sanitize("<Status note='my &quot;password&quot; is hunter2' keep='fine'/>");
+    assert!(
+        !clean.contains("hunter2") && !clean.contains("password"),
+        "an attribute whose value is sensitive must be dropped, decoded or not; got {clean}"
+    );
+    assert!(
+        clean.contains("keep=\"fine\""),
+        "a harmless attribute alongside it must still be kept; got {clean}"
+    );
+}
+
+/// `has_child` must answer about a **direct child** of the root, not any descendant.
+///
+/// The `status_metadata_child` evidence claim rests on this being a structural child fact: ADR 003
+/// asks whether `Status` carries a `metadata` child, and a `metadata` nested three levels down inside
+/// something else is a different fact. Answering "yes" for a descendant is a false *presence*, the
+/// mirror of the false absences this lane exists to avoid.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn has_child_distinguishes_a_direct_child_from_a_deeper_descendant() {
+    use mock_servers::hqplayer::raw::has_child;
+
+    // The real shape: a self-closing `metadata` directly under the root.
+    assert!(
+        has_child(
+            "<Status state=\"2\"><metadata artist=\"Bill Evans\"/></Status>",
+            "metadata"
+        ),
+        "a self-closing direct child must be found"
+    );
+    // Non-self-closing direct child, for the same reason.
+    assert!(
+        has_child("<Status><metadata></metadata></Status>", "metadata"),
+        "a direct child with an end tag must be found too"
+    );
+
+    // The defect: nested deeper, so it is not the structural fact the claim names.
+    assert!(
+        !has_child(
+            "<Status><wrapper><metadata artist=\"Bill Evans\"/></wrapper></Status>",
+            "metadata"
+        ),
+        "a grandchild must not satisfy a direct-child claim"
+    );
+    // The root itself is not its own child.
+    assert!(
+        !has_child("<metadata/>", "metadata"),
+        "the root element must not count as its own child"
+    );
+    // Absent means absent.
+    assert!(
+        !has_child("<Status state=\"2\"/>", "metadata"),
+        "an absent child must read as absent"
+    );
+}
+
+/// An `<option>` with no text node must still be recorded as a named profile.
+///
+/// `Start` and `Empty` shared one arm, so `<option value="Speakers"/>` parked the value in
+/// `pending_option` and nothing ever consumed it — the next option overwrote it and the profile
+/// silently disappeared. The tier-1 differ then reports a corpus-only profile that the daemon
+/// actually offered: a false absence attributed to the daemon.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn a_self_closing_profile_option_is_still_a_named_profile() {
+    let page = concat!(
+        "<html><body><form>",
+        "<select name=\"profile\">",
+        "<option value=\"[default]\"/>",
+        "<option value=\"Speakers\"/>",
+        "<option value=\"Headphones\">Cans</option>",
+        "<option value=\"Night\"></option>",
+        "</select>",
+        "</form></body></html>"
+    );
+
+    let obs = tier1::project_config_form(page);
+
+    assert!(
+        obs.offers_default,
+        "the `[default]` base must still be recognised"
+    );
+    assert_eq!(
+        obs.named_profiles,
+        vec![
+            ("Speakers".to_string(), "Speakers".to_string()),
+            ("Headphones".to_string(), "Cans".to_string()),
+            ("Night".to_string(), "Night".to_string()),
+        ],
+        "every named option must be recorded; a self-closing or text-less option falls back to its \
+         value as its label"
+    );
+}
+
+/// An option outside the profile select must still be ignored — the fix must not widen what is kept.
+///
+/// The projection is an allowlist: element text is kept *only* as an option label inside the profile
+/// select. Splitting the `Start`/`Empty` arms must not turn that into "any option anywhere".
+///
+/// **Label: model-fidelity.**
+#[test]
+fn a_self_closing_option_outside_the_profile_select_is_still_ignored() {
+    let page = concat!(
+        "<html><body><form>",
+        "<select name=\"filter\"><option value=\"poly-sinc\"/></select>",
+        "<select name=\"profile\"><option value=\"Speakers\"/></select>",
+        "</form></body></html>"
+    );
+
+    let obs = tier1::project_config_form(page);
+    assert_eq!(
+        obs.named_profiles,
+        vec![("Speakers".to_string(), "Speakers".to_string())],
+        "only options inside the `profile` select are profiles"
+    );
+}
+
+/// A coalesced push frame must not bleed into the raw lane's returned document, and a reply behind one
+/// must not be thrown away.
+///
+/// The lane accumulated by line and returned the whole buffer once anything in it parsed. A daemon
+/// that puts an unsolicited `Status` push and the real reply on one line therefore produced two
+/// failures at once: when the first root matched, the returned "document" carried a second document
+/// glued to its tail; when it did not, `document.clear()` discarded the reply that had already
+/// arrived and the lane waited out its whole deadline for bytes it was holding.
+///
+/// `framing::first_document_span` exists for exactly this and was already used by the client.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn the_raw_lane_takes_one_frame_and_keeps_what_was_coalesced_behind_it() {
+    use mock_servers::hqplayer::raw::{observe, Query};
+
+    // A push frame first, then the reply the lane asked for, both on a single line — one `read_line`
+    // yields both.
+    let coalesced = concat!(
+        "<Status state=\"2\" track=\"3\"/>",
+        "<State state=\"1\" volume=\"-23.5\" mode=\"1\"/>\n"
+    );
+    let port = serve_one_canned_line(coalesced).await;
+
+    let document = observe("127.0.0.1", port, Query::State, Duration::from_secs(2))
+        .await
+        .expect("the reply is present in the buffer, so the lane must find it");
+
+    assert_eq!(
+        framing::root_element(&document).as_deref(),
+        Some("State"),
+        "the lane must return the reply it asked for, not the push frame; got {document:?}"
+    );
+    assert!(
+        !document.contains("<Status"),
+        "the push frame must not be glued to the returned document; got {document:?}"
+    );
+    assert_eq!(
+        framing::classify(&document),
+        framing::Framing::Complete,
+        "what is returned must be exactly one complete document; got {document:?}"
+    );
+    // The whole point: attribute reads scope to the root open tag, so a returned buffer holding two
+    // documents is a buffer whose attributes cannot be trusted.
+    assert_eq!(
+        mock_servers::hqplayer::raw::root_attrs(&document)
+            .into_iter()
+            .find(|(k, _)| k == "volume")
+            .map(|(_, v)| v)
+            .as_deref(),
+        Some("-23.5"),
+        "the reply's own attributes must be readable off what is returned"
+    );
+}
+
+/// The other half: the wanted frame arriving **first**, with a push frame behind it. What is returned
+/// must still be one document, and the trailing push must not appear in it.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn the_raw_lane_does_not_return_a_push_frame_glued_behind_the_reply() {
+    use mock_servers::hqplayer::raw::{observe, Query};
+
+    let coalesced = concat!(
+        "<State state=\"1\" volume=\"-11.5\" mode=\"1\"/>",
+        "<Status state=\"2\" track=\"3\"/>\n"
+    );
+    let port = serve_one_canned_line(coalesced).await;
+
+    let document = observe("127.0.0.1", port, Query::State, Duration::from_secs(2))
+        .await
+        .expect("the reply is the first frame, so the lane must return it");
+
+    assert!(
+        !document.contains("<Status"),
+        "a trailing push frame must be excluded from the returned document; got {document:?}"
+    );
+    assert_eq!(
+        framing::classify(&document),
+        framing::Framing::Complete,
+        "exactly one document; got {document:?}"
+    );
+}
+
+/// A push frame on its own line leaves only whitespace in the carry buffer. That tail is incomplete,
+/// not malformed, so the raw lane must continue to the reply on the following line.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn the_raw_lane_continues_after_a_push_frame_on_its_own_line() {
+    use mock_servers::hqplayer::raw::{observe, Query};
+
+    let port = serve_one_canned_line(concat!(
+        "<Status state=\"2\" track=\"3\"/>\n",
+        "<State state=\"1\" volume=\"-9.5\" mode=\"1\"/>\n"
+    ))
+    .await;
+
+    let document = observe("127.0.0.1", port, Query::State, Duration::from_secs(2))
+        .await
+        .expect("a whitespace-only carry after a push frame must not block the next line");
+    assert_eq!(framing::root_element(&document).as_deref(), Some("State"));
+    assert!(document.contains("volume=\"-9.5\""));
+}
+
+/// A single well-formed reply must be unaffected — the ordinary path is the one that must not regress.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn the_raw_lane_still_reads_an_ordinary_single_reply() {
+    use mock_servers::hqplayer::raw::{observe, Query};
+
+    let port = serve_one_canned_line("<State state=\"1\" volume=\"-7.5\" mode=\"1\"/>\n").await;
+    let document = observe("127.0.0.1", port, Query::State, Duration::from_secs(2))
+        .await
+        .expect("an ordinary reply must still be read");
+    assert_eq!(framing::root_element(&document).as_deref(), Some("State"));
+    assert!(document.contains("volume=\"-7.5\""));
+}
+
+/// Serve one canned line to the first connection, then hold the socket open.
+///
+/// Held open rather than closed so a lane that discards the reply reports a **timeout** — its actual
+/// failure — instead of "connection closed mid-document", which would pass the test for the wrong
+/// reason by reporting an error either way.
+async fn serve_one_canned_line(line: &str) -> u16 {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind canned responder");
+    let port = listener.local_addr().expect("local addr").port();
+    let line = line.to_string();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Read the request so the lane's write completes, then answer once.
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(line.as_bytes()).await;
+            let _ = sock.flush().await;
+            // Hold the connection open.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+    port
 }

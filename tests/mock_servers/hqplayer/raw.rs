@@ -155,18 +155,41 @@ pub async fn observe(
             Ok(Ok(0)) => anyhow::bail!("raw lane: connection closed mid-document"),
             Ok(Ok(_)) => {
                 document.push_str(&line);
-                match framing::classify(&document) {
-                    framing::Framing::Complete => {
-                        if framing::root_element(&document).as_deref() == Some(expected_reply) {
-                            return Ok(document);
+                // Drain every complete frame the buffer now holds, not just the first, because one
+                // `read_line` can deliver several: the daemon pushes `Status` unprompted, so a push and
+                // the reply can arrive coalesced on one line.
+                //
+                // Two defects lived in doing this by whole buffer. Returning `document` returned the
+                // *buffer* rather than the frame, so a push coalesced behind the reply came back glued
+                // to it — and attribute reads scope to the root open tag, so a two-document buffer is
+                // one whose attributes cannot be trusted. And `document.clear()` on a non-matching
+                // root discarded whatever had arrived behind it, so a reply already in hand was thrown
+                // away and the lane then burned its whole deadline waiting for it.
+                //
+                // `framing::first_document_span` is the production helper that exists for exactly this
+                // and is what the client itself uses, so the lane keeps observing what the client sees.
+                loop {
+                    match framing::classify(&document) {
+                        framing::Framing::Complete => {
+                            let Some((start, end)) = framing::first_document_span(&document) else {
+                                // `Complete` and no span is not a shape `framing` produces; treating it
+                                // as "keep reading" would spin this loop, so stop rather than guess.
+                                break;
+                            };
+                            let frame = document[start..end].to_string();
+                            // Keep the tail: it may already hold the reply.
+                            document = document[end..].to_string();
+                            if framing::root_element(&frame).as_deref() == Some(expected_reply) {
+                                return Ok(frame);
+                            }
+                            // Unsolicited push frame; drop that frame only and keep reading, exactly
+                            // as the client does.
                         }
-                        // Unsolicited push frame; drop it and keep reading, exactly as the client does.
-                        document.clear();
+                        framing::Framing::Malformed => {
+                            anyhow::bail!("raw lane: malformed document for {element}")
+                        }
+                        framing::Framing::Incomplete => break,
                     }
-                    framing::Framing::Malformed => {
-                        anyhow::bail!("raw lane: malformed document for {element}")
-                    }
-                    framing::Framing::Incomplete => {}
                 }
             }
             Ok(Err(e)) => anyhow::bail!("raw lane read error: {e}"),
@@ -175,17 +198,38 @@ pub async fn observe(
     }
 }
 
-/// Whether a container's named child element is present, as a structural fact rather than an
-/// inference from any value inside it.
+/// Whether a container's named **direct child** element is present, as a structural fact rather than
+/// an inference from any value inside it.
+///
+/// Depth is tracked rather than matching any descendant. ADR 003's `status_metadata_child` claim is
+/// about `Status` carrying a `metadata` child; a `metadata` nested inside something else is a
+/// different fact, and answering "present" for it is a false *presence* — the mirror of the false
+/// absences this whole lane exists to avoid. The root element is at depth 0, so a direct child is
+/// exactly depth 1, and the root is never its own child.
 pub fn has_child(document: &str, child: &str) -> bool {
     let mut reader = quick_xml::Reader::from_str(document);
     reader.config_mut().check_end_names = false;
+    // How many elements are currently open. Incremented *after* the depth test on `Start`, so the
+    // element being tested is measured at its own nesting level rather than one deeper.
+    let mut depth = 0usize;
     loop {
         match reader.read_event() {
-            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
-                if String::from_utf8_lossy(e.name().as_ref()) == child {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                if depth == 1 && String::from_utf8_lossy(e.name().as_ref()) == child {
                     return true;
                 }
+                depth += 1;
+            }
+            // A self-closing element opens and closes in one event, so it never changes the depth —
+            // it just occupies the level it appears at. This is the shape the real `metadata` child
+            // takes, so it must be measured, not skipped.
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                if depth == 1 && String::from_utf8_lossy(e.name().as_ref()) == child {
+                    return true;
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                depth = depth.saturating_sub(1);
             }
             Ok(quick_xml::events::Event::Eof) | Err(_) => return false,
             Ok(_) => {}
@@ -385,15 +429,29 @@ fn is_hostile_tag(e: &quick_xml::events::BytesStart<'_>) -> bool {
 
 /// Re-render a start tag's name and attributes, dropping any attribute whose name or value is
 /// sensitive.
+///
+/// Values are decoded before being inspected and re-escaped before being emitted, for the same reason
+/// [`sanitize`] does it for element text: `a.value` is the raw wire bytes, and XML permits a `"`
+/// inside a single-quoted value, so re-emitting verbatim between double quotes turned
+/// `song='say "hi"'` into a document that no longer reparses. A stored artifact that cannot be
+/// reparsed is not evidence.
+///
+/// The decode also makes the sensitivity check stronger rather than weaker: it runs on the *decoded*
+/// value, so `&quot;password&quot;` is caught where the raw bytes would have hidden it. Escaping
+/// happens only after that check has passed, so decoding can never become a way for a credential to
+/// come back out re-encoded.
 fn render_start(e: &quick_xml::events::BytesStart<'_>) -> String {
     let mut out = String::from_utf8_lossy(e.name().as_ref()).into_owned();
     for a in e.attributes().filter_map(Result::ok) {
         let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
-        let value = String::from_utf8_lossy(a.value.as_ref()).into_owned();
+        let value = a
+            .unescape_value()
+            .map(|v| v.into_owned())
+            .unwrap_or_else(|_| framing::decode_entities(&String::from_utf8_lossy(&a.value)));
         if is_sensitive(&key) || is_sensitive(&value) {
             continue;
         }
-        out.push_str(&format!(" {key}=\"{value}\""));
+        out.push_str(&format!(" {key}=\"{}\"", quick_xml::escape::escape(&value)));
     }
     out
 }

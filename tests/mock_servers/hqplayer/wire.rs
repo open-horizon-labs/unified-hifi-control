@@ -286,26 +286,37 @@ impl WireServer {
     }
 }
 
+/// Byte offset of the first occurrence of `needle` in `hay`, or `None`.
+///
+/// One search shared by both marker arms. `AfterMarker` used to search a `String::from_utf8_lossy`
+/// copy and then slice the *raw* bytes with the offset it found — but every invalid byte becomes a
+/// 3-byte `U+FFFD` in that copy, so from the first one onward the offset no longer indexes the
+/// original and the cut lands somewhere other than the marker, which is the one thing this type exists
+/// to control. `BytesAfterMarker` already searched bytes for exactly that reason; the two arms
+/// disagreed about the same question.
+///
+/// The empty needle is answered explicitly: `slice::windows(0)` panics, while `str::find("")` returns
+/// `Some(0)`. Matching `str::find` keeps the previous behaviour instead of turning a degenerate
+/// chunking config into a crash inside a test server.
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 fn split(document: &[u8], chunking: &Chunking) -> Vec<Vec<u8>> {
     match chunking {
         Chunking::Whole => vec![document.to_vec()],
-        Chunking::AfterMarker(marker) => {
-            let hay = String::from_utf8_lossy(document).into_owned();
-            match hay.find(marker.as_str()) {
-                Some(at) => {
-                    let cut = at + marker.len();
-                    vec![document[..cut].to_vec(), document[cut..].to_vec()]
-                }
-                None => vec![document.to_vec()],
+        Chunking::AfterMarker(marker) => match find_bytes(document, marker.as_bytes()) {
+            Some(at) => {
+                let cut = at + marker.len();
+                vec![document[..cut].to_vec(), document[cut..].to_vec()]
             }
-        }
+            None => vec![document.to_vec()],
+        },
         Chunking::BytesAfterMarker { marker, extra } => {
-            // Byte search, not `str::find`, so the marker is located without ever needing the buffer
-            // to be valid UTF-8 — and so the resulting cut is a raw byte offset.
-            let at = document
-                .windows(marker.len())
-                .position(|w| w == marker.as_bytes());
-            match at {
+            match find_bytes(document, marker.as_bytes()) {
                 Some(at) => {
                     let cut = (at + marker.len() + extra).min(document.len());
                     vec![document[..cut].to_vec(), document[cut..].to_vec()]
@@ -521,5 +532,96 @@ async fn serve_connection(
             }
         }
         stats.replies.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Harness tests for the splitter itself (CodeRabbit review 4816484338).
+///
+/// `split` is what decides where a TCP segment boundary lands, so every framing test in the suite
+/// rests on it computing the offset it claims to. Tested directly because no framing test can tell a
+/// correct cut from a cut that happened to land somewhere harmless.
+///
+/// **Label: model-fidelity.** Harness behaviour, red against the unmodified harness.
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    /// The defect: `AfterMarker` searched a **lossy** UTF-8 copy and then sliced the raw bytes with
+    /// the offset it found. Every invalid byte becomes a 3-byte `U+FFFD` in that copy, so from the
+    /// first one onward the offset no longer indexes the original — the cut lands somewhere else than
+    /// the marker, which is the one thing this type exists to control.
+    ///
+    /// `BytesAfterMarker` already searched bytes for exactly this reason; the two arms disagreed.
+    #[test]
+    fn after_marker_cuts_at_the_marker_even_after_an_invalid_byte() {
+        // `0xFF` is not valid UTF-8. It stands in for the arbitrary bytes a daemon can put on the
+        // wire — the suite already models a non-UTF-8 buffer elsewhere, so this is a reachable shape
+        // for the splitter even though today's callers all pass documents built from `String`.
+        let mut document = b"<Status>".to_vec();
+        document.push(0xFF);
+        document.extend_from_slice(b"<metadata/></Status>");
+
+        let parts = split(&document, &Chunking::AfterMarker("<metadata/>".to_string()));
+
+        assert_eq!(parts.len(), 2, "the marker is present, so it must split");
+        let cut = parts[0].len();
+        assert_eq!(
+            &document[..cut],
+            parts[0].as_slice(),
+            "the first part must be a prefix of the original bytes"
+        );
+        assert!(
+            parts[0].ends_with(b"<metadata/>"),
+            "the cut must fall immediately after the marker; got {:?}",
+            String::from_utf8_lossy(&parts[0])
+        );
+        assert_eq!(parts[1], b"</Status>".to_vec());
+        assert_eq!(
+            [parts[0].clone(), parts[1].clone()].concat(),
+            document,
+            "splitting must lose no bytes"
+        );
+    }
+
+    /// The ordinary case must keep working unchanged.
+    #[test]
+    fn after_marker_cuts_after_the_marker_in_valid_utf8() {
+        let document = b"<Status><metadata/></Status>".to_vec();
+        let parts = split(&document, &Chunking::AfterMarker("<metadata/>".to_string()));
+        assert_eq!(
+            parts,
+            vec![b"<Status><metadata/>".to_vec(), b"</Status>".to_vec()]
+        );
+    }
+
+    /// An absent marker keeps the whole-document fallback rather than splitting at nothing.
+    #[test]
+    fn an_absent_marker_yields_the_whole_document() {
+        let document = b"<Status/>".to_vec();
+        let parts = split(&document, &Chunking::AfterMarker("<metadata/>".to_string()));
+        assert_eq!(parts, vec![document]);
+    }
+
+    /// A marker longer than the document is absent, not a panic. `slice::windows` yields nothing when
+    /// the window exceeds the slice, which is the same answer `str::find` gave — pinned so the byte
+    /// search cannot regress into an arithmetic overflow on a short buffer.
+    #[test]
+    fn a_marker_longer_than_the_document_is_simply_absent() {
+        let document = b"<S/>".to_vec();
+        let parts = split(
+            &document,
+            &Chunking::AfterMarker("a-very-long-marker".to_string()),
+        );
+        assert_eq!(parts, vec![document]);
+    }
+
+    /// An empty marker must not panic. `slice::windows(0)` panics, so the byte search needs the same
+    /// "matches at offset 0" answer `str::find("")` gives — this is the case that turns the nitpick
+    /// into a crash if implemented naively.
+    #[test]
+    fn an_empty_marker_matches_at_the_start_rather_than_panicking() {
+        let document = b"<Status/>".to_vec();
+        let parts = split(&document, &Chunking::AfterMarker(String::new()));
+        assert_eq!(parts, vec![Vec::new(), document]);
     }
 }

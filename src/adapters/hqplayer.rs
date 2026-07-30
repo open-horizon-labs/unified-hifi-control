@@ -446,17 +446,30 @@ pub mod framing {
     /// Attribute lookups must be scoped to this slice: a plain substring scan over the whole
     /// document matches the XML declaration's `version="1.0"` before the root element's own
     /// `version`, silently replacing the daemon's version with the XML spec's.
+    ///
+    /// Quote tracking records **which** character opened the current attribute value, not merely that
+    /// one is open, for the same reason [`root_frame_end`] does: XML permits both forms and only the
+    /// matching character closes a value. Tracking `"` alone stopped the scan at the `>` inside
+    /// `song='a>b'`, and because every attribute after that point then read as absent — with callers
+    /// substituting `0`/`""` rather than reporting a parse failure — a track title containing `>`
+    /// silently zeroed the volume the UI showed. An unterminated quote yields no scope at all rather
+    /// than a guessed one, again matching [`root_frame_end`].
     pub fn root_open_tag(buf: &str) -> Option<&str> {
         let rest = skip_prologue(buf)?;
         if !rest.starts_with('<') || rest.starts_with("</") {
             return None;
         }
         let bytes = rest.as_bytes();
-        let mut in_quote = false;
+        let mut quote: Option<u8> = None;
         for (i, b) in bytes.iter().enumerate() {
             match b {
-                b'"' => in_quote = !in_quote,
-                b'>' if !in_quote => return Some(&rest[..=i]),
+                b'"' | b'\'' => match quote {
+                    // Only the character that opened the value can close it.
+                    Some(open) if open == *b => quote = None,
+                    Some(_) => {}
+                    None => quote = Some(*b),
+                },
+                b'>' if quote.is_none() => return Some(&rest[..=i]),
                 _ => {}
             }
         }
@@ -3681,5 +3694,65 @@ mod parse_attr_scope_tests {
             HqpAdapter::parse_attr(reply, "volume").as_deref(),
             Some("-12.5")
         );
+    }
+
+    /// A `>` inside a **single-quoted** attribute value must not end the root tag's scope
+    /// (CodeRabbit review 4816484338).
+    ///
+    /// XML permits either quote form, and `root_frame_end` already tracks both — deliberately, because
+    /// a single bool for `"` alone lets `song='</Status>'` end a frame. `root_open_tag` tracked only
+    /// `"`, so the scope stopped at the `>` *inside* the value and every attribute after it read as
+    /// absent. That is silent: `parse_attr` returns `None`, and callers substitute `0`/`""` rather
+    /// than reporting a parse failure, so a playing track whose title contains `>` would zero the
+    /// volume the UI shows.
+    ///
+    /// Asserted on `parse_attr` and on `root_open_tag` both: the outcome is what callers depend on,
+    /// but only the scope assertion pins the *mechanism*, and an outcome test can pass for the wrong
+    /// reason.
+    #[test]
+    fn a_gt_inside_a_single_quoted_value_does_not_truncate_the_root_scope() {
+        // The daemon sends `song` entity-escaped, but the reference warns a bare character has been
+        // observed too, so this is the shape that must not corrupt the read.
+        let reply = "<State song='a>b' state=\"1\" volume=\"-23.5\"/>";
+
+        assert_eq!(
+            framing::root_open_tag(reply),
+            Some("<State song='a>b' state=\"1\" volume=\"-23.5\"/>"),
+            "the root scope must reach the tag's own `>`, not the one inside a single-quoted value"
+        );
+        assert_eq!(
+            HqpAdapter::parse_attr(reply, "volume").as_deref(),
+            Some("-23.5"),
+            "an attribute after a single-quoted value containing `>` must still be found; `None` \
+             here becomes a silent 0 dB in every caller"
+        );
+        assert_eq!(HqpAdapter::parse_attr(reply, "state").as_deref(), Some("1"));
+    }
+
+    /// The negative side of the same rule: a `'` inside a **double-quoted** value must not open a
+    /// quote region, and an apostrophe in ordinary text is exactly where that would bite.
+    #[test]
+    fn an_apostrophe_inside_a_double_quoted_value_does_not_open_a_quote_region() {
+        let reply = "<State song=\"Gloria's Step\" volume=\"-11.5\"/>";
+        assert_eq!(
+            framing::root_open_tag(reply),
+            Some("<State song=\"Gloria's Step\" volume=\"-11.5\"/>"),
+            "only the character that opened a value may close it; a lone `'` inside `\"…\"` is content"
+        );
+        assert_eq!(
+            HqpAdapter::parse_attr(reply, "volume").as_deref(),
+            Some("-11.5")
+        );
+    }
+
+    /// An **unterminated** single quote must not be rescued by guessing a boundary.
+    ///
+    /// With the quote still open there is no way to tell markup from data, so the honest answer is no
+    /// scope at all — the same shape `root_frame_end` deliberately declines to resolve.
+    #[test]
+    fn an_unterminated_single_quote_yields_no_root_scope() {
+        let truncated = "<State song='a>b state=\"1\"";
+        assert_eq!(framing::root_open_tag(truncated), None);
+        assert_eq!(HqpAdapter::parse_attr(truncated, "state"), None);
     }
 }

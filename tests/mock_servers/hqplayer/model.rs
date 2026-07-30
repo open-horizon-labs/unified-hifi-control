@@ -258,6 +258,10 @@ impl std::fmt::Debug for Faults {
             .field("accept_but_ignore", &self.accept_but_ignore)
             .field("apply_after_polls", &self.apply_after_polls)
             .field("matrix_current_override", &self.matrix_current_override)
+            // Named even when unarmed. Faults are printed in assertion messages precisely so a failure
+            // says which misbehaviour was armed, and this flag changes `SetRate` semantics — omitting
+            // it made the mode-conditional refusal invisible in exactly the message a maintainer reads.
+            .field("source_refuses_rate_pin", &self.source_refuses_rate_pin)
             .field("pending", &self.pending.len())
             .finish()
     }

@@ -83,7 +83,15 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
     let mut pending_option: Option<String> = None;
 
     loop {
-        match reader.read_event() {
+        let event = reader.read_event();
+        // Whether this element closes in the same event. `Start` parks an option's value in
+        // `pending_option` for the `Text` handler to pair with a label; an `Empty` option has no text
+        // node, so nothing ever consumed it — the next option overwrote it and the profile silently
+        // disappeared, which the tier-1 differ then reported as a profile the daemon does not offer.
+        // A false absence attributed to the daemon is exactly the class this boundary exists to
+        // prevent, so the two events are distinguished rather than shared.
+        let self_closing = matches!(event, Ok(quick_xml::events::Event::Empty(_)));
+        match event {
             Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
                 let tag = String::from_utf8_lossy(e.name().as_ref()).to_lowercase();
                 let attrs: BTreeMap<String, String> = e
@@ -122,7 +130,14 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
                         if value == "[default]" {
                             obs.offers_default = true;
                             pending_option = None;
-                        } else if !value.is_empty() {
+                        } else if value.is_empty() {
+                            // Nothing to record either way.
+                        } else if self_closing {
+                            // No text node is coming, so record it now with its value as its label —
+                            // the same fallback the `Text` handler applies to an empty label.
+                            obs.named_profiles.push((value.clone(), value));
+                            pending_option = None;
+                        } else {
                             pending_option = Some(value);
                         }
                     }
@@ -145,9 +160,21 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
                 }
             }
             Ok(quick_xml::events::Event::End(e)) => {
-                if String::from_utf8_lossy(e.name().as_ref()).to_lowercase() == "select" {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_lowercase();
+                // `<option value="Night"></option>` carries no text node either, so the `Text` handler
+                // never ran and the value is still parked. Flushing it here is the other half of the
+                // self-closing case: unconditionally clearing `pending_option` on any end tag is what
+                // dropped it, and a dropped profile reads as one the daemon does not offer.
+                if tag == "option" {
+                    if let Some(value) = pending_option.take() {
+                        obs.named_profiles.push((value.clone(), value));
+                    }
+                }
+                if tag == "select" {
                     in_profile_select = false;
                 }
+                // Any other end tag closes whatever context an option's text could have belonged to,
+                // so a value still parked at that point has no label coming and no element to own it.
                 pending_option = None;
             }
             Ok(quick_xml::events::Event::Eof) | Err(_) => break,
@@ -1226,12 +1253,11 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
              carry the daemon address"
                 .into(),
         );
-    } else if let Some((_, current)) = &capture.current_matrix_profile {
-        let (current_index, _) = capture
-            .current_matrix_profile
-            .as_ref()
-            .map(|(i, n)| (*i, n.clone()))
-            .unwrap_or((0, String::new()));
+    } else if let Some((current_index, current)) = &capture.current_matrix_profile {
+        // Bound by the pattern rather than re-read through `map`/`unwrap_or`: the second read had a
+        // `(0, "")` default that could never be taken here, and a default that cannot happen is a
+        // default nobody checks if the code around it moves.
+        let current_index = *current_index;
         // The pair must match, not just the name: MatrixGetProfile reports an index too, and the right
         // name at the wrong index is still an incoherent daemon.
         let listed = capture

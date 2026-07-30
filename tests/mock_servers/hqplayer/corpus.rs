@@ -44,11 +44,20 @@ pub struct Provenance {
     pub source_chain: String,
     /// Whether any tier could ever promote this fixture's claims to UHC-qualified evidence.
     ///
-    /// `tier-1` means a read-only live run can settle it. `tier-2-only` means settling it requires a
-    /// mutating run with a human present, so the read-only merge gate never can. `never-promotable`
-    /// marks a synthetic fixture, which is a constructed shape rather than an observation and must not
-    /// be promoted by anything. Absent in older fixtures, which default to `unspecified`.
+    /// `tier-1` means a read-only live run can settle it. Hardware-dependent claims require a daemon
+    /// configured with the hardware the fixture describes; another tier-1 run does not verify them.
+    /// `tier-2-only` means settling it requires a mutating run with a human present, so the read-only
+    /// merge gate never can. `never-promotable` marks a synthetic fixture, which is a constructed
+    /// shape rather than an observation and must not be promoted by anything. Absent in older
+    /// fixtures, which default to `unspecified`. The vocabulary is closed and asserted by
+    /// `every_fixture_tier_is_a_known_classification`.
     pub tier: String,
+    /// Optional semantic hardware marker required to qualify a device-dependent tier-1 fixture.
+    ///
+    /// A read-only query can still describe hardware-specific behavior. In that case the live gate
+    /// must be told which hardware class the operator actually attached; choosing the fixture profile
+    /// alone is not evidence that the daemon is backed by the required device.
+    pub hardware: String,
     /// Playback state at capture: `active`, `idle`, or `unknown`.
     ///
     /// Required by the HQPTuner amendment, because every "live, verified" claim in the upstream
@@ -87,12 +96,31 @@ fn fixtures_root() -> PathBuf {
 }
 
 fn parse_provenance(raw: &str, path: &Path) -> Provenance {
+    // The provenance comment must be the fixture's *first* content, not merely present somewhere in
+    // it. `raw.find("<!--")` took the first comment anywhere, so a fixture could put a document — or
+    // an XML declaration — in front of it and any later inline comment became the evidence metadata
+    // for the whole file. Provenance is what lets a reader tell a capture from a transcription; a
+    // parser that will read it from an arbitrary position cannot support that claim.
+    //
+    // Leading whitespace is not content: the corpus is hand-written and files legitimately begin with
+    // a newline, so `raw.starts_with("<!--")` would reject valid fixtures.
+    //
+    // "No comment at all" is checked first and keeps its own message. The two failures are different
+    // authoring mistakes and a reader fixing one should not be handed the other's diagnosis.
     let start = raw.find("<!--").unwrap_or_else(|| {
         panic!(
             "fixture {} has no provenance comment; every corpus document must carry one",
             path.display()
         )
     });
+    if !raw.trim_start().starts_with("<!--") {
+        panic!(
+            "fixture {} does not begin with its provenance comment; the provenance comment must be \
+             the first content in the file, before any XML declaration or element, so an unrelated \
+             inline comment cannot be read as evidence metadata",
+            path.display()
+        );
+    }
     let end = start
         + raw[start..].find("-->").unwrap_or_else(|| {
             panic!(
@@ -132,6 +160,7 @@ fn parse_provenance(raw: &str, path: &Path) -> Provenance {
         // honest reading for them. A synthetic fixture must say `never-promotable` explicitly, and
         // `a_synthetic_profile_is_never_evidence` enforces that.
         tier: optional("tier").unwrap_or_else(|| "unspecified".to_string()),
+        hardware: optional("hardware").unwrap_or_default(),
         source_chain: optional("source_chain").unwrap_or_else(|| "unrecorded".to_string()),
         notes: field("notes"),
     }
@@ -315,4 +344,76 @@ pub fn element_name(line: &str) -> Option<String> {
         .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
         .unwrap_or(rest.len());
     Some(rest[..end].to_string())
+}
+
+/// Harness tests for the provenance parser itself (CodeRabbit review 4816484338).
+///
+/// The corpus-wide assertions in `tests/hqplayer_conformance.rs` all run against fixtures that
+/// happen to be well-formed, so none of them can observe what the parser accepts that it should not.
+/// These call the parser directly, where the accepted and rejected shapes are the assertion.
+///
+/// **Label: model-fidelity.** These are harness defects, not client defects: the red below is against
+/// the unmodified harness, and no production code is involved.
+#[cfg(test)]
+mod provenance_parsing_tests {
+    use super::*;
+
+    fn parse(raw: &str) -> Provenance {
+        parse_provenance(raw, Path::new("<in-memory fixture>"))
+    }
+
+    const HEADER: &str = concat!(
+        "<!--\n",
+        "  provenance:\n",
+        "    source: in-memory\n",
+        "    daemon: hqplayerd 6.0.4 (Opal)\n",
+        "    status: derived-shape\n",
+        "    date: 2026-07-30\n",
+        "    playback: unknown\n",
+        "    notes: a fixture written for this test\n",
+        "-->\n",
+    );
+
+    #[test]
+    fn a_leading_provenance_comment_is_accepted() {
+        let p = parse(&format!("{HEADER}<State volume=\"-23.5\"/>"));
+        assert_eq!(p.source, "in-memory");
+        assert_eq!(p.status, "derived-shape");
+    }
+
+    /// Leading *whitespace* is not content, so it must not disqualify the comment. Pinned because the
+    /// obvious tightening — `raw.starts_with("<!--")` — would reject every fixture that begins with a
+    /// newline, and the corpus is written by hand.
+    #[test]
+    fn leading_whitespace_before_the_comment_is_still_accepted() {
+        let p = parse(&format!("\n\n   \t{HEADER}<State volume=\"-23.5\"/>"));
+        assert_eq!(p.source, "in-memory");
+    }
+
+    /// The defect: `raw.find("<!--")` takes the first comment *anywhere*, so a fixture can put a
+    /// document in front of it and an unrelated inline comment becomes the evidence metadata for the
+    /// whole file. Provenance is what lets a reader tell a capture from a transcription; a parser that
+    /// will read it out of an arbitrary position cannot support that claim.
+    #[test]
+    #[should_panic(expected = "does not begin with its provenance comment")]
+    fn a_comment_after_other_content_is_not_provenance() {
+        parse(&format!("<State volume=\"-23.5\"/>\n{HEADER}"));
+    }
+
+    /// The narrower shape of the same defect: an XML declaration is not whitespace either. A fixture
+    /// whose header sits after the prologue is still a fixture whose first content is not provenance,
+    /// and accepting it is what would let the position drift file by file.
+    #[test]
+    #[should_panic(expected = "does not begin with its provenance comment")]
+    fn a_comment_after_an_xml_declaration_is_not_provenance() {
+        parse(&format!("<?xml version=\"1.0\"?>\n{HEADER}<State/>"));
+    }
+
+    /// Unchanged behaviour: no comment at all is still the original panic, not the new one silently
+    /// replacing it.
+    #[test]
+    #[should_panic(expected = "has no provenance comment")]
+    fn a_fixture_with_no_comment_at_all_still_fails() {
+        parse("<State volume=\"-23.5\"/>");
+    }
 }
