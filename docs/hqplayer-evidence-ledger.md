@@ -405,13 +405,24 @@ The daemon accepted the raw element and round-tripped the value on L1. The adapt
 **What would settle it:** #329 deciding whether the junk filter belongs in the live-settings surface.
 The protocol half is settled (HQP-C-050).
 
-### HQP-C-053 / HQP-C-056 — licensing actions this PR must not take
+### HQP-C-053 — the notices file this PR must not create
 
-`THIRD-PARTY-NOTICES` does not exist and is **not** created here: it is maintainer-owned licensing
-policy, and #348 owns it.
+`THIRD-PARTY-NOTICES` does not exist in this repository and is **not** created here: it is
+maintainer-owned licensing policy, and #348 owns it. Nothing from HQPTuner is ported yet, so nothing is
+currently unattributed — the risk is entirely prospective.
 
 **What would settle it:** #348 landing the guardrail and the notices file, naming Copyright (c) 2026
-Adam Goldsmith and preserving the MIT terms, before any HQPTuner implementation code is ported.
+Adam Goldsmith and preserving the MIT terms, **before** any HQPTuner implementation code is ported.
+
+### HQP-C-056 — private correspondence stays unreproduced
+
+Cited at a high level only, never quoted, and never used as a claim's proof. This row previously shared
+HQP-C-053's anchor, which is how CodeRabbit's anchor-hijack finding surfaced a real defect rather than a
+hypothetical one: a heading that merely *contains* an ID satisfied the settle-condition check for a row
+that had no plan of its own.
+
+**What would settle it:** #348 stating the correspondence boundary as a repository guardrail, so the rule
+outlives this ledger and does not depend on a reader noticing this row.
 
 ### HQP-C-061 — a de-qualification that cited this ledger back at itself · **resolved upstream**
 

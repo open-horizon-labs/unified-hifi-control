@@ -641,3 +641,40 @@ other claim.
 `6e84172b…` push while the branch ref had already advanced, so the PR object could not be re-anchored to a
 head it did not yet expose. This append-only note is the smallest truthful commit that retriggers PR
 synchronisation: no amend, no force-push, no empty commit.
+
+### CodeRabbit's fourth pass at `65b1d4e` — the fifth false pass, and it exposed a real defect in the ledger
+
+**CR5 (P2) — an unresolved row's settle condition could be satisfied by a *hijacked* anchor.**
+`anchor_section` took the first heading whose text *contained* the claim ID, so a heading reading
+`### Notes on HQP-C-0240`, placed before the real `HQP-C-024` anchor and carrying an unrelated plan,
+matched it — and the real anchor's plan could then be deleted with the check still green. The topic-map
+check cannot see this either, because the claim **row** is untouched.
+
+| # | Mutation | Before | After |
+|---|---|---|---|
+| M26 | decoy heading `### Notes on HQP-C-0240` inserted before the real anchor, real plan deleted | `test … ok` | fails: *"HQP-C-024 has no prose anchor section"* |
+| M27 | `####### not a heading in CommonMark` inserted inside an anchor | (would have cut the section short) | passes — a seven-hash line is no longer treated as a boundary |
+
+`heading_declares` now requires the ID to **begin** the heading's content and to end at a boundary that
+cannot extend an identifier, so `HQP-C-0240` no longer matches `HQP-C-024` while `HQP-C-024 — …` and
+`HQP-C-023's …` still do. `is_heading` is limited to one-to-six hashes, per CommonMark.
+
+**The fix immediately failed on real content, which is the part worth recording.** With the stricter rule
+in place, `HQP-C-056` had **no anchor of its own**: it had been sharing a combined
+`### HQP-C-053 / HQP-C-056` heading, and the old `contains` rule let a heading that declares *another*
+row satisfy its settle condition. So CR5 was not hypothetical here — the ledger already contained one
+instance. The rows are now split, each with its own acquisition plan, which they needed anyway: #348
+landing the notices file is not the same action as #348 stating the correspondence boundary.
+
+### Five false passes, and the dissent that predicted this one
+
+Report 6/6 said, before this pass ran: *"the four false passes were not the last four… a fourth external
+pass would likely find a fifth. Stopping here is a budget decision, not a completeness claim."* A fourth
+pass ran and found a fifth. **That prediction is now evidence rather than caution**, and it applies
+unchanged to a sixth pass: the rate has not fallen, so any decision to stop reviewing this file is a
+budget decision.
+
+**Tally: five false passes and one factual ledger error. All six were found by someone other than the
+author of the checks** — five by CodeRabbit, one by a human reviewer. The internal 27-mutation table
+caught precisely what its author thought to break, which is the whole reason the ledger says out loud
+that its checks constrain **schema, not truth**.

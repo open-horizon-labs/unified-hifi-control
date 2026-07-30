@@ -183,19 +183,48 @@ fn claims() -> Vec<Claim> {
 
 /// Whether a line is a markdown ATX heading.
 ///
-/// The leading-`#` test alone is wrong in this document: `#322` and `#341` start body lines all over
-/// the ledger, and treating those as headings truncated a section before its `What would settle it`
-/// line. An ATX heading requires a space after the run of hashes.
+/// Two narrowings, both from defects rather than from taste:
+///
+/// * The leading-`#` test alone is wrong in this document — `#322` and `#341` start body lines all over
+///   the ledger, and treating those as headings truncated a section before its `What would settle it`
+///   line. An ATX heading requires a space after the run of hashes.
+/// * The run is **one to six** hashes. CodeRabbit pointed out that `#######` is not a heading in
+///   CommonMark, so accepting it would let a non-heading line create an artificial section boundary and
+///   cut an anchor short.
 fn is_heading(line: &str) -> bool {
     let h = line.trim_start();
     let hashes = h.chars().take_while(|c| *c == '#').count();
-    hashes > 0 && h.chars().nth(hashes) == Some(' ')
+    (1..=6).contains(&hashes) && h.chars().nth(hashes) == Some(' ')
 }
 
-/// The lines of the section introduced by the heading that contains `id`, up to the next heading.
+/// Whether a heading line *declares* `id` — the ID begins its content and ends at a boundary.
+///
+/// A `contains` test is exploitable, and CodeRabbit demonstrated it: a heading reading
+/// `### Notes on HQP-C-0240` sits before the real `HQP-C-024` anchor, matches it on substring, and can
+/// carry an unrelated acquisition plan while the real anchor's plan is deleted — so
+/// `every_unsettled_claim_names_an_owner_and_what_would_settle_it` passes on a hijacked section. The
+/// topic-map check cannot see it either, because the claim row itself is untouched.
+fn heading_declares(line: &str, id: &str) -> bool {
+    let h = line.trim_start();
+    let hashes = h.chars().take_while(|c| *c == '#').count();
+    let content = h[hashes..].trim_start();
+    match content.strip_prefix(id) {
+        // A boundary is anything that cannot extend the identifier: `HQP-C-0240` must not match
+        // `HQP-C-024`, while `HQP-C-024 — …` and `HQP-C-023's …` must.
+        Some(rest) => rest
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_'),
+        None => false,
+    }
+}
+
+/// The lines of the section whose heading declares `id`, up to the next heading.
 fn anchor_section(text: &str, id: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
-    let start = lines.iter().position(|l| is_heading(l) && l.contains(id))?;
+    let start = lines
+        .iter()
+        .position(|l| is_heading(l) && heading_declares(l, id))?;
     let end = lines[start + 1..]
         .iter()
         .position(|l| is_heading(l))
