@@ -30,6 +30,7 @@ use unified_hifi_control::bus::create_bus;
 
 use mock_servers::hqplayer::corpus::{self, LEGACY_PROFILE, VERIFIED_PROFILE};
 use mock_servers::hqplayer::model::{request_attr, DaemonModel, DocumentStyle, Metadata};
+use mock_servers::hqplayer::tier1;
 use mock_servers::hqplayer::wire::{Chunking, Disruption, WirePolicy, WireServer};
 
 // =============================================================================
@@ -1449,6 +1450,122 @@ async fn continuous_unsolicited_traffic_cannot_extend_the_command_deadline() {
          the push stream. err={} frames_streamed={consumed} (a 300ms deadline at one frame per 20ms \
          should consume well under 60 across both attempts)",
         result.is_err()
+    );
+    h.stop();
+}
+
+// =============================================================================
+// Tier-1 read-only live verification (ADR 003) — exercised hermetically here
+// =============================================================================
+
+/// The differ is the whole value of tier 1, so it has to be proven to *detect* rather than assumed.
+/// Run against the fake serving the very corpus it is diffing, a clean run must find nothing.
+#[tokio::test]
+async fn tier1_finds_no_divergence_when_the_daemon_serves_the_corpus_it_is_diffed_against() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter)
+        .await
+        .expect("capture the fake daemon");
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+    assert!(
+        report.is_clean(),
+        "a daemon serving this exact corpus must produce no divergences, else the differ is \
+         reporting noise:\n{}",
+        report.render()
+    );
+    h.stop();
+}
+
+/// The other half, and the one that matters: a daemon whose lists disagree with the corpus must be
+/// caught, naming the family, the entry and both numbers. The legacy profile reorders the same filter
+/// names deliberately, so diffing a legacy daemon against the 6.0.4 corpus is a known mismatch.
+#[tokio::test]
+async fn tier1_reports_index_divergence_when_the_daemon_orders_a_list_differently() {
+    let h = Harness::start(LEGACY_PROFILE, WirePolicy::default(), fast_timeouts()).await;
+    h.adapter.connect().await.expect("connect");
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+
+    let index_mismatches: Vec<&tier1::Divergence> = report
+        .divergences
+        .iter()
+        .filter(|d| d.kind == tier1::DivergenceKind::IndexMismatch)
+        .collect();
+    assert!(
+        !index_mismatches.is_empty()
+            && index_mismatches
+                .iter()
+                .any(|d| d.detail.contains("poly-sinc-lp")),
+        "poly-sinc-lp sits at index 2 on the legacy daemon and index 6 in the 6.0.4 corpus; tier 1 \
+         must report that as an index divergence naming both numbers. Got:\n{}",
+        report.render()
+    );
+    h.stop();
+}
+
+/// A tier-1 report is only useful if it is honest about what it could not reach. A read-only run
+/// cannot see the inactive mode's lists, because reaching them needs `SetMode`.
+#[tokio::test]
+async fn tier1_records_the_inactive_mode_lists_as_not_captured() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+    assert!(
+        report
+            .not_captured
+            .iter()
+            .any(|n| n.contains("SetMode") && n.contains("tier 2")),
+        "the report must say the inactive mode's lists were not reached and why, so a clean run \
+         cannot imply per-mode coverage it did not have. not_captured={:?}",
+        report.not_captured
+    );
+    h.stop();
+}
+
+/// Container delivery time is the evidence `HqpTimeouts::response` should be set from, so a capture
+/// has to record it per family rather than leaving the value inherited.
+#[tokio::test]
+async fn tier1_records_container_delivery_time_per_family() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let missing: Vec<&str> = [
+        "getinfo",
+        "state",
+        "status",
+        "volume_range",
+        "modes",
+        "filters",
+        "shapers",
+        "rates",
+    ]
+    .into_iter()
+    .filter(|f| !capture.latencies.contains_key(*f))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "every captured family needs a delivery time, else response cannot be set from evidence; \
+         missing {missing:?}"
+    );
+    h.stop();
+}
+
+/// Skips should be zero against a well-behaved daemon; a non-zero count on real hardware is the
+/// signal that the reply-element invariant is narrower than the reference implies. Either way the
+/// count has to be observable, which means the client has to actually track it.
+#[tokio::test]
+async fn tier1_records_how_many_unsolicited_documents_the_client_skipped() {
+    let h = Harness::with_policy(WirePolicy {
+        coalesce_extra_for_element: Some(("State".to_string(), PUSH_STATUS_FRAME.to_string())),
+        ..WirePolicy::default()
+    })
+    .await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    assert!(
+        capture.unsolicited_skipped > 0,
+        "this daemon emits an unsolicited frame after every State, so the capture must report a \
+         non-zero skip count; got {}",
+        capture.unsolicited_skipped
     );
     h.stop();
 }

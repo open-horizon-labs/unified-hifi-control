@@ -816,6 +816,15 @@ impl HqpAdapter {
         state.host.is_some() && state.web_username.is_some() && state.web_password.is_some()
     }
 
+    /// How many unsolicited documents this client has skipped while awaiting command replies.
+    ///
+    /// Diagnostics for tier-1 live verification: the reply-element invariant says a skip should never
+    /// happen against a well-behaved daemon, so a non-zero count on real hardware is the signal that
+    /// the invariant does not hold as broadly as the reference implies.
+    pub async fn unsolicited_skipped(&self) -> u32 {
+        0 // STUB - counted for real in the GREEN commit.
+    }
+
     /// Current timeout/retry policy.
     pub async fn timeouts(&self) -> HqpTimeouts {
         self.state.read().await.timeouts

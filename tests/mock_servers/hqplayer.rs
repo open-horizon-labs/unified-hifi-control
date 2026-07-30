@@ -9,6 +9,7 @@
 
 pub mod corpus;
 pub mod model;
+pub mod tier1;
 pub mod wire;
 
 use std::net::SocketAddr;
