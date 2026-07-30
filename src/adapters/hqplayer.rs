@@ -32,7 +32,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
@@ -171,13 +171,43 @@ pub mod framing {
     /// Pure and cheap, so it can be exercised exhaustively at every byte offset of a document
     /// without a socket.
     pub fn classify(buf: &str) -> Framing {
+        match scan(buf) {
+            Scan::Complete(_) => Framing::Complete,
+            Scan::Incomplete => Framing::Incomplete,
+            Scan::Malformed => Framing::Malformed,
+        }
+    }
+
+    /// Byte offset just past the end of the **first** complete document in `buf`.
+    ///
+    /// `None` when the buffer holds no complete document, for either reason. This is what lets a
+    /// caller drop one document from an accumulated buffer while keeping whatever was coalesced
+    /// behind it: discarding the whole buffer would throw away a reply that had already arrived in the
+    /// same read.
+    pub fn first_document_end(buf: &str) -> Option<usize> {
+        match scan(buf) {
+            Scan::Complete(end) => Some(end),
+            _ => None,
+        }
+    }
+
+    /// Outcome of one framing walk. [`classify`] and [`first_document_end`] are both projections of
+    /// it, so there is one traversal to keep correct rather than two that can disagree.
+    enum Scan {
+        /// A document ended at this byte offset.
+        Complete(usize),
+        Incomplete,
+        Malformed,
+    }
+
+    fn scan(buf: &str) -> Scan {
         // A buffer whose first element is a closing tag can never become a document, however much
         // more arrives. This is exactly the leftover a truncating reader produces, so catching it
         // here turns a silent desync into a reported error. quick_xml raises a generic parse error
         // for it, which is indistinguishable from "truncated mid-token", hence the explicit check.
         if let Some(rest) = skip_prologue(buf) {
             if rest.starts_with("</") {
-                return Framing::Malformed;
+                return Scan::Malformed;
             }
         }
 
@@ -201,41 +231,33 @@ pub mod framing {
                         // Depth counting alone accepts `<State …></Status>`: one element opened and
                         // one closed. Comparing names is what makes that a rejection.
                         Some(expected) if expected.as_str() != closing.as_ref() => {
-                            return Framing::Malformed
+                            return Scan::Malformed
                         }
                         // A closing tag with nothing open: the leftover tail of a document that a
                         // previous read truncated. Never a valid document on its own.
-                        None => return Framing::Malformed,
-                        Some(_) if open.is_empty() => return Framing::Complete,
+                        None => return Scan::Malformed,
+                        Some(_) if open.is_empty() => {
+                            return Scan::Complete(reader.buffer_position() as usize)
+                        }
                         Some(_) => {}
                     }
                 }
                 Ok(Event::Empty(_)) => {
                     if open.is_empty() {
-                        return Framing::Complete;
+                        return Scan::Complete(reader.buffer_position() as usize);
                     }
                 }
-                // Ran out of bytes. Normally that means more is coming — but if the root's own
-                // closing tag is sitting at the end of the buffer, the frame *is* closed and only
-                // the children are unreadable. See `root_frame_closed`.
-                Ok(Event::Eof) => {
-                    return if root_frame_closed(buf) {
-                        Framing::Complete
-                    } else {
-                        Framing::Incomplete
+                // Ran out of bytes, or hit a token quick_xml cannot read. Normally that means more is
+                // coming — but if the root's own closing tag is already present, the frame *is* closed
+                // and only the children are unreadable. See `root_frame_end`.
+                Ok(Event::Eof) | Err(_) => {
+                    return match root_frame_end(buf) {
+                        Some(end) => Scan::Complete(end),
+                        None => Scan::Incomplete,
                     }
                 }
                 // Declaration, text, comments and processing instructions carry no framing weight.
                 Ok(_) => {}
-                // quick_xml cannot distinguish "truncated mid-token" from "genuinely broken", so a
-                // parse error means keep reading unless the frame is demonstrably closed.
-                Err(_) => {
-                    return if root_frame_closed(buf) {
-                        Framing::Complete
-                    } else {
-                        Framing::Incomplete
-                    }
-                }
             }
         }
     }
@@ -259,7 +281,7 @@ pub mod framing {
     /// * It is consulted only when the parse could not complete on its own, so every well-formed
     ///   document takes the unchanged path.
     ///
-    /// Reaching here with the buffer ending in `</root>` is itself the diagnosis: had that tag been
+    /// Reaching here with the root's closing tag present is itself the diagnosis: had that tag been
     /// parsed as an end event, the element stack would have emptied and `Complete` would already
     /// have been returned.
     ///
@@ -269,11 +291,36 @@ pub mod framing {
     /// The root's name comes from [`root_element`] rather than a private scan, so this shares one
     /// tokeniser with the rest of the module. A self-closing root cannot reach here at all: quick_xml
     /// reports it as `Event::Empty`, which the loop above answers before any child is read.
-    fn root_frame_closed(buf: &str) -> bool {
-        match root_element(buf) {
-            Some(name) => buf.trim_end().ends_with(&format!("</{name}>")),
-            None => false,
+    ///
+    /// The boundary is the **first defensible** occurrence of the root's closing tag, not the last
+    /// token in the buffer. Requiring it last was simpler but wrong in a case the daemon actually
+    /// produces: it emits malformed XML inside `<metadata>` *and* pushes `Status` frames unprompted,
+    /// so a hostile reply with a push frame coalesced behind it would have gone unrecovered and cost
+    /// the whole deadline. "First defensible" keeps the guarantees that mattered:
+    ///
+    /// * The scan tracks attribute quoting, so a `</Status>` literal inside an attribute value is
+    ///   data and never a boundary.
+    /// * A document truncated before its root close has no boundary to find, so it stays incomplete.
+    /// * A mismatched root is decided by the name-comparison path above, which is reached first.
+    ///
+    /// An *unterminated* attribute quote is the one shape this cannot resolve, and deliberately so:
+    /// with the quote still open there is no way to tell markup from data, so the scan declines to
+    /// find a boundary rather than guessing at one.
+    fn root_frame_end(buf: &str) -> Option<usize> {
+        let name = root_element(buf)?;
+        let close = format!("</{name}>");
+        let bytes = buf.as_bytes();
+        let mut in_quote = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => in_quote = !in_quote,
+                b'<' if !in_quote && buf[i..].starts_with(&close) => return Some(i + close.len()),
+                _ => {}
+            }
+            i += 1;
         }
+        None
     }
 
     /// Skip leading whitespace, XML declarations, comments and processing instructions.
@@ -479,6 +526,15 @@ const MAX_UNSOLICITED_BACKLOG: u32 = 256;
 /// mid-line check would need the reader to hand back a partial line — and it is stated because
 /// "4 MiB" would otherwise read as a hard bound on the allocation rather than on the accumulation.
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Size of one socket read while accumulating a reply.
+///
+/// Fixed and stack-allocated, which is what makes [`MAX_RESPONSE_BYTES`] a bound on *allocation*: the
+/// ceiling is compared against `already_held + n` before anything is appended, so the accumulated
+/// buffer can never exceed it and the read itself can never exceed this. 8 KiB comfortably holds the
+/// largest observed container in one or two reads without making a small reply pay for a large
+/// buffer.
+const RESPONSE_READ_CHUNK: usize = 8 * 1024;
 
 /// HQPlayer state information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1201,7 +1257,12 @@ impl HqpAdapter {
         // first `/>` truncates any container with a self-closing child (notably
         // `<Status …><metadata …/></Status>`) and leaves its closing tag in the socket for the next
         // command to consume. See the `framing` module.
-        let mut response = String::new();
+        // Accumulated as bytes and read in fixed-size chunks, so the ceiling below is a bound on what
+        // is **allocated** and not merely on what is retained. An earlier revision read whole lines
+        // and checked afterwards, which bounds nothing: `read_line` grows its target until it finds a
+        // newline or the peer closes, so one newline-free line is unbounded however small the cap.
+        let mut raw: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; RESPONSE_READ_CHUNK];
         let mut complete = false;
         let mut skipped = 0u32;
 
@@ -1215,19 +1276,17 @@ impl HqpAdapter {
                 return Err(anyhow!("Response timeout"));
             }
 
-            let mut line = String::new();
-            let read_result = timeout(remaining, conn.stream.read_line(&mut line)).await;
+            let read_result = timeout(remaining, conn.stream.read(&mut chunk)).await;
 
             match read_result {
                 Ok(Ok(0)) => break, // EOF
-                Ok(Ok(_)) => {
-                    response.push_str(&line);
-                    // Memory bound, checked before classification: an unbounded container must not
-                    // be allowed to grow for the whole deadline. Returning an error here is enough
-                    // to recover, because `send_command`'s wrapper marks the connection
-                    // disconnected on any inner failure, so the next command reconnects onto a
-                    // clean stream rather than reading this reply's tail.
-                    if response.len() > MAX_RESPONSE_BYTES {
+                Ok(Ok(n)) => {
+                    // Checked **before** the append, against a fixed-size chunk that has already
+                    // landed on the stack. Nothing unbounded is ever allocated. Returning an error is
+                    // enough to recover: `send_command`'s wrapper marks the connection disconnected
+                    // on any inner failure, so the next command reconnects onto a clean stream rather
+                    // than reading this reply's tail.
+                    if raw.len() + n > MAX_RESPONSE_BYTES {
                         return Err(anyhow!(
                             "Response exceeded {} bytes awaiting a {} reply; discarding the \
                              connection rather than accumulating further",
@@ -1235,9 +1294,34 @@ impl HqpAdapter {
                             expected_element.unwrap_or_default()
                         ));
                     }
-                    match framing::classify(&response) {
+                    let fresh = &chunk[..n];
+                    raw.extend_from_slice(fresh);
+
+                    // A newline is a **hint**, not a frame: documents are newline-terminated but may
+                    // contain internal newlines. Attempting to frame only when one arrives keeps the
+                    // classification frequency at roughly once per document, as it was when this loop
+                    // read whole lines. Classifying on every chunk instead would re-parse the whole
+                    // accumulated buffer per chunk, which is quadratic in a large reply. A reply with
+                    // no newline at all never frames — and is exactly what the ceiling above stops.
+                    if !fresh.contains(&b'\n') {
+                        continue;
+                    }
+
+                    // Classify the longest valid UTF-8 prefix. A multi-byte character can straddle a
+                    // chunk boundary, so the tail of `raw` may be a partial sequence; it is not
+                    // discarded, only excluded from this attempt until its remaining bytes arrive.
+                    let response = match std::str::from_utf8(&raw) {
+                        Ok(s) => s,
+                        Err(e) => match std::str::from_utf8(&raw[..e.valid_up_to()]) {
+                            Ok(s) => s,
+                            // Unreachable by construction: `valid_up_to` is a valid boundary.
+                            Err(_) => continue,
+                        },
+                    };
+
+                    match framing::classify(response) {
                         framing::Framing::Complete => {
-                            let got = framing::root_element(&response);
+                            let got = framing::root_element(response);
                             if expected_element.is_some() && got != expected_element {
                                 // An unsolicited document shared this read — the daemon emits
                                 // `Status` push frames of its own accord. Drop it and keep waiting
@@ -1260,8 +1344,45 @@ impl HqpAdapter {
                                     got,
                                     expected_element
                                 );
-                                response.clear();
+                                // Drop only the skipped document, never the whole buffer. One read
+                                // can carry an unsolicited frame *and* the wanted reply behind it, so
+                                // clearing would discard a reply that had already arrived. Falling
+                                // back to a clear when the boundary is unknown is unreachable —
+                                // `Complete` is what got us here — and is written as a total match
+                                // rather than an unwrap.
+                                match framing::first_document_end(response) {
+                                    Some(end) => {
+                                        raw.drain(..end);
+                                    }
+                                    None => raw.clear(),
+                                }
                             } else {
+                                // The wanted reply. Anything coalesced *behind* it in the same read is
+                                // an unsolicited follower: count it and drop it here rather than
+                                // leaving it in the stream.
+                                //
+                                // Leaving it was the previous behaviour, and it was worse in two ways.
+                                // A stale pushed `Status` left in the buffer is the right *element* for
+                                // a later `Status` command, so it could be handed over as that
+                                // command's reply — a stale document passing for a fresh one. And the
+                                // reply this call returned could carry a second document concatenated
+                                // onto it, which only went unnoticed because attribute reads scope to
+                                // the root tag.
+                                if let Some(end) = framing::first_document_end(response) {
+                                    let mut rest = &response[end..];
+                                    while let Some(next) = framing::first_document_end(rest) {
+                                        skipped += 1;
+                                        self.unsolicited_skipped
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        tracing::debug!(
+                                            "Dropping unsolicited HQPlayer document coalesced behind a \
+                                             {:?} reply",
+                                            expected_element
+                                        );
+                                        rest = &rest[next..];
+                                    }
+                                    raw.truncate(end);
+                                }
                                 complete = true;
                             }
                         }
@@ -1282,11 +1403,13 @@ impl HqpAdapter {
         if !complete {
             return Err(anyhow!(
                 "Connection closed mid-document after {} bytes",
-                response.len()
+                raw.len()
             ));
         }
 
-        Ok(response.trim().to_string())
+        // Lossless: the loop only completes on a buffer whose valid UTF-8 prefix framed a document, so
+        // any trailing partial sequence belongs to a coalesced follower and not to this reply.
+        Ok(String::from_utf8_lossy(&raw).trim().to_string())
     }
 
     // =========================================================================
