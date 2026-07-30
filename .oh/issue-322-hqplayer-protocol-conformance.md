@@ -898,4 +898,3 @@ records why the public knob was wrong so nobody re-adds it.
 Reproduced at test scale before the fix — `continuous_unsolicited_traffic_cannot_extend_the_command_deadline`
 consumed **133 frames on a 300 ms budget** (~2.7 s), and the suite's own wall time went 0.65 s → 2.89 s.
 Both are back to normal after it.
-

@@ -275,4 +275,3 @@ Because tier 2 needs hardware nobody should volunteer casually, the honest posit
   deterministic `/hqp/discover` multicast 500s, and the pre-existing ~1-in-10
   `error_handling::lms_fails_gracefully_when_unconfigured` concurrency flake in `adapter_integration`
   (green 4/4 under `--test-threads=1`; the file is byte-identical to `v3`).
-

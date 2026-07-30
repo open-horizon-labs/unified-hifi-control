@@ -1233,8 +1233,19 @@ async fn tier1_live_read_only_verification_when_opted_in() {
         .unwrap_or_else(|e| panic!("tier-1 capture from {host}:{port}: {e}"));
     let report = tier1::diff(&capture, &profile);
 
-    // Printed unconditionally: the report is the deliverable, not the pass/fail bit.
+    // Printed unconditionally: the report is the deliverable, not the pass/fail bit. Both forms go
+    // out — the render for whoever is in the room, the marker-bracketed artifact for CI to store and
+    // a later run to diff against.
     eprintln!("\n{}", report.render());
+    eprintln!("\n{}", report.artifact_block());
+    if let Ok(path) = std::env::var("UHC_HQP_CONFORMANCE_ARTIFACT") {
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&report.to_json()).expect("serialise"),
+        )
+        .unwrap_or_else(|e| panic!("write tier-1 artifact to {path}: {e}"));
+        eprintln!("tier-1 artifact written to {path}");
+    }
 
     assert!(
         report.is_clean(),
@@ -1829,24 +1840,24 @@ async fn tier1_emits_the_artifact_between_stable_markers() {
 /// reported like any other missing entry.
 #[tokio::test]
 async fn tier1_diffs_the_matrix_profile_list_against_the_corpus() {
-    let h = Harness::start(LEGACY_PROFILE, WirePolicy::default(), fast_timeouts()).await;
-    h.adapter.connect().await.expect("connect");
-    // The legacy profile has no matrix fixture, so it falls back to the verified one; instead make the
-    // daemon's own list disagree by asking the verified corpus about a daemon serving it, then
-    // removing a name the corpus claims.
+    let h = Harness::verified().await;
     let capture = tier1::capture(&h.adapter).await.expect("capture");
+    // Drop a profile the corpus claims, leaving matrix as the only thing that can diverge.
+    // "Speakers" is in matrix_profiles.xml; "Headphones" is in the /config form fixture, which is a
+    // different family entirely — an easy confusion, and picking the wrong one is how this test first
+    // passed vacuously.
     let mut trimmed = capture.clone();
     trimmed
         .enumerations
         .get_mut("matrix")
         .expect("matrix captured")
-        .retain(|e| e.name != "Headphones");
+        .retain(|e| e.name != "Speakers");
 
     let report = tier1::diff(&trimmed, VERIFIED_PROFILE);
     assert!(
         report.divergences.iter().any(|d| d.family.contains("matrix")
             && d.kind == tier1::DivergenceKind::MissingEntry
-            && d.detail.contains("Headphones")),
+            && d.detail.contains("Speakers")),
         "a matrix profile the corpus claims and the daemon lacks must be a MissingEntry divergence \
          on the matrix family. Got: {:?}",
         report.divergences

@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use unified_hifi_control::adapters::hqplayer::HqpAdapter;
+use unified_hifi_control::adapters::hqplayer::{framing, HqpAdapter};
 
 use super::corpus::{self, EnumEntry};
 
@@ -205,7 +205,11 @@ impl Report {
     /// The artifact wrapped in stable markers, so a caller can lift it out of captured stdout
     /// without scraping the human render. The markers are part of the contract.
     pub fn artifact_block(&self) -> String {
-        String::new() // STUB - emitted for real in the GREEN commit. Test-side only, no src change.
+        format!(
+            "{ARTIFACT_BEGIN}\n{}\n{ARTIFACT_END}",
+            serde_json::to_string_pretty(&self.to_json())
+                .unwrap_or_else(|e| format!("{{\"error\":\"serialisation failed: {e}\"}}"))
+        )
     }
 
     /// Machine-readable artifact for CI to store and later runs to compare against.
@@ -238,6 +242,31 @@ impl Report {
                 "entries": self.capture.enumerations.get(name).map(|e| e.len()),
                 "within_deadline": self.within_deadline.get(name).copied().unwrap_or(false),
             })).collect::<Vec<_>>(),
+            // The normalized capture itself, so a later run can be compared against this one without
+            // scraping the human render. Everything here came from the daemon; nothing here came from
+            // the connection.
+            //
+            // Authority note, since some values also appear as a digest above: `capture` is the
+            // normalized state and is what a later run should diff against. The top-level fields are a
+            // convenience summary for a human or a CI dashboard, derived from exactly this data.
+            "capture": {
+                "enumerations": self.capture.enumerations.iter().map(|(family, entries)| {
+                    let rows: Vec<serde_json::Value> = entries
+                        .iter()
+                        .map(|e| serde_json::json!({
+                            "index": e.index,
+                            "name": e.name,
+                            "enum_id": e.enum_id,
+                            "rate": e.rate,
+                        }))
+                        .collect();
+                    (family.clone(), serde_json::Value::Array(rows))
+                }).collect::<serde_json::Map<String, serde_json::Value>>(),
+                "scalars": self.capture.scalars,
+                // Explicitly null when unreached, so absent-and-ambiguous is not a possible state.
+                "config_profiles": self.capture.config_profiles,
+                "matrix_current_read_failed": self.capture.matrix_current_read_failed,
+            },
             "divergences": self.divergences.iter().map(|d| serde_json::json!({
                 "family": d.family,
                 "kind": format!("{:?}", d.kind),
@@ -249,12 +278,13 @@ impl Report {
 }
 
 /// Families the corpus holds as enumerations, paired with their item tag.
-const ENUM_FAMILIES: [(&str, &str, &str); 5] = [
+const ENUM_FAMILIES: [(&str, &str, &str); 6] = [
     ("modes", "GetModes", "ModesItem"),
     ("filters", "GetFilters", "FiltersItem"),
     ("shapers", "GetShapers", "ShapersItem"),
     ("rates", "GetRates", "RatesItem"),
     ("junkfilters", "GetJunkFilters", "JunkFiltersItem"),
+    ("matrix", "MatrixListProfiles", "MatrixProfile"),
 ];
 
 /// Read every family this tier is allowed to touch.
@@ -440,7 +470,14 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
             timed("matrix_current", t.elapsed(), &mut c);
             c.current_matrix_profile = None;
         }
-        Err(e) => tracing::warn!("tier-1: MatrixGetProfile unavailable: {e}"),
+        Err(e) => {
+            // A read failure and "no current selection" are different facts, and None cannot tell
+            // them apart. The error text is logged but deliberately not stored in the capture: it can
+            // contain the address the client was talking to, and the artifact must stay free of that.
+            tracing::warn!("tier-1: MatrixGetProfile unavailable: {e}");
+            c.matrix_current_read_failed = true;
+            c.current_matrix_profile = None;
+        }
     }
 
     c.response_deadline = adapter.timeouts().await.response;
@@ -513,9 +550,21 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
             ("shapers", _) => "shapers_pcm".to_string(),
             ("rates", 2) => "rates_sdm".to_string(),
             ("rates", _) => "rates_pcm".to_string(),
+            ("matrix", _) => "matrix_profiles".to_string(),
             (other, _) => other.to_string(),
         };
-        let expected = corpus::enum_entries(&corpus::document(profile, &doc_stem), item_tag);
+        // Corpus documents hold attribute values in escaped wire form; the client returns them
+        // decoded. Compare in the decoded domain, using the very function the client uses, or every
+        // name carrying an entity - a matrix profile called "Rock & Roll", say - reads as a
+        // divergence on both sides at once.
+        let expected: Vec<EnumEntry> =
+            corpus::enum_entries(&corpus::document(profile, &doc_stem), item_tag)
+                .into_iter()
+                .map(|mut e| {
+                    e.name = framing::decode_entities(&e.name);
+                    e
+                })
+                .collect();
 
         if stem == "rates" {
             diff_rates(&mut report, stem, &expected, observed);
@@ -612,6 +661,48 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
                     });
                 }
             }
+        }
+    }
+
+    // The current selection has to be coherent with the daemon's own two views of it.
+    if capture.matrix_current_read_failed {
+        report.not_captured.push(
+            "MatrixGetProfile — read failed, so the current selection is unknown. Distinct from a \
+             daemon reporting no selection; the failure detail is logged, not stored, because it can \
+             carry the daemon address"
+                .into(),
+        );
+    } else if let Some((_, current)) = &capture.current_matrix_profile {
+        let listed = capture
+            .enumerations
+            .get("matrix")
+            .map(|list| list.iter().any(|e| &e.name == current))
+            .unwrap_or(false);
+        if !listed {
+            report.divergences.push(Divergence {
+                family: "matrix_current".into(),
+                kind: DivergenceKind::MissingEntry,
+                detail: format!(
+                    "MatrixGetProfile reports {current:?} as current, but it is absent from this \
+                     daemon's own MatrixListProfiles"
+                ),
+            });
+        }
+        let from_state = capture
+            .scalars
+            .get("state")
+            .and_then(|m| m.get("matrix_profile"))
+            .cloned()
+            .unwrap_or_default();
+        if !from_state.is_empty() && &from_state != current {
+            report.divergences.push(Divergence {
+                family: "matrix_current".into(),
+                kind: DivergenceKind::AttributePresence,
+                detail: format!(
+                    "the daemon's two views of the current matrix profile disagree: \
+                     MatrixGetProfile says {current:?}, State.matrix_profile says {from_state:?}"
+                ),
+            });
         }
     }
 
