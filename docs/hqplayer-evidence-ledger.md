@@ -106,10 +106,11 @@ were **not executed** and are recorded as gaps in that comment.
 | ID | Claim | Class | Provenance | Proof | Status | Owner |
 |---|---|---|---|---|---|---|
 | HQP-C-001 | `SetMode value=` carries the **list index**, not the enum ID: SDM is index 2 while its enum ID is 1 | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:modes_list_distinguishes_list_index_from_enum_id · fixture:tests/fixtures/hqplayer/hqpd-6.0.4-opal/modes.xml | settled | — |
-| HQP-C-002 | Domain 1 — the **live wire** domain: `State.mode/filter/filter1x/filterNx/shaper/rate` and the **enumerated** setters (`SetMode`, `SetFilter`, `SetShaping`, `SetRate`, `SetJunkFilter`) speak a **list index** into the currently loaded enumeration. Volume is **not** in this domain — it is absolute dB (HQP-C-040) | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it · test:a_filter_name_is_not_sent_as_its_enum_id | settled | — |
+| HQP-C-002 | Domain 1 — the **live wire** domain: `State.mode/filter/filter1x/filterNx/shaper/rate` and the **enumerated** setters (`SetMode`, `SetFilter`, `SetShaping`, `SetRate`, `SetJunkFilter`) speak a **list index** into the currently loaded enumeration. Volume is **not** in this domain — it is absolute dB (HQP-C-040). Commands evidenced elsewhere: SetShaping (HQP-C-064), SetJunkFilter (HQP-C-051) | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it · test:a_filter_name_is_not_sent_as_its_enum_id · test:a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain · test:a_rate_valid_in_one_chain_is_refused_in_the_other | settled | — |
 | HQP-C-003 | Domain 2 — the **persistent** domain: `hqplayerd.xml` and the 8088 config form store **enum IDs**, which are not list indices and must never be fed to the live lane | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-hqplayer-protocol-conformance.md` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_persistent_configuration_lane_stores_enum_ids_not_list_indices · test:feeding_a_persistent_enum_id_to_the_live_lane_is_rejected | settled | — |
 | HQP-C-004 | Domain 3 — the **client** domain **as designed**: clients exchange setting-appropriate values — semantic names for mode/filter/shaper, Hz for rate, decimal dB for volume — and the adapter owns both numeric conversions. **This is the design rule, not a description of every path today**: see HQP-C-063 | E6-documentary | `.oh/hqplayer-spec.md` layer table · direct · n/a · 2026-02-04 · n/a | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it | settled | — |
 | HQP-C-063 | Raw indices **do** cross the client boundary today, in two evidenced places: the legacy numeric route `HqpSettingRequest { name: String, value: u32 }` stringifies its number for name-based lookup (`src/api/mod.rs:825-836`), and the adapter's resolvers fall back to parsing a numeric string as a direct index (`resolve_mode_index:2081`, `resolve_filter_index:2186`, `resolve_shaper_index:2247`) | E6-documentary | `src/api/mod.rs` and `src/adapters/hqplayer.rs` at this head · direct · n/a · 2026-07-30 · n/a | none:#347 removing the raw integer-string fallback from production control paths while keeping the legacy numeric HTTP contract at the compatibility boundary | open | #347 |
+| HQP-C-064 | **No conformance expectation drives `set_shaper`**, so the shaper setter's behaviour is L1-observed only — `shaper 24→0→24`, `result="OK"`, readback-verified on the live run — and unpinned hermetically | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | none:a conformance expectation that drives `set_shaper` and verifies the readback; the fake already applies `SetShaping` (`model.rs`), so only the expectation is missing | open | #329 |
 | HQP-C-005 | `SetMode` does **not** reset the filter or shaper selections; the fake once modelled that and no evidence supports it | E3-derived | `.oh/issue-322-…` amendment row B14 · direct · hqplayerd 6.0.4 (Opal) · 2026-07-30 · unknown | test:set_mode_does_not_reset_the_filter_and_shaper_selections | settled | — |
 | HQP-C-006 | A mode change reloads the chain, so a list index resolved before it can name a **different** setting after it | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain · test:the_same_filter_index_selects_a_different_filter_per_loaded_chain | settled | — |
 | HQP-C-007 | Under configured `[source]` the **loaded chain** can move between PCM and SDM while `State.mode` stays 0 | E1-upstream-verified | UHC-SALVAGE-BETA-DEV via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_loaded_chain_moves_under_source_while_the_configured_mode_stays_source | settled | — |
@@ -173,7 +174,7 @@ withdrawn.
 |---|---|---|---|---|---|---|
 | HQP-C-027 | Setters and transport commands **echo the request element** carrying `result="OK"` or `result="Error"` with a reason as element text; an **absent** `result` is a third legitimate case, and `<Ok/>` is a shape the daemon never sends | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:an_explicitly_rejected_setter_reports_the_daemon_reason · test:a_rejected_setter_is_reported_as_an_error_without_dropping_the_connection | settled | — |
 | HQP-C-028 | `result="OK"` is **not proof of application**: a setter can answer OK without applying, and a change can land a poll later | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:a_setter_accepted_but_not_applied_does_not_report_success · test:a_setter_whose_change_lands_after_a_poll_still_reports_success | settled | — |
-| HQP-C-029 | A **timeout or disconnect after a write attempt is ambiguous delivery**, never proof of non-application: on HQPlayer Embedded 6.0.4 a `SetMode` was accepted, logged and acted on while the daemon sent no response and later dropped the connection | E1-upstream-verified | HQPTuner `origin/dev@04ab82e148c8db8ffbcccd4c3c3e69cce7332b64` via #341 body · read-via-issue · HQPlayer Embedded 6.0.4 · 2026-07-30 · unknown | test:next_advances_one_track_when_the_reply_is_lost_after_the_daemon_applied_it · test:volume_mute_retries_and_converges_when_the_reply_is_lost_after_the_daemon_applied_it | open | #332 |
+| HQP-C-029 | A **timeout or disconnect after a write attempt is ambiguous delivery**, never proof of non-application: on HQPlayer Embedded 6.0.4 a `SetMode` was accepted, logged and acted on while the daemon sent no response and later dropped the connection. Commands evidenced elsewhere: SetMode (the upstream observation itself; the cited proofs exercise the same reply-loss shape with `Next` and `VolumeMute`, which is the portable rule) | E1-upstream-verified | HQPTuner `origin/dev@04ab82e148c8db8ffbcccd4c3c3e69cce7332b64` via #341 body · read-via-issue · HQPlayer Embedded 6.0.4 · 2026-07-30 · unknown | test:next_advances_one_track_when_the_reply_is_lost_after_the_daemon_applied_it · test:volume_mute_retries_and_converges_when_the_reply_is_lost_after_the_daemon_applied_it | open | #332 |
 | HQP-C-030 | A **relative or sequential** one-shot (`Next`, `Previous`, `VolumeUp`, `VolumeDown`) is never retried once its write is attempted: the protocol carries no request identity, so a retry doubles the side effect | E1-upstream-verified | `.oh/issue-322-…` execution record · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:next_advances_one_track_when_the_reply_is_lost_after_the_daemon_applied_it | settled | — |
 | HQP-C-031 | `VolumeMute` is an **absolute mute-to-floor and idempotent** — three live calls held −60 dB, unmute is a separate `<Volume>` write, and `State` exposes no mute flag — so it is retry-safe | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:mute_is_absolute_and_idempotent_on_the_daemon · test:volume_mute_retries_and_converges_when_the_reply_is_lost_after_the_daemon_applied_it | settled | — |
 | HQP-C-032 | A setter **overridden by another controller** is indistinguishable from one the daemon dropped; both fail, and the error names the value the daemon actually reports | E3-derived | `.oh/issue-322-…` stage-2 dissent · direct · hqplayerd 6.0.4 (Opal) · 2026-07-29 · unknown | test:a_setter_overridden_by_another_controller_fails_and_names_the_observed_value | settled | — |
@@ -219,8 +220,8 @@ withdrawn.
 
 | ID | Claim | Class | Provenance | Proof | Status | Owner |
 |---|---|---|---|---|---|---|
-| HQP-C-050 | The 20 kHz filter is `filter_junk`, an **int index** into `GetJunkFilters` — not a boolean `filter_20k` — and the wire element is `SetJunkFilter` | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_junk_filter_is_read_as_a_list_index_not_a_boolean | settled | — |
-| HQP-C-051 | `SetJunkFilter` round-tripped `filter_junk 0→1→0` with `result="OK"` on L1 — the daemon capability is real | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:the_junk_filter_is_read_as_a_list_index_not_a_boolean | settled | — |
+| HQP-C-050 | The 20 kHz filter is `filter_junk`, an **int index** into `GetJunkFilters` — not a boolean `filter_20k` — and the wire element is `SetJunkFilter`. Commands evidenced elsewhere: SetJunkFilter (HQP-C-051; the cited test covers the read side only) | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_junk_filter_is_read_as_a_list_index_not_a_boolean | settled | — |
+| HQP-C-051 | `SetJunkFilter` round-tripped `filter_junk 0→1→0` with `result="OK"` on L1 — the daemon capability is real, and **no hermetic test covers it**: the observation is live-only | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | none:a conformance expectation that drives the raw `SetJunkFilter` command and verifies the readback; the fake already implements it (`model.rs:994`) so only the expectation is missing | open | #329 |
 | HQP-C-062 | UHC's adapter exposes **no** `set_junk_filter`, so no surface can reach that daemon capability | E6-documentary | `src/adapters/hqplayer.rs` at this head · direct · n/a · 2026-07-30 · n/a | test:tests/hqplayer_ledger_lint.rs::the_adapter_exposes_no_junk_filter_setter | open | #329 |
 
 ### Licensing and provenance
@@ -273,6 +274,22 @@ update. The asymmetry is the reason one is executable and the other is not.
 
 **What would settle it:** #347 landing both halves, after which HQP-C-004's stronger wording becomes true
 and this row retires. Until then the ledger must not describe the intended state as the shipped one.
+
+### HQP-C-064 — the shaper setter has no hermetic coverage
+
+Found by **check 34**, which this PR added in response to CodeRabbit's HQP-C-051 finding: every `Set*`
+command a claim names must be exercised by one of that claim's own cited proofs. Running it flagged
+`SetShaping` in HQP-C-002, and the reason turned out to be a genuine gap rather than a citation slip —
+**no test in `tests/hqplayer_conformance.rs` calls `adapter.set_shaper`.** Verified directly: `set_mode`
+and `set_rate` are each driven by four expectations; `set_shaper` by none.
+
+So the shaper setter's behaviour rests entirely on L1: `shaper 24→0→24`, `result="OK"`, readback-verified
+against a real daemon. That is good evidence and it is **not** a regression pin — a client change could
+break `set_shaper` today and this suite would stay green.
+
+**What would settle it:** a conformance expectation that drives `set_shaper` and verifies the readback. The
+fake already applies `SetShaping`, so only the expectation is missing, which makes this a coverage gap
+rather than a capability gap — the same shape as HQP-C-051.
 
 ### HQP-C-011 — does `GetFilters` renumber a name's enum ID between chains?
 
@@ -425,6 +442,24 @@ native port and the daemon rejected it.
 **What would settle it:** an authenticated-4321 capture against a daemon configured to require
 session authentication, recording what the daemon accepts. L1 needed none (HQP-C-049), so UHC has no
 first-hand evidence either way.
+
+### HQP-C-051 — the daemon capability is observed live and untested here
+
+`SetJunkFilter` moved `filter_junk 0→1→0` with `result="OK"` on L1. That is first-hand evidence and it
+stands. What it does **not** have is a hermetic proof, and this row previously cited
+`the_junk_filter_is_read_as_a_list_index_not_a_boolean` as though it did. **It does not:** that test mutates
+the fake's state externally and asserts the adapter *reads* `filter_junk == 2`. It never sends the command,
+never checks a `result`, and never exercises a transition. CodeRabbit caught the mismatch — the fifth
+finding in this PR where wording outran its cited proof, and the first found in the place I had asked them
+to look.
+
+The row therefore carries an explicit `none:` proof with the acquisition plan, and **the lint refuses to let
+it be `settled`** on that basis (`a_claim_proved_only_by_a_future_live_row_is_not_settled`). The daemon-side
+fact is observed; the client-side coverage is absent, and the two are now visibly different things.
+
+**What would settle it:** a conformance expectation driving the raw `SetJunkFilter` command and verifying
+the readback. The fake already implements the command (`tests/mock_servers/hqplayer/model.rs:994`), so only
+the expectation is missing — which is why this is a coverage gap rather than a capability gap.
 
 ### HQP-C-062 — `SetJunkFilter` works and UHC does not expose it
 

@@ -1114,6 +1114,130 @@ fn the_retired_set_mode_value_claim_is_struck_where_it_still_appears() {
     }
 }
 
+/// Phrase after which a claim may name commands its own cited proofs do not exercise.
+///
+/// Explicit by design: the author has to say *where* the evidence is, and a reader sees it in the same
+/// cell as the claim.
+const ELSEWHERE_MARKER: &str = "Commands evidenced elsewhere:";
+
+/// Every claim's named `Set*` command must appear in at least one of its own cited proofs.
+///
+/// CodeRabbit found HQP-C-051 claiming a `SetJunkFilter` round-trip while citing a test that only *reads*
+/// `State.filter_junk` — the fifth finding in this PR where wording outran its cited proof, and the first
+/// in the place I had asked them to look. A hand sweep then found the same shape in five more rows, so the
+/// sweep is this check: a class found five times by readers is a class that should not need a reader.
+///
+/// Rows whose only proofs are `none:` or `#332:` are skipped — they have no proof body to check, and
+/// `a_claim_proved_only_by_a_future_live_row_is_not_settled` already forbids them from claiming settlement.
+#[test]
+fn every_command_a_claim_names_is_exercised_by_one_of_its_own_proofs() {
+    let conformance = read(&repo_root().join(DEFAULT_PROOF_FILE));
+    let mut bad = Vec::new();
+    for c in claims() {
+        let (claim, exempt) = match c.claim.split_once(ELSEWHERE_MARKER) {
+            Some((head, tail)) => (head.to_string(), commands_in(tail)),
+            None => (c.claim.clone(), Vec::new()),
+        };
+        let named = commands_in(&claim);
+        if named.is_empty() {
+            continue;
+        }
+        let mut bodies = String::new();
+        for proof in c.proof.split(" · ") {
+            let p = proof.trim().trim_matches('`');
+            if let Some(spec) = p.strip_prefix("test:") {
+                let name = spec.rsplit("::").next().unwrap_or(spec);
+                if let Some(body) = test_body(&conformance, name) {
+                    bodies.push_str(&body);
+                }
+            } else if let Some(rel) = p.strip_prefix("fixture:") {
+                if let Ok(doc) = fs::read_to_string(repo_root().join(rel)) {
+                    bodies.push_str(&doc);
+                }
+            }
+        }
+        if bodies.is_empty() {
+            continue; // no executable proof to check against; see the doc comment
+        }
+        for cmd in named {
+            if exempt.contains(&cmd) {
+                continue;
+            }
+            // A command counts as exercised if the proof mentions the wire element or the adapter method
+            // that emits it.
+            let method = format!("set_{}", camel_to_snake(&cmd[3..]));
+            let alt = format!("set_{}", cmd[3..].to_ascii_lowercase());
+            if !bodies.contains(&cmd) && !bodies.contains(&method) && !bodies.contains(&alt) {
+                bad.push(format!(
+                    "{} names {cmd} but no cited proof exercises it (looked for {cmd}, {method}, {alt})",
+                    c.id
+                ));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "a claim that names a command its own proofs never send is wording outrunning evidence — the class \
+         CodeRabbit found at HQP-C-051. Either cite a proof that exercises it, or name where the evidence \
+         lives after {ELSEWHERE_MARKER:?}: {bad:#?}"
+    );
+}
+
+/// `Set*` command names mentioned in a fragment.
+fn commands_in(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(&['S', 'e', 't']) {
+            let mut j = i + 3;
+            while j < bytes.len() && (bytes[j].is_alphanumeric()) {
+                j += 1;
+            }
+            if j > i + 3 && bytes[i + 3].is_uppercase() {
+                let name: String = bytes[i..j].iter().collect();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn camel_to_snake(s: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            out.push('_');
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
+}
+
+/// The body of a `#[test]`/`#[tokio::test]` function in `src`, by name.
+fn test_body(src: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines.iter().position(|l| {
+        let t = l.trim_start();
+        t.strip_prefix("async fn ")
+            .or_else(|| t.strip_prefix("fn "))
+            .and_then(|r| r.split('(').next())
+            .map(str::trim)
+            == Some(name)
+    })?;
+    // A test body ends at the first line that is exactly `}` at column zero.
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| *l == "}")
+        .map_or(lines.len(), |p| start + 1 + p);
+    Some(lines[start..end].join("\n"))
+}
+
 /// Byte ranges *inside* each `~~…~~` span on one line, delimiters excluded.
 ///
 /// An unpaired trailing `~~` opens no span, so a half-written strikethrough retires nothing.

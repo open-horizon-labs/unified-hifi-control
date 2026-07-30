@@ -902,3 +902,63 @@ description* rather than on logic: F1 (the contract text), F3 (both banners), Co
 this. Recorded as a pattern in its own right, because it is a different failure mode from the false passes
 and needs a different guard: the false passes were found by attacking the checks, and these by reading the
 prose against the code.
+
+### CodeRabbit's eighth pass at `f0bc908` — a claim/proof mismatch, and the check it forced
+
+**CR8 (P2) — HQP-C-051's cited test did not prove its claim.** The row said `SetJunkFilter` round-tripped
+`filter_junk 0→1→0` with `result="OK"` on L1, and cited
+`the_junk_filter_is_read_as_a_list_index_not_a_boolean`. Verified against the test at
+`tests/hqplayer_conformance.rs:998`: it mutates the fake's state externally and asserts the adapter *reads*
+`filter_junk == 2`. **It never sends the command, never checks a `result`, and never exercises a
+transition.** No conformance test drives `SetJunkFilter` at all — the fake implements it (`model.rs:994`)
+and nothing calls it.
+
+**Fixed by keeping the live evidence and dropping the false citation.** HQP-C-051 now carries an explicit
+`none:` proof naming the missing expectation, and **the lint refuses to let it be `settled`** on that basis
+— verified by re-marking it `settled` and watching
+`a_claim_proved_only_by_a_future_live_row_is_not_settled` fail. The daemon-side fact is observed; the
+client-side coverage is absent; the two are now visibly different things.
+
+**This was the fifth finding of one class — wording outrunning its cited proof — and the first found where I
+had asked them to look.** So the response was not another hand-fix.
+
+#### Check 34: every command a claim names must be exercised by one of its own proofs
+
+A hand sweep of all 63 rows found the same shape in five more. A class found five times by readers is a
+class that should not need a reader, so the sweep became a check: for each claim, extract every `Set*`
+command it names, gather the bodies of its own cited tests and fixtures, and require each command to appear
+in at least one. Rows whose only proofs are `none:`/`#332:` are skipped — they have no proof body, and the
+not-settled rule already constrains them. An explicit `Commands evidenced elsewhere: …` marker exempts a
+command **only by naming where its evidence lives**, in the same cell a reader is looking at.
+
+It flagged six items across three rows on its first run. Two were citation gaps with proofs available
+(HQP-C-002 now also cites the mode and rate expectations that exist). Two were legitimate
+evidence-elsewhere cases, now marked (HQP-C-029's proofs exercise the reply-loss shape with `Next` and
+`VolumeMute`, not `SetMode`; HQP-C-050's test covers the read side only). **And two were a real gap nobody
+had recorded.**
+
+#### HQP-C-064 — the check found a coverage gap, not a citation slip
+
+Chasing `SetShaping` produced a fact worth having: **no test in `tests/hqplayer_conformance.rs` calls
+`adapter.set_shaper`.** Verified directly — `set_mode` and `set_rate` are each driven by four expectations,
+`set_shaper` by none. The shaper setter's behaviour rests entirely on L1 (`shaper 24→0→24`, `result="OK"`,
+readback-verified against a real daemon). Good evidence, and **not a regression pin**: a client change
+could break `set_shaper` today and the suite would stay green.
+
+Recorded as **HQP-C-064**, `open`, owner #329, with the acquisition plan. That is the ledger doing the job
+it was built for — and it took an external reviewer's finding to build the check that found it.
+
+### Twelve defects, and what the shape of them says
+
+| Source | Count |
+|---|---|
+| CodeRabbit, **eight** passes | **10** |
+| Independent Codex reviews, **three** | **3** (one factual, one text scan, one stale-description sweep) |
+| This session's own controls, before external prompting | **0** |
+| This session's own **check 34**, built in response to CR8 | **1 previously unrecorded coverage gap** |
+
+**Eight for eight: every external pass has found something.** The mechanisms, now clear enough to name:
+**eight defects were a text scan standing in for a parser**, and **five were wording that outran its cited
+proof**. The first mechanism yields to structural parsing — `declares_fn` via `syn` is the only helper no
+later pass reopened. The second now has check 34, which is the first guard in this file aimed at the *claim*
+rather than at the *form*. Checks: **33 → 34**. Claim rows: **63 → 64**.
