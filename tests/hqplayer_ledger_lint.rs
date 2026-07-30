@@ -288,6 +288,33 @@ fn test_functions(path: &Path) -> HashMap<String, bool> {
     out
 }
 
+/// Shortest acquisition plan that counts as one rather than as a label. Four words and twenty
+/// characters is deliberately low: the check is meant to catch an empty or one-word cell, not to
+/// legislate prose length.
+const MIN_SETTLE_CHARS: usize = 20;
+
+/// The acquisition plan on an anchor's designated `**What would settle it:**` line, continued across
+/// following non-blank lines.
+///
+/// Returns `None` when no line *begins* with the phrase, so the phrase buried in other prose does not
+/// satisfy the requirement.
+fn settle_condition(section: &str) -> Option<String> {
+    let lines: Vec<&str> = section.lines().collect();
+    let i = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("**What would settle it"))?;
+    let after = lines[i].split_once(':')?.1.trim_start_matches('*').trim();
+    let mut plan = after.to_string();
+    for line in &lines[i + 1..] {
+        if line.trim().is_empty() {
+            break;
+        }
+        plan.push(' ');
+        plan.push_str(line.trim());
+    }
+    Some(plan.trim().to_string())
+}
+
 /// Fixtures whose provenance records that the cited upstream file was not read directly.
 ///
 /// Derived from the corpus rather than curated, so the ledger's pending-confirmation table cannot
@@ -657,13 +684,28 @@ fn every_unsettled_claim_names_an_owner_and_what_would_settle_it() {
         }
         // The settle condition lives in the claim's prose anchor, because one table cell cannot hold
         // it honestly. The anchor is the heading that carries the ID.
+        //
+        // CodeRabbit found the substring form of this check to be a false pass: an anchor whose
+        // `**What would settle it:**` line was emptied after the colon still reported green, and so
+        // would one that mentioned the phrase in unrelated prose. So the *designated line* is parsed
+        // and its content is required to be a sentence, not a label.
         match anchor_section(&text, &c.id) {
             None => bad.push(format!("{} has no prose anchor section", c.id)),
-            Some(section) if !section.contains("What would settle it") => bad.push(format!(
-                "{} anchor has no `What would settle it` line",
-                c.id
-            )),
-            Some(_) => {}
+            Some(section) => match settle_condition(&section) {
+                None => bad.push(format!(
+                    "{} anchor has no line beginning `**What would settle it`; the phrase appearing \
+                     inside other prose does not count",
+                    c.id
+                )),
+                Some(plan) if plan.len() < MIN_SETTLE_CHARS || plan.split_whitespace().count() < 4 => {
+                    bad.push(format!(
+                        "{} names its settle condition as {plan:?}, which is a label rather than an \
+                         acquisition plan",
+                        c.id
+                    ))
+                }
+                Some(_) => {}
+            },
         }
     }
     assert!(

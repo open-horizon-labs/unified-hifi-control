@@ -507,3 +507,35 @@ not the one to worry about first.
 same way: this branch adopts #322's current text for the overlapping hunks and keeps only the banner and
 the paraphrases. `git merge-tree --write-tree` clean again. That is now **two** resolutions in one session
 for one file, and the structural fix remains merging #337 rather than anything available here.
+
+### CodeRabbit's second pass at `799c4c0` — a third false pass, and a state correction I had wrong
+
+**CR3 (P2) — `every_unsettled_claim_names_an_owner_and_what_would_settle_it` accepted a label.** The
+check asked whether the anchor *contained* the words "What would settle it", so an anchor whose
+designated line was emptied after the colon, or which mentioned the phrase inside other prose, passed.
+Proven both ways before fixing:
+
+| # | Mutation | Before | After |
+|---|---|---|---|
+| M19 | the settle paragraph reduced to `**What would settle it:**` | `test … ok` | fails: *"which is a label rather than an acquisition plan"* |
+| M20 | the phrase demoted to mid-sentence prose (`Somebody should decide What would settle it: …`) | would have passed | fails: *"no line beginning `**What would settle it`"* |
+| M21 | `**What would settle it:** TBD` | would have passed | fails on the four-word floor |
+
+The check now parses the **designated line** — a line that *begins* with the phrase — continues it across
+following non-blank lines, and requires at least 20 characters and four words. The floor is deliberately
+low: it is meant to catch an empty cell or a `TBD`, not to legislate prose.
+
+**CodeRabbit's "ideally also" was not implemented, with a reason.** It suggested requiring the settle text
+to name the row's owner issue. Several anchors legitimately name a *different* issue in their plan — HQP-C-022's
+cites #322's acceptance wording while the row is owned by #332 — so that rule would reject correct rows.
+The owner is already checked as a separate condition on the row itself.
+
+**A state correction against me, and it was right.** My review-request comment claimed `MERGEABLE`;
+CodeRabbit observed GitHub reported `CONFLICTING`/`DIRTY` at `799c4c0`. Both were true at different
+moments — the base branch moved between my check and its read — and the honest version is that a
+mergeability claim is only valid at the SHA *and the minute* it was taken. Every such claim in the Stage 3
+reports names the head it was measured at.
+
+**Three false passes across two CodeRabbit passes, all in checks written by the author of the artefact they
+check.** That is now the most useful sentence in this record: the mutation table proves what its author
+thought to break, and an external reviewer found what he did not.
