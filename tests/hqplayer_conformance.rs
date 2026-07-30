@@ -3742,10 +3742,22 @@ fn a_closed_malformed_root_is_recovered_even_with_a_coalesced_push_frame() {
     );
 
     // Defences that the first-defensible-boundary rule must not give up.
+    //
+    // These two exercise the quote-awareness specifically. A shorter case —
+    // `<Status note="</Status>"` — also reads Incomplete, but for an unrelated reason: the root tag
+    // itself never closes, so no root name is recovered and the scan never runs. It would have passed
+    // whatever the boundary rule did, which makes it worthless as a defence.
     assert_eq!(
-        framing::classify("<Status note=\"</Status>\""),
+        framing::classify("<Status a=\"1\">\n<metadata song=\"</Status>\"/>\n"),
         framing::Framing::Incomplete,
-        "a closing-tag literal inside an attribute value is data, not a frame boundary"
+        "with the root open and a closing-tag literal sitting inside a CHILD attribute value, that \
+         literal is data and must not be taken for the frame boundary"
+    );
+    assert_eq!(
+        framing::classify("<Status a=\"1\">\n<metadata song=\"</Status>\"\n</Status>\n"),
+        framing::Framing::Complete,
+        "and when a real closing tag follows the literal, the boundary is the real one — the literal \
+         is skipped rather than ending the scan"
     );
     assert_eq!(
         framing::classify("<Status state=\"2\">\n<metadata song=\"x\"\n"),
