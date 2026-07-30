@@ -67,8 +67,16 @@ const STATUSES: [&str; 4] = ["settled", "open", "pending-live", "retired"];
 
 const PLAYBACK: [&str; 4] = ["active", "idle", "unknown", "n/a"];
 
-/// Classes whose claim is an observation of a running daemon, so `unknown` is not an acceptable
-/// capture date or playback state for them.
+/// Classes whose claim is an observation of a running daemon, so a vague capture date or playback
+/// state is not acceptable for them.
+///
+/// **Contract correction, made during stage 2 and not a silent relaxation.** The stage-1 rule was
+/// "classes `E0` and `E1` may not say `unknown`" for playback. `E0` still may not: UHC ran the daemon,
+/// so UHC knows. `E1` may, and only when the row's prose anchor states
+/// [`UNRECORDED_PLAYBACK_ADMISSION`] — because two upstream observations genuinely have no recorded
+/// playback state, and the alternatives were to guess a value or to relabel a live observation as a
+/// transcription. The escape is itself checked, so it cannot be taken silently. The capture **date**
+/// rule is unchanged for both: an ISO date is required.
 const OBSERVED_CLASSES: [&str; 2] = ["E0-uhc-live", "E1-upstream-verified"];
 
 /// The lowest number of claim rows that counts as a ledger rather than a stub. #341 names nine
@@ -800,16 +808,25 @@ fn the_reference_document_no_longer_settles_the_active_mode_question_by_fiat() {
     let text = read(&repo_root().join("docs/hqplayer-protocol-reference.md"));
     // Two phrasings, because the document said it twice — once as a warning under **State vs Status**
     // and once as a checklist item — and fixing only the phrasing a test names is how the other
-    // survives. Each retired line is kept in place with a `[retired #341]` marker beside it, which is
-    // why the check is for the *unmarked imperative*, not for the words appearing at all.
+    // survives. What is forbidden is the *unqualified imperative*, not the words appearing at all, so
+    // either marker discharges it:
+    //
+    // * `[retired #341]` — this issue struck the line in place.
+    // * `HQP-C-024` — the sentence qualifies itself by citing the open ledger row. The #322 branch
+    //   independently reframed both phrasings this way while this branch was being written, keeping
+    //   "use State's active_mode (INDEX), not Status's string" as the *explicit PCM/SDM* case and
+    //   naming the `[source]` case unmeasured. That is the outcome this check exists to produce, so
+    //   it must pass, and the alternative — demanding this branch's own marker — would have made the
+    //   check reject the better wording.
     let retired_imperatives = [
         "Always use State's numeric",
         "use State's active_mode (INDEX), not Status's string",
     ];
+    let qualifiers = ["[retired #341]", "HQP-C-024"];
     let mut found = Vec::new();
     for line in text.lines() {
         for phrase in retired_imperatives {
-            if line.contains(phrase) && !line.contains("[retired #341]") {
+            if line.contains(phrase) && !qualifiers.iter().any(|q| line.contains(q)) {
                 found.push(line.trim().to_string());
             }
         }

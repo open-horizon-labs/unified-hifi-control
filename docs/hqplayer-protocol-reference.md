@@ -9,8 +9,11 @@
 > **Retired claims**.
 >
 > This page is kept, not deleted, because links to it exist and a reader arriving at one must see the
-> correction rather than a clean file. Two of its statements are corrected in place below and marked
-> **[retired #341]**. Nothing here should be implemented from without checking the ledger row first.
+> correction rather than a clean file. Corrections come from two directions and are marked
+> accordingly: three verbatim `hqp-control` excerpts are paraphrased and marked **[retired #341]**,
+> and the `active_mode` guidance was reframed by #322 itself, which cites ledger row **HQP-C-024**
+> rather than this banner. Nothing here should be implemented from without checking the ledger row
+> first.
 
 > **This document is a reader's guide, not the authority.** Since issue #322 the authority is the
 > executable corpus under `tests/fixtures/hqplayer/<version>/`, driven by the conformance suite in

@@ -43,9 +43,11 @@ Every claim's provenance cell reads `source · chain · daemon/version · date �
   treating a report's citation as though the cited file had been read.
 - **date** for a `read-via-report` claim is the **report's** date, not the observation's — the
   observation date was not recorded upstream, and the report date is the closest honest bound UHC has.
-- **playback** is `active`, `idle`, `unknown` or `n/a`. The upstream evidence base's probes ran with
-  the engine **stopped**, which is why `idle` appears on `E1` behavioural rows: a behaviour verified
-  idle is not thereby verified under load. `E0` may **never** say `unknown` — UHC ran the daemon, so
+- **playback** is `active`, `idle`, `unknown` or `n/a`. The upstream evidence base's probes were
+  *largely* collected with the engine **stopped**, which is why `idle` appears on most `E1`
+  behavioural rows — a behaviour verified idle is not thereby verified under load. That aggregate
+  caveat is **not** a per-probe record and must not be used as one: where the #322 session file
+  records a specific probe's state, that record wins (HQP-C-023 is `active` for exactly this reason). `E0` may **never** say `unknown` — UHC ran the daemon, so
   UHC knows. `E1` may say `unknown` only when its prose anchor states *"Playback state was not
   recorded upstream"*, which is the case for two rows (HQP-C-029, HQP-C-038). Guessing a value to fill
   the column, or downgrading a live observation to a transcription to dodge it, would both be worse.
@@ -138,10 +140,25 @@ were **not executed** and are recorded as gaps in that comment.
 
 | ID | Claim | Class | Provenance | Proof | Status | Owner |
 |---|---|---|---|---|---|---|
-| HQP-C-023 | `Status.active_mode` **echoes the configured mode** under `[source]`, so it cannot resolve the loaded chain | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…:1732-1740` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics | settled | — |
+| HQP-C-023 | `Status.active_mode` **echoes the configured mode** under `[source]`, so it cannot resolve the loaded chain | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…:1549-1552` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · active | test:the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics | settled | — |
 | HQP-C-024 | What `State.active_mode` reports under `[source]` — the loaded chain or the configured mode — is **unmeasured**, upstream and here | E4-unverified | `.oh/issue-322-…:1738-1740` · direct · unmeasured on any daemon · 2026-07-30 · unknown | test:the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics · #332:Resolve State.active_mode versus Status.active_mode under configured PCM/SDM and [source]/Auto with PCM and DSD sources | open | #332 |
 | HQP-C-025 | `Status` reports active settings as **display names** while `State` reports numbers, so the two are complementary rather than redundant | E3-derived | `tests/fixtures/hqplayer/hqpd-6.0.4-opal/status_playing_with_metadata.xml` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · unknown | test:status_reports_active_settings_as_display_names | settled | — |
 | HQP-C-026 | UHC's own comment at `src/adapters/hqplayer.rs:2473` calls `Status.active_mode` "unreliable" and instructs using `State`'s — a global rule the evidence does not support | E4-unverified | `src/adapters/hqplayer.rs:2473` · direct · n/a · 2026-07-30 · n/a | none:HQP-C-024 settling, after which the comment states a measured fact or is deleted | open | #347 |
+
+#### HQP-C-023's playback state was corrected, and the wrong value had already travelled
+
+An earlier revision of this row recorded `playback: idle`, inferred from the aggregate caveat that the
+upstream probes were collected with the engine stopped. **The #322 session file records this specific
+probe as `playback active`** (`.oh/issue-322-hqplayer-protocol-conformance.md:1549-1552`), and a
+per-probe record beats an aggregate caveat. The row now says `active`.
+
+**This matters beyond one cell.** While this branch was being written, base-branch commit `ab18874`
+*removed* a "mid-playback" qualifier from `docs/hqplayer-protocol-reference.md` and
+`tests/mock_servers/hqplayer/model.rs`, and its stated reason was: *"the ledger (HQP-C-023) records
+this upstream probe as idle."* That is circular — it used this ledger's unverified inference as
+evidence against the session file's contemporaneous record. Recorded as **HQP-C-061** so the base
+branch can re-decide on a non-circular basis rather than inheriting a value this ledger has since
+withdrawn.
 
 ### Command outcomes, delivery, and ambiguity
 
@@ -216,6 +233,7 @@ were **not executed** and are recorded as gaps in that comment.
 | HQP-C-058 | L1's **SDM enumerations and filter `description` presence are first-hand evidence** that can re-provenance specific `read-via-report` fixtures — recorded here, deliberately not acted on, because re-provenancing from a report of a run is not the same as re-provenancing from the capture | E0-uhc-live | PR #337 comment 5135836825 follow-up · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | #332:Confirm all upstream hqplayerd 6.0.4 observations on supported UHC rigs before converting them into general claims | pending-live | #332 |
 | HQP-C-059 | The `hqpd-5.x-legacy` profile is `UNVERIFIED` and exists only to vary list ordering; it is never protocol truth | E4-unverified | `tests/fixtures/hqplayer/hqpd-5.x-legacy/*` · direct · hqplayerd 5.x, unavailable for verification · 2026-07-29 · unknown | test:the_legacy_profile_is_marked_unverified_so_it_cannot_pass_as_protocol_truth | settled | — |
 | HQP-C-060 | The `synthetic-chain-hazard` profile is constructed, `never-promotable`, and every name in it is fictional so a row cannot be copied into the evidence corpus by mistake | E5-synthetic | `tests/fixtures/hqplayer/synthetic-chain-hazard/*` · direct · none — no daemon involved · 2026-07-30 · n/a | fixture:tests/fixtures/hqplayer/synthetic-chain-hazard/filters_sdm.xml | settled | — |
+| HQP-C-061 | Base-branch commit `ab18874` de-qualified the `Status.active_mode` echo's playback state citing this ledger's own (now withdrawn) `idle`, so the de-qualification rests on circular evidence rather than on the #322 session file's contemporaneous `playback active` record | E6-documentary | `ab18874` commit message and `.oh/issue-322-…:1549-1552` · direct · n/a · 2026-07-30 · n/a | none:the base branch re-deciding on the session file's record, or reading the salvage report directly | open | #337 |
 
 ---
 
@@ -390,6 +408,17 @@ policy, and #348 owns it.
 
 **What would settle it:** #348 landing the guardrail and the notices file, naming Copyright (c) 2026
 Adam Goldsmith and preserving the MIT terms, before any HQPTuner implementation code is ported.
+
+### HQP-C-061 — a de-qualification that cites this ledger back at itself
+
+`ab18874` is careful work: it refused to let an unsupported "mid-playback" qualifier stand. But its
+evidence was *this ledger's* `idle`, which was an inference from an aggregate caveat and not a reading
+of the source report. Two documents now agree with each other because one of them copied the other,
+which is the failure mode the `chain` field exists to make visible.
+
+**What would settle it:** the base branch re-deciding on `.oh/issue-322-…:1549-1552` — which records
+`playback active` for this probe — or someone reading the salvage report directly and settling it from
+the source. Either way the fix belongs on the branch that owns those files, not here.
 
 ### HQP-C-057 — eight fixtures still carry prose in a closed-vocabulary field
 

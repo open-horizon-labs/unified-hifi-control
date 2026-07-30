@@ -403,3 +403,52 @@ file and in the PR reports is **base-relative** unless it says otherwise.
   edit from a stacked branch would conflict for no behavioural gain.
 - The eight fixture headers still carrying prose inside the closed-vocabulary `source_chain` field
   (HQP-C-057, owner #337) — base-branch files, same reason.
+
+### Stage 2 remediation — independent review at `5d8c607`, three items, all valid
+
+Received mid-stage, all three verified against the evidence before acting.
+
+**R1 — the `E1` playback relaxation is a contract correction and must be documented as one.** Valid.
+The stage-1 rule was "classes `E0` and `E1` may not say `unknown`"; stage 2 relaxed it for `E1` with an
+anchor admission and left the old rule standing in two places — `OBSERVED_CLASSES`' doc comment and the
+ledger's provenance bullet. Both now state the corrected contract and why. **`E0` stays strict**, which
+was the other half of the instruction. Dispositioned in Reports 3/6 and 4/6 as a contract change, not as
+"making GREEN".
+
+**R2 — a licensing row must not be classed as a daemon observation.** Already done, and the check is
+what found it: `an_observed_claim_names_a_real_capture_date_and_playback_state` refused HQP-C-053 as
+`E1-upstream-verified` with `playback: n/a`, and seven rows moved to the new `E6-documentary` class
+rather than the check being weakened. Recorded here because "already done" is only credible with the
+mechanism named.
+
+**R3 — HQP-C-023's playback state was factually wrong.** Valid and corrected: `idle` → `active`, source
+re-pointed to `.oh/issue-322-…:1549-1552`, which records this probe as `playback active`. My `idle` was
+inferred from the aggregate "upstream probes ran stopped" caveat, and the ledger's provenance bullet now
+says explicitly that the aggregate caveat is not a per-probe record.
+
+**What R3 exposed, which was not in the review.** Base-branch commit `ab18874` removed a "mid-playback"
+qualifier from the reference document and `model.rs` **because "the ledger (HQP-C-023) records this
+upstream probe as idle."** It used this ledger's inference as evidence against the session file's
+contemporaneous record — circular, and now recorded as **HQP-C-061** (owner #337) rather than fixed from
+here, because those are base-branch files. Two documents agreeing because one copied the other is
+precisely what the `chain` field exists to expose, and it happened inside this program within a day.
+
+### The base branch moved under this one, exactly as the stage-1 dissent predicted
+
+Three commits landed on `feat/issue-322-hqplayer-protocol-conformance` while stage 2 was being written
+(`cba1731`, `e406866`, `ab18874`), two of them editing `docs/hqplayer-protocol-reference.md` — the one
+file this branch also edits. GitHub reported the PR `CONFLICTING`, and `git merge-tree` confirmed one
+content conflict in that file.
+
+**Resolved forward-only, with no merge commit and no force-push.** #322 had independently reframed the
+same `active_mode` prose, and its wording is better than mine: it distinguishes the explicit PCM/SDM
+case from `[source]`, cites ledger row HQP-C-024, and points at `ActiveModeReporting`. So this branch
+now carries **#322's exact text** for both overlapping hunks, and keeps only its non-overlapping edits
+(the retirement banner and the three paraphrases). A three-way merge sees identical changes on the
+overlapping hunks: `git merge-tree --write-tree HEAD origin/feat/issue-322-…` reports no conflict.
+
+One check had to adapt rather than the document: `the_reference_document_no_longer_settles_the_active_mode_question_by_fiat`
+demanded a `[retired #341]` marker, which #322's better wording does not carry. It now accepts either
+that marker **or** a citation of `HQP-C-024`, because what the check forbids is the *unqualified*
+imperative. Insisting on this branch's own marker would have made the check reject the outcome it exists
+to produce.
