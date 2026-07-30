@@ -165,3 +165,38 @@ normative spec text rather than prose:
 **Verification gap:** `dx` is not installed in this environment, so the WASM/fullstack
 build is proved only by CI's `build-wasm` job (`.github/workflows/build.yml:488`). The
 dependency lint is the host-runnable proxy.
+
+## Ship
+**Updated:** 2026-07-30
+**Status:** staged (draft PR, nothing merged or deployed)
+
+**Delivery path:** draft PR #362 (base `v3`) -> CodeRabbit + human review -> maintainer
+approval -> squash merge to `v3` -> `build.yml` on push. Release artifacts only on tag `v*`
+or a published release; `docker.yml` is `master`-only, so a `v3` merge publishes no image.
+
+**CI at `a5cae03`** (run 30571330314): Test, Build WASM Assets, Build Linux x64 and Smoke
+Test Binary all pass. Lint fails on `src/app/pages/zones.rs:269`
+(`clippy::unnecessary_sort_by`) - pre-existing on `v3`, untouched by this PR, fires only on
+CI's newer toolchain. Blocks merge; the one-line fix belongs in a separate PR.
+
+**Delivery-path tax:** one red job outside this PR's control. Everything else is green.
+
+**Rollback:** plain revert, no data migration - true only while this is the tip. After #324
+publishes and #327 persists bindings, reverting breaks them and the additive-only policy
+forbids removal within major 1.
+
+**Verified rather than asserted:** nothing outside `src/adaptive/` references it except
+`pub mod adaptive;`; `src/adaptive/` imports nothing from the crate; `api_routes.txt` is
+byte-identical to `v3`; `api-guard` does not trigger.
+
+## Review
+**Updated:** 2026-07-30
+**Verdict:** ALIGNED
+
+Six gate reports on PR #362. Two required in-place correction after later gates caught their
+errors - report 3 filed a contract defect as a downstream hazard, report 4 recommended a
+v1.1 deletion gate that contradicted the compatibility policy in the same PR. Both fixed at
+`a5cae03`. Durable record is ADR 003 plus the specification, not the PR comments.
+
+Raised on #324: C1/C2 publication-time enforcement, and ownership of the pre-publication
+reshaping window.
