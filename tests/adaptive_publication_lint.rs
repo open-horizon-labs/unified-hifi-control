@@ -164,11 +164,10 @@ fn is_sweep_exempt(path: &str) -> bool {
 /// `src/lib.rs` and `src/main.rs` are the crate root (0). `src/api/mod.rs` is `api` (1).
 /// `src/adapters/hqplayer.rs` is `adapters::hqplayer` (2).
 fn module_depth(path: &str) -> usize {
-    let trimmed = path
-        .strip_prefix("src/")
-        .unwrap_or(path)
-        .strip_suffix(".rs")
-        .unwrap_or(path);
+    // Two separate steps, because chaining them makes the second `unwrap_or` fall back to
+    // the untrimmed `path` and undo the first: `src/api/mod` would count `src` as a module.
+    let trimmed = path.strip_prefix("src/").unwrap_or(path);
+    let trimmed = trimmed.strip_suffix(".rs").unwrap_or(trimmed);
     if trimmed == "lib" || trimmed == "main" {
         return 0;
     }
@@ -751,16 +750,13 @@ impl<'ast> Visit<'ast> for ModuleReferenceVisitor {
             }
             // An *inline* module puts its contents one module further down, so `super::`
             // inside it needs one more hop to reach the crate root. `depth` was fixed per
-            // file, which got both directions backwards inside a nested module. An external
-            // `mod x;` declares a module whose contents live in another file and are not
-            // traversed here, so it must not change the depth. Raised by Codex against the
-            // first draft of the `super::` fix.
+            // file, which got both directions backwards inside a nested module. Raised by
+            // Codex against the first draft of the `super::` fix.
             //
-            // Incrementing for an external `mod x;` too would be *unobservable* rather than
-            // wrong: there is no inline content to scan under it, and the restore below
-            // makes the pair a no-op. No probe can distinguish the two, so the guard stays
-            // because it is semantically right, not because a test proves it - stated so
-            // nobody mistakes the surviving mutation for coverage.
+            // Gating on `content` is semantic, not load-bearing: an external `mod x;` has
+            // nothing beneath it to scan, so incrementing there too would be paired with the
+            // restore below and observable by nothing. No probe can distinguish the two -
+            // stated so nobody mistakes that surviving mutation for coverage.
             self.depth += 1;
         }
         visit::visit_item_mod(self, item);
@@ -2241,6 +2237,12 @@ fn module_depth_is_derived_from_the_file_path() {
         ("src/producers/event.rs", 2),
         ("src/app/pages/zones.rs", 3),
         ("src/server/routes/mod.rs", 2),
+        // A path with no `.rs` suffix must still lose its `src/` prefix. Chaining the two
+        // `unwrap_or`s made the second fall back to the *original* path, silently undoing
+        // the first trim and counting `src` as a module.
+        ("src/api/mod", 1),
+        ("src/adapters/hqplayer", 2),
+        ("src/lib", 0),
     ] {
         assert_eq!(
             module_depth(path),
