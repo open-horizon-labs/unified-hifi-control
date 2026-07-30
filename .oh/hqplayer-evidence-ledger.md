@@ -838,3 +838,43 @@ and the fix was to stop scanning text and start parsing. That is the same lesson
 repository's lint family, arrived at from a different direction.
 
 Checks: **31 → 32**. Claim rows: **62 → 63**.
+
+### CodeRabbit's seventh pass at `e2739d8` — an eleventh false pass, in the last text scan I had named
+
+**CR7 (P2) — the retired-claim guard accepted an unstruck claim when *anything else* on the line was
+struck.** The check asked whether the containing line contains `~~`, so
+`| Mode | VALUE | VALUE | ~~historical note~~ …` left the retired claim readable as current guidance and
+passed. **M31, CodeRabbit's exact mutation, passed before the fix and fails after it** — now reporting
+*"still asserts … outside any `~~…~~` span … Strikethrough elsewhere on the line does not retire this
+claim."*
+
+`phrase_is_struck` computes the byte ranges *inside* each `~~…~~` span and requires the matched phrase to
+lie wholly within one. An unpaired trailing `~~` opens no span, so a half-written strikethrough retires
+nothing. Pinned by `a_phrase_counts_as_struck_only_when_it_is_inside_the_span`.
+
+**This was one of the two helpers named for CodeRabbit's attention** in the previous review request. Naming
+them did not make them safe; an external pass attacking them did.
+
+**One control of mine was wrong and the suite caught it.** The first version asserted that a *partially*
+struck phrase is not struck — a case that **cannot occur**: a span boundary inside the phrase inserts `~~`
+into it, so the contiguous needle no longer matches and the loop never reaches the span check. The
+assertion constructed a line its own search could not find. Replaced with a reachable case (the phrase
+between two spans) plus a comment recording why the unreachable one is absent, rather than deleting it
+silently.
+
+### Eleven false-pass-class defects, one factual error, and the pattern behind all of them
+
+| Source | Count | Mechanism |
+|---|---|---|
+| CodeRabbit, seven passes | **9** (CR1–CR7 plus the duplicate and F7–F9 group) | eight of them a text scan standing in for a parser |
+| Independent Codex reviews, two | **2** | one factual overbreadth, one text scan |
+| This session's own controls | **0** | — |
+
+**Every external pass has found at least one defect. Seven for seven.** The one time this was treated as
+converging — stopping after five — the next pass found four more. The mechanism is now unambiguous: **eight
+of eleven were a text scan where a parser was needed**, and the only helper converted to structural parsing
+(`declares_fn`, via `syn`) is the only one no later pass has reopened. The markdown helpers cannot take the
+same treatment without a markdown parser, which this repository does not have as a dependency — so they are
+pinned by controls instead, and that is a weaker guarantee, stated rather than glossed.
+
+Checks: **32 → 33**.

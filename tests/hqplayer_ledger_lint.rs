@@ -1101,14 +1101,82 @@ fn the_retired_set_mode_value_claim_is_struck_where_it_still_appears() {
             let line_end = spec[pos..].find('\n').map_or(spec.len(), |n| pos + n);
             let line = &spec[line_start..line_end];
             assert!(
-                line.contains("~~"),
-                "`.oh/hqplayer-spec.md` still asserts {needle:?} unstruck, on line {line:?}. The \
+                phrase_is_struck(line, pos - line_start, needle.len()),
+                "`.oh/hqplayer-spec.md` still asserts {needle:?} outside any `~~…~~` span, on line \
+                 {line:?}. Strikethrough elsewhere on the line does not retire this claim. The \
                  client sends the list index (src/adapters/hqplayer.rs `set_mode`) and the live \
                  6.0.2 run confirmed it; leaving this readable as current guidance is the \
                  contradiction #341 exists to retire"
             );
         }
     }
+}
+
+/// Byte ranges *inside* each `~~…~~` span on one line, delimiters excluded.
+///
+/// An unpaired trailing `~~` opens no span, so a half-written strikethrough retires nothing.
+fn struck_spans(line: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut marks = line.match_indices("~~");
+    while let (Some((open, _)), Some((close, _))) = (marks.next(), marks.next()) {
+        spans.push(open + 2..close);
+    }
+    spans
+}
+
+/// Whether the phrase at `at..at + len` lies wholly inside a strikethrough span.
+///
+/// CodeRabbit found that asking whether the *line* contains `~~` is a false pass: a retired claim could
+/// be un-struck while an unrelated struck fragment kept the check green —
+/// `| Mode | VALUE | VALUE | ~~historical note~~` reads as current guidance and passed. The claim itself
+/// has to be inside the span.
+fn phrase_is_struck(line: &str, at: usize, len: usize) -> bool {
+    struck_spans(line)
+        .iter()
+        .any(|span| span.start <= at && at + len <= span.end)
+}
+
+/// Controls for [`phrase_is_struck`], using CodeRabbit's exact evasion as the negative case.
+#[test]
+fn a_phrase_counts_as_struck_only_when_it_is_inside_the_span() {
+    let at = |line: &str, phrase: &str| {
+        let pos = line
+            .find(phrase)
+            .expect("phrase present in the control line");
+        phrase_is_struck(line, pos, phrase.len())
+    };
+
+    assert!(at("x ~~resolves to VALUE~~ y", "resolves to VALUE"));
+    assert!(at("~~resolves to VALUE~~", "resolves to VALUE"));
+    assert!(at(
+        "| ~~a resolves to VALUE b~~ | note |",
+        "resolves to VALUE"
+    ));
+
+    // The evasion: strikethrough elsewhere on the line, claim readable as current.
+    assert!(!at(
+        "| Mode | VALUE | VALUE | ~~historical note~~ `State.mode` uses list index",
+        "| Mode | VALUE | VALUE |"
+    ));
+    assert!(!at(
+        "resolves to VALUE ~~struck later~~",
+        "resolves to VALUE"
+    ));
+    assert!(!at(
+        "~~struck first~~ resolves to VALUE",
+        "resolves to VALUE"
+    ));
+    // A half-open span retires nothing.
+    assert!(!at("~~resolves to VALUE", "resolves to VALUE"));
+    // Two spans, the phrase between them, covered by neither.
+    assert!(!at(
+        "~~one~~ resolves to VALUE ~~two~~",
+        "resolves to VALUE"
+    ));
+    // "Partially struck" has no test because it cannot occur: a span boundary inside the phrase inserts
+    // `~~` into it, so the contiguous needle no longer matches at all and the loop never reaches the
+    // span check. Recorded rather than asserted, because an assertion here would have to construct a
+    // line the search cannot find - which is how the first version of this control failed.
 }
 
 #[test]
