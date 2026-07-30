@@ -755,7 +755,8 @@ split honestly":
 
 - **HQP-C-051** keeps the wire fact, `settled`, proven by the conformance test.
 - **HQP-C-062** carries the adapter-surface claim, `open`, owner #329 — and is now **executable**:
-  `the_adapter_exposes_no_junk_filter_setter` scans `src/adapters/hqplayer.rs`, so if #329 adds the setter
+  `the_adapter_exposes_no_junk_filter_setter` inspects `src/adapters/hqplayer.rs` — a text scan when this
+  entry was written, **structurally parsed with `syn` one commit later** — so if #329 adds the setter
   the check fails and the row must be updated rather than outliving its own truth.
 
 That is the ledger's discipline applied to itself: one claim, one proof.
@@ -878,3 +879,26 @@ same treatment without a markdown parser, which this repository does not have as
 pinned by controls instead, and that is a weaker guarantee, stated rather than glossed.
 
 Checks: **32 → 33**.
+
+### Independent audit: three descriptions went stale the moment the implementation improved
+
+The structural rewrite replaced a text scan with a `syn` visitor, and **three places still described the
+old implementation**. An independent audit caught all three:
+
+| Site | Said | Now says |
+|---|---|---|
+| `tests/hqplayer_ledger_lint.rs`, directly above the check | *"a text scan of the adapter for a junk-filter setter"* | a **structural inspection** of the adapter's Rust declarations — `syn` parses the file and every function and method signature is visited |
+| `docs/hqplayer-evidence-ledger.md`, HQP-C-062's anchor | *"scans the adapter"* | **parses** the adapter with `syn` and visits every signature |
+| `.oh/hqplayer-evidence-ledger.md`, the sixth-pass entry | *"scans `src/adapters/hqplayer.rs`"* | inspects it — *"a text scan when this entry was written, structurally parsed with `syn` one commit later"* |
+
+**Swept for the rest.** Every remaining "text scan" mention describes either the implementation that was
+*replaced* (`declares_fn`'s own doc, the control that exists to pin the escape) or the general pattern
+behind eight of the eleven defects. Both are accurate and both stay.
+
+**Why this is worth a commit of its own.** A ledger whose subject is provenance cannot afford a description
+that no longer matches its own mechanism — a reader deciding how much to trust HQP-C-062 would have been
+told it was the weaker thing. This is the fourth finding in a row that turned on *stale or overbroad
+description* rather than on logic: F1 (the contract text), F3 (both banners), Codex 1 (HQP-C-004), and now
+this. Recorded as a pattern in its own right, because it is a different failure mode from the false passes
+and needs a different guard: the false passes were found by attacking the checks, and these by reading the
+prose against the code.

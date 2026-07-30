@@ -957,8 +957,10 @@ fn every_required_evidence_topic_maps_to_a_claim() {
 ///
 /// The wire half of that pair is proven by a conformance test; the *adapter-surface* half was not proven
 /// by anything, and CodeRabbit was right that one citation cannot carry both. This is the missing half:
-/// a text scan of the adapter for a junk-filter setter. If #329 adds one, this test fails and the ledger
-/// row must be updated — which is the behaviour wanted, because the claim would then be false.
+/// a **structural inspection** of the adapter's Rust declarations for a junk-filter setter — `syn` parses
+/// the file and every function and method signature is visited, so no formatting or qualifier hides one.
+/// If #329 adds the setter, this test fails and the ledger row must be updated — which is the behaviour
+/// wanted, because the claim would then be false.
 /// Whether `src` **declares** a function or method named `name`, determined structurally.
 ///
 /// A text scan for `fn <name>` is evadable and was: `pub  async  fn   set_junk_filter` with ordinary

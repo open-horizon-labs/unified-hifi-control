@@ -430,7 +430,7 @@ first-hand evidence either way.
 
 The daemon accepted the raw element and round-tripped the value on L1 (HQP-C-051, settled). The adapter
 has no `set_junk_filter`, so the capability is unavailable to any UHC surface. This is a gap, not a
-defect — and it is now **executable**: `the_adapter_exposes_no_junk_filter_setter` scans the adapter, so
+defect — and it is now **executable**: `the_adapter_exposes_no_junk_filter_setter` **parses** the adapter with `syn` and visits every function and method signature, so
 if #329 adds the setter the check fails and this row must be updated rather than quietly outliving its
 own truth. The two halves were one row until CodeRabbit pointed out that a single wire-behaviour test
 cannot support a claim about the adapter's surface.
