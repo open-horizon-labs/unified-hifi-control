@@ -387,7 +387,7 @@ test (hashes followed by a space).
 ### Scope held
 
 **Base-relative** (`git diff --name-only origin/feat/issue-322-hqplayer-protocol-conformance...HEAD`)
-covers four files: the ledger, the lint, and the two retirement edits. No `src/`, no
+covers five files: this session record, the ledger, the lint, and the two retirement edits. No `src/`, no
 `tests/fixtures/`, no `tests/hqplayer_conformance.rs`, no API surface, no label, no live host.
 
 **`v3`-relative is not the same number and must not be quoted as one.** Because this branch is stacked,
