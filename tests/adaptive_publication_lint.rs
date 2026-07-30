@@ -237,38 +237,46 @@ fn lint_the_sse_projection_does_not_mention_the_publication_layer() {
 // =============================================================================
 
 #[test]
-fn lint_surfaces_do_not_import_the_contract_or_the_publication_layer() {
-    // `ProducerDocument` derives `Serialize`, so a single `Json(snapshot)` in a handler
-    // re-exports the whole contract. `src/main.rs` is deliberately not listed: it is the
-    // composition root and must name both to wire them together.
-    const SURFACES: &[&str] = &[
-        "src/api",
-        "src/mcp",
-        "src/app",
-        "src/knobs",
-        "src/devices",
-        "src/components",
-    ];
+fn lint_only_the_composition_root_names_the_contract_or_the_publication_layer() {
+    // Swept over *all* of `src/` rather than an enumerated list of surfaces. An enumerated
+    // list is the same shape of blind spot that has now been remediated twice in
+    // `tests/adaptive_dependency_lint.rs`: it silently stops covering whatever is added
+    // next. The first draft of this lint listed six directories and omitted `src/mqtt`,
+    // which publishes to Home Assistant — an out-of-repository consumer, and therefore the
+    // single worst omission available.
+    //
+    // Exempt, with reasons:
+    //   src/adaptive, src/producers — the layers themselves
+    //   src/lib.rs, src/main.rs     — the composition root, which must name both to wire them
+    const EXEMPT: &[&str] = &["src/adaptive", "src/producers", "src/lib.rs", "src/main.rs"];
     let mut violations = Vec::new();
-    for surface in SURFACES {
-        for (path, text) in sources_under(surface) {
-            let code = code_only(&text);
-            for needle in [
-                "crate::adaptive",
-                "crate::producers",
-                "unified_hifi_control::adaptive",
-                "unified_hifi_control::producers",
-            ] {
-                if code.contains(needle) {
-                    violations.push(format!("{path}: references `{needle}`"));
-                }
+    let mut swept = 0usize;
+    for (path, text) in sources_under("src") {
+        if EXEMPT.iter().any(|exempt| path.starts_with(exempt)) {
+            continue;
+        }
+        swept += 1;
+        let code = code_only(&text);
+        for needle in [
+            "crate::adaptive",
+            "crate::producers",
+            "unified_hifi_control::adaptive",
+            "unified_hifi_control::producers",
+        ] {
+            if code.contains(needle) {
+                violations.push(format!("{path}: references `{needle}`"));
             }
         }
     }
     assert!(
+        swept > 50,
+        "the sweep covered only {swept} files, which means it is not actually walking src/"
+    );
+    assert!(
         violations.is_empty(),
-        "#324 publishes to in-repository consumers only. A surface reading the producer \
-         document is #326's decision and needs its own API approval:\n{}",
+        "#324 publishes to in-repository consumers only, and `ProducerDocument` derives \
+         `Serialize` — one `Json(snapshot)` re-exports the whole contract. A surface reading \
+         the producer document is #326's decision and needs its own API approval:\n{}",
         violations.join("\n")
     );
 }

@@ -408,9 +408,18 @@ impl ProducerAggregator {
 
 /// Fold a document's lane health into the witness map.
 ///
-/// `last_success` only ever advances. That is the whole point: a poll that fails publishes a
-/// lane with no success timestamp, and forgetting the previous one would blank exactly the
-/// information a user needs to judge how stale the reading is.
+/// A `last_success` is retained until the producer publishes a newer one. A poll that fails
+/// publishes a lane with no success timestamp, and forgetting the previous one would blank
+/// exactly the information a user needs to judge how stale a reading is.
+///
+/// **Ordering comes from admission, not from comparing timestamps.** An earlier draft
+/// advanced `last_success` only when the incoming string sorted after the held one, which
+/// looked like a monotonicity guard and was in fact a bug: [`Timestamp`] is documented as
+/// RFC 3339 but its format is not pinned, so `…:21.500Z` sorts *before* `…:21Z` (`.` is
+/// 0x2E, `Z` is 0x5A) and a `+00:00` offset does not compare with a `Z` at all. The guard
+/// was also unnecessary — [`admit`] refuses any document that regresses in epoch or
+/// revision, so an admitted document is never older than the one it replaces. Taking the
+/// producer's latest word is both simpler and correct.
 fn witness_lanes(
     witnesses: &mut BTreeMap<TransportLane, LaneWitness>,
     document: &ProducerDocument,
@@ -426,15 +435,9 @@ fn witness_lanes(
                 observed_in_epoch: document.producer.epoch,
             });
         witness.state = health.state.clone();
-        if let Some(success) = &health.last_success {
-            let advances = witness
-                .last_success
-                .as_ref()
-                .is_none_or(|held| success.as_str() > held.as_str());
-            if advances {
-                witness.last_success = Some(success.clone());
-                witness.observed_in_epoch = document.producer.epoch;
-            }
+        if health.last_success.is_some() {
+            witness.last_success.clone_from(&health.last_success);
+            witness.observed_in_epoch = document.producer.epoch;
         }
         if health.last_error.is_some() {
             witness.last_error.clone_from(&health.last_error);

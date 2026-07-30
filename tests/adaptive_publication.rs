@@ -491,6 +491,33 @@ mod intent_coherence {
         unknown_control.controls.retain(|c| c.id != control);
         broken.push(unknown_control);
 
+        // C2, which the earlier version of this test omitted: it was covered only by
+        // `two_drafts_claiming_one_control_both_lose_validity`, which asserts the demoted
+        // validity but never re-checks the document against the coherence rules. The
+        // invariant has to hold for every way of breaking it, not for three of the four.
+        let mut contested = staged();
+        let (first_id, control) = valid_entry_control(&contested);
+        let second_id = contested
+            .change_sets
+            .iter()
+            .map(|cs| cs.id.clone())
+            .find(|id| id != &first_id)
+            .expect("the fixture publishes more than one change set");
+        let template = contested
+            .change_sets
+            .iter()
+            .find(|cs| cs.id == first_id)
+            .and_then(|cs| cs.entries.iter().find(|e| e.control == control))
+            .cloned()
+            .expect("located above");
+        for change_set in &mut contested.change_sets {
+            if change_set.id == second_id {
+                change_set.entries.retain(|e| e.control != control);
+                change_set.entries.push(template.clone());
+            }
+        }
+        broken.push(contested);
+
         for document in broken {
             let admitted = expect_admitted(admit_fresh(document));
             assert!(

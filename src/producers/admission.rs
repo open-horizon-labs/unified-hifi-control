@@ -26,8 +26,6 @@
 //! comparing a raw incoming document against it would report a spurious difference and
 //! refuse an identical republication as [`AdmissionRefusal::NotAdvanced`].
 
-use serde::{Deserialize, Serialize};
-
 use crate::adaptive::{
     ChangeSetId, CommandOutcome, ControlId, DocumentRevisions, EntryValidity, Grounding,
     IntentIncoherence, OperationId, ProducerDocument, ProducerEpoch, Reason, ReasonCode, Refusal,
@@ -36,7 +34,11 @@ use crate::adaptive::{
 use crate::bus::PrefixedZoneId;
 
 /// Stable aggregator key for one producer document.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// Deliberately carries no serde derives. It is aggregator-internal addressing, and the
+/// less of this module is serializable the less of it can be exposed by accident. #327 may
+/// need to persist a binding keyed on this; that issue can add the derive with a reason.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProducerKey {
     /// Stable semantic producer id.
     pub producer_id: String,
