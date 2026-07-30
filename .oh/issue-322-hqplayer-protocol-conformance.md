@@ -3,9 +3,15 @@
 **OH:** 80222d6d
 **Program:** #310 · **Epic:** #311 · **Issue:** #322
 **Branch:** `feat/issue-322-hqplayer-protocol-conformance` · **Base:** `origin/v3`
-**Stage:** 2 (execution, complete pending Codex review) — Stage 1 sections are unchanged. Stage 2
-evidence is appended at the end; the *red checkpoint* section is an early snapshot, superseded by
-**Stage 2 execution record** below.
+**Stage:** 2 (execution, complete pending Codex review) — the original Stage 1 sections are
+unchanged. Stage 2 evidence is appended in the middle; the *red checkpoint* section is an early
+snapshot, superseded by **Stage 2 execution record** below.
+
+> **A second Stage 1 is open.** The HQPTuner stable/beta/dev salvage was added to issue #322 *after*
+> the original Stage 1 and Stage 2 completed, so its additions have never been through a solution
+> decision. **[HQPTuner Stage 1 amendment (2026-07-29)](#hqptuner-stage-1-amendment-2026-07-29)** at
+> the end of this file is that decision, and it supersedes nothing above it — the original Stage 1
+> and Stage 2 records stand as written. No `src` or `tests` file was changed in the amendment turn.
 
 ---
 
@@ -1056,3 +1062,352 @@ no production timing path or `HqpTimeouts` value reads either.
 Nothing here has touched a real daemon. Every tier-1 result to date is hermetic, against the fake.
 The corpus cannot be settled until the gate below is run on hardware, and no live claim will be made
 before then.
+
+---
+---
+
+# HQPTuner Stage 1 amendment (2026-07-29)
+
+**Status:** Stage 1 decision only. **No `src` or `tests` file was changed in this turn.** Nothing was
+merged, the PR stays draft, no API route or payload was touched, `api-change-approved` was not
+applied, and Stage 2 has not begun.
+
+**Why this exists.** Issue #322 gained two new acceptance sections — *HQPTuner salvage regression
+coverage (2026-07-30)* and *Beta/dev state-model fixtures (2026-07-30)* — after the original Stage 1
+decision and the whole of Stage 2 were complete. Seventeen bullets were added to a plan that had
+already been decided, so they have never been through `/solution-space`, `/review` or `/dissent`.
+PR #337's own body warns against exactly this: *"Its existing checks must not be described as
+covering these additions unless the exact regression is present."* This amendment reframes only
+those additions.
+
+**Evidence base.** Read in full for this amendment: `AGENTS.md`; the complete current #322 body;
+issues #347, #341, #348; PR #337 including reconciliation comment 5125711271; both salvage reports
+(`/tmp/hqptuner-salvage.Ahcwce/UHC-SALVAGE-UI-DATA-INTEGRATION.md`,
+`.../uhc-salvage-beta-dev/UHC-SALVAGE-BETA-DEV.md`). **Every classification below was checked against
+the tests and the model at `6b8e97f`, not against issue prose.** `rna-mcp` returned no metis,
+guardrail or signal artifacts for this area, and no local outcome artifact exists for `80222d6d`, so
+the only prior situated judgment remains `.oh/hqplayer-spec.md` and ADR 003.
+
+**What was not read.** HQPTuner's own repository. Every upstream claim here is sourced from the two
+salvage reports — reports *about* a repo, not the repo. That distinction produced a real error in
+this amendment's first draft; see **Two corrections** below.
+
+## Framing rejected up front
+
+- **HQPTuner framing is not imported.** Its fake reads 4096 bytes and splits on `?>`, satisfying none
+  of UHC's fragmentation, coalescing, root-boundary or response-size criteria. UHC's `wire.rs` is
+  strictly stronger here and stays. Only the *state model* is a design reference.
+- **No DSP causal claims.** The junk-filter advisor's cause verdicts, any spectral-signature →
+  cause inference, the metering side channel, and any measurement of a filter's specification
+  (corner, transition width, slope, taps, stop-band attenuation) are out of #322 and out of UHC's
+  permitted evidence-acquisition boundary. #348 owns that guardrail.
+- **Upstream ≠ qualified.** Every `[source]`, chain and pin behaviour below is an upstream
+  observation on one daemon (hqplayerd 6.0.4, Opal, one host), pending #332.
+
+## Classification of all seventeen added bullets
+
+Legend: **A** exact coverage already present · **B** missing harness/fixture capability, belongs in
+#322 · **C** production client semantics, owned by #347 · **D** evidence/provenance, owned by #341 or
+#348. Bullets spanning more than one class are split.
+
+### A — already covered, with test and line evidence
+
+| # | Added behaviour | Where it is already satisfied |
+|---|---|---|
+| A1 | Setters mutate state (bullet 45) | `Inner::apply` (`tests/mock_servers/hqplayer/model.rs:566-575`) applies a `Change` to `DaemonState`; every `Set*` arm routes through it |
+| A2 | Responses echo the command element with real result semantics (45) | `Inner::ok`/`Inner::error` (`model.rs:528-541`) echo the request element; `check_result` (`src/adapters/hqplayer.rs:1054`) reads it. Tests `an_explicitly_rejected_setter_reports_the_daemon_reason` (`tests/hqplayer_conformance.rs:637`), `an_unknown_command_is_reported_as_an_error_without_dropping_the_connection` (`:674`) |
+| A3 | Index 0 means Auto where observed (45) | `rates_pcm.xml`/`rates_sdm.xml` both carry `RatesItem index="0" rate="0"`; enforced live by `tier1_requires_rate_index_zero_to_be_auto` (`:2250`) |
+| A4 | Mode lists include `[source]` (45) | `modes.xml` — `index="0" name="[source]" value="-1"`. Test `modes_list_distinguishes_list_index_from_enum_id` (`:224`) |
+| A5 | `Status` carries child metadata (45) | `render_status` emits a self-closing `<metadata/>` (`model.rs:466-483`); tests `:182`, `:313`, `:2130` |
+| A6 | Decimal volume exercised (45) | `DaemonState::volume_db` defaults to `-23.5` (`model.rs:143`); eleven AC4 tests, `:696`–`:857` |
+| A7 | `VolumeRange` does not invent a wire step (45) | `step_db: Option<f64>` with `None` reproducing the verified sample (`model.rs:57-58`); test `a_volume_range_that_omits_step_reports_it_as_absent` (`:792`) |
+| A8 | Framing waits for the actual document root close (46) | `framing::classify` + root-element matching (`src/adapters/hqplayer.rs:1131-1197`); tests `:313`, `:341`, `:548`, `:569` |
+| A9 | EOF mid-document is rejected (46) | `"Connection closed mid-document after {} bytes"` (`src/adapters/hqplayer.rs:1211-1216`); test `a_truncated_document_fails_instead_of_returning_partial_state` (`:362`) |
+| A10 | Bare-ampersand tolerance (46) | Already handled — `decode_entities`' fall-through pushes `&` and continues rather than swallowing text. **Untested, not broken**; see B7 |
+| A11 | `result=Error` is failure; `OK` with unchanged `State` is also failure; bare response is command-specific (47) | `check_result` (`:1054`), `verify_applied` (`:1537`), and the `SetAdaptiveVolume` bare-reply arm (`model.rs:779-785`). Tests `:593`, `:612`, `:637`, `:1375` |
+| A12 | `SetFilter value` alone changes both chains — *daemon side* (48) | Modelled at `model.rs:723-724`: `s.filter_1x_index = one_x.unwrap_or(nx)` |
+| A13 | External mode change is covered (49) | `a_change_made_by_another_controller_is_visible_on_the_next_read` (`:658`), `a_setter_overridden_by_another_controller_fails_and_names_the_observed_value` (`:1375`) |
+| A14 | Never switch modes merely to pre-capture an inactive list (49) | Tier 1 is read-only by construction and *discloses* the gap instead of reaching for it: `tier1_records_the_inactive_mode_lists_as_not_captured` (`:1526`) |
+| A15 | `SetRate` distinguishes list index from Hz (50) | `set_rate` resolves Hz → index and sends the index (`src/adapters/hqplayer.rs:1787-1815`); `rates_*.xml` carry `rate` and no `value`, pinned by `rates_list_reports_hz_and_has_no_enum_id` (`:270`) |
+| A16 | Fixture provenance records edition/version/date (52) | `Provenance{source,daemon,status,date,notes}` (`corpus.rs:26-32`), enforced by `every_corpus_fixture_records_its_provenance` (`:1264`) |
+| A17 | Command-keyed deaf behaviour, not only a magic-value sentinel (62) | **Already exactly this.** `Faults::accept_but_ignore: Vec<String>` is keyed by *element name* (`model.rs:169`), consumed at `:552` and `:566`. UHC never had a value-keyed sentinel, so the "not only" clause is satisfied by construction. Test `a_setter_accepted_but_not_applied_does_not_report_success` (`:593`) |
+| A18 | `SetMode` resets `State.rate` to Auto/0 — *daemon side* (63) | `model.rs:700-708` sets `rate_index = 0` and `active_rate_hz = 0`, and a same-mode write takes the same path |
+| A19 | One mutable daemon state shared across connections (65) | Structural: one `Arc<dyn Responder>` serves every accepted connection (`tests/hqplayer_conformance.rs:73`, `wire.rs:175-181`) over `Arc<Mutex<Inner>>` (`model.rs:241-244`). Observable via `:658`. **Caveat:** no test opens two simultaneous client connections; the guarantee is the `Arc`, not an assertion |
+| A20 | Do not import HQPTuner framing (66) | Held. `wire.rs` owns chunking, coalescing, silence, unsolicited streams and drops; nothing from HQPTuner's framing is present or proposed |
+
+**Consequence for the issue body:** bullets 45, 47, 62, 65 and 66 are met in full today, and 46, 48,
+49, 50, 52 and 63 are partly met. Leaving them unticked misreports #322's state in the opposite
+direction from the over-claiming PR #337 was warned about.
+
+### B — missing harness/fixture capability, belongs in #322
+
+| # | Gap | Evidence that it is absent |
+|---|---|---|
+| B1 | **No loaded chain distinct from configured mode** (59) | `Inner::sdm()` is literally `self.state.mode_index == 2` (`model.rs:334`) and is the sole enumeration resolver (`:338-352`). Under `[source]` (`mode_index == 0`) the model serves the **PCM** lists unconditionally, and no `DaemonState` field can express an SDM chain while `State.mode` stays 0 |
+| B2 | **No source-following chain change mid-session** (59) | Follows from B1; `external_change` has no field to move |
+| B3 | **Chain-scoped enumerations with divergent IDs/indices** (60) | *Indices* already diverge (`poly-sinc-gauss-long` is index 7 in `filters_pcm.xml`, index 1 in `filters_sdm.xml`). *Enum IDs* do not — 40 in both chains and in the legacy profile; `sinc-Lh` 72, `poly-sinc-ext2` 16, `poly-sinc-short-lp` 30 likewise. **See correction 1: the live-lane half of this is an open evidence question, not a fixture defect.** The *evidenced* half is B4 |
+| B4 | **The persistent lane has no second numbering domain** | `persistent_config.xml` is `<output mode="0" filter="40" filter1x="6" shaper="5" rate="0"/>` — no `oversampling` attribute at all, so the cross-lane fixture cannot express the SDM persistent domain the salvage evidence actually names |
+| B5 | **No device-mode-omission fixture** (61) | `hqpd-6.0.4-opal/modes.xml` and `hqpd-5.x-legacy/modes.xml` both carry all three entries. No fixture omits SDM with remaining indices intact |
+| B6 | **No response accumulation cap, and no way to provoke one** (46) | `response.push_str(&line)` (`src/adapters/hqplayer.rs:1156`) is unbounded. Only a document *count* (`MAX_UNSOLICITED_BACKLOG = 256`, `:414`) and the per-command deadline bound it. `WirePolicy` (`wire.rs:54-79`) cannot emit an oversized document. `grep` for `oversiz|size_limit|MAX_RESPONSE|max_bytes` across `src` and the suite: no matches |
+| B7 | **No bare-`&` or double-escaped attribute fixture** (46) | Only single-escaped decode is covered (`the_matrix_profile_family_round_trips_a_name_containing_an_entity`, `:1163`). Bare `&` works but is unpinned; double-escaping is an evidence question — see D3 |
+| B8 | **No root recovery when a `metadata` child will not parse** (46) | No `_recover_root` equivalent exists (`grep recover` in `src/adapters/hqplayer.rs` and the suite: no matches). A `Status` whose `<metadata>` carries unescaped `<` or `"` classifies `Malformed` and errors — **on every poll while a track is loaded** |
+| B9 | **No `SetRate` expectation whatsoever** (50) | `grep -n "set_rate\|SetRate" tests/hqplayer_conformance.rs` returns **no matches**. The model implements `SetRate` (`model.rs:741-760`) but nothing drives `adapter.set_rate()`. Exact-Hz-pin semantics, `[source]` accept-and-ignore, mode-varying and empty rate lists: all unexercised |
+| B10 | **`[source]` cannot accept-and-ignore a rate pin** (50) | `SetRate` applies unconditionally (`model.rs:741-760`); no mode gate. `accept_but_ignore("SetRate")` yields OK-without-mutation but not the mode-conditional semantics, and `Status.active_rate` is not held independently |
+| B11 | **No expectation observes `SetMode` clearing the pin, same-mode or otherwise** (63) | The model does it (A18) but `set_mode` appears in the suite only at `:286` (list refetch, which asserts list *length* only) and `:678` (error path) |
+| B12 | **`Status.active_mode` echo and `active_rate` family are not fixture-driven** (64) | `render_state` sets `active_mode = s.mode_index` (`model.rs:411`) and `render_status` sets it from `name_at_index(GetModes, mode_index)` (`:431`). Both echo the configured mode, so the fake agrees with itself by construction and no fixture carries the disputed case |
+| B13 | **Provenance has no playback-state field** (52) | `Provenance` is source/daemon/status/date/notes (`corpus.rs:26-32`); `daemon` is free text. The added bullet requires playback state as a recorded dimension |
+| B14 | **Unevidenced fake behaviour: `SetMode` resets filters and shaper to index 0** | `model.rs:704-706` sets `filter_1x_index`, `filter_nx_index` and `shaper_index` to 0 on every `SetMode`. Upstream evidence says `SetMode` clears the *rate pin* and reloads the chain; it does not say filters reset to index 0, and no fixture provenance carries it |
+| B15 | **A #322 expectation depends on a behaviour #347 must delete** | `an_unknown_command_is_reported_as_an_error_without_dropping_the_connection` (`:674`) drives `set_mode("99")`, which reaches the daemon **only** via the numeric-string fallback at `src/adapters/hqplayer.rs:1603`. Retargeting it is #322 work |
+| B16 | **No fixture where the source rate and the output rate differ** | The model can express it (`model.rs:455-459` takes root `samplerate` from metadata while `active_rate` is separate) but nothing pins the domain split. `Status.active_bits` itself *is* already parsed — `src/adapters/hqplayer.rs:1247`, `:1390`, consumed `:2638` — so only the fixture is missing. The consuming semantics belong to **#328**, which is outside this amendment's four classes and is named here rather than force-fitted |
+
+### C — production client semantics, owned by #347
+
+Every row is a defect in `src/adapters/hqplayer.rs` today. **None of them is #322 work**, and #322 must
+not be described as covering them.
+
+| # | Behaviour | Site |
+|---|---|---|
+| C1 | No `[source]` guard on rate writes; `set_rate` sends unconditionally | `:1787-1815` |
+| C2 | No client-held per-family rate memory and no re-assertion after a mode change | absent |
+| C3 | A no-op `SetMode` is written rather than skipped, destroying the pin | `set_mode`, `:1574-1584` |
+| C4 | No loaded-chain observer; `refresh_lists()` runs only after UHC's own `set_mode` | `:1580` |
+| C5 | `SetFilter` may be sent with an absent sibling, and the one-sided helpers *guess* it | `set_filter(value, value1x: Option<u32>)` `:1630`; `state.filter_nx.unwrap_or(state.filter)` `:1661`; `state.filter1x.unwrap_or(state.filter)` `:1678` |
+| C6 | Numeric-string fallback in every resolver | `resolve_mode_index:1603`, `resolve_filter_index:1708`, `resolve_shaper_index:1769` |
+| C7 | Mode matching is exact equality, so `SDM (DSD)` needs prefix/alias handling | `:1591` and the `eq_ignore_ascii_case` calls around it |
+| C8 | Volume is result-checked but deliberately not readback-verified | `set_volume_db` doc comment |
+| C9 | Auto (index 0) in `[source]` reports **success** for an ignored command — readback compares 0 against 0 | consequence of `verify_applied("rate", …)` at `:1815` |
+
+C9 was found by dissent and is not in any issue's AC list yet. It belongs to #347's *ignored*
+outcome, and #322 structurally cannot catch it.
+
+### D — evidence and provenance, owned by #341 or #348
+
+| # | Item | Owner |
+|---|---|---|
+| D1 | `State.active_mode` vs `Status.active_mode` resolved as a **versioned** question rather than a global choice (51) | #341 (its AC already names it). #322 owns only *not pretending* — see B12 |
+| D2 | The `SetRate` semantics ledger: index on the wire, exact runtime Hz pin, Auto behaviour, mode/filter/device-dependent lists, mode switch clears the pin, marked upstream-pending (50) | #341 |
+| D3 | Whether the daemon emits **double-escaped** attribute values on the wire, or whether the double-escape is an artefact of `hqp-control`'s own XML parse. UHC substring-scans and decodes once; HQPTuner XML-parses then decodes again. One pass may be correct *for UHC's pipeline* | #341 — an evidence question, not a coverage gap |
+| D4 | Negative findings recorded so they are not retried: partial `POST /config` returns HTTP 200 without applying; `profile/save`/`profile/load` are unsafe as a durable preset store; self-generated 4321 session-authentication keys were rejected (53) | #341 |
+| D5 | The `.oh/hqplayer-spec.md` vs `docs/hqplayer-protocol-reference.md` `SetMode` value-vs-index contradiction | #341 |
+| D6 | MIT attribution for lifted HQPTuner or official `hqp-control` material (52). **No `THIRD-PARTY-NOTICES` file exists in this repository** — verified, and no commit has ever added one | #348 |
+| D7 | Manual-derived Signalyst prose not copied; evidence-acquisition boundary (no DSP characterisation, no disassembly, ambiguous probes stop for approval) | #348 |
+| D8 | Private upstream correspondence cited at a high level only, never reproduced | #348 |
+
+**Tally:** 20 already-covered findings across 11 bullets, 16 genuine #322 gaps, 9 #347 defects, 8
+#341/#348 items. Not one #347 row is proposed as #322 work.
+
+## Two corrections, both found by challenge rather than by the suite
+
+Recorded prominently because in both cases the mistake was mine and the mechanism that caught it is
+the part worth keeping.
+
+### Correction 1 — the "corpus contradicts the evidence" finding was wrong
+
+The `/review` pass concluded that `filters_pcm.xml` and `filters_sdm.xml` "encode the opposite of the
+evidence" by giving `poly-sinc-gauss-long` enum ID 40 in both chains, and proposed renumbering the SDM
+fixture to 38 as the amendment's **first** bite.
+
+`/dissent` re-read the source quotations. Both salvage reports say the same thing in the same words:
+`poly-sinc-gauss-long` is "enum 40 under PCM **`filter`** and 38 under SDM **`oversampling`**", and
+`sinc-M` is "25 under `filter`, 23 under `oversampling`" (`livemap.py:17-18`). **`filter` and
+`oversampling` are `hqplayerd.xml` / config-form attribute names, not two modes of `GetFilters`.** The
+cited evidence establishes that the *persistent* lane carries two separately-numbered enumerations. It
+does **not** establish that `GetFilters` returns a different enum ID for the same name in SDM.
+
+So the corpus does not encode the opposite of the evidence; it encodes an *unproven invariance*, which
+is a weaker and different charge. Renumbering 40 → 38 would have replaced one unverified number with
+another while newly asserting a live-lane fact nobody measured — the exact failure the original Stage
+1 dissent predicted for a hand-transcribed corpus (contrary evidence 4), arriving through the one
+channel nobody was watching: a **report about** a repository rather than the repository. The
+amendment's first bite is withdrawn and replaced by B4, which is what the evidence actually supports.
+
+### Correction 2 — two "biting" items do not bite
+
+The `/review` pass listed `SetFilter value` alone and bare-ampersand tolerance as expectations that
+would fail against today's client. Inspection says otherwise:
+
+- **`SetFilter` with an absent sibling is unreachable from production.** Both callers pass
+  `Some(...)` — `src/adapters/hqplayer.rs:1662` and `:1679`. The reachable hazard is the *guess* at
+  `:1661`/`:1678`, which is C5, i.e. #347's.
+- **Bare `&` is already handled.** `decode_entities`' fall-through pushes `&` and advances rather than
+  swallowing the following text. It is untested, not broken.
+
+## Solution Space
+
+**Problem:** #322's seventeen new bullets must be reframed into a #322-scoped plan that says which
+additions are already met, which are #347's, and what is actually built — without absorbing #347.
+
+**Key constraint:** ADR 003's three-layer split (corpus / wire / model) is committed and inherited by
+#162/#208/#328/#329/#330, so every addition must land in an existing layer.
+
+| Option | Level | Approach | Trade-off |
+|---|---|---|---|
+| A | Band-Aid | Paste the seventeen bullets into the AC list; add a fixture per bullet | 11 bullets are partly or wholly met; four are #347's and would be built in the wrong issue |
+| B | Local Optimum | Add each fault/fixture to the existing layers; keep `Inner::sdm()` and special-case `[source]` inside each setter arm | Encodes the conflation the evidence exists to prevent; N special cases that can disagree |
+| C | **Reframe** | One new state axis — loaded chain, distinct from configured mode — then compose the chain/pin/mode items from that axis × existing faults; short independent tail | Touches every enumeration path; forces a position on an open evidence question |
+| D | Reframe | Port HQPTuner's `fake_control.py` state model as a second responder | Two state models that can drift; its framing is rejected by #322's own criteria; a literal port is blocked on #348's missing `THIRD-PARTY-NOTICES` |
+| E | Redesign | Split: #322 closes on document/framing conformance, a new issue owns the live state model | Foreclosed by the issue body — the maintainer has already placed both sections inside #322 |
+
+**Selected: Option C.** The seventeen bullets are not seventeen requirements. The #322 remainder is
+dominated by one structural absence — the model has no loaded chain, so `mode_index` answers two
+questions the evidence says are independent. Adding the axis makes the chain, pin and mode items
+compositions of machinery that already exists.
+
+**The reframe, stated once:** *#322 owns making each daemon misbehaviour expressible and observed;
+#347 owns the quality of the client's response.* The line is mechanical, not a judgement call — an
+expectation belongs to #322 if the fake plus the **unmodified** client can satisfy it, and to #347
+otherwise. That is why no #347 row above is smuggled in.
+
+**Why not the others:** A restates instead of classifying. B encodes the conflation. D's wire layer
+fails #322's own criteria and its code path needs #348 first. E asks the right question — #337 is
+already 4,902 insertions and the live state model is genuinely different work — but the issue body
+records the opposite decision, so raising it is legitimate and acting on it is not. **It is raised, as
+a maintainer decision, in the gate section below.**
+
+## Review — verdict: ADJUST
+
+Five findings kept this off *Continue*. All are corrections inside Option C; none reopens the space.
+
+1. **Only three of the sixteen #322 gaps can fail against today's client** — B6 (no cap at all), B8
+   (root recovery; fails every `Status` poll while a track is loaded), and the stale-index
+   misselection behind B1–B3. The other thirteen are *capability* or *fidelity* work that cannot
+   produce a client red. **Adjustment: label every new expectation `client-conformance` or
+   `model-fidelity`.** This matters because PR #337 has already twice had to disclose REDs that added
+   a deliberately-failing production stub so an expectation could fail behaviourally (`bd87e21`,
+   `d7f62c2`). Without the label, Stage 2 manufactures more.
+2. **The headline chain fixture as specified would prove the wrong thing.** `poly-sinc-gauss-long` is
+   PCM index 7; `filters_sdm.xml` has 5 entries. Sending the stale index 7 hits the range check at
+   `model.rs:718` and returns `result="Error"`, so the test would observe a **spurious error** while
+   the real hazard is a **silent wrong selection**. The SDM fixture must be long enough that index 7
+   exists and names a different filter.
+3. **The corpus fidelity item deserved first position** — subsequently corrected by dissent; see
+   correction 1.
+4. **One production change is implied and contested.** The response cap is claimed by both #322
+   (bullet 46) and #347 ("Accumulated native responses have an explicit size limit"). Raised as a
+   maintainer decision rather than assumed either way.
+5. **Two ripple effects were unnamed:** B14 (unevidenced `SetMode` filter reset) and B15
+   (`set_mode("99")` depending on the fallback #347 deletes).
+
+**Drift detected.** *Scope drift, latent:* the loaded-chain axis sits one step from #347's chain
+observer. The guard is mechanical — an expectation needing new client behaviour is #347's. *Goal
+drift, present in the issue body itself:* bullets 45, 47, 62, 65 and 66 are already met, so leaving
+them unticked misreports #322's state in the opposite direction from the over-claiming the
+reconciliation comment warned about.
+
+## Dissent — verdict: ADJUST
+
+**Confidence before:** MEDIUM-HIGH. **After:** MEDIUM.
+
+Six lines of contrary evidence. The two that changed the plan:
+
+1. **The chain-divergence evidence is about the persistent lane** — correction 1 above. Fatal to the
+   plan's opening move, and it inverted the first bite.
+2. **The tier-1 merge gate can never settle chain-scoped claims.** ADR 003 and PR #337 both state
+   that tier 1 captures whichever mode the daemon is *already* in, because reaching the other needs
+   `SetMode`, which is mutating. Chain-scoped enumerations are two modes' worth of evidence by
+   definition. So chain fixtures join a `derived` population the merge gate structurally cannot
+   promote — labelling them "pending #332" overstates what will ever arrive.
+
+The others: six of ten new expectations can only observe the fake, and a label makes that legible
+rather than smaller; the axis cannot be added without taking a position on the `State`/`Status`
+contradiction #341 owns (`model.rs:411` vs `:431`); and the truthful-outcome floor has a hole exactly
+where `[source]` is most used (C9).
+
+**Pre-mortems.** (i) *The fake resolves a contradiction the project agreed not to resolve* — an
+`active_mode` value chosen for fixture convenience becomes de-facto truth across nine passing
+expectations with no provenance behind it. (ii) *#347 routes around the fixtures built for it*,
+cannot tell verified daemon facts from 2026-07 modelling choices, and writes its own fake — the
+program-level regression the original dissent named. (iii) *The cheap wins wait behind the expensive
+unverifiable ones* — B8 is a live user-harm path of the same class as the 0 dB volume defect this PR
+already fixed.
+
+**Modifications folded into the plan:**
+
+1. Withdraw the `filters_sdm.xml` renumbering; record the live-lane question in #341 with both
+   citations attached. No fixture changes numbers on this evidence.
+2. Replace it with B4 — add `oversampling` to `persistent_config.xml` as a second, separately
+   numbered persistent attribute, and extend the cross-lane expectation to cover it.
+3. Ship the three biting items **first and independently**; none needs the axis.
+4. Split capability from expectation: #322 builds the axis and the `[source]` faults so #347 is
+   unblocked; expectations that can only observe the fake travel with #347's client change.
+5. Make `active_mode` fixture-driven rather than model-derived, so the fake cannot resolve the
+   `State`/`Status` contradiction by construction. If that costs more than the axis is worth, that is
+   itself the finding.
+6. Label chain claims **tier-2-only**, not merely "pending #332".
+7. Hand C9 (Auto-in-`[source]` false success) to #347 in writing.
+8. Keep B14 and B15 as named bites.
+
+**Create ADR?** **No new ADR.** ADR 003 already owns this boundary and the capability-versus-
+expectation policy is a Consequence of it, not a new one-way door. Amend ADR 003 in Stage 2 — after
+the axis prototype settles whether `active_mode` can stay fixture-driven — so the amendment does not
+have to hedge its most consequential paragraph.
+
+## Proposed Stage 2 bite plan
+
+Six bites, ordered so the highest-value and most-verifiable land first, and so the plan can stop
+after any bite with value delivered. **Every bite is RED-first in its own commit, and every new
+expectation carries a `client-conformance` or `model-fidelity` label in its doc comment.** Line counts
+are estimates for a re-estimate checkpoint after bite 2, per the original Stage 1 discipline.
+
+| # | Bite | Class | Delivers | Est. |
+|---|---|---|---|---|
+| **1** | **Root recovery for an unparseable `metadata` child** (B8) | client-conformance | A `Status` whose child carries unescaped `<`/`"` but whose root is complete yields the playback fields instead of failing. Today this errors on **every** poll while a track is loaded. Needs a `wire.rs` malformed-child document and a `framing` recovery path | 120–160 |
+| **2** | **Response accumulation cap** (B6) | client-conformance | `wire.rs` gains an oversized-document fault; the framer gains an explicit byte bound; an oversized reply fails without wedging the next poll. **Blocked on the ownership decision below** | 80–110 |
+| **3** | **Loaded-chain axis** (B1, B2) | capability | `LoadedChain{Pcm,Sdm}` on `DaemonState`, `Inner::chain()` replacing `Inner::sdm()` as the enumeration resolver, `external_change` able to move the chain with `mode_index` untouched. `active_mode` becomes fixture-driven in both renderers. One `model-fidelity` expectation that a `[source]` chain change swaps the served lists | 180–240 |
+| **4** | **Stale-index misselection** (B3, on top of bite 3) | client-conformance | `filters_sdm.xml` extended so the stale PCM index is *in range* and names a different filter, then a source-driven chain change followed by a filter write by name. This is the one chain expectation that bites the unmodified client. Fixtures marked `derived-upstream`, **tier-2-only** | 90–130 |
+| **5** | **Persistent-lane second numbering domain** (B4) | client-conformance | `oversampling` added to `persistent_config.xml` with its own enum domain; the cross-lane expectation extended so a PCM `filter` number and an SDM `oversampling` number for the same name are not interchangeable. Evidenced, cheap, needs no axis | 60–90 |
+| **6** | **Fidelity tail** (B5, B7, B9–B16) | mostly model-fidelity | Device-mode-omission fixture; bare-`&` pinned; `SetRate` expectations incl. `[source]` accept-and-ignore and mode-clears-pin; `Status.active_mode` echo fixture; `Provenance.playback` as a required field; remove the unevidenced `SetMode` filter/shaper reset (B14); retarget `set_mode("99")` off the numeric fallback (B15); source-rate ≠ output-rate fixture | 260–340 |
+
+Total ≈ **790–1,070** lines, overwhelmingly fixtures and expectations. **Bites 3, 4 and 6 deliver the
+capability #347 is blocked on; the expectations that can only bite after #347's client change travel
+with #347, not here.**
+
+Carried forward unchanged: every assertion through `HqpAdapter`'s public surface; one behaviour per
+test; no wall-clock assertions; every fixture carries provenance; `MockHqpServer` stays a facade for
+`tests/adapter_integration.rs` and `tests/zones_sha_integration.rs`; no route, request or response
+change; `tests/fixtures/api_routes.txt` untouched; `api-change-approved` never self-applied.
+
+## Maintainer decisions this amendment will not make
+
+1. **Who owns the response accumulation cap** — #322 bullet 46 or #347's AC? It lives in the framing
+   path #322 already changed. Recommendation: #322 owns it, #347's duplicate AC is struck as
+   inherited. Bite 2 is blocked until this is answered.
+2. **Should #322 be split** (Option E)? The issue body places both salvage sections inside #322, and
+   #337 is already 4,902 insertions. Splitting the live state model into its own issue is defensible;
+   reversing a recorded maintainer decision is not an agent's call.
+3. **Should bullets 45, 47, 62, 65 and 66 be ticked** in the issue, given the evidence above?
+4. **How should tier-2-only claims be marked** in fixture provenance, given that no read-only gate
+   can ever promote them?
+
+## Superego disposition (`sg review`, superego 0.9.4)
+
+Run against the staged artifact at the Stage 1 decision point. **No blocking concerns.** It
+independently spot-checked the citations against the worktree — `Inner::apply`, `Inner::sdm()`, the
+`SetMode`/`SetFilter` handlers, both negative-evidence greps, correction 1's enum-ID claim, and B4's
+missing `oversampling` attribute — and found them accurate rather than confidently wrong. It confirmed
+the diff is one file, 344 insertions / 3 deletions, with no `src` or `tests` touched.
+
+One follow-up raised, and closed:
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | Re-confirm the `rna-mcp` "no metis/guardrail/signal, no outcome artifact for `80222d6d`" claim, since it underwrites "the only prior situated judgment is `.oh/hqplayer-spec.md` and ADR 003" | **Closed.** Re-run in the same turn: the artifact-typed search returns only code symbols and this file; `outcome_progress("80222d6d")` returns *not found in `.oh/outcomes/`*. `.oh/` contains only `.cache/`, `hqplayer-spec.md` and this artifact — there are no `metis/`, `guardrails/` or `outcomes/` directories to search |
+
+## Stage-1 amendment gate status
+
+| Gate requirement (#310 per-issue workflow) | Status |
+|---|---|
+| `/solution-space` run, ≥3 genuine candidates across ≥2 escalation levels | Met — 5 candidates across 4 levels |
+| `/review` verdict Continue or Adjust, no unresolved blocker | Met — **ADJUST**; five findings folded in |
+| `/dissent` verdict PROCEED or ADJUST, not RECONSIDER | Met — **ADJUST**; 8 modifications folded in |
+| `sg review` at the Stage 1 decision point | Run against this artifact; disposition recorded in the superego comment on PR #337 |
+| One-way architectural decision has an ADR or a stated reason not to create one | Met — ADR 003 amended in Stage 2, reason stated |
+| Outputs persisted to `.oh/issue-<number>-<slug>.md` | Met — this section |
+| Planning artifact committed, four reports posted as separate PR comments | See PR #337 |
+| Stop for the independent Codex Stage 1 gate before `/execute` | **Stopping here** |
+
+**Not done in this turn, by instruction:** no `src` change, no `tests` change, no Stage 2 work, no
+merge, no ready-for-review, no auto-merge, no API route or payload change, no
+`api-change-approved`, no force push. **No live verification is claimed anywhere in this amendment**
+— the suite was not run in this turn, and no HQPlayer daemon was contacted. Every classification is
+sourced to a file and line read at `6b8e97f`.
