@@ -54,8 +54,11 @@ Consequences of that split, all load-bearing:
 - **The default suite is hermetic.** The opt-in real-daemon mode is `UHC_HQP_CONFORMANCE_HOST`,
   read-only, and skips with a printed note rather than being permanently `#[ignore]`d. It is now the
   **implemented tier-1 capture-and-diff merge gate** (`tier1_live_read_only_verification_when_opted_in`)
-  — it captures every read-only protocol family, diffs it against a corpus profile, and fails on
-  divergence or on any required ADR 003 claim it did not compare. It has not yet run against a real
+  — it captures every read-only protocol family, diffs it against a corpus profile, and fails on any
+  divergence and on any required claim it could capture but left unverified. Claims a given run
+  structurally cannot reach — the `/config` lane when no web credentials are supplied, the inactive
+  mode's lists, and (under a configured `[source]` mode) the material-dependent loaded chain — are
+  recorded as accepted limits or `not_captured` with a reason, not treated as failures. It has not yet run against a real
   daemon. It began as a connectivity/identity smoke check; see the tier-1 section below for what the
   gate does and does not settle.
 - **`MockHqpServer` survives untouched** as the facade for `tests/adapter_integration.rs` and
@@ -218,10 +221,20 @@ and **diff against the corpus**:
 | `Status` | attribute set, the `metadata` child's presence and self-closing shape, active-\* fields as strings |
 | `VolumeRange` | whether `step` is sent at all, and that min/max are doubles |
 | `MatrixListProfiles` / `MatrixGetProfile` | container and child shape |
-| `GET /config` (8088) | the `profile` / `profile_name` field names and the `[default]`-versus-named distinction |
+| `GET /config` (8088) | the `profile` / `profile_name` field names and the `[default]`-versus-named distinction — **only when web credentials are supplied**; without `_WEB_USER`/`_WEB_PASS` this lane is a declared accepted limit recorded in `not_captured`, never a divergence |
 
 Every mismatch either re-provenances a fixture from the capture or ships as a stated gap. A
 `derived-excerpt` or `UNVERIFIED` label surviving this pass unexamined is a finding, not a footnote.
+
+**What the gate compares is bounded by what the run could observe.** The three mode-relative rows —
+`GetFilters`, `GetShapers`, `GetRates` — are diffed only against the chain the daemon is actually
+serving: index 2 is SDM, index 1 is PCM. The *inactive* mode's lists cannot be reached read-only
+(that needs `SetMode`, tier 2) and are recorded `not_captured`. Under a configured `[source]` mode
+the loaded chain is decided by the source material, not the configured mode, so it is neither PCM nor
+SDM to the differ; those three families are recorded `not_captured`/`unverified` with a reason rather
+than diffed against a guessed chain — comparing against PCM there would manufacture a false
+divergence. So the gate's pass means *the required claims it could capture matched*; it never claims
+to have compared a family it could not observe.
 
 **This tier is what the real-daemon merge gate means.** It is implemented as of stage 3 — see the
 runbook below — and awaits a reachable daemon.
@@ -266,6 +279,7 @@ evidence for setting `HqpTimeouts::response`, every divergence with family/kind/
 `tier1_finds_no_divergence_when_the_daemon_serves_the_corpus_it_is_diffed_against`,
 `tier1_reports_index_divergence_when_the_daemon_orders_a_list_differently`,
 `tier1_records_the_inactive_mode_lists_as_not_captured`,
+`tier1_does_not_diff_mode_relative_lists_under_source`,
 `tier1_records_container_delivery_time_per_family` and
 `tier1_records_how_many_unsolicited_documents_the_client_skipped`, all of which run hermetically
 against the fake daemon. What those cannot cover is the live gate's own env-var handling and its

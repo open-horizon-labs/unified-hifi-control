@@ -180,10 +180,10 @@ HQPlayer has two query commands with different semantics:
 | Aspect | State | Status |
 |--------|-------|--------|
 | Filter/Shaper | Numeric (INDEX) | String (name) |
-| active_mode | Numeric INDEX - **reliable** | String - **unreliable** |
-| Use for | Settings UI, actual state | Display names |
+| active_mode | Numeric INDEX - **reliable for an explicit PCM/SDM mode; unmeasured under `[source]`** | String - **unreliable** |
+| Use for | Settings UI, configured mode | Display names |
 
-**Warning:** Status's `active_mode` may show `"[source]"` even when outputting DSD. Always use State's numeric `active_mode`.
+**Warning:** Status's `active_mode` may show `"[source]"` even when outputting DSD, so it does not resolve the loaded chain. State's numeric `active_mode` is the reliable reading of the *configured* mode — but under a configured `[source]` mode the *loaded* chain is decided by the source material and **what `State.active_mode` reports there has not been measured** in UHC's evidence base. Do not treat it as a chain resolver under `[source]`: derive the loaded chain from the `Status.active_rate` family instead, as the upstream client does. See the `ActiveModeReporting` doc in `tests/mock_servers/hqplayer/model.rs` and issue #341, which owns settling this.
 
 ## Implementation Checklist
 
@@ -196,7 +196,7 @@ When implementing HQPlayer control:
 - [ ] SetMode: send INDEX (CLI help confirms `--set-mode <index>`)
 - [ ] SetRate: send INDEX (RateItem has no value field)
 - [ ] For display: use Status's string fields (active_filter, active_shaper)
-- [ ] For actual mode: use State's active_mode (INDEX), not Status's string
+- [ ] For the configured mode: use State's active_mode (INDEX), not Status's string. Under a configured `[source]` mode this reports the configured mode, not the loaded chain (which is material-dependent and unmeasured for this field); resolve the loaded chain from `Status.active_rate`. See #341.
 
 ## Quick Reference Table
 

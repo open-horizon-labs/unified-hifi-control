@@ -1616,6 +1616,74 @@ async fn tier1_records_the_inactive_mode_lists_as_not_captured() {
     h.stop();
 }
 
+/// Under a configured `[source]` mode the loaded chain is material-dependent — it can be PCM or SDM
+/// depending on what the source is feeding — so the configured mode index does not identify the
+/// chain. `diff` used to fall through `active_mode_index != 2` to the PCM corpus, which meant a
+/// `[source]` daemon serving the SDM chain was diffed against PCM and every entry read as a
+/// divergence. That is a false absence manufactured by the differ, the exact class this gate exists
+/// to prevent. Under `[source]` the mode-relative families must be recorded not-captured/unverified
+/// with a reason, never compared against a guessed chain; mode-independent families (matrix) still
+/// compare. (CodeRabbit review at `bc9158e`, finding 4.)
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn tier1_does_not_diff_mode_relative_lists_under_source() {
+    let h = Harness::verified().await;
+    // Configure `[source]` (mode index 0) with the SDM chain actually loaded — the case the finding
+    // describes: the daemon reports mode 0 while serving SDM enumerations.
+    h.model.external_change(|s| s.mode_index = 0);
+    h.model.source_loads_chain(LoadedChain::Sdm);
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    h.stop();
+    assert_eq!(
+        capture.active_mode_index, 0,
+        "precondition: the capture is under [source]"
+    );
+
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+
+    // No mode-relative family may be diffed against a chosen chain under [source].
+    let false_divergences: Vec<&tier1::Divergence> = report
+        .divergences
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.family.as_str(),
+                "filters_pcm" | "filters_sdm" | "shapers_pcm" | "shapers_sdm" | "rates"
+            )
+        })
+        .collect();
+    assert!(
+        false_divergences.is_empty(),
+        "under [source] the loaded chain is unknown to the configured mode, so filters/shapers/rates \
+         must not be diffed against PCM or SDM; got false divergences:\n{false_divergences:#?}"
+    );
+
+    // They must be recorded unverified with an explicit [source] reason, and not counted as checked.
+    for family in ["filters", "shapers", "rates"] {
+        assert!(
+            report
+                .unverified
+                .iter()
+                .any(|u| u.starts_with(family) && u.contains("source")),
+            "{family} must be recorded unverified with a [source] reason; unverified={:?}",
+            report.unverified
+        );
+        assert!(
+            !report.checked.contains(family),
+            "{family} must not be marked checked under [source]; checked={:?}",
+            report.checked
+        );
+    }
+
+    // Mode-independent families still compare: matrix is not chain-scoped.
+    assert!(
+        report.checked.contains("matrix"),
+        "matrix is mode-independent and must still be compared under [source]; checked={:?}",
+        report.checked
+    );
+}
+
 /// Container delivery time is the evidence `HqpTimeouts::response` should be set from, so a capture
 /// has to record it per family rather than leaving the value inherited.
 #[tokio::test]
@@ -5346,7 +5414,11 @@ fn the_debug_output_for_faults_names_the_rate_pin_refusal() {
     use mock_servers::hqplayer::model::Faults;
 
     // Built by mutation rather than struct-update syntax: `Faults` keeps its `pending` queue private,
-    // so `..Default::default()` is not available from outside the model module.
+    // so `..Default::default()` is not available from outside the model module. Clippy's
+    // `field_reassign_with_default` currently stays silent for exactly that reason (its suggested
+    // rewrite would not compile), but the allow makes the intent explicit and survives a future
+    // clippy that stops making the exception.
+    #[allow(clippy::field_reassign_with_default)]
     let mut armed = Faults::default();
     armed.source_refuses_rate_pin = true;
     let shown = format!("{armed:?}");

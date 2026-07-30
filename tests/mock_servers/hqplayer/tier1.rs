@@ -1052,8 +1052,27 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
             report.not_captured.push(format!("{stem} (not in capture)"));
             continue;
         };
-        // Filters and shapers are mode-relative; compare against the profile document for the mode
-        // the daemon was actually in.
+        // Filters, shapers and rates are mode-relative. Under a configured `[source]` mode (index 0)
+        // the loaded chain is decided by the material the source feeds, not by the configured mode, so
+        // it can be PCM or SDM and the corpus has no document that is correct to diff against. The old
+        // `_` arm fell to the PCM corpus for *any* non-SDM index, which meant a `[source]` daemon
+        // serving the SDM chain was compared against PCM and every entry read as a divergence — a
+        // false absence manufactured by the differ. Record the family not-captured and the claim
+        // unverified, with the reason, rather than compare a guessed chain. `matrix` is mode-
+        // independent and still compares.
+        if matches!(stem, "filters" | "shapers" | "rates") && capture.active_mode_index == 0 {
+            report.not_captured.push(format!(
+                "{stem} — daemon is in [source] mode (index 0); the loaded chain (PCM or SDM) is \
+                 material-dependent and not identified by the configured mode, so no mode-relative \
+                 corpus is correct to diff against"
+            ));
+            report.unverified.push(format!(
+                "{stem} — not compared under [source]; the loaded chain is unknown here and reaching a \
+                 known chain needs SetMode (tier 2)"
+            ));
+            continue;
+        }
+        // For an explicit mode the configured mode *is* the chain: index 2 is SDM, index 1 is PCM.
         let doc_stem = match (stem, capture.active_mode_index) {
             ("filters", 2) => "filters_sdm".to_string(),
             ("filters", _) => "filters_pcm".to_string(),
