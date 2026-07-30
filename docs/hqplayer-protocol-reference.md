@@ -3,10 +3,11 @@
 > ## Retired as guidance — start at the evidence ledger
 >
 > **[`docs/hqplayer-evidence-ledger.md`](hqplayer-evidence-ledger.md) supersedes this page** (issue
-> #341). The ledger carries every claim with its evidence class, provenance quadruple
-> (source · chain · daemon/version · date · playback state) and the executable test that proves it;
-> this page carries none of that and was confidently wrong in ways the ledger records under
-> **Retired claims**.
+> #341). The ledger carries every claim with its evidence class, provenance quintuple
+> (source · chain · daemon/version · date · playback state) and **the proof pointer or acquisition
+> plan that supports it** — an executable test or fixture where one exists, a named plan with an owner
+> where none does. This page carries none of that and was confidently wrong in ways the ledger records
+> under **Retired claims**.
 >
 > This page is kept, not deleted, because links to it exist and a reader arriving at one must see the
 > correction rather than a clean file. Corrections come from two directions and are marked
@@ -14,6 +15,8 @@
 > and the `active_mode` guidance was reframed by #322 itself, which cites ledger row **HQP-C-024**
 > rather than this banner. Nothing here should be implemented from without checking the ledger row
 > first.
+
+---
 
 > **This document is a reader's guide, not the authority.** Since issue #322 the authority is the
 > executable corpus under `tests/fixtures/hqplayer/<version>/`, driven by the conformance suite in

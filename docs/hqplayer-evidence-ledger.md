@@ -4,7 +4,9 @@
 
 > **What this is.** One ranked, provenance-tagged index of what UHC knows about HQPlayer's control
 > protocol, how it knows each thing, for which edition and version on which date with playback active
-> or idle, and which executable test proves it.
+> or idle, and **which proof pointer or acquisition plan supports it** — an executable test or fixture
+> where one exists, and a named plan with an owner where none does. Nineteen of these rows have no
+> executable proof, and saying otherwise would be the first thing this ledger got wrong.
 >
 > **What it is not.** It is **not** the protocol authority. The authority is the executable corpus
 > under `tests/fixtures/hqplayer/<version>/` driven by `tests/hqplayer_conformance.rs`, per
@@ -104,9 +106,9 @@ were **not executed** and are recorded as gaps in that comment.
 | ID | Claim | Class | Provenance | Proof | Status | Owner |
 |---|---|---|---|---|---|---|
 | HQP-C-001 | `SetMode value=` carries the **list index**, not the enum ID: SDM is index 2 while its enum ID is 1 | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:modes_list_distinguishes_list_index_from_enum_id · fixture:tests/fixtures/hqplayer/hqpd-6.0.4-opal/modes.xml | settled | — |
-| HQP-C-002 | Domain 1 — the **live wire** domain: `State.mode/filter/filter1x/filterNx/shaper/rate` and every `Set*` speak a **list index** into the currently loaded enumeration | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it · test:a_filter_name_is_not_sent_as_its_enum_id | settled | — |
+| HQP-C-002 | Domain 1 — the **live wire** domain: `State.mode/filter/filter1x/filterNx/shaper/rate` and the **enumerated** setters (`SetMode`, `SetFilter`, `SetShaping`, `SetRate`, `SetJunkFilter`) speak a **list index** into the currently loaded enumeration. Volume is **not** in this domain — it is absolute dB (HQP-C-040) | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it · test:a_filter_name_is_not_sent_as_its_enum_id | settled | — |
 | HQP-C-003 | Domain 2 — the **persistent** domain: `hqplayerd.xml` and the 8088 config form store **enum IDs**, which are not list indices and must never be fed to the live lane | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-hqplayer-protocol-conformance.md` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_persistent_configuration_lane_stores_enum_ids_not_list_indices · test:feeding_a_persistent_enum_id_to_the_live_lane_is_rejected | settled | — |
-| HQP-C-004 | Domain 3 — the **semantic name**: UHC's clients (UI, API, MCP) exchange names and Hz only; index and enum-ID conversion is the adapter's job and never leaves it | E6-documentary | `.oh/hqplayer-spec.md` layer table · direct · n/a · 2026-02-04 · n/a | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it | settled | — |
+| HQP-C-004 | Domain 3 — the **client** domain: UHC's clients (UI, API, MCP) exchange setting-appropriate values — semantic names for mode/filter/shaper, Hz for rate, decimal dB for volume — and never list indices or enum IDs; both conversions are the adapter's job and never leave it | E6-documentary | `.oh/hqplayer-spec.md` layer table · direct · n/a · 2026-02-04 · n/a | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it | settled | — |
 | HQP-C-005 | `SetMode` does **not** reset the filter or shaper selections; the fake once modelled that and no evidence supports it | E3-derived | `.oh/issue-322-…` amendment row B14 · direct · hqplayerd 6.0.4 (Opal) · 2026-07-30 · unknown | test:set_mode_does_not_reset_the_filter_and_shaper_selections | settled | — |
 | HQP-C-006 | A mode change reloads the chain, so a list index resolved before it can name a **different** setting after it | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain · test:the_same_filter_index_selects_a_different_filter_per_loaded_chain | settled | — |
 | HQP-C-007 | Under configured `[source]` the **loaded chain** can move between PCM and SDM while `State.mode` stays 0 | E1-upstream-verified | UHC-SALVAGE-BETA-DEV via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_loaded_chain_moves_under_source_while_the_configured_mode_stays_source | settled | — |
@@ -217,7 +219,8 @@ withdrawn.
 | ID | Claim | Class | Provenance | Proof | Status | Owner |
 |---|---|---|---|---|---|---|
 | HQP-C-050 | The 20 kHz filter is `filter_junk`, an **int index** into `GetJunkFilters` — not a boolean `filter_20k` — and the wire element is `SetJunkFilter` | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_junk_filter_is_read_as_a_list_index_not_a_boolean | settled | — |
-| HQP-C-051 | `SetJunkFilter` round-tripped `filter_junk 0→1→0` with `result="OK"` on L1, but the adapter exposes **no** `set_junk_filter` — a daemon capability UHC does not offer | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:the_junk_filter_is_read_as_a_list_index_not_a_boolean | open | #329 |
+| HQP-C-051 | `SetJunkFilter` round-tripped `filter_junk 0→1→0` with `result="OK"` on L1 — the daemon capability is real | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:the_junk_filter_is_read_as_a_list_index_not_a_boolean | settled | — |
+| HQP-C-062 | UHC's adapter exposes **no** `set_junk_filter`, so no surface can reach that daemon capability | E6-documentary | `src/adapters/hqplayer.rs` at this head · direct · n/a · 2026-07-30 · n/a | test:tests/hqplayer_ledger_lint.rs::the_adapter_exposes_no_junk_filter_setter | open | #329 |
 
 ### Licensing and provenance
 
@@ -397,13 +400,17 @@ native port and the daemon rejected it.
 session authentication, recording what the daemon accepts. L1 needed none (HQP-C-049), so UHC has no
 first-hand evidence either way.
 
-### HQP-C-051 — `SetJunkFilter` works and UHC does not expose it
+### HQP-C-062 — `SetJunkFilter` works and UHC does not expose it
 
-The daemon accepted the raw element and round-tripped the value on L1. The adapter has no
-`set_junk_filter`, so the capability is unavailable to any UHC surface. This is a gap, not a defect.
+The daemon accepted the raw element and round-tripped the value on L1 (HQP-C-051, settled). The adapter
+has no `set_junk_filter`, so the capability is unavailable to any UHC surface. This is a gap, not a
+defect — and it is now **executable**: `the_adapter_exposes_no_junk_filter_setter` scans the adapter, so
+if #329 adds the setter the check fails and this row must be updated rather than quietly outliving its
+own truth. The two halves were one row until CodeRabbit pointed out that a single wire-behaviour test
+cannot support a claim about the adapter's surface.
 
 **What would settle it:** #329 deciding whether the junk filter belongs in the live-settings surface.
-The protocol half is settled (HQP-C-050).
+The protocol half is already settled (HQP-C-050, HQP-C-051).
 
 ### HQP-C-053 — the notices file this PR must not create
 

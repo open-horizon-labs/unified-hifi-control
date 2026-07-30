@@ -258,7 +258,10 @@ is lint-gated on that version string, so no row can quietly promote itself to fi
 2. Claim IDs are unique, well-formed, and contiguous from `HQP-C-001`.
 3. Every `Class` is in the closed vocabulary.
 4. Every test name in a `Proof` cell exists in the named test file.
-5. Every fixture path in a `Proof` cell exists on disk.
+5. Every fixture path in a `Proof` cell names an **existing corpus document with complete
+   provenance** — a regular `.xml`/`.html` file under `tests/fixtures/hqplayer/` that loads through
+   `corpus::load`, which refuses a missing or misplaced provenance header. A directory or an
+   arbitrary file that merely exists is not a fixture proof.
 6. The pending-first-hand-confirmation table lists **exactly** the set of fixtures whose provenance
    records `source_chain: read-via-report` — computed from the corpus, not curated.
 7. Every `open` / `pending-live` row names an owner issue and a settle condition.
@@ -318,7 +321,7 @@ Nothing was committed; `make css` downloads a standalone binary and was not run.
 **Test-only RED commit `8874707`** — verified test-only: `git diff 8874707^..8874707 --name-only`
 returns `tests/hqplayer_ledger_lint.rs` alone.
 
-```
+```text
 test result: FAILED. 5 passed; 18 failed
 ```
 
@@ -711,3 +714,68 @@ not fallen: every pass has found at least one. Report 6/6 predicted the fifth be
 stopping *a budget decision, not a completeness claim*; that framing is now supported by five data points
 and applies unchanged to a sixth pass. **Anyone reading a green `hqplayer_ledger_lint` as evidence that
 the ledger is correct is making the exact inference this ledger exists to prevent.**
+
+### CodeRabbit's sixth pass at `0683760` — `CHANGES_REQUESTED`, nine actionable items, all valid
+
+Review [4823720730](https://github.com/open-horizon-labs/unified-hifi-control/pull/364#pullrequestreview-4823720730). **Stopping at five passes was overridden, and the sixth pass found three more
+false passes plus one real bug** — vindicating the dissent's "budget decision, not a completeness claim"
+rather than the decision to stop. Every item was verified against the code before being acted on.
+
+#### Three false passes and one shape bug, each RED before GREEN
+
+| # | Defect | RED evidence | Now pinned by |
+|---|---|---|---|
+| F7 | `cells` re-added the leading pipe when a row lacked a trailing one, shifting every field by one — so a shape error surfaced as *"malformed claim ID"* for a row whose ID was fine | `left: ["", "a", "b", "c"]` | `cells_does_not_reinstate_the_leading_pipe_when_a_row_lacks_a_trailing_one` |
+| F8 | `#[ignore="reason"]` **without a space** read as *not ignored*, so a citation to an ignored test would have counted as proof | `left: Some(false)` for `unspaced_ignore` | `an_ignored_test_is_detected_with_or_without_spacing` |
+| F9 | a citation naming a nonexistent proof file **panicked** inside the file reader, aborting the aggregated diagnostics with the ledger's own "this file is #341's deliverable" message | probe: `catch_unwind` caught the panic | `a_missing_proof_file_is_reported_rather_than_panicking`, plus M30 which now reports *"HQP-C-052 cites tests/typo_does_not_exist.rs::whatever, but … is not a readable file"* |
+| dup | the strikethrough check inspected only the **first** occurrence of each retired claim | M29: a second unstruck *"resolves to VALUE"* passed | `match_indices`, re-proven by M29 |
+
+**Seven focused controls replaced seven throwaway mutations.** Every false pass so far has been in a
+*helper* — `contains` where a prefix was meant, a prefix where an exact marker was meant, a fallback that
+re-added a delimiter — and a mutation proves a helper's boundary exactly once, then is reverted. The new
+tests call the helpers directly with the exploit strings as inputs, so CR5's prefix collision, CR6's
+malformed marker, the seven-hash pseudo-heading, the owner-token forms and both `#[ignore]` spellings are
+**permanently** pinned. Check count: **23 → 31**.
+
+#### Five documentation findings, all valid
+
+| # | Finding | Fix |
+|---|---|---|
+| F1 | the `.oh` contract still described the fixture check as *"exists on disk"* after it had been strengthened to load through `corpus::load` | contract text now states the real requirement: an existing corpus document **with complete provenance** |
+| F2 | a fenced block with no language (`MD040`) | `text` |
+| F3 | both banners said *"which executable test proves it"* — but **19 rows have no executable proof** | *"which proof pointer or acquisition plan supports it"*, and the ledger banner now says the 19 out loud |
+| F4 | HQP-C-002 claimed *every* `Set*` speaks a list index — **volume does not**, it is absolute dB; and HQP-C-004 said clients exchange *"names and Hz only"*, which excludes the dB it documents in HQP-C-040 | narrowed to the **enumerated** setters with volume explicitly excluded; the client domain now names its three real value kinds |
+| F6 | a blank line between two adjacent blockquotes (`MD028`) | a thematic break, which separates them without pulling base-branch content into this banner |
+
+#### F5 — the finding that improved the ledger's structure
+
+HQP-C-051 asserted two things — the daemon accepts `SetJunkFilter`, **and** UHC's adapter exposes no
+setter — behind one conformance test that only supports the first. **Split**, per the review's own "or
+split honestly":
+
+- **HQP-C-051** keeps the wire fact, `settled`, proven by the conformance test.
+- **HQP-C-062** carries the adapter-surface claim, `open`, owner #329 — and is now **executable**:
+  `the_adapter_exposes_no_junk_filter_setter` scans `src/adapters/hqplayer.rs`, so if #329 adds the setter
+  the check fails and the row must be updated rather than outliving its own truth.
+
+That is the ledger's discipline applied to itself: one claim, one proof.
+
+### Running tally after six external passes
+
+**Nine false passes and one factual error, none of them found by this session's own mutation table.**
+
+| Pass | Findings |
+|---|---|
+| 1 | CR1 registry playback comparison · CR2 fixture-path validation |
+| 2 | CR3 settle-phrase presence |
+| 3 | CR4 owner tokens |
+| 4 | CR5 anchor hijack — **one real instance already in the ledger** |
+| 5 | CR6 variant settle marker |
+| 6 | F7 `cells` shape bug · F8 unspaced `#[ignore]` · F9 panicking proof-file read · dup strikethrough first-occurrence-only |
+
+Plus HQP-C-023's playback state, found by a human reviewer.
+
+**The rate still has not fallen**, and this pass is the second consecutive one to find a defect in a
+*helper* rather than a check. **A seventh pass is requested rather than assumed unnecessary.** The
+prediction in Report 6/6 — that stopping is a budget decision — is now supported six times over, and the
+one time it was acted on as if it were a completeness claim, the next pass found four more things.

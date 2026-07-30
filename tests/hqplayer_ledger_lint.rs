@@ -147,11 +147,11 @@ impl Claim {
 /// that the surrounding pipes produce.
 fn cells(line: &str) -> Vec<String> {
     let trimmed = line.trim();
-    let inner = trimmed
-        .strip_prefix('|')
-        .unwrap_or(trimmed)
-        .strip_suffix('|')
-        .unwrap_or(trimmed);
+    // Each strip must feed the next. Falling back to `trimmed` after stripping the prefix re-adds the
+    // leading pipe, so a row missing its trailing pipe yields a leading empty cell and every field
+    // shifts by one — surfacing as "malformed claim ID" for a row whose ID was fine.
+    let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
     inner.split('|').map(|c| c.trim().to_string()).collect()
 }
 
@@ -277,7 +277,21 @@ fn table_rows_under(heading_marker: &str) -> Vec<Vec<String>> {
 /// `#[ignore]` matters: a name-existence check would accept an ignored test as proof of a claim, and
 /// an ignored test proves nothing. The suite carries none today, which is a fact about today.
 fn test_functions(path: &Path) -> HashMap<String, bool> {
-    let text = read(path);
+    parse_test_functions(&read(path))
+}
+
+/// [`test_functions`] for a file that may not exist: `None` when it cannot be read.
+///
+/// The panicking form aborted the aggregated diagnostics, so a claim citing `test:tests/typo.rs::name`
+/// produced the ledger reader's own "this file is issue #341's deliverable" message instead of naming
+/// the offending claim. A citation to a file that is not there is a missing citation.
+fn test_functions_of_existing_file(path: &Path) -> Option<HashMap<String, bool>> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|t| parse_test_functions(&t))
+}
+
+fn parse_test_functions(text: &str) -> HashMap<String, bool> {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = HashMap::new();
     for (i, line) in lines.iter().enumerate() {
@@ -307,7 +321,12 @@ fn test_functions(path: &Path) -> HashMap<String, bool> {
                 if attr == "test" || attr.starts_with("test(") || attr.ends_with("::test") {
                     is_test = true;
                 }
-                if attr == "ignore" || attr.starts_with("ignore(") || attr.starts_with("ignore =") {
+                // Matched on the bare name plus a delimiter, because `#[ignore="flaky"]` without a
+                // space is valid Rust and `starts_with("ignore =")` misses it — and an ignored test
+                // read as a live proof is exactly the false absence this check exists to prevent.
+                let ignore_rest = attr.strip_prefix("ignore").map(str::trim_start);
+                if matches!(ignore_rest, Some(r) if r.is_empty() || r.starts_with('(') || r.starts_with('='))
+                {
                     ignored = true;
                 }
                 continue;
@@ -574,7 +593,7 @@ fn an_observed_claim_names_a_real_capture_date_and_playback_state() {
 
 #[test]
 fn every_cited_test_exists_and_is_not_ignored() {
-    let mut cache: HashMap<String, HashMap<String, bool>> = HashMap::new();
+    let mut cache: HashMap<String, Option<HashMap<String, bool>>> = HashMap::new();
     let mut missing = Vec::new();
     let mut ignored = Vec::new();
     for c in claims() {
@@ -586,9 +605,18 @@ fn every_cited_test_exists_and_is_not_ignored() {
                 Some((f, n)) => (f.to_string(), n.to_string()),
                 None => (DEFAULT_PROOF_FILE.to_string(), spec.to_string()),
             };
-            let fns = cache
+            let path = repo_root().join(&file);
+            let Some(fns) = cache
                 .entry(file.clone())
-                .or_insert_with(|| test_functions(&repo_root().join(&file)));
+                .or_insert_with(|| test_functions_of_existing_file(&path))
+                .as_ref()
+            else {
+                missing.push(format!(
+                    "{} cites {file}::{name}, but {file} is not a readable file",
+                    c.id
+                ));
+                continue;
+            };
             match fns.get(&name) {
                 None => missing.push(format!("{} cites {file}::{name}", c.id)),
                 Some(true) => ignored.push(format!("{} cites {file}::{name}", c.id)),
@@ -685,7 +713,8 @@ fn every_proof_uses_a_known_form() {
                 || p.starts_with("fixture:")
                 || p.starts_with("#332:")
                 || p.starts_with("none:");
-            if !known || p.split_once(':').map(|(_, v)| v.trim().is_empty()) != Some(false) {
+            let has_value = p.split_once(':').is_some_and(|(_, v)| !v.trim().is_empty());
+            if !known || !has_value {
                 bad.push(format!("{} proof {:?}", c.id, p));
             }
         }
@@ -924,6 +953,28 @@ fn every_required_evidence_topic_maps_to_a_claim() {
 // Retirement checks — the superseded documents
 // ===========================================================================================
 
+/// HQP-C-062: the daemon accepts `SetJunkFilter` and UHC's adapter exposes no setter for it.
+///
+/// The wire half of that pair is proven by a conformance test; the *adapter-surface* half was not proven
+/// by anything, and CodeRabbit was right that one citation cannot carry both. This is the missing half:
+/// a text scan of the adapter for a junk-filter setter. If #329 adds one, this test fails and the ledger
+/// row must be updated — which is the behaviour wanted, because the claim would then be false.
+#[test]
+fn the_adapter_exposes_no_junk_filter_setter() {
+    let adapter = read(&repo_root().join("src/adapters/hqplayer.rs"));
+    let found: Vec<&str> = adapter
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.contains("fn set_junk_filter"))
+        .collect();
+    assert!(
+        found.is_empty(),
+        "HQP-C-062 records that UHC exposes no junk-filter setter, and the adapter now has one: \
+         {found:#?}. The daemon capability is real (HQP-C-051) — if it is now offered, update the \
+         ledger row rather than this test"
+    );
+}
+
 #[test]
 fn the_superseded_documents_point_at_the_ledger() {
     let mut bad = Vec::new();
@@ -950,7 +1001,7 @@ fn the_retired_set_mode_value_claim_is_struck_where_it_still_appears() {
     // rather than delete it, so a reader sees the correction and not a clean file. What must not
     // remain is the claim standing unmarked.
     for needle in ["| Mode | VALUE | VALUE |", "resolves to VALUE"] {
-        if let Some(pos) = spec.find(needle) {
+        for (pos, _) in spec.match_indices(needle) {
             let line_start = spec[..pos].rfind('\n').map_or(0, |n| n + 1);
             let line_end = spec[pos..].find('\n').map_or(spec.len(), |n| pos + n);
             let line = &spec[line_start..line_end];
@@ -1013,5 +1064,203 @@ fn no_verbatim_upstream_source_excerpt_remains_in_the_reference_document() {
          docs/hqplayer-protocol-reference.md. This repository records no license for those sources, \
          and the interoperability fact each excerpt carries survives a paraphrase with the same \
          file/line citation. #348 owns the standing guardrail"
+    );
+}
+
+// ===========================================================================================
+// Focused controls for the parsing helpers (CodeRabbit review 4823720730)
+//
+// Every false pass this file has shipped was in a helper, not in a check: `contains` where a prefix
+// was meant, a prefix where an exact marker was meant, a fallback that re-added a delimiter. Mutating
+// the ledger to prove each one works once and proves nothing afterwards, because the mutation is
+// reverted. These call the helpers directly with the exploit strings as inputs, so the boundary stays
+// pinned.
+// ===========================================================================================
+
+/// `heading_declares` must match the claim ID as the **leading identifier**, not as a substring.
+#[test]
+fn heading_declares_requires_the_id_to_lead_and_to_end_at_a_boundary() {
+    // Accepted: the ID leads, and what follows cannot extend an identifier.
+    for good in [
+        "### HQP-C-024 — `State.active_mode` under `[source]`",
+        "#### HQP-C-023's playback state was corrected",
+        "###### HQP-C-024",
+        "  ### HQP-C-024 trailing prose",
+        "### HQP-C-024, with a comma",
+        "### HQP-C-024: with a colon",
+    ] {
+        assert!(
+            heading_declares(good, "HQP-C-024") || heading_declares(good, "HQP-C-023"),
+            "should declare its ID: {good:?}"
+        );
+    }
+
+    // Rejected: prefix collision. This is CodeRabbit's exact exploit — a decoy heading placed before
+    // the real anchor, hijacking the settle condition of a row whose plan has been deleted.
+    for bad in [
+        "### Notes on HQP-C-0240",
+        "### HQP-C-0240",
+        "### HQP-C-024_note",
+        "### HQP-C-024-bis",
+        "### Notes on HQP-C-024",
+        "not a heading at all HQP-C-024",
+    ] {
+        assert!(
+            !heading_declares(bad, "HQP-C-024"),
+            "must not declare HQP-C-024: {bad:?}"
+        );
+    }
+}
+
+/// Only one-to-six hashes open a section, per CommonMark. A seven-hash line is paragraph text, and
+/// treating it as a heading would let it cut an anchor short before its acquisition plan.
+#[test]
+fn only_one_to_six_hashes_open_a_section() {
+    for good in ["# a", "## a", "###### a", "   ### indented"] {
+        assert!(is_heading(good), "should be a heading: {good:?}");
+    }
+    for bad in [
+        "####### seven is not a heading",
+        "#no-space",
+        "#322 starts a body line",
+        "#341's row",
+        "",
+        "text",
+    ] {
+        assert!(!is_heading(bad), "must not be a heading: {bad:?}");
+    }
+}
+
+/// The settle condition must carry the **exact** marker. A label that merely parses like it is the
+/// false pass CodeRabbit found: it reads as a plan, satisfies a length floor, and names no action.
+#[test]
+fn settle_condition_requires_the_exact_marker_and_reads_its_continuation() {
+    let plan = settle_condition(
+        "### HQP-C-099 — a row\n\n**What would settle it:** a read-only capture of the thing,\nrecorded per device.\n",
+    );
+    assert_eq!(
+        plan.as_deref(),
+        Some("a read-only capture of the thing, recorded per device."),
+        "the plan must continue across following non-blank lines"
+    );
+
+    // A blank line ends the plan, so unrelated prose below it is not absorbed.
+    let bounded =
+        settle_condition("**What would settle it:** capture it live.\n\nUnrelated prose.\n");
+    assert_eq!(bounded.as_deref(), Some("capture it live."));
+
+    for malformed in [
+        "**What would settle it is unrelated prose:** this sufficiently long text is not the label.",
+        "Somebody should decide What would settle it: a read-only capture.",
+        "**what would settle it:** lower case is a different marker",
+        "What would settle it: unbolded",
+        "**What would settle it** no colon at all",
+    ] {
+        assert!(
+            settle_condition(malformed).is_none(),
+            "must not be read as a settle condition: {malformed:?}"
+        );
+    }
+}
+
+/// A row missing its trailing pipe must be reported as a table-shape problem, not silently shifted by
+/// one field — which surfaced as a confusing "malformed claim ID" for a row whose ID was fine.
+#[test]
+fn cells_does_not_reinstate_the_leading_pipe_when_a_row_lacks_a_trailing_one() {
+    assert_eq!(cells("| a | b | c |"), vec!["a", "b", "c"]);
+    assert_eq!(
+        cells("| a | b | c"),
+        vec!["a", "b", "c"],
+        "a missing trailing pipe must not re-add the leading empty cell"
+    );
+    assert_eq!(cells("a | b | c |"), vec!["a", "b", "c"]);
+    assert_eq!(cells("a | b"), vec!["a", "b"]);
+}
+
+/// An owner must be a reachable issue. `#0`, `#abc1` and `#-1` are not.
+#[test]
+fn is_issue_reference_requires_a_hash_and_a_non_zero_decimal() {
+    for good in ["#332", "#1", "`#348`", "**#337**", " #341 "] {
+        assert!(is_issue_reference(good), "should be an issue ref: {good:?}");
+    }
+    for bad in ["#0", "#00", "#abc1", "#-1", "#", "332", "", "—", "#3a2"] {
+        assert!(
+            !is_issue_reference(bad),
+            "must not be an issue ref: {bad:?}"
+        );
+    }
+}
+
+/// `#[ignore]` must be detected however it is spelled. `#[ignore="flaky"]` without a space is valid
+/// Rust, and an ignored test proves nothing — so a citation to one must not read as proof.
+#[test]
+fn an_ignored_test_is_detected_with_or_without_spacing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("probe.rs");
+    std::fs::write(
+        &path,
+        r#"
+#[test]
+fn plain_test() {}
+
+#[test]
+#[ignore]
+fn bare_ignore() {}
+
+#[test]
+#[ignore = "spaced reason"]
+fn spaced_ignore() {}
+
+#[test]
+#[ignore="unspaced reason"]
+fn unspaced_ignore() {}
+
+#[tokio::test]
+#[ignore("parenthesised")]
+fn parenthesised_ignore() {}
+
+#[cfg(test)]
+fn not_a_test_despite_the_substring() {}
+"#,
+    )
+    .expect("write probe");
+
+    let fns = test_functions(&path);
+    assert_eq!(
+        fns.get("plain_test"),
+        Some(&false),
+        "plain test, not ignored"
+    );
+    for ignored in [
+        "bare_ignore",
+        "spaced_ignore",
+        "unspaced_ignore",
+        "parenthesised_ignore",
+    ] {
+        assert_eq!(
+            fns.get(ignored),
+            Some(&true),
+            "{ignored} carries #[ignore] in some spelling and must be reported as ignored"
+        );
+    }
+    assert!(
+        !fns.contains_key("not_a_test_despite_the_substring"),
+        "`#[cfg(test)]` contains the substring `test` but does not make a function a test"
+    );
+}
+
+/// A citation naming a proof file that does not exist must be reported as a missing citation, naming
+/// the offending claim — not panic inside the file reader and abort the aggregated diagnostics.
+#[test]
+fn a_missing_proof_file_is_reported_rather_than_panicking() {
+    let missing = repo_root().join("tests/this_file_does_not_exist_341.rs");
+    assert!(!missing.exists(), "precondition: the path is absent");
+    assert!(
+        test_functions_of_existing_file(&missing).is_none(),
+        "an absent proof file yields None so the caller can aggregate it as a missing citation"
+    );
+    assert!(
+        test_functions_of_existing_file(&repo_root().join(DEFAULT_PROOF_FILE)).is_some(),
+        "the real conformance suite is readable"
     );
 }
