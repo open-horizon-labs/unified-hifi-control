@@ -4253,3 +4253,74 @@ async fn a_burst_larger_than_the_skip_ceiling_is_reported_rather_than_drained_fo
     );
     h.stop();
 }
+
+/// A wanted reply followed by only the **prefix** of a coalesced unsolicited frame, with the suffix
+/// arriving before the next real reply.
+///
+/// This is ordinary TCP behaviour, not an exotic peer: the daemon emits unsolicited `Status`
+/// documents, coalescing them into a reply's write is already an accepted wire condition, and TCP may
+/// split any write at any byte — including in the middle of the follower.
+///
+/// Composed from two existing `WirePolicy` knobs so the sequence is deterministic and nothing asserts
+/// on elapsed time: `coalesce_extra_for_element` puts the push in the same write as every `State`
+/// reply, and `Chunking::AfterMarker("<Status")` cuts that write immediately after the follower's root
+/// name. `chunk_delay` only *orders* the two segments.
+///
+/// So the first command sees `<State …/>` plus `<?xml …?><Status`, and the follower's remainder —
+/// carrying a **conflicting `volume`** — arrives afterwards, ahead of the next `State` reply.
+///
+/// The corruption is silent and same-element: the second command uses one connection and one attempt,
+/// reports the right `state`, and takes `volume` from the push. `framing::root_element` finds the later
+/// expected root, so the reply looks legitimate, while `parse_attr` falls back to scanning the whole
+/// string because `root_open_tag` cannot start at an orphaned suffix — and the orphan's attribute is
+/// found first.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn a_fragmented_follower_suffix_cannot_override_the_next_reply() {
+    // Deliberately conflicting: the push claims -1 dB where the daemon's real level is -23.5, which
+    // the client reports rounded as -24. A shared attribute name is what makes the corruption silent.
+    const PUSH_WITH_CONFLICTING_VOLUME: &str = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<Status state=\"2\" track=\"3\" position=\"43\" length=\"215\" volume=\"-1\"/>"
+    );
+
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            // Cut the combined write immediately after the follower's root name, so the first read
+            // ends mid-follower. `split` runs after the coalesce, so this cuts the joined buffer.
+            chunking: Chunking::AfterMarker("<Status".to_string()),
+            coalesce_extra_for_element: Some((
+                "State".to_string(),
+                PUSH_WITH_CONFLICTING_VOLUME.to_string(),
+            )),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    // A state the push does not also claim, so a wrong `state` would be a different bug than a wrong
+    // `volume`. The push says state="2"; the daemon says 1.
+    h.model.external_change(|s| s.playback = 1);
+
+    // First command: reply + follower prefix in one segment, follower suffix in the next.
+    h.adapter.get_state().await.expect("first State");
+
+    // Second command on the same connection. The orphaned suffix is ahead of its reply.
+    let state = h.adapter.get_state().await.expect("second State");
+
+    assert_eq!(
+        state.volume, -24,
+        "a shared attribute in the fragmented push must not override the following State reply. The \
+         daemon's level is -23.5 dB, reported rounded as -24; -1 is the push's value, reached because \
+         the follower's discarded prefix left its suffix to be concatenated with this reply"
+    );
+    assert_eq!(
+        state.state, 1,
+        "and the reply's own fields must still be the reply's: a wrong volume beside a right state is \
+         exactly what makes this silent"
+    );
+    h.stop();
+}
