@@ -256,6 +256,85 @@ fn sources_under(root: &str) -> Vec<(String, String)> {
     sources
 }
 
+/// Join attributes that wrap across lines onto a single line.
+///
+/// [`attributes_attached_to`] and [`declaration_gates`] walk lines, and a line that is not
+/// itself an attribute clears the pending set — that is the rule which stops one item's
+/// attributes leaking onto the next. A wrapped attribute defeats it:
+///
+/// ```ignore
+/// #[derive(          // seen as an unterminated attribute, held as pending
+///     Debug,         // not an attribute -> pending cleared, the derive is lost
+///     Serialize,
+/// )]
+/// pub enum AdaptiveEvent { … }
+/// ```
+///
+/// The declaration then reports only `#[derive(Debug, Clone)]` and the scanner passes.
+/// Verified against the real module before this existed: a wrapped
+/// `#[cfg_attr(…, derive(serde::Serialize))]` compiled and
+/// `lint_adaptive_event_derives_no_serialization` passed. Found by CodeRabbit at
+/// `b35af10`.
+///
+/// Newlines are replaced by spaces only while inside an attribute's brackets, so the line
+/// structure everywhere else — and therefore the pending-clearing rule — is untouched.
+fn join_wrapped_attributes(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = String::with_capacity(code.len());
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    let mut in_string = false;
+
+    while index < chars.len() {
+        let c = chars[index];
+        if in_string {
+            out.push(c);
+            if c == '\\' && index + 1 < chars.len() {
+                out.push(chars[index + 1]);
+                index += 2;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        // `#[` and `#![` both open an attribute.
+        if c == '#' {
+            let bracket = if chars.get(index + 1) == Some(&'!') {
+                index + 2
+            } else {
+                index + 1
+            };
+            if chars.get(bracket) == Some(&'[') {
+                out.extend(&chars[index..=bracket]);
+                depth += 1;
+                index = bracket + 1;
+                continue;
+            }
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '[' if depth > 0 => {
+                depth += 1;
+                out.push(c);
+            }
+            ']' if depth > 0 => {
+                depth -= 1;
+                out.push(c);
+            }
+            '\n' if depth > 0 => out.push(' '),
+            _ => out.push(c),
+        }
+        index += 1;
+    }
+    out
+}
+
 /// Every `#[...]` attribute written in `text`, whole.
 ///
 /// Bracket-depth aware and string-literal aware, so `#[cfg_attr(feature = "server",
@@ -365,7 +444,10 @@ fn declaration_gates(source: &str, declaration: &str) -> Option<Vec<String>> {
     let mut pending: Vec<String> = Vec::new();
     let mut gates: Option<Vec<String>> = None;
 
-    for line in code_only(source).lines() {
+    // Wrapped attributes are joined first: a line-oriented walk would see only `#[cfg(` and
+    // then clear it on the continuation line. See `join_wrapped_attributes`.
+    let joined = join_wrapped_attributes(&code_only(source));
+    for line in joined.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -411,7 +493,12 @@ fn attributes_attached_to(source: &str, declaration: &str) -> Option<Vec<String>
     let mut pending: Vec<String> = Vec::new();
     let mut attached: Option<Vec<String>> = None;
 
-    for line in code_only(source).lines() {
+    // Wrapped attributes are joined first. Without this a `#[derive(` spanning lines is
+    // held as pending, then discarded by its own continuation line, and the declaration
+    // reports only the attributes that happened to fit on one line. See
+    // `join_wrapped_attributes`.
+    let joined = join_wrapped_attributes(&code_only(source));
+    for line in joined.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -947,6 +1034,124 @@ fn a_non_serializing_adaptive_event_is_accepted() {
             "the scanner invented a serialization derive in:\n{source}\nfound: {offenders:?}"
         );
     }
+}
+
+#[test]
+fn a_wrapped_attribute_is_not_lost_by_the_line_walk() {
+    // The scanners walk lines, and a line that is not an attribute clears the pending set —
+    // that rule is what stops one item's attributes leaking onto the next. A wrapped
+    // attribute was destroyed by it: `#[derive(` was held as pending and then discarded by
+    // its own continuation line, so the declaration reported only the attributes that
+    // happened to fit on one line.
+    //
+    // Verified against the real module before the fix: a wrapped
+    // `#[cfg_attr(…, derive(serde::Serialize))]` compiled, and
+    // `lint_adaptive_event_derives_no_serialization` passed while
+    // `attributes_attached_to` reported only `["#[derive(Debug, Clone)]"]`. Found by
+    // CodeRabbit at `b35af10`.
+    for (label, source) in [
+        (
+            "wrapped derive with a serializing member",
+            "#[derive(\n    Debug,\n    Serialize,\n)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "wrapped derive above the innocent one",
+            "#[derive(\n    Serialize,\n)]\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "wrapped cfg_attr - the form proved against the real module",
+            "#[cfg_attr(\n    feature = \"x\",\n    derive(serde::Serialize)\n)]\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "wrapped derive of an alias",
+            "use serde::Serialize as EventWire;\n#[derive(\n    Debug,\n    EventWire,\n)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "deeply wrapped, one member per line",
+            "#[cfg_attr(\n    all(\n        feature = \"x\",\n        unix,\n    ),\n    derive(\n        Deserialize,\n    )\n)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+    ] {
+        let names = serialization_names(source);
+        let attributes = attributes_attached_to(source, ADAPTIVE_EVENT_DECLARATION)
+            .unwrap_or_else(|| panic!("declaration not found for {label}:\n{source}"));
+        assert!(
+            attributes
+                .iter()
+                .any(|attribute| introduces_serialization(attribute, &names).is_some()),
+            "{label} was admitted:\n{source}\nattributes seen: {attributes:?}"
+        );
+    }
+}
+
+#[test]
+fn joining_wrapped_attributes_does_not_attach_them_to_the_wrong_item() {
+    // Positive controls for the joiner. Collapsing newlines inside brackets must not
+    // collapse the line structure that separates one item from the next, or every wrapped
+    // attribute in a file would leak onto whatever declaration came after it.
+    for (label, source) in [
+        (
+            "a wrapped serializing derive on a different item",
+            "#[derive(\n    Serialize,\n)]\npub struct Unrelated {\n}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "a wrapped innocent derive on the right item",
+            "#[derive(\n    Debug,\n    Clone,\n)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "a wrapped cfg_attr deriving something harmless",
+            "#[cfg_attr(\n    test,\n    derive(Default)\n)]\n#[derive(Debug)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "a wrapped doc comment containing a bracket and the word Serialize",
+            "#[doc = \"see Serialize ]\"]\n#[derive(\n    Debug,\n)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+    ] {
+        let names = serialization_names(source);
+        let attributes = attributes_attached_to(source, ADAPTIVE_EVENT_DECLARATION)
+            .unwrap_or_else(|| panic!("declaration not found for {label}:\n{source}"));
+        let offenders: Vec<_> = attributes
+            .iter()
+            .filter_map(|attribute| introduces_serialization(attribute, &names))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "{label} produced a false positive: {offenders:?}\n{source}\nattributes: {attributes:?}"
+        );
+    }
+
+    // The joiner itself: newlines inside brackets become spaces, newlines outside do not.
+    let joined = join_wrapped_attributes("#[derive(\n  Debug,\n)]\npub enum X {\n}\n");
+    assert!(
+        joined.starts_with("#[derive(   Debug, )]\n"),
+        "attribute was not joined onto one line: {joined:?}"
+    );
+    assert!(
+        joined.contains("]\npub enum X"),
+        "the joiner collapsed the line structure between the attribute and its item: {joined:?}"
+    );
+}
+
+#[test]
+fn a_wrapped_server_gate_is_still_detected() {
+    // `declaration_gates` had the identical defect, so it takes the identical fix. A gate
+    // that wraps is still a gate.
+    let source = "#[cfg(\n    feature = \"server\"\n)]\npub mod producers;\n";
+    let gates = declaration_gates(source, PRODUCERS_DECLARATION)
+        .unwrap_or_else(|| panic!("declaration not found in:\n{source}"));
+    assert!(
+        gates.iter().any(|gate| is_server_gate(gate)),
+        "a wrapped server gate was missed: {gates:?}"
+    );
+
+    // And the false-positive direction: a wrapped gate belonging to the item above must
+    // not carry onto this declaration.
+    let neighbour = "#[cfg(\n    feature = \"server\"\n)]\npub mod bus;\npub mod producers;\n";
+    let carried = declaration_gates(neighbour, PRODUCERS_DECLARATION)
+        .unwrap_or_else(|| panic!("declaration not found in:\n{neighbour}"));
+    assert!(
+        !carried.iter().any(|gate| is_server_gate(gate)),
+        "a wrapped gate leaked from the item above: {carried:?}"
+    );
 }
 
 #[test]
