@@ -107,8 +107,19 @@ struct Entry {
 #[derive(Default)]
 struct Store {
     producers: BTreeMap<ProducerKey, Entry>,
-    refusals: BTreeMap<ProducerKey, AdmissionRefusal>,
+    refusals: BTreeMap<ProducerKey, RefusalRecord>,
     missed_updates: u64,
+}
+
+/// A retained refusal, with the identity of the adapter that published it.
+///
+/// The producer type is kept beside the refusal because a first-publication refusal never
+/// creates a producer entry, and an `AdapterStopping` flush derives its victims from the
+/// producer map. Without this, a refusal for a producer that never existed outlived the
+/// adapter that caused it. Found by CodeRabbit at `9c53079`.
+struct RefusalRecord {
+    refusal: AdmissionRefusal,
+    producer_type: String,
 }
 
 /// Owns every current adaptive producer document.
@@ -225,6 +236,7 @@ impl ProducerAggregator {
     /// to be replaced.
     pub async fn ingest(&self, document: ProducerDocument) -> Admission {
         let key = ProducerKey::of(&document);
+        let producer_type = document.producer.producer_type.clone();
         let admission = {
             let mut store = self.store.write().await;
             let previous = store
@@ -252,8 +264,16 @@ impl ProducerAggregator {
                 }
                 Admission::Refused(refusal) => {
                     // Retained rather than replacing anything. The previously admitted
-                    // document, if there is one, keeps being served.
-                    store.refusals.insert(key.clone(), refusal.clone());
+                    // document, if there is one, keeps being served. The publishing
+                    // adapter's identity is retained with it, because a refusal on a first
+                    // publication has no producer entry to be flushed alongside.
+                    store.refusals.insert(
+                        key.clone(),
+                        RefusalRecord {
+                            refusal: refusal.clone(),
+                            producer_type: producer_type.clone(),
+                        },
+                    );
                 }
             }
             admission
@@ -337,10 +357,14 @@ impl ProducerAggregator {
         for key in &doomed {
             store.producers.remove(key);
         }
-        // Same reasoning as `remove`: a refusal must not outlive the producer it names.
-        store
-            .refusals
-            .retain(|key, _| !doomed.iter().any(|gone| gone == key));
+        // A refusal must not outlive the adapter that caused it, and a first-publication
+        // refusal has no producer entry to be found among `doomed`. Matched the same way
+        // the producers are: by producer type, or by the `adapter:` id prefix.
+        store.refusals.retain(|key, record| {
+            !(doomed.iter().any(|gone| gone == key)
+                || record.producer_type == adapter
+                || key.producer_id.starts_with(&prefix))
+        });
         doomed.len()
     }
 
@@ -374,7 +398,7 @@ impl ProducerAggregator {
             },
             repairs: entry.repairs.clone(),
             missed_updates: store.missed_updates,
-            last_refusal: store.refusals.get(key).cloned(),
+            last_refusal: store.refusals.get(key).map(|r| r.refusal.clone()),
         }
     }
 
@@ -408,7 +432,7 @@ impl ProducerAggregator {
         store
             .refusals
             .iter()
-            .map(|(key, refusal)| (key.clone(), refusal.clone()))
+            .map(|(key, record)| (key.clone(), record.refusal.clone()))
             .collect()
     }
 

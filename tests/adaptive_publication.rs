@@ -101,6 +101,7 @@ mod envelope {
             "hqplayer_degraded_lanes",
             "staged_intent_multi_surface",
             "command_outcomes",
+            "control_removed_after_advance",
             "forward_compatible_additions",
         ] {
             let document = fixture(name);
@@ -273,6 +274,29 @@ mod envelope {
 mod lane_value_invariant {
     use super::*;
 
+    /// Break the first lane of the first control that has one, returning what was broken.
+    ///
+    /// Returns the owning control id as well as the lane, so a refusal can be asserted to
+    /// name both rather than only the lane.
+    fn break_first_lane(
+        document: &mut ProducerDocument,
+        mutate: impl FnOnce(&mut LaneValue),
+    ) -> (ControlId, ValueLane) {
+        let control = document
+            .controls
+            .iter_mut()
+            .find(|c| !c.values.is_empty())
+            .expect("a canonical fixture has at least one control with a lane");
+        let control_id = control.id.clone();
+        let value = control
+            .values
+            .first_mut()
+            .expect("checked non-empty just above");
+        let lane = value.lane.clone();
+        mutate(value);
+        (control_id, lane)
+    }
+
     fn first_control_lane(document: &mut ProducerDocument) -> &mut LaneValue {
         let control = document
             .controls
@@ -288,18 +312,22 @@ mod lane_value_invariant {
     #[test]
     fn a_grounded_lane_with_no_value_is_refused_and_names_control_and_lane() {
         let mut document = pipeline();
-        let (control_id, lane) = {
-            let value = first_control_lane(&mut document);
+        let (control_id, lane) = break_first_lane(&mut document, |value| {
             value.grounding = Grounding::Grounded;
             value.value = None;
-            (None::<ControlId>, value.lane.clone())
-        };
-        let _ = control_id;
+        });
         match expect_refused(admit_fresh(document)) {
             AdmissionRefusal::LaneValueInconsistent {
-                lane: got, detail, ..
+                control,
+                lane: got,
+                detail,
             } => {
-                assert_eq!(got, lane);
+                // Both halves are asserted: a refusal that names the wrong control is as
+                // unactionable as one that names none. An earlier version of this test
+                // carried a `None::<ControlId>` placeholder and matched the control with
+                // `..`, so it proved nothing about it.
+                assert_eq!(control, control_id, "the refusal named the wrong control");
+                assert_eq!(got, lane, "the refusal named the wrong lane");
                 assert_eq!(detail, LaneDefect::GroundedWithoutValue);
             }
             other => panic!("expected LaneValueInconsistent, got {other:?}"),
@@ -448,6 +476,29 @@ mod intent_coherence {
         panic!("staged_intent_multi_surface must publish a valid entry")
     }
 
+    /// Find the `display_text_key` of the first reason in `value` carrying `code`, at any
+    /// depth. Searching rather than indexing a fixed path keeps this test measuring the
+    /// published key itself rather than the fixture's current nesting.
+    fn find_key(value: &serde_json::Value, code: &str) -> Option<String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("code").and_then(serde_json::Value::as_str) == Some(code) {
+                    if let Some(key) = map
+                        .get("display_text_key")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        return Some(key.to_string());
+                    }
+                }
+                map.values().find_map(|nested| find_key(nested, code))
+            }
+            serde_json::Value::Array(items) => {
+                items.iter().find_map(|nested| find_key(nested, code))
+            }
+            _ => None,
+        }
+    }
+
     #[test]
     fn a_coherent_document_is_admitted_with_no_repairs() {
         let admitted = expect_admitted(admit_fresh(staged()));
@@ -583,9 +634,57 @@ mod intent_coherence {
                     ReasonCode::ControlRemoved,
                     "a removed control must be distinguishable from an unvalidated one"
                 );
+                // `detail` is documented as non-localised diagnostic text "for logs rather
+                // than for users". Emitting only `detail` means the sole explanation a user
+                // can be shown is untranslatable English prose - which is precisely the
+                // failure `display_text_key` exists to prevent.
+                assert_eq!(
+                    reason.display_text_key.as_deref(),
+                    Some("reason.control_no_longer_exists"),
+                    "a removed control must carry the catalog key consumers render, not \
+                     only log detail"
+                );
             }
             other => panic!("expected DraftInvalid(control_removed), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_removed_control_key_matches_the_one_the_canonical_fixture_publishes() {
+        // Two sources claim to define this key: production and the worked example that
+        // `every_vocabulary_member_has_a_worked_example` forces to exist. If they drift, a
+        // consumer built against the fixture renders a blank string against the real thing.
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string("tests/fixtures/adaptive/control_removed_after_advance.json")
+                .expect("the canonical control-removed fixture must exist"),
+        )
+        .expect("the canonical fixture must be valid JSON");
+
+        let published = find_key(&fixture, "control_removed")
+            .expect("the fixture must carry a control_removed reason with a display_text_key");
+
+        let mut document = staged();
+        let (_, control) = valid_entry_control(&document);
+        document.controls.retain(|c| c.id != control);
+        document.revisions = DocumentRevisions::new(13, 4194);
+        let admitted = expect_admitted(admit_fresh(document));
+        let produced = admitted
+            .repairs
+            .iter()
+            .find_map(|repair| match &repair.to {
+                EntryValidity::DraftInvalid { reason }
+                    if reason.code == ReasonCode::ControlRemoved =>
+                {
+                    reason.display_text_key.clone()
+                }
+                _ => None,
+            })
+            .expect("production must emit a display_text_key for a removed control");
+
+        assert_eq!(
+            produced, published,
+            "production and the canonical fixture disagree on the control-removed catalog key"
+        );
     }
 
     #[test]
@@ -1266,6 +1365,101 @@ mod refusal_observability {
         assert!(
             aggregator.refusals().await.is_empty(),
             "a refusal survived the removal of the producer it names"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_an_adapter_clears_refusals_it_never_became_a_producer_for() {
+        // A first-publication refusal creates a refusal record with no producer entry, so
+        // the flush - which derives its victims from the producer map - never saw it and
+        // left it behind after the adapter stopped. The refusal must not outlive the
+        // adapter that caused it any more than it outlives a producer. Found by CodeRabbit
+        // at `9c53079`.
+        use unified_hifi_control::bus::BusEvent;
+        let bus = unified_hifi_control::bus::create_bus();
+        let adaptive = unified_hifi_control::producers::create_adaptive_bus();
+        let aggregator = ProducerAggregator::new(bus, adaptive);
+
+        // Refused on its very first document, so no producer entry is ever created.
+        let mut never_admitted = pipeline();
+        never_admitted.target.zone_id = Some("no-prefix".to_string());
+        aggregator.ingest(never_admitted).await;
+        assert_eq!(aggregator.producer_count().await, 0);
+        assert_eq!(aggregator.refusals().await.len(), 1);
+
+        aggregator
+            .apply_bus_event(BusEvent::AdapterStopping {
+                adapter: "hqplayer".to_string(),
+                reason: None,
+            })
+            .await;
+
+        assert!(
+            aggregator.refusals().await.is_empty(),
+            "a refusal outlived the adapter that produced it: {:?}",
+            aggregator.refusals().await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_flushed_by_producer_type_even_without_an_id_prefix() {
+        // The id-prefix clause alone is not enough: a producer id need not carry the
+        // adapter prefix, and the flush must still find its refusal. This is what makes
+        // retaining the source adapter load-bearing rather than redundant with the prefix.
+        use unified_hifi_control::bus::BusEvent;
+        let bus = unified_hifi_control::bus::create_bus();
+        let adaptive = unified_hifi_control::producers::create_adaptive_bus();
+        let aggregator = ProducerAggregator::new(bus, adaptive);
+
+        let mut unprefixed = pipeline();
+        unprefixed.producer.producer_id = "living-room".to_string();
+        unprefixed.producer.producer_type = "hqplayer".to_string();
+        unprefixed.target.zone_id = Some("no-prefix".to_string());
+        aggregator.ingest(unprefixed).await;
+        assert_eq!(aggregator.refusals().await.len(), 1);
+
+        aggregator
+            .apply_bus_event(BusEvent::AdapterStopping {
+                adapter: "hqplayer".to_string(),
+                reason: None,
+            })
+            .await;
+
+        assert!(
+            aggregator.refusals().await.is_empty(),
+            "a refusal whose producer id carries no adapter prefix survived its adapter \
+             stopping: {:?}",
+            aggregator.refusals().await
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_one_adapter_leaves_another_adapters_refusal_alone() {
+        // The other direction: the flush must be as narrow for refusals as it is for
+        // producers.
+        use unified_hifi_control::bus::BusEvent;
+        let bus = unified_hifi_control::bus::create_bus();
+        let adaptive = unified_hifi_control::producers::create_adaptive_bus();
+        let aggregator = ProducerAggregator::new(bus, adaptive);
+
+        let mut other = pipeline();
+        other.producer.producer_id = "roon:core".to_string();
+        other.producer.producer_type = "roon".to_string();
+        other.target.zone_id = Some("not-prefixed".to_string());
+        aggregator.ingest(other).await;
+        assert_eq!(aggregator.refusals().await.len(), 1);
+
+        aggregator
+            .apply_bus_event(BusEvent::AdapterStopping {
+                adapter: "hqplayer".to_string(),
+                reason: None,
+            })
+            .await;
+
+        assert_eq!(
+            aggregator.refusals().await.len(),
+            1,
+            "stopping hqplayer removed a roon refusal"
         );
     }
 

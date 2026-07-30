@@ -144,6 +144,41 @@ const ADAPTIVE_EVENT_ALLOWED_ATTRIBUTES: &[&str] = &["derive", "doc"];
 /// added a log line.
 const EVENT_ALLOWED_MACROS: &[&str] = &["tracing::trace"];
 
+/// Directories exempt from the source sweep. Trailing separator, so a sibling directory
+/// sharing a prefix - `src/adaptive_extras/` - is not accidentally exempted too.
+const EXEMPT_DIRS: &[&str] = &["src/adaptive/", "src/producers/"];
+/// Files exempt from the source sweep, matched by exact equality rather than prefix.
+const EXEMPT_FILES: &[&str] = &["src/lib.rs", "src/main.rs"];
+
+/// Whether a source path is outside the surface sweep.
+///
+/// Raw prefix matching would exempt `src/adaptive_extras/` along with `src/adaptive/`, and
+/// anything beginning with `src/lib.rs`. A too-broad exemption is silent - the sweep just
+/// stops covering a directory - which is the same failure class as a lint that passes.
+fn is_sweep_exempt(path: &str) -> bool {
+    EXEMPT_FILES.contains(&path) || EXEMPT_DIRS.iter().any(|dir| path.starts_with(dir))
+}
+
+/// How many modules deep a source file sits, so `super::` can be resolved.
+///
+/// `src/lib.rs` and `src/main.rs` are the crate root (0). `src/api/mod.rs` is `api` (1).
+/// `src/adapters/hqplayer.rs` is `adapters::hqplayer` (2).
+fn module_depth(path: &str) -> usize {
+    let trimmed = path
+        .strip_prefix("src/")
+        .unwrap_or(path)
+        .strip_suffix(".rs")
+        .unwrap_or(path);
+    if trimmed == "lib" || trimmed == "main" {
+        return 0;
+    }
+    let mut parts: Vec<&str> = trimmed.split('/').collect();
+    if parts.last() == Some(&"mod") {
+        parts.pop();
+    }
+    parts.len()
+}
+
 /// Modules a surface may not reach.
 const FORBIDDEN_MODULES: &[&str] = &["adaptive", "producers"];
 /// Crate roots those modules can be addressed through.
@@ -585,6 +620,8 @@ struct ModuleReferenceVisitor {
     /// Names that address this crate's root in the module currently being visited.
     roots: BTreeSet<String>,
     saved: Vec<BTreeSet<String>>,
+    /// How many modules deep the file being scanned sits, so `super::` can be resolved.
+    depth: usize,
 }
 
 impl ModuleReferenceVisitor {
@@ -600,36 +637,69 @@ impl ModuleReferenceVisitor {
     /// aliased root second. Scanning pairs also covers `self::`, and costs nothing because
     /// a pair only matches when its left half is a known root.
     fn note_pairs(&mut self, segments: &[String]) {
+        // A leading run of `super` is resolved against the file's own module depth: from
+        // `src/api/mod.rs`, one module deep, `super::adaptive::X` *is* `crate::adaptive::X`.
+        // Exactly `depth` supers reach the crate root; fewer land in an intermediate module
+        // and more are not expressible. Found by CodeRabbit at `9c53079`.
+        let supers = segments.iter().take_while(|s| *s == "super").count();
+        if supers > 0 && supers == self.depth {
+            if let Some(module) = segments.get(supers) {
+                if FORBIDDEN_MODULES.contains(&module.as_str()) {
+                    self.found.insert(format!("super x{supers}::{module}"));
+                }
+            }
+        }
         for window in segments.windows(2) {
             self.note(&window[0], &window[1]);
         }
     }
 
-    /// Look for an `Ident :: Ident` token sequence, recursing into groups.
+    /// Collect maximal `Ident (:: Ident)*` runs and resolve each like an ordinary path,
+    /// recursing into groups.
     ///
     /// The previous implementation stringified the whole token stream and substring-matched
     /// it, so `println!("crate::adaptive")` registered as a reference — while the comment
     /// above it claimed a literal could not fabricate a match. It could, and did. Found by
     /// Codex at `4129b87`.
     ///
-    /// Walking `TokenTree` fixes it by construction rather than by exclusion: a `Literal`
+    /// Walking `TokenTree` fixes that by construction rather than by exclusion: a `Literal`
     /// is a different variant from an `Ident`, so its contents are never sequence material.
-    /// A real path inside a macro is still four tokens and is still found.
+    ///
+    /// Collecting whole runs rather than adjacent four-token windows is what makes macro
+    /// arguments obey the same rules as everything else. A window can only ever see one
+    /// pair, and a leading `super` run is by definition wider than a pair — so
+    /// `super::adaptive::X` was caught by [`Visit::visit_path`] and missed here, in the one
+    /// place a path can be written without syn parsing it as a path. Feeding the full run
+    /// through [`Self::note_pairs`] gives macro tokens the same depth resolution.
     fn scan_tokens(&mut self, stream: &proc_macro2::TokenStream) {
         let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
-        for window in trees.windows(4) {
-            let (
-                TokenTree::Ident(root),
-                TokenTree::Punct(first),
-                TokenTree::Punct(second),
-                TokenTree::Ident(module),
-            ) = (&window[0], &window[1], &window[2], &window[3])
-            else {
+        let mut index = 0;
+        while index < trees.len() {
+            let TokenTree::Ident(first) = &trees[index] else {
+                index += 1;
                 continue;
             };
-            if first.as_char() == ':' && second.as_char() == ':' {
-                self.note(&root.to_string(), &module.to_string());
+            // Extend through every following `:: Ident`, so the run is the whole path.
+            let mut segments = vec![first.to_string()];
+            let mut end = index + 1;
+            while let (
+                Some(TokenTree::Punct(left)),
+                Some(TokenTree::Punct(right)),
+                Some(TokenTree::Ident(next)),
+            ) = (trees.get(end), trees.get(end + 1), trees.get(end + 2))
+            {
+                if left.as_char() != ':' || right.as_char() != ':' {
+                    break;
+                }
+                segments.push(next.to_string());
+                end += 3;
             }
+            if segments.len() > 1 {
+                self.note_pairs(&segments);
+            }
+            // Resume past the run: its interior idents were already considered as segments,
+            // and restarting inside it would only rediscover suffixes of the same path.
+            index = end.max(index + 1);
         }
         for tree in trees {
             if let TokenTree::Group(group) = tree {
@@ -672,14 +742,29 @@ impl<'ast> Visit<'ast> for ModuleReferenceVisitor {
     /// its subtree, and a `mod` it declares shadows an inherited alias of the same name.
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         self.saved.push(self.roots.clone());
+        let outer_depth = self.depth;
         if let Some((_, items)) = &item.content {
             let (aliases, shadowed) = scope_delta(items, &self.roots);
             self.roots.extend(aliases);
             for name in &shadowed {
                 self.roots.remove(name);
             }
+            // An *inline* module puts its contents one module further down, so `super::`
+            // inside it needs one more hop to reach the crate root. `depth` was fixed per
+            // file, which got both directions backwards inside a nested module. An external
+            // `mod x;` declares a module whose contents live in another file and are not
+            // traversed here, so it must not change the depth. Raised by Codex against the
+            // first draft of the `super::` fix.
+            //
+            // Incrementing for an external `mod x;` too would be *unobservable* rather than
+            // wrong: there is no inline content to scan under it, and the restore below
+            // makes the pair a no-op. No probe can distinguish the two, so the guard stays
+            // because it is semantically right, not because a test proves it - stated so
+            // nobody mistakes the surviving mutation for coverage.
+            self.depth += 1;
         }
         visit::visit_item_mod(self, item);
+        self.depth = outer_depth;
         if let Some(previous) = self.saved.pop() {
             self.roots = previous;
         }
@@ -806,7 +891,7 @@ fn collect_crate_aliases(
 }
 
 /// Forbidden module references in `file`, resolving crate-root aliases within their scope.
-fn forbidden_module_references(file: &File) -> Vec<String> {
+fn forbidden_module_references(file: &File, depth: usize) -> Vec<String> {
     let mut roots: BTreeSet<String> = CRATE_ROOTS.iter().map(|r| (*r).to_string()).collect();
     let (aliases, shadowed) = scope_delta(&file.items, &roots);
     roots.extend(aliases);
@@ -817,6 +902,7 @@ fn forbidden_module_references(file: &File) -> Vec<String> {
         found: BTreeSet::new(),
         roots,
         saved: Vec::new(),
+        depth,
     };
     visitor.visit_file(file);
     visitor.found.into_iter().collect()
@@ -832,10 +918,32 @@ fn lint_public_bus_cannot_carry_adaptive_types() {
     // serializes it verbatim into `GET /events`. A variant naming an adaptive type would
     // change that endpoint's response schema and publish the v1 contract outside this
     // repository.
+    // Both layouts supported, and the collection asserted non-empty before it is iterated:
+    // `rust_sources_under` returns an empty vector for a path that does not exist, so
+    // renaming `src/bus/` to `src/bus.rs` would have made this pass by scanning nothing.
+    // Found by CodeRabbit at `9c53079`.
+    let mut sources = rust_sources_under("src/bus");
+    if let Ok(text) = fs::read_to_string("src/bus.rs") {
+        sources.push(("src/bus.rs".to_string(), text));
+    }
+    assert!(
+        !sources.is_empty(),
+        "no bus sources found under src/bus/ or at src/bus.rs; this lint would pass by \
+         scanning nothing"
+    );
+    // The vacuity this guards against is real, not hypothetical: a path that does not exist
+    // yields an empty collection rather than an error, so the loop below would simply not
+    // run. Asserted directly, because a mutation that disables the guard cannot fail while
+    // `src/bus/` still exists.
+    assert!(
+        rust_sources_under("src/bus_does_not_exist").is_empty(),
+        "the source walker is expected to return empty for a missing path"
+    );
+
     let mut violations = Vec::new();
-    for (path, text) in rust_sources_under("src/bus") {
+    for (path, text) in sources {
         let file = parse_source(&path, &text);
-        for reference in forbidden_module_references(&file) {
+        for reference in forbidden_module_references(&file, module_depth(&path)) {
             violations.push(format!("{path}: references `{reference}`"));
         }
     }
@@ -851,7 +959,7 @@ fn lint_public_bus_cannot_carry_adaptive_types() {
 #[test]
 fn lint_the_sse_projection_does_not_mention_the_publication_layer() {
     let file = parse_file_at("src/api/mod.rs");
-    let references = forbidden_module_references(&file);
+    let references = forbidden_module_references(&file, module_depth("src/api/mod.rs"));
     assert!(
         references.is_empty(),
         "src/api/mod.rs references {references:?}. Any HTTP or SSE exposure of the producer \
@@ -869,16 +977,15 @@ fn lint_only_the_composition_root_names_the_contract_or_the_publication_layer() 
     // Swept over all of `src/` rather than an enumerated list of surfaces. An enumerated
     // list stops covering whatever is added next; the first draft listed six directories
     // and omitted `src/mqtt`, which publishes to Home Assistant.
-    const EXEMPT: &[&str] = &["src/adaptive", "src/producers", "src/lib.rs", "src/main.rs"];
     let mut violations = Vec::new();
     let mut swept = 0usize;
     for (path, text) in rust_sources_under("src") {
-        if EXEMPT.iter().any(|exempt| path.starts_with(exempt)) {
+        if is_sweep_exempt(&path) {
             continue;
         }
         swept += 1;
         let file = parse_source(&path, &text);
-        for reference in forbidden_module_references(&file) {
+        for reference in forbidden_module_references(&file, module_depth(&path)) {
             violations.push(format!("{path}: references `{reference}`"));
         }
     }
@@ -1118,11 +1225,11 @@ fn lint_producers_module_is_server_gated() {
 fn lint_publication_layer_is_reachable_only_from_the_composition_root() {
     let mut referrers = Vec::new();
     for (path, text) in rust_sources_under("src") {
-        if path.starts_with("src/producers") || path == "src/lib.rs" || path == "src/main.rs" {
+        if path.starts_with("src/producers/") || path == "src/lib.rs" || path == "src/main.rs" {
             continue;
         }
         let file = parse_source(&path, &text);
-        if forbidden_module_references(&file)
+        if forbidden_module_references(&file, module_depth(&path))
             .iter()
             .any(|reference| reference.ends_with("::producers"))
         {
@@ -1690,7 +1797,7 @@ fn a_crate_root_alias_cannot_launder_a_forbidden_module_reference() {
         ),
     ] {
         assert!(
-            !forbidden_module_references(&snippet(source)).is_empty(),
+            !forbidden_module_references(&snippet(source), 0).is_empty(),
             "{label}: an aliased crate root laundered the reference:\n{source}"
         );
     }
@@ -1705,27 +1812,27 @@ fn crate_root_aliases_are_scoped_to_the_module_that_declares_them() {
     // module of the same name look like the crate root somewhere else.
     let sibling_scope = "mod a {\n    use crate as internal;\n}\nmod b {\n    mod internal {\n        pub mod adaptive {}\n    }\n    fn f() { let _ = internal::adaptive::X; }\n}\n";
     assert!(
-        forbidden_module_references(&snippet(sibling_scope)).is_empty(),
+        forbidden_module_references(&snippet(sibling_scope), 0).is_empty(),
         "an alias declared in a sibling module leaked: {:?}\n{sibling_scope}",
-        forbidden_module_references(&snippet(sibling_scope))
+        forbidden_module_references(&snippet(sibling_scope), 0)
     );
 
     // The same leak without any shadowing to mask it: `b` declares no `mod internal`, so
     // only restoring the outer scope on the way out of `a` keeps this clean.
     let sibling_no_shadow = "mod a {\n    use crate as internal;\n}\nmod b {\n    fn f() { let _ = internal::adaptive::X; }\n}\n";
     assert!(
-        forbidden_module_references(&snippet(sibling_no_shadow)).is_empty(),
+        forbidden_module_references(&snippet(sibling_no_shadow), 0).is_empty(),
         "an alias leaked out of the module that declared it: {:?}\n{sibling_no_shadow}",
-        forbidden_module_references(&snippet(sibling_no_shadow))
+        forbidden_module_references(&snippet(sibling_no_shadow), 0)
     );
 
     // Reverse: a real crate alias shadowed by a local module of the same name is no longer
     // the crate root inside that module.
     let shadowed = "use crate as internal;\nmod b {\n    mod internal {\n        pub mod adaptive {}\n    }\n    fn f() { let _ = internal::adaptive::X; }\n}\n";
     assert!(
-        forbidden_module_references(&snippet(shadowed)).is_empty(),
+        forbidden_module_references(&snippet(shadowed), 0).is_empty(),
         "a shadowed alias still counted as the crate root: {:?}\n{shadowed}",
-        forbidden_module_references(&snippet(shadowed))
+        forbidden_module_references(&snippet(shadowed), 0)
     );
 
     // The three genuine exploits must stay caught, so the scoping does not buy its
@@ -1745,7 +1852,7 @@ fn crate_root_aliases_are_scoped_to_the_module_that_declares_them() {
         ),
     ] {
         assert!(
-            !forbidden_module_references(&snippet(source)).is_empty(),
+            !forbidden_module_references(&snippet(source), 0).is_empty(),
             "{label}: scoping introduced a false negative:\n{source}"
         );
     }
@@ -1814,7 +1921,7 @@ fn extern_crate_self_and_transitive_aliases_are_crate_roots_too() {
         ),
     ] {
         assert!(
-            !forbidden_module_references(&snippet(source)).is_empty(),
+            !forbidden_module_references(&snippet(source), 0).is_empty(),
             "{label}: an alias form bypassed the boundary:\n{source}"
         );
     }
@@ -1868,9 +1975,308 @@ fn extended_alias_forms_remain_scope_aware_and_shadowable() {
         ),
     ] {
         assert!(
-            forbidden_module_references(&snippet(source)).is_empty(),
+            forbidden_module_references(&snippet(source), 0).is_empty(),
             "{label}: the extended forms invented a reference: {:?}\n{source}",
-            forbidden_module_references(&snippet(source))
+            forbidden_module_references(&snippet(source), 0)
+        );
+    }
+}
+
+#[test]
+fn super_resolves_to_the_crate_root_at_the_right_depth() {
+    // `super::adaptive::X` written in `src/api/mod.rs` *is* `crate::adaptive::X`, because
+    // that file is one module deep. The visitor only knew `crate` and `unified_hifi_control`
+    // as roots, so every `super::` route was invisible. Found by CodeRabbit at `9c53079`.
+    for (label, depth, source) in [
+        (
+            "one super at depth 1",
+            1,
+            "fn f() { let _ = super::adaptive::X; }",
+        ),
+        (
+            "one super at depth 1, publication layer",
+            1,
+            "fn f() { let _ = super::producers::P; }",
+        ),
+        (
+            "two supers at depth 2",
+            2,
+            "fn f() { let _ = super::super::adaptive::X; }",
+        ),
+        (
+            "three supers at depth 3",
+            3,
+            "fn f() { let _ = super::super::super::producers::P; }",
+        ),
+        (
+            "super in a use tree at depth 1",
+            1,
+            "use super::adaptive::X;",
+        ),
+        (
+            "super in type position at depth 1",
+            1,
+            "fn f(x: super::adaptive::X) {}",
+        ),
+    ] {
+        assert!(
+            !forbidden_module_references(&snippet(source), depth).is_empty(),
+            "{label}: a super:: route to the crate root was missed:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn super_does_not_reach_the_crate_root_from_the_wrong_depth() {
+    // Near misses. Too few supers lands in an intermediate module, too many is not
+    // expressible, and a file at the crate root has no `super` at all.
+    for (label, depth, source) in [
+        (
+            "one super at depth 2 lands one module short",
+            2,
+            "fn f() { let _ = super::adaptive::X; }",
+        ),
+        (
+            "two supers at depth 3 lands one module short",
+            3,
+            "fn f() { let _ = super::super::adaptive::X; }",
+        ),
+        (
+            "two supers at depth 1 over-shoots",
+            1,
+            "fn f() { let _ = super::super::adaptive::X; }",
+        ),
+        (
+            "no super at depth 1 is a sibling module",
+            1,
+            "fn f() { let _ = adaptive::X; }",
+        ),
+        (
+            "super at depth 0 has no parent",
+            0,
+            "fn f() { let _ = super::adaptive::X; }",
+        ),
+        (
+            "a prefix-sharing module through super",
+            1,
+            "fn f() { let _ = super::adaptive_extras::X; }",
+        ),
+    ] {
+        assert!(
+            forbidden_module_references(&snippet(source), depth).is_empty(),
+            "{label}: super:: resolution over-reached: {:?}\n{source}",
+            forbidden_module_references(&snippet(source), depth)
+        );
+    }
+}
+
+#[test]
+fn inline_modules_shift_the_effective_super_depth() {
+    // `depth` is the file's depth, but an inline `mod nested { … }` puts its contents one
+    // module further down. At file depth 1, inside one inline module the effective depth is
+    // 2: `super::super::adaptive` reaches the crate root and `super::adaptive` only reaches
+    // the file's own module. A fixed per-file depth gets both backwards. Raised by Codex
+    // against the first draft of the `super::` fix.
+    for (label, depth, source) in [
+        (
+            "two supers inside one inline module at file depth 1",
+            1,
+            "mod nested {\n    fn f() { let _ = super::super::adaptive::X; }\n}\n",
+        ),
+        (
+            "three supers inside two inline modules at file depth 1",
+            1,
+            "mod a {\n    mod b {\n        fn f() { let _ = super::super::super::producers::P; }\n    }\n}\n",
+        ),
+        (
+            "one super inside an inline module at file depth 0",
+            0,
+            "mod nested {\n    fn f() { let _ = super::adaptive::X; }\n}\n",
+        ),
+    ] {
+        assert!(
+            !forbidden_module_references(&snippet(source), depth).is_empty(),
+            "{label}: an inline module's effective depth was not applied:\n{source}"
+        );
+    }
+
+    for (label, depth, source) in [
+        (
+            "one super inside an inline module at file depth 1 stops at the file's module",
+            1,
+            "mod nested {\n    fn f() { let _ = super::adaptive::X; }\n}\n",
+        ),
+        (
+            "two supers inside two inline modules at file depth 1 falls short",
+            1,
+            "mod a {\n    mod b {\n        fn f() { let _ = super::super::adaptive::X; }\n    }\n}\n",
+        ),
+        (
+            "depth must be restored after leaving an inline module",
+            1,
+            "mod nested {\n    fn inner() {}\n}\nfn after() { let _ = super::super::adaptive::X; }\n",
+        ),
+        (
+            "an external module declaration does not add depth",
+            1,
+            "mod external;\nfn f() { let _ = super::super::adaptive::X; }\n",
+        ),
+    ] {
+        assert!(
+            forbidden_module_references(&snippet(source), depth).is_empty(),
+            "{label}: super:: over-reached: {:?}\n{source}",
+            forbidden_module_references(&snippet(source), depth)
+        );
+    }
+
+    // And the file-level case still holds inside a file that also has inline modules.
+    let mixed = "fn top() { let _ = super::adaptive::X; }\nmod nested { fn f() {} }\n";
+    assert!(
+        !forbidden_module_references(&snippet(mixed), 1).is_empty(),
+        "a file-level super:: stopped being caught once the file gained an inline module"
+    );
+}
+
+#[test]
+fn macro_token_paths_resolve_super_against_the_same_depth_as_ordinary_paths() {
+    // A path written inside a macro invocation is compiled exactly like one written outside
+    // it, so the sweep must resolve it identically. The token scanner checked only adjacent
+    // `Ident :: Ident` windows, which cannot see a leading `super` run at all - so
+    // `super::adaptive::X` was caught as a plain path and missed as a macro argument. That
+    // asymmetry is the whole bypass. Raised before commit against the `super::` fix.
+    for (label, depth, source) in [
+        (
+            "one super at file depth 1",
+            1,
+            "fn f() { do_thing!(super::adaptive::X); }\n",
+        ),
+        (
+            "two supers at file depth 2",
+            2,
+            "fn f() { do_thing!(super::super::adaptive::X); }\n",
+        ),
+        (
+            "two supers inside one inline module at file depth 1",
+            1,
+            "mod nested {\n    fn f() { do_thing!(super::super::adaptive::X); }\n}\n",
+        ),
+        (
+            "three supers inside two inline modules at file depth 1",
+            1,
+            "mod a {\n    mod b {\n        fn f() { do_thing!(super::super::super::producers::P); }\n    }\n}\n",
+        ),
+        (
+            "nested inside a delimiter group",
+            1,
+            "fn f() { do_thing!(vec![(super::adaptive::X)]); }\n",
+        ),
+        (
+            "an aliased root reached through super still resolves",
+            1,
+            "use crate as internal;\nfn f() { do_thing!(super::internal::adaptive::X); }\n",
+        ),
+    ] {
+        assert!(
+            !forbidden_module_references(&snippet(source), depth).is_empty(),
+            "{label}: a forbidden path inside a macro escaped depth resolution:\n{source}"
+        );
+    }
+
+    for (label, depth, source) in [
+        (
+            "one super at file depth 2 falls short",
+            2,
+            "fn f() { do_thing!(super::adaptive::X); }\n",
+        ),
+        (
+            "two supers at file depth 1 over-reach",
+            1,
+            "fn f() { do_thing!(super::super::adaptive::X); }\n",
+        ),
+        (
+            "one super inside an inline module at file depth 1 stops at the file's module",
+            1,
+            "mod nested {\n    fn f() { do_thing!(super::adaptive::X); }\n}\n",
+        ),
+    ] {
+        assert!(
+            forbidden_module_references(&snippet(source), depth).is_empty(),
+            "{label}: super:: over-reached inside a macro: {:?}\n{source}",
+            forbidden_module_references(&snippet(source), depth)
+        );
+    }
+
+    // The literal controls must survive the change: a string is a different TokenTree
+    // variant from an Ident, so its contents can never become path segments. This is the
+    // regression Codex found at `4129b87` and it stays covered.
+    for (label, source) in [
+        (
+            "a plain string literal",
+            r#"fn f() { println!("crate::adaptive"); }"#,
+        ),
+        (
+            "a raw string literal",
+            "fn f() { println!(r#\"super::super::adaptive::X\"#); }",
+        ),
+        (
+            "a literal inside a nested group",
+            r#"fn f() { do_thing!(vec![("super::adaptive::X")]); }"#,
+        ),
+    ] {
+        assert!(
+            forbidden_module_references(&snippet(source), 1).is_empty(),
+            "{label}: a string literal fabricated a module reference:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn module_depth_is_derived_from_the_file_path() {
+    for (path, expected) in [
+        ("src/lib.rs", 0),
+        ("src/main.rs", 0),
+        ("src/aggregator.rs", 1),
+        ("src/api/mod.rs", 1),
+        ("src/adapters/hqplayer.rs", 2),
+        ("src/producers/event.rs", 2),
+        ("src/app/pages/zones.rs", 3),
+        ("src/server/routes/mod.rs", 2),
+    ] {
+        assert_eq!(
+            module_depth(path),
+            expected,
+            "wrong module depth for {path}"
+        );
+    }
+}
+
+#[test]
+fn sweep_exemptions_do_not_match_sibling_paths() {
+    // The exemptions were raw prefixes, so `src/adaptive` would also exempt a future
+    // `src/adaptive_extras/`, and a file exemption would match anything beginning with it.
+    // A too-broad exemption is silent: the sweep simply stops covering a directory.
+    // Found by CodeRabbit at `9c53079`.
+    for exempt in [
+        "src/adaptive/mod.rs",
+        "src/adaptive/value.rs",
+        "src/producers/event.rs",
+        "src/lib.rs",
+        "src/main.rs",
+    ] {
+        assert!(is_sweep_exempt(exempt), "{exempt} should be exempt");
+    }
+    for covered in [
+        "src/adaptive_extras/mod.rs",
+        "src/producers_extra/thing.rs",
+        "src/lib.rs.bak.rs",
+        "src/main.rs.orig.rs",
+        "src/lib/helper.rs",
+        "src/api/mod.rs",
+        "src/mqtt/mod.rs",
+    ] {
+        assert!(
+            !is_sweep_exempt(covered),
+            "{covered} must stay inside the sweep"
         );
     }
 }
@@ -1895,9 +2301,9 @@ fn unrelated_crate_aliases_do_not_false_positive() {
         ),
     ] {
         assert!(
-            forbidden_module_references(&snippet(source)).is_empty(),
+            forbidden_module_references(&snippet(source), 0).is_empty(),
             "{label}: alias tracking invented a reference: {:?}\n{source}",
-            forbidden_module_references(&snippet(source))
+            forbidden_module_references(&snippet(source), 0)
         );
     }
 }
@@ -1997,7 +2403,7 @@ fn the_inspectors_do_not_invent_findings() {
                       const S: &str = \"crate::producers\";\n\
                       fn f() {}\n";
     assert!(
-        forbidden_module_references(&snippet(prose_only)).is_empty(),
+        forbidden_module_references(&snippet(prose_only), 0).is_empty(),
         "prose or a string literal registered as a module reference"
     );
 
@@ -2021,18 +2427,18 @@ fn the_inspectors_do_not_invent_findings() {
         ),
     ] {
         assert!(
-            forbidden_module_references(&snippet(source)).is_empty(),
+            forbidden_module_references(&snippet(source), 0).is_empty(),
             "{label}: a literal inside a macro fabricated a module reference: {:?}\n{source}",
-            forbidden_module_references(&snippet(source))
+            forbidden_module_references(&snippet(source), 0)
         );
     }
 
     // A module whose name merely shares a prefix is not forbidden.
     let near_miss = "use crate::adaptive_extras::X;\nuse crate::production::Y;\n";
     assert!(
-        forbidden_module_references(&snippet(near_miss)).is_empty(),
+        forbidden_module_references(&snippet(near_miss), 0).is_empty(),
         "a prefix-sharing module name registered: {:?}",
-        forbidden_module_references(&snippet(near_miss))
+        forbidden_module_references(&snippet(near_miss), 0)
     );
 }
 
@@ -2072,7 +2478,7 @@ fn module_references_are_found_in_every_position() {
         ),
     ] {
         assert!(
-            !forbidden_module_references(&snippet(source)).is_empty(),
+            !forbidden_module_references(&snippet(source), 0).is_empty(),
             "{label}: a module reference was missed:\n{source}"
         );
     }

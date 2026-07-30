@@ -50,7 +50,7 @@ pub mod event;
 
 pub use admission::{
     admit, Admission, AdmissionKind, AdmissionRefusal, AdmittedDocument, IntentRepair, LaneDefect,
-    ProducerKey,
+    ProducerKey, CONTROL_REMOVED_TEXT_KEY,
 };
 pub use aggregator::{LaneWitness, ProducerAggregator, ProducerPresence, ProducerSnapshot};
 pub use event::{create_adaptive_bus, AdaptiveBus, AdaptiveEvent, SharedAdaptiveBus};

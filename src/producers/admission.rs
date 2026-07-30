@@ -33,6 +33,13 @@ use crate::adaptive::{
 };
 use crate::bus::PrefixedZoneId;
 
+/// Catalog key rendered when a staged entry targets a control that no longer exists.
+///
+/// Named once because two places must agree on it: this module and the canonical
+/// `control_removed_after_advance` fixture consumers are built against. Catalog *text* is
+/// governed by #343; only the key is fixed here.
+pub const CONTROL_REMOVED_TEXT_KEY: &str = "reason.control_no_longer_exists";
+
 /// Stable aggregator key for one producer document.
 ///
 /// Deliberately carries no serde derives. It is aggregator-internal addressing, and the
@@ -436,6 +443,12 @@ fn repair_intent(mut document: ProducerDocument) -> (ProducerDocument, Vec<Inten
                 change_set,
             } => {
                 let mut reason = Reason::draft(ReasonCode::ControlRemoved);
+                // Both fields, and they are not interchangeable. `detail` names the specific
+                // control for a log reader; `display_text_key` is what a consumer can
+                // actually render to a user, because catalog keys localise and English
+                // diagnostic prose does not. Emitting only `detail` would leave the user
+                // with either untranslated text or nothing at all.
+                reason.display_text_key = Some(CONTROL_REMOVED_TEXT_KEY.to_string());
                 reason.detail = Some(format!(
                     "control {control} is no longer described by this producer document"
                 ));
