@@ -286,23 +286,37 @@ Because tier 2 needs hardware nobody should volunteer casually, the honest posit
   narrated. Opening that issue belongs to the program owner, not to this PR — the issue graph under
   #310 is maintained deliberately — so it is recorded here as a pre-merge action rather than filed
   unilaterally.
-- Confirm on GitHub runners, not this sandbox, the two known full-run failure sources. Neither is a
-  property of the code, and both were previously described more strongly than the evidence supports.
-  - The two `/hqp/discover` multicast 500s. These reproduced in **3 of 4** runs in this sandbox, where
-    multicast to `239.192.0.199` is unavailable, while an **independent** full run at the same head passed
-    every test binary. Earlier revisions called them "deterministic", then *environment-specific*. **Both
-    are too strong, and both are withdrawn.** The fourth sandbox run, at `15281cc`, passed *both* tests and
-    the whole suite — 501 passed, 0 failed, 12 ignored, exit 0. The same sandbox therefore produces both
-    outcomes at one SHA, so the property is **intermittent**, not a fixed attribute of the environment.
-    This action is now largely discharged rather than pending: CI's own `cargo test --workspace` at
-    `15281cc` is a GitHub-runner full run and it is **green**. What a runner can establish is a *rate*; it
-    cannot return a verdict, because for an intermittent failure a green aggregate is no more proof the
-    pair is fixed than a red one is proof it is broken.
-  - A pre-existing concurrency failure *family* in `adapter_integration` around
-    `error_handling::lms_fails_gracefully_when_unconfigured`. The earlier "~1-in-10" characterisation was
-    wrong and is withdrawn: measured under the full suite the family fired in **2 of 3** runs, while the
-    `adapter_integration` binary run on its own was **6/6 green**. The `4/4` figure applied only to that
-    isolated binary under `--test-threads=1` and never to the whole suite. It did **not** fire in the
-    `15281cc` sandbox run above, and an independent aggregate at that same head reported it as the *sole*
-    failing target — the same intermittency, read from both sides. The file is byte-identical to
-    `v3`, so the mechanism is process-global state under concurrency, not this branch.
+- Establish a **rate** on GitHub runners for the two known full-run failure sources. Neither is a
+  property of the code. **Both were previously described more strongly than the evidence supports, three
+  times over, and the running-tally form is itself the defect** — every count below went stale on the next
+  run, so they are recorded as lower bounds and the *property* is what this ADR asserts.
+
+  **The property: both sources are intermittent, in both directions, at a single SHA.** Successive
+  revisions called the `/hqp/discover` pair "deterministic", then *environment-specific*, and the LMS
+  family "~1-in-10". **All three characterisations are withdrawn.** The disproof is direct: two aggregates
+  in *this* sandbox, at two heads one docs-only commit apart, disagreed with each other and with the
+  earlier record.
+
+  | Aggregate run | Result |
+  |---|---|
+  | This sandbox at `15281cc` | **green** — 501 passed, 0 failed, 12 ignored, exit 0. `/hqp/discover` **passed**; LMS family did not fire |
+  | This sandbox at `32ff6df` | **exit 101** — 500 passed, 1 failed. Sole failure `lms_integration::volume_control_fails_when_disconnected`; `/hqp/discover` **passed** again |
+  | CI `cargo test --workspace` at `15281cc` | **green**, all 21 targets, 12 doc tests ignored |
+  | Independent aggregate at `15281cc` | exit 101, `adapter_integration` the sole failing target |
+  | Earlier sandbox aggregates | `/hqp/discover` pair fired; LMS family fired under the full suite |
+
+  - The two `/hqp/discover` multicast 500s, where multicast to `239.192.0.199` is unavailable in this
+    sandbox. They fired in the earlier sandbox aggregates and in **neither** of the two most recent, so
+    the environment is not the whole explanation.
+  - A pre-existing concurrency failure *family* in `adapter_integration`, seen at both
+    `error_handling::lms_fails_gracefully_when_unconfigured` and
+    `lms_integration::volume_control_fails_when_disconnected`. The `4/4` and `6/6` green figures applied
+    only to the **isolated** binary and never to the whole suite; the isolated target passes at every head
+    measured here. `tests/adapter_integration.rs` is byte-identical to `v3`, so the mechanism is
+    process-global state (`UHC_CONFIG_DIR`) under cross-binary concurrency, not this branch.
+
+  **Consequence for any reader of a full-suite result.** A runner can establish a rate; it cannot return a
+  verdict. For an intermittent failure a green aggregate is no more proof either source is fixed than a red
+  one is proof it is broken — and a genuine regression in this area would be indistinguishable from the
+  known flake on a single run. The action is therefore *not* discharged by CI's green run at `15281cc`;
+  discharging it means N runs and a reported rate.
