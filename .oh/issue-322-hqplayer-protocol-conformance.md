@@ -1787,3 +1787,83 @@ One `src` file — `src/adapters/hqplayer.rs`, the `framing` module and `send_co
 request, response or payload change; `api-change-approved` not applied. **No #347 change was
 implemented.** ADR 003 still not amended: the framing internals were restructured, but the decision it
 records — three layers, asserted through the adapter's public surface — is unchanged.
+
+### Adjustment `/review`, `/dissent` and `sg review`
+
+**`/review` — one finding, applied.** The blocker-2 defence assertion was passing for the wrong reason.
+`<Status note="</Status>"` reads `Incomplete` because the root tag never closes, so `root_element`
+returns `None` and the quote-aware scan never runs — it would have passed whatever the boundary rule
+did. Replaced with a closing-tag literal inside a *child* attribute with the root open, plus the case
+where a real close follows the literal. Label audit: **24 tests in the amendment section, 24 contract
+labels, none missing, no non-contract labels.**
+
+**`/dissent` — two findings, both applied, both mine.**
+
+1. **First-defensible-boundary opened a hole the last-token rule did not have.** The scan was
+   quote-aware but not comment- or CDATA-aware, and neither form is quoted:
+
+   ```text
+   <Status a="1"><!-- </Status> -->        classify=Complete  first_end=Some(28)
+   <Status a="1"><![CDATA[ </Status> ]]>   classify=Complete  first_end=Some(46)
+   ```
+
+   A **truncated** document read as complete — the single failure recovery exists to prevent. Fixed
+   with `comment_or_cdata_len`; an unterminated comment or CDATA consumes the remainder, because there
+   is no boundary inside something that has not ended.
+
+   **This is the second time in this amendment that a fix introduced the class of defect it was
+   closing** — the first was reintroducing semantic-parser evidence inside the fix for it. Worth
+   naming as a tendency rather than a coincidence.
+
+2. **Three factual errors, one channel.** All three came from reading a *report about* HQPTuner as
+   though it were HQPTuner: the enum-ID renumbering (Stage 1 dissent), the nonexistent
+   `fake_control.py` path, and the superseded `active_mode` claim (both this gate). **None of my own
+   review passes caught any of the three.** So it is a channel, not three mistakes — and 14 fixtures
+   were citing upstream URLs as `source:` with the same defect, just without a broken path to expose
+   it. All 14 now record `source_chain: read-via-report`, enforced by
+   `every_upstream_citation_records_how_it_was_obtained`.
+
+**`sg review pr` — no new blocking finding on the adjustment.** Four of its five points are standing
+maintainer questions it credits this PR for surfacing: proportionality (~8,000 lines of harness against
+a focused production diff), the three parsing implementations, four nested self-review rounds in one
+PR, and the `.oh` file being closer to a transcript than a design doc. Its remaining point — that the
+corpus's `verified` labels rest on second-hand summaries — was **partly addressed by the `source_chain`
+work in the same pass, and the residual is now fixed**: three fixtures claimed bare `verified` while
+resting on a salvage report, and are now `verified-upstream`, guarded by
+`no_fixture_claims_uhc_verified_status_on_second_hand_evidence`. A bare `verified` is reserved for a
+first-hand UHC capture, which this corpus does not have. `is_verified()` is a prefix match, so the
+observed-versus-derived distinction is preserved while the claim now names whose observation it is.
+
+**sg's explicit ask, carried forward unresolved:** a human sign-off on the
+infrastructure-versus-immediate-value ratio, because "amortised across five future issues" only pays
+off if those issues consume this harness rather than routing around it. This amendment's own dissent
+reached the same conclusion from the other direction.
+
+### Recorded, not resolved
+
+- `classify` builds a `Vec<String>` of open element names, so 4 MiB of pathological nesting yields tens
+  of megabytes. Bounded, not unbounded. "Nothing unbounded is allocated" is precise about the
+  accumulation buffer and should not be read as covering every derived allocation.
+- The synthetic profile is not hermetic: it defines two filter documents and falls back to the Opal
+  profile for everything else.
+- The two-label contract is audited mechanically but not structurally guarded; a 25th test could omit
+  a label.
+- `source_chain` makes the read-via-report channel visible without closing it. **#341** owns the
+  first-hand or live confirmations for all 14 flagged claims.
+
+### Verification at the pushed HEAD
+
+| Command | Result |
+|---|---|
+| `--test hqplayer_conformance` | **164 passed; 0 failed; 0 ignored** (162 at `5f37974`, 157 at `ff70554`, 138 at `6b8e97f`) |
+| lib unit tests | 84 passed |
+| `--test adapter_integration` / `--test zones_sha_integration` | 42 / 20 |
+| `--test api_contract` / `--test protocol_schema` | 2 / 41 — no route or payload drift |
+| `cargo fmt --check` | clean |
+| `cargo clippy -- -D warnings` | clean, 0 findings |
+| `git diff --check origin/v3...HEAD` | clean |
+| `cargo test --no-fail-fast` | **473 passed; 2 failed; 12 ignored** |
+| live tier 1 / tier 2 | **not run** — daemon offline, no mutating permission |
+
+The two failures remain the reproduced `/hqp/discover` baseline. **#339 remains unmerged**, so PR CI
+may still show the known Rust 1.97 base lint failure on `v3`.

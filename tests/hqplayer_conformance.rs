@@ -4084,3 +4084,33 @@ fn every_upstream_citation_records_how_it_was_obtained() {
         "every upstream-citing fixture must be covered, got {checked}"
     );
 }
+
+/// A bare `verified` status means **UHC** confirmed it against a live daemon. Nothing in this corpus
+/// has that, so nothing may claim it.
+///
+/// Three fixtures did. Their evidence is a salvage report stating that *upstream* verified the
+/// behaviour on a live hqplayerd 6.0.4 — a real and useful claim, but upstream's rather than ours, and
+/// second-hand at that. `verified-upstream` says so in the status itself, where a reader weighing the
+/// fixture will actually see it, rather than only in the notes.
+///
+/// `is_verified()` is a prefix match, so these still read as observation claims wherever the corpus
+/// distinguishes observed from derived — which is correct. What changes is that the claim now names
+/// whose observation it is.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn no_fixture_claims_uhc_verified_status_on_second_hand_evidence() {
+    for profile in corpus::profiles() {
+        for fixture in corpus::all_in(&profile) {
+            if fixture.provenance.source_chain.contains("read-via-report") {
+                assert_ne!(
+                    fixture.provenance.status, "verified",
+                    "{}/{} rests on a salvage report, so it must not claim bare `verified` — that \
+                     status is reserved for a first-hand UHC capture, which this corpus does not yet \
+                     have. Use `verified-upstream`",
+                    profile, fixture.name
+                );
+            }
+        }
+    }
+}

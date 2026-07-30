@@ -1,0 +1,1236 @@
+{
+  "dir_mtimes": {
+    "lms-plugin/HTML/EN/plugins": [
+      1785361225,
+      561924375
+    ],
+    "e2e": [
+      1785361225,
+      561632791
+    ],
+    "src/mqtt": [
+      1785361225,
+      572296404
+    ],
+    "plugin/.claude-plugin": [
+      1785361225,
+      563199337
+    ],
+    "test-results": [
+      1785361225,
+      572609446
+    ],
+    "tests": [
+      1785382964,
+      224155048
+    ],
+    "tags": [
+      1785361225,
+      572519737
+    ],
+    "src/devices": [
+      1785361225,
+      570859983
+    ],
+    "docs/adr": [
+      1785366331,
+      651316625
+    ],
+    "scripts": [
+      1785361225,
+      564121589
+    ],
+    "lms-plugin/HTML/EN": [
+      1785361225,
+      561884708
+    ],
+    ".github": [
+      1785361225,
+      553475352
+    ],
+    "firmware": [
+      1785361225,
+      561744916
+    ],
+    "tests/fixtures/hqplayer": [
+      1785384362,
+      475035822
+    ],
+    "src/app": [
+      1785361225,
+      568499977
+    ],
+    "lms-plugin/HTML/EN/plugins/UnifiedHiFi/settings": [
+      1785361225,
+      562001167
+    ],
+    ".cargo": [
+      1785361225,
+      552745600
+    ],
+    "src/components": [
+      1785361225,
+      570146439
+    ],
+    "plugin/commands": [
+      1785361225,
+      563373088
+    ],
+    "src/hqplayer": [
+      1785361225,
+      571148234
+    ],
+    "lms-plugin/HTML/EN/plugins/UnifiedHiFi": [
+      1785361225,
+      561956750
+    ],
+    "mcp": [
+      1785361225,
+      562667002
+    ],
+    "lms-plugin/HTML": [
+      1785361225,
+      561844458
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal": [
+      1785382308,
+      594295285
+    ],
+    ".oh": [
+      1785383318,
+      264682966
+    ],
+    "src/knobs": [
+      1785361225,
+      571656360
+    ],
+    ".claude-plugin/plugin/skills": [
+      1785361225,
+      553034934
+    ],
+    "src/api": [
+      1785361225,
+      566633305
+    ],
+    ".github/workflows": [
+      1785361225,
+      553917978
+    ],
+    "src/app/pages": [
+      1785361225,
+      568135475
+    ],
+    "src": [
+      1785361225,
+      572393529
+    ],
+    "src/config": [
+      1785361225,
+      570415065
+    ],
+    ".claude-plugin/plugin": [
+      1785361225,
+      553001476
+    ],
+    "assets": [
+      1785361225,
+      555949609
+    ],
+    "src/components/tabs": [
+      1785361225,
+      570303106
+    ],
+    "src/lib": [
+      1785361225,
+      571851236
+    ],
+    "docs/tasks": [
+      1785361225,
+      561429999
+    ],
+    ".claude-plugin": [
+      1785361225,
+      552912559
+    ],
+    "src/app/components": [
+      1785361225,
+      567328640
+    ],
+    "tests/fixtures/hqplayer/hqpd-5.x-legacy": [
+      1785364103,
+      135549244
+    ],
+    "assets/icons": [
+      1785361225,
+      556376402
+    ],
+    "src/roon": [
+      1785361225,
+      572359070
+    ],
+    "src/server/routes": [
+      1785361225,
+      572452196
+    ],
+    "plugin": [
+      1785361225,
+      563278671
+    ],
+    "docs": [
+      1785361225,
+      561503832
+    ],
+    "tests/fixtures": [
+      1785363197,
+      926978986
+    ],
+    "src/bus": [
+      1785361225,
+      569109936
+    ],
+    "src/components/button": [
+      1785361225,
+      569446979
+    ],
+    "lms-plugin": [
+      1785361225,
+      562568544
+    ],
+    "src/bin": [
+      1785361225,
+      568676269
+    ],
+    "src/components/collapsible": [
+      1785361225,
+      569722688
+    ],
+    "tests/mock_servers/hqplayer": [
+      1785384480,
+      456196841
+    ],
+    "src/components/navbar": [
+      1785361225,
+      570071856
+    ],
+    "docs/bus": [
+      1785361225,
+      560929456
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-pcm-only-dac": [
+      1785382472,
+      752265805
+    ],
+    "tests/mock_servers": [
+      1785363225,
+      117058470
+    ],
+    "src/adapters": [
+      1785384911,
+      202919249
+    ],
+    "src/server": [
+      1785361225,
+      572421404
+    ],
+    "docs/architecture": [
+      1785361225,
+      560820414
+    ],
+    "public": [
+      1785363284,
+      701707848
+    ],
+    "src/mcp": [
+      1785361225,
+      572048153
+    ],
+    "tests/fixtures/hqplayer/synthetic-chain-hazard": [
+      1785384362,
+      475168323
+    ]
+  },
+  "file_mtimes": {
+    "docs/Dioxus-components-research.md": [
+      1785361225,
+      560431580
+    ],
+    ".github/dependabot.yml": [
+      1785361225,
+      553453060
+    ],
+    "tests/ignored_send_lint.rs": [
+      1785361225,
+      573480365
+    ],
+    "public/dx-components-theme.css": [
+      1785361225,
+      563906089
+    ],
+    "src/components/navbar/component.rs": [
+      1785361225,
+      569975772
+    ],
+    "docs/ARCHITECTURE.md": [
+      1785361225,
+      560371871
+    ],
+    "docs/ui-features.md": [
+      1785361225,
+      561563833
+    ],
+    "tests/fixtures/hqplayer/hqpd-5.x-legacy/getinfo.xml": [
+      1785382507,
+      343528487
+    ],
+    "scripts/pre-commit": [
+      1785361225,
+      564166090
+    ],
+    "src/embedded.rs": [
+      1785361225,
+      570987983
+    ],
+    ".claude-plugin/marketplace.json": [
+      1785361225,
+      552886434
+    ],
+    "docs/lms-plugin.md": [
+      1785361225,
+      561243915
+    ],
+    "src/components/mod.rs": [
+      1785361225,
+      569851980
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/matrix_profiles.xml": [
+      1785384952,
+      360225721
+    ],
+    "docs/protocol.md": [
+      1785361225,
+      561361999
+    ],
+    "lms-plugin/HTML/EN/plugins/UnifiedHiFi/settings/basic.html": [
+      1785361225,
+      562042917
+    ],
+    "docs/adapter.md": [
+      1785361225,
+      560601288
+    ],
+    ".cargo/config.toml": [
+      1785361225,
+      552786017
+    ],
+    "tests/mock_servers/hqplayer/model.rs": [
+      1785384632,
+      87660850
+    ],
+    "tests/protocol_integration.rs": [
+      1785361225,
+      574406326
+    ],
+    "src/app/components/nav.rs": [
+      1785361225,
+      567300640
+    ],
+    "src/coordinator.rs": [
+      1785361225,
+      570784274
+    ],
+    "LICENSE-PRIOR": [
+      1785361225,
+      555547399
+    ],
+    "src/input.css": [
+      1785361225,
+      571253151
+    ],
+    "src/api/mod.rs": [
+      1785361225,
+      566791847
+    ],
+    "src/devices/.gitkeep": [
+      1785361225,
+      570858816
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/modes.xml": [
+      1785384952,
+      360289680
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/filters_sdm.xml": [
+      1785384952,
+      360021135
+    ],
+    "Dockerfile.release": [
+      1785361225,
+      555355941
+    ],
+    "tests/hqplayer_conformance.rs": [
+      1785384970,
+      391699521
+    ],
+    "package.json": [
+      1785361225,
+      562978253
+    ],
+    "src/components/tabs/mod.rs": [
+      1785361225,
+      570272731
+    ],
+    "playwright.config.ts": [
+      1785361225,
+      563065587
+    ],
+    "src/components/navbar/mod.rs": [
+      1785361225,
+      570040856
+    ],
+    "src/components/navbar/style.css": [
+      1785361225,
+      570116148
+    ],
+    "src/app/sse.rs": [
+      1785361225,
+      568439935
+    ],
+    "tests/api_contract.rs": [
+      1785361225,
+      572908364
+    ],
+    "public/apple-touch-icon.png": [
+      1785361225,
+      563815756
+    ],
+    "src/config/mod.rs": [
+      1785361225,
+      570639732
+    ],
+    "docs/AGENTS.md": [
+      1785361225,
+      560039912
+    ],
+    "Cross.toml": [
+      1785361225,
+      555128773
+    ],
+    "docs/tasks/phase-1-bus-foundation.md": [
+      1785361225,
+      561475082
+    ],
+    "public/favicon.ico": [
+      1785361225,
+      563980131
+    ],
+    "assets/icons/icon-256.png": [
+      1785361225,
+      556344235
+    ],
+    "lms-plugin/repo.xml": [
+      1785361225,
+      562537335
+    ],
+    "tests/volume_safety.rs": [
+      1785361225,
+      574729577
+    ],
+    "src/app/mod.rs": [
+      1785361225,
+      567563891
+    ],
+    "src/app/components/form_inputs.rs": [
+      1785361225,
+      567060681
+    ],
+    "src/app/api.rs": [
+      1785361225,
+      566902806
+    ],
+    "tests/mock_servers/roon.rs": [
+      1785361225,
+      574098617
+    ],
+    "tests/client_harness.rs": [
+      1785361225,
+      573317781
+    ],
+    "tests/adapter_integration.rs": [
+      1785361225,
+      572784322
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/status_playing_with_metadata.xml": [
+      1785384952,
+      360782478
+    ],
+    "tests/volume_step.rs": [
+      1785361225,
+      574796827
+    ],
+    "docs/adr/002-single-binary-assets.md": [
+      1785361225,
+      560710038
+    ],
+    "RUST_SPIKE.md": [
+      1785361225,
+      555897817
+    ],
+    "docs/ARCHITECTURE-RECOMMENDATION-A.md": [
+      1785361225,
+      560249954
+    ],
+    ".github/workflows/docker.yml": [
+      1785361225,
+      554017979
+    ],
+    "tests/protocol_schema.rs": [
+      1785361225,
+      574526076
+    ],
+    "src/app/settings_context.rs": [
+      1785361225,
+      568315768
+    ],
+    "src/firmware.rs": [
+      1785361225,
+      571087109
+    ],
+    "docs/hqplayer-protocol-reference.md": [
+      1785366361,
+      659680962
+    ],
+    "src/adapters/lms_discovery.rs": [
+      1785361225,
+      565866886
+    ],
+    "tests/oneshot_leak_lint.rs": [
+      1785361225,
+      574296909
+    ],
+    "src/adapters/hqplayer.rs": [
+      1785384911,
+      202225199
+    ],
+    "src/adapters/openhome.rs": [
+      1785361225,
+      566072636
+    ],
+    ".oh/issue-322-hqplayer-protocol-conformance.md": [
+      1785384752,
+      872958970
+    ],
+    "tests/architecture_lint.rs": [
+      1785361225,
+      573093239
+    ],
+    "src/knobs/store.rs": [
+      1785361225,
+      571727985
+    ],
+    "docs/lyrion.md": [
+      1785361225,
+      561304040
+    ],
+    "PHASE_4_INSTRUCTIONS.md": [
+      1785361225,
+      555657650
+    ],
+    "src/lib.rs": [
+      1785361225,
+      571796694
+    ],
+    "docs/ARCHITECTURE-GAP-ANALYSIS.md": [
+      1785361225,
+      560157912
+    ],
+    "src/adapters/handle.rs": [
+      1785361225,
+      564350049
+    ],
+    "src/components/tabs/component.rs": [
+      1785361225,
+      570213148
+    ],
+    "tests/arbitrary_find_lint.rs": [
+      1785361225,
+      572970572
+    ],
+    "src/hqplayer/.gitkeep": [
+      1785361225,
+      571147234
+    ],
+    "Cargo.lock": [
+      1785361225,
+      554976815
+    ],
+    "docs/arch-linux.md": [
+      1785361225,
+      560769789
+    ],
+    "README.md": [
+      1785361225,
+      555831942
+    ],
+    "public/.gitkeep": [
+      1785361225,
+      563619046
+    ],
+    "test-results/.last-run.json": [
+      1785361225,
+      572637321
+    ],
+    "src/app/components/hqp_controls.rs": [
+      1785361225,
+      567120889
+    ],
+    "src/knobs/image.rs": [
+      1785361225,
+      571385985
+    ],
+    "src/app/pages/knobs.rs": [
+      1785361225,
+      567847308
+    ],
+    "src/lib/.gitkeep": [
+      1785361225,
+      571850194
+    ],
+    "Dockerfile.ci": [
+      1785361225,
+      555299316
+    ],
+    "src/app/pages/lms.rs": [
+      1785361225,
+      567955017
+    ],
+    "PHASE_5_INSTRUCTIONS.md": [
+      1785361225,
+      555716692
+    ],
+    "src/knobs/mod.rs": [
+      1785361225,
+      571449860
+    ],
+    "src/components/button/style.css": [
+      1785361225,
+      569488813
+    ],
+    "Makefile": [
+      1785361225,
+      555601316
+    ],
+    "src/bus/events.rs": [
+      1785361225,
+      569003395
+    ],
+    "docs/architecture/bus-design.md": [
+      1785361225,
+      560879747
+    ],
+    "tests/mock_servers/hqplayer/tier1.rs": [
+      1785375338,
+      711903000
+    ],
+    "build.rs": [
+      1785361225,
+      556725653
+    ],
+    "src/app/components/error_alert.rs": [
+      1785361225,
+      566994431
+    ],
+    "src/app/pages/settings.rs": [
+      1785361225,
+      568106642
+    ],
+    "src/mcp/mod.rs": [
+      1785361225,
+      572178778
+    ],
+    "src/app/components/volume.rs": [
+      1785361225,
+      567370473
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/shapers_pcm.xml": [
+      1785384952,
+      360638268
+    ],
+    "lms-plugin/Settings.pm": [
+      1785361225,
+      562290585
+    ],
+    "src/app/theme.rs": [
+      1785361225,
+      568580935
+    ],
+    ".dockerignore": [
+      1785361225,
+      553301518
+    ],
+    "src/components/collapsible/mod.rs": [
+      1785361225,
+      569687146
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-pcm-only-dac/modes.xml": [
+      1785384459,
+      289597727
+    ],
+    "tests/fixtures/api_routes.txt": [
+      1785361225,
+      573411948
+    ],
+    ".github/workflows/api-guard.yml": [
+      1785361225,
+      553538186
+    ],
+    "src/adapters/lms.rs": [
+      1785361225,
+      565643511
+    ],
+    "mcp/index.js": [
+      1785361225,
+      562738419
+    ],
+    "lms-plugin/Plugin.pm": [
+      1785361225,
+      562204834
+    ],
+    "HQPLAYER-MULTI-INSTANCE.md": [
+      1785361225,
+      555428107
+    ],
+    "tests/fixtures/hqplayer/hqpd-5.x-legacy/modes.xml": [
+      1785382507,
+      343803610
+    ],
+    "package-lock.json": [
+      1785361225,
+      562898336
+    ],
+    ".claude-plugin/plugin/skills/sync-upstream.md": [
+      1785361225,
+      553079184
+    ],
+    ".github/RELEASE_TEMPLATE.md": [
+      1785361225,
+      553399352
+    ],
+    ".oh/hqplayer-spec.md": [
+      1785361225,
+      554280979
+    ],
+    "src/app/pages/hqplayer.rs": [
+      1785361225,
+      567712474
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/persistent_config.xml": [
+      1785384952,
+      360354639
+    ],
+    "src/app/pages/mod.rs": [
+      1785361225,
+      568012142
+    ],
+    "tests/fixtures/hqplayer/synthetic-chain-hazard/filters_pcm.xml": [
+      1785384362,
+      475133697
+    ],
+    "src/adapters/traits.rs": [
+      1785361225,
+      566366846
+    ],
+    "assets/icons/icon-128.png": [
+      1785361225,
+      556050151
+    ],
+    "src/bin/protocol_checker.rs": [
+      1785361225,
+      568769644
+    ],
+    "tests/fixtures/hqplayer/synthetic-chain-hazard/filters_sdm.xml": [
+      1785384362,
+      475200156
+    ],
+    "plugin/commands/setup.md": [
+      1785361225,
+      563469754
+    ],
+    "clippy.toml": [
+      1785361225,
+      559801119
+    ],
+    "src/roon/.gitkeep": [
+      1785361225,
+      572357987
+    ],
+    "src/components/button/mod.rs": [
+      1785361225,
+      569414896
+    ],
+    "src/adapters/roon.rs": [
+      1785361225,
+      566293929
+    ],
+    "src/adapters/upnp.rs": [
+      1785361225,
+      566502804
+    ],
+    "docs/ARCHITECTURE-RECOMMENDATION-B-REJECTED.md": [
+      1785361225,
+      560313537
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/shapers_sdm.xml": [
+      1785384952,
+      360711060
+    ],
+    "src/main.rs": [
+      1785361225,
+      571991986
+    ],
+    "tests/mock_servers/upnp.rs": [
+      1785361225,
+      574216409
+    ],
+    "LICENSE": [
+      1785361225,
+      555485983
+    ],
+    "src/app/embedded_assets.rs": [
+      1785361225,
+      567495724
+    ],
+    "tests/mock_servers/openhome.rs": [
+      1785361225,
+      573945367
+    ],
+    "src/components/tabs/style.css": [
+      1785361225,
+      570345607
+    ],
+    "lms-plugin/strings.txt": [
+      1785361225,
+      562612502
+    ],
+    "tests/mock_servers/lms.rs": [
+      1785361225,
+      573683574
+    ],
+    "tests/zones_sha_integration.rs": [
+      1785361225,
+      574864119
+    ],
+    "src/components/button/component.rs": [
+      1785361225,
+      569329854
+    ],
+    "src/aggregator.rs": [
+      1785361225,
+      566573513
+    ],
+    "src/components/collapsible/style.css": [
+      1785361225,
+      569772438
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/restore_response.html": [
+      1785384952,
+      360568767
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/rates_sdm.xml": [
+      1785384952,
+      360488641
+    ],
+    "src/server/routes/.gitkeep": [
+      1785361225,
+      572451321
+    ],
+    "Dockerfile": [
+      1785361225,
+      555245690
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/getinfo.xml": [
+      1785384952,
+      360088928
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/filters_pcm.xml": [
+      1785384952,
+      359943926
+    ],
+    "src/mdns.rs": [
+      1785361225,
+      572242570
+    ],
+    "src/components/collapsible/component.rs": [
+      1785361225,
+      569609521
+    ],
+    "docs/adr/003-hqplayer-conformance-boundary.md": [
+      1785373864,
+      341853205
+    ],
+    ".mcp.json": [
+      1785361225,
+      554147104
+    ],
+    "docs/bus/existing-patterns.md": [
+      1785361225,
+      561001039
+    ],
+    ".github/workflows/build.yml": [
+      1785361225,
+      553887603
+    ],
+    "tests/spawn_cancellation_lint.rs": [
+      1785361225,
+      574599118
+    ],
+    "public/hifi-logo.png": [
+      1785361225,
+      564055839
+    ],
+    ".coderabbit.yaml": [
+      1785361225,
+      553235477
+    ],
+    "AGENTS.md": [
+      1785361225,
+      554593105
+    ],
+    "src/app/components/mod.rs": [
+      1785361225,
+      567236473
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/junkfilters.xml": [
+      1785384952,
+      360162720
+    ],
+    "tests/aggregator_lint.rs": [
+      1785361225,
+      572845363
+    ],
+    "tests/unbounded_channel_lint.rs": [
+      1785361225,
+      574664785
+    ],
+    "tests/fixtures/hqplayer/hqpd-5.x-legacy/filters_pcm.xml": [
+      1785382507,
+      343372488
+    ],
+    "tests/mock_servers/hqplayer/corpus.rs": [
+      1785384970,
+      192604092
+    ],
+    "src/app/pages/zones.rs": [
+      1785361225,
+      568236851
+    ],
+    "src/adapters/mod.rs": [
+      1785361225,
+      565935053
+    ],
+    "src/mqtt/.gitkeep": [
+      1785361225,
+      572295529
+    ],
+    "docs/LMS-PLUGIN-SPEC.md": [
+      1785361225,
+      560529622
+    ],
+    "tests/await_in_lock_lint.rs": [
+      1785361225,
+      573186573
+    ],
+    "tests/mock_servers/hqplayer/raw.rs": [
+      1785375529,
+      17065242
+    ],
+    "tests/mock_servers/mod.rs": [
+      1785361225,
+      573743574
+    ],
+    "tests/mock_servers/hqplayer/wire.rs": [
+      1785383941,
+      768445005
+    ],
+    "Dioxus.toml": [
+      1785361225,
+      555191107
+    ],
+    "Cargo.toml": [
+      1785361225,
+      555069815
+    ],
+    "src/bus/mod.rs": [
+      1785361225,
+      569167187
+    ],
+    "src/knobs/routes.rs": [
+      1785361225,
+      571622360
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/rates_pcm.xml": [
+      1785384952,
+      360425348
+    ],
+    ".gitignore": [
+      1785361225,
+      554079187
+    ],
+    "docs/gh-release.md": [
+      1785361225,
+      561121123
+    ],
+    "plugin/.claude-plugin/plugin.json": [
+      1785361225,
+      563247129
+    ],
+    "lms-plugin/Helper.pm": [
+      1785361225,
+      562136709
+    ],
+    "assets/icons/icon-512.png": [
+      1785361225,
+      556644111
+    ],
+    "lms-plugin/install.xml": [
+      1785361225,
+      562424252
+    ],
+    "firmware/.gitkeep": [
+      1785361225,
+      561744000
+    ],
+    "COMMERCIAL-LICENSE.md": [
+      1785361225,
+      554645939
+    ],
+    "e2e/mobile.spec.ts": [
+      1785361225,
+      561676666
+    ],
+    "docker-compose.yml": [
+      1785361225,
+      559946703
+    ],
+    "tests/mock_servers/hqplayer.rs": [
+      1785372927,
+      79609530
+    ],
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/config_profile_form.html": [
+      1785384952,
+      359845425
+    ],
+    "tags/v3.0.0-rc.2": [
+      1785361225,
+      572552779
+    ],
+    "src/app/components/layout.rs": [
+      1785361225,
+      567182056
+    ],
+    ".claude-plugin/plugin/plugin.json": [
+      1785361225,
+      552975434
+    ]
+  },
+  "file_content_hashes": {
+    "public/apple-touch-icon.png": "c03a3b5798655e97f513e05d91b4675973466e6d6c4bb331110b3368d445da3f",
+    "public/.gitkeep": "abcf19091c44f25c35bbcb12b008fc4483c162f61b04bb1331116f0d7046fe2f",
+    "LICENSE-PRIOR": "81833e2372257f410e7cc29b31e994a8851fd37de41e00f39ada411e78981f89",
+    "scripts/pre-commit": "279e752eef1ac2da3e2ba00a391824e267d99de4a20409ff67047ef04a6639ac",
+    "tests/volume_step.rs": "dfd6a191d50cf5e777cd7c31a6f62c275e68c6255671c44c8711b66fa65265a5",
+    "tags/v3.0.0-rc.2": "d36db35df76f70ae6b3f3cac4701c44dccac95618b07f39b1a852d0e89232ce6",
+    "tests/mock_servers/roon.rs": "6e014750ef2abc36a331939722ec5b2d0a1875478aebb17dc8ffeb92b27835d3",
+    "src/app/pages/knobs.rs": "f4f402a4b5d09d85022ec5d72621570055981e5367473c217d105d67c41e1573",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/shapers_sdm.xml": "10e7aac4192eba84c683b1ac16edccf82955c018a556b2306eed087c187854f2",
+    "tests/fixtures/hqplayer/hqpd-5.x-legacy/modes.xml": "e60578cd6ee6b06ee0a79e9d8f1c83ae6f67b96cb4c2767b0802e11a4e5b8d56",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/matrix_profiles.xml": "f4c61aa6c05db1590e66af36da364eb2a139e70ae3b46d196b06b913cd8995f0",
+    "Dockerfile": "b15819564b141b8bc6b5c28bc89644e9db3b56fb5b21ac7d70d06dfa7fbd8f31",
+    "docs/Dioxus-components-research.md": "1c67030b7b7a92a6252c7be86206dd2875712bc52108995937496ade3a9c8d89",
+    "src/aggregator.rs": "8accc13a4002b9444698d1fcbfa69c92600f6887a8a08a01ee57aac6535ab644",
+    "tests/mock_servers/hqplayer/model.rs": "4aa85865bc4720982d58ea1c3fb820c1f97874309e628458fb20870ccbf47d69",
+    "src/components/collapsible/style.css": "cd2362f2a811178402cd2978e2082987e60c80b2988f2a0dd74624758071b755",
+    "src/lib.rs": "0e39c5aea5155e59945a39aa9ecac8da5d6593eed2c3dd6c057b728789d21490",
+    "src/components/button/style.css": "4f944731071b413b185f2cf2d5ddc1c388e07b76105af2cb90fc54fb8ba5a558",
+    "lms-plugin/HTML/EN/plugins/UnifiedHiFi/settings/basic.html": "46f35d56fc53d47d4e595a063afb562ba9a20d53c537d961ff62edb7e50e3cec",
+    "docs/ARCHITECTURE-RECOMMENDATION-A.md": "ed8165b8a01f57b69dde7e044afc46bef8e7711a817865b8f3f97481c45e1648",
+    ".coderabbit.yaml": "c4e7036bb4c3cf8c0aa37b8bc02c69d9bb95f763d805e3bd8f95767f6d95a7ae",
+    "src/knobs/image.rs": "a3f102c8fab4a0ffd31a36e12f466b37b05819609255520c2263dd68556f649c",
+    "test-results/.last-run.json": "53be43295c2bebef4ae983fa6d49083f800ea704cb0920a5fcd0618ba2fdf02a",
+    "PHASE_5_INSTRUCTIONS.md": "a1862e1970dbd7d3c00274d8f2c0fa6f23b69d351b531208095ca1d8eac586df",
+    "assets/icons/icon-256.png": "caf7653802a72319fed5869326464d34354f0c1a351e1a8b8aafd82bc4d5e326",
+    "src/components/navbar/mod.rs": "61dc53df6aa74e6069128bdbf56bdbb3033446c2021b5baf44c6f26bebdd81fb",
+    "tests/arbitrary_find_lint.rs": "6fcbdc0040f9a8649466b411e1cf1ff4bf247a0bd5cc7c43ce3bc4b73edc9fc3",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/status_playing_with_metadata.xml": "70639231602fc5329e8ec799da037fa9f224f0e67b06f64dd1659490da733314",
+    "docs/gh-release.md": "bcf763268679ca5120beea67edef842d5b6d27737fef85352d12db3365507604",
+    "src/app/embedded_assets.rs": "895828c84e796494cca3cc7a18b69567f75dddb8d45a9d6c0d5b3976d373f5f6",
+    "docs/adapter.md": "1cbb212a83e58b12f2a1b4c241e66f51869271886aaeabeab5af55ff76cba29c",
+    "COMMERCIAL-LICENSE.md": "d9359573eb2b729676651cc893190e0a4b55e2b8670107dbc5154369946be83d",
+    ".claude-plugin/marketplace.json": "83011678f490e306d41374efff7a0c6f51864cd005cba66c05c687effc2148bd",
+    "Cargo.lock": "d25191f8008fb0bcda05dd68523041070218a21edab793d6df65fae12b6841ae",
+    "src/components/collapsible/mod.rs": "61dc53df6aa74e6069128bdbf56bdbb3033446c2021b5baf44c6f26bebdd81fb",
+    "docs/adr/003-hqplayer-conformance-boundary.md": "5ed415371cfb95e3c873c14b4b1635869a3dc63999c749ddd9107017aae2f9d0",
+    "src/firmware.rs": "dd3fb7124a3b6a15e3e0dbc3eafe6f9633f94f0d61abd84e153d7009eaf4bf7c",
+    "src/app/pages/mod.rs": "005f95ce8726f1217fca7890b45c020752319258698ccb632e70b40ca78e7005",
+    "src/app/pages/lms.rs": "a227d123ee24496c2984767688f9f296f6a039133ada0c950703cfc068ffd649",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/junkfilters.xml": "c90abfc4dbe2425e970a5f06120a1706b884668f0b690463a3a7c085fefecaf4",
+    "src/components/button/mod.rs": "61dc53df6aa74e6069128bdbf56bdbb3033446c2021b5baf44c6f26bebdd81fb",
+    "src/coordinator.rs": "c1bfddfc03344b6f68c23e475dc7cc15fd16c145c2703a462138f9519913bc22",
+    "src/bus/events.rs": "fad5bfead379586e0bdcf47e19ec1d4b1cea0186b9ca4002a70b3b5c3653b21b",
+    "src/bin/protocol_checker.rs": "6739f6f72394206c5bb2616ddf88c12e735b5bd1d43fb8ca373f00ca1ca8fd44",
+    "docs/lms-plugin.md": "9da0373a91a15a70dcd26f3166f631a81f923860a8245ec8dbf6d1cfa103b320",
+    "src/knobs/routes.rs": "35783b1c91c72e12d1af20c12cd28ce8e6ca3c8ff052ff0806c5443d80372a5c",
+    "src/app/components/hqp_controls.rs": "8b23867b82791b171db1b6c4a07b61a688e17c3573bf18804ba2883fa5f78cb4",
+    "src/config/mod.rs": "658e86ab24fdd4086c29de867f1699e5f0e1705a49a827adccde9222fb187019",
+    ".claude-plugin/plugin/plugin.json": "d232e02d02cc2bdc45a9d0873f94358e77e93d0d39f6f221d6ac0f484b144f0b",
+    "tests/mock_servers/openhome.rs": "83b48033f574164667805ca73fae49e509a1f760774816a373ba5ec4574b7c71",
+    "Makefile": "a6f0f7da64e448bf92ffbd6b01db9217eddf05f3850f7180b9ee4e062951e4f8",
+    "docs/ui-features.md": "a797691082ef4106c984ac8987bdcf6343e58ae303a69b74ffe798fe840e8bc7",
+    "src/app/settings_context.rs": "e5a2a4691c1be5a2009446afbdb2d3f78e5495cc4d0a480091364c6d4c96573a",
+    "src/adapters/traits.rs": "eee27bde57537b9dda538e5f2af85a40845aa5ca498f2934fa8c7c0cb107ffb5",
+    "src/input.css": "8665f6e6c970e6f894e79316aa8170b513f9a4cb44cf54079dad7e83ebc96489",
+    "docker-compose.yml": "6db566a988feb13d0c3d473c6a5150748ccec71468713ac79fa61cec84ce58e7",
+    "tests/mock_servers/hqplayer/raw.rs": "3d4b20b90cf7a526f7f944ba6cb7acffc12a5e1b7bf32f464fb611e7ed73e98f",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/filters_sdm.xml": "d49479a9e13821ee8fb538bcdf16477a082fe8bab6c8ce33870e392c2022d1a4",
+    "docs/architecture/bus-design.md": "9878aebce3faa3b972001785ed9c29bddeec2f3ed56593a08f6c9000bbff681a",
+    ".github/dependabot.yml": "e3216e9e8441f26093c9221be6ba8f155ec9f9f539e31c638959a4d937a90f4e",
+    "docs/arch-linux.md": "361e78c213be68d0b6084202fab3ba3e8397a2d5b1ceaf55c6ed66c3a2941440",
+    "src/components/tabs/mod.rs": "61dc53df6aa74e6069128bdbf56bdbb3033446c2021b5baf44c6f26bebdd81fb",
+    "docs/adr/002-single-binary-assets.md": "b35369dc3c220ef2c83fbc566294478ceb13f5e53c60b1ae0eba6264cccff9ca",
+    "src/bus/mod.rs": "0c9c923bc9aa2f142a10cad0fdbdd489692a4f9a05a8cbc28c94799ea184ed91",
+    "src/adapters/hqplayer.rs": "0b62c85116d3cc006380b0a2a0d62fde64eff8e0c85cbbf1284a621708ba8a48",
+    "src/knobs/store.rs": "3cf016207b99a8e88405aaa9320355fd222429b295d5e1119bed81c6e8232a1f",
+    "tests/fixtures/hqplayer/synthetic-chain-hazard/filters_pcm.xml": "5b17e7fe7dc4a7bfc0bb8f5d68b1497f651a6ace8fe3de8770b8a3ab2bd6d4b9",
+    "clippy.toml": "125d491e67b9d4aebf9c21591b0780d004181be32653ddb8f34f31ef23e3e58a",
+    "src/app/pages/zones.rs": "9837627befc3388aafca5f222065d5cbcceb862cb535575a4075aa3cd9864587",
+    "src/components/tabs/style.css": "0923f4577cdb00a08713e694ef871b1d4d0f6e849da346b405f109f2757b9c24",
+    "AGENTS.md": "34759cb91d5cd4125b8c817ec4ec2d4a421958ca24c60594b5efe0cb2ddc1ea3",
+    "assets/icons/icon-512.png": "ccd8c410842d32c082e15493fdefb9a4b9723df373362f5cab27fad30de22cad",
+    "src/components/button/component.rs": "7dfbc1e6b3dd0364a7dcee4ed8b89ff7426caff8b47c155a16760e6b39bd86a8",
+    "src/components/mod.rs": "2516eb2b6dd84b21da9b63d01b71e241b232ef785cfc8d545338ded31d813f2e",
+    "plugin/.claude-plugin/plugin.json": "4b74a2b0e48ae7792c068eeb203f4c3e2bc3740a74bdd23d4e3dc3191b8a7ff9",
+    "tests/unbounded_channel_lint.rs": "75ded3071c9bc97ccb6945adba27dd6d6e2ce3aeebe4e77269d36092199868b7",
+    "package.json": "6db60f8336923c91fdcfde3982d1f2f87fe9164652834ecf17d1e4c9b894259f",
+    "src/app/api.rs": "fc8bad10bb0e17ab0db69bc5e760aaddb0fb0f3b4c7c46a2b501f633d17fb50d",
+    "src/server/routes/.gitkeep": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "playwright.config.ts": "d6f64367938a53f9a80cc104f6976c8d6896d374ff1edf2e0e5c079c9993f43c",
+    "Cross.toml": "cc5821c3e6bb599f9e2241f26cd7901ea9e1880cdc37475544df4587eb0ce79f",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/rates_pcm.xml": "27e7cbdcaba361ff00e69c3c05d762f7391d74e898a9d537557183a87b0b2b9d",
+    "lms-plugin/repo.xml": "38337dbfaca6b8771db81c5f454b391f4914f5967b0c9be25222c87cc0c09f1d",
+    "tests/mock_servers/hqplayer/corpus.rs": "38c9787cb7a9a1ef04d1b4b07630eb201d8786b35fe188b181cffa28831fea00",
+    "tests/mock_servers/mod.rs": "173b93748740e0f58caa5569aea1778c26914180ecfccca909cbf1e50bb6bf67",
+    "src/app/components/mod.rs": "e008d12b503e049c1bd5990df7197a02ad0abc49f9d46f86e705304ce201f939",
+    "tests/oneshot_leak_lint.rs": "153bd668ca08c92b766013954d3d7b99411316a67b3d71ec30458f0a93dc7e98",
+    "src/hqplayer/.gitkeep": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/shapers_pcm.xml": "f80ffc635c9671f9e4bad969d149b6f593d19d17bc6131c011051db1ee66ca05",
+    "tests/fixtures/hqplayer/hqpd-5.x-legacy/getinfo.xml": "ca04710e6e14ad8a118416befd6c2faf90fea8c541e510f87bfd841838da1fe0",
+    "docs/hqplayer-protocol-reference.md": "bf9d7a7a819f978f7d2b82ddd221a81b95db2002457f8796663b834bf5b7aa2e",
+    ".dockerignore": "f9e2d3c0ed09388cd13c12e4871e12f829d049df4aded357008446325b9e96c2",
+    "LICENSE": "e8f5f4657b5c903a9dbed87cb792fed5a25b0e2f4ccc177a0dc65ffa644b7d5d",
+    "tests/hqplayer_conformance.rs": "aea1b36ea1ecc15c9bd69a92de1ffe13e885df5da52129c1368b622e065add69",
+    ".github/workflows/docker.yml": "694dda5c3c21472ffc843051c88c4f3fe05cf2f4985a5dd24b2f7dfe06142585",
+    ".github/RELEASE_TEMPLATE.md": "66815aa2d1bba3d0c90ed0c1e9b0ff15934b44841360a28bce16c10a322ce13a",
+    "assets/icons/icon-128.png": "aa9ce5131c7d93a5cdd9611c1fa7f3b76e5bf8f822f3a938754aa2b3f0398aae",
+    "tests/zones_sha_integration.rs": "e8677da5fce309786bda7454a2dcc08e4bea8af539049a34e5542cae07345c5b",
+    "build.rs": "0757619123156d18ddfd24916e3012058bab7d7e3e71a69ecc5ce17c05da6aef",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/modes.xml": "3d055757eff36557e21bd6af76f51df9467ac3f89a559f22925ac52db8c5415e",
+    "RUST_SPIKE.md": "7b5de3147278acb8bbbb206b0eacd394ba0c66a3ac2c8fe9706783512c8781db",
+    "src/app/sse.rs": "fbee0101e7a7b3fa77a27cbcf4bc8da91ac71d8ffa0c3635cdbaa0572e0c8c51",
+    "src/app/components/volume.rs": "2e713faf14332513c700eb78341bfe4e5ca44d50b8383ea62dac9ee72f242620",
+    "src/app/mod.rs": "29997a44497f711ac1fd9152dd9bfcbfb7ed8ea1fc7fd62c840afaf08ae73e01",
+    "src/adapters/roon.rs": "d15ad9caa363cbd1621aa86a07e3898c3db708eb6f6f7e7161854c3d8e007bb2",
+    "Cargo.toml": "ab38b123543a8e3a6325eea1b0e2574e5ed15eb8f6521dbe3e1990d7f34f1473",
+    ".oh/issue-322-hqplayer-protocol-conformance.md": "6d40efba487fcdaf09ce14b9b009150e8128da3f3904491fd5b253d7035216af",
+    "src/mdns.rs": "8f1f297ac5d3d2f96ac18b2a17276e5633756fe016bee3819326d9479e62d505",
+    "README.md": "a70326d3e2201d622e6e429075ff3b3fd649f7b17946f3253b698d82938c256e",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/restore_response.html": "9ab1c383a1edf1b654a8f05e0cb1f8c8537822784ccf29da42e4341a97fc80ea",
+    ".claude-plugin/plugin/skills/sync-upstream.md": "ddbe0fbef41526b40c28f85b11ec32c235a1daf2072277131f4cc6337f5e6a86",
+    ".oh/hqplayer-spec.md": "5ef22477992f998065ef7954e459be02480b6e60c52d1a0812fbabd57104314d",
+    "src/roon/.gitkeep": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "tests/adapter_integration.rs": "c702658a7864cd857e02d46a9e614470b0efff3e5d0b9e6c67576f4579ac1d3e",
+    "docs/LMS-PLUGIN-SPEC.md": "d4320429a6ae9ddb33114e81aa5679975b8192635a583f2b8f5c7e516f8d525e",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/persistent_config.xml": "6a73eb2a750024a9eae40c5ae2d9cd67ac723fa0105cac1d189270c6834503d0",
+    "src/app/theme.rs": "2e109a61eabbda62658603982ae9a898bb97d9fc4711dc869b0a351ff0098172",
+    ".mcp.json": "03c4a18b1a4b9b294795efd3216bd3fd5aba0eebf9ed641309775fb346e20b6f",
+    "docs/ARCHITECTURE.md": "dc0daf0367ebec813d5af560f4540b16366cb0d1ba807ea30fefdf317a3a6e2c",
+    "src/adapters/lms_discovery.rs": "947756e0d9aac992244315fe3f173486ef6989e132e7197593f68ece1090ebc0",
+    "src/adapters/openhome.rs": "63c41eb6d5d66b95b007034748c5e8bcefd5d100ef4a1fb73095500ca4095b32",
+    "tests/fixtures/hqplayer/synthetic-chain-hazard/filters_sdm.xml": "2b36f8e1fd5fbd498207217677a152d069ae048be626397141999e0d8f0e2193",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-pcm-only-dac/modes.xml": "1164f561b83ddca5b8cfdfc6c5c9b4a6282825cc87204e38455ac243ebcf9546",
+    "tests/aggregator_lint.rs": "a1ea015d88d2da322e5485c6fe2b482518a3d5e060c71cdb041f50c4ec00a444",
+    "docs/bus/existing-patterns.md": "ff555f855bec30fa9e8f08550907ccac824fe1df1d3181a90879887154f5eb3b",
+    "src/main.rs": "f2a67595cb0dca0ab941fb2d2bcc310a7026620b278c3743021e991e02a61133",
+    "src/devices/.gitkeep": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "tests/mock_servers/hqplayer/wire.rs": "84ab9eca0dfa2a694dc052f6ac8c37da96331156e09b845dc41e700804bdf8cf",
+    ".github/workflows/api-guard.yml": "a67c3981a38119cf83cbc8ec1e106b61fd25a60dbae9af895a1e437c09326524",
+    "tests/api_contract.rs": "1631d8024c2a8c8023b51f7caee98a0a003de2c4ba3661d4736e21420449a1b2",
+    "lms-plugin/strings.txt": "09dcc6fa0ca71250143b99bef62162238a328746c6fbc380c9ad57ac240371dc",
+    "src/app/pages/settings.rs": "c5397d929168ed8d2def6e2f8b97375e0b8bc2b1b66f4ddcceef49b6b19402bc",
+    "lms-plugin/Settings.pm": "1c6ebd831c1847ac3df161d5dbad04eac45f783241ecb3061fe004ddf4527673",
+    "tests/ignored_send_lint.rs": "e7fb9d66f13eeeb5940d4a4e53d725445b8665326d87ab1e41e7efab19b4d9f4",
+    "src/adapters/handle.rs": "6fda5acf8fd5d3f4d29cda1fb957be067ad40da331229c6e47b1021de10db2e8",
+    "src/components/tabs/component.rs": "36ac709c0bc675003d85eb653df0deb0b3f93f7ac6763d74357a9ccac45253da",
+    "lms-plugin/install.xml": "822024aa513bcf72dfa46610caf148353ed37b0f7b3c1d702ff61133801ddf2e",
+    "tests/spawn_cancellation_lint.rs": "cfe0bd2f9f5fcb84ab6e1acd9673a6876140e743f83c551f768eddf52663ef4c",
+    "src/adapters/mod.rs": "2f4a4a059eb6edd0a9b034fe7e9cbbd1bccb566096974992609fb190505fa5aa",
+    "tests/mock_servers/hqplayer/tier1.rs": "dd5bb6049ab83010e787ee832ee0ada382b53ecd356b5d9beba63d4d6858a467",
+    "src/app/components/form_inputs.rs": "9e2cf731f448caddc2a12c7e505e755a82141d6f2ca88f5a67bbdfeb7ecade9c",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/config_profile_form.html": "7a178364904b03f88d2635de7a2bec404b9d1070ee946fb9c2eadfcd2e7ef260",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/rates_sdm.xml": "fe1c334aabae803212f9a79f3cfa318c55d0749598f65a4b149634ef5c2f5dc3",
+    ".github/workflows/build.yml": "61d9961937386768385c296e354b305dd3b5458eee3960e6974c886189c35516",
+    "PHASE_4_INSTRUCTIONS.md": "7caa220f741a39c06b3a4649e15d3ad3ee32d50a338c117e777808b873b7f40f",
+    "docs/protocol.md": "28f549d3a5748f6cdb4f4ef5be2b7e144a779768a897c947baa2d3aff831a90c",
+    "docs/tasks/phase-1-bus-foundation.md": "ba16ed7687b10f92805f0f8d835c466d54c92f40cade83c273b8d377fe958c5b",
+    ".cargo/config.toml": "c46c85e2bc8db5dc22588eb20346dbf806465302094f7301280c8e61bb0329e7",
+    ".gitignore": "bf658f41133dc9ef7b2a2c0bfd35c49a498cf7f947a014d1355847b1cf2d5bd2",
+    "lms-plugin/Plugin.pm": "9dfbb74b302b389eb5e2e0db25d3ad7f68ebc1ad7d6f7291f5ff0246f4fde793",
+    "src/lib/.gitkeep": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "src/components/navbar/component.rs": "1fba883111b8eea17f8f9caac812ff45dab8cce1e9b57b835a7ff3af3e0cf442",
+    "src/adapters/upnp.rs": "4c9dfc5dbec9948d941ad2f2cebb1bcbda4eb8d9b505fd0c63d6cfde8c55383b",
+    "src/app/components/layout.rs": "f7f11b22460c8f4846bdf9e0097d79d953bf2733f75a79647b8b694ed7780bf5",
+    "lms-plugin/Helper.pm": "9ff213a4242f23c2f1b8df6dd8cf029135d869f0ee94373474b8ff69ce9b317c",
+    "src/app/components/nav.rs": "141ff6d8083adbd3cf3ad76c90020a64050cffea0aa5cb858635b38f1dc2ddc0",
+    "tests/await_in_lock_lint.rs": "c0ebabe2b06dcf4bc105d4e13fb1a8dbab1d485260a5e8303e9f85b8f75df682",
+    "src/mqtt/.gitkeep": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "docs/AGENTS.md": "bcdc87085bceadc325e9ad530305af297b35dd169dd1c688e08d87b240003a9a",
+    "src/mcp/mod.rs": "e83a1bb3379baadeabae3cff763c0caf1da14aacb219049bf9e49b9b21e0ef53",
+    "tests/fixtures/hqplayer/hqpd-5.x-legacy/filters_pcm.xml": "d1463a446733f220b866ea66d72daaaca23f699967b8fa3336a83b242395e298",
+    "Dockerfile.release": "65d87def47ad553fb174384e2cc728b4ebb3915237133f994d718518ef97d68e",
+    "src/api/mod.rs": "25dd6ec6cccf47a25ac6665ab9eb9778749c23a7eb44fcfd4ecf9893cd4257a2",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/getinfo.xml": "74dd24f0955f94d6ce450e6854cc11d93b8fa6bace6d1ffb53ae3e4395f7ee67",
+    "docs/ARCHITECTURE-RECOMMENDATION-B-REJECTED.md": "f991acb055fd9d2993af6949432cd131da70b3decccd40164932458fad25d8ab",
+    "tests/architecture_lint.rs": "14e5ed9371487e2756c03af900283502ea2e88316de38b328ae5aca3a1fc7c50",
+    "tests/mock_servers/lms.rs": "ced27453afe52b44eebb2ccedc17e44bdd5f62cf3026affddb7343a8a24f8a04",
+    "tests/volume_safety.rs": "da92c2a7505bc249f2d2df09bdece742e0dab9639db5c10d7bf253e35bbdb93d",
+    "public/hifi-logo.png": "681b672512a87782b8f58b20d59005f74e87bbd557f9064e0e04be7946861b57",
+    "tests/protocol_integration.rs": "520e7fbcba896869533b6c4bfc49d06afc00f1e6b850e0b2602e6218f4c03a17",
+    "src/knobs/mod.rs": "023b7770adb7f86358268961dad9a696f090d9e2755112c83037c473cdbc22fc",
+    "Dioxus.toml": "63cf4f891a64f3bcc6d03c59b47825ce7e793f9de49d63774708a270ff66a42c",
+    "tests/protocol_schema.rs": "e5ea6c81c2703189b9ba962ba9614fd137fac03d83955b3ff60233dc6ee6e58e",
+    "firmware/.gitkeep": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "plugin/commands/setup.md": "c11c325aff881807a2ed1ecc49ce31a8b3ed13cf3159903f127eaaf9f230a0ad",
+    "HQPLAYER-MULTI-INSTANCE.md": "e640dc30142eaee7f629ed1b370ebdb3a484ce547983b05a41227990b0d70962",
+    "Dockerfile.ci": "19afa1b95a28e4547cf8630aef5881efbe3ff6423365d8f273488adde09aaaaf",
+    "src/adapters/lms.rs": "cbdeb03bad17f1528748c1fae1c7bf1d03a3f2024d89c93b6cd726735c95cff9",
+    "e2e/mobile.spec.ts": "9522735f038755de3b8ad679c317950ca573cd68d7e0dfc0ec131795e05cfe03",
+    "docs/ARCHITECTURE-GAP-ANALYSIS.md": "945ee8453823cc82478c5b13573b1e1394df84e9fa108ebf15b7516a9fbd0650",
+    "src/app/components/error_alert.rs": "aa102a00e51cd442a36500056bbedbfec872a5df2a5d2815d24877bae69664d3",
+    "src/components/navbar/style.css": "e7bc70ae43fed447263dcdc3b77c5248e335d6463b9115dade33a2e2b3ae5930",
+    "mcp/index.js": "bca5d2e8f906b6a8252ac4787f6d680334731713bf9e846443814b1043a70674",
+    "src/app/pages/hqplayer.rs": "c5f5969edc7058a2a9a4ab9b86551ef087d11b7127977f35965f63a06b8bd7ee",
+    "tests/fixtures/hqplayer/hqpd-6.0.4-opal/filters_pcm.xml": "87b58aa5ad5263daa25ec05e61c15f175fe5c17c43fb0cbd0555f5878b063ed9",
+    "src/components/collapsible/component.rs": "7f9676000799b1dab832fae0636c2a444d3ea2abc413f7a5614e213e1331ff8b",
+    "public/dx-components-theme.css": "a1bbe499edc57e170d974e3c43f8ae32e1b5628941a1f5477d8ebfb8045eda15",
+    "tests/client_harness.rs": "38d89b1c227862023f53b340b573c157d1b82577f2f98d50a44c17f79cbcfbc6",
+    "tests/fixtures/api_routes.txt": "b0dbcc2d7e2a702945b589a41c5cad952521284f295650c0c9693b4a954eaf03",
+    "tests/mock_servers/hqplayer.rs": "7e6808d099f03351a3788cbdfeb4a64f5ae5e136dc4b3ebd871862dbad3c1b57",
+    "tests/mock_servers/upnp.rs": "a1e9fd4cd7a6d236f96ed215cf70bf1e107f12068ae52c2ed3033ea5a68dc08b",
+    "docs/lyrion.md": "d6d84cb1f1be4c8f6bab30cda22b7c6d1552d40dc6e31b30bb2c441c1d6f7389",
+    "src/embedded.rs": "77e308875923ae48e67fd6607267d345433c45c691efe1e95fa79ce217dc57d5",
+    "package-lock.json": "25726e86881c672f2b64edfb9c89139a721abdcfcfa3242357f582ccd5a930f3",
+    "public/favicon.ico": "a5f7353db4acec83845d0e6cf7719b2bc127c403d9e5945cd79401f93a08934c"
+  },
+  "last_commit_sha": "f0d465a6034a313c56f7e893e210b78d6b2b57b0",
+  "last_scan": [
+    1785385014,
+    584828000
+  ]
+}
