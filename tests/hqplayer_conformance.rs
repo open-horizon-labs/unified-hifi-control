@@ -1418,10 +1418,11 @@ async fn a_burst_of_unsolicited_frames_is_skipped_without_dropping_the_connectio
     h.stop();
 }
 
-/// `response` bounds a single read, so every skipped document resets it. Without an overall
-/// per-command deadline, a daemon that streams unsolicited `Status` frames and never answers keeps
-/// the command alive for as long as the stream lasts — at a verified 1-2 Hz that is tens of seconds,
-/// far worse than the no-reply case it was supposed to protect.
+/// Previously, `response` bounded a single *read*, so every skipped document reset it: a daemon that
+/// streamed unsolicited `Status` frames and never answered kept the command alive for as long as the
+/// stream lasted — at a verified 1-2 Hz that is tens of seconds, far worse than the plain no-reply
+/// case it was meant to protect. `response` is now a whole-command deadline, and this expectation is
+/// what holds it that way.
 ///
 /// Client expectation: unsolicited traffic cannot extend how long a command waits. Asserted on the
 /// **count** of frames the client consumed, not on elapsed time: bounded by the deadline, that count

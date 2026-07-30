@@ -128,6 +128,16 @@ Accepted costs, with the measured numbers rather than the estimates:
   were relabelled to `derived-*` accordingly. Three fixtures now claim verification — `getinfo`,
   `modes`, `rates_sdm` — and those three are the ones whose content is byte-for-byte from the
   reference.
+- **One command, one deadline.** `HqpTimeouts::response` is a *whole-command* budget, not a per-read
+  one, and that distinction is load-bearing. A per-read timeout resets on every document, so a daemon
+  streaming unsolicited `Status` frames — a verified 1–2 Hz during playback — can keep a reply-less
+  command alive for as long as it keeps pushing. An intermediate revision tried to fix this by
+  raising a skip *count* to a derived 64 and exposing it as `HqpTimeouts::max_unsolicited`; that made
+  the worst case **worse**, roughly 32–64 s against the ~4–8 s it replaced, because counts were never
+  the thing at risk. The public seam therefore stays at four fields, the skip ceiling is a private
+  `MAX_UNSOLICITED_BACKLOG` that exists only as CPU protection, and
+  `continuous_unsolicited_traffic_cannot_extend_the_command_deadline` pins the property by asserting
+  on frames consumed rather than on elapsed time.
 - **The corpus is transcribed, not captured.** Enumeration excerpts preserve the verified
   name/enum-ID pairs and the verified `Set*` anchors, but their list *positions* are excerpt-local and
   say so in their provenance. Closing that gap needs the opt-in real-daemon run, which is recorded as
@@ -217,7 +227,14 @@ Because tier 2 needs hardware nobody should volunteer casually, the honest posit
 ### Also outstanding for stage 3
 
 - Make the unsolicited-document skip count observable, so tier 1 can assert it stays at zero across
-  every command family. Deferred here because its only consumer is that assertion.
+  every command family. Deferred here because its only consumer is that assertion — and note the
+  per-command deadline, not the count, is now what bounds the wait, so this is diagnostics rather
+  than safety.
+- **Track tier 1 as a real follow-up, not a paragraph.** Superego's standing objection is that
+  `derived-*` fixtures will accumulate dependents (#162, #328, #329) while the live verification stays
+  narrated. Opening that issue belongs to the program owner, not to this PR — the issue graph under
+  #310 is maintained deliberately — so it is recorded here as a pre-merge action rather than filed
+  unilaterally.
 - Confirm on GitHub runners, not this sandbox, the three known full-run failures: the two
   deterministic `/hqp/discover` multicast 500s, and the pre-existing ~1-in-10
   `error_handling::lms_fails_gracefully_when_unconfigured` concurrency flake in `adapter_integration`

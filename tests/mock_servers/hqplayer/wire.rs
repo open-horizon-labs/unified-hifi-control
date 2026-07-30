@@ -125,24 +125,10 @@ impl WireStats {
     }
 
     fn record(&self, line: &str) {
-        if let Some(name) = element_name(line) {
+        if let Some(name) = super::corpus::element_name(line) {
             self.elements.lock().expect("wire stats lock").push(name);
         }
     }
-}
-
-/// Element name of a request line such as `<?xml version="1.0"?><State/>`.
-fn element_name(line: &str) -> Option<String> {
-    let mut rest = line.trim();
-    if rest.starts_with("<?") {
-        rest = &rest[rest.find("?>")? + 2..];
-        rest = rest.trim_start();
-    }
-    let rest = rest.strip_prefix('<')?;
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
-        .unwrap_or(rest.len());
-    Some(rest[..end].to_string())
 }
 
 /// Produces the reply document for one request line. `None` means the daemon stayed silent.

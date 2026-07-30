@@ -846,7 +846,7 @@ implementable inside #322's scope and is implemented; the rest are recorded obli
 | # | Modification | Status |
 |---|---|---|
 | 1 | Pin what a verified setter does when another controller intervenes between acknowledgement and readback | **Implemented.** `a_setter_overridden_by_another_controller_fails_and_names_the_observed_value`. The behaviour turned out to be already correct — the setter fails and the error names the daemon's actual value — so no production change was needed. The gap was that it was *unspecified and untested*, which is the one thing a conformance boundary must not leave open. Now a contract, and recorded in ADR 003 |
-| 2 | Make the unsolicited-document skip path observable, and have stage 3 assert the counter stays zero across every command family | **Recorded for stage 3.** Deliberately not added now: it needs production surface whose only consumer would be a stage-3 assertion |
+| 2 | Make the unsolicited-document skip path observable, and have stage 3 assert the counter stays zero across every command family | **Recorded for stage 3**, and its safety rationale is now obsolete: the per-command deadline bounds the wait regardless of the count, so an observable counter is diagnostics rather than protection. Still worth having; still not worth production surface whose only consumer is a stage-3 assertion |
 | 3 | Bind stage 3 to the fidelity close-out — every `derived-excerpt`/`UNVERIFIED` fixture either re-provenanced from a live diff or shipped as a stated gap | **Recorded for stage 3** |
 | 4 | Require every new malformed-input expectation to cite a reference passage or an observed capture | **Recorded as a suite convention** |
 | 5 | Hand the failure-versus-divergence question to #329 in writing | **Recorded in ADR 003 Consequences** |
@@ -877,4 +877,25 @@ tiers that must not be conflated:
 
 The consequence worth stating plainly: the `Set*` anchor claims stay **derived** until someone runs
 tier 2 deliberately. No read-only run, however thorough, can confirm them.
+
+### Correction: the unsolicited-document bound
+
+Recorded because the mistake is instructive and the gate caught it, not me.
+
+Superego flagged the original `MAX_UNSOLICITED_DOCUMENTS = 8` as an unjustified constant outside the
+injectable seam. I "fixed" it by deriving 64 from the daemon's ~1–2 Hz push cadence and exposing it as
+`HqpTimeouts::max_unsolicited`. Codex rejected that, correctly: `response` bounds a single **read**, so
+every skipped document reset it, and a bigger count meant a reply-less command could survive roughly
+32–64 s instead of ~4–8 s. I had reasoned about frame counts while the clock was the thing at risk.
+
+The actual fix is one overall per-command deadline: `send_command_inner` computes it once and gives
+each read only the remainder, so skipping an unsolicited document costs exactly what waiting for a
+wanted one costs. Unsolicited traffic cannot extend a command's wait by construction rather than by
+tuning. The public seam went back to four fields; the skip ceiling is a private
+`MAX_UNSOLICITED_BACKLOG = 256` whose only job is to stop unbounded work, and whose doc comment
+records why the public knob was wrong so nobody re-adds it.
+
+Reproduced at test scale before the fix — `continuous_unsolicited_traffic_cannot_extend_the_command_deadline`
+consumed **133 frames on a 300 ms budget** (~2.7 s), and the suite's own wall time went 0.65 s → 2.89 s.
+Both are back to normal after it.
 

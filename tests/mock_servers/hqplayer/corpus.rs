@@ -245,3 +245,20 @@ pub fn config_attr(document: &str, element: &str, key: &str) -> Option<String> {
     let end = rest.find('>')?;
     attr(&rest[..end], key)
 }
+
+/// Element name of a protocol line such as `<?xml version="1.0"?><SetFilter value="6"/>`.
+///
+/// Lives here, in the document layer, because both [`super::wire`] and [`super::model`] need it and
+/// two copies would drift. The layer separation this boundary rests on is about *responsibility* —
+/// bytes versus documents versus state — not about refusing to share a five-line tokeniser.
+pub fn element_name(line: &str) -> Option<String> {
+    let mut rest = line.trim();
+    if rest.starts_with("<?") {
+        rest = rest[rest.find("?>")? + 2..].trim_start();
+    }
+    let rest = rest.strip_prefix('<')?;
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}

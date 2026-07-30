@@ -585,18 +585,10 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Element name of a request line such as `<?xml version="1.0"?><SetFilter value="6"/>`.
+/// Element name of a request line. Delegates to the document layer so the wire and the model share
+/// one tokeniser rather than keeping two that can drift.
 pub fn request_element(line: &str) -> Option<String> {
-    let mut rest = line.trim();
-    if rest.starts_with("<?") {
-        let end = rest.find("?>")? + 2;
-        rest = rest[end..].trim_start();
-    }
-    let rest = rest.strip_prefix('<')?;
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
-        .unwrap_or(rest.len());
-    Some(rest[..end].to_string())
+    corpus::element_name(line)
 }
 
 /// Read an attribute off a request line. Used by tests to assert what the client sent (AC5).
