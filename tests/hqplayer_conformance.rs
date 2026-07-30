@@ -1935,3 +1935,426 @@ async fn tier1_distinguishes_a_matrix_read_failure_from_no_current_selection() {
     );
     h.stop();
 }
+
+// =============================================================================
+// Tier-1 acceptance: coverage completeness, not just detection capability
+// =============================================================================
+
+/// The meta-fix. Every previous tier-1 test picked one family, mutated it, and proved a divergence
+/// appeared — which validates the mechanism for families that were wired up and is structurally blind
+/// to one that was forgotten. Three scalar families were captured and never compared for exactly that
+/// reason. ADR 003's required list is held as data so the differ is asserted against the spec rather
+/// than against whatever it happens to walk.
+#[tokio::test]
+async fn tier1_checks_every_family_adr_003_requires() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+    let unchecked: Vec<&str> = tier1::REQUIRED_CLAIMS
+        .into_iter()
+        .filter(|claim| !report.checked.contains(*claim))
+        .collect();
+    assert!(
+        unchecked.is_empty(),
+        "ADR 003 requires these claims to be compared and this run did not compare them: \
+         {unchecked:?}. checked={:?}",
+        report.checked
+    );
+    h.stop();
+}
+
+/// "Clean" must not be able to mean "we never looked". A required claim that could not be observed is
+/// an unverified claim, and it has to withhold a merge-gate pass unless it is one of the two
+/// deliberately accepted limits.
+#[tokio::test]
+async fn tier1_withholds_merge_gate_pass_when_a_required_claim_is_unobserved() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let mut blinded = capture.clone();
+    blinded.status_metadata_child = tier1::MetadataChild::Unobserved;
+    blinded.enumerations.remove("junkfilters");
+
+    let report = tier1::diff(&blinded, VERIFIED_PROFILE);
+    assert!(
+        !report.merge_gate_pass() && !report.unverified.is_empty(),
+        "with the metadata child unobserved and the junk-filter family missing, no merge-gate pass \
+         may be reported. pass={} unverified={:?} divergences={}",
+        report.merge_gate_pass(),
+        report.unverified,
+        report.divergences.len()
+    );
+    h.stop();
+}
+
+// --- scalar families: captured but never diffed until now ---
+
+#[tokio::test]
+async fn tier1_reports_divergence_when_state_shape_differs() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let mut mutated = capture.clone();
+    mutated
+        .scalars
+        .get_mut("state")
+        .expect("state captured")
+        .remove("filter_junk");
+    let report = tier1::diff(&mutated, VERIFIED_PROFILE);
+    assert!(
+        report
+            .divergences
+            .iter()
+            .any(|d| d.family == "state" && d.detail.contains("filter_junk")),
+        "a State document missing filter_junk must diverge — the client read that attribute as the \
+         wrong type once already. Got: {:?}",
+        report.divergences
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_reports_divergence_when_status_shape_differs() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let mut mutated = capture.clone();
+    mutated
+        .scalars
+        .get_mut("status")
+        .expect("status captured")
+        .remove("active_filter");
+    let report = tier1::diff(&mutated, VERIFIED_PROFILE);
+    assert!(
+        report
+            .divergences
+            .iter()
+            .any(|d| d.family == "status" && d.detail.contains("active_filter")),
+        "a Status document missing active_filter must diverge. Got: {:?}",
+        report.divergences
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_reports_divergence_when_volume_range_shape_differs() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let mut mutated = capture.clone();
+    mutated
+        .scalars
+        .get_mut("volume_range")
+        .expect("volume_range captured")
+        .remove("enabled");
+    let report = tier1::diff(&mutated, VERIFIED_PROFILE);
+    assert!(
+        report
+            .divergences
+            .iter()
+            .any(|d| d.family == "volume_range" && d.detail.contains("enabled")),
+        "VolumeRange without `enabled` cannot tell a fixed-volume daemon from a variable one, so it \
+         must diverge. Got: {:?}",
+        report.divergences
+    );
+    h.stop();
+}
+
+// --- complete normalized scalar capture ---
+
+#[tokio::test]
+async fn tier1_captures_every_parsed_state_field() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let recorded = capture.scalars.get("state").cloned().unwrap_or_default();
+    let missing: Vec<&str> = [
+        "state",
+        "mode",
+        "filter",
+        "filter1x",
+        "filterNx",
+        "shaper",
+        "rate",
+        "volume",
+        "active_mode",
+        "active_rate",
+        "invert",
+        "convolution",
+        "repeat",
+        "random",
+        "adaptive",
+        "filter_junk",
+        "matrix_profile",
+    ]
+    .into_iter()
+    .filter(|k| !recorded.contains_key(*k))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "every field the client parses out of State must reach the artifact, or a live run cannot be \
+         compared on it; missing {missing:?}"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_captures_every_parsed_status_field() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let recorded = capture.scalars.get("status").cloned().unwrap_or_default();
+    let missing: Vec<&str> = [
+        "state",
+        "track",
+        "track_id",
+        "position",
+        "length",
+        "volume",
+        "active_mode",
+        "active_filter",
+        "active_shaper",
+        "active_rate",
+        "active_bits",
+        "active_channels",
+        "samplerate",
+        "bitrate",
+    ]
+    .into_iter()
+    .filter(|k| !recorded.contains_key(*k))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "every field the client parses out of Status must reach the artifact; missing {missing:?}"
+    );
+    h.stop();
+}
+
+/// The bug class this whole boundary exists to remove, committed inside the boundary itself: presence
+/// was inferred from `samplerate > 0`, so a present child carrying zeros read as no child at all.
+#[tokio::test]
+async fn tier1_distinguishes_a_present_zero_valued_metadata_child_from_absence() {
+    let with_zero_child = Harness::verified().await;
+    with_zero_child.model.external_change(|s| {
+        s.metadata = Some(mock_servers::hqplayer::model::Metadata {
+            artist: "Zero".to_string(),
+            album: String::new(),
+            song: String::new(),
+            samplerate: 0,
+            bits: 0,
+            channels: 0,
+            bitrate: 0,
+        })
+    });
+    let present = tier1::capture(&with_zero_child.adapter)
+        .await
+        .expect("capture with a zero-valued child");
+    with_zero_child.stop();
+
+    let without = Harness::verified().await;
+    without.model.external_change(|s| s.metadata = None);
+    let absent = tier1::capture(&without.adapter)
+        .await
+        .expect("capture with no child");
+    without.stop();
+
+    assert_eq!(
+        (present.status_metadata_child, absent.status_metadata_child),
+        (
+            tier1::MetadataChild::Present,
+            tier1::MetadataChild::Absent
+        ),
+        "a metadata child carrying zeros is still present; inferring presence from a value that has \
+         a legitimate zero is exactly the defect this harness exists to catch"
+    );
+}
+
+// --- filter/shaper wire-shape claims ADR 003 requires ---
+
+#[tokio::test]
+async fn tier1_captures_and_diffs_filter_arg_flags() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    // poly-sinc-ext2 carries arg=1 (apodizing) in the corpus.
+    let shape = capture.entry_shapes.get("filters/poly-sinc-ext2").cloned();
+    assert_eq!(
+        shape.and_then(|s| s.arg),
+        Some(1),
+        "FiltersItem.arg is a flags bitfield ADR 003 requires diffing; it was dropped at the \
+         adapter-to-corpus boundary. entry_shapes keys={:?}",
+        capture.entry_shapes.keys().take(4).collect::<Vec<_>>()
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_captures_and_diffs_filter_description_presence() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let shape = capture.entry_shapes.get("filters/poly-sinc-ext2").cloned();
+    assert_eq!(
+        shape.and_then(|s| s.has_description),
+        Some(true),
+        "`description` is not on FilterItem at all, so its presence can only be observed from the raw \
+         document — and ADR 003 requires it. Calling it verified without looking is the failure mode."
+    );
+    h.stop();
+}
+
+// --- identity, rates, matrix, config read side ---
+
+#[tokio::test]
+async fn tier1_diffs_the_full_getinfo_attribute_contract() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let mut mutated = capture.clone();
+    // `name` and `platform` are instance-specific in value but contractually present.
+    mutated.identity.remove("platform");
+    let report = tier1::diff(&mutated, VERIFIED_PROFILE);
+    assert!(
+        report
+            .divergences
+            .iter()
+            .any(|d| d.family == "getinfo" && d.detail.contains("platform")),
+        "GetInfo's attribute set is part of the contract even where values are instance-specific; a \
+         missing platform must diverge. Got: {:?}",
+        report.divergences
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_reports_a_daemon_only_rate_mapping() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let mut mutated = capture.clone();
+    mutated
+        .enumerations
+        .get_mut("rates")
+        .expect("rates captured")
+        .push(mock_servers::hqplayer::corpus::EnumEntry {
+            index: 99,
+            name: String::new(),
+            enum_id: None,
+            rate: Some(1_536_000),
+        });
+    let report = tier1::diff(&mutated, VERIFIED_PROFILE);
+    assert!(
+        report
+            .divergences
+            .iter()
+            .any(|d| d.family == "rates" && d.detail.contains("99")),
+        "rates had no reverse pass, so a daemon-only index was silently accepted. Got: {:?}",
+        report.divergences
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_requires_rate_index_zero_to_be_auto() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let mut mutated = capture.clone();
+    if let Some(first) = mutated
+        .enumerations
+        .get_mut("rates")
+        .and_then(|r| r.iter_mut().find(|e| e.index == 0))
+    {
+        first.rate = Some(44_100);
+    }
+    let report = tier1::diff(&mutated, VERIFIED_PROFILE);
+    assert!(
+        report
+            .divergences
+            .iter()
+            .any(|d| d.family == "rates" && d.detail.contains("auto")),
+        "index 0 is rate 0 meaning auto/source-based; a daemon reporting otherwise must diverge. \
+         Got: {:?}",
+        report.divergences
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_requires_the_current_matrix_index_and_name_to_match_the_list() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let mut mutated = capture.clone();
+    // Right name, wrong index: membership-by-name alone accepts this.
+    mutated.current_matrix_profile = Some((7, "Default".to_string()));
+    let report = tier1::diff(&mutated, VERIFIED_PROFILE);
+    assert!(
+        report
+            .divergences
+            .iter()
+            .any(|d| d.family.contains("matrix") && d.detail.contains('7')),
+        "MatrixGetProfile reports an index as well as a name, and the pair must match the list. \
+         Got: {:?}",
+        report.divergences
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_diffs_the_config_form_field_names_and_default_structure() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let mut mutated = capture.clone();
+    mutated.config_form = Some(tier1::ConfigFormObs {
+        field_names: ["profile".to_string()].into_iter().collect(),
+        offers_default: false,
+        named_profiles: vec![("Speakers".to_string(), "Speakers".to_string())],
+    });
+    let report = tier1::diff(&mutated, VERIFIED_PROFILE);
+    let details: Vec<&String> = report.divergences.iter().map(|d| &d.detail).collect();
+    assert!(
+        details.iter().any(|d| d.contains("profile_name"))
+            && details.iter().any(|d| d.contains("[default]")),
+        "the read-side contract is the field names and the [default]-versus-named structure, not just \
+         the profile values. Got: {details:?}"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_serializes_config_profile_value_and_title() {
+    let h = Harness::verified().await;
+    let mut capture = tier1::capture(&h.adapter).await.expect("capture");
+    capture.config_profiles = Some(vec![("Speakers".to_string(), "Living room".to_string())]);
+    let json = tier1::diff(&capture, VERIFIED_PROFILE).to_json();
+    let text = json.to_string();
+    assert!(
+        text.contains("Living room"),
+        "HqpProfile.title was discarded; the artifact must carry value and title. Got {text}"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_artifact_excludes_auth_and_hidden_token_material() {
+    let h = Harness::verified().await;
+    let mut capture = tier1::capture(&h.adapter).await.expect("capture");
+    capture.raw_documents.insert(
+        "config_form".to_string(),
+        "<form><input type=\"hidden\" name=\"csrf\" value=\"SEKRET\"/></form>".to_string(),
+    );
+    let text = tier1::diff(&capture, VERIFIED_PROFILE)
+        .to_json()
+        .to_string();
+    assert!(
+        !text.contains("SEKRET") && !text.to_lowercase().contains("csrf"),
+        "hidden-token and auth material must be stripped before anything reaches the artifact. \
+         Got {text}"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_artifact_carries_the_raw_shape_observations_each_diff_used() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let json = tier1::diff(&capture, VERIFIED_PROFILE).to_json();
+    let raw = json.pointer("/capture/raw_documents").cloned();
+    let shapes = json.pointer("/capture/entry_shapes").cloned();
+    assert!(
+        raw.as_ref().and_then(|v| v.as_object()).map(|o| !o.is_empty()) == Some(true)
+            && shapes.as_ref().and_then(|v| v.as_object()).map(|o| !o.is_empty()) == Some(true),
+        "the artifact must carry the evidence the shape diffs actually used, not a reconstruction. \
+         raw={raw:?} shapes={shapes:?}"
+    );
+    h.stop();
+}

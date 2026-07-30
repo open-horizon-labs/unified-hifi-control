@@ -14,13 +14,49 @@
 //! The same code runs hermetically against the fake daemon — that is how the differ itself is tested,
 //! and how a deliberate corpus/daemon mismatch is proven to be detected rather than assumed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use unified_hifi_control::adapters::hqplayer::{framing, HqpAdapter};
 
 use super::corpus::{self, EnumEntry};
+
+/// Whether a `Status` document actually carried its optional self-closing `metadata` child.
+///
+/// Three states, deliberately. An earlier version inferred presence from `samplerate > 0`, which made
+/// a present child carrying zeros indistinguishable from no child at all — the same
+/// infer-a-fact-from-a-legitimate-zero mistake as the original `unwrap_or(0)` volume defect, committed
+/// inside the tool built to catch it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MetadataChild {
+    Present,
+    Absent,
+    /// Never looked at. Distinct from `Absent`, and must never read as a satisfied claim.
+    #[default]
+    Unobserved,
+}
+
+/// Shape facts about an enumeration entry that the semantic types cannot carry.
+///
+/// `FilterItem` has `arg` but no `description`, so `description` presence can only come from the raw
+/// document. ADR 003 requires both, so both are observed rather than assumed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryShape {
+    pub arg: Option<u32>,
+    pub has_description: Option<bool>,
+}
+
+/// The observable read-side contract of the persistent `/config` form.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigFormObs {
+    /// Form field names actually present, e.g. `profile`, `profile_name`.
+    pub field_names: BTreeSet<String>,
+    /// Whether the unnamed base `[default]` option is offered.
+    pub offers_default: bool,
+    /// `(value, title)` for every named profile. Title was previously discarded.
+    pub named_profiles: Vec<(String, String)>,
+}
 
 /// What the daemon said, in the shape the corpus can be compared against.
 #[derive(Debug, Clone, Default)]
@@ -33,11 +69,19 @@ pub struct Capture {
     /// The mode the daemon was already in, as a list index. The enumerations above are its lists.
     pub active_mode_index: u32,
     pub active_mode_name: String,
-    /// Whether a `Status` document carried the optional self-closing `metadata` child.
-    pub status_had_metadata_child: bool,
-    /// Names from the persistent HTTP lane's `/config` profile list. Empty when no credentials were
-    /// supplied — recorded as not-captured rather than as an empty truth.
-    pub config_profiles: Option<Vec<String>>,
+    /// Whether a `Status` document carried the optional self-closing `metadata` child, **observed**
+    /// from the raw document rather than inferred from any value.
+    pub status_metadata_child: MetadataChild,
+    /// Per-family shape facts, keyed `family/name`, for claims the semantic types cannot carry.
+    pub entry_shapes: BTreeMap<String, EntryShape>,
+    /// Sanitized raw documents, per family, as the evidence each shape diff actually used. Host and
+    /// credential material never reach this map.
+    pub raw_documents: BTreeMap<String, String>,
+    /// The `/config` read-side contract, when credentials were supplied.
+    pub config_form: Option<ConfigFormObs>,
+    /// `(value, title)` from the persistent HTTP lane's `/config` profile list. `None` when no
+    /// credentials were supplied — recorded as not-captured rather than as an empty truth.
+    pub config_profiles: Option<Vec<(String, String)>>,
     /// How long each family took to deliver, so `HqpTimeouts::response` can be set from evidence.
     pub latencies: BTreeMap<String, Duration>,
     /// Unsolicited documents the client skipped during the capture.
@@ -87,11 +131,43 @@ pub struct Report {
     pub within_deadline: BTreeMap<String, bool>,
     /// True only when every captured family delivered inside the deadline.
     pub overall_within_deadline: bool,
+    /// Every claim this run actually compared. The point of recording it is that "clean" must not be
+    /// able to mean "never checked" — a family missing from here is an unverified claim, not a pass.
+    pub checked: BTreeSet<String>,
+    /// Required claims that could not be observed and are **not** one of the deliberately accepted
+    /// limits. Any entry here withholds a merge-gate pass.
+    pub unverified: Vec<String>,
 }
+
+/// Every claim ADR 003 requires a tier-1 run to compare. Held as data so a family cannot be forgotten
+/// silently: the differ is asserted against this list, not against whatever it happens to walk.
+pub const REQUIRED_CLAIMS: [&str; 12] = [
+    "getinfo",
+    "state",
+    "status",
+    "status_metadata_child",
+    "volume_range",
+    "modes",
+    "filters",
+    "filters_arg",
+    "shapers",
+    "rates",
+    "junkfilters",
+    "matrix",
+];
+
+/// Claims a read-only run is allowed not to reach, with the reason recorded in the report.
+pub const ACCEPTED_LIMITS: [&str; 2] = ["inactive_mode_lists", "config_read_side_no_credentials"];
 
 impl Report {
     pub fn is_clean(&self) -> bool {
         self.divergences.is_empty()
+    }
+
+    /// A merge-gate pass needs more than an empty divergence list: every required claim must have
+    /// actually been compared. STUB - computed for real in the GREEN commit.
+    pub fn merge_gate_pass(&self) -> bool {
+        true
     }
 
     /// A human-readable summary for the operator running the gate.
@@ -120,10 +196,10 @@ impl Report {
         let _ = writeln!(
             out,
             "  status metadata child: {}",
-            if self.capture.status_had_metadata_child {
-                "present"
-            } else {
-                "absent (no track loaded?)"
+            match self.capture.status_metadata_child {
+                MetadataChild::Present => "present",
+                MetadataChild::Absent => "absent (no track loaded?)",
+                MetadataChild::Unobserved => "UNOBSERVED - not a satisfied claim",
             }
         );
         let _ = writeln!(
@@ -229,7 +305,7 @@ impl Report {
                 "name": self.capture.active_mode_name,
                 "note": "enumerations below are this mode's lists only; the other mode needs SetMode (tier 2)",
             },
-            "status_metadata_child": self.capture.status_had_metadata_child,
+            "status_metadata_child": format!("{:?}", self.capture.status_metadata_child),
             "current_matrix_profile": self.capture.current_matrix_profile
                 .as_ref()
                 .map(|(i, n)| serde_json::json!({ "index": i, "name": n })),
@@ -343,7 +419,9 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
     status_attrs.insert("volume".into(), format!("{}", status.volume_db));
     c.scalars.insert("status".into(), status_attrs);
     // A metadata child is the only way samplerate/bits reach Status, so their presence is the proxy.
-    c.status_had_metadata_child = status.samplerate > 0 || status.active_bits > 0;
+    // Deliberately left Unobserved here: presence is a raw-document fact and is filled by the raw
+    // lane in the GREEN commit. Inferring it from a value was the bug.
+    c.status_metadata_child = MetadataChild::Unobserved;
 
     let t = Instant::now();
     let vr = adapter.get_volume_range().await?;
@@ -490,7 +568,8 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
         match adapter.fetch_profiles().await {
             Ok(profiles) => {
                 timed("config_profiles", t.elapsed(), &mut c);
-                c.config_profiles = Some(profiles.into_iter().map(|p| p.value).collect());
+                c.config_profiles =
+                    Some(profiles.into_iter().map(|p| (p.value, p.title)).collect());
             }
             Err(e) => {
                 c.config_profiles = None;
@@ -653,7 +732,7 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
                 .filter(|n| !n.is_empty() && *n != "[default]" && *n != "Apply")
                 .collect::<Vec<_>>()
             {
-                if !observed.iter().any(|o| o == name) {
+                if !observed.iter().any(|(v, _)| v == name) {
                     report.divergences.push(Divergence {
                         family: "config_profile_form".into(),
                         kind: DivergenceKind::MissingEntry,
