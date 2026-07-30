@@ -3016,14 +3016,13 @@ fn the_framer_recovers_a_closed_root_whose_child_tag_never_terminates() {
     );
 }
 
-/// Records what inspection established rather than what the salvage report implied: UHC's
-/// substring-and-root-scope design is already immune to the hostile *attribute value* class, so no
-/// production change was needed for it. HQPTuner needed `_recover_root` for these because it
+/// UHC's substring-and-root-scope design is already immune to the hostile *attribute value* class,
+/// so no production change was needed for it: the children are never parsed and attribute reads stop
+/// at the root tag's own `>`. The reference implementation needs a recovery path for these because it
 /// XML-parses whole documents; UHC does not.
 ///
-/// **Label: regression-pin.** Never claimed as a client red — it passed before any change in this
-/// amendment. It exists so a future "improvement" that starts parsing children cannot silently
-/// reintroduce a poll-wedging failure.
+/// **Label: regression-pin.** This passed before the amendment and is not a fix. It exists so a future
+/// change that starts parsing children cannot silently reintroduce a poll-wedging failure.
 #[test]
 fn the_framer_already_tolerates_hostile_attribute_values_in_children() {
     for (what, doc) in [
@@ -3405,9 +3404,8 @@ async fn a_chain_change_under_source_can_put_the_daemon_on_an_unrequested_filter
 /// index — it is *two* stored-ID domains, and a converter that takes a bare number without knowing
 /// which attribute produced it cannot be correct for both.
 ///
-/// This is the boundary the amendment's dissent established and the Codex gate confirmed. The
-/// upstream evidence names the persistent **field names** `filter` and `oversampling`; it is not a
-/// `GetFilters` capture. Whether the *live* enum ID also differs between chains is an open question
+/// The upstream evidence names the persistent **field names** `filter` and `oversampling`; it is not
+/// a `GetFilters` capture, and the distinction is load-bearing. Whether the *live* enum ID also differs between chains is an open question
 /// on #341, so this corpus still reports `value="40"` for the name in both live chain lists and this
 /// test deliberately does not resolve 38 against a live list. Renumbering `filters_sdm.xml` on this
 /// evidence would have turned a persistent-lane fact into an unmeasured live-lane claim.
@@ -3648,9 +3646,9 @@ fn every_corpus_fixture_records_the_playback_state_it_was_captured_under() {
 
 /// A bare `&` in an attribute value survives decoding rather than swallowing the text after it.
 ///
-/// **Label: regression-pin.** This passed before the amendment — inspection found the fall-through in
-/// `decode_entities` already handles it, contrary to what the salvage report implied. It is pinned
-/// because nothing covered it, so a future change to entity handling could have removed it silently.
+/// **Label: regression-pin.** This passed before the amendment: `decode_entities`' fall-through
+/// already keeps a bare `&` and advances. Pinned because nothing covered it, so a future change to
+/// entity handling could have removed the property silently.
 #[test]
 fn a_bare_ampersand_in_an_attribute_value_is_preserved() {
     assert_eq!(
@@ -3679,9 +3677,8 @@ fn a_bare_ampersand_in_an_attribute_value_is_preserved() {
 /// requiring it last would cover it, at the cost of the two guarantees above; that trade is worth a
 /// deliberate decision rather than a quiet widening, and it belongs with whoever needs it.
 ///
-/// **Label: stated-limit.** If someone improves recovery, this test fails loudly and they update it
-/// on purpose. Documented in `.oh/issue-322-hqplayer-protocol-conformance.md` under the amendment's
-/// Stage 2 record.
+/// **Label: stated-limit.** If recovery is ever widened, this test fails loudly so the trade is made
+/// on purpose rather than by accident.
 #[test]
 fn root_recovery_does_not_survive_coalescing_and_that_is_a_stated_limit() {
     let hostile_alone = "<Status state=\"2\">\n<metadata song=\"x\"\n</Status>\n";

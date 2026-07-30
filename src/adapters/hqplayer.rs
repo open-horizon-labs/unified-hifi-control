@@ -265,21 +265,15 @@ pub mod framing {
     ///
     /// Attribute reads stay correct either way — [`root_open_tag`] is a quote-aware scan that stops
     /// at the root tag's own `>`, so it never looks at a child.
+    ///
+    /// The root's name comes from [`root_element`] rather than a private scan, so this shares one
+    /// tokeniser with the rest of the module. A self-closing root cannot reach here at all: quick_xml
+    /// reports it as `Event::Empty`, which the loop above answers before any child is read.
     fn root_frame_closed(buf: &str) -> bool {
-        let Some(open) = root_open_tag(buf) else {
-            return false;
-        };
-        // A self-closing root has no separate closing tag and cannot reach here: quick_xml reports
-        // it as `Event::Empty`, which the loop above answers before any child is read.
-        let Some(name) = open
-            .trim_start_matches('<')
-            .split([' ', '\t', '\r', '\n', '>', '/'])
-            .next()
-            .filter(|n| !n.is_empty())
-        else {
-            return false;
-        };
-        buf.trim_end().ends_with(&format!("</{name}>"))
+        match root_element(buf) {
+            Some(name) => buf.trim_end().ends_with(&format!("</{name}>")),
+            None => false,
+        }
     }
 
     /// Skip leading whitespace, XML declarations, comments and processing instructions.
