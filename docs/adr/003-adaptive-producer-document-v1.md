@@ -129,6 +129,28 @@ adapter code — re-coupling surfaces to backends, which is what the epic remove
   `recovery_required` / `divergent` outcomes, multi-revision plan boundaries, the
   `in_range` / `is_grounded` / `not_eq` / `any` operators, and `held` values on producers
   with no settings interface.
+
+  **Rule for the window while it is open (added by #324).** "The window is open" was too
+  loose to govern anything: #324 declared it open and then added to v1 in the same
+  document. What actually governs, stated so the next issue does not have to re-derive it:
+
+  1. An **addition** is permitted when an acceptance criterion of an issue in the #312
+     graph forces it. Nothing else is.
+  2. A **removal** or a semantic change to an existing member is not permitted, window or
+     no window. §8 of the specification is additive-only and a compatibility rule cannot
+     carry a private exception for its own authors.
+  3. Every addition taken under (1) is recorded here with the criterion that forced it.
+
+  Additions taken so far:
+
+  | Addition | Forced by | Issue |
+  |---|---|---|
+  | `ReasonCode::ControlRemoved` | "`IntentIncoherence::UnknownControl` is treated as a distinct, user-visible state … users should see *this control no longer exists*, not the generic *needs producer validation*" | #324 |
+  | `tests/fixtures/adaptive/control_removed_after_advance.json` | "add a fixture and test for a change set whose base predates a control-plane advance that **removed** a targeted control" — and then required by `every_vocabulary_member_has_a_worked_example` once the reason code existed | #324 |
+
+  Neither is free. A canonical fixture path is additive-only per §8, so registering a sixth
+  one narrows the window it was added under. That is the cost of rule (1) and it is why
+  rule (1) is bounded by an acceptance criterion rather than by judgment.
 * Non-Rust consumers get canonical fixtures and normative prose now; a generated JSON
   Schema is owed to the first issue that needs it (#314 or #326).
 * Consumers must handle an `Unrecognized` arm for every vocabulary. That is the cost of
