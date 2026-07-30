@@ -390,6 +390,91 @@ exactly that way. That is now three consecutive rounds in this epic where the de
 record was a lint reporting success on a violation, and the third where external review
 found it before the internal gates did.
 
+## Solution checkpoint: the boundary lints
+**Updated:** 2026-07-30
+
+Raised after the seventh escape from the hand-written scanner in
+`tests/adaptive_publication_lint.rs`. The escapes, in order, each found by an external
+reviewer and each failing in the direction that reports success:
+
+| # | Escape | Found by |
+|---|---|---|
+| 1 | only the nearest `#[derive(` was inspected | CodeRabbit |
+| 2 | an attribute wrapped across lines was cleared by its own continuation line | CodeRabbit |
+| 3 | `use serde::Serialize as EventWire;` — no literal `Serialize` | CodeRabbit |
+| 4 | a crate-local `pub use` re-export — no literal `serde` in the file | CodeRabbit |
+| 5 | `r##"… " … ] …"##` — string mode left at the embedded quote | CodeRabbit |
+| 6 | `pub use` — the boundary rule rejected exactly that one visibility form | Codex |
+| 7 | `'\''` — the char lexer stopped at the escaped apostrophe | Codex |
+| 8 | `#[allow(unused_imports)] use …;` — an attribute is not a statement boundary | Codex |
+
+Eight commits, 1,982 lines, 56 helper functions, and the escape rate was not falling.
+
+### Candidates
+
+| Option | Approach | Trade-off |
+|---|---|---|
+| A | Continue the shared lexer: lex identifier tokens outside comments and literals, as Codex first suggested | Fixes escape 8 and probably 9. Each round has produced a *new* class rather than a repeat, so the fix is another special case in an incrementally hand-written Rust lexer living in a test file |
+| B | Parse with `syn`, inspect the AST | Escapes stop being detected and become unrepresentable. Costs a parse-failure path and knows nothing about names |
+
+### Evaluation
+
+**A — continue scanning.** Solves the stated problem: for the reported instance, yes; for
+the class, no. Cost: low per round, unbounded in aggregate. Second-order: the file had
+become a Rust lexer written by defect report, in a test, maintained by whoever last got
+reviewed. The recurring shape is the argument — *a text scanner approximates a parser, and
+every approximation has a boundary an adversary finds before its author does.*
+
+**B — `syn` AST.** Solves the stated problem: yes, structurally. Cost: one rewrite, zero
+new dependency — `syn = { version = "2", features = ["full", "parsing", "visit"] }` is
+already a direct dev-dependency, and six sibling lints already call `syn::parse_file`
+(`await_in_lock_lint`, `spawn_cancellation_lint`, `ignored_send_lint`, `oneshot_leak_lint`,
+`arbitrary_find_lint`, `unbounded_channel_lint`). Second-order: attributes become a
+`Vec<Attribute>` on the item however they were formatted; `UseTree::Rename` becomes a
+variant rather than a spelling; visibility and attributes become fields of `ItemUse`
+rather than characters preceding it; and lexing raw strings and char literals correctly
+becomes the parser's job by definition. Every one of the eight escapes above is closed by
+the representation rather than by a check.
+
+### Recommendation
+
+**Selected: B.** The ad-hoc lexer is deleted rather than kept alongside — `code_only`,
+`join_wrapped_attributes`, `attributes_in`, `string_literal_end`, `char_literal_end`,
+`starts_a_use_statement`, `imports_in`, `derive_tokens`, `collapse_whitespace`,
+`split_top_level`. Keeping both would claim a joint sufficiency neither has.
+
+The module gates moved to `syn` too: `ItemMod` with structured `Meta`, so
+`any(feature = "server", feature = "web")` is rejected by having no accepting arm rather
+than by a string test for `any(`.
+
+1,982 lines → 887. 34 tests → 17, because the probes became table-driven corpora rather
+than one test per spelling; assertion count rose.
+
+### Contrary case
+
+**`syn` resolves no names.** `use crate::wire::EventWire;` is an import of *something*;
+that it is `serde::Serialize` re-exported lives in another file, and a parser will never
+know. If the guarantee had been "detect serialization", B would fail exactly where A did.
+
+It does not fail, because the guarantee is an **allowlist**: parsing makes enumeration
+exact, and the allowlist decides without needing to know what a name means. That is the
+load-bearing pairing — either alone is insufficient, and the previous rounds failed
+precisely because they tried detection alone.
+
+**Residual, unfixed by either architecture:** items produced by macro *expansion* are
+invisible to a parse of pre-expansion source. Macro *invocations* are visited and their
+token streams checked — exact, because tokens are post-lexing — but a macro assembling an
+`impl` from fragments escapes A and B alike. Recorded rather than papered over.
+
+### Evidence
+
+All eight escapes replayed against the new architecture as source snippets through the
+production helpers, plus four replayed against the real `src/producers/event.rs` with the
+build confirmed clean each time (three fail the allowlists, one fails the derive list).
+Five mutations, each verified to have applied first: stop recursing into `cfg_attr`; widen
+the derive allowlist; drop `UseTree::Rename`; accept `any(...)` as a server gate; swallow
+parse errors. Each is detected.
+
 ## Ship
 **Updated:** 2026-07-30
 **Status:** staged (draft PR, nothing merged, deployed or marked ready)
