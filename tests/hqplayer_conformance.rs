@@ -672,12 +672,26 @@ async fn a_change_made_by_another_controller_is_visible_on_the_next_read() {
     h.stop();
 }
 
+/// Retargeted by the HQPTuner amendment (bite 6). It used to drive `set_mode("99")`, which reaches
+/// the daemon **only** through the numeric-string fallback in `resolve_mode_index` — a fallback
+/// **#347 is going to delete**. So a #322 expectation was quietly depending on production behaviour
+/// another issue must remove, and it would have failed for an unrelated reason when that landed.
+///
+/// It now uses the low-level `set_filter`, which takes an index directly and resolves no name, so the
+/// rejection comes from the daemon rather than from a fallback.
+///
+/// Also renamed for accuracy: `set_mode("99")` sent a *known* element (`SetMode`) with an invalid
+/// value, so this never exercised the model's unknown-*element* arm. That arm is reachable only by
+/// sending an element no adapter method emits, so nothing covers it — recorded rather than papered
+/// over.
 #[tokio::test]
-async fn an_unknown_command_is_reported_as_an_error_without_dropping_the_connection() {
+async fn a_rejected_setter_is_reported_as_an_error_without_dropping_the_connection() {
     let h = Harness::verified().await;
-    // `control` rejects unknown actions locally, so drive an unknown element through a setter the
-    // daemon does not recognise by asking for a mode index the daemon will refuse.
-    let rejected = h.adapter.set_mode("99").await;
+    let beyond_the_list = 9_999;
+
+    // Low-level: takes an index, resolves no name, so this cannot depend on name-resolution
+    // fallbacks in either direction.
+    let rejected = h.adapter.set_filter(beyond_the_list, None).await;
     // The connection must still be usable afterwards.
     let state_after = h.adapter.get_state().await;
 
@@ -3461,4 +3475,185 @@ async fn feeding_the_persistent_oversampling_id_to_the_live_lane_is_rejected() {
          live lane must not silently succeed"
     );
     h.stop();
+}
+
+// -----------------------------------------------------------------------------
+// Bite 6 — the fidelity tail
+// -----------------------------------------------------------------------------
+
+/// Under a configured `[source]` mode the daemon accepts every rate pin and applies none of it.
+/// Verified upstream 2026-07-29 mid-playback, twice, and confirmed on the output (`Status.active_rate`)
+/// as well as on the slot (`State.rate`). Playback is not what blocks it — `[source]` is. What governs
+/// the rate there is a persistent config limit for which **no wire command exists**, so retrying on
+/// the live lane can never succeed.
+///
+/// The nonzero case is caught today by accident of arithmetic: readback compares the requested index
+/// against 0 and they differ, so the client errors. That is a truthful *outcome* reached without any
+/// understanding of the cause, and it is why the message says nothing useful. #347 owns suppressing
+/// the write with an explicit reason.
+///
+/// **Provenance: derived-upstream, tier-2-only, pending #332.**
+///
+/// **Label: regression-pin** for the client half (it passes today) and **model-fidelity** for the
+/// daemon half (the mode-conditional refusal is new fake capability).
+#[tokio::test]
+async fn a_nonzero_rate_pin_under_source_is_accepted_and_ignored() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`
+        s.playback = 2;
+    });
+    h.model.arm(|f| f.source_refuses_rate_pin = true);
+
+    let outcome = h.adapter.set_rate(705600).await;
+
+    let after = h.model.state();
+    assert_eq!(
+        (after.rate_index, after.active_rate_hz),
+        (0, 0),
+        "under `[source]` the pin must be refused on BOTH the slot and the output, which is what the \
+         upstream probes checked and why checking only `State.rate` produced a plausible wrong \
+         answer; got {after:?}"
+    );
+    assert!(
+        h.model.request_count("SetRate") > 0,
+        "the client must actually have sent the pin: this is a daemon-side refusal, not a \
+         client-side suppression. Suppression is #347's"
+    );
+    assert!(
+        outcome.is_err(),
+        "readback happens to catch the nonzero case, because the requested index differs from the \
+         observed 0. That is the floor holding by arithmetic, not by understanding"
+    );
+    h.stop();
+}
+
+/// The narrower form of the same defect, and the one readback **cannot** catch.
+///
+/// A request for Auto (index 0) under `[source]` is ignored exactly like any other, but the readback
+/// compares expected 0 against observed 0 and therefore reports **success** for a command that had no
+/// effect. Equality with pre-existing state is not proof that a setter applied.
+///
+/// Recorded on #347 in comment 5125915480. This test asserts **only** the daemon-side facts and
+/// deliberately does not assert the client's return value: asserting success would encode a known
+/// defect as expected behaviour, and asserting failure would fail until #347 lands. #322's job is to
+/// make the case reachable, which it now is.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn an_auto_rate_request_under_source_is_ignored_and_readback_cannot_tell() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+    });
+    h.model.arm(|f| f.source_refuses_rate_pin = true);
+    let before = h.model.state();
+    assert_eq!(
+        before.rate_index, 0,
+        "precondition: the rate must already be unpinned, which is what makes the readback blind"
+    );
+
+    // Auto is rate 0, which the observed list carries at index 0.
+    let _ = h.adapter.set_rate(0).await;
+
+    let after = h.model.state();
+    assert_eq!(
+        (after.rate_index, after.active_rate_hz),
+        (before.rate_index, before.active_rate_hz),
+        "nothing moved, which is the point: a readback comparing 0 to 0 sees a match and calls an \
+         ignored command applied"
+    );
+    assert!(
+        h.model.request_count("SetRate") > 0,
+        "the request reached the daemon, so this is an ignored write and not an absent one"
+    );
+    h.stop();
+}
+
+/// A DAC that cannot do DSD yields a modes list with **no SDM entry**, and the remaining entries keep
+/// their own indices — `[source]` stays 0, PCM stays 1, nothing is renumbered to close the gap. That
+/// is what makes a hardcoded position dangerous rather than merely wrong: a caller that assumed index
+/// 2 is SDM still finds something on a device that has it, and finds the wrong thing on one that does
+/// not.
+///
+/// The client-side consequence — matching a mode by semantic prefix or alias, so that the daemon's
+/// `"SDM (DSD)"` resolves for a caller who asked for `"DSD"` — is **#347's** acceptance criterion.
+/// #322 supplies the device fixture.
+///
+/// **Provenance: derived-upstream, tier-2-only, pending #332.** **Label: model-fidelity.**
+#[tokio::test]
+async fn a_device_without_dsd_omits_sdm_while_the_remaining_mode_indices_stay_intact() {
+    let h = Harness::start(
+        "hqpd-6.0.4-pcm-only-dac",
+        WirePolicy::default(),
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    let modes = h.adapter.get_modes().await.expect("GetModes");
+    let names: Vec<&str> = modes.iter().map(|m| m.name.as_str()).collect();
+    let indices: Vec<u32> = modes.iter().map(|m| m.index).collect();
+
+    assert_eq!(
+        (names.as_slice(), indices.as_slice()),
+        (["[source]", "PCM"].as_slice(), [0, 1].as_slice()),
+        "SDM is absent and the survivors keep their original indices rather than being renumbered"
+    );
+    assert!(
+        h.adapter.set_mode("SDM (DSD)").await.is_err(),
+        "a mode the device does not offer must not resolve to some other mode's index"
+    );
+    h.stop();
+}
+
+/// Every fixture records the playback state it was captured under.
+///
+/// The upstream evidence base's own caveat is that its probes ran with the engine **stopped**, while
+/// UHC's users are playing — so a behaviour verified idle is not thereby verified under load, and a
+/// corpus that does not record which cannot tell the difference. Most of this corpus is derived from a
+/// protocol reference rather than captured from a session, so most fixtures honestly say `unknown`.
+/// **That most say `unknown` is the finding**, not a gap in the check.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn every_corpus_fixture_records_the_playback_state_it_was_captured_under() {
+    let allowed = ["active", "idle", "unknown"];
+    let mut checked = 0;
+    for profile in corpus::profiles() {
+        for fixture in corpus::all_in(&profile) {
+            assert!(
+                allowed.contains(&fixture.provenance.playback.as_str()),
+                "fixture {}/{} records playback {:?}, which is not one of {allowed:?}",
+                profile,
+                fixture.name,
+                fixture.provenance.playback
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 18,
+        "the whole corpus must be covered, got {checked} fixtures"
+    );
+}
+
+/// A bare `&` in an attribute value survives decoding rather than swallowing the text after it.
+///
+/// **Label: regression-pin.** This passed before the amendment — inspection found the fall-through in
+/// `decode_entities` already handles it, contrary to what the salvage report implied. It is pinned
+/// because nothing covered it, so a future change to entity handling could have removed it silently.
+#[test]
+fn a_bare_ampersand_in_an_attribute_value_is_preserved() {
+    assert_eq!(
+        framing::decode_entities("R & B and Rock &amp; Roll"),
+        "R & B and Rock & Roll",
+        "a bare ampersand is kept verbatim while a real entity beside it still decodes"
+    );
+    assert_eq!(
+        framing::decode_entities("Simon & Garfunkel"),
+        "Simon & Garfunkel",
+        "and a bare ampersand must not consume the words that follow it"
+    );
 }

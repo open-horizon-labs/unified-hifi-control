@@ -4,6 +4,7 @@
     daemon: hqplayerd 6.0.4 (Opal), PCM mode
     status: derived-excerpt
     date: 2026-07-29
+    playback: unknown
     notes: PCM mode dithers. Verified: the PCM list has 10 entries beginning none/NS1/NS4/NS5/NS9/LNS15 and ending TPDF/Gauss1/shaped. Enum IDs are derived, not live-observed.
 -->
 <GetShapers>

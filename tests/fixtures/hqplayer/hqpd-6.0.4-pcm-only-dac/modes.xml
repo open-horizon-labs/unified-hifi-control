@@ -1,0 +1,14 @@
+<!--
+  provenance:
+    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/tests/fake_control.py (device-dependent modes list) and hqptuner/lanes/livemap.py:64-66
+    daemon: hqplayerd 6.0.4 (Opal), attached DAC without DSD capability
+    status: derived-upstream
+    date: 2026-07-29
+    playback: unknown
+    tier: tier-2-only
+    notes: DEVICE-DEPENDENT MODES LIST. A DAC that cannot do DSD yields a modes list with NO SDM entry at all, and the remaining entries keep their own indices - [source] stays 0 and PCM stays 1, they are not renumbered to close the gap. That is what makes a hardcoded position dangerous rather than merely wrong: a caller that assumed index 2 is SDM "still finds something and still gets it wrong" on a device where the list is shorter. Upstream matches mode by NAME PREFIX for exactly this reason, and the daemon reports name="SDM (DSD)" rather than "SDM", so exact-equality matching against "SDM" or "DSD" fails on the device that DOES have it. Semantic prefix/alias matching is #347's acceptance criterion, not this issue's; #322 supplies the fixture. This profile carries only modes.xml - the model falls back to the verified 6.0.4 profile for every other document, so nothing else here is being claimed. Derived from an upstream fake's shape rather than a UHC capture, and tier-2-only because confirming a device-specific list requires that device. Pending UHC hardware qualification in #332.
+-->
+<GetModes>
+<ModesItem index="0" name="[source]" value="-1"/>
+<ModesItem index="1" name="PCM" value="0"/>
+</GetModes>

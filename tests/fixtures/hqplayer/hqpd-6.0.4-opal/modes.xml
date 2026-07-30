@@ -4,6 +4,7 @@
     daemon: hqplayerd 6.0.4 (Opal)
     status: verified
     date: 2026-07-29
+    playback: unknown
     notes: Complete list. Verified live: index 0 = [source] (enum ID -1), 1 = PCM (0), 2 = SDM (1). This is the canonical proof that list index and enum ID are different domains.
 -->
 <GetModes>

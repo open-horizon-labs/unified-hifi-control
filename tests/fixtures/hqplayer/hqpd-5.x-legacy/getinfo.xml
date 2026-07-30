@@ -4,6 +4,7 @@
     daemon: hqplayerd 5.x (unavailable for verification)
     status: UNVERIFIED
     date: 2026-07-29
+    playback: unknown
     notes: DERIVED FROM SOURCES ONLY, NEVER OBSERVED ON A LIVE DAEMON. Exists solely so a version-regression expectation can prove that name-based resolution survives a different list ordering. No assertion may treat this profile as authoritative protocol truth.
 -->
 <GetInfo engine="5.2.30" name="Legacy" platform="Linux" product="Signalyst HQPlayer Desktop" version="5"/>

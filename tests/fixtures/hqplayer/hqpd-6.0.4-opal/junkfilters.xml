@@ -4,6 +4,7 @@
     daemon: hqplayerd 6.0.4 (Opal)
     status: derived
     date: 2026-07-29
+    playback: unknown
     notes: Verified: the wire element is SetJunkFilter (the CLI advertises --set-20kfilter but only accepts --set-junkfilter), and State reports filter_junk as an INT index into this list, not a boolean. Entry names are derived, not live-observed.
 -->
 <GetJunkFilters>

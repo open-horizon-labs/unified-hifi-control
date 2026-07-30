@@ -4,6 +4,7 @@
     daemon: hqplayerd 6.0.4 (Opal), SDM chain
     status: derived-excerpt
     date: 2026-07-29
+    playback: unknown
     tier: tier-2-only
     notes: Representative excerpt of the 77-entry SDM list. Encodes the verified fact that GetFilters returns the CURRENT chain's list only, that the PCM and SDM lists differ wholesale, that indices shift between chains, and that the SDM list has no leading none entry. Positions are excerpt-local. EXTENDED 2026-07-29 for the #322 HQPTuner amendment (bite 4) from 5 to 9 entries, so that a stale PCM index is IN RANGE here and names a DIFFERENT filter: poly-sinc-gauss-long is index 7 in the PCM excerpt and index 1 here, while index 7 here is poly-sinc-lp. That makes a cross-chain stale-cache resolution a silent WRONG SELECTION rather than an out-of-range rejection, which is the hazard worth catching. Every added name and enum ID is reused verbatim from filters_pcm.xml, so no enum ID was renumbered and no new enum-ID claim is made. Whether GetFilters renumbers a name's enum ID between chains is an OPEN QUESTION recorded on issue #341 comment 5125948432; this fixture deliberately does not answer it. The chain-relative ordering is derived-upstream and TIER-2-ONLY: reaching the inactive chain needs SetMode, which mutates, so the read-only tier-1 gate can never promote it. Pending UHC hardware qualification in #332.
 -->

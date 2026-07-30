@@ -4,6 +4,7 @@
     daemon: hqplayerd 6.0.4 (Opal), PCM mode
     status: derived-excerpt
     date: 2026-07-29
+    playback: unknown
     notes: Representative 12-entry excerpt of the 67-entry PCM list. Name-to-enum-ID pairs and the index != enum-ID relationship come from verified evidence; list POSITIONS are excerpt-local and contiguous, so absolute indices are not claimed as live-observed. Verified anchors preserved: SetFilter value=6 selects the entry at INDEX 6 (poly-sinc-lp), not the entry whose enum ID is 6 (poly-sinc-lp-2s, at index 5); and hqplayerd.xml filter=40 is the enum ID of poly-sinc-gauss-long. arg bit 0 = apodizing.
 -->
 <GetFilters>

@@ -4,6 +4,7 @@
     daemon: hqplayerd 6.0.4 (Opal), SDM mode
     status: derived-excerpt
     date: 2026-07-29
+    playback: unknown
     notes: SDM modulators. Verified anchor preserved exactly: SetShaping value=5 selects the entry at INDEX 5 (ASDM5EC), not the entry whose enum ID is 5 (ASDM5, at index 4). Positions are excerpt-local within a 36-entry live list.
 -->
 <GetShapers>

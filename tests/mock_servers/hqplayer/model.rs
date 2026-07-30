@@ -225,6 +225,20 @@ pub struct Faults {
     /// Make `MatrixGetProfile` report a different name than `State.matrix_profile`, so a client can
     /// be tested against a daemon whose two views of the same setting disagree.
     pub matrix_current_override: Option<String>,
+    /// Under a configured `[source]` mode, answer every `SetRate` with `result="OK"` and apply
+    /// nothing, leaving both `State.rate` and `Status.active_rate` where they were.
+    ///
+    /// Distinct from [`Self::accept_but_ignore`], which is unconditional: the refusal here is
+    /// **mode-conditional**, which is the behaviour that was measured, and it is what makes the
+    /// difference between "this setter is deaf" and "this setter is deaf *in this mode*". What
+    /// governs the rate under `[source]` is a persistent config limit for which no wire command
+    /// exists, so no amount of retrying on the live lane can succeed.
+    ///
+    /// Verified upstream 2026-07-29 mid-playback, twice, and confirmed on the output as well as the
+    /// slot. **Provenance: derived-upstream, tier-2-only, pending #332.** Defaults to `false` so no
+    /// existing expectation silently changes meaning; a fixture that wants the behaviour opts in and
+    /// carries the provenance.
+    pub source_refuses_rate_pin: bool,
     pending: Vec<(u32, Change)>,
 }
 
@@ -891,22 +905,31 @@ impl Responder for DaemonModel {
 
             "SetRate" => {
                 let entries = corpus::enum_entries(&inner.enumeration("GetRates"), "RatesItem");
-                match request_u32(request, "value") {
-                    Some(index) if entries.iter().any(|e| e.index == index) => {
-                        let hz = entries
-                            .iter()
-                            .find(|e| e.index == index)
-                            .and_then(|e| e.rate)
-                            .unwrap_or(0);
-                        inner.apply(
-                            "SetRate",
-                            Box::new(move |s| {
-                                s.rate_index = index;
-                                s.active_rate_hz = hz;
-                            }),
-                        )
+                // Mode-conditional deafness, checked before validity: under `[source]` the daemon
+                // answers OK and applies nothing, whatever the requested index. Note that this is
+                // indistinguishable from success by readback whenever the request happens to equal
+                // the current value — Auto/0 against an already-unpinned rate being the case that
+                // matters. #347 owns making that outcome truthful.
+                if inner.faults.source_refuses_rate_pin && inner.state.mode_index == 0 {
+                    inner.ok("SetRate")
+                } else {
+                    match request_u32(request, "value") {
+                        Some(index) if entries.iter().any(|e| e.index == index) => {
+                            let hz = entries
+                                .iter()
+                                .find(|e| e.index == index)
+                                .and_then(|e| e.rate)
+                                .unwrap_or(0);
+                            inner.apply(
+                                "SetRate",
+                                Box::new(move |s| {
+                                    s.rate_index = index;
+                                    s.active_rate_hz = hz;
+                                }),
+                            )
+                        }
+                        _ => inner.error("SetRate", "invalid rate"),
                     }
-                    _ => inner.error("SetRate", "invalid rate"),
                 }
             }
 

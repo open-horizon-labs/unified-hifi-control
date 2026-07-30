@@ -27,6 +27,18 @@ pub struct Provenance {
     pub daemon: String,
     pub status: String,
     pub date: String,
+    /// Playback state at capture: `active`, `idle`, or `unknown`.
+    ///
+    /// Required by the HQPTuner amendment, because every "live, verified" claim in the upstream
+    /// evidence base carries the caveat that its probes ran with the engine **stopped**, while UHC's
+    /// users are playing. A behaviour verified idle is not thereby verified under load, and a corpus
+    /// that does not record which it was cannot tell the difference.
+    ///
+    /// `unknown` is the honest answer for a document derived from a protocol reference rather than
+    /// captured from a session, and most of this corpus is derived. That most fixtures say `unknown`
+    /// is itself the finding: the corpus was built without recording this, which is why the
+    /// acceptance criterion exists.
+    pub playback: String,
     pub notes: String,
 }
 
@@ -86,6 +98,7 @@ fn parse_provenance(raw: &str, path: &Path) -> Provenance {
         daemon: field("daemon"),
         status: field("status"),
         date: field("date"),
+        playback: field("playback"),
         notes: field("notes"),
     }
 }

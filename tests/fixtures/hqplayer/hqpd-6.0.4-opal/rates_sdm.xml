@@ -4,6 +4,7 @@
     daemon: hqplayerd 6.0.4 (Opal), SDM mode
     status: verified
     date: 2026-07-29
+    playback: unknown
     notes: Verified anchor preserved exactly: SetRate value=7 in SDM mode activated 22579200 Hz, which is index 7 here. Verified SDM span 2.8-24.6 MHz.
 -->
 <GetRates>

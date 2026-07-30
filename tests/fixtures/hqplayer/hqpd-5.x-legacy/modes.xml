@@ -4,6 +4,7 @@
     daemon: hqplayerd 5.x (unavailable for verification)
     status: UNVERIFIED
     date: 2026-07-29
+    playback: unknown
     notes: DERIVED FROM SOURCES ONLY. Same three modes as 6.0.4 per the v5.2.30 reference. Not authoritative.
 -->
 <GetModes>

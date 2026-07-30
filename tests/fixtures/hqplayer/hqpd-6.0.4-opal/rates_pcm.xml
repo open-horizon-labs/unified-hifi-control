@@ -4,6 +4,7 @@
     daemon: hqplayerd 6.0.4 (Opal), PCM mode
     status: derived-excerpt
     date: 2026-07-29
+    playback: unknown
     notes: Verified: RatesItem carries index and rate (Hz) only, with NO value attribute, and index 0 is rate=0 meaning auto/source-based. Verified PCM span 44100-768000 Hz.
 -->
 <GetRates>

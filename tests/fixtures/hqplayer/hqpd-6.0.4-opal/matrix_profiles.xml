@@ -4,6 +4,7 @@
     daemon: hqplayerd 6.0.4 (Opal)
     status: derived
     date: 2026-07-29
+    playback: unknown
     notes: Container and child shape match the MatrixListProfiles family. One profile name contains an ampersand so entity handling on the read path is exercised. Profile names are illustrative.
 -->
 <MatrixListProfiles>
