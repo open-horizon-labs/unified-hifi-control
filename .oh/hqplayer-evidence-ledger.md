@@ -629,3 +629,15 @@ check.** Plus one factual ledger error found by a human reviewer. The internal 2
 everything its author thought to break; every one of the five things it missed was found by someone else.
 Anyone reading the mutation table as evidence that the ledger is *correct* is making exactly the mistake
 this ledger exists to prevent — it is evidence about **schema**, and nothing more.
+
+### Independent verification at `6e84172b85cb3458f4abd9d4bf9db885cc71c700`
+
+**Codex, independently of this session:** `cargo test --test hqplayer_ledger_lint` → **23 passed; 0 failed**
+at that exact SHA. **No HQPlayer appliance was contacted.** Recorded as reported to this session, not as
+a run this session performed — the distinction is the same `chain` discipline the ledger applies to every
+other claim.
+
+**Why this note exists at all.** GitHub's `refs/pull/364/head` and PR API stayed at `5c97f6c7…` after the
+`6e84172b…` push while the branch ref had already advanced, so the PR object could not be re-anchored to a
+head it did not yet expose. This append-only note is the smallest truthful commit that retriggers PR
+synchronisation: no amend, no force-push, no empty commit.
