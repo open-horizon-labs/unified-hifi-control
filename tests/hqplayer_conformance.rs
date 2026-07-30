@@ -5013,6 +5013,25 @@ fn corpus_attribute_reads_accept_every_spelling_the_daemon_may_use() {
         Some("HQPlayer"),
         "whitespace around `=` is legal XML"
     );
+
+    // The declaration must not shadow the root element. This is the same mistake the adapter's own
+    // `parse_attr` made before this PR — the declaration's `version="1.0"` was returned for a request
+    // for `version` — so the replacement is pinned against reintroducing it on the corpus side.
+    let declared = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><GetInfo version=\"6.0.4\"/>";
+    assert_eq!(
+        tier1::attr_of(declared, "version").as_deref(),
+        Some("6.0.4"),
+        "the XML declaration must not supply the root element's attribute"
+    );
+
+    // Corpus documents are stored with a provenance comment; `corpus::document` strips it, but the
+    // reader must not depend on that having happened.
+    let commented = "<!-- provenance: x -->\n<GetInfo version=\"6.0.4\"/>";
+    assert_eq!(
+        tier1::attr_of(commented, "version").as_deref(),
+        Some("6.0.4"),
+        "a leading comment must not stop the root element being read"
+    );
 }
 
 /// Resolve one optional port from the environment.
