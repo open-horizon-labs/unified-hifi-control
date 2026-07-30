@@ -3663,39 +3663,112 @@ fn a_bare_ampersand_in_an_attribute_value_is_preserved() {
     );
 }
 
-/// The boundary of bite 1's recovery, made executable so it cannot be forgotten.
+/// A closed-but-malformed `Status` followed by a **coalesced unsolicited `Status`** must still be
+/// recovered. Both halves are documented daemon behaviour — it emits malformed XML inside
+/// `<metadata>`, and it pushes `Status` frames of its own accord — so the combination is not a corner
+/// case, and a client that waits out its deadline on it is broken for the same reason it was broken
+/// on the malformed document alone.
 ///
-/// `root_frame_closed` requires the root's closing tag to be the buffer's **last** token. That is
-/// what keeps a truncated document from being credited with a tag that has not arrived, and what
-/// stops a `</Status>` inside an attribute value passing for a frame end. The cost is that recovery
-/// does **not** survive coalescing: a hostile document followed in the same buffer by one of the
-/// daemon's unsolicited push frames still reads as incomplete, and that command still waits out its
-/// deadline.
+/// The earlier form of this expectation asserted `Incomplete` here and called it a stated limit. That
+/// was encoding a known defect as expected behaviour, which is exactly what this suite claims not to
+/// do.
 ///
-/// That combination is plausible — the daemon does push `Status` frames — so this is a **stated
-/// limit**, not an oversight. Widening the check to find the *first* matching close tag rather than
-/// requiring it last would cover it, at the cost of the two guarantees above; that trade is worth a
-/// deliberate decision rather than a quiet widening, and it belongs with whoever needs it.
+/// Recovery finds the **first root-frame boundary it can defend**, and the defences are kept:
+/// a `</Status>` literal inside an attribute value is not a boundary, a truncated document is still
+/// incomplete, and a mismatched root is still malformed.
 ///
-/// **Label: stated-limit.** If recovery is ever widened, this test fails loudly so the trade is made
-/// on purpose rather than by accident.
+/// **Label: client-conformance.**
 #[test]
-fn root_recovery_does_not_survive_coalescing_and_that_is_a_stated_limit() {
+fn a_closed_malformed_root_is_recovered_even_with_a_coalesced_push_frame() {
     let hostile_alone = "<Status state=\"2\">\n<metadata song=\"x\"\n</Status>\n";
     assert_eq!(
         framing::classify(hostile_alone),
         framing::Framing::Complete,
-        "a hostile document arriving alone is recovered — trailing whitespace is trimmed"
+        "a hostile document arriving alone is recovered"
     );
 
     let hostile_then_push =
         "<Status state=\"2\">\n<metadata song=\"x\"\n</Status>\n<Status state=\"1\"/>\n";
     assert_eq!(
         framing::classify(hostile_then_push),
-        framing::Framing::Incomplete,
-        "but a hostile document coalesced with a following push frame is NOT recovered, because the \
-         root's closing tag is no longer the buffer's last token. Stated limit, not an oversight: \
-         widening the check would give up the truncation and attribute-value guarantees that the \
-         last-token rule buys"
+        framing::Framing::Complete,
+        "and so is the same document with one of the daemon's push frames coalesced behind it: both \
+         halves are documented behaviour, so waiting out the deadline here would be a defect rather \
+         than a limit"
     );
+
+    // Defences that the first-defensible-boundary rule must not give up.
+    assert_eq!(
+        framing::classify("<Status note=\"</Status>\""),
+        framing::Framing::Incomplete,
+        "a closing-tag literal inside an attribute value is data, not a frame boundary"
+    );
+    assert_eq!(
+        framing::classify("<Status state=\"2\">\n<metadata song=\"x\"\n"),
+        framing::Framing::Incomplete,
+        "a document truncated before its root close is still incomplete"
+    );
+    assert_eq!(
+        framing::classify("<State state=\"2\"></Status>"),
+        framing::Framing::Malformed,
+        "a mismatched root is still malformed"
+    );
+    assert_eq!(
+        framing::classify("</Status>"),
+        framing::Framing::Malformed,
+        "a leftover closing tag is still malformed"
+    );
+}
+
+/// A **newline-free** oversized reply. The cap must be a bound on what is *allocated*, not merely on
+/// what is *retained*.
+///
+/// A line-oriented reader cannot defend against this shape: `read_line` grows its target until it
+/// finds a `\n` or the peer closes, so a ceiling checked after the read has already allocated
+/// whatever the daemon chose to send. The previous implementation documented its peak as "the cap
+/// plus one line" as though naming the hole closed it; one line is unbounded.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn a_newline_free_oversized_reply_is_refused_before_it_is_allocated() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            oversized_newline_free_for_element: Some(("GetFilters".to_string(), 6 * 1024 * 1024)),
+            ..WirePolicy::default()
+        },
+        HqpTimeouts {
+            // Generous on purpose: a timeout here would mean the ceiling never ran.
+            response: Duration::from_secs(4),
+            max_attempts: 1,
+            ..fast_timeouts()
+        },
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    let err = h
+        .adapter
+        .get_filters()
+        .await
+        .expect_err("a reply with no newline must still be refused");
+    let message = err.to_string();
+
+    assert!(
+        message.contains("exceeded") && message.contains("bytes"),
+        "the failure must name the byte ceiling. A timeout instead would mean the reader waited for a \
+         newline that never came while accumulating without limit. Got: {message}"
+    );
+    assert!(
+        h.server.oversized_fired(),
+        "the newline-free reply must actually have been served"
+    );
+
+    let state = h
+        .adapter
+        .get_state()
+        .await
+        .expect("the connection must be usable again after the refusal");
+    assert_eq!(state.state, 0, "and it must read the daemon, not leftovers");
+    h.stop();
 }

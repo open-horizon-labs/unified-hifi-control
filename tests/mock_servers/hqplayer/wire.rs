@@ -79,6 +79,16 @@ pub struct WirePolicy {
     /// Fires **once** per server so a test can prove the *next* command still works, which is the
     /// recovery half of the requirement.
     pub oversized_for_element: Option<(String, usize)>,
+    /// `(element, at_least_bytes)` — like [`Self::oversized_for_element`], but **without a single
+    /// newline anywhere**.
+    ///
+    /// This is the shape a line-oriented reader cannot defend against. `read_line` grows its target
+    /// `String` until it finds a `\n` or the peer closes, so a check performed *after* the read has
+    /// already allocated whatever the daemon chose to send. A cap that runs post-read is a bound on
+    /// what is *retained*, not on what is *allocated*, and those are different guarantees.
+    ///
+    /// Fires once per server, so a test can prove the next command recovers.
+    pub oversized_newline_free_for_element: Option<(String, usize)>,
     /// `(element, extra_document)` — after replying to that element, append a second, unsolicited
     /// document to the **same TCP write**, so both land in the client's receive buffer together.
     ///
@@ -98,6 +108,7 @@ impl Default for WirePolicy {
             silent_for_element: None,
             malformed_for_element: None,
             oversized_for_element: None,
+            oversized_newline_free_for_element: None,
             coalesce_extra_for_element: None,
             unsolicited_stream_for_element: None,
         }
@@ -184,7 +195,8 @@ impl WireServer {
         // The oversized fault, in contrast, is armed by declaring it in the policy: it answers a
         // named element rather than "whatever comes next", so it cannot disturb connection setup.
         let oversized_left = Arc::new(AtomicU32::new(u32::from(
-            policy.oversized_for_element.is_some(),
+            policy.oversized_for_element.is_some()
+                || policy.oversized_newline_free_for_element.is_some(),
         )));
 
         let accept_stats = stats.clone();
@@ -324,6 +336,38 @@ async fn serve_connection(
                     tokio::time::sleep(interval).await;
                 }
                 return;
+            }
+        }
+
+        if let Some((ref element, at_least)) = policy.oversized_newline_free_for_element {
+            if mentions(&line, element)
+                && oversized_left
+                    .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                // One unbroken run of bytes with no newline and no document end. A reader that waits
+                // for a newline before checking any ceiling has already allocated all of it.
+                let filler = "x".repeat(64 * 1024);
+                let mut written = 0usize;
+                if writer
+                    .write_all(b"<?xml version=\"1.0\"?><GetFilters junk=\"")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                while written < at_least {
+                    if writer.write_all(filler.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    written += filler.len();
+                }
+                if writer.flush().await.is_err() {
+                    return;
+                }
+                stats.replies.fetch_add(1, Ordering::SeqCst);
+                // No newline, no closing quote, no closing tag, connection left open.
+                continue;
             }
         }
 
