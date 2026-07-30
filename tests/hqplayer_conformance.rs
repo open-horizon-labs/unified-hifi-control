@@ -4324,3 +4324,228 @@ async fn a_fragmented_follower_suffix_cannot_override_the_next_reply() {
     );
     h.stop();
 }
+
+/// Same fragmentation, but the next command asks for a **different** element.
+///
+/// The previous case relied on the orphan and the reply sharing a root name, which is what made the
+/// corruption invisible. A different-name reply is the other half: the orphan must not be mistaken for
+/// this reply, and its attributes must not reach it either. `VolumeRange` shares no attribute with
+/// `Status` except by accident, so the check is that the range is the daemon's own.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn a_fragmented_follower_suffix_cannot_pollute_a_different_next_reply() {
+    const PUSH: &str = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<Status state=\"2\" volume=\"-1\" min=\"-99\" max=\"99\"/>"
+    );
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            chunking: Chunking::AfterMarker("<Status".to_string()),
+            coalesce_extra_for_element: Some(("State".to_string(), PUSH.to_string())),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    h.adapter
+        .get_state()
+        .await
+        .expect("State leaves a fragment");
+    let range = h
+        .adapter
+        .get_volume_range()
+        .await
+        .expect("VolumeRange after the fragment");
+
+    assert_eq!(
+        (range.min, range.max),
+        (-60, 0),
+        "the orphaned fragment carries min/max of its own; a different-element reply must still \
+         report the daemon's range. Got {range:?}"
+    );
+    h.stop();
+}
+
+/// A **partial** follower is not a skipped document until it finishes, and the command that finishes
+/// it is the one that counts it.
+///
+/// Attribution matters because the skip counter is what tier 1 reports as evidence about the daemon's
+/// push behaviour. Counting a fragment when it is first glimpsed would double-count it; never counting
+/// it would hide it.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn a_partial_follower_is_counted_by_the_command_that_completes_it() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            chunking: Chunking::AfterMarker("<Status".to_string()),
+            coalesce_extra_for_element: Some(("State".to_string(), PUSH_STATUS_FRAME.to_string())),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    h.adapter.get_state().await.expect("first State");
+    let after_first = h.adapter.unsolicited_skipped().await;
+    h.adapter.get_state().await.expect("second State");
+    let after_second = h.adapter.unsolicited_skipped().await;
+
+    assert!(
+        after_second > after_first,
+        "the follower that was only a prefix during the first command must be counted once it \
+         completes during the second; got {after_first} then {after_second}"
+    );
+    h.stop();
+}
+
+/// A carried fragment holding **multi-byte UTF-8** must survive byte-exact.
+///
+/// The carry is raw bytes, and the accumulation loop classifies only the longest valid UTF-8 prefix so
+/// a character split across reads is excluded from that attempt rather than mangled. If the carry were
+/// stored lossily, a split multi-byte sequence would come back as replacement characters and the
+/// follower would never parse — turning a recoverable fragment into a permanent desync.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn a_carried_fragment_preserves_multi_byte_characters() {
+    // A follower whose attribute holds characters outside ASCII, split immediately after its root
+    // name so the multi-byte bytes land in the carry.
+    const PUSH: &str = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<Status state=\"2\" track_id=\"Björk — Vespertine ☃\"/>"
+    );
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            chunking: Chunking::AfterMarker("<Status".to_string()),
+            coalesce_extra_for_element: Some(("State".to_string(), PUSH.to_string())),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    h.model.external_change(|s| s.playback = 1);
+
+    h.adapter.get_state().await.expect("first State");
+    let state = h.adapter.get_state().await.expect("second State");
+
+    assert_eq!(
+        (state.state, state.volume),
+        (1, -24),
+        "the carried fragment must complete and be skipped rather than corrupting this reply; a \
+         lossy carry would leave it unparseable forever. Got {state:?}"
+    );
+    // And the follower was recognised as a document, not discarded as junk.
+    assert!(
+        h.adapter.unsolicited_skipped().await > 0,
+        "the multi-byte follower must be counted as a skipped document"
+    );
+    h.stop();
+}
+
+/// A reconnect must not inherit the previous socket's unread bytes.
+///
+/// The carry lives on the connection rather than the adapter precisely so this holds by construction:
+/// a new socket starts with an empty carry.
+///
+/// Verified to **pass against the pre-fix code too**, and recorded as such rather than presented as a
+/// fourth defect proof — before the carry existed there was nothing to inherit. Its value is forward:
+/// it fails the moment someone hoists the field onto the adapter for convenience, which is exactly how
+/// "by construction" stops being true.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn a_reconnect_starts_with_no_carried_bytes() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            chunking: Chunking::AfterMarker("<Status".to_string()),
+            coalesce_extra_for_element: Some(("State".to_string(), PUSH_STATUS_FRAME.to_string())),
+            disruption: Disruption::DropNextReplyOnce,
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    h.model.external_change(|s| s.playback = 1);
+
+    // Leaves a follower fragment carried on this connection.
+    h.adapter.get_state().await.expect("first State");
+    // Now force the connection away mid-command; the retry reconnects onto a fresh socket.
+    h.server.arm_disruption();
+    let state = h
+        .adapter
+        .get_state()
+        .await
+        .expect("the command recovers by reconnecting");
+
+    assert_eq!(
+        (state.state, state.volume),
+        (1, -24),
+        "a reply read on a fresh socket must be the reply, not something assembled from the dead \
+         connection's leftovers. Got {state:?}"
+    );
+    assert!(
+        h.server.stats().connections() >= 2,
+        "precondition: the disruption must actually have forced a reconnect"
+    );
+    h.stop();
+}
+
+/// The second layer: an attribute lookup with no identifiable root element reports **nothing** rather
+/// than searching the whole string.
+///
+/// This is the mechanism that turned a stray fragment into silent corruption. `root_element` found the
+/// expected root further along, so the reply passed every structural check, while the attribute came
+/// from the orphan because a whole-string scan finds whatever appears first. The framing fix stops the
+/// orphan forming; this stops an orphan mattering if one ever does.
+///
+/// `None` is the honest answer, and every caller already treats it as "not present" rather than
+/// assuming a value. Both legitimate input shapes keep working: a returned reply is exactly one
+/// document, and `parse_items` hands over one element at a time.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn an_attribute_lookup_without_a_root_element_reports_nothing() {
+    let h = Harness::verified().await;
+
+    // A reply preceded by an orphaned fragment carrying a conflicting `volume`. Served as a raw
+    // malformed body so the shape is exact rather than incidental.
+    let orphan_then_reply = concat!(
+        " state=\"2\" volume=\"-1\"/>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<State state=\"1\" volume=\"-23.5\" mode=\"1\"/>"
+    );
+    h.stop();
+
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            malformed_for_element: Some(("State".to_string(), orphan_then_reply.to_string())),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    // Whatever the client concludes, it must not be the orphan's volume. Either it rejects the buffer
+    // or it reads the real document — both are defensible; taking -1 is not.
+    match h.adapter.get_state().await {
+        Ok(state) => assert_ne!(
+            state.volume, -1,
+            "a leading orphan must never supply an attribute; got {state:?}"
+        ),
+        Err(_) => {} // Refusing the buffer outright is also correct.
+    }
+    h.stop();
+}

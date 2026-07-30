@@ -172,7 +172,7 @@ pub mod framing {
     /// without a socket.
     pub fn classify(buf: &str) -> Framing {
         match scan(buf) {
-            Scan::Complete(_) => Framing::Complete,
+            Scan::Complete { .. } => Framing::Complete,
             Scan::Incomplete => Framing::Incomplete,
             Scan::Malformed => Framing::Malformed,
         }
@@ -185,8 +185,19 @@ pub mod framing {
     /// behind it: discarding the whole buffer would throw away a reply that had already arrived in the
     /// same read.
     pub fn first_document_end(buf: &str) -> Option<usize> {
+        first_document_span(buf).map(|(_, end)| end)
+    }
+
+    /// Byte range of the **first** complete document in `buf`, as `(start, end)`.
+    ///
+    /// `start` is where the document's own prologue or root begins, so any leading bytes belonging to
+    /// nothing — the tail of a fragment, say — are outside the span. Returning the span rather than
+    /// only the end is what lets a caller hand back *exactly* the document it selected instead of the
+    /// document plus whatever preceded it: attribute lookups scope to a root open tag, and a scope
+    /// that cannot start is a scope that falls back to searching everything.
+    pub fn first_document_span(buf: &str) -> Option<(usize, usize)> {
         match scan(buf) {
-            Scan::Complete(end) => Some(end),
+            Scan::Complete { start, end } => Some((start, end)),
             _ => None,
         }
     }
@@ -194,8 +205,11 @@ pub mod framing {
     /// Outcome of one framing walk. [`classify`] and [`first_document_end`] are both projections of
     /// it, so there is one traversal to keep correct rather than two that can disagree.
     enum Scan {
-        /// A document ended at this byte offset.
-        Complete(usize),
+        /// A document occupied this byte range. `start` excludes anything that preceded its prologue.
+        Complete {
+            start: usize,
+            end: usize,
+        },
         Incomplete,
         Malformed,
     }
@@ -218,10 +232,16 @@ pub mod framing {
         let mut reader = Reader::from_str(buf);
         reader.config_mut().check_end_names = false;
         let mut open: Vec<String> = Vec::new();
+        // Where this document begins. Set at the first structurally significant event — a
+        // declaration, or the root's own tag — so leading text that belongs to no document is left
+        // outside the span.
+        let mut start: Option<usize> = None;
 
         loop {
+            let before = reader.buffer_position() as usize;
             match reader.read_event() {
                 Ok(Event::Start(e)) => {
+                    start.get_or_insert(before);
                     open.push(String::from_utf8_lossy(e.name().as_ref()).into_owned());
                 }
                 Ok(Event::End(e)) => {
@@ -237,14 +257,21 @@ pub mod framing {
                         // previous read truncated. Never a valid document on its own.
                         None => return Scan::Malformed,
                         Some(_) if open.is_empty() => {
-                            return Scan::Complete(reader.buffer_position() as usize)
+                            return Scan::Complete {
+                                start: start.unwrap_or(0),
+                                end: reader.buffer_position() as usize,
+                            }
                         }
                         Some(_) => {}
                     }
                 }
                 Ok(Event::Empty(_)) => {
+                    let at = *start.get_or_insert(before);
                     if open.is_empty() {
-                        return Scan::Complete(reader.buffer_position() as usize);
+                        return Scan::Complete {
+                            start: at,
+                            end: reader.buffer_position() as usize,
+                        };
                     }
                 }
                 // Ran out of bytes, or hit a token quick_xml cannot read. Normally that means more is
@@ -252,11 +279,18 @@ pub mod framing {
                 // and only the children are unreadable. See `root_frame_end`.
                 Ok(Event::Eof) | Err(_) => {
                     return match root_frame_end(buf) {
-                        Some(end) => Scan::Complete(end),
+                        Some(end) => Scan::Complete {
+                            start: start.unwrap_or(0),
+                            end,
+                        },
                         None => Scan::Incomplete,
                     }
                 }
-                // Declaration, text, comments and processing instructions carry no framing weight.
+                // A declaration opens a document even though it carries no framing weight itself.
+                Ok(Event::Decl(_)) => {
+                    start.get_or_insert(before);
+                }
+                // Text, comments and processing instructions carry no framing weight.
                 Ok(_) => {}
             }
         }
@@ -779,6 +813,19 @@ pub struct HqpConnectionStatus {
 struct HqpConnection {
     stream: BufReader<tokio::net::tcp::OwnedReadHalf>,
     write_half: tokio::net::tcp::OwnedWriteHalf,
+    /// Bytes read from the socket that belong to no completed reply yet — everything after the
+    /// document `send_command_inner` returned.
+    ///
+    /// Without this, a read carrying a reply plus only the **prefix** of a coalesced unsolicited
+    /// frame discarded that prefix while its suffix stayed in the socket, and the next command
+    /// concatenated the orphan with its own reply. A shared attribute in the push then overrode the
+    /// real one silently, because the reply's root still matched what was expected.
+    ///
+    /// Keeping the prefix means the follower completes on a later read and is recognised and skipped
+    /// as the document it is, so the orphan never forms. Bounded by construction: this is always a
+    /// suffix of an accumulation already capped at [`MAX_RESPONSE_BYTES`], and it lives on the
+    /// connection, so a reconnect starts empty and cannot inherit another socket's bytes.
+    carry: Vec<u8>,
 }
 
 /// Profile info from web UI
@@ -1074,6 +1121,7 @@ impl HqpAdapter {
             *conn = Some(HqpConnection {
                 stream: reader,
                 write_half,
+                carry: Vec::new(),
             });
         }
 
@@ -1324,7 +1372,10 @@ impl HqpAdapter {
         // is **allocated** and not merely on what is retained. An earlier revision read whole lines
         // and checked afterwards, which bounds nothing: `read_line` grows its target until it finds a
         // newline or the peer closes, so one newline-free line is unbounded however small the cap.
-        let mut raw: Vec<u8> = Vec::new();
+        // Seeded with whatever the previous command read but did not consume, so a follower split
+        // across reads keeps its prefix and completes here instead of being orphaned. The cap below
+        // counts these bytes because they are already in `raw`.
+        let mut raw: Vec<u8> = std::mem::take(&mut conn.carry);
         let mut chunk = [0u8; RESPONSE_READ_CHUNK];
         let mut complete = false;
         let mut skipped = 0u32;
@@ -1338,45 +1389,53 @@ impl HqpAdapter {
         // straight back to the socket blocks on bytes that may already be in hand — one read can carry
         // an unsolicited push frame *and* the reply behind it, since the daemon emits those frames of
         // its own accord.
+        // The carry may already hold a complete document, so drain before reading. `first_pass`
+        // enters the inner loop once without a socket read; every later entry follows a read.
+        let mut first_pass = !raw.is_empty();
+
         'reading: while !complete {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(anyhow!("Response timeout"));
-            }
+            if first_pass {
+                first_pass = false;
+            } else {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(anyhow!("Response timeout"));
+                }
 
-            let read_result = timeout(remaining, conn.stream.read(&mut chunk)).await;
+                let read_result = timeout(remaining, conn.stream.read(&mut chunk)).await;
 
-            let n = match read_result {
-                Ok(Ok(0)) => break, // EOF
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => return Err(anyhow!("Read error: {}", e)),
-                Err(_) => return Err(anyhow!("Response timeout")),
-            };
+                let n = match read_result {
+                    Ok(Ok(0)) => break, // EOF
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return Err(anyhow!("Read error: {}", e)),
+                    Err(_) => return Err(anyhow!("Response timeout")),
+                };
 
-            // Checked **before** the append, against a fixed-size chunk that has already landed on
-            // the stack. Nothing unbounded is ever allocated. Returning an error is enough to
-            // recover: `send_command`'s wrapper marks the connection disconnected on any inner
-            // failure, so the next command reconnects onto a clean stream rather than reading this
-            // reply's tail.
-            if raw.len() + n > MAX_RESPONSE_BYTES {
-                return Err(anyhow!(
-                    "Response exceeded {} bytes awaiting a {} reply; discarding the \
+                // Checked **before** the append, against a fixed-size chunk that has already landed on
+                // the stack. Nothing unbounded is ever allocated. Returning an error is enough to
+                // recover: `send_command`'s wrapper marks the connection disconnected on any inner
+                // failure, so the next command reconnects onto a clean stream rather than reading this
+                // reply's tail.
+                if raw.len() + n > MAX_RESPONSE_BYTES {
+                    return Err(anyhow!(
+                        "Response exceeded {} bytes awaiting a {} reply; discarding the \
                      connection rather than accumulating further",
-                    MAX_RESPONSE_BYTES,
-                    expected_element.unwrap_or_default()
-                ));
-            }
-            let fresh = &chunk[..n];
-            raw.extend_from_slice(fresh);
+                        MAX_RESPONSE_BYTES,
+                        expected_element.unwrap_or_default()
+                    ));
+                }
+                let fresh = &chunk[..n];
+                raw.extend_from_slice(fresh);
 
-            // A newline is a **hint**, not a frame: documents are newline-terminated but may contain
-            // internal newlines. Attempting to frame only when one arrives keeps the classification
-            // frequency at roughly once per document, as it was when this loop read whole lines.
-            // Classifying on every chunk instead would re-parse the whole accumulated buffer per
-            // chunk, which is quadratic in a large reply. A reply with no newline at all never frames
-            // — and is exactly what the ceiling above stops.
-            if !fresh.contains(&b'\n') {
-                continue 'reading;
+                // A newline is a **hint**, not a frame: documents are newline-terminated but may contain
+                // internal newlines. Attempting to frame only when one arrives keeps the classification
+                // frequency at roughly once per document, as it was when this loop read whole lines.
+                // Classifying on every chunk instead would re-parse the whole accumulated buffer per
+                // chunk, which is quadratic in a large reply. A reply with no newline at all never frames
+                // — and is exactly what the ceiling above stops.
+                if !fresh.contains(&b'\n') {
+                    continue 'reading;
+                }
             }
 
             // Drain every document the buffer already holds before reading again.
@@ -1445,9 +1504,19 @@ impl HqpAdapter {
                         // unsolicited follower: count it and drop it here rather than leaving it in
                         // the stream, where it is the right *element* for a later command of the same
                         // name and could be handed over as that command's reply.
-                        if let Some(end) = framing::first_document_end(response) {
-                            let mut rest = &response[end..];
-                            while let Some(next) = framing::first_document_end(rest) {
+                        // Hand back **only** this document, and keep everything after it for the next
+                        // command. Truncating at the end alone was not enough: anything before the
+                        // document travelled with it, and an attribute scope that cannot start falls
+                        // back to searching the whole string, so a stray leading fragment could win.
+                        //
+                        // Complete followers behind it are counted here and dropped. A *partial*
+                        // follower is deliberately NOT counted yet — it is not a document until it
+                        // finishes, and the command that finishes it counts it.
+                        if let Some((start, end)) = framing::first_document_span(response) {
+                            let mut cursor = end;
+                            while let Some((_, next)) =
+                                framing::first_document_span(&response[cursor..])
+                            {
                                 skipped += 1;
                                 self.unsolicited_skipped
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1456,9 +1525,11 @@ impl HqpAdapter {
                                      reply",
                                     expected_element
                                 );
-                                rest = &rest[next..];
+                                cursor += next;
                             }
-                            raw.truncate(end);
+                            conn.carry = raw[cursor..].to_vec();
+                            raw.drain(..start);
+                            raw.truncate(end - start);
                         }
                         complete = true;
                         break;
@@ -1555,7 +1626,16 @@ impl HqpAdapter {
     /// preference to the root's own. The leading space still guards against matching a longer
     /// attribute name's suffix, e.g. `mode` inside `active_mode`.
     fn parse_attr(xml: &str, attr: &str) -> Option<String> {
-        let scope = framing::root_open_tag(xml).unwrap_or(xml);
+        // No fallback to scanning the whole string. A scope that cannot start is the mechanism that
+        // turned a stray leading fragment into silent corruption: `root_element` found the expected
+        // root further along, so the reply looked legitimate, while the attribute came from the
+        // orphan because it appeared first. Absent an identifiable root element there is no
+        // attribute to report, and `None` is the honest answer — every caller already treats it as
+        // "not present" rather than assuming a value.
+        //
+        // Both legitimate input shapes satisfy this: `send_command_inner` returns exactly one
+        // document, and `parse_items` hands over one element at a time.
+        let scope = framing::root_open_tag(xml)?;
         let pattern = format!(" {}=\"", attr);
         let start = scope.find(&pattern)? + pattern.len();
         let rest = &scope[start..];
