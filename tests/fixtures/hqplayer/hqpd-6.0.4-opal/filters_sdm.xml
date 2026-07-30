@@ -7,12 +7,12 @@
     date: 2026-07-29
     playback: unknown
     tier: tier-2-only
-    notes: Representative excerpt of the 77-entry SDM list. Encodes the verified fact that GetFilters returns the CURRENT chain's list only, that the PCM and SDM lists differ wholesale, that indices shift between chains, and that the SDM list has no leading none entry. Positions are excerpt-local. Every row is Opal-derived. An earlier revision of the #322 amendment padded this file with four rows copied from filters_pcm.xml to make a stale cross-chain index land in range; that was a NEW SDM claim even though no number was altered, so it was reverted and the hazard moved to the explicitly synthetic profile synthetic-chain-hazard, which is not evidence. Whether GetFilters renumbers a name's enum ID between chains is an OPEN QUESTION recorded on issue #341 comment 5125948432; this fixture does not answer it. Chain-relative ordering is derived-upstream and TIER-2-ONLY: reaching the inactive chain needs SetMode, which mutates, so the read-only tier-1 gate can never promote it. Pending UHC hardware qualification in #332.
+    notes: LICENSING: the `description` attribute's PRESENCE is a wire fact and is what any test here asserts. Its CONTENT is not reproduced. Earlier revisions carried HQPTuner's quality/focus facet compilation (e.g. "3/5 timbre"), whose own _source is hqplayer6desktop-manual.pdf section 4.6 - Signalyst's copyrighted documentation, which HQPTuner's MIT grant does not convey rights to. Replaced with a neutral placeholder: the schema shape is reusable, the manual-derived prose is not. See #348 for the standing provenance guardrail. Representative excerpt of the 77-entry SDM list. Encodes the verified fact that GetFilters returns the CURRENT chain's list only, that the PCM and SDM lists differ wholesale, that indices shift between chains, and that the SDM list has no leading none entry. Positions are excerpt-local. Every row is Opal-derived. An earlier revision of the #322 amendment padded this file with four rows copied from filters_pcm.xml to make a stale cross-chain index land in range; that was a NEW SDM claim even though no number was altered, so it was reverted and the hazard moved to the explicitly synthetic profile synthetic-chain-hazard, which is not evidence. Whether GetFilters renumbers a name's enum ID between chains is an OPEN QUESTION recorded on issue #341 comment 5125948432; this fixture does not answer it. Chain-relative ordering is derived-upstream and TIER-2-ONLY: reaching the inactive chain needs SetMode, which mutates, so the read-only tier-1 gate can never promote it. Pending UHC hardware qualification in #332.
 -->
 <GetFilters>
-<FiltersItem index="0" name="poly-sinc-short-lp" value="30" arg="0" description="3/5 timbre"/>
-<FiltersItem index="1" name="poly-sinc-gauss-long" value="40" arg="0" description="5/5 timbre"/>
-<FiltersItem index="2" name="poly-sinc-ext2" value="16" arg="1" description="5/5 timbre"/>
-<FiltersItem index="3" name="sinc-Lh" value="72" arg="0" description="5/5 timbre"/>
-<FiltersItem index="4" name="poly-sinc-xtr" value="61" arg="0" description="5/5 timbre"/>
+<FiltersItem index="0" name="poly-sinc-short-lp" value="30" arg="0" description="(text not reproduced)"/>
+<FiltersItem index="1" name="poly-sinc-gauss-long" value="40" arg="0" description="(text not reproduced)"/>
+<FiltersItem index="2" name="poly-sinc-ext2" value="16" arg="1" description="(text not reproduced)"/>
+<FiltersItem index="3" name="sinc-Lh" value="72" arg="0" description="(text not reproduced)"/>
+<FiltersItem index="4" name="poly-sinc-xtr" value="61" arg="0" description="(text not reproduced)"/>
 </GetFilters>

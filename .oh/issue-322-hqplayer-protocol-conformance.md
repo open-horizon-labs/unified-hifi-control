@@ -2159,3 +2159,22 @@ here does.
 
 Both failures are the deterministic `/hqp/discover` baseline; the LMS flake family did not fire in this
 run. **#339 remains unmerged**, so PR CI may still show the known Rust 1.97 base lint failure on `v3`.
+
+### Third-gate pass: a licensing loose end closed rather than deferred
+
+`sg review` asked a concrete question instead of deferring one: had any Signalyst-manual-derived prose
+crossed into the repo, given that #348 lists MIT attribution as unresolved? **It had.** The filter
+fixtures carried `description="3/5 timbre"` and similar — HQPTuner's `quality`/`focus` facet
+compilation, whose own `_source` is `hqplayer6desktop-manual.pdf §4.6`. Per the salvage's own §8.2,
+**HQPTuner's MIT grant does not convey rights to Signalyst's manual text**, and its recommendation is
+to reuse the schema shape while re-authoring or citing rather than reproducing the prose.
+
+Checked what the coverage actually needed: `tier1_captures_and_diffs_filter_description_presence`
+asserts the attribute's **presence**, never its content. So the values were removable at zero cost to
+coverage. They are now `description="(text not reproduced)"`, with the reasoning recorded in both
+fixtures' provenance. The wire fact — that `description` exists on `FiltersItem` and is observable only
+from the raw document — is preserved; the manual-derived compilation is gone.
+
+Worth naming why this was missed for five gate rounds: the amendment's provenance work concentrated on
+*where a claim came from* (`source_chain`) and not on *what rights attach to the content itself*. Those
+are different audits, and only the first had been run. #348 owns the standing guardrail.
