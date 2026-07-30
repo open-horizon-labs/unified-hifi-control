@@ -191,6 +191,12 @@ pub struct Capture {
     pub raw_documents: BTreeMap<String, String>,
     /// The `/config` read-side contract, when credentials were supplied.
     pub config_form: Option<ConfigFormObs>,
+    /// Whether web credentials were available for this run at all.
+    ///
+    /// Recorded because `config_form: None` conflates two different facts: a run that was never
+    /// entitled to look (an accepted limit) and a run that looked and failed (an unverified required
+    /// claim). Without this the differ cannot tell them apart and reads the second as the first.
+    pub has_web_credentials: bool,
     /// `(value, title)` from the persistent HTTP lane's `/config` profile list. `None` when no
     /// credentials were supplied — recorded as not-captured rather than as an empty truth.
     pub config_profiles: Option<Vec<(String, String)>>,
@@ -824,7 +830,8 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
     // Persistent HTTP lane, read side only. Attempted just when credentials were supplied; a failure
     // is recorded as not-captured rather than swallowed, because "no profiles" and "could not ask"
     // are different facts.
-    if adapter.has_web_credentials().await {
+    c.has_web_credentials = adapter.has_web_credentials().await;
+    if c.has_web_credentials {
         // Read-side shape via an allowlisted projection. The page itself never enters the capture:
         // tag-level sanitisation left secrets in the element text between the tags, so the only safe
         // handling is to keep the three facts we need and discard everything else.
@@ -1318,7 +1325,7 @@ fn diff_rates(report: &mut Report, stem: &str, expected: &[EnumEntry], observed:
     }
 }
 
-fn attr_of(document: &str, key: &str) -> Option<String> {
+pub fn attr_of(document: &str, key: &str) -> Option<String> {
     let pat = format!(" {key}=\"");
     let start = document.find(&pat)? + pat.len();
     let rest = &document[start..];

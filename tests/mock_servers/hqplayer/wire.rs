@@ -58,6 +58,15 @@ pub enum Disruption {
     /// Close the connection without replying to the next request, once. The client must reconnect
     /// and retry to make progress.
     DropNextReplyOnce,
+    /// Apply the next request to the model, then close the connection without replying, once.
+    ///
+    /// The mirror image of [`Self::DropNextReplyOnce`] and the one that matters for at-most-once
+    /// semantics: from the client's side the two are **indistinguishable** — a request was written and
+    /// no reply came back. The difference is invisible to it and decisive for the user, because a
+    /// blind retry of `Next`, `VolumeUp`, or `VolumeMute` applies the side effect a second time.
+    /// `DropNextReplyOnce` alone can never expose that: it returns before the model is touched, so
+    /// every retry is harmless there by construction.
+    ApplyThenDropReplyOnce,
 }
 
 /// The wire's byte-level policy.
@@ -462,6 +471,17 @@ async fn serve_connection(
         let Some(reply) = responder.respond(&line) else {
             continue;
         };
+
+        // The command has now been applied. Vanishing here is the ambiguous case the client cannot
+        // resolve: it wrote a request and got nothing back, exactly as in `DropNextReplyOnce`, but the
+        // side effect has already happened.
+        if policy.disruption == Disruption::ApplyThenDropReplyOnce
+            && disruptions_left
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return;
+        }
 
         // Documents are newline-terminated on the wire. Internal newlines are legal, and are
         // exactly what makes a line-per-document reader misframe a container response.

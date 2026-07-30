@@ -4646,3 +4646,400 @@ async fn an_attribute_lookup_without_a_root_element_reports_nothing() {
     }
     h.stop();
 }
+
+// ===========================================================================================
+// At-most-once semantics for one-shot commands (CodeRabbit threads 4 and 17)
+//
+// `Next`, `Previous`, `VolumeUp`, `VolumeDown` and `VolumeMute` are relative or toggling: applying
+// one twice is not the same as applying it once. The protocol carries no request identity, so a
+// client that writes such a command and then loses the connection cannot learn whether it landed.
+// Retrying is therefore a *choice to double the side effect* on the chance that it did not.
+//
+// These use `ApplyThenDropReplyOnce`, which is indistinguishable from `DropNextReplyOnce` at the
+// socket and the opposite of it at the model. The assertion is deliberately on the model's state and
+// not on the call's `Result`: failing the call is the honest outcome, but it is the duplicate side
+// effect that harms the user.
+// ===========================================================================================
+
+/// Arrange a daemon that applies the next command and then vanishes without replying.
+async fn apply_then_drop_harness() -> Harness {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            disruption: Disruption::ApplyThenDropReplyOnce,
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("initial connect");
+    // Arm only now, so connection setup is never the thing under test.
+    h.server.arm_disruption();
+    h
+}
+
+#[tokio::test]
+async fn next_advances_one_track_when_the_reply_is_lost_after_the_daemon_applied_it() {
+    let h = apply_then_drop_harness().await;
+    let before = h.model.state().track;
+
+    // Either outcome is defensible for the caller: reporting failure is honest, and reporting success
+    // would be a lie. What is not defensible is skipping two tracks.
+    let _ = h.adapter.next().await;
+
+    assert_eq!(
+        h.model.state().track,
+        before + 1,
+        "Next was applied then its reply was lost; retrying it skips a second track. Track went \
+         {before} -> {}",
+        h.model.state().track
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn volume_mute_toggles_once_when_the_reply_is_lost_after_the_daemon_applied_it() {
+    let h = apply_then_drop_harness().await;
+    let before = h.model.state().muted;
+
+    let _ = h.adapter.volume_mute().await;
+
+    // A toggle retried lands back where it started, so the user presses mute and hears nothing change
+    // — the worst shape of this bug, because it looks like the command was simply ignored.
+    assert_eq!(
+        h.model.state().muted,
+        !before,
+        "VolumeMute is a toggle; a retry after it applied returns it to {before}"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn volume_up_steps_once_when_the_reply_is_lost_after_the_daemon_applied_it() {
+    let h = apply_then_drop_harness().await;
+    let before = h.model.state().volume_db;
+    let step = h
+        .model
+        .state()
+        .volume_range
+        .step_db
+        .expect("the verified profile publishes a volume step");
+
+    let _ = h.adapter.volume_up().await;
+
+    let after = h.model.state().volume_db;
+    assert!(
+        (after - (before + step)).abs() < f64::EPSILON,
+        "VolumeUp is relative; a retry after it applied moves {step} dB twice. {before} -> {after}"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn a_query_still_retries_after_a_lost_reply_because_reading_twice_is_harmless() {
+    // The guard above must be scoped to commands that carry a side effect. Queries are idempotent and
+    // must keep their existing reconnect-and-retry recovery, or this fix trades one defect for another.
+    let h = apply_then_drop_harness().await;
+    h.model.external_change(|s| s.playback = 2);
+
+    let state = h
+        .adapter
+        .get_state()
+        .await
+        .expect("a query must still recover by reconnecting after a lost reply");
+
+    assert_eq!(
+        state.state, 2,
+        "the retry must return real state, not a fabricated default"
+    );
+    h.stop();
+}
+#[tokio::test]
+async fn a_follower_burst_past_the_ceiling_is_refused_like_a_leading_burst() {
+    // The documented ceiling is a bound on unsolicited documents processed per command. The leading
+    // path enforces it; the follower path counted without checking, so the same burst was bounded or
+    // unbounded purely by whether it arrived before or after the reply. A ceiling that depends on
+    // arrival order is not a ceiling.
+    //
+    // 300 > MAX_UNSOLICITED_BACKLOG (256), coalesced into the same write as the reply.
+    let follower = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Status state=\"2\"/>\n".repeat(300);
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            coalesce_extra_for_element: Some(("State".to_string(), follower)),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    let outcome = h.adapter.get_state().await;
+
+    assert!(
+        outcome.is_err(),
+        "300 coalesced followers exceed the 256 ceiling and must be refused, not silently drained; \
+         got {outcome:?}"
+    );
+    let message = outcome.unwrap_err().to_string();
+    assert!(
+        message.contains("Gave up after"),
+        "the refusal must name the backlog ceiling as the reason, so the operator can tell it from a \
+         timeout; got {message:?}"
+    );
+    h.stop();
+}
+
+// ===========================================================================================
+// Evidence-quality remediations from the CodeRabbit review (threads 7, 12, 14, 15, 16)
+// ===========================================================================================
+
+#[test]
+fn every_fixture_sourced_from_a_salvage_report_records_that_chain() {
+    // Thread 7. Prose inside `source` is not a machine-checkable fact: one fixture said in words that
+    // the report was the immediate source and still left `source_chain` unrecorded, so the auditable
+    // field disagreed with the sentence beside it. The whole point of `source_chain` is that
+    // second-hand evidence is visible without reading prose, so the field has to be present wherever
+    // the claim is.
+    let mut missing = Vec::new();
+    for profile in corpus::profiles() {
+        for fixture in corpus::all_in(&profile) {
+            // Keyed on the report itself, not on the upstream URL. The existing citation test only
+            // looks at fixtures naming a `github.com/ohshitgorillas` URL, which is precisely how the
+            // device-specific `modes.xml` escaped it: it cites a salvage report and an upstream *path*
+            // at a dev ref, with no URL to trip the other check.
+            let names_a_report = fixture.provenance.source.contains("SALVAGE")
+                || fixture.provenance.source.contains("salvage report");
+            if names_a_report && !fixture.provenance.source_chain.contains("read-via-report") {
+                missing.push(format!(
+                    "{}/{} (source_chain = {:?})",
+                    profile, fixture.name, fixture.provenance.source_chain
+                ));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these fixtures cite a salvage report but do not record source_chain: read-via-report: {missing:#?}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "source_loads_chain requires configured [source] mode")]
+fn loading_a_chain_outside_source_mode_is_rejected_as_harness_misuse() {
+    // Thread 12. `[source]` is the only configured mode whose loaded chain the source decides; in PCM
+    // or SDM the configured mode *is* the chain. Allowing the pair to disagree lets the model serve SDM
+    // enumerations while reporting configured PCM — a state no daemon produces, so a test that relies
+    // on it proves nothing about the client. `armed_upstream_claims` does not flag it, so the model has
+    // to refuse it at the setter.
+    let model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    model.external_change(|s| s.mode_index = 1);
+    model.source_loads_chain(LoadedChain::Sdm);
+}
+
+#[test]
+fn a_hidden_field_is_dropped_whatever_the_case_of_its_type_attribute() {
+    // Thread 14. Attribute *keys* are lowercased by the projection, values are not, so `type="Hidden"`
+    // slipped past the hidden-field drop and the field name was recorded. `raw::is_hostile_tag` already
+    // compares this value case-insensitively; two spellings of the same rule in one crate is how a
+    // privacy guarantee ends up depending on the daemon's capitalisation.
+    let page = concat!(
+        "<html><body><form>",
+        "<input type=\"Hidden\" name=\"advanced_layout\" value=\"x\"/>",
+        "<input type=\"HIDDEN\" name=\"pipeline_hint\" value=\"y\"/>",
+        "<input type=\"text\" name=\"profile_name\" value=\"z\"/>",
+        "</form></body></html>"
+    );
+
+    // Premise. The first draft of this test used `csrf_token` and `session_key`, which the sensitive-name
+    // filter drops on its own — so it passed while the case-sensitivity it names went untested. These
+    // names must be non-sensitive for the assertion below to mean anything.
+    assert!(
+        !mock_servers::hqplayer::raw::is_sensitive("advanced_layout")
+            && !mock_servers::hqplayer::raw::is_sensitive("pipeline_hint"),
+        "these field names must not be independently droppable, or this test proves nothing"
+    );
+
+    let obs = tier1::project_config_form(page);
+
+    assert!(
+        !obs.field_names.contains("advanced_layout") && !obs.field_names.contains("pipeline_hint"),
+        "hidden fields must be dropped regardless of the case of `type`; recorded {:?}",
+        obs.field_names
+    );
+    assert!(
+        obs.field_names.contains("profile_name"),
+        "visible fields must still be recorded; got {:?}",
+        obs.field_names
+    );
+}
+
+#[test]
+fn a_credentialed_run_that_never_read_the_config_form_is_unverified_not_accepted() {
+    // Thread 15. Both `/config` reads only `warn!` on failure, so a credentialed run that observed
+    // nothing left `config_form` and `config_profiles` both `None` — indistinguishable, to the differ,
+    // from having no credentials at all. The first branch then marked the claim *checked*, which is the
+    // one thing `Report::checked` exists to prevent: it must never be able to mean "never looked".
+    let mut capture = tier1::Capture {
+        has_web_credentials: true,
+        ..Default::default()
+    };
+    capture.config_form = None;
+    capture.config_profiles = None;
+
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+
+    assert!(
+        !report.checked.contains("config_form"),
+        "a run that observed nothing must not record config_form as checked"
+    );
+    assert!(
+        report.unverified.iter().any(|u| u.contains("config_form")),
+        "a credentialed run that failed both reads must leave config_form unverified; unverified = {:?}",
+        report.unverified
+    );
+}
+
+#[test]
+fn corpus_attribute_reads_accept_every_spelling_the_daemon_may_use() {
+    // Thread 16. `raw.rs` records hand-rolled attribute scanning as the cause of a silent
+    // under-observation and replaced it with quick-xml for exactly this reason; the differ then
+    // reintroduced the same `find(" key=\"")` pattern. It fails *quietly* — the comparison vanishes
+    // rather than erroring — which is the failure mode that makes a clean report meaningless.
+    let single_quoted = "<GetInfo name='HQPlayer' version='6.0.4'/>";
+    let spaced = "<GetInfo name = \"HQPlayer\" version=\"6.0.4\"/>";
+
+    assert_eq!(
+        tier1::attr_of(single_quoted, "name").as_deref(),
+        Some("HQPlayer"),
+        "single-quoted attribute values are legal XML and the daemon may emit them"
+    );
+    assert_eq!(
+        tier1::attr_of(spaced, "name").as_deref(),
+        Some("HQPlayer"),
+        "whitespace around `=` is legal XML"
+    );
+}
+
+/// Resolve one optional port from the environment.
+///
+/// Extracted so the tier-1 gate's configuration rules are testable without a daemon. Silently
+/// defaulting a *malformed explicit* value is the dangerous case: `PORT=4321x` becomes 4321, so the
+/// gate verifies a different service than the operator named and reports a clean pass for it. Absent
+/// means "use the default"; present-but-unparseable means the operator made a mistake and must hear
+/// about it.
+fn tier1_port(var: &str, default: u16) -> Result<u16, String> {
+    match std::env::var(var) {
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(format!("read {var}: {e}")),
+        Ok(raw) => raw
+            .parse()
+            .map_err(|_| format!("{var} must be a u16 port, got {raw:?}")),
+    }
+}
+
+/// Both web credentials or neither.
+///
+/// One-sided credentials are accepted by `configure` and then fail at request time, which the capture
+/// records as "the read side was not observed" — indistinguishable from the declared no-credentials
+/// limit. A typo in the password variable name would therefore make the `/config` lane look
+/// legitimately uncaptured instead of misconfigured.
+fn tier1_credentials(
+    user: Option<String>,
+    pass: Option<String>,
+) -> Result<(Option<String>, Option<String>), String> {
+    match (user, pass) {
+        (None, None) => Ok((None, None)),
+        (Some(u), Some(p)) => Ok((Some(u), Some(p))),
+        (Some(_), None) => Err("UHC_HQP_CONFORMANCE_WEB_USER is set without _PASS".to_string()),
+        (None, Some(_)) => Err("UHC_HQP_CONFORMANCE_WEB_PASS is set without _USER".to_string()),
+    }
+}
+
+#[test]
+fn a_malformed_explicit_port_is_refused_rather_than_silently_defaulted() {
+    // Thread 9. Uses a variable name no other test reads, so this cannot race the live gate.
+    let var = "UHC_HQP_CONFORMANCE_PORT_MALFORMED_PROBE";
+    std::env::set_var(var, "4321x");
+    let outcome = tier1_port(var, 4321);
+    std::env::remove_var(var);
+
+    assert!(
+        outcome.is_err(),
+        "an explicit unparseable port must be refused, not turned into the default; got {outcome:?}"
+    );
+}
+
+#[test]
+fn an_absent_port_still_takes_the_documented_default() {
+    // The other half of the rule: hardening must not break the hermetic default.
+    let outcome = tier1_port("UHC_HQP_CONFORMANCE_PORT_ABSENT_PROBE", 4321);
+    assert_eq!(outcome, Ok(4321));
+}
+
+#[test]
+fn one_sided_web_credentials_are_refused() {
+    // Thread 9, second half.
+    assert!(
+        tier1_credentials(Some("hqp".into()), None).is_err(),
+        "a user without a password must be refused"
+    );
+    assert!(
+        tier1_credentials(None, Some("secret".into())).is_err(),
+        "a password without a user must be refused"
+    );
+    assert!(
+        tier1_credentials(None, None).is_ok(),
+        "neither is the documented no-credentials lane"
+    );
+    assert!(
+        tier1_credentials(Some("hqp".into()), Some("secret".into())).is_ok(),
+        "both is the credentialed lane"
+    );
+}
+
+#[tokio::test]
+async fn the_fake_config_web_routes_a_request_head_split_across_reads() {
+    // Thread 10. TCP does not promise that one `read` yields the whole request line. The fake server
+    // routed on a single read, so a `/config/profile/load` request split mid-path was served the
+    // `/config` page instead — a latent nondeterminism in the tests that read this lane rather than an
+    // observed flake, because loopback usually delivers a small head in one segment. Written here as a
+    // deliberate split so the guarantee is proven rather than assumed.
+    let web = FakeConfigWeb::start("CONFIG-PAGE-BODY", "PROFILE-PAGE-BODY").await;
+
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", web.port))
+        .await
+        .expect("connect to the fake config web");
+    {
+        use tokio::io::AsyncWriteExt;
+        // Split *inside* the path, after a prefix that is itself a legal route.
+        sock.write_all(b"GET /config/profile/lo").await.expect("first half");
+        sock.flush().await.expect("flush first half");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sock.write_all(b"ad HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("second half");
+        sock.flush().await.expect("flush second half");
+    }
+
+    let mut response = String::new();
+    {
+        use tokio::io::AsyncReadExt;
+        // Tolerant on purpose. The pre-fix server answers the *truncated* head immediately and closes,
+        // so the second half of the request meets a closed socket and the read can end in a reset. That
+        // reset is a symptom, not the finding; accumulating whatever arrived keeps the assertion below —
+        // which body was served — as the thing that reports the defect.
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = sock.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            response.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+    }
+
+    assert!(
+        response.contains("PROFILE-PAGE-BODY"),
+        "a split request head must still route to /config/profile/load; served {response:?}"
+    );
+}

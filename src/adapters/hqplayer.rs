@@ -3546,3 +3546,56 @@ fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
 
     None
 }
+
+#[cfg(test)]
+mod parse_attr_scope_tests {
+    use super::*;
+
+    /// Root-scoping, asserted directly on `parse_attr` (CodeRabbit thread 11).
+    ///
+    /// The conformance suite already covers this end to end, but that test accepts *any* error from
+    /// the adapter, so framing can reject the orphaned buffer before scoping is ever consulted and the
+    /// test stays green even with whole-buffer scanning restored. It therefore pins the outcome
+    /// without pinning the mechanism. These cases call the function itself, where nothing else can
+    /// satisfy them.
+    #[test]
+    fn an_attribute_outside_any_root_element_is_not_reported() {
+        // A bare fragment: the attribute is present in the text but no root element opens, so there is
+        // no scope that could legitimately own it.
+        let rootless = " state=\"2\" volume=\"-1\"/>";
+        assert_eq!(HqpAdapter::parse_attr(rootless, "volume"), None);
+        assert_eq!(HqpAdapter::parse_attr(rootless, "state"), None);
+    }
+
+    #[test]
+    fn a_leading_orphan_can_never_supply_an_attribute() {
+        // The corruption shape: an orphaned fragment carrying a conflicting `volume` precedes a
+        // well-formed reply. `root_open_tag` refuses a buffer that does not *start* at a root element,
+        // so the answer is `None` rather than the later document's value — the buffer is not one
+        // document and the function does not guess which part to trust.
+        //
+        // This is the discriminating case. Whole-buffer scanning returns `Some("-1")` here, taking the
+        // orphan's value because it appears first; that is the silent corruption this scoping removed.
+        // Production never presents this shape — `send_command_inner` hands over exactly one document —
+        // which is why it has to be asserted here rather than through the adapter.
+        let orphan_then_reply = concat!(
+            " state=\"2\" volume=\"-1\"/>\n",
+            "<State state=\"1\" volume=\"-23.5\" mode=\"1\"/>"
+        );
+        assert_eq!(
+            HqpAdapter::parse_attr(orphan_then_reply, "volume"),
+            None,
+            "a buffer that does not begin at a root element has no attribute to report"
+        );
+    }
+
+    #[test]
+    fn an_attribute_of_the_root_element_is_still_reported_normally() {
+        // Guard against over-tightening: the ordinary case must keep working.
+        let reply = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><State volume=\"-12.5\"/>";
+        assert_eq!(
+            HqpAdapter::parse_attr(reply, "volume").as_deref(),
+            Some("-12.5")
+        );
+    }
+}
