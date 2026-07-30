@@ -127,6 +127,13 @@ pub struct Freshness {
     pub stale: bool,
 }
 
+impl Freshness {
+    /// Whether every field is at its default, so fixtures may omit the object.
+    pub fn is_default(&self) -> bool {
+        self.observed_at.is_none() && self.age_ms.is_none() && !self.stale
+    }
+}
+
 pub(crate) fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -362,7 +369,7 @@ pub struct LaneValue {
     /// Who asserted it and how.
     pub provenance: Provenance,
     /// How current it is.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Freshness::is_default")]
     pub freshness: Freshness,
     /// Additive fields from a newer minor version, preserved for pass-through.
     #[serde(flatten, default, skip_serializing_if = "Extensions::is_empty")]

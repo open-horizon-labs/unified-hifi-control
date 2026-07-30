@@ -186,7 +186,7 @@ pub struct LaneHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<Reason>,
     /// Freshness of whatever this lane last provided.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Freshness::is_default")]
     pub freshness: Freshness,
     /// Additive fields from a newer minor version, preserved for pass-through.
     #[serde(flatten, default, skip_serializing_if = "Extensions::is_empty")]
@@ -219,6 +219,9 @@ pub struct ProducerIdentity {
     pub product_version: Option<String>,
     /// The current epoch.
     pub epoch: ProducerEpoch,
+    /// Additive fields from a newer minor version, preserved for pass-through.
+    #[serde(flatten, default, skip_serializing_if = "Extensions::is_empty")]
+    pub extensions: Extensions,
 }
 
 /// What the document's controls act on.
@@ -229,6 +232,9 @@ pub struct ProducerTarget {
     /// The prefixed zone id, when the producer is bound to a zone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_id: Option<String>,
+    /// Additive fields from a newer minor version, preserved for pass-through.
+    #[serde(flatten, default, skip_serializing_if = "Extensions::is_empty")]
+    pub extensions: Extensions,
 }
 
 /// An immutable, versioned snapshot of a producer's controllable state.
@@ -300,6 +306,8 @@ impl ProducerDocument {
     pub fn extension_key_paths(&self) -> Vec<String> {
         let mut paths = Vec::new();
         collect(&self.extensions, "", &mut paths);
+        collect(&self.producer.extensions, "producer", &mut paths);
+        collect(&self.target.extensions, "target", &mut paths);
         for control in &self.controls {
             let prefix = format!("controls[{}]", control.id);
             collect(&control.extensions, &prefix, &mut paths);

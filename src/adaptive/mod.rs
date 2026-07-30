@@ -64,7 +64,7 @@ pub use constraint::{Constraint, ConstraintEffect, Evaluation, Expr, Permission,
 pub use control::{
     ApplyEffect, ApplyLane, ApplySemantics, Availability, AvailabilityState, Choice, ChoiceSet,
     Control, ControlGroup, ControlId, ControlKind, Disruption, NumericRange, Reason, ReasonCode,
-    RiskClass, Verification,
+    ReasonScope, RiskClass, Verification,
 };
 pub use document::{
     admit_document, admit_document_str, DocumentRevisions, Extensions, LaneHealth, LaneState,
