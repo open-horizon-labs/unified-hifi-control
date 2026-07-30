@@ -309,11 +309,18 @@ pub mod framing {
     ///
     /// * It keys on the root's **own** name, so `<State …></Status>` is not rescued — mismatched
     ///   nesting is decided by the name-comparison path above, which is reached first.
-    /// * It requires the closing tag to be the buffer's **last** token, so a document truncated
-    ///   mid-child stays incomplete instead of being credited with a tag that has not arrived, and
-    ///   a `</Status>` appearing inside an attribute value cannot pass for a frame end.
+    /// * It takes the **first defensible** occurrence of that closing tag, skipping every region where
+    ///   XML says `<` is not markup: quoted attribute values in either quote form, comments, CDATA
+    ///   sections, and processing instructions. So a `</Status>` sitting inside an attribute value or a
+    ///   comment is data and never a boundary, and a document truncated before its real closing tag has
+    ///   no boundary to find and stays incomplete.
     /// * It is consulted only when the parse could not complete on its own, so every well-formed
     ///   document takes the unchanged path.
+    ///
+    /// An earlier revision required the closing tag to be the buffer's **last** token. That was
+    /// replaced because it is wrong for a case the daemon actually produces — a hostile reply with an
+    /// unsolicited push frame coalesced behind it — and the requirement is recorded here only to say it
+    /// is gone.
     ///
     /// Reaching here with the root's closing tag present is itself the diagnosis: had that tag been
     /// parsed as an end event, the element stack would have emptied and `Complete` would already

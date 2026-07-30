@@ -4405,48 +4405,138 @@ async fn a_partial_follower_is_counted_by_the_command_that_completes_it() {
     h.stop();
 }
 
-/// A carried fragment holding **multi-byte UTF-8** must survive byte-exact.
+/// A reply cut **inside a multi-byte code point** must arrive with the character intact.
 ///
-/// The carry is raw bytes, and the accumulation loop classifies only the longest valid UTF-8 prefix so
-/// a character split across reads is excluded from that attempt rather than mangled. If the carry were
-/// stored lossily, a split multi-byte sequence would come back as replacement characters and the
-/// follower would never parse — turning a recoverable fragment into a permanent desync.
+/// The accumulation loop classifies only the longest valid UTF-8 prefix of its buffer, precisely so a
+/// character straddling a read is excluded from that attempt rather than mangled. Nothing exercised
+/// that: `Chunking::AfterMarker` cuts at a `&str` boundary and so can never land mid-character.
+/// `Chunking::BytesAfterMarker` can, and this is the case where the split character's value is
+/// **observable**, so the claim is about content and not merely about parseability.
+///
+/// The test asserts its own premise. An earlier version of this coverage claimed a multi-byte carry it
+/// never performed — its cut landed after an ASCII root name — so the arithmetic here is checked rather
+/// than trusted: the prefix up to the cut must be *invalid* UTF-8, which is only true if the cut fell
+/// between the bytes of a character.
 ///
 /// **Label: client-conformance.**
 #[tokio::test]
-async fn a_carried_fragment_preserves_multi_byte_characters() {
-    // A follower whose attribute holds characters outside ASCII, split immediately after its root
-    // name so the multi-byte bytes land in the carry.
-    const PUSH: &str = concat!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-        "<Status state=\"2\" track_id=\"Björk — Vespertine ☃\"/>"
+async fn a_reply_split_inside_a_multi_byte_character_arrives_intact() {
+    // `☃` is three bytes (E2 98 83). Cutting one byte past the opening quote leaves a lone E2 at the
+    // end of the first read: a valid prefix boundary excludes it, and the next read completes it.
+    const SNOWMAN: &str = "☃";
+    // The character must be FIRST in the value, so that one byte past the opening quote is inside it.
+    // An earlier draft put it mid-string and the premise assertion below caught the arithmetic.
+    let profile_name = format!("{SNOWMAN} Rock Roll");
+
+    // Premise check, before any wire is involved: one byte into the character is not a char boundary.
+    let marker = "value=\"";
+    let doc = format!("<MatrixGetProfile index=\"0\" value=\"{profile_name}\"/>");
+    let cut = doc.find(marker).expect("marker present") + marker.len() + 1;
+    assert!(
+        std::str::from_utf8(&doc.as_bytes()[..cut]).is_err(),
+        "premise: the cut must fall INSIDE a multi-byte code point, or this test proves nothing about \
+         split tails. Prefix was valid UTF-8 up to byte {cut}"
     );
+
     let h = Harness::start(
         VERIFIED_PROFILE,
         WirePolicy {
-            chunking: Chunking::AfterMarker("<Status".to_string()),
-            coalesce_extra_for_element: Some(("State".to_string(), PUSH.to_string())),
+            chunking: Chunking::BytesAfterMarker {
+                marker: marker.to_string(),
+                extra: 1,
+            },
             ..WirePolicy::default()
         },
         fast_timeouts(),
     )
     .await;
     h.adapter.connect().await.expect("connect");
-    h.model.external_change(|s| s.playback = 1);
+    h.model
+        .external_change(|st| st.matrix_profile = profile_name.clone());
 
-    h.adapter.get_state().await.expect("first State");
-    let state = h.adapter.get_state().await.expect("second State");
+    let current = h
+        .adapter
+        .get_matrix_profile()
+        .await
+        .expect("a reply split mid-character must still parse");
+
+    assert_eq!(
+        current.as_ref().map(|p| p.name.as_str()),
+        Some(profile_name.as_str()),
+        "the character split across two reads must be reassembled exactly; a lossy read would show \
+         replacement characters here. Got {current:?}"
+    );
+    h.stop();
+}
+
+/// An **incomplete UTF-8 tail must survive in the carry** and complete on the next read.
+///
+/// The previous case splits a character inside one command. This one splits a *follower* so that the
+/// incomplete sequence is what the connection carries between commands — the path the carry exists for.
+/// If the carry were stored as a lossy `String` rather than raw bytes, the partial sequence would be
+/// replaced before its remaining bytes arrived and could never reassemble.
+///
+/// Premise asserted, as above. What this proves and what it does not: the follower completes as a
+/// document and is counted as skipped, and the next reply is uncorrupted. It does **not** prove the
+/// follower's own content byte-exact, because a skipped document's content is never surfaced through
+/// the public API — [`a_reply_split_inside_a_multi_byte_character_arrives_intact`] carries that claim.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn an_incomplete_utf8_tail_survives_in_the_carry_and_completes_on_the_next_read() {
+    const SNOWMAN: &str = "☃";
+    let push = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Status state=\"2\" volume=\"-1\"          track_id=\"{SNOWMAN} carried\"/>"
+    );
+    let marker = "track_id=\"";
+
+    // Premise: cutting one byte into the snowman leaves an incomplete sequence.
+    let cut = push.find(marker).expect("marker present") + marker.len() + 1;
+    assert!(
+        std::str::from_utf8(&push.as_bytes()[..cut]).is_err(),
+        "premise: the cut must land inside the multi-byte character so the carry ends mid-sequence"
+    );
+
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            // The cut is applied to the JOINED write, so the first read holds the whole State reply
+            // plus a follower prefix ending mid-character.
+            chunking: Chunking::BytesAfterMarker {
+                marker: marker.to_string(),
+                extra: 1,
+            },
+            coalesce_extra_for_element: Some(("State".to_string(), push.clone())),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    h.model.external_change(|st| st.playback = 1);
+
+    h.adapter
+        .get_state()
+        .await
+        .expect("first State, leaving an incomplete UTF-8 tail in the carry");
+    let skipped_before = h.adapter.unsolicited_skipped().await;
+
+    let state = h
+        .adapter
+        .get_state()
+        .await
+        .expect("second State completes the carried sequence");
 
     assert_eq!(
         (state.state, state.volume),
         (1, -24),
-        "the carried fragment must complete and be skipped rather than corrupting this reply; a \
-         lossy carry would leave it unparseable forever. Got {state:?}"
+        "the carried partial character must not corrupt this reply, and the follower must not supply \
+         its volume. Got {state:?}"
     );
-    // And the follower was recognised as a document, not discarded as junk.
     assert!(
-        h.adapter.unsolicited_skipped().await > 0,
-        "the multi-byte follower must be counted as a skipped document"
+        h.adapter.unsolicited_skipped().await > skipped_before,
+        "the follower whose first read ended mid-character must complete and be counted, which it can \
+         only do if the incomplete tail was carried as raw bytes"
     );
     h.stop();
 }

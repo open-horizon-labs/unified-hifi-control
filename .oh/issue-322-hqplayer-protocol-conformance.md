@@ -2102,7 +2102,7 @@ Verified by reverting `src` and re-running:
 |---|---|
 | Different-name next reply | **FAILED** |
 | Partial-follower attribution | **FAILED** |
-| Multi-byte carried fragment | **FAILED** |
+| ~~Multi-byte carried fragment~~ | ~~**FAILED**~~ — **CLAIM WITHDRAWN**, see the third-gate section: that test's cut landed after an ASCII root name, so it carried no multi-byte byte and its pre-fix failure was the generic orphan path already proven by the row above |
 | Reconnect starts with no carry | passed |
 
 The last is recorded as passing pre-fix rather than presented as a fourth proof — before the carry

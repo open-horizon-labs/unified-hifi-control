@@ -38,6 +38,16 @@ pub enum Chunking {
     /// names as a hard constraint: a reader must not treat the child's `/>` as the end of the
     /// document.
     AfterMarker(String),
+    /// Split `extra` **bytes** past the first occurrence of `marker`.
+    ///
+    /// [`Self::AfterMarker`] cuts at a `&str` boundary and so can never land inside a multi-byte code
+    /// point. This can, which is the whole reason it exists: the client classifies only the longest
+    /// valid UTF-8 prefix of its buffer precisely so a character straddling a read is excluded from
+    /// that attempt rather than mangled, and a char-aligned cut cannot exercise that path at all.
+    ///
+    /// The offset is in bytes on purpose. A test computes it so the cut falls between the bytes of a
+    /// known character, and asserts that premise itself rather than trusting the arithmetic.
+    BytesAfterMarker { marker: String, extra: usize },
 }
 
 /// What the wire does to the connection instead of, or after, replying (AC2 reconnect boundaries).
@@ -275,6 +285,20 @@ fn split(document: &[u8], chunking: &Chunking) -> Vec<Vec<u8>> {
             match hay.find(marker.as_str()) {
                 Some(at) => {
                     let cut = at + marker.len();
+                    vec![document[..cut].to_vec(), document[cut..].to_vec()]
+                }
+                None => vec![document.to_vec()],
+            }
+        }
+        Chunking::BytesAfterMarker { marker, extra } => {
+            // Byte search, not `str::find`, so the marker is located without ever needing the buffer
+            // to be valid UTF-8 — and so the resulting cut is a raw byte offset.
+            let at = document
+                .windows(marker.len())
+                .position(|w| w == marker.as_bytes());
+            match at {
+                Some(at) => {
+                    let cut = (at + marker.len() + extra).min(document.len());
                     vec![document[..cut].to_vec(), document[cut..].to_vec()]
                 }
                 None => vec![document.to_vec()],
