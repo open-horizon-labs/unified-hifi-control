@@ -1869,3 +1869,110 @@ reached the same conclusion from the other direction.
 
 The two failures remain the reproduced `/hqp/discover` baseline. **#339 remains unmerged**, so PR CI
 may still show the known Rust 1.97 base lint failure on `v3`.
+
+---
+
+## Cleanup pass and three further audit fixes (2026-07-30)
+
+Prompted by a stop-correction: **`5adb618` accidentally committed 1,024 generated files under
+`.oh/.cache`** — 1,314,169 lines — against an explicit instruction to leave that directory untracked.
+It had been untracked throughout this work until one careless `git add -A .oh`. My error, and the
+mechanism is worth naming: `-A` on a directory that contains both a tracked artifact and an ignored-by-
+convention-but-not-by-rule cache will take both.
+
+**Repaired forward**, since the branch is pushed and AGENTS.md forbids force pushing:
+
+| Step | Proof |
+|---|---|
+| `git rm -r --cached .oh/.cache` | `git ls-tree -r HEAD .oh/.cache` → **0** |
+| Local cache untouched | directory present, **334 MB** |
+| `.gitignore` gains `.oh/.cache/` | matches `.oh/.cache/lance/…`; matches **neither** `.oh/issue-322-*.md` **nor** `.oh/hqplayer-spec.md` |
+| Branch diff clean of it | `git diff origin/v3...HEAD -- .oh/.cache` → **0** |
+| Only intended files tracked under `.oh/` | `hqplayer-spec.md`, `issue-322-hqplayer-protocol-conformance.md` |
+
+The blobs remain in history at `5adb618` and cannot be removed without a rewrite. The ignore rule is
+deliberately narrow: `.oh/` itself must stay tracked.
+
+### Three further audit findings, all fixed
+
+**1. A reply already in the buffer was waited for anyway.** After draining an unsolicited document that
+arrived *ahead* of the wanted reply in the same fixed-size read, `send_command_inner` went straight back
+to the socket — blocking on bytes it already held. New fake capability
+`WirePolicy::coalesce_leading_for_element` prepends a push frame before the reply in one write, and the
+wire then falls silent, so going back to the socket can only end in a timeout. That is what made it
+observable rather than merely inefficient. Observed RED:
+
+```text
+test an_unsolicited_document_ahead_of_the_reply_in_one_read_does_not_block_for_more ... FAILED
+  the reply was in the same read as the unsolicited frame ahead of it: Response timeout
+```
+
+Fixed by splitting the read loop in two: the outer loop reads, the inner loop drains everything the
+buffer holds before the outer one may read again. `continue 'reading` is the only path back to the
+socket, taken when a document is incomplete or when draining leaves nothing but whitespace. Both bounds
+survive — the per-command deadline still gates every socket read, and the skip counter still trips
+`MAX_UNSOLICITED_BACKLOG`.
+
+Same class as the malformed-root wedge, one layer up: correct framing, wrong loop structure.
+
+**2. `root_frame_end` tracked only double quotes.** XML permits both forms and only the *matching*
+character closes a value, so `song='</Status>'` ended the frame and a truncated document read as
+`Complete`. Verified before the fix — `left: Complete`. Now `quote: Option<u8>` records which character
+opened the value. Three assertions added, including that a `"` inside a single-quoted value does not
+toggle quoting.
+
+**This is the third distinct hole found in the same recovery scan** — quote-blindness to comments and
+CDATA, then to single quotes. Each was found by probing rather than by the suite. The scan is a
+hand-rolled tokeniser standing in for a parser, and the pattern says the remaining risk is in what it
+still does not know about, not in what it does.
+
+**3. Two stale comments corrected.** The burst test claimed several documents sharing one line cost a
+single skip because `response.clear()` drops the rest of the line — true of an earlier revision, not of
+this one. The artifact's follower note now also covers the ahead-of-reply case.
+
+### Evidence dispositions recorded on #341
+
+Posted to #341 (comment 5126438674) rather than modelled: the **empty `GetRates`** case has no
+supporting observation in either audited report — searching both returns only unrelated backup-archive
+and now-playing matches — and the **filter-dependent rate list** is evidenced (`livelane.py:33-38`) but
+unmodelled, because the corpus has no filter→rates dependency and adding one means inventing which
+rates each filter removes. Each carries what would settle it. The mode half *is* covered.
+
+### Baseline attribution, with a correction to the PR's flake claim
+
+Two full-suite runs on the cleaned tree:
+
+| Run | Result | Failures |
+|---|---|---|
+| 1 | 473 passed, 3 failed, 12 ignored | 2 × `/hqp/discover` + `error_handling::lms_fails_gracefully_when_unconfigured` |
+| 2 | 472 passed, 4 failed, 12 ignored | 2 × `/hqp/discover` + `lms_integration::control_fails_when_disconnected` + `…volume_control_fails_when_disconnected` |
+
+The two `/hqp/discover` failures are deterministic and environmental, as before.
+
+The LMS failures are the documented concurrency flake, and **`tests/adapter_integration.rs` is
+byte-identical to `v3`** — `git diff origin/v3 HEAD -- tests/adapter_integration.rs` is empty. Measured:
+the binary alone is **6/6 green**, three runs single-threaded and three default-threaded. The failures
+appear only under whole-suite concurrency, i.e. multiple test binaries racing the process-global
+`UHC_CONFIG_DIR`.
+
+**Correction to this PR's earlier characterisation:** it described this as one test failing "~1 in 10,
+4/4 green under `--test-threads=1`". Both parts understate it. The flake is a **family** — three
+different tests across two runs — and it fired in **2 of 2** full-suite runs here rather than 1 in 10.
+Single-threading the *whole suite* was never what was measured; single-threading one binary is, and that
+is green either way. The mechanism is unchanged and still belongs on `v3`, but the rate and the blast
+radius were both reported too favourably.
+
+### Verification after the cleanup
+
+| Command | Result |
+|---|---|
+| `--test hqplayer_conformance` | **165 passed; 0 failed; 0 ignored** |
+| `--test api_contract` / `--test protocol_schema` | 2 / 41 — no route or payload drift |
+| `--test adapter_integration` / `--test zones_sha_integration` | 42 / 20 |
+| lib unit tests | 84 passed |
+| `cargo fmt --check` | clean |
+| `cargo clippy -- -D warnings` | clean, 0 findings |
+| `git diff --check origin/v3...HEAD` | clean |
+| `cargo test --no-fail-fast` | 473/472 passed; 3/4 failed (all attributed above); 12 ignored |
+| tracked files under `.oh/.cache` | **0** |
+| live tier 1 / tier 2 | **not run** — daemon offline, no mutating permission |
