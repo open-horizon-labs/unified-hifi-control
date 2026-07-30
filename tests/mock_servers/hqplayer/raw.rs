@@ -20,19 +20,6 @@ use tokio::net::TcpStream;
 
 use unified_hifi_control::adapters::hqplayer::framing;
 
-/// Query elements this lane is permitted to send. Read-only by enumeration, not by intention: adding
-/// a mutating element here would be an obvious review flag rather than a silent behaviour change.
-pub const READ_ONLY_QUERIES: [&str; 8] = [
-    "GetInfo",
-    "State",
-    "Status",
-    "VolumeRange",
-    "GetModes",
-    "GetFilters",
-    "GetShapers",
-    "GetRates",
-];
-
 /// A closed set of read-only requests this lane can express.
 ///
 /// Deliberately not a free-form attribute string: with `attrs: &str` interpolated into the request, a
@@ -56,20 +43,83 @@ pub enum Query {
 }
 
 impl Query {
+    /// Every query this lane can express, for exhaustive coverage checks.
+    pub const ALL: [Query; 11] = [
+        Query::GetInfo,
+        Query::State,
+        Query::Status,
+        Query::VolumeRange,
+        Query::GetModes,
+        Query::GetFilters,
+        Query::GetShapers,
+        Query::GetRates,
+        Query::GetJunkFilters,
+        Query::MatrixListProfiles,
+        Query::MatrixGetProfile,
+    ];
+
     /// The request element name.
     pub fn element(self) -> &'static str {
-        "STUB"
+        match self {
+            Query::GetInfo => "GetInfo",
+            Query::State => "State",
+            Query::Status => "Status",
+            Query::VolumeRange => "VolumeRange",
+            Query::GetModes => "GetModes",
+            Query::GetFilters => "GetFilters",
+            Query::GetShapers => "GetShapers",
+            Query::GetRates => "GetRates",
+            Query::GetJunkFilters => "GetJunkFilters",
+            Query::MatrixListProfiles => "MatrixListProfiles",
+            Query::MatrixGetProfile => "MatrixGetProfile",
+        }
     }
 
-    /// The element name the daemon answers with. Usually the same, but not guaranteed for every
-    /// family, and assuming it silently turns a naming difference into a timeout.
+    /// The element the daemon answers with.
+    ///
+    /// Stated per query rather than assumed equal to the request. Every family the reference documents
+    /// does echo its request element, and this mapping records that as a checked fact — if a future
+    /// daemon answers a query under a different name, the fix is one line here instead of a timeout
+    /// nobody can explain.
+    /// Every family the reference documents answers under its own request element, so today this is the
+    /// identity. It exists as a separate function anyway: the moment one family answers under a
+    /// different name, the fix is one arm here rather than a timeout nobody can explain. The matrix
+    /// pair was checked specifically, being the likeliest to diverge — one is a container of
+    /// `MatrixProfile` children, the other a single current-selection element — and both echo.
     pub fn reply_element(self) -> &'static str {
-        "STUB"
+        self.element()
     }
 
-    /// The full request document. No caller-supplied text reaches it.
+    /// The capture key this query's evidence is filed under, so the mapping lives with the query
+    /// instead of in a parallel list that can drift out of step with `ALL`.
+    pub fn capture_family(self) -> &'static str {
+        match self {
+            Query::GetInfo => "getinfo",
+            Query::State => "state",
+            Query::Status => "status",
+            Query::VolumeRange => "volume_range",
+            Query::GetModes => "modes",
+            Query::GetFilters => "filters",
+            Query::GetShapers => "shapers",
+            Query::GetRates => "rates",
+            Query::GetJunkFilters => "junkfilters",
+            Query::MatrixListProfiles => "matrix",
+            Query::MatrixGetProfile => "matrix_current",
+        }
+    }
+
+    /// The full request document. No caller-supplied text reaches it, so there is no interpolation
+    /// point at which a command could be appended.
     pub fn request(self) -> String {
-        String::new()
+        let attrs = match self {
+            // One-shot only. Push mode is not something this lane may enable.
+            Query::Status => " subscribe=\"0\"",
+            _ => "",
+        };
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><{}{attrs}/>\n",
+            self.element()
+        )
     }
 }
 
@@ -80,14 +130,11 @@ impl Query {
 pub async fn observe(
     host: &str,
     port: u16,
-    element: &str,
-    attrs: &str,
+    query: Query,
     response_deadline: Duration,
 ) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        READ_ONLY_QUERIES.contains(&element),
-        "the raw lane refuses {element}: it sends queries only"
-    );
+    let element = query.element();
+    let expected_reply = query.reply_element();
 
     let stream = tokio::time::timeout(response_deadline, TcpStream::connect((host, port)))
         .await
@@ -95,7 +142,7 @@ pub async fn observe(
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    let request = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><{element}{attrs}/>\n");
+    let request = query.request();
     write_half.write_all(request.as_bytes()).await?;
     write_half.flush().await?;
 
@@ -113,7 +160,7 @@ pub async fn observe(
                 document.push_str(&line);
                 match framing::classify(&document) {
                     framing::Framing::Complete => {
-                        if framing::root_element(&document).as_deref() == Some(element) {
+                        if framing::root_element(&document).as_deref() == Some(expected_reply) {
                             return Ok(document);
                         }
                         // Unsolicited push frame; drop it and keep reading, exactly as the client does.
@@ -134,62 +181,90 @@ pub async fn observe(
 /// Whether a container's named child element is present, as a structural fact rather than an
 /// inference from any value inside it.
 pub fn has_child(document: &str, child: &str) -> bool {
-    document.contains(&format!("<{child}"))
+    let mut reader = quick_xml::Reader::from_str(document);
+    reader.config_mut().check_end_names = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                if String::from_utf8_lossy(e.name().as_ref()) == child {
+                    return true;
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return false,
+            Ok(_) => {}
+        }
+    }
 }
 
 /// Every `(name, attribute-map)` pair for a repeated child element, so attribute *presence* can be
 /// distinguished from attribute *value*.
 pub fn child_attrs(document: &str, child: &str) -> Vec<Vec<(String, String)>> {
-    document
-        .split(&format!("<{child}"))
-        .skip(1)
-        .filter_map(|part| {
-            let end = part.find("/>")?;
-            Some(parse_attrs(&part[..end]))
-        })
-        .collect()
+    let mut out = Vec::new();
+    let mut reader = quick_xml::Reader::from_str(document);
+    reader.config_mut().check_end_names = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                if String::from_utf8_lossy(e.name().as_ref()) == child {
+                    out.push(
+                        e.attributes()
+                            .filter_map(Result::ok)
+                            .map(|a| {
+                                let name = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                                let value = a
+                                    .unescape_value()
+                                    .map(|v| v.into_owned())
+                                    .unwrap_or_else(|_| {
+                                        framing::decode_entities(&String::from_utf8_lossy(&a.value))
+                                    });
+                                (name, value)
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return out,
+            Ok(_) => {}
+        }
+    }
 }
 
 /// Attributes of a document's root element.
 pub fn root_attrs(document: &str) -> Vec<(String, String)> {
-    framing::root_open_tag(document)
-        .map(parse_attrs)
-        .unwrap_or_default()
+    element_attrs(document)
 }
 
-fn parse_attrs(fragment: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let bytes = fragment.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // name=
-        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
-            i += 1;
-        }
-        let start = i;
-        while i < bytes.len() && bytes[i] != b'=' && !(bytes[i] as char).is_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b'=' {
-            break;
-        }
-        let name = fragment[start..i].trim().to_string();
-        i += 1;
-        if i >= bytes.len() || bytes[i] != b'"' {
-            break;
-        }
-        i += 1;
-        let vstart = i;
-        while i < bytes.len() && bytes[i] != b'"' {
-            i += 1;
-        }
-        let value = fragment[vstart..i.min(fragment.len())].to_string();
-        i += 1;
-        if !name.is_empty() {
-            out.push((name, framing::decode_entities(&value)));
+/// Attributes of the first element in a fragment, parsed with quick-xml.
+///
+/// Hand-rolled scanning is what made the previous version silently under-observe: it assumed double
+/// quotes and no whitespace around `=`, so `index = '0'` yielded nothing at all and the diff reported
+/// a false absence. quick-xml is already in the dependency graph and handles both quote styles,
+/// whitespace, and entity decoding, so the parser cannot be more restrictive than the daemon.
+fn element_attrs(fragment: &str) -> Vec<(String, String)> {
+    let mut reader = quick_xml::Reader::from_str(fragment);
+    reader.config_mut().check_end_names = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                return e
+                    .attributes()
+                    .filter_map(Result::ok)
+                    .map(|a| {
+                        let name = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                        let value =
+                            a.unescape_value()
+                                .map(|v| v.into_owned())
+                                .unwrap_or_else(|_| {
+                                    framing::decode_entities(&String::from_utf8_lossy(&a.value))
+                                });
+                        (name, value)
+                    })
+                    .collect();
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return Vec::new(),
+            Ok(_) => {}
         }
     }
-    out
 }
 
 /// Strip anything that must never reach a stored artifact: hidden form inputs, anything that looks

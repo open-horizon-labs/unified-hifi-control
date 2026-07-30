@@ -65,12 +65,103 @@ pub struct ConfigFormObs {
 /// An allowlisted projection rather than stored HTML: tag-level redaction left secrets in the element
 /// text between the tags, and no amount of pattern-matching on a whole page is as safe as never keeping
 /// the page. STUB - implemented in the GREEN commit.
-pub fn project_config_form(_page: &str) -> ConfigFormObs {
-    ConfigFormObs::default()
+pub fn project_config_form(page: &str) -> ConfigFormObs {
+    // An allowlist, built by walking the document with quick-xml and keeping only three things: the
+    // names of non-hidden form fields, whether the profile select offers `[default]`, and each named
+    // option's value and label. Element TEXT is never kept except as an option label, and an option
+    // label sits inside the select we are already allowlisting.
+    //
+    // The previous approach stored the page and redacted tags, which left `<password>SEKRET</password>`
+    // as `<!-- redacted -->SEKRET<!-- redacted -->` — the secret survived between the tags. Nothing
+    // that is not on this allowlist is retained at all, so there is nothing to leak.
+    const SENSITIVE: [&str; 8] = [
+        "password",
+        "passwd",
+        "csrf",
+        "token",
+        "nonce",
+        "authorization",
+        "secret",
+        "key",
+    ];
+    let sensitive_name = |n: &str| SENSITIVE.iter().any(|s| n.to_lowercase().contains(s));
+
+    let mut obs = ConfigFormObs::default();
+    let mut reader = quick_xml::Reader::from_str(page);
+    reader.config_mut().check_end_names = false;
+    let mut in_profile_select = false;
+    let mut pending_option: Option<String> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                let tag = String::from_utf8_lossy(e.name().as_ref()).to_lowercase();
+                let attrs: BTreeMap<String, String> = e
+                    .attributes()
+                    .filter_map(Result::ok)
+                    .map(|a| {
+                        (
+                            String::from_utf8_lossy(a.key.as_ref()).to_lowercase(),
+                            a.unescape_value()
+                                .map(|v| v.into_owned())
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                let name = attrs.get("name").cloned().unwrap_or_default();
+                let is_hidden = attrs.get("type").map(|t| t == "hidden").unwrap_or(false);
+
+                match tag.as_str() {
+                    "input" | "select" | "textarea" => {
+                        // Hidden inputs and anything sensitively named are dropped entirely — not
+                        // recorded and not redacted, because a redaction still admits the name existed.
+                        if !name.is_empty() && !is_hidden && !sensitive_name(&name) {
+                            obs.field_names.insert(name.clone());
+                        }
+                        in_profile_select = tag == "select" && name == "profile";
+                    }
+                    "option" if in_profile_select => {
+                        let value = attrs.get("value").cloned().unwrap_or_default();
+                        if value == "[default]" {
+                            obs.offers_default = true;
+                            pending_option = None;
+                        } else if !value.is_empty() {
+                            pending_option = Some(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Text(t)) => {
+                // The only element text kept anywhere: an option's label, inside the profile select.
+                if let Some(value) = pending_option.take() {
+                    let label = t
+                        .unescape()
+                        .map(|v| v.trim().to_string())
+                        .unwrap_or_default();
+                    let title = if label.is_empty() {
+                        value.clone()
+                    } else {
+                        label
+                    };
+                    obs.named_profiles.push((value, title));
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                if String::from_utf8_lossy(e.name().as_ref()).to_lowercase() == "select" {
+                    in_profile_select = false;
+                }
+                pending_option = None;
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    obs
 }
 
-/// Claims REQUIRED_CLAIMS must contain, kept beside the ADR rows they render so the two cannot drift
-/// silently. STUB - the real list is asserted in the GREEN commit.
+/// ADR 003's claim rows, rendered as data. `REQUIRED_CLAIMS` *is* this list, and
+/// `required_claims_faithfully_renders_every_adr_003_row` asserts the two cannot drift.
 pub const ADR_CLAIM_ROWS: [&str; 15] = [
     "getinfo",
     "state",
@@ -82,7 +173,7 @@ pub const ADR_CLAIM_ROWS: [&str; 15] = [
     "filters_arg",
     "filters_description",
     "shapers",
-    "shapers_description",
+    "shapers_shape",
     "rates",
     "junkfilters",
     "matrix",
@@ -172,20 +263,7 @@ pub struct Report {
 
 /// Every claim ADR 003 requires a tier-1 run to compare. Held as data so a family cannot be forgotten
 /// silently: the differ is asserted against this list, not against whatever it happens to walk.
-pub const REQUIRED_CLAIMS: [&str; 12] = [
-    "getinfo",
-    "state",
-    "status",
-    "status_metadata_child",
-    "volume_range",
-    "modes",
-    "filters",
-    "filters_arg",
-    "shapers",
-    "rates",
-    "junkfilters",
-    "matrix",
-];
+pub const REQUIRED_CLAIMS: [&str; 15] = ADR_CLAIM_ROWS;
 
 /// Attributes `State` must carry. Values are instance-specific; presence is the contract.
 pub const STATE_REQUIRED: [&str; 17] = [
@@ -549,23 +627,23 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
     let conn = adapter.get_status().await;
     if let Some(host) = conn.host.clone() {
         let deadline = adapter.timeouts().await.response;
-        for (element, attrs, family) in [
-            ("Status", " subscribe=\"0\"", "status"),
-            ("GetFilters", "", "filters"),
-            ("GetShapers", "", "shapers"),
-            ("GetInfo", "", "getinfo"),
-        ] {
-            match raw::observe(&host, conn.port, element, attrs, deadline).await {
+        // Every native family, read off the socket through the closed query set. Nothing here is
+        // reconstructed from semantically parsed values: the diffs compare what the wire actually said.
+        // Iterates Query::ALL rather than a hand-typed list, so a twelfth variant is observed without
+        // anyone remembering to add it here.
+        for query in raw::Query::ALL {
+            let family = query.capture_family();
+            match raw::observe(&host, conn.port, query, deadline).await {
                 Ok(document) => {
-                    if element == "Status" {
+                    if query == raw::Query::Status {
                         c.status_metadata_child = if raw::has_child(&document, "metadata") {
                             MetadataChild::Present
                         } else {
                             MetadataChild::Absent
                         };
                     }
-                    if element == "GetFilters" || element == "GetShapers" {
-                        let item = if element == "GetFilters" {
+                    if matches!(query, raw::Query::GetFilters | raw::Query::GetShapers) {
+                        let item = if query == raw::Query::GetFilters {
                             "FiltersItem"
                         } else {
                             "ShapersItem"
@@ -586,12 +664,12 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
                             }
                         }
                     }
-                    // Sanitised before it is stored, so the sanitiser is not something a caller can
-                    // forget. Never carries the host it came from.
+                    // Sanitised before storage, so the sanitiser is not something a caller can forget.
+                    // Never carries the host it came from.
                     c.raw_documents
                         .insert(family.to_string(), raw::sanitize(&document));
                 }
-                Err(e) => tracing::warn!("tier-1 raw lane: {element} unobserved: {e}"),
+                Err(e) => tracing::warn!("tier-1 raw lane: {} unobserved: {e}", query.element()),
             }
         }
     }
@@ -645,7 +723,7 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
                 name: f.name,
                 enum_id: Some(f.value),
                 rate: None,
-                arg: None,
+                arg: Some(f.arg),
                 description: None,
             })
             .collect(),
@@ -854,6 +932,44 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
     }
 
     // Filter arg flags and description presence, per ADR 003.
+    // `FiltersItem` carries `description`; `ShapersItem` does not. Requiring it of both - as an
+    // earlier revision of the ADR row did - made a correct daemon look wrong, so each family is now
+    // checked against its own documented shape.
+    for (prefix, claim, expect_description) in [
+        ("filters/", "filters_description", true),
+        ("shapers/", "shapers_shape", false),
+    ] {
+        if capture.entry_shapes.keys().any(|k| k.starts_with(prefix)) {
+            report.checked.insert(claim.into());
+            for (key, shape) in &capture.entry_shapes {
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+                match (expect_description, shape.has_description) {
+                    (true, Some(true)) | (false, Some(false)) => {}
+                    (true, _) => report.divergences.push(Divergence {
+                        family: claim.into(),
+                        kind: DivergenceKind::AttributePresence,
+                        detail: format!("{key} carries no description attribute"),
+                    }),
+                    (false, _) => report.divergences.push(Divergence {
+                        family: claim.into(),
+                        kind: DivergenceKind::AttributePresence,
+                        detail: format!(
+                            "{key} carries a description attribute; ShapersItem is documented as \
+                             index/name/value only, so this is a wire shape the reference does not \
+                             describe"
+                        ),
+                    }),
+                }
+            }
+        } else {
+            report.unverified.push(format!(
+                "{claim} - the raw lane observed no shapes for {prefix}"
+            ));
+        }
+    }
+
     if capture
         .entry_shapes
         .keys()
@@ -992,6 +1108,19 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
             vr.get("min").cloned().unwrap_or_default(),
             vr.get("max").cloned().unwrap_or_default(),
         ));
+    }
+
+    if capture.config_form.is_none() && capture.config_profiles.is_none() {
+        // No credentials: a declared accepted limit, recorded in not_captured rather than as an
+        // unverified required claim.
+        report.checked.insert("config_form".into());
+    } else if capture.config_form.is_none() {
+        // Credentials were accepted but the form was never observed. That is a required claim left
+        // unverified, and collapsing it into the accepted limit would make an absent credential and a
+        // failed observation look alike.
+        report.unverified.push(
+            "config_form - credentials were available but the read side was not observed".into(),
+        );
     }
 
     if let Some(form) = &capture.config_form {

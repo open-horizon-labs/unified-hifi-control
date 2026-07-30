@@ -2394,22 +2394,7 @@ fn no_production_code_reads_the_raw_config_page() {
 #[test]
 fn the_raw_lane_cannot_express_a_mutating_request() {
     use mock_servers::hqplayer::raw::Query;
-    let rendered: Vec<String> = [
-        Query::GetInfo,
-        Query::Status,
-        Query::State,
-        Query::VolumeRange,
-        Query::GetModes,
-        Query::GetFilters,
-        Query::GetShapers,
-        Query::GetRates,
-        Query::GetJunkFilters,
-        Query::MatrixListProfiles,
-        Query::MatrixGetProfile,
-    ]
-    .into_iter()
-    .map(|q| q.request())
-    .collect();
+    let rendered: Vec<String> = Query::ALL.into_iter().map(|q| q.request()).collect();
 
     let mutating = [
         "Set", "Volume", "Play", "Pause", "Stop", "Next", "Previous", "Seek", "Reset",
@@ -2436,22 +2421,7 @@ fn the_raw_lane_cannot_express_a_mutating_request() {
 #[test]
 fn the_raw_lane_query_set_covers_every_read_only_family() {
     use mock_servers::hqplayer::raw::Query;
-    let elements: Vec<&str> = [
-        Query::GetInfo,
-        Query::State,
-        Query::Status,
-        Query::VolumeRange,
-        Query::GetModes,
-        Query::GetFilters,
-        Query::GetShapers,
-        Query::GetRates,
-        Query::GetJunkFilters,
-        Query::MatrixListProfiles,
-        Query::MatrixGetProfile,
-    ]
-    .into_iter()
-    .map(|q| q.element())
-    .collect();
+    let elements: Vec<&str> = Query::ALL.into_iter().map(|q| q.element()).collect();
     let missing: Vec<&str> = [
         "GetInfo",
         "State",
@@ -2479,22 +2449,10 @@ fn the_raw_lane_query_set_covers_every_read_only_family() {
 #[test]
 fn the_raw_lane_states_the_reply_root_for_every_query() {
     use mock_servers::hqplayer::raw::Query;
-    let pairs: Vec<(&str, &str)> = [
-        Query::GetInfo,
-        Query::State,
-        Query::Status,
-        Query::VolumeRange,
-        Query::GetModes,
-        Query::GetFilters,
-        Query::GetShapers,
-        Query::GetRates,
-        Query::GetJunkFilters,
-        Query::MatrixListProfiles,
-        Query::MatrixGetProfile,
-    ]
-    .into_iter()
-    .map(|q| (q.element(), q.reply_element()))
-    .collect();
+    let pairs: Vec<(&str, &str)> = Query::ALL
+        .into_iter()
+        .map(|q| (q.element(), q.reply_element()))
+        .collect();
     let unstated: Vec<&(&str, &str)> = pairs
         .iter()
         .filter(|(el, reply)| *el == "STUB" || *reply == "STUB" || reply.is_empty())

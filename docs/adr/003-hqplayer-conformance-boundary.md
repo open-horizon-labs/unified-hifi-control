@@ -193,7 +193,8 @@ and **diff against the corpus**:
 |---|---|
 | `GetInfo` | attribute set and value shapes |
 | `GetModes` | names, enum IDs, and **list positions** |
-| `GetFilters`, `GetShapers` | names, enum IDs, list positions, `arg` flags, `description` presence — **per mode**, since the lists are mode-relative |
+| `GetFilters` | names, enum IDs, list positions, **`arg` flags and `description` presence** — **per mode**, since the lists are mode-relative |
+| `GetShapers` | names, enum IDs, list positions, and that the item shape is `index`/`name`/`value` **only** — `ShapersItem` carries no `arg` and no `description`, so a daemon that sends either is a divergence worth knowing about, not a pass. An earlier revision of this row lumped shapers in with filters and demanded `description` of both; that over-specified the wire and made a correct daemon look wrong |
 | `GetRates` | index-to-Hz mapping, and that index 0 is rate 0 |
 | `GetJunkFilters` | names, enum IDs, positions |
 | `State` | attribute set, numeric-vs-decimal types, `filter_junk` as an int, whether `filter1x`/`filterNx` are present |
