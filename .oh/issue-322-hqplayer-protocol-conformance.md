@@ -1976,3 +1976,61 @@ radius were both reported too favourably.
 | `cargo test --no-fail-fast` | 473/472 passed; 3/4 failed (all attributed above); 12 ignored |
 | tracked files under `.oh/.cache` | **0** |
 | live tier 1 / tier 2 | **not run** — daemon offline, no mutating permission |
+
+### Cleanup-pass `/review`, `/dissent` and `sg review`
+
+**`/review` — one finding, applied at `16f6295`.** The restructure moved which bound is load-bearing.
+The inner drain loop never touches the socket, so the per-command deadline — which only gates socket
+reads — cannot bound it; `MAX_UNSOLICITED_BACKLOG` is now the only thing that can. That ceiling's trip
+was tested nowhere, and the existing burst expectation uses 12 frames against 256. A 400-frame burst
+delivered ahead of the reply now has to be reported, asserting the message names the ceiling, since a
+timeout would be impossible for a loop that never reads.
+
+**`/dissent` — one finding, applied at `06c1754`, and it changed the diagnosis.** Three holes had been
+found in the recovery scan one at a time, each after the previous was called complete. Instead of
+probing for a fourth example, the question became *what is the set*:
+
+```text
+processing instruction     classify=Complete   <- truncated document, no real close
+DOCTYPE internal subset    classify=Complete
+```
+
+There was a fourth. But the answer is that the approach is right and the **list** was incomplete — and
+the list is **closed**: XML defines exactly four places `<` appears without opening a tag (quoted value,
+comment, CDATA, processing instruction). `non_markup_region_len` now covers all four plus a conservative
+skip for any other `<!` declaration.
+
+The instructive part: **`skip_prologue` already knew this vocabulary** — `<?`, `<!--`, `<!` — for the
+prologue. The knowledge had never been applied mid-document, which is why each hole looked novel when
+none was. Three rounds of "found by probing" were one round of not asking what the set was.
+
+**`sg review pr` — no blocking findings**, and explicitly "nothing here should block continuing". Its six
+points are all standing questions, and three independently confirm this amendment's own conclusions:
+
+| # | Point | Disposition |
+|---|---|---|
+| 1 | Proportionality needs a **human** decision, not another agent round | Open. Flagged three times now across passes; this amendment's dissent reached the same conclusion from the value side (811 of 1,257 lines produced no client defect) |
+| 2 | Zero hours against real hardware; every claim rests on secondary sources | Open and disclosed throughout. Tier 1 is the only mechanism that closes it and cannot run here |
+| 3 | Same root cause three times — treating a report's citation as if read | Structurally fixed by `source_chain`, and named as a standing lesson: flag read-via-report evidence *before* building on it, not after a dissent cycle |
+| 4 | The `.oh` file is a transcript, not a design doc | Open documentation-policy question, now raised in three separate passes. Recommends collapsing to a summary plus PR history after merge |
+| 5 | Diminishing returns — each round finds smaller things; get a maintainer's eyes | **Agreed.** This pass found a quote form and a stale comment. Stopping for the gate |
+| 6 | The cache blobs are permanent in this branch's history | Confirmed and already recorded. **Worth the maintainer knowing it affects clone and fetch size forever**, with no secrets exposure |
+
+**Point 5 is the one I act on directly:** this pass's findings were a quote form, a stale comment and a
+missing ceiling test. That is the shape of diminishing returns, and the right next step is external
+review rather than a fifth internal cycle.
+
+### Verification at the pushed HEAD
+
+| Command | Result |
+|---|---|
+| `--test hqplayer_conformance` | **166 passed; 0 failed; 0 ignored** |
+| `--test api_contract` / `--test protocol_schema` | 2 / 41 — no route or payload drift |
+| `--test adapter_integration` / `--test zones_sha_integration` | 42 / 20 |
+| lib unit tests | 84 passed |
+| `cargo fmt --check` | clean |
+| `cargo clippy -- -D warnings` | clean, 0 findings |
+| `git diff --check origin/v3...HEAD` | clean |
+| `cargo test --no-fail-fast` | 473/472 passed; 3/4 failed, all attributed; 12 ignored |
+| `git ls-tree -r HEAD .oh/.cache` | **0** |
+| live tier 1 / tier 2 | **not run** — daemon offline, no mutating permission |
