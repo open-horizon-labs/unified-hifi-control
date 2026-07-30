@@ -582,8 +582,9 @@ fn gate_is_server_only(meta: &Meta) -> bool {
 #[derive(Default)]
 struct ModuleReferenceVisitor {
     found: BTreeSet<String>,
-    /// Names that address this crate's root, including aliases bound in this file.
+    /// Names that address this crate's root in the module currently being visited.
     roots: BTreeSet<String>,
+    saved: Vec<BTreeSet<String>>,
 }
 
 impl ModuleReferenceVisitor {
@@ -666,41 +667,79 @@ impl<'ast> Visit<'ast> for ModuleReferenceVisitor {
         self.scan_tokens(&mac.tokens);
         visit::visit_macro(self, mac);
     }
-}
 
-/// Names bound to this crate's root in `file`, including `use crate as internal;`.
-///
-/// `use crate as internal;` then `internal::adaptive::X` reached the forbidden module
-/// through a root the visitor had never heard of: the alias statement has a single path
-/// segment so it registered nothing, and the reference began with `internal`. Found by
-/// CodeRabbit at `59523f8`.
-fn crate_root_names(file: &File) -> BTreeSet<String> {
-    #[derive(Default)]
-    struct AliasVisitor {
-        aliases: BTreeSet<String>,
-    }
-    impl<'ast> Visit<'ast> for AliasVisitor {
-        fn visit_use_tree(&mut self, tree: &'ast UseTree) {
-            if let UseTree::Rename(rename) = tree {
-                if CRATE_ROOTS.contains(&rename.ident.to_string().as_str()) {
-                    self.aliases.insert(rename.rename.to_string());
-                }
+    /// Enter a module with its own crate-root scope: aliases it declares become roots for
+    /// its subtree, and a `mod` it declares shadows an inherited alias of the same name.
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        self.saved.push(self.roots.clone());
+        if let Some((_, items)) = &item.content {
+            let (aliases, shadowed) = scope_delta(items);
+            self.roots.extend(aliases);
+            for name in &shadowed {
+                self.roots.remove(name);
             }
-            visit::visit_use_tree(self, tree);
+        }
+        visit::visit_item_mod(self, item);
+        if let Some(previous) = self.saved.pop() {
+            self.roots = previous;
         }
     }
-    let mut visitor = AliasVisitor::default();
-    visitor.visit_file(file);
-    let mut roots: BTreeSet<String> = CRATE_ROOTS.iter().map(|r| (*r).to_string()).collect();
-    roots.extend(visitor.aliases);
-    roots
 }
 
-/// Forbidden module references in `file`, resolving crate-root aliases first.
+/// Crate-root names declared directly among `items`, and local module names that shadow.
+///
+/// A file-global alias set is wrong in both directions. `mod a { use crate as internal; }`
+/// must not make `internal` a crate root inside `mod b`, and a genuine
+/// `use crate as internal;` must stop being one inside a module that declares its own
+/// `mod internal`. Found by Codex reviewing the first alias fix.
+///
+/// This is scope tracking, not name resolution: aliases are inherited by descendants and
+/// shadowed by a sibling `mod` of the same name. That covers the reachable cases without
+/// pretending to resolve Rust's full name lookup.
+fn scope_delta(items: &[Item]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut aliases = BTreeSet::new();
+    let mut shadowed = BTreeSet::new();
+    for item in items {
+        match item {
+            Item::Use(item_use) => collect_crate_aliases(&item_use.tree, &mut aliases),
+            Item::Mod(item_mod) => {
+                shadowed.insert(item_mod.ident.to_string());
+            }
+            _ => {}
+        }
+    }
+    (aliases, shadowed)
+}
+
+fn collect_crate_aliases(tree: &UseTree, out: &mut BTreeSet<String>) {
+    match tree {
+        UseTree::Rename(rename) => {
+            if CRATE_ROOTS.contains(&rename.ident.to_string().as_str()) {
+                out.insert(rename.rename.to_string());
+            }
+        }
+        UseTree::Group(group) => {
+            for item in &group.items {
+                collect_crate_aliases(item, out);
+            }
+        }
+        UseTree::Path(path) => collect_crate_aliases(&path.tree, out),
+        _ => {}
+    }
+}
+
+/// Forbidden module references in `file`, resolving crate-root aliases within their scope.
 fn forbidden_module_references(file: &File) -> Vec<String> {
+    let mut roots: BTreeSet<String> = CRATE_ROOTS.iter().map(|r| (*r).to_string()).collect();
+    let (aliases, shadowed) = scope_delta(&file.items);
+    roots.extend(aliases);
+    for name in &shadowed {
+        roots.remove(name);
+    }
     let mut visitor = ModuleReferenceVisitor {
         found: BTreeSet::new(),
-        roots: crate_root_names(file),
+        roots,
+        saved: Vec::new(),
     };
     visitor.visit_file(file);
     visitor.found.into_iter().collect()
@@ -1576,6 +1615,61 @@ fn a_crate_root_alias_cannot_launder_a_forbidden_module_reference() {
         assert!(
             !forbidden_module_references(&snippet(source)).is_empty(),
             "{label}: an aliased crate root laundered the reference:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn crate_root_aliases_are_scoped_to_the_module_that_declares_them() {
+    // A file-global alias set is wrong in both directions. Found by Codex reviewing the
+    // alias fix at `1c48c2e`.
+    //
+    // Forward: an alias declared inside one module must not make an unrelated *local*
+    // module of the same name look like the crate root somewhere else.
+    let sibling_scope = "mod a {\n    use crate as internal;\n}\nmod b {\n    mod internal {\n        pub mod adaptive {}\n    }\n    fn f() { let _ = internal::adaptive::X; }\n}\n";
+    assert!(
+        forbidden_module_references(&snippet(sibling_scope)).is_empty(),
+        "an alias declared in a sibling module leaked: {:?}\n{sibling_scope}",
+        forbidden_module_references(&snippet(sibling_scope))
+    );
+
+    // The same leak without any shadowing to mask it: `b` declares no `mod internal`, so
+    // only restoring the outer scope on the way out of `a` keeps this clean.
+    let sibling_no_shadow = "mod a {\n    use crate as internal;\n}\nmod b {\n    fn f() { let _ = internal::adaptive::X; }\n}\n";
+    assert!(
+        forbidden_module_references(&snippet(sibling_no_shadow)).is_empty(),
+        "an alias leaked out of the module that declared it: {:?}\n{sibling_no_shadow}",
+        forbidden_module_references(&snippet(sibling_no_shadow))
+    );
+
+    // Reverse: a real crate alias shadowed by a local module of the same name is no longer
+    // the crate root inside that module.
+    let shadowed = "use crate as internal;\nmod b {\n    mod internal {\n        pub mod adaptive {}\n    }\n    fn f() { let _ = internal::adaptive::X; }\n}\n";
+    assert!(
+        forbidden_module_references(&snippet(shadowed)).is_empty(),
+        "a shadowed alias still counted as the crate root: {:?}\n{shadowed}",
+        forbidden_module_references(&snippet(shadowed))
+    );
+
+    // The three genuine exploits must stay caught, so the scoping does not buy its
+    // precision with a false negative.
+    for (label, source) in [
+        (
+            "file-level alias",
+            "use crate as internal;\nfn f() { let _ = internal::adaptive::X; }\n",
+        ),
+        (
+            "alias inherited by a nested module",
+            "use crate as internal;\nmod inner {\n    fn f() { let _ = internal::producers::P; }\n}\n",
+        ),
+        (
+            "alias declared and used in the same module",
+            "mod a {\n    use crate as internal;\n    fn f() { let _ = internal::adaptive::X; }\n}\n",
+        ),
+    ] {
+        assert!(
+            !forbidden_module_references(&snippet(source)).is_empty(),
+            "{label}: scoping introduced a false negative:\n{source}"
         );
     }
 }
