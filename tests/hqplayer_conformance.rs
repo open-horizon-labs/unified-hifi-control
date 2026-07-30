@@ -3520,10 +3520,17 @@ async fn a_nonzero_rate_pin_under_source_is_accepted_and_ignored() {
         "the client must actually have sent the pin: this is a daemon-side refusal, not a \
          client-side suppression. Suppression is #347's"
     );
+    // Assert the *mechanism*, not merely that the call failed. `is_err()` alone would be satisfied
+    // by any error at all — including one for an unrelated reason — so it would pass while telling
+    // us nothing about why. The message must show readback observing the unmoved rate.
+    let err = outcome
+        .expect_err("an unapplied pin must not report success")
+        .to_string();
     assert!(
-        outcome.is_err(),
-        "readback happens to catch the nonzero case, because the requested index differs from the \
-         observed 0. That is the floor holding by arithmetic, not by understanding"
+        err.contains("rate") && err.contains("still reads 0"),
+        "the failure must come from readback observing the rate still at 0, which is the only reason \
+         the floor holds here — it holds by arithmetic rather than by any understanding of \
+         `[source]`, and #347 owns replacing that with a stated reason. Got: {err}"
     );
     h.stop();
 }
