@@ -181,18 +181,53 @@ fn code_only(text: &str) -> String {
     out
 }
 
+/// The `#[cfg(...)]` attributes written in `text`, each as its own readable string.
+///
+/// Extracted rather than matched whole-line because a gate can share a line with the item it
+/// gates, and because `#[cfg_attr(...)]` must not match — it cannot exclude a module.
+fn cfg_attributes_in(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("#[cfg(") {
+        let tail = &rest[start..];
+        match tail.find(")]") {
+            Some(end) => {
+                found.push(tail[..end + 2].to_string());
+                rest = &tail[end + 2..];
+            }
+            None => {
+                // Unterminated on this line. Record what is here rather than dropping a gate.
+                found.push(tail.trim().to_string());
+                break;
+            }
+        }
+    }
+    found
+}
+
 /// Every `#[cfg(...)]` attribute that applies to `pub mod adaptive;` in `source`.
 ///
 /// `None` means the declaration is absent. An empty vector means it is present and ungated.
 ///
-/// Scans for the declaration line rather than the first textual occurrence, because
-/// `str::find` would happily match a doc comment above the real site and then assert about
-/// the wrong line. Brace depth is tracked so a gate on an *enclosing* `mod` block counts
-/// too: wrapping the declaration in `#[cfg(feature = "server")] mod inner { … }` makes the
-/// contract layer server-only just as surely as gating it directly.
+/// Three things this has to get right, each of which hid a real gate at some point:
+///
+/// 1. **The declaration line, not the first textual occurrence.** `str::find` would match a
+///    doc comment above the real site and then assert about the wrong line.
+/// 2. **Enclosing blocks.** Wrapping the declaration in
+///    `#[cfg(feature = "server")] mod inner { … }` makes the contract layer server-only just
+///    as surely as gating it directly, so brace depth is tracked and each frame carries the
+///    gates that opened it.
+/// 3. **Attribute stacks.** A `#[cfg(...)]` need not be the attribute nearest the
+///    declaration — Rust allows any number in any order, so
+///    `#[cfg(feature = "server")]` / `#[allow(dead_code)]` / `pub mod adaptive;` is gated.
+///    Pending gates therefore *accumulate* across consecutive attribute lines.
+///
+/// The accumulation has to stop somewhere, or every ungated `pub mod` below the server block
+/// in `src/lib.rs` would be reported as gated. It stops at the next item or block: whatever
+/// consumes the attributes owns them, and they do not carry forward.
 fn adaptive_declaration_gates(source: &str) -> Option<Vec<String>> {
-    let mut enclosing: Vec<Option<String>> = Vec::new();
-    let mut pending: Option<String> = None;
+    let mut enclosing: Vec<Vec<String>> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
     let mut gates: Option<Vec<String>> = None;
 
     for line in code_only(source).lines() {
@@ -200,29 +235,33 @@ fn adaptive_declaration_gates(source: &str) -> Option<Vec<String>> {
         if trimmed.is_empty() {
             continue;
         }
+        // The declaration consumes any pending attributes, plus every enclosing frame.
         if let Some(prefix) = trimmed.strip_suffix(ADAPTIVE_DECLARATION) {
-            let mut found = Vec::new();
-            if prefix.contains("#[cfg(") {
-                found.push(prefix.trim().to_string());
-            }
-            found.extend(pending.take());
+            let mut found = cfg_attributes_in(prefix);
+            found.append(&mut pending);
             found.extend(enclosing.iter().flatten().cloned());
             gates = Some(found);
             continue;
         }
-        if trimmed.starts_with("#[cfg(") {
-            pending = Some(trimmed.to_string());
-            continue;
-        }
+        // A block opener consumes them instead, and holds them until it closes.
         if trimmed.ends_with('{') {
-            enclosing.push(pending.take());
+            let mut frame = cfg_attributes_in(trimmed);
+            frame.append(&mut pending);
+            enclosing.push(frame);
             continue;
         }
         if trimmed == "}" {
             enclosing.pop();
             continue;
         }
-        pending = None;
+        // An attribute adds to the stack without disturbing what is already there. `#![…]`
+        // crate attributes land here too and contribute nothing, which is correct.
+        if trimmed.starts_with('#') {
+            pending.extend(cfg_attributes_in(trimmed));
+            continue;
+        }
+        // Any other item consumed the attributes above it. They are not ours.
+        pending.clear();
     }
     gates
 }
@@ -320,6 +359,65 @@ fn gate_detection_survives_whitespace_and_the_declaration_scan_finds_the_real_si
     );
 
     assert_eq!(adaptive_declaration_gates("pub mod other;\n"), None);
+}
+
+#[test]
+fn stacked_attributes_do_not_hide_a_cfg_gate_on_the_declaration() {
+    // A `#[cfg(...)]` does not have to be the attribute nearest the declaration. Rust allows
+    // any number of attributes in any order, so a gate two lines up is still a gate - and a
+    // scan that remembers only the previous line reports the module as shared while the build
+    // excludes it from the web target.
+    let stacked = "#[cfg(feature = \"server\")]\n\
+                   #[allow(dead_code)]\n\
+                   pub mod adaptive;\n";
+    assert_eq!(
+        adaptive_declaration_gates(stacked),
+        Some(vec!["#[cfg(feature = \"server\")]".to_string()]),
+        "a cfg attribute above another attribute still gates the declaration"
+    );
+
+    // Order does not matter, and several gates stack.
+    let after = "#[allow(dead_code)]\n#[cfg(feature = \"server\")]\npub mod adaptive;\n";
+    assert_eq!(
+        adaptive_declaration_gates(after),
+        Some(vec!["#[cfg(feature = \"server\")]".to_string()])
+    );
+    let both = "#[cfg(feature = \"server\")]\n\
+                #[doc = \"shared\"]\n\
+                #[cfg(feature = \"web\")]\n\
+                pub mod adaptive;\n";
+    assert_eq!(
+        adaptive_declaration_gates(both),
+        Some(vec![
+            "#[cfg(feature = \"server\")]".to_string(),
+            "#[cfg(feature = \"web\")]".to_string(),
+        ])
+    );
+
+    // The other half of the property: an attribute stack that belongs to a *different* item
+    // must not leak onto the declaration. Accumulating without this would report every
+    // ungated declaration below the server block in `src/lib.rs` as gated.
+    let neighbour = "#[cfg(feature = \"server\")]\n\
+                     #[allow(dead_code)]\n\
+                     pub mod bus;\n\
+                     pub mod adaptive;\n";
+    assert_eq!(
+        adaptive_declaration_gates(neighbour),
+        Some(Vec::new()),
+        "a gate consumed by an earlier item must not carry forward"
+    );
+
+    // Nor may a gate consumed by an enclosing block be double-counted once the block closes.
+    let closed = "#[cfg(feature = \"server\")]\n\
+                  mod inner {\n\
+                      pub fn helper() {}\n\
+                  }\n\
+                  pub mod adaptive;\n";
+    assert_eq!(adaptive_declaration_gates(closed), Some(Vec::new()));
+
+    // And the real file must still read as ungated, which is the assertion that matters.
+    let lib = fs::read_to_string("src/lib.rs").expect("src/lib.rs readable");
+    assert_eq!(adaptive_declaration_gates(&lib), Some(Vec::new()));
 }
 
 #[test]
