@@ -3593,6 +3593,40 @@ fn a_synthetic_profile_is_never_evidence() {
     }
 }
 
+/// `source_chain` is a closed vocabulary, asserted **exactly** (#341 execute review, HQP-C-057).
+///
+/// The other source_chain checks use `source_chain.contains("read-via-report")`, which passes even
+/// when the field also carries explanatory prose — which is how thirteen fixtures kept whole
+/// sentences inside the closed-vocabulary field, five caught in an earlier pass and eight more here.
+/// This asserts the field is *exactly* one of the allowed tokens, so prose (or any drift) fails here
+/// rather than being masked by a substring match. The explanation of how a fixture was obtained
+/// belongs in `notes`, never in this field.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn source_chain_is_exactly_a_closed_vocabulary_token() {
+    // `read-via-report` is the only recorded chain; `unrecorded` is the parser default for fixtures
+    // that cite no upstream file. Kept here, outside the parser, so the corpus cannot widen its own
+    // vocabulary.
+    const KNOWN: [&str; 2] = ["read-via-report", "unrecorded"];
+    let offenders: Vec<String> = corpus::profiles()
+        .iter()
+        .flat_map(|p| {
+            let p = p.clone();
+            corpus::all_in(&p)
+                .into_iter()
+                .map(move |f| (p.clone(), f.name, f.provenance.source_chain))
+        })
+        .filter(|(_, _, chain)| !KNOWN.contains(&chain.as_str()))
+        .map(|(profile, name, chain)| format!("{profile}/{name}: source_chain = {chain:?}"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "source_chain must be exactly one of {KNOWN:?}; explanations belong in `notes`, not embedded \
+         in this closed-vocabulary field. Offenders (prose or unknown value):\n{offenders:#?}"
+    );
+}
+
 /// `corpus::carries` is extension-aware, not `.xml`-only (CodeRabbit review 4823413965, finding 4).
 ///
 /// The stateful model's fixture lookup used to hardcode `{profile}/{stem}.xml` to decide whether a

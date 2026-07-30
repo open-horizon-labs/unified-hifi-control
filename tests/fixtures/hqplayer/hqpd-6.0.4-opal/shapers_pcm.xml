@@ -1,12 +1,12 @@
 <!--
   provenance:
     source: UHC-SALVAGE-UI-DATA-INTEGRATION.md and UHC-SALVAGE-BETA-DEV.md (2026-07-29 comparative salvage reports), which cite https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 6, SetShaping / GetShapers)
-    source_chain: read-via-report. The upstream file was NOT read directly for this fixture; the salvage report is the immediate source and the upstream ref is the report's own citation. Recorded because two errors in this amendment came from treating a report's citation as if it had been read: a path that does not exist at the ref given, and a superseded claim the report's own newer companion had already corrected.
+    source_chain: read-via-report
     daemon: hqplayerd 6.0.4 (Opal), PCM mode
     status: derived-excerpt
     date: 2026-07-29
     playback: unknown
-    notes: PCM mode dithers. INCOMPLETE EXCERPT - 9 of a reported 10 entries. The salvage report states the PCM list has 10 entries and then names only these 9 (none/NS1/NS4/NS5/NS9/LNS15/TPDF/Gauss1/shaped), so the tenth is unaccounted for in the evidence and is NOT invented here. The discrepancy is left visible rather than normalised to 9, because the missing entry is a real gap in provenance and closing it needs a live GetShapers capture (#332). Nothing may treat this list as complete: status is derived-excerpt and the conformance test parses whatever the fixture holds rather than asserting a count. Enum IDs are derived, not live-observed.
+    notes: PCM mode dithers. INCOMPLETE EXCERPT - 9 of a reported 10 entries. The salvage report states the PCM list has 10 entries and then names only these 9 (none/NS1/NS4/NS5/NS9/LNS15/TPDF/Gauss1/shaped), so the tenth is unaccounted for in the evidence and is NOT invented here. The discrepancy is left visible rather than normalised to 9, because the missing entry is a real gap in provenance and closing it needs a live GetShapers capture (#332). Nothing may treat this list as complete: status is derived-excerpt and the conformance test parses whatever the fixture holds rather than asserting a count. Enum IDs are derived, not live-observed. Source chain: read-via-report - the upstream file was NOT read directly for this fixture; the salvage report is the immediate source and the upstream ref is the report's own citation, recorded because two errors in this amendment came from treating a report's citation as if it had been read (a path that did not exist at the ref given, and a superseded claim the report's own newer companion had already corrected).
 -->
 <GetShapers>
 <ShapersItem index="0" name="none" value="0"/>
