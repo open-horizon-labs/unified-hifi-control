@@ -26,6 +26,10 @@
 // Note: clippy::pedantic, clippy::nursery, and clippy::cargo are NOT enabled
 // because they have hundreds of existing violations. Enable incrementally.
 
+// Adaptive-control producer contract (shared: server, WASM consumers, MCP).
+// Deliberately not feature-gated - see src/adaptive/mod.rs for the dependency rule.
+pub mod adaptive;
+
 // Dioxus UI app (shared between server SSR and WASM client)
 pub mod app;
 
