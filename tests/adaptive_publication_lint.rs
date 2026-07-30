@@ -442,22 +442,143 @@ fn attributes_attached_to(source: &str, declaration: &str) -> Option<Vec<String>
     attached
 }
 
-/// Whether an attribute would make its item serializable.
+/// Every name by which serde's `Serialize`/`Deserialize` can be spelled in `code`.
 ///
-/// Covers `#[derive(Serialize)]` and `#[cfg_attr(…, derive(Serialize))]` alike: the question
-/// is whether the attribute introduces a serialization derive under *any* configuration, not
-/// which spelling it used. A `cfg_attr` gate does not make it safe — it makes it conditional,
-/// and the condition is somebody else's to set.
-fn introduces_serialization(attribute: &str) -> Option<&'static str> {
-    let squeezed: String = attribute.chars().filter(|c| !c.is_whitespace()).collect();
-    if !squeezed.contains("derive(") {
-        return None;
+/// Always includes the canonical two. Adds any **alias**, because
+/// `use serde::Serialize as EventWire;` binds the trait *and* the derive macro under that
+/// name — so `#[derive(EventWire)]` and `impl EventWire for AdaptiveEvent` both compile and
+/// neither contains the substring `Serialize`. Verified by compiling both forms against the
+/// real module before this was written. Found by CodeRabbit at `b35af10`.
+///
+/// Matching is on the **exact final path segment**, never a prefix: `serde::Serializer` and
+/// `serde::de::DeserializeOwned` are ordinary serde imports that must not register as the
+/// serialization traits, and both would match a substring test.
+fn serialization_names(code: &str) -> Vec<String> {
+    let mut names: Vec<String> = vec!["Serialize".to_string(), "Deserialize".to_string()];
+    let normalized = collapse_whitespace(code);
+    let mut rest = normalized.as_str();
+
+    while let Some(at) = rest.find("use serde") {
+        let tail = &rest[at + 4..];
+        let statement = match tail.find(';') {
+            Some(end) => &tail[..end],
+            None => tail,
+        };
+        rest = &tail[statement.len().min(tail.len())..];
+
+        // `use serde::{a, b}` or `use serde::a` (possibly via `ser::` / `de::`).
+        let items: Vec<String> = match (statement.find('{'), statement.rfind('}')) {
+            (Some(open), Some(close)) if open < close => {
+                let base = &statement[..open];
+                split_top_level(&statement[open + 1..close])
+                    .into_iter()
+                    .map(|item| format!("{base}{item}"))
+                    .collect()
+            }
+            _ => vec![statement.to_string()],
+        };
+
+        for item in items {
+            let (path, alias) = match item.split_once(" as ") {
+                Some((path, alias)) => (path.trim(), Some(alias.trim())),
+                None => (item.trim(), None),
+            };
+            let Some(last) = path.rsplit("::").next() else {
+                continue;
+            };
+            if last != "Serialize" && last != "Deserialize" {
+                continue;
+            }
+            if let Some(alias) = alias {
+                if !alias.is_empty() && !names.iter().any(|held| held == alias) {
+                    names.push(alias.to_string());
+                }
+            }
+        }
     }
-    // Matched on the capitalized trait names, which do not overlap: `Deserialize` contains
-    // a lower-case `serialize`, never `Serialize`, so neither can be mistaken for the other.
-    ["Serialize", "Deserialize"]
+    names
+}
+
+/// The trait names an attribute would derive, as final path segments.
+///
+/// Reads every `derive(...)` list in the attribute, including one nested inside
+/// `cfg_attr(...)`, and splits it into tokens so matching is exact rather than substring —
+/// `#[derive(Serializer)]` must not be mistaken for `#[derive(Serialize)]`.
+fn derive_tokens(attribute: &str) -> Vec<String> {
+    let normalized = collapse_whitespace(attribute);
+    let mut tokens = Vec::new();
+    let mut rest = normalized.as_str();
+    while let Some(at) = rest.find("derive(") {
+        let after = &rest[at + "derive(".len()..];
+        let mut depth = 1usize;
+        let mut end = after.len();
+        for (index, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = index;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for item in after[..end].split(',') {
+            let token = item.trim().rsplit("::").next().unwrap_or_default().trim();
+            if !token.is_empty() {
+                tokens.push(token.to_string());
+            }
+        }
+        rest = &after[end.min(after.len())..];
+    }
+    tokens
+}
+
+/// Whether an attribute would make its item serializable, under any name.
+///
+/// Covers `#[derive(Serialize)]`, `#[cfg_attr(…, derive(Serialize))]` and
+/// `#[derive(EventWire)]` where `EventWire` is an alias for one of the traits. A `cfg_attr`
+/// gate does not make it safe — it makes it conditional, and the condition is somebody
+/// else's to set.
+fn introduces_serialization(attribute: &str, names: &[String]) -> Option<String> {
+    derive_tokens(attribute)
         .into_iter()
-        .find(|forbidden| squeezed.contains(forbidden))
+        .find(|token| names.iter().any(|name| name == token))
+}
+
+/// Whether `code` hand-writes a serialization impl for `type_name`, under any name.
+///
+/// Scans back from each `for <type_name>` to the `impl` that opened it, so
+/// `impl<'de> Deserialize<'de> for AdaptiveEvent` is caught — the previous check looked for
+/// the literal `DeserializeforAdaptiveEvent` and that idiomatic form never produces it.
+fn handwritten_serialization_impl(code: &str, type_name: &str, names: &[String]) -> Option<String> {
+    let normalized = collapse_whitespace(code);
+    let needle = format!("for {type_name}");
+    let mut search_from = 0usize;
+    while let Some(at) = normalized[search_from..].find(&needle) {
+        let absolute = search_from + at;
+        // The character after the match must end the type name, or `AdaptiveEventLog` would
+        // count as `AdaptiveEvent`.
+        let after = normalized[absolute + needle.len()..].chars().next();
+        let terminated = after.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if terminated {
+            if let Some(impl_at) = normalized[..absolute].rfind("impl") {
+                let header = &normalized[impl_at..absolute];
+                for name in names {
+                    let mentioned = header
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|token| token == name);
+                    if mentioned {
+                        return Some(name.clone());
+                    }
+                }
+            }
+        }
+        search_from = absolute + needle.len();
+    }
+    None
 }
 
 // =============================================================================
@@ -551,7 +672,14 @@ fn lint_adaptive_event_derives_no_serialization() {
     // `#[derive(Serialize)]` above a later `#[derive(Debug, Clone)]` was invisible to the
     // previous `rfind("#[derive(")` scan, as was any `#[cfg_attr(…, derive(Serialize))]`,
     // which the scan never looked for at all. Found by CodeRabbit at `eebde11`.
+    //
+    // Aliases are resolved rather than assumed away: `use serde::Serialize as EventWire;`
+    // binds the derive macro *and* the trait under a name containing no forbidden
+    // substring. Found by CodeRabbit at `b35af10`.
     let event = fs::read_to_string("src/producers/event.rs").expect("src/producers/event.rs");
+    let code = code_only(&event);
+    let names = serialization_names(&code);
+
     let attributes =
         attributes_attached_to(&event, ADAPTIVE_EVENT_DECLARATION).unwrap_or_else(|| {
             panic!("src/producers/event.rs must declare `{ADAPTIVE_EVENT_DECLARATION}`")
@@ -559,7 +687,7 @@ fn lint_adaptive_event_derives_no_serialization() {
     let offenders: Vec<String> = attributes
         .iter()
         .filter_map(|attribute| {
-            introduces_serialization(attribute)
+            introduces_serialization(attribute, &names)
                 .map(|trait_name| format!("{trait_name} via {attribute}"))
         })
         .collect();
@@ -571,17 +699,42 @@ fn lint_adaptive_event_derives_no_serialization() {
     );
 
     // A hand-written impl defeats the same guarantee without any derive at all.
-    let squeezed: String = code_only(&event)
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    for forbidden in ["Serialize", "Deserialize"] {
-        assert!(
-            !squeezed.contains(&format!("{forbidden}forAdaptiveEvent")),
-            "AdaptiveEvent has a hand-written `{forbidden}` impl, which reaches a wire just \
-             as surely as a derive."
+    if let Some(name) = handwritten_serialization_impl(&code, "AdaptiveEvent", &names) {
+        panic!(
+            "AdaptiveEvent has a hand-written `{name}` impl, which reaches a wire just as \
+             surely as a derive."
         );
     }
+}
+
+#[test]
+fn lint_the_internal_event_module_imports_no_serialization_trait() {
+    // The structural half, and the one that makes aliasing moot rather than merely detected.
+    //
+    // Resolving aliases catches `use serde::Serialize as EventWire;`. Forbidding the import
+    // outright removes the question: this module exists to hold the one producer type that
+    // cannot reach a wire, so it has no legitimate need for a serialization trait under any
+    // name. If that ever changes it should be a deliberate edit that has to delete this
+    // test, not an import nobody noticed.
+    let event = fs::read_to_string("src/producers/event.rs").expect("src/producers/event.rs");
+    let code = code_only(&event);
+
+    let aliases: Vec<String> = serialization_names(&code)
+        .into_iter()
+        .filter(|name| name != "Serialize" && name != "Deserialize")
+        .collect();
+    assert!(
+        aliases.is_empty(),
+        "src/producers/event.rs aliases a serialization trait: {aliases:?}. An alias makes \
+         `#[derive(…)]` and `impl … for AdaptiveEvent` invisible to any literal scan."
+    );
+
+    assert!(
+        !code.contains("serde"),
+        "src/producers/event.rs references serde. This module exists to hold the one \
+         producer type that cannot reach a wire; a serialization import here needs a \
+         deliberate justification, not a silent addition."
+    );
 }
 
 #[test]
@@ -758,12 +911,13 @@ fn a_serializing_adaptive_event_is_rejected_however_it_is_spelled() {
         // 7. Sharing the line with the declaration.
         "#[derive(Debug)] #[derive(Serialize)] pub enum AdaptiveEvent {\n}\n",
     ] {
+        let names = serialization_names(source);
         let attributes = attributes_attached_to(source, ADAPTIVE_EVENT_DECLARATION)
             .unwrap_or_else(|| panic!("declaration not found in:\n{source}"));
         assert!(
             attributes
                 .iter()
-                .any(|attribute| introduces_serialization(attribute).is_some()),
+                .any(|attribute| introduces_serialization(attribute, &names).is_some()),
             "a serializing AdaptiveEvent was admitted:\n{source}\nattributes: {attributes:?}"
         );
     }
@@ -783,13 +937,135 @@ fn a_non_serializing_adaptive_event_is_accepted() {
     ] {
         let attributes = attributes_attached_to(source, ADAPTIVE_EVENT_DECLARATION)
             .unwrap_or_else(|| panic!("declaration not found in:\n{source}"));
+        let names = serialization_names(source);
         let offenders: Vec<_> = attributes
             .iter()
-            .filter(|attribute| introduces_serialization(attribute).is_some())
+            .filter(|attribute| introduces_serialization(attribute, &names).is_some())
             .collect();
         assert!(
             offenders.is_empty(),
             "the scanner invented a serialization derive in:\n{source}\nfound: {offenders:?}"
+        );
+    }
+}
+
+#[test]
+fn an_aliased_serialization_trait_is_rejected() {
+    // `use serde::Serialize as EventWire;` binds the derive macro *and* the trait under a
+    // name containing neither "Serialize" nor "Deserialize", so every literal scan passes
+    // while the type is fully serializable. Both forms were compiled against the real
+    // module to confirm this before the test was written: `cargo build --lib` finished
+    // clean with an aliased derive and an aliased hand-written impl in place, and
+    // `lint_adaptive_event_derives_no_serialization` passed. Found by CodeRabbit at
+    // `b35af10`.
+    for (label, source) in [
+        (
+            "aliased derive",
+            "use serde::Serialize as EventWire;\n#[derive(EventWire)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "aliased derive stacked behind the innocent one",
+            "use serde::Serialize as EventWire;\n#[derive(EventWire)]\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "aliased Deserialize",
+            "use serde::Deserialize as EventRead;\n#[derive(Debug)]\n#[derive(EventRead)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "aliased inside a grouped import",
+            "use serde::{Serialize as EventWire, Deserializer};\n#[derive(EventWire)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "aliased via cfg_attr",
+            "use serde::Serialize as EventWire;\n#[cfg_attr(feature = \"x\", derive(EventWire))]\n#[derive(Debug)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "aliased through a submodule path",
+            "use serde::ser::Serialize as EventWire;\n#[derive(EventWire)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+    ] {
+        let names = serialization_names(source);
+        let attributes = attributes_attached_to(source, ADAPTIVE_EVENT_DECLARATION)
+            .unwrap_or_else(|| panic!("declaration not found for {label}:\n{source}"));
+        assert!(
+            attributes
+                .iter()
+                .any(|attribute| introduces_serialization(attribute, &names).is_some()),
+            "{label} was admitted:\n{source}\nresolved names: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn an_aliased_handwritten_impl_is_rejected() {
+    for (label, source) in [
+        (
+            "aliased impl",
+            "use serde::Serialize as EventWire;\nimpl EventWire for AdaptiveEvent {}\n",
+        ),
+        (
+            "aliased Deserialize impl with a lifetime",
+            "use serde::Deserialize as EventRead;\nimpl<'de> EventRead<'de> for AdaptiveEvent {}\n",
+        ),
+        (
+            "canonical impl with a lifetime, which the previous literal scan also missed",
+            "impl<'de> Deserialize<'de> for AdaptiveEvent {}\n",
+        ),
+        ("canonical impl", "impl Serialize for AdaptiveEvent {}\n"),
+    ] {
+        let names = serialization_names(source);
+        assert!(
+            handwritten_serialization_impl(source, "AdaptiveEvent", &names).is_some(),
+            "{label} was admitted:\n{source}\nresolved names: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn unrelated_aliases_and_imports_do_not_false_positive() {
+    // Positive controls. Two of these are the specific traps in exact-name matching:
+    // `Serializer` has `Serialize` as a prefix, and `DeserializeOwned` has `Deserialize`
+    // as one. Both are ordinary serde imports that must not register as the traits.
+    for (label, source) in [
+        (
+            "Serializer is not Serialize",
+            "use serde::Serializer;\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "DeserializeOwned is not Deserialize",
+            "use serde::de::DeserializeOwned;\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "an alias of something else entirely",
+            "use std::fmt::Display as EventWire;\n#[derive(EventWire)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "a serializing impl for a different type",
+            "use serde::Serialize as EventWire;\nimpl EventWire for SomethingElse {}\n#[derive(Debug)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "a prefix-sharing type name",
+            "impl Serialize for AdaptiveEventLog {}\n#[derive(Debug)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "an unrelated impl for the right type",
+            "impl Clone for AdaptiveEvent {}\n#[derive(Debug)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+    ] {
+        let names = serialization_names(source);
+        let attributes = attributes_attached_to(source, ADAPTIVE_EVENT_DECLARATION)
+            .unwrap_or_else(|| panic!("declaration not found for {label}:\n{source}"));
+        let derived: Vec<_> = attributes
+            .iter()
+            .filter_map(|attribute| introduces_serialization(attribute, &names))
+            .collect();
+        assert!(
+            derived.is_empty(),
+            "{label} produced a false positive on a derive: {derived:?}\n{source}"
+        );
+        assert!(
+            handwritten_serialization_impl(source, "AdaptiveEvent", &names).is_none(),
+            "{label} produced a false positive on an impl\n{source}\nnames: {names:?}"
         );
     }
 }
