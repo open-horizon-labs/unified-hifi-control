@@ -78,14 +78,11 @@ impl Query {
     /// The element the daemon answers with.
     ///
     /// Stated per query rather than assumed equal to the request. Every family the reference documents
-    /// does echo its request element, and this mapping records that as a checked fact — if a future
-    /// daemon answers a query under a different name, the fix is one line here instead of a timeout
-    /// nobody can explain.
-    /// Every family the reference documents answers under its own request element, so today this is the
-    /// identity. It exists as a separate function anyway: the moment one family answers under a
-    /// different name, the fix is one arm here rather than a timeout nobody can explain. The matrix
-    /// pair was checked specifically, being the likeliest to diverge — one is a container of
-    /// `MatrixProfile` children, the other a single current-selection element — and both echo.
+    /// answers under its own request element, so today this is the identity — but it exists as a
+    /// separate function anyway: the moment one family answers under a different name, the fix is one
+    /// arm here rather than a timeout nobody can explain. The matrix pair was checked specifically,
+    /// being the likeliest to diverge — one is a container of `MatrixProfile` children, the other a
+    /// single current-selection element — and both echo.
     pub fn reply_element(self) -> &'static str {
         self.element()
     }
@@ -272,33 +269,131 @@ fn element_attrs(fragment: &str) -> Vec<(String, String)> {
 ///
 /// Applied to every raw document before it is recorded, so the sanitiser is not something a caller can
 /// forget to invoke.
+/// The single list of substrings that mark a name, attribute, or text run as unsafe to keep.
+///
+/// One definition, deliberately. Three copies of this list existed briefly and had already drifted
+/// (`"apikey"` here, `"key"` in the config projection), which is the same failure mode as the leak
+/// this list exists to prevent: add `"bearer"` to one copy, miss the others, reopen the hole. The
+/// union is used, so matching stays as broad as the broadest former copy.
+///
+/// `"key"` is deliberately broad and now also drives *text* redaction, not just attribute matching, so
+/// its blast radius grew: an element named `monkey` would have its text dropped. That is accepted —
+/// HQPlayer's protocol vocabulary (`State`, `Status`, `FiltersItem`, `index`, `value`, `arg`, `rate`)
+/// contains no such name, and over-redaction costs evidence while under-redaction costs a secret.
+pub const SENSITIVE_MARKERS: [&str; 9] = [
+    "password",
+    "passwd",
+    "csrf",
+    "token",
+    "nonce",
+    "authorization",
+    "secret",
+    "key",
+    "bearer",
+];
+
+/// True when `text` contains any [`SENSITIVE_MARKERS`] substring, case-insensitively.
+pub fn is_sensitive(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    SENSITIVE_MARKERS.iter().any(|m| lower.contains(m))
+}
+
 pub fn sanitize(document: &str) -> String {
+    // Element TEXT as well as tags. An earlier version redacted only tags, so
+    // `<password>SEKRET</password>` became `<!-- redacted -->SEKRET<!-- redacted -->` and the secret
+    // survived between them. Walking with quick-xml means a sensitive element's text is dropped with
+    // the element rather than left stranded in the output.
     let mut out = String::with_capacity(document.len());
-    let mut rest = document;
-    while let Some(at) = rest.find('<') {
-        out.push_str(&rest[..at]);
-        let tail = &rest[at..];
-        let end = tail.find('>').map(|e| e + 1).unwrap_or(tail.len());
-        let tag = &tail[..end];
-        let lower = tag.to_lowercase();
-        let sensitive = [
-            "hidden",
-            "password",
-            "passwd",
-            "csrf",
-            "token",
-            "nonce",
-            "authorization",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle));
-        if sensitive {
-            out.push_str("<!-- redacted: sensitive attribute or hidden input -->");
-        } else {
-            out.push_str(tag);
+    let mut reader = quick_xml::Reader::from_str(document);
+    reader.config_mut().check_end_names = false;
+    let mut suppress_depth = 0usize;
+
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Decl(_)) => out.push_str("<?xml version=\"1.0\"?>"),
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let hostile = is_hostile_tag(&e);
+                if hostile || suppress_depth > 0 {
+                    if suppress_depth == 0 {
+                        out.push_str("<!-- redacted: sensitive element -->");
+                    }
+                    suppress_depth += 1;
+                } else {
+                    out.push('<');
+                    out.push_str(&render_start(&e));
+                    out.push('>');
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                let hostile = is_hostile_tag(&e);
+                if suppress_depth == 0 && hostile {
+                    out.push_str("<!-- redacted: sensitive element -->");
+                } else if suppress_depth == 0 {
+                    out.push('<');
+                    out.push_str(&render_start(&e));
+                    out.push_str("/>");
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                if suppress_depth > 0 {
+                    suppress_depth -= 1;
+                } else {
+                    out.push_str("</");
+                    out.push_str(&String::from_utf8_lossy(e.name().as_ref()));
+                    out.push('>');
+                }
+            }
+            Ok(quick_xml::events::Event::Text(t)) => {
+                if suppress_depth == 0 {
+                    let text = t.unescape().map(|v| v.into_owned()).unwrap_or_default();
+                    // Belt and braces: text that itself looks like a credential line goes too.
+                    if is_sensitive(&text) {
+                        out.push_str("<!-- redacted: sensitive text -->");
+                    } else {
+                        // Re-escape. The text was decoded to inspect it, so emitting it verbatim would
+                        // put a bare `&` back into the document and the artifact embeds these as
+                        // evidence — sanitised output that no longer reparses is not evidence.
+                        out.push_str(&quick_xml::escape::escape(&text));
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            Ok(_) => {}
         }
-        rest = &tail[end..];
     }
-    out.push_str(rest);
+    out
+}
+
+/// Whether a tag must be dropped whole, along with everything inside it.
+///
+/// One definition covering both `Start` and `Empty`: the check was duplicated in the two arms, which
+/// is the same drift risk as the three copies of the marker list.
+fn is_hostile_tag(e: &quick_xml::events::BytesStart<'_>) -> bool {
+    if is_sensitive(&String::from_utf8_lossy(e.name().as_ref())) {
+        return true;
+    }
+    e.attributes().filter_map(Result::ok).any(|a| {
+        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+        // `type="hidden"` specifically, rather than "hidden" appearing in any attribute value: an
+        // unrelated `status="Hidden"` would otherwise cost a whole element of evidence for nothing.
+        // Secret-*named* attributes are already covered by `is_sensitive` on the key.
+        is_sensitive(&key)
+            || (key.eq_ignore_ascii_case("type")
+                && String::from_utf8_lossy(a.value.as_ref()).eq_ignore_ascii_case("hidden"))
+    })
+}
+
+/// Re-render a start tag's name and attributes, dropping any attribute whose name or value is
+/// sensitive.
+fn render_start(e: &quick_xml::events::BytesStart<'_>) -> String {
+    let mut out = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+    for a in e.attributes().filter_map(Result::ok) {
+        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+        let value = String::from_utf8_lossy(a.value.as_ref()).into_owned();
+        if is_sensitive(&key) || is_sensitive(&value) {
+            continue;
+        }
+        out.push_str(&format!(" {key}=\"{value}\""));
+    }
     out
 }

@@ -2636,3 +2636,246 @@ async fn tier1_observes_every_native_family_through_the_raw_lane() {
     );
     h.stop();
 }
+
+/// The sanitiser is applied to raw protocol XML, which is allowed to be retained, so its own holes
+/// matter. Tag-level redaction left `<password>SEKRET</password>` as
+/// `<!-- redacted -->SEKRET<!-- redacted -->` — the secret stranded between the removed tags.
+#[test]
+fn the_sanitiser_drops_sensitive_element_text_not_just_the_tags() {
+    use mock_servers::hqplayer::raw::sanitize;
+    let cases = [
+        "<config><password>SEKRET</password></config>",
+        "<config><token>tok-abcdef</token></config>",
+        "<config><x auth_token=\"SEKRET\"/></config>",
+        "<config><input type='hidden' name='csrf' value='SEKRET'/></config>",
+        "<config><div>Authorization: Digest cnonce=SEKRET</div></config>",
+        "<config><wrapper><secret>SEKRET</secret></wrapper></config>",
+    ];
+    let leaks: Vec<&str> = cases
+        .into_iter()
+        .filter(|doc| {
+            let clean = sanitize(doc);
+            clean.contains("SEKRET") || clean.contains("tok-abcdef")
+        })
+        .collect();
+    assert!(
+        leaks.is_empty(),
+        "a sensitive element's text must go with the element, not be stranded in the output. \
+         Leaked from: {leaks:?}"
+    );
+}
+
+#[test]
+fn the_sanitiser_keeps_ordinary_protocol_content_intact() {
+    use mock_servers::hqplayer::raw::sanitize;
+    let doc = "<?xml version=\"1.0\"?><GetInfo engine=\"6.0.4\" name=\"Opal\" version=\"6\"/>";
+    let clean = sanitize(doc);
+    assert!(
+        clean.contains("engine=\"6.0.4\"")
+            && clean.contains("name=\"Opal\"")
+            && clean.contains("GetInfo"),
+        "sanitising must not destroy the evidence it exists to make safe to keep; got {clean}"
+    );
+}
+
+/// The redaction list must have exactly one definition. Three copies existed briefly and had already
+/// diverged (`"apikey"` in the sanitiser, `"key"` in the config projection) — which is the very
+/// failure mode the list exists to prevent: extend one copy, miss the others, reopen the hole. This
+/// is a lint, not a behaviour test, so it fails on the duplication rather than on a later leak.
+#[test]
+fn the_redaction_marker_list_has_exactly_one_definition() {
+    let mut definitions = Vec::new();
+    for entry in walkdir::WalkDir::new("tests")
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+    {
+        let body = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        for (n, line) in body.lines().enumerate() {
+            // A literal array of redaction markers, wherever it is declared.
+            // Needles are split so this lint's own source line is not a match for itself.
+            let decl = concat!("SENSITIVE", "");
+            // Only a marker ARRAY trips this. A future `const SENSITIVE_TIMEOUT: Duration` is not a
+            // second redaction list, and failing on it would point the next reader at the wrong idea.
+            let is_marker_array = line.contains("const ") && line.contains(": [&str;");
+            if line.contains(decl) && is_marker_array {
+                definitions.push(format!("{}:{}", entry.path().display(), n + 1));
+            }
+        }
+    }
+    assert_eq!(
+        definitions.len(),
+        1,
+        "expected one definition of the redaction markers, found {}: {definitions:?}. \
+         Import `raw::is_sensitive` instead of declaring a second list.",
+        definitions.len()
+    );
+}
+
+// =============================================================================
+// Tier-1 config read side: the evidence must come from the raw lane
+// =============================================================================
+
+/// A minimal HTTP/1.1 fake for the `/config` read side. The web lane had no hermetic coverage at all,
+/// which is how a defect in it survived: `capture()` sourced `config_profiles` from
+/// `fetch_profiles()` — the *semantic* parser — silently discarding the raw projection taken from
+/// `/config`. Serving deliberately different content on the two paths makes the source observable.
+struct FakeConfigWeb {
+    port: u16,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl FakeConfigWeb {
+    /// `config_page` is served at `/config`; `profile_page` at `/config/profile/load`.
+    async fn start(config_page: &'static str, profile_page: &'static str) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake config web");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    // Longest path first: `/config` is a prefix of `/config/profile/load`.
+                    let body = if head.contains("/config/profile/load") {
+                        profile_page
+                    } else {
+                        config_page
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        Self { port, handle }
+    }
+
+    fn stop(self) {
+        self.handle.abort();
+    }
+}
+
+/// The two pages name different profiles. Whichever set lands in the capture names its source.
+const CONFIG_PAGE_RAW_LANE: &str = r#"<html><body><form>
+    <input type="text" name="matrix_profile"/>
+    <select name="profile">
+      <option value="raw-a">Raw Lane A</option>
+      <option value="raw-b">Raw Lane B</option>
+    </select>
+</form></body></html>"#;
+
+const PROFILE_PAGE_SEMANTIC_LANE: &str = r#"<html><body><form>
+    <select name="profile">
+      <option value="semantic-z">Semantic Lane Z</option>
+    </select>
+</form></body></html>"#;
+
+/// Codex finding 7: evidence must be read off the raw lane, not reconstructed after semantic parsing.
+/// `config_profiles` was assigned from the `/config` projection and then unconditionally overwritten
+/// in *both* arms of the `fetch_profiles()` match, so the projection could never survive.
+#[tokio::test]
+async fn tier1_takes_the_config_profile_evidence_from_the_raw_page_not_the_semantic_parser() {
+    let web = FakeConfigWeb::start(CONFIG_PAGE_RAW_LANE, PROFILE_PAGE_SEMANTIC_LANE).await;
+    let h = Harness::start(VERIFIED_PROFILE, WirePolicy::default(), fast_timeouts()).await;
+    h.adapter.connect().await.expect("connect to fake daemon");
+    h.adapter
+        .configure(
+            "127.0.0.1".to_string(),
+            Some(h.server.port()),
+            Some(web.port),
+            Some("conformance".to_string()),
+            Some("conformance".to_string()),
+        )
+        .await;
+
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let profiles = capture
+        .config_profiles
+        .clone()
+        .expect("the read side was reachable, so profiles must be captured");
+    let values: Vec<&str> = profiles.iter().map(|(v, _)| v.as_str()).collect();
+
+    assert!(
+        values.contains(&"raw-a") && values.contains(&"raw-b"),
+        "config_profiles must be the /config raw-lane projection, but got {values:?}. \
+         If this reads `semantic-z`, the evidence was reconstructed from fetch_profiles() \
+         after semantic parsing — the exact thing tier 1 must not do."
+    );
+    assert!(
+        !values.contains(&"semantic-z"),
+        "the semantic parser's output must not stand in as raw-lane evidence; got {values:?}"
+    );
+
+    h.stop();
+    web.stop();
+}
+
+/// The semantic parser is still worth running — as a cross-check. When the two lanes disagree that is
+/// a finding about the client, so it must surface as a divergence rather than be silently resolved.
+#[tokio::test]
+async fn tier1_reports_a_divergence_when_the_semantic_parser_disagrees_with_the_raw_page() {
+    let web = FakeConfigWeb::start(CONFIG_PAGE_RAW_LANE, PROFILE_PAGE_SEMANTIC_LANE).await;
+    let h = Harness::start(VERIFIED_PROFILE, WirePolicy::default(), fast_timeouts()).await;
+    h.adapter.connect().await.expect("connect to fake daemon");
+    h.adapter
+        .configure(
+            "127.0.0.1".to_string(),
+            Some(h.server.port()),
+            Some(web.port),
+            Some("conformance".to_string()),
+            Some("conformance".to_string()),
+        )
+        .await;
+
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+    // Assert on the typed divergence, not on a substring of the rendering: "config_profiles" appears
+    // in the report for several unrelated reasons, so a substring check here passes vacuously.
+    let lane = report.divergences.iter().find(|d| {
+        d.family == "config_profiles" && d.kind == tier1::DivergenceKind::LaneDisagreement
+    });
+    assert!(
+        lane.is_some(),
+        "the raw lane named raw-a/raw-b and the parser named semantic-z; that disagreement must be \
+         reported as a LaneDisagreement, not silently resolved. Divergences were: {:?}",
+        report.divergences
+    );
+
+    h.stop();
+    web.stop();
+}
+
+/// Sanitising must leave the document reparseable. The rewrite unescapes text with quick-xml and
+/// pushes the result straight back out, so a document whose text contained `&amp;` would emit a bare
+/// `&` — no longer well-formed, and the artifact embeds these documents as evidence.
+#[test]
+fn the_sanitiser_emits_a_document_that_still_reparses() {
+    use mock_servers::hqplayer::raw::sanitize;
+    let doc = "<?xml version=\"1.0\"?><Status active_filter=\"poly-sinc\">Rock &amp; Roll &lt;live&gt;</Status>";
+    let clean = sanitize(doc);
+
+    let mut reader = quick_xml::Reader::from_str(&clean);
+    let mut text = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Text(t)) => {
+                text.push_str(&t.unescape().expect("text must unescape after sanitising"));
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(e) => panic!("sanitised output no longer reparses: {e}\noutput was: {clean}"),
+        }
+    }
+    assert_eq!(
+        text, "Rock & Roll <live>",
+        "text must survive the round trip with its meaning intact; got {text:?} from {clean:?}"
+    );
+}

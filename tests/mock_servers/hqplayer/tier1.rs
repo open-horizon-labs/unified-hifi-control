@@ -64,7 +64,7 @@ pub struct ConfigFormObs {
 ///
 /// An allowlisted projection rather than stored HTML: tag-level redaction left secrets in the element
 /// text between the tags, and no amount of pattern-matching on a whole page is as safe as never keeping
-/// the page. STUB - implemented in the GREEN commit.
+/// the page.
 pub fn project_config_form(page: &str) -> ConfigFormObs {
     // An allowlist, built by walking the document with quick-xml and keeping only three things: the
     // names of non-hidden form fields, whether the profile select offers `[default]`, and each named
@@ -74,17 +74,7 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
     // The previous approach stored the page and redacted tags, which left `<password>SEKRET</password>`
     // as `<!-- redacted -->SEKRET<!-- redacted -->` — the secret survived between the tags. Nothing
     // that is not on this allowlist is retained at all, so there is nothing to leak.
-    const SENSITIVE: [&str; 8] = [
-        "password",
-        "passwd",
-        "csrf",
-        "token",
-        "nonce",
-        "authorization",
-        "secret",
-        "key",
-    ];
-    let sensitive_name = |n: &str| SENSITIVE.iter().any(|s| n.to_lowercase().contains(s));
+    let sensitive_name = raw::is_sensitive;
 
     let mut obs = ConfigFormObs::default();
     let mut reader = quick_xml::Reader::from_str(page);
@@ -204,6 +194,10 @@ pub struct Capture {
     /// `(value, title)` from the persistent HTTP lane's `/config` profile list. `None` when no
     /// credentials were supplied — recorded as not-captured rather than as an empty truth.
     pub config_profiles: Option<Vec<(String, String)>>,
+    /// The same list as the *production semantic parser* reports it, kept only to cross-check the raw
+    /// projection above. It is never allowed to stand in as the evidence: tier 1 reads the raw lane so
+    /// that a parser defect shows up as a disagreement instead of being reproduced in the record.
+    pub config_profiles_semantic: Option<Vec<(String, String)>>,
     /// How long each family took to deliver, so `HqpTimeouts::response` can be set from evidence.
     pub latencies: BTreeMap<String, Duration>,
     /// Unsolicited documents the client skipped during the capture.
@@ -238,6 +232,9 @@ pub enum DivergenceKind {
     AttributePresence,
     /// Identity fields differ, e.g. a different daemon version than the corpus profile claims.
     Identity,
+    /// Two lanes that should agree do not — e.g. the raw `/config` projection and the production
+    /// semantic parser naming different profiles. The daemon is not at fault here; the client is.
+    LaneDisagreement,
 }
 
 /// The outcome of a tier-1 run.
@@ -507,6 +504,7 @@ impl Report {
                 "scalars": self.capture.scalars,
                 // Explicitly null when unreached, so absent-and-ambiguous is not a possible state.
                 "config_profiles": self.capture.config_profiles,
+                "config_profiles_semantic": self.capture.config_profiles_semantic,
                 "matrix_current_read_failed": self.capture.matrix_current_read_failed,
                 "status_metadata_child": format!("{:?}", self.capture.status_metadata_child),
                 "entry_shapes": self.capture.entry_shapes.iter().map(|(k, v)| (k.clone(), serde_json::json!({
@@ -555,7 +553,7 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
     let mut c = Capture::default();
     let skipped_before = adapter.unsolicited_skipped().await;
 
-    let mut timed = |name: &str, took: Duration, c: &mut Capture| {
+    let timed = |name: &str, took: Duration, c: &mut Capture| {
         c.latencies.insert(name.to_string(), took);
     };
 
@@ -827,35 +825,32 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
     // is recorded as not-captured rather than swallowed, because "no profiles" and "could not ask"
     // are different facts.
     if adapter.has_web_credentials().await {
-        // Read-side shape: which form fields exist and whether [default] is offered. Sanitised, so no
-        // hidden input or token can reach the artifact.
-        if let Ok(page) = adapter.fetch_config_page_raw().await {
-            let clean = raw::sanitize(&page);
-            let mut obs = ConfigFormObs {
-                offers_default: clean.contains("value=\"[default]\""),
-                ..ConfigFormObs::default()
-            };
-            for field in clean
-                .split("name=\"")
-                .skip(1)
-                .filter_map(|p| p.split('"').next())
-            {
-                obs.field_names.insert(field.to_string());
+        // Read-side shape via an allowlisted projection. The page itself never enters the capture:
+        // tag-level sanitisation left secrets in the element text between the tags, so the only safe
+        // handling is to keep the three facts we need and discard everything else.
+        let t = Instant::now();
+        match adapter.fetch_config_page_raw().await {
+            Ok(page) => {
+                timed("config_profiles", t.elapsed(), &mut c);
+                let obs = project_config_form(&page);
+                // The raw lane is the evidence. Both facts come from the same projection, so the
+                // record cannot end up half raw and half reconstructed.
+                c.config_profiles = Some(obs.named_profiles.clone());
+                c.config_form = Some(obs);
             }
-            c.raw_documents.insert("config_form".to_string(), clean);
-            c.config_form = Some(obs);
+            Err(e) => tracing::warn!("tier-1: /config read side unavailable: {e}"),
         }
+
+        // Cross-check only. The production parser reads a different path (`/config/profile/load`), so
+        // a disagreement is a real finding about the client and is reported as one below.
         let t = Instant::now();
         match adapter.fetch_profiles().await {
             Ok(profiles) => {
-                timed("config_profiles", t.elapsed(), &mut c);
-                c.config_profiles =
+                timed("config_profiles_semantic", t.elapsed(), &mut c);
+                c.config_profiles_semantic =
                     Some(profiles.into_iter().map(|p| (p.value, p.title)).collect());
             }
-            Err(e) => {
-                c.config_profiles = None;
-                tracing::warn!("tier-1: /config read side unavailable: {e}");
-            }
+            Err(e) => tracing::warn!("tier-1: semantic profile cross-check unavailable: {e}"),
         }
     }
 
@@ -1142,6 +1137,28 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
                          the named-versus-default distinction is load-bearing, since loading a NAMED \
                          profile restarts the daemon and empties /backup/settings.zip"
                     .into(),
+            });
+        }
+    }
+
+    // The two lanes read different paths for the same fact. Disagreement is a client finding, so it is
+    // surfaced rather than silently resolved in favour of either side.
+    if let (Some(raw_lane), Some(semantic)) =
+        (&capture.config_profiles, &capture.config_profiles_semantic)
+    {
+        let mut raw_values: Vec<&str> = raw_lane.iter().map(|(v, _)| v.as_str()).collect();
+        let mut semantic_values: Vec<&str> = semantic.iter().map(|(v, _)| v.as_str()).collect();
+        raw_values.sort_unstable();
+        semantic_values.sort_unstable();
+        if raw_values != semantic_values {
+            report.divergences.push(Divergence {
+                family: "config_profiles".into(),
+                kind: DivergenceKind::LaneDisagreement,
+                detail: format!(
+                    "the raw /config projection names {raw_values:?} but the production parser \
+                     reports {semantic_values:?}; the profile list must not depend on which lane \
+                     read it"
+                ),
             });
         }
     }
