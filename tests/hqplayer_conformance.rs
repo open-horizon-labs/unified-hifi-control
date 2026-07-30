@@ -3378,3 +3378,87 @@ async fn a_chain_change_under_source_can_put_the_daemon_on_an_unrequested_filter
     );
     h.stop();
 }
+
+// -----------------------------------------------------------------------------
+// Bite 5 — the persistent lane has TWO separately numbered filter domains
+// -----------------------------------------------------------------------------
+
+/// The evidenced half of the chain-numbering question, and the one #322 can settle now.
+///
+/// `hqplayerd.xml` stores the PCM chain's filter under `filter` and the SDM chain's under
+/// `oversampling`, and the **same semantic filter carries a different number in each**: 40 under
+/// `filter`, 38 under `oversampling`. So the persistent lane is not one enum-ID domain plus a list
+/// index — it is *two* stored-ID domains, and a converter that takes a bare number without knowing
+/// which attribute produced it cannot be correct for both.
+///
+/// This is the boundary the amendment's dissent established and the Codex gate confirmed. The
+/// upstream evidence names the persistent **field names** `filter` and `oversampling`; it is not a
+/// `GetFilters` capture. Whether the *live* enum ID also differs between chains is an open question
+/// on #341, so this corpus still reports `value="40"` for the name in both live chain lists and this
+/// test deliberately does not resolve 38 against a live list. Renumbering `filters_sdm.xml` on this
+/// evidence would have turned a persistent-lane fact into an unmeasured live-lane claim.
+///
+/// **Label: model-fidelity** (a corpus property; no client reads `oversampling` yet — the persistent
+/// write lane is #330's).
+#[test]
+fn the_persistent_lane_numbers_the_same_filter_differently_per_chain() {
+    let config = corpus::document(VERIFIED_PROFILE, "persistent_config");
+    let pcm_stored = corpus::config_attr(&config, "output", "filter").expect("filter attribute");
+    let sdm_stored =
+        corpus::config_attr(&config, "output", "oversampling").expect("oversampling attribute");
+
+    assert_ne!(
+        pcm_stored, sdm_stored,
+        "the PCM `filter` domain and the SDM `oversampling` domain number the same semantic filter \
+         differently, so a stored number is meaningless without the attribute it came from"
+    );
+
+    // And neither stored number is the live list index of that filter, which is the original
+    // cross-lane property extended to the second domain.
+    let filters = corpus::document(VERIFIED_PROFILE, "filters_pcm");
+    let live_index = corpus::index_of(&filters, "FiltersItem", "poly-sinc-gauss-long")
+        .expect("the name is in the observed PCM list");
+    for stored in [&pcm_stored, &sdm_stored] {
+        assert_ne!(
+            stored.parse::<u32>().ok(),
+            Some(live_index),
+            "a persistent stored ID ({stored}) must not coincide with the live list index \
+             ({live_index}); if it did, a conversion that served both lanes could pass by accident"
+        );
+    }
+}
+
+/// The `oversampling` number must not be usable on the live lane either, for the same reason
+/// `filter` is not: it is a stored ID from a different domain.
+///
+/// **Label: client-conformance** — this drives the real client and would fail if a future change made
+/// the live lane accept a persistent number.
+#[tokio::test]
+async fn feeding_the_persistent_oversampling_id_to_the_live_lane_is_rejected() {
+    let h = Harness::verified().await;
+    let config = corpus::document(VERIFIED_PROFILE, "persistent_config");
+    let stored: u32 = corpus::config_attr(&config, "output", "oversampling")
+        .expect("oversampling attribute")
+        .parse()
+        .expect("numeric");
+
+    // Put the SDM chain in force, so this is the live lane the stored SDM domain corresponds to.
+    h.model.source_loads_chain(LoadedChain::Sdm);
+    let sdm_entries = corpus::enum_entries(
+        &corpus::document(VERIFIED_PROFILE, "filters_sdm"),
+        "FiltersItem",
+    );
+    assert!(
+        !sdm_entries.iter().any(|e| e.index == stored),
+        "precondition: the stored oversampling ID {stored} must be outside the live SDM list's \
+         index range for this to be a rejection rather than a misselection"
+    );
+
+    let result = h.adapter.set_filter(stored, None).await;
+    assert!(
+        result.is_err(),
+        "the persistent SDM domain's stored ID {stored} is not a live list index; sending it on the \
+         live lane must not silently succeed"
+    );
+    h.stop();
+}
