@@ -226,14 +226,25 @@ fn char_literal_end(chars: &[char], index: usize) -> Option<usize> {
         return None;
     }
     if chars.get(index + 1) == Some(&'\\') {
+        // The escaped character comes first, then the closing quote. Scanning forward for
+        // "the next `'`" stops at the *escaped* apostrophe in `'\''` and leaves a dangling
+        // quote behind that reads as the start of another literal. Found by Codex at
+        // `20926e1`.
         let mut scan = index + 2;
-        while scan < chars.len() {
-            if chars[scan] == '\'' {
-                return Some(scan + 1);
+        if chars.get(scan) == Some(&'u') && chars.get(scan + 1) == Some(&'{') {
+            scan += 2;
+            while scan < chars.len() && chars[scan] != '}' {
+                scan += 1;
             }
             scan += 1;
+        } else {
+            scan += 1;
         }
-        return None;
+        return if chars.get(scan) == Some(&'\'') {
+            Some(scan + 1)
+        } else {
+            None
+        };
     }
     if chars.get(index + 2) == Some(&'\'') {
         return Some(index + 3);
@@ -250,7 +261,15 @@ fn starts_a_literal(chars: &[char], index: usize) -> bool {
 fn literal_end(chars: &[char], index: usize) -> Option<usize> {
     match chars.get(index) {
         Some('"') => string_literal_end(chars, index),
-        Some('r') | Some('b') if starts_a_literal(chars, index) => string_literal_end(chars, index),
+        Some('r') if starts_a_literal(chars, index) => string_literal_end(chars, index),
+        // `b'x'` is a byte-char literal; `b"…"` and `br#"…"#` are byte strings.
+        Some('b') if starts_a_literal(chars, index) => {
+            if chars.get(index + 1) == Some(&'\'') {
+                char_literal_end(chars, index + 1)
+            } else {
+                string_literal_end(chars, index)
+            }
+        }
         Some('\'') => char_literal_end(chars, index),
         _ => None,
     }
@@ -268,12 +287,8 @@ fn imports_in(code: &str) -> Vec<String> {
     let mut index = 0usize;
 
     while index < chars.len() {
-        let at_boundary = index == 0
-            || matches!(chars[index - 1], ' ' | ';' | '{' | '}' | '\n')
-                && !(index >= 2 && chars[index - 2].is_alphanumeric() && chars[index - 1] == ' ');
         let is_use = chars[index..].starts_with(&['u', 's', 'e', ' ']);
-        // `pub use …` counts too; the boundary check sits before `pub`.
-        if is_use && at_boundary {
+        if is_use && starts_a_use_statement(&chars, index) {
             let mut scan = index;
             while scan < chars.len() && chars[scan] != ';' {
                 scan += 1;
@@ -286,6 +301,49 @@ fn imports_in(code: &str) -> Vec<String> {
         index += 1;
     }
     found
+}
+
+/// Whether the `use` at `index` opens a statement rather than ending an identifier.
+///
+/// The previous rule rejected "alphanumeric then space" before `use`, to stop `misuse` and
+/// prose from registering. It also rejected `pub use` — and *only* `pub use`, since
+/// `pub(crate) use` ends in `)` — so the plainest re-export form in Rust was invisible to
+/// the allowlist while its parenthesised siblings were caught. Wrong in the direction that
+/// passes. Found by Codex at `20926e1`.
+///
+/// Now: the `use` must not be the tail of an identifier, and whatever immediately precedes
+/// it must be a statement boundary or a visibility qualifier — `pub`, `pub(crate)`,
+/// `pub(super)`, `pub(in some::path)`.
+fn starts_a_use_statement(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    // `misuse ` must not count: `use` has to begin a word.
+    let previous = chars[index - 1];
+    if previous.is_alphanumeric() || previous == '_' {
+        return false;
+    }
+    if matches!(previous, ';' | '{' | '}' | '\n') {
+        return true;
+    }
+    if previous != ' ' {
+        return false;
+    }
+    // A space precedes it. Accept only a statement start or a visibility qualifier.
+    let before: String = chars[..index - 1].iter().collect();
+    let head = before.trim_end();
+    if head.is_empty() {
+        return true;
+    }
+    if head.ends_with(';') || head.ends_with('{') || head.ends_with('}') {
+        return true;
+    }
+    let last_word = head
+        .rsplit(|c: char| c == ';' || c == '{' || c == '}' || c == '\n')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    last_word == "pub" || (last_word.starts_with("pub(") && last_word.ends_with(')'))
 }
 
 /// Every trait implemented for `type_name` in `code`, as written.
@@ -1422,19 +1480,143 @@ fn raw_strings_do_not_break_the_shared_lexer() {
         .is_some()),
         "hash-count matching failed, hiding the derive:\n{attributes:?}"
     );
+}
 
-    // Char literals are the same class: `']'` is data, not a bracket.
-    let char_bracket =
-        "#[doc = \"x\"]\n#[cfg_attr(all(unix), derive(Serialize))]\npub enum AdaptiveEvent {\n}\n";
-    let attributes =
-        attributes_attached_to(char_bracket, ADAPTIVE_EVENT_DECLARATION).expect("declaration");
+#[test]
+fn char_literals_are_data_not_brackets_or_quotes() {
+    // An earlier version of this file claimed to test char literals in a case whose source
+    // contained none — `#[doc = "x"]` is an ordinary string. Codex caught the mislabel and
+    // the real defect underneath it. These are actual char literals.
+    for (label, source) in [
+        // A bracket inside a char literal must not close the attribute.
+        (
+            "bracket",
+            "#[x = ']']\n#[derive(Serialize)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        // An escaped apostrophe. `char_literal_end` returned at the *escaped* quote rather
+        // than the closing one, leaving a dangling `'` that reads as another literal.
+        (
+            "escaped quote",
+            "#[x = '\\'']\n#[derive(Serialize)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "escaped backslash",
+            "#[x = '\\\\']\n#[derive(Serialize)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "byte char",
+            "#[x = b']']\n#[derive(Serialize)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+        (
+            "unicode escape that is a closing bracket",
+            "#[x = '\\u{5D}']\n#[derive(Serialize)]\npub enum AdaptiveEvent {\n}\n",
+        ),
+    ] {
+        let attributes = attributes_attached_to(source, ADAPTIVE_EVENT_DECLARATION)
+            .unwrap_or_else(|| panic!("declaration not found for {label}:\n{source}"));
+        assert!(
+            attributes.iter().any(|attribute| introduces_serialization(
+                attribute,
+                &["Serialize".to_string()]
+            )
+            .is_some()),
+            "{label}: a char literal ate the derive:\n{attributes:?}"
+        );
+    }
+
+    // The lexer directly, so a failure names the cause rather than a symptom.
+    for (literal, expected) in [
+        ("']'", Some(3)),
+        ("'\\''", Some(4)),
+        ("'\\\\'", Some(4)),
+        ("'\\n'", Some(4)),
+        ("'\\u{5D}'", Some(8)),
+        ("'a'", Some(3)),
+    ] {
+        let chars: Vec<char> = literal.chars().collect();
+        assert_eq!(
+            char_literal_end(&chars, 0),
+            expected,
+            "char literal {literal:?} was mis-measured"
+        );
+    }
+
+    // Lifetimes are not char literals and must consume nothing.
+    for lifetime in ["'de", "'a", "'static"] {
+        let chars: Vec<char> = lifetime.chars().collect();
+        assert_eq!(
+            char_literal_end(&chars, 0),
+            None,
+            "lifetime {lifetime:?} was read as a char literal"
+        );
+    }
     assert!(
-        attributes.iter().any(|attribute| introduces_serialization(
-            attribute,
-            &["Serialize".to_string()]
+        handwritten_serialization_impl(
+            "impl<'de> Deserialize<'de> for AdaptiveEvent {}\n",
+            "AdaptiveEvent",
+            &["Deserialize".to_string()]
         )
-        .is_some()),
-        "attribute scan lost the derive:\n{attributes:?}"
+        .is_some(),
+        "a lifetime swallowed a hand-written impl"
+    );
+}
+
+#[test]
+fn visibility_qualified_use_statements_are_still_imports() {
+    // `pub use serde::Serialize as EventWire;` written directly in the module is the same
+    // re-export exploit as the previous round, one file closer. `imports_in` explicitly
+    // rejected "alphanumeric then space" before `use`, so `pub use` — and only `pub use` —
+    // was invisible, while `pub(crate) use` was caught because `)` is not alphanumeric.
+    // Inconsistent, and wrong in the direction that passes. Found by Codex at `20926e1`.
+    for (label, source) in [
+        ("plain", "use serde::Serialize as W;"),
+        ("pub", "pub use serde::Serialize as W;"),
+        ("pub(crate)", "pub(crate) use serde::Serialize as W;"),
+        ("pub(super)", "pub(super) use serde::Deserialize as R;"),
+        (
+            "pub(in path)",
+            "pub(in crate::producers) use serde::Serialize as W;",
+        ),
+        ("indented pub", "    pub use serde::Serialize as W;"),
+    ] {
+        let found = imports_in(&code_only(source));
+        assert_eq!(
+            found.len(),
+            1,
+            "{label}: a visibility-qualified use was missed: {found:?}\n{source}"
+        );
+        assert!(
+            !EVENT_ALLOWED_IMPORTS.contains(&found[0].as_str()),
+            "{label}: the allowlist admitted a re-export: {found:?}"
+        );
+    }
+}
+
+#[test]
+fn the_import_scanner_does_not_invent_imports() {
+    // The other direction. `use` appears inside identifiers and prose, and a scanner that
+    // fires on those makes the allowlist unmaintainable — which is how it ends up deleted.
+    for (label, source) in [
+        (
+            "identifier containing use",
+            "let misuse = 1;\nlet reuse_count = 2;\n",
+        ),
+        ("word in a string literal", "let s = \"please use this\";\n"),
+        ("method named use_default", "thing.use_default();\n"),
+    ] {
+        let found = imports_in(&code_only(source));
+        assert!(
+            found.is_empty(),
+            "{label}: the scanner invented an import: {found:?}\n{source}"
+        );
+    }
+
+    // Prose is stripped before the scan, so a doc comment mentioning `use` is not one.
+    let prose = "/// callers use crate::adaptive::X for this\nuse std::sync::Arc;\n";
+    assert_eq!(
+        imports_in(&code_only(prose)),
+        vec!["use std::sync::Arc;".to_string()],
+        "a doc comment was read as an import"
     );
 }
 
