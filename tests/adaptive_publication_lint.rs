@@ -673,7 +673,7 @@ impl<'ast> Visit<'ast> for ModuleReferenceVisitor {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         self.saved.push(self.roots.clone());
         if let Some((_, items)) = &item.content {
-            let (aliases, shadowed) = scope_delta(items);
+            let (aliases, shadowed) = scope_delta(items, &self.roots);
             self.roots.extend(aliases);
             for name in &shadowed {
                 self.roots.remove(name);
@@ -696,34 +696,85 @@ impl<'ast> Visit<'ast> for ModuleReferenceVisitor {
 /// This is scope tracking, not name resolution: aliases are inherited by descendants and
 /// shadowed by a sibling `mod` of the same name. That covers the reachable cases without
 /// pretending to resolve Rust's full name lookup.
-fn scope_delta(items: &[Item]) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut aliases = BTreeSet::new();
+fn scope_delta(
+    items: &[Item],
+    known_roots: &BTreeSet<String>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut aliases: BTreeSet<String> = BTreeSet::new();
     let mut shadowed = BTreeSet::new();
+
     for item in items {
-        match item {
-            Item::Use(item_use) => collect_crate_aliases(&item_use.tree, &mut aliases),
-            Item::Mod(item_mod) => {
-                shadowed.insert(item_mod.ident.to_string());
-            }
-            _ => {}
+        if let Item::Mod(item_mod) = item {
+            shadowed.insert(item_mod.ident.to_string());
         }
     }
+
+    // Fixed point, because an alias may be bound from another alias:
+    //
+    //     use crate as internal;
+    //     use self::internal as also;
+    //
+    // The second rename's *source* is `internal`, which is not an original root, so a
+    // single pass over the items would bind `internal` and miss `also`. Iterating until
+    // nothing new is bound also handles longer chains and any declaration order. Raised by
+    // Codex against `24ac3de`.
+    loop {
+        let mut roots: BTreeSet<String> = known_roots.clone();
+        roots.extend(aliases.iter().cloned());
+        let before = aliases.len();
+
+        for item in items {
+            match item {
+                Item::Use(item_use) => collect_crate_aliases(&item_use.tree, &roots, &mut aliases),
+                // `extern crate self as internal;` binds the crate root without being a
+                // `use` at all, and `extern crate unified_hifi_control as uhc;` does the
+                // same by name.
+                Item::ExternCrate(item_extern) => {
+                    if let Some((_, rename)) = &item_extern.rename {
+                        let source = item_extern.ident.to_string();
+                        if source == "self" || roots.contains(&source) {
+                            aliases.insert(rename.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if aliases.len() == before {
+            break;
+        }
+    }
+
     (aliases, shadowed)
 }
 
-fn collect_crate_aliases(tree: &UseTree, out: &mut BTreeSet<String>) {
+/// Names bound to a known crate root by a use tree.
+///
+/// The source is matched against the roots known *so far* rather than against the two
+/// original spellings, which is what lets `use self::internal as also;` bind through an
+/// alias. A leading `self::` is transparent, so both `use internal as also;` and
+/// `use self::internal as also;` are recognized.
+fn collect_crate_aliases(tree: &UseTree, roots: &BTreeSet<String>, out: &mut BTreeSet<String>) {
     match tree {
         UseTree::Rename(rename) => {
-            if CRATE_ROOTS.contains(&rename.ident.to_string().as_str()) {
+            if roots.contains(&rename.ident.to_string()) {
                 out.insert(rename.rename.to_string());
             }
         }
         UseTree::Group(group) => {
             for item in &group.items {
-                collect_crate_aliases(item, out);
+                collect_crate_aliases(item, roots, out);
             }
         }
-        UseTree::Path(path) => collect_crate_aliases(&path.tree, out),
+        UseTree::Path(path) => {
+            // `self::x` and `crate::x` are transparent prefixes for this purpose; any
+            // other prefix means the rename below it is not naming a crate root.
+            let head = path.ident.to_string();
+            if head == "self" || roots.contains(&head) {
+                collect_crate_aliases(&path.tree, roots, out);
+            }
+        }
         _ => {}
     }
 }
@@ -731,7 +782,7 @@ fn collect_crate_aliases(tree: &UseTree, out: &mut BTreeSet<String>) {
 /// Forbidden module references in `file`, resolving crate-root aliases within their scope.
 fn forbidden_module_references(file: &File) -> Vec<String> {
     let mut roots: BTreeSet<String> = CRATE_ROOTS.iter().map(|r| (*r).to_string()).collect();
-    let (aliases, shadowed) = scope_delta(&file.items);
+    let (aliases, shadowed) = scope_delta(&file.items, &roots);
     roots.extend(aliases);
     for name in &shadowed {
         roots.remove(name);
@@ -1670,6 +1721,92 @@ fn crate_root_aliases_are_scoped_to_the_module_that_declares_them() {
         assert!(
             !forbidden_module_references(&snippet(source)).is_empty(),
             "{label}: scoping introduced a false negative:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn extern_crate_self_and_transitive_aliases_are_crate_roots_too() {
+    // `scope_delta` recognized only a `UseTree::Rename` whose source ident is literally
+    // `crate` or `unified_hifi_control`. Two further legal forms bind the crate root under
+    // a new name and neither is a direct rename of those idents. Raised by Codex against
+    // `24ac3de`.
+    for (label, source) in [
+        // `extern crate self as X;` is an ItemExternCrate, not an ItemUse at all.
+        (
+            "extern crate self",
+            "extern crate self as internal;\nfn f() { let _ = internal::adaptive::X; }\n",
+        ),
+        (
+            "extern crate self reaching the publication layer",
+            "extern crate self as internal;\nfn f() { let _ = internal::producers::P; }\n",
+        ),
+        (
+            "extern crate by name",
+            "extern crate unified_hifi_control as uhc;\nfn f() { let _ = uhc::adaptive::X; }\n",
+        ),
+        // Transitive: the second rename's source is an alias, not an original root.
+        (
+            "transitive alias",
+            "use crate as internal;\nuse self::internal as also;\nfn f() { let _ = also::producers::P; }\n",
+        ),
+        (
+            "transitive alias two hops",
+            "use crate as internal;\nuse self::internal as also;\nuse self::also as third;\nfn f() { let _ = third::adaptive::X; }\n",
+        ),
+        (
+            "transitive from extern crate self",
+            "extern crate self as internal;\nuse self::internal as also;\nfn f() { let _ = also::adaptive::X; }\n",
+        ),
+        (
+            "transitive without the self:: prefix",
+            "use crate as internal;\nuse internal as also;\nfn f() { let _ = also::adaptive::X; }\n",
+        ),
+    ] {
+        assert!(
+            !forbidden_module_references(&snippet(source)).is_empty(),
+            "{label}: an alias form bypassed the boundary:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn extended_alias_forms_remain_scope_aware_and_shadowable() {
+    // The extra forms must not loosen the boundary into a file-global set again.
+    for (label, source) in [
+        (
+            "extern crate self scoped to a sibling module",
+            "mod a {\n    extern crate self as internal;\n}\nmod b {\n    mod internal { pub mod adaptive {} }\n    fn f() { let _ = internal::adaptive::X; }\n}\n",
+        ),
+        (
+            "extern crate self leaking to a sibling with no shadow",
+            "mod a {\n    extern crate self as internal;\n}\nmod b {\n    fn f() { let _ = internal::adaptive::X; }\n}\n",
+        ),
+        (
+            "transitive alias shadowed by a local module",
+            "use crate as internal;\nuse self::internal as also;\nmod b {\n    mod also { pub mod adaptive {} }\n    fn f() { let _ = also::adaptive::X; }\n}\n",
+        ),
+        (
+            "an extern crate that is not this crate",
+            "extern crate serde as s;\nfn f() { let _ = s::adaptive::X; }\n",
+        ),
+        (
+            "an alias of an alias of something unrelated",
+            "use std as s;\nuse self::s as t;\nfn f() { let _ = t::fmt::Debug; }\n",
+        ),
+        // The prefix guard: `foo::internal` is a real module that merely shares a name with
+        // the alias, so renaming *it* binds nothing. Only `self::` and a known root are
+        // transparent prefixes; treating every prefix as transparent would bind `also` here
+        // and flag clean code.
+        (
+            "a rename under an unrelated path prefix",
+            "use crate as internal;\nmod foo {\n    pub mod internal { pub mod adaptive {} }\n}\nuse foo::internal as also;\nfn f() { let _ = also::adaptive::X; }\n",
+        ),
+    ] {
+        assert!(
+            forbidden_module_references(&snippet(source)).is_empty(),
+            "{label}: the extended forms invented a reference: {:?}\n{source}",
+            forbidden_module_references(&snippet(source))
         );
     }
 }
