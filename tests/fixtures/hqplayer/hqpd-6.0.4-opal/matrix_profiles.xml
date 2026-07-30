@@ -1,6 +1,7 @@
 <!--
   provenance:
-    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (Matrix commands; docs/matrix-spec.md)
+    source: UHC-SALVAGE-UI-DATA-INTEGRATION.md and UHC-SALVAGE-BETA-DEV.md (2026-07-29 comparative salvage reports), which cite https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (Matrix commands; docs/matrix-spec.md)
+    source_chain: read-via-report. The upstream file was NOT read directly for this fixture; the salvage report is the immediate source and the upstream ref is the report's own citation. Recorded because two errors in this amendment came from treating a report's citation as if it had been read: a path that does not exist at the ref given, and a superseded claim the report's own newer companion had already corrected.
     daemon: hqplayerd 6.0.4 (Opal)
     status: derived
     date: 2026-07-29

@@ -3774,6 +3774,31 @@ fn a_closed_malformed_root_is_recovered_even_with_a_coalesced_push_frame() {
         framing::Framing::Malformed,
         "a leftover closing tag is still malformed"
     );
+
+    // A closing-tag literal inside a comment or a CDATA section is content, not markup. Quoting
+    // alone does not cover these, since neither form is quoted, and taking one for a boundary would
+    // let a TRUNCATED document pass as complete — the one failure recovery must never produce.
+    for (what, open, close) in [("a comment", "<!--", "-->"), ("CDATA", "<![CDATA[", "]]>")] {
+        assert_eq!(
+            framing::classify(&format!("<Status a=\"1\">{open} </Status> {close}")),
+            framing::Framing::Incomplete,
+            "a closing tag inside {what} must not end the frame, or a truncated document reads as \
+             complete"
+        );
+        assert_eq!(
+            framing::classify(&format!(
+                "<Status a=\"1\">{open} </Status> {close}</Status>"
+            )),
+            framing::Framing::Complete,
+            "and with a real closing tag after {what}, the boundary is the real one"
+        );
+        assert_eq!(
+            framing::classify(&format!("<Status a=\"1\">{open} </Status>")),
+            framing::Framing::Incomplete,
+            "an unterminated {what} consumes the remainder: there is no boundary inside something \
+             that has not ended"
+        );
+    }
 }
 
 /// A **newline-free** oversized reply. The cap must be a bound on what is *allocated*, not merely on
@@ -4018,4 +4043,44 @@ async fn a_default_fake_arms_no_unqualified_upstream_claim() {
         "and each entry must name the qualification it is still waiting on; got {armed:?}"
     );
     h.stop();
+}
+
+/// Every fixture whose evidence came through a salvage report says so **in its provenance**.
+///
+/// Three errors in this amendment came through one channel: a report *about* HQPTuner read as if it
+/// were HQPTuner. The Stage 1 dissent caught one (an enum-ID renumbering), and the Codex Stage 2 gate
+/// caught two more (a path that does not exist at the ref cited, and a claim the report's own newer
+/// companion had already superseded). None of my own review passes caught any of the three.
+///
+/// So this is a channel rather than three mistakes, and the fix is structural: a fixture that cites an
+/// upstream URL must also record that the URL is the *report's* citation and not something read here.
+/// A reader can then weigh the claim correctly, and #341 knows exactly which claims still need a
+/// first-hand or live confirmation.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn every_upstream_citation_records_how_it_was_obtained() {
+    let mut checked = 0;
+    for profile in corpus::profiles() {
+        for fixture in corpus::all_in(&profile) {
+            if fixture
+                .provenance
+                .source
+                .contains("github.com/ohshitgorillas")
+            {
+                assert!(
+                    fixture.provenance.source_chain.contains("read-via-report"),
+                    "{}/{} cites an upstream URL but does not record that the URL came from a salvage \
+                     report rather than from reading the file",
+                    profile,
+                    fixture.name
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 14,
+        "every upstream-citing fixture must be covered, got {checked}"
+    );
 }

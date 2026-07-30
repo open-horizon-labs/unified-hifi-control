@@ -34,6 +34,14 @@ pub struct Provenance {
     pub daemon: String,
     pub status: String,
     pub date: String,
+    /// How the `source` was obtained: `read-via-report` when the cited upstream file was not read
+    /// directly and a salvage report is the immediate source, `direct` when it was read here.
+    ///
+    /// Exists because three errors in this amendment came from treating a report's citation as if it
+    /// had been read. Recording the chain lets a reader weigh a claim correctly and tells #341 which
+    /// claims still need first-hand or live confirmation. Defaults to `unrecorded` for fixtures that
+    /// cite no upstream file.
+    pub source_chain: String,
     /// Whether any tier could ever promote this fixture's claims to UHC-qualified evidence.
     ///
     /// `tier-1` means a read-only live run can settle it. `tier-2-only` means settling it requires a
@@ -124,6 +132,7 @@ fn parse_provenance(raw: &str, path: &Path) -> Provenance {
         // honest reading for them. A synthetic fixture must say `never-promotable` explicitly, and
         // `a_synthetic_profile_is_never_evidence` enforces that.
         tier: optional("tier").unwrap_or_else(|| "unspecified".to_string()),
+        source_chain: optional("source_chain").unwrap_or_else(|| "unrecorded".to_string()),
         notes: field("notes"),
     }
 }

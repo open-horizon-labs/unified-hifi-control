@@ -313,12 +313,38 @@ pub mod framing {
         let mut in_quote = false;
         let mut i = 0;
         while i < bytes.len() {
+            // Regions where a closing-tag literal is content, not markup. Skipping them wholesale is
+            // what stops `<!-- </Status> -->` being read as a frame boundary — which would let a
+            // *truncated* document pass as complete, the one failure this whole function exists to
+            // avoid. Quoting alone does not cover these: neither form is quoted.
+            if !in_quote {
+                if let Some(skip) = comment_or_cdata_len(&buf[i..]) {
+                    i += skip;
+                    continue;
+                }
+            }
             match bytes[i] {
                 b'"' => in_quote = !in_quote,
                 b'<' if !in_quote && buf[i..].starts_with(&close) => return Some(i + close.len()),
                 _ => {}
             }
             i += 1;
+        }
+        None
+    }
+
+    /// Length of a comment or CDATA section starting at `rest`, if one does.
+    ///
+    /// An unterminated comment or CDATA consumes the remainder: there is no boundary inside something
+    /// that has not ended, and treating its contents as markup is exactly the mistake this prevents.
+    fn comment_or_cdata_len(rest: &str) -> Option<usize> {
+        for (open, close) in [("<!--", "-->"), ("<![CDATA[", "]]>")] {
+            if let Some(body) = rest.strip_prefix(open) {
+                return Some(match body.find(close) {
+                    Some(at) => open.len() + at + close.len(),
+                    None => rest.len(),
+                });
+            }
         }
         None
     }
