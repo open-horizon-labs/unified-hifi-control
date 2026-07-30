@@ -296,57 +296,49 @@ pub mod framing {
         }
     }
 
-    /// Whether the buffer ends with the root element's own closing tag.
+    /// Byte offset just past the **first defensible** occurrence of the root element's own closing
+    /// tag, or `None` if there is none.
     ///
     /// This is the recovery boundary for a document whose *children* cannot be parsed. The daemon
     /// emits malformed XML inside `<metadata>`, and a child tag that never terminates makes a parser
     /// consume the `</Status>` that follows it as part of the child's own attribute soup — so the
-    /// closing tag is in the buffer but was never seen as an end event. Without recovery such a
-    /// reply reads as incomplete and the command burns its whole deadline waiting for bytes it
-    /// already holds, on **every** poll while a track is loaded.
+    /// closing tag is in the buffer but was never seen as an end event. Without recovery such a reply
+    /// reads as incomplete and the command burns its whole deadline waiting for bytes it already
+    /// holds, on **every** poll while a track is loaded.
     ///
-    /// Deliberately narrow. Each clause protects a framing guarantee #322 exists to hold:
+    /// Reaching here at all is the diagnosis: had that tag been parsed as an end event, the element
+    /// stack would have emptied and `Complete` would already have been returned.
+    ///
+    /// "First defensible" means the first occurrence that is markup rather than content. Each clause
+    /// below protects a framing guarantee #322 exists to hold:
     ///
     /// * It keys on the root's **own** name, so `<State …></Status>` is not rescued — mismatched
-    ///   nesting is decided by the name-comparison path above, which is reached first.
-    /// * It takes the **first defensible** occurrence of that closing tag, skipping every region where
-    ///   XML says `<` is not markup: quoted attribute values in either quote form, comments, CDATA
-    ///   sections, and processing instructions. So a `</Status>` sitting inside an attribute value or a
-    ///   comment is data and never a boundary, and a document truncated before its real closing tag has
-    ///   no boundary to find and stays incomplete.
+    ///   nesting is decided by the name-comparison path in [`scan`], which is reached first.
+    /// * It skips every region where XML says `<` is not markup: quoted attribute values in **either**
+    ///   quote form, comments, CDATA sections, and processing instructions (plus any other `<!`
+    ///   declaration, conservatively). That set is closed, not open-ended. So a `</Status>` sitting in
+    ///   an attribute value or a comment is data and never a boundary.
+    /// * A document truncated before its real closing tag therefore has no boundary to find and stays
+    ///   incomplete — it is never credited with a tag that has not arrived.
     /// * It is consulted only when the parse could not complete on its own, so every well-formed
     ///   document takes the unchanged path.
     ///
-    /// An earlier revision required the closing tag to be the buffer's **last** token. That was
-    /// replaced because it is wrong for a case the daemon actually produces — a hostile reply with an
-    /// unsolicited push frame coalesced behind it — and the requirement is recorded here only to say it
-    /// is gone.
+    /// The one shape it deliberately declines to resolve is an **unterminated** attribute quote: with
+    /// the quote still open there is no way to tell markup from data, so it finds no boundary rather
+    /// than guessing at one.
     ///
-    /// Reaching here with the root's closing tag present is itself the diagnosis: had that tag been
-    /// parsed as an end event, the element stack would have emptied and `Complete` would already
-    /// have been returned.
+    /// Taking the *first* such occurrence rather than requiring the closing tag to be the buffer's last
+    /// token is load-bearing, because the daemon both emits malformed `<metadata>` children *and*
+    /// pushes `Status` frames unprompted: a hostile reply with a push frame coalesced behind it has a
+    /// closing tag that is not last, and a last-token rule left it unrecovered for a whole deadline.
     ///
-    /// Attribute reads stay correct either way — [`root_open_tag`] is a quote-aware scan that stops
-    /// at the root tag's own `>`, so it never looks at a child.
+    /// Two implementation notes. The root's name comes from [`root_element`] rather than a private
+    /// scan, so this shares one tokeniser with the rest of the module. And a self-closing root cannot
+    /// reach here at all — quick_xml reports it as `Event::Empty`, which [`scan`] answers before any
+    /// child is read.
     ///
-    /// The root's name comes from [`root_element`] rather than a private scan, so this shares one
-    /// tokeniser with the rest of the module. A self-closing root cannot reach here at all: quick_xml
-    /// reports it as `Event::Empty`, which the loop above answers before any child is read.
-    ///
-    /// The boundary is the **first defensible** occurrence of the root's closing tag, not the last
-    /// token in the buffer. Requiring it last was simpler but wrong in a case the daemon actually
-    /// produces: it emits malformed XML inside `<metadata>` *and* pushes `Status` frames unprompted,
-    /// so a hostile reply with a push frame coalesced behind it would have gone unrecovered and cost
-    /// the whole deadline. "First defensible" keeps the guarantees that mattered:
-    ///
-    /// * The scan tracks attribute quoting, so a `</Status>` literal inside an attribute value is
-    ///   data and never a boundary.
-    /// * A document truncated before its root close has no boundary to find, so it stays incomplete.
-    /// * A mismatched root is decided by the name-comparison path above, which is reached first.
-    ///
-    /// An *unterminated* attribute quote is the one shape this cannot resolve, and deliberately so:
-    /// with the quote still open there is no way to tell markup from data, so the scan declines to
-    /// find a boundary rather than guessing at one.
+    /// Attribute reads are unaffected either way: [`root_open_tag`] is a quote-aware scan that stops at
+    /// the root tag's own `>`, so it never looks at a child.
     fn root_frame_end(buf: &str) -> Option<usize> {
         let name = root_element(buf)?;
         let close = format!("</{name}>");
