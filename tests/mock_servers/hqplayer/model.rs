@@ -123,7 +123,8 @@ pub enum LoadedChain {
 /// evidence base. **#341 owns settling them.** What is actually known:
 ///
 /// * `Status.active_mode` **does not resolve** under `[source]`: it echoes the configured mode,
-///   verified upstream on hqplayerd 6.0.4, 2026-07-29, mid-playback. The upstream client therefore
+///   verified upstream on hqplayerd 6.0.4, 2026-07-29 (the source report does not establish the
+///   playback state of this probe, so none is asserted). The upstream client therefore
 ///   *rejects* that field as a chain resolver and falls back to the `Status.active_rate` family
 ///   instead (`livemap._chain_from_status`). An earlier upstream revision did build a fallback on
 ///   `active_mode` and it was replaced precisely because it was wrong.
@@ -143,7 +144,8 @@ pub enum LoadedChain {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveModeReporting {
     /// Echo the **configured** mode. Under `[source]` this reports `[source]` and resolves nothing.
-    /// **Measured** for `Status.active_mode`: hqplayerd 6.0.4, 2026-07-29, playback active.
+    /// **Measured** for `Status.active_mode`: hqplayerd 6.0.4, 2026-07-29 (playback state not
+    /// asserted — the source report does not establish it for this probe).
     EchoesConfiguredMode,
     /// Resolve to the **loaded** chain's family — what a caller usually wants, and what
     /// `docs/hqplayer-protocol-reference.md` claims of `State.active_mode`. **Unmeasured** for either

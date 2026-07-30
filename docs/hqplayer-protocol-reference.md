@@ -185,7 +185,7 @@ HQPlayer has two query commands with different semantics:
 
 **Warning:** for an explicit PCM or SDM mode, State's numeric `active_mode` is the reliable reading of the configured mode. Under a configured `[source]` mode the *loaded* chain is decided by the source material, and the two fields diverge:
 
-- `Status.active_mode` **echoes the configured `[source]`** (measured upstream on hqplayerd 6.0.4, 2026-07-29, mid-playback), so it does not resolve the loaded chain — it may read `"[source]"` even while DSD is being output.
+- `Status.active_mode` **echoes the configured `[source]`** (measured upstream on hqplayerd 6.0.4, 2026-07-29), so it does not resolve the loaded chain — it may read `"[source]"` even while DSD is being output.
 - **What `State.active_mode` reports under `[source]` has not been measured** in UHC's evidence base (ledger HQP-C-024). This doc does not assert that it echoes the configured mode, or anything else, there.
 
 So do not rely on either field to resolve the loaded chain under `[source]`. HQPTuner's upstream client derives the chain from the `Status.active_rate` family instead — treat that as upstream **precedent/inference, not a UHC-verified guarantee**. See the `ActiveModeReporting` doc in `tests/mock_servers/hqplayer/model.rs` and issue #341, which owns settling this.
