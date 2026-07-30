@@ -131,3 +131,37 @@ second consumer crate actually exists.
 8. Architecture lint test keeps `src/adaptive/` transport-free and crate-extractable.
 9. No route changes. `tests/fixtures/api_routes.txt` is not touched and
    `api-change-approved` is never applied.
+
+## Execute
+**Updated:** 2026-07-30
+**Status:** complete
+
+Landed in three commits plus a cleanup commit:
+
+- `43d674b` domain model (`src/adaptive/`, 8 modules, shared not server-gated)
+- `67e83bb` untrack `.oh/.cache` artifacts a `git add -A` had swept in
+- `9449152` six canonical fixtures, 79 contract tests, dependency lint
+- docs: normative spec, ADR 003, ARCHITECTURE.md pointer
+
+All five solution-review actions and all five solution-dissent actions landed as tests or
+normative spec text rather than prose:
+
+| Action | Where |
+|---|---|
+| serde/std-only dependency rule, host-runnable | `tests/adaptive_dependency_lint.rs` (verified non-vacuous) |
+| JSON Schema debt recorded | spec section 8, ADR consequences, PR body |
+| canonical fixtures round-trip exactly | `every_canonical_fixture_round_trips_exactly` |
+| no stray fields in our own fixtures | `canonical_fixtures_have_no_stray_fields` |
+| every vocabulary member has a worked example | `every_vocabulary_member_has_a_worked_example` |
+| two-revision ordering rules + out-of-order test | spec section 3, `mod revisions` |
+| visibility open / permission closed, both tested | spec section 5, `mod constraints` |
+| change-set lifecycle first-class in v1 | `src/adaptive/change_set.rs`, `mod change_sets` |
+| fixture stability policy | spec section 8 |
+| expected-ungrounded lanes per producer family | spec section 2 |
+
+**Drift check:** none. No routes touched, `tests/fixtures/api_routes.txt` unchanged,
+`api-change-approved` never applied, no user-owned file modified. 390 tests pass.
+
+**Verification gap:** `dx` is not installed in this environment, so the WASM/fullstack
+build is proved only by CI's `build-wasm` job (`.github/workflows/build.yml:488`). The
+dependency lint is the host-runnable proxy.
