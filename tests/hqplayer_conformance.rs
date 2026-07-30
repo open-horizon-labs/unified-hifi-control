@@ -3273,3 +3273,108 @@ async fn set_mode_does_not_reset_the_filter_and_shaper_selections() {
     );
     h.stop();
 }
+
+// -----------------------------------------------------------------------------
+// Bite 4 — the stale-chain hazard, made expressible and in-range
+// -----------------------------------------------------------------------------
+
+/// The corpus invariant that makes the hazard a *silent misselection* rather than a rejection.
+///
+/// A stale index from the other chain must land **in range** and name a **different** filter. If it
+/// landed out of range the daemon would answer `result="Error"`, the client would surface a failure,
+/// and the test would be proving the opposite of the hazard: a loud rejection is safe, a quiet wrong
+/// answer is not.
+///
+/// `filters_sdm.xml` was extended from 5 to 9 entries for exactly this, reusing names and enum IDs
+/// verbatim from `filters_pcm.xml`. **No enum ID was renumbered.** Whether `GetFilters` renumbers a
+/// name's enum ID between chains is an open question recorded on #341; this fixture does not answer
+/// it and must not be read as answering it.
+///
+/// **Label: model-fidelity** (a corpus property, no client involved).
+#[test]
+fn a_stale_cross_chain_filter_index_lands_in_range_on_a_different_filter() {
+    let pcm = corpus::document(VERIFIED_PROFILE, "filters_pcm");
+    let sdm = corpus::document(VERIFIED_PROFILE, "filters_sdm");
+    let name = "poly-sinc-gauss-long";
+
+    let pcm_index = corpus::index_of(&pcm, "FiltersItem", name).expect("in the PCM list");
+    let sdm_entries = corpus::enum_entries(&sdm, "FiltersItem");
+    let at_stale_index = sdm_entries
+        .iter()
+        .find(|e| e.index == pcm_index)
+        .map(|e| e.name.as_str());
+
+    assert_eq!(
+        at_stale_index,
+        Some("poly-sinc-lp"),
+        "the PCM index of {name} ({pcm_index}) must exist in the SDM chain and name a DIFFERENT \
+         filter, or a stale-cache write would be rejected out of range instead of silently \
+         selecting the wrong filter"
+    );
+    assert_ne!(
+        corpus::index_of(&sdm, "FiltersItem", name),
+        Some(pcm_index),
+        "the same name must sit at a different index in the two chains, which is what makes a \
+         cached list from one chain wrong for the other"
+    );
+}
+
+/// Demonstrates the hazard end to end through the real client, and pins the half that belongs to
+/// #322: the fake can now put the daemon on a filter the caller never asked for, from a chain change
+/// the caller never made.
+///
+/// **Observed at this commit** (recorded, not asserted — see below):
+///
+/// ```text
+/// requested name 'poly-sinc-gauss-long'; cached PCM index 7; sent value=Some("7");
+/// client outcome ok=true; daemon now reports active_filter="poly-sinc-lp"
+/// ```
+///
+/// So the client reports **success** for a filter it did not select. That is a real, reproducible
+/// defect, and its fix is a loaded-chain observer that invalidates the enumeration cache — which is
+/// **#347's** first acceptance criterion, not this issue's. Per the maintainer decision on #322,
+/// adapter-facing expectations that need new production semantics travel with #347.
+///
+/// This test therefore asserts **only** the daemon-side outcome, and deliberately does *not* assert
+/// what the client returned. Asserting `outcome.is_ok()` would encode a known defect as expected
+/// behaviour, and asserting `is_err()` would fail until #347 lands. Neither belongs in a suite whose
+/// standing claim is that it encodes no defect as correct.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn a_chain_change_under_source_can_put_the_daemon_on_an_unrequested_filter() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`: the source decides the chain
+        s.playback = 2;
+    });
+
+    // A surface reads pipeline status while the PCM chain is loaded. This is what populates the
+    // adapter's list cache (`get_pipeline_status` -> `refresh_lists`), and it is the path both
+    // `GET /hqplayer/pipeline` and the MCP status tool already take.
+    h.adapter
+        .get_pipeline_status()
+        .await
+        .expect("pipeline status");
+
+    // A DSD track follows a PCM one. The loaded chain changes; the configured mode does not, so
+    // nothing in the client is prompted to re-read anything.
+    h.model.source_loads_chain(LoadedChain::Sdm);
+
+    let _ = h.adapter.set_filter_nx("poly-sinc-gauss-long").await;
+
+    let status = h.adapter.get_playback_status().await.expect("Status");
+    assert_eq!(
+        status.active_filter, "poly-sinc-lp",
+        "the fixture must be able to express the hazard: a name resolved against the previous \
+         chain's list selects a different filter in the loaded chain, in range and without error. \
+         Got active_filter={:?}, which would mean the scenario is no longer constructible",
+        status.active_filter
+    );
+    assert_eq!(
+        h.model.state().mode_index,
+        0,
+        "and the configured mode never moved, which is why no cache invalidation was triggered"
+    );
+    h.stop();
+}
