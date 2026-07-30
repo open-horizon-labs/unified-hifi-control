@@ -30,6 +30,7 @@ use std::path::Path;
 use walkdir::WalkDir;
 
 const PRODUCERS_DECLARATION: &str = "pub mod producers;";
+const ADAPTIVE_EVENT_DECLARATION: &str = "pub enum AdaptiveEvent {";
 /// The readable spelling, used in failure messages.
 const SERVER_GATE: &str = "#[cfg(feature = \"server\")]";
 
@@ -255,6 +256,79 @@ fn sources_under(root: &str) -> Vec<(String, String)> {
     sources
 }
 
+/// Every `#[...]` attribute written in `text`, whole.
+///
+/// Bracket-depth aware and string-literal aware, so `#[cfg_attr(feature = "server",
+/// derive(Serialize))]` and `#[doc = "contains a ] bracket"]` are each captured entire
+/// rather than truncated at the first `]`.
+fn attributes_in(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let bytes: Vec<char> = text.chars().collect();
+    let mut index = 0usize;
+    while index + 1 < bytes.len() {
+        if bytes[index] != '#' || (bytes[index + 1] != '[' && bytes[index + 1] != '!') {
+            index += 1;
+            continue;
+        }
+        // `#![...]` is an inner attribute; it applies to the enclosing module, not to the
+        // next item, so it is skipped rather than attributed to a declaration below it.
+        let open = if bytes[index + 1] == '!' {
+            index + 2
+        } else {
+            index + 1
+        };
+        if open >= bytes.len() || bytes[open] != '[' {
+            index += 1;
+            continue;
+        }
+        let inner = bytes[index + 1] == '!';
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut cursor = open;
+        let mut end = None;
+        while cursor < bytes.len() {
+            let c = bytes[cursor];
+            if in_string {
+                if c == '\\' {
+                    cursor += 2;
+                    continue;
+                }
+                if c == '"' {
+                    in_string = false;
+                }
+            } else {
+                match c {
+                    '"' => in_string = true,
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(cursor);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cursor += 1;
+        }
+        match end {
+            Some(close) => {
+                if !inner {
+                    found.push(bytes[index..=close].iter().collect());
+                }
+                index = close + 1;
+            }
+            // Unterminated. Record what is there rather than dropping an attribute.
+            None => {
+                found.push(bytes[index..].iter().collect());
+                break;
+            }
+        }
+    }
+    found
+}
+
 /// Every `#[cfg(...)]` attribute written in `text`.
 ///
 /// Extracted rather than matched whole-line, because a gate may share a line with the item
@@ -320,6 +394,70 @@ fn declaration_gates(source: &str, declaration: &str) -> Option<Vec<String>> {
         pending.clear();
     }
     gates
+}
+
+/// Every attribute attached to `declaration` in `source`, including those on an enclosing
+/// block.
+///
+/// `None` means the declaration is absent; an empty vector means it carries no attributes.
+///
+/// Same accumulation rule as [`declaration_gates`] — Rust allows any number of attributes in
+/// any order, so they gather across consecutive attribute lines and are consumed by whatever
+/// comes next. Inspecting only the *nearest* attribute is the blind spot this replaced: an
+/// earlier `#[derive(Serialize)]` sitting above a later `#[derive(Debug, Clone)]` was
+/// invisible.
+fn attributes_attached_to(source: &str, declaration: &str) -> Option<Vec<String>> {
+    let mut enclosing: Vec<Vec<String>> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    let mut attached: Option<Vec<String>> = None;
+
+    for line in code_only(source).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(prefix) = trimmed.strip_suffix(declaration) {
+            let mut found = attributes_in(prefix);
+            found.append(&mut pending);
+            found.extend(enclosing.iter().flatten().cloned());
+            attached = Some(found);
+            continue;
+        }
+        if trimmed.ends_with('{') {
+            let mut frame = attributes_in(trimmed);
+            frame.append(&mut pending);
+            enclosing.push(frame);
+            continue;
+        }
+        if trimmed == "}" {
+            enclosing.pop();
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            pending.extend(attributes_in(trimmed));
+            continue;
+        }
+        pending.clear();
+    }
+    attached
+}
+
+/// Whether an attribute would make its item serializable.
+///
+/// Covers `#[derive(Serialize)]` and `#[cfg_attr(…, derive(Serialize))]` alike: the question
+/// is whether the attribute introduces a serialization derive under *any* configuration, not
+/// which spelling it used. A `cfg_attr` gate does not make it safe — it makes it conditional,
+/// and the condition is somebody else's to set.
+fn introduces_serialization(attribute: &str) -> Option<&'static str> {
+    let squeezed: String = attribute.chars().filter(|c| !c.is_whitespace()).collect();
+    if !squeezed.contains("derive(") {
+        return None;
+    }
+    // Matched on the capitalized trait names, which do not overlap: `Deserialize` contains
+    // a lower-case `serialize`, never `Serialize`, so neither can be mistaken for the other.
+    ["Serialize", "Deserialize"]
+        .into_iter()
+        .find(|forbidden| squeezed.contains(forbidden))
 }
 
 // =============================================================================
@@ -408,19 +546,40 @@ fn lint_only_the_composition_root_names_the_contract_or_the_publication_layer() 
 fn lint_adaptive_event_derives_no_serialization() {
     // Belt to the braces above: even if a variant were added to the wrong enum, the
     // internal event type itself cannot be written to a wire.
+    //
+    // Inspects *every* attached attribute, not the nearest one. An earlier
+    // `#[derive(Serialize)]` above a later `#[derive(Debug, Clone)]` was invisible to the
+    // previous `rfind("#[derive(")` scan, as was any `#[cfg_attr(…, derive(Serialize))]`,
+    // which the scan never looked for at all. Found by CodeRabbit at `eebde11`.
     let event = fs::read_to_string("src/producers/event.rs").expect("src/producers/event.rs");
-    let code = code_only(&event);
-    let derive = code
-        .split("pub enum AdaptiveEvent")
-        .next()
-        .and_then(|before| before.rfind("#[derive(").map(|at| before[at..].to_string()))
-        .expect("AdaptiveEvent must carry a derive attribute");
+    let attributes =
+        attributes_attached_to(&event, ADAPTIVE_EVENT_DECLARATION).unwrap_or_else(|| {
+            panic!("src/producers/event.rs must declare `{ADAPTIVE_EVENT_DECLARATION}`")
+        });
+    let offenders: Vec<String> = attributes
+        .iter()
+        .filter_map(|attribute| {
+            introduces_serialization(attribute)
+                .map(|trait_name| format!("{trait_name} via {attribute}"))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "AdaptiveEvent would be serializable. The internal bus exists precisely so producer \
+         lifecycle cannot reach a wire, and a derive is the only structural part of that \
+         guarantee. Found: {offenders:?}"
+    );
+
+    // A hand-written impl defeats the same guarantee without any derive at all.
+    let squeezed: String = code_only(&event)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     for forbidden in ["Serialize", "Deserialize"] {
         assert!(
-            !derive.contains(forbidden),
-            "AdaptiveEvent derives `{forbidden}`. The internal bus exists precisely so that \
-             producer lifecycle cannot reach a wire; deriving serialization removes the \
-             only structural part of that guarantee. Found: {derive}"
+            !squeezed.contains(&format!("{forbidden}forAdaptiveEvent")),
+            "AdaptiveEvent has a hand-written `{forbidden}` impl, which reaches a wire just \
+             as surely as a derive."
         );
     }
 }
@@ -575,6 +734,89 @@ fn a_stricter_conjunctive_gate_is_still_server_only() {
     let source = "#[cfg(all(feature = \"server\", unix))]\npub mod producers;\n";
     let gates = declaration_gates(source, PRODUCERS_DECLARATION).expect("declaration found");
     assert!(gates.iter().any(|gate| is_server_gate(gate)));
+}
+
+#[test]
+fn a_serializing_adaptive_event_is_rejected_however_it_is_spelled() {
+    // Non-vacuity for `lint_adaptive_event_derives_no_serialization`. Cases 2 and 4 through
+    // 7 all passed the previous scanner, which read only the *nearest* `#[derive(` and never
+    // looked for `cfg_attr` at all. Found by CodeRabbit at `eebde11`.
+    for source in [
+        // 1. The obvious form.
+        "#[derive(Serialize)]\npub enum AdaptiveEvent {\n}\n",
+        // 2. Stacked behind the innocent derive - the reported blind spot.
+        "#[derive(Serialize, Deserialize)]\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+        // 3. The other order.
+        "#[derive(Debug, Clone)]\n#[derive(Deserialize)]\npub enum AdaptiveEvent {\n}\n",
+        // 4. Behind an unrelated attribute.
+        "#[derive(Serialize)]\n#[non_exhaustive]\n#[derive(Debug)]\npub enum AdaptiveEvent {\n}\n",
+        // 5. Conditional. A cfg_attr gate does not make it safe, it makes it somebody
+        //    else's build flag.
+        "#[cfg_attr(feature = \"server\", derive(Serialize))]\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+        // 6. Conditional, unspaced, and behind the innocent derive.
+        "#[derive(Debug,Clone)]\n#[cfg_attr(test,derive(Deserialize))]\npub enum AdaptiveEvent {\n}\n",
+        // 7. Sharing the line with the declaration.
+        "#[derive(Debug)] #[derive(Serialize)] pub enum AdaptiveEvent {\n}\n",
+    ] {
+        let attributes = attributes_attached_to(source, ADAPTIVE_EVENT_DECLARATION)
+            .unwrap_or_else(|| panic!("declaration not found in:\n{source}"));
+        assert!(
+            attributes
+                .iter()
+                .any(|attribute| introduces_serialization(attribute).is_some()),
+            "a serializing AdaptiveEvent was admitted:\n{source}\nattributes: {attributes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_non_serializing_adaptive_event_is_accepted() {
+    // The other direction. A scanner that rejects everything is as useless as one that
+    // rejects nothing, and case 3 is the false positive the previous implementation
+    // avoided by accident and this one must avoid on purpose: a *different* type's
+    // serializing derive higher up the file.
+    for source in [
+        "#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+        "#[derive(Debug, Clone)]\n#[non_exhaustive]\npub enum AdaptiveEvent {\n}\n",
+        "#[derive(Serialize, Deserialize)]\npub struct Unrelated {\n}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+        "#[cfg_attr(test, derive(Default))]\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n}\n",
+    ] {
+        let attributes = attributes_attached_to(source, ADAPTIVE_EVENT_DECLARATION)
+            .unwrap_or_else(|| panic!("declaration not found in:\n{source}"));
+        let offenders: Vec<_> = attributes
+            .iter()
+            .filter(|attribute| introduces_serialization(attribute).is_some())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the scanner invented a serialization derive in:\n{source}\nfound: {offenders:?}"
+        );
+    }
+}
+
+#[test]
+fn attribute_extraction_survives_nesting_and_string_literals() {
+    // `attributes_in` has to close on the matching bracket, not the first one. A
+    // `cfg_attr` carrying a derive and a doc comment carrying a `]` are the two shapes
+    // that break a naive scan, and both are reachable in ordinary code.
+    let nested = attributes_in("#[cfg_attr(feature = \"server\", derive(Serialize))]");
+    assert_eq!(nested.len(), 1);
+    assert!(
+        nested[0].ends_with("))]"),
+        "attribute was truncated: {nested:?}"
+    );
+
+    let bracketed = attributes_in("#[doc = \"a ] bracket\"]\n#[derive(Debug)]");
+    assert_eq!(
+        bracketed.len(),
+        2,
+        "a string literal split an attribute: {bracketed:?}"
+    );
+    assert_eq!(bracketed[1], "#[derive(Debug)]");
+
+    // Inner attributes belong to the enclosing module, not to the next item.
+    let inner = attributes_in("#![deny(unsafe_code)]\n#[derive(Debug)]");
+    assert_eq!(inner, vec!["#[derive(Debug)]".to_string()]);
 }
 
 #[test]

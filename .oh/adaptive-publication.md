@@ -226,7 +226,7 @@ layer may not name.
 
 ### The reshaping window — decision, not deferral
 
-#323's ship-gate dissent asked this issue to decide, before any outside-repository
+The ship-gate dissent on #323 asked this issue to decide, before any outside-repository
 consumer exists, whether v1's shape is right. **Decision: the window stays open, and this
 issue deliberately does not close it.** #324 publishes to in-repo consumers only; no HTTP,
 SSE, MCP or device surface is added. The evidence that would justify reshaping — which
