@@ -1,5 +1,17 @@
 # HQPlayer Control Protocol Reference
 
+> ## Retired as guidance — start at the evidence ledger
+>
+> **[`docs/hqplayer-evidence-ledger.md`](hqplayer-evidence-ledger.md) supersedes this page** (issue
+> #341). The ledger carries every claim with its evidence class, provenance quadruple
+> (source · chain · daemon/version · date · playback state) and the executable test that proves it;
+> this page carries none of that and was confidently wrong in ways the ledger records under
+> **Retired claims**.
+>
+> This page is kept, not deleted, because links to it exist and a reader arriving at one must see the
+> correction rather than a clean file. Two of its statements are corrected in place below and marked
+> **[retired #341]**. Nothing here should be implemented from without checking the ledger row first.
+
 > **This document is a reader's guide, not the authority.** Since issue #322 the authority is the
 > executable corpus under `tests/fixtures/hqplayer/<version>/`, driven by the conformance suite in
 > `tests/hqplayer_conformance.rs`. Where the two disagree, the corpus wins — it carries per-fixture
@@ -131,47 +143,31 @@ The `<State/>` command returns these fields for settings:
 
 All commands use INDEX consistently. ModesItem has index (0,1,2) and value (-1,0,1) - these differ!
 
-### setFilter Implementation (ControlInterface.cpp:1337)
+### setFilter (ControlInterface.cpp:1337)
 
-```cpp
-void clControlInterface::setFilter(int value, int value1x)
-{
-    xwriter->writeStartElement(QStringLiteral("SetFilter"));
-    xwriter->writeAttribute(QStringLiteral("value"), QString::number(value));
-    if (value1x >= 0)
-        xwriter->writeAttribute(QStringLiteral("value1x"), QString::number(value1x));
-}
-```
+**[retired #341 — paraphrased, was a verbatim excerpt]** The reference implementation writes a
+`SetFilter` element whose `value` attribute is the number it was handed, and adds a `value1x`
+attribute only when that second argument is non-negative. Its parameter is *named* `value` while the
+CLI passes the `<index>` argument straight into it — which is the whole source of the naming confusion
+this page exists to unpick.
 
-The parameter is named `value` but the CLI passes the `<index>` argument directly.
+### State parsing (ControlInterface.cpp:1774-1790)
 
-### State Parsing (ControlInterface.cpp:1774-1790)
+**[retired #341 — paraphrased, was a verbatim excerpt]** The reference reads `state`, `mode`,
+`filter`, `filter1x`, `filterNx`, `shaper` and `rate` off the `State` element's attributes and
+converts each to an integer, passing them on untransformed. It applies no index/enum-ID mapping of its
+own, so the numbers it hands upward are exactly the numbers on the wire.
 
-```cpp
-emit stateResponse(
-    xreader->attributes().value("state").toString().toInt(),
-    xreader->attributes().value("mode").toString().toInt(),
-    xreader->attributes().value("filter").toString().toInt(),
-    iFilter1x, iFilterNx,
-    xreader->attributes().value("shaper").toString().toInt(),
-    xreader->attributes().value("rate").toString().toInt(),
-    // ...
-);
-```
+### FiltersItem parsing (ControlInterface.cpp:2084-2091)
 
-State values are parsed and passed through - the reference doesn't transform them.
+**[retired #341 — paraphrased, was a verbatim excerpt]** The reference captures `index`, `name`,
+`value` and `arg` from each list item — so both numeric identifiers are available to a client, and it
+is the client's job to know which domain each belongs to. See ledger rows HQP-C-002 and HQP-C-003.
 
-### FiltersItem Parsing (ControlInterface.cpp:2084-2091)
-
-```cpp
-emit filtersItem(
-    xreader->attributes().value("index").toString().toUInt(),
-    xreader->attributes().value("name").toString(),
-    xreader->attributes().value("value").toString().toInt(),
-    xreader->attributes().value("arg").toString().toUInt());
-```
-
-Both `index` and `value` are captured from the list response.
+> **Why these are paraphrases.** The excerpts they replace were verbatim C++ from Signalyst's
+> `hqp-control` sources, whose license this repository does not record (ledger HQP-C-052). Each
+> interoperability fact survives the paraphrase, the file and line citations are unchanged, and
+> `no_verbatim_upstream_source_excerpt_remains_in_the_reference_document` keeps them out.
 
 ## State vs Status
 

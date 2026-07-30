@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 // ===========================================================================================
 
 /// Evidence classes, strongest first. The order is the ranking the ledger promises.
-const CLASSES: [&str; 6] = [
+const CLASSES: [&str; 7] = [
     // First-hand UHC observation against a real daemon, matching a recorded run in the ledger's
     // live-run registry.
     "E0-uhc-live",
@@ -51,16 +51,17 @@ const CLASSES: [&str; 6] = [
     "E4-unverified",
     // Constructed to build a hazard shape. Never evidence.
     "E5-synthetic",
+    // A fact about a document, repository, licence or issue record rather than about daemon
+    // behaviour. Orthogonal to the ranking above rather than weaker than all of it: its strength
+    // comes from the `chain` field, not from its position here. Exists because the observed-claim
+    // check caught a licensing row claiming class `E1-upstream-verified`, which asserts that a
+    // running daemon was watched.
+    "E6-documentary",
 ];
 
 /// How the immediate source was obtained. Mirrors `Provenance::source_chain` in the corpus, whose
 /// vocabulary CodeRabbit review 4816484338 closed for the same reason.
-const CHAINS: [&str; 4] = [
-    "direct",
-    "read-via-report",
-    "read-via-issue",
-    "read-via-pr",
-];
+const CHAINS: [&str; 4] = ["direct", "read-via-report", "read-via-issue", "read-via-pr"];
 
 const STATUSES: [&str; 4] = ["settled", "open", "pending-live", "retired"];
 
@@ -120,9 +121,6 @@ struct Claim {
 }
 
 impl Claim {
-    fn source(&self) -> &str {
-        self.provenance.first().map_or("", String::as_str)
-    }
     fn chain(&self) -> &str {
         self.provenance.get(1).map_or("", String::as_str)
     }
@@ -166,16 +164,35 @@ fn claims() -> Vec<Claim> {
             line: i + 1,
             claim: get(1),
             class: get(2),
-            provenance: get(3)
-                .split(" · ")
-                .map(|p| p.trim().to_string())
-                .collect(),
+            provenance: get(3).split(" · ").map(|p| p.trim().to_string()).collect(),
             proof: get(4),
             status: get(5),
             owner: get(6),
         });
     }
     out
+}
+
+/// Whether a line is a markdown ATX heading.
+///
+/// The leading-`#` test alone is wrong in this document: `#322` and `#341` start body lines all over
+/// the ledger, and treating those as headings truncated a section before its `What would settle it`
+/// line. An ATX heading requires a space after the run of hashes.
+fn is_heading(line: &str) -> bool {
+    let h = line.trim_start();
+    let hashes = h.chars().take_while(|c| *c == '#').count();
+    hashes > 0 && h.chars().nth(hashes) == Some(' ')
+}
+
+/// The lines of the section introduced by the heading that contains `id`, up to the next heading.
+fn anchor_section(text: &str, id: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|l| is_heading(l) && l.contains(id))?;
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| is_heading(l))
+        .map_or(lines.len(), |p| start + 1 + p);
+    Some(lines[start..end].join("\n"))
 }
 
 /// Rows of a `|`-delimited table under the heading whose text contains `heading_marker`, excluding the
@@ -185,7 +202,7 @@ fn table_rows_under(heading_marker: &str) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     let mut inside = false;
     for line in text.lines() {
-        if line.starts_with('#') {
+        if is_heading(line) {
             // A new heading always ends the previous section, so a table cannot leak across one.
             inside = line.contains(heading_marker);
             continue;
@@ -198,9 +215,9 @@ fn table_rows_under(heading_marker: &str) -> Vec<Vec<String>> {
             continue;
         }
         let c = cells(t);
-        let is_separator = c.iter().all(|x| {
-            !x.is_empty() && x.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')
-        });
+        let is_separator = c
+            .iter()
+            .all(|x| !x.is_empty() && x.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '));
         if is_separator {
             continue;
         }
@@ -271,11 +288,7 @@ fn second_hand_fixtures() -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for profile in corpus::profiles() {
         for fixture in corpus::all_in(&profile) {
-            if fixture
-                .provenance
-                .source_chain
-                .contains("read-via-report")
-            {
+            if fixture.provenance.source_chain.contains("read-via-report") {
                 out.insert(format!("{profile}/{}", fixture.name));
             }
         }
@@ -352,7 +365,10 @@ fn claim_ids_are_unique_and_contiguous() {
         if !seen.insert(id.clone()) {
             dupes.push(id.clone());
         }
-        match id.strip_prefix("HQP-C-").and_then(|n| n.parse::<usize>().ok()) {
+        match id
+            .strip_prefix("HQP-C-")
+            .and_then(|n| n.parse::<usize>().ok())
+        {
             Some(n) if id.len() == "HQP-C-000".len() => numbers.push(n),
             _ => malformed.push(id.clone()),
         }
@@ -409,6 +425,11 @@ fn every_source_chain_and_playback_state_is_in_the_closed_vocabulary() {
     );
 }
 
+/// The admission an `E1` row must carry in its prose anchor to be allowed `playback: unknown`.
+///
+/// `E0` rows have no such escape: UHC ran the daemon, so UHC knows.
+const UNRECORDED_PLAYBACK_ADMISSION: &str = "Playback state was not recorded upstream";
+
 #[test]
 fn an_observed_claim_names_a_real_capture_date_and_playback_state() {
     let iso = |d: &str| {
@@ -417,6 +438,7 @@ fn an_observed_claim_names_a_real_capture_date_and_playback_state() {
             && d.as_bytes()[7] == b'-'
             && d.chars().filter(char::is_ascii_digit).count() == 8
     };
+    let text = ledger();
     let mut bad = Vec::new();
     for c in claims() {
         if !OBSERVED_CLASSES.contains(&c.class.as_str()) {
@@ -425,15 +447,31 @@ fn an_observed_claim_names_a_real_capture_date_and_playback_state() {
         if !iso(c.date()) {
             bad.push(format!("{} date {:?}", c.id, c.date()));
         }
-        if c.playback() == "unknown" || c.playback() == "n/a" {
-            bad.push(format!("{} playback {:?}", c.id, c.playback()));
+        match c.playback() {
+            "active" | "idle" => {}
+            // An upstream observation whose playback state nobody wrote down is a real case, and the
+            // two dishonest ways out are to guess a value or to reclassify a live observation as a
+            // transcription. The third way is to say so in the row's anchor, where a reader sees it.
+            "unknown" if c.class == "E1-upstream-verified" => {
+                let admitted = anchor_section(&text, &c.id)
+                    .is_some_and(|s| s.contains(UNRECORDED_PLAYBACK_ADMISSION));
+                if !admitted {
+                    bad.push(format!(
+                        "{} is E1 with playback \"unknown\" and its anchor does not state \
+                         {UNRECORDED_PLAYBACK_ADMISSION:?}",
+                        c.id
+                    ));
+                }
+            }
+            other => bad.push(format!("{} playback {other:?}", c.id)),
         }
     }
     assert!(
         bad.is_empty(),
         "a claim in class {OBSERVED_CLASSES:?} says a running daemon was observed, so `unknown` is \
-         not an available answer for when, or for whether audio was playing. A behaviour verified \
-         idle is not thereby verified under load. Offending: {bad:#?}"
+         not an available answer for when, or for whether audio was playing — a behaviour verified \
+         idle is not thereby verified under load. An `E1` row may say `unknown` only if its anchor \
+         admits the upstream record is silent. Offending: {bad:#?}"
     );
 }
 
@@ -523,7 +561,11 @@ fn every_proof_uses_a_known_form() {
 fn a_claim_proved_only_by_a_future_live_row_is_not_settled() {
     let mut bad = Vec::new();
     for c in claims() {
-        let proofs: Vec<&str> = c.proof.split(" · ").map(|p| p.trim().trim_matches('`')).collect();
+        let proofs: Vec<&str> = c
+            .proof
+            .split(" · ")
+            .map(|p| p.trim().trim_matches('`'))
+            .collect();
         let executable = proofs
             .iter()
             .any(|p| p.starts_with("test:") || p.starts_with("fixture:"));
@@ -532,7 +574,10 @@ fn a_claim_proved_only_by_a_future_live_row_is_not_settled() {
                 .iter()
                 .any(|p| p.starts_with("#332:") || p.starts_with("none:"));
         if future_only && c.status == "settled" {
-            bad.push(format!("{} status {:?} proof {:?}", c.id, c.status, c.proof));
+            bad.push(format!(
+                "{} status {:?} proof {:?}",
+                c.id, c.status, c.proof
+            ));
         }
     }
     assert!(
@@ -556,14 +601,12 @@ fn every_unsettled_claim_names_an_owner_and_what_would_settle_it() {
         }
         // The settle condition lives in the claim's prose anchor, because one table cell cannot hold
         // it honestly. The anchor is the heading that carries the ID.
-        let anchor = text
-            .split("\n#")
-            .find(|section| section.lines().next().is_some_and(|h| h.contains(&c.id)));
-        match anchor {
+        match anchor_section(&text, &c.id) {
             None => bad.push(format!("{} has no prose anchor section", c.id)),
-            Some(section) if !section.contains("What would settle it") => {
-                bad.push(format!("{} anchor has no `What would settle it` line", c.id))
-            }
+            Some(section) if !section.contains("What would settle it") => bad.push(format!(
+                "{} anchor has no `What would settle it` line",
+                c.id
+            )),
             Some(_) => {}
         }
     }
@@ -646,16 +689,32 @@ fn every_required_evidence_topic_maps_to_a_claim() {
             "three numeric domains",
             &["HQP-C-002", "HQP-C-003", "HQP-C-004"],
         ),
-        ("SetRate semantics", &["HQP-C-010"]),
-        ("active_mode contradiction", &["HQP-C-016"]),
+        (
+            "SetRate semantics: index on the wire, the exact Hz pin, Auto, mode/filter/device \
+             dependence, and mode switches clearing the pin",
+            &[
+                "HQP-C-015",
+                "HQP-C-016",
+                "HQP-C-017",
+                "HQP-C-018",
+                "HQP-C-019",
+                "HQP-C-020",
+                "HQP-C-021",
+                "HQP-C-022",
+            ],
+        ),
+        ("active_mode contradiction", &["HQP-C-023", "HQP-C-024"]),
         (
             "HTTP / profile / session-auth negative findings",
-            &["HQP-C-020", "HQP-C-021", "HQP-C-022"],
+            &["HQP-C-043", "HQP-C-044", "HQP-C-045", "HQP-C-048"],
         ),
-        ("apply-then-drop ambiguity", &["HQP-C-023"]),
-        ("push status cadence", &["HQP-C-025"]),
-        ("LibraryPicture binary interlude", &["HQP-C-026"]),
-        ("licensing and provenance", &["HQP-C-027"]),
+        ("apply-then-drop ambiguity", &["HQP-C-029"]),
+        ("push status cadence", &["HQP-C-037"]),
+        ("LibraryPicture binary interlude", &["HQP-C-038"]),
+        (
+            "licensing and provenance",
+            &["HQP-C-052", "HQP-C-053", "HQP-C-054"],
+        ),
     ];
     let by_id: HashMap<String, Claim> = claims().into_iter().map(|c| (c.id.clone(), c)).collect();
     let mut bad = Vec::new();
@@ -670,8 +729,11 @@ fn every_required_evidence_topic_maps_to_a_claim() {
     }
     // The two topics #341 requires to stay *unresolved* must not be quietly settled.
     for (topic, id) in [
-        ("active_mode contradiction", "HQP-C-016"),
-        ("apply-then-drop ambiguity", "HQP-C-023"),
+        // HQP-C-023 (`Status.active_mode` echoes the configured mode) *is* measured and settled. The
+        // half that must stay open is HQP-C-024, `State.active_mode` under `[source]`, which nobody
+        // has measured.
+        ("State.active_mode under [source]", "HQP-C-024"),
+        ("apply-then-drop ambiguity", "HQP-C-029"),
     ] {
         if let Some(c) = by_id.get(id) {
             assert_ne!(
@@ -736,13 +798,29 @@ fn the_retired_set_mode_value_claim_is_struck_where_it_still_appears() {
 #[test]
 fn the_reference_document_no_longer_settles_the_active_mode_question_by_fiat() {
     let text = read(&repo_root().join("docs/hqplayer-protocol-reference.md"));
+    // Two phrasings, because the document said it twice — once as a warning under **State vs Status**
+    // and once as a checklist item — and fixing only the phrasing a test names is how the other
+    // survives. Each retired line is kept in place with a `[retired #341]` marker beside it, which is
+    // why the check is for the *unmarked imperative*, not for the words appearing at all.
+    let retired_imperatives = [
+        "Always use State's numeric",
+        "use State's active_mode (INDEX), not Status's string",
+    ];
+    let mut found = Vec::new();
+    for line in text.lines() {
+        for phrase in retired_imperatives {
+            if line.contains(phrase) && !line.contains("[retired #341]") {
+                found.push(line.trim().to_string());
+            }
+        }
+    }
     assert!(
-        !text.contains("Always use State's numeric"),
-        "`docs/hqplayer-protocol-reference.md` still instructs the reader to always use State's \
-         numeric `active_mode`. `Status.active_mode` echoing the configured mode is measured; \
-         `State.active_mode` under `[source]` is unmeasured — the conformance suite deliberately \
-         refuses to settle it (`the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics`), \
-         so the document must not"
+        found.is_empty(),
+        "`docs/hqplayer-protocol-reference.md` still instructs the reader to pick `State.active_mode` \
+         globally. `Status.active_mode` echoing the configured mode is measured; `State.active_mode` \
+         under `[source]` is unmeasured — the conformance suite deliberately refuses to settle it \
+         (`the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics`), so the \
+         document must not. Offending lines: {found:#?}"
     );
 }
 

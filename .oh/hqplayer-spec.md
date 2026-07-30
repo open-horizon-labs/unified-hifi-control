@@ -1,5 +1,21 @@
 # HQPlayer Protocol Specification Session
 
+> ## Historical session record — its protocol claims are retired
+>
+> **[`docs/hqplayer-evidence-ledger.md`](../docs/hqplayer-evidence-ledger.md) supersedes the protocol
+> claims on this page** (issue #341). This file is a February 2026 session record and is kept for the
+> reasoning it captures, not for its conclusions.
+>
+> **One claim here is wrong and was contradicted by `docs/hqplayer-protocol-reference.md` for five
+> months:** that `SetMode` expects an enum **VALUE** (−1 / 0 / 1). It expects the **list index**
+> (0 / 1 / 2). The client resolves a name to a list index and sends that
+> (`src/adapters/hqplayer.rs` `set_mode`), and the live HQPlayer Embedded 6.0.2 run on 2026-07-30
+> round-tripped SDM→PCM→SDM with `State.mode=2` for SDM, whose enum ID is 1. See ledger
+> **HQP-C-001**.
+>
+> Wrong claims below are struck through **in place** rather than deleted, so a reader arriving from an
+> old link sees the correction instead of a clean file.
+
 ## Solution Space Analysis
 **Updated:** 2026-02-04
 
@@ -54,7 +70,7 @@
 
 | Item | State Returns | SetCommand Expects | Notes |
 |------|--------------|-------------------|-------|
-| Mode | VALUE | VALUE | mode values: -1=[source], 0=PCM, 1=SDM |
+| ~~Mode~~ | ~~VALUE~~ | ~~VALUE~~ | **[retired #341 — wrong]** ~~mode values: -1=[source], 0=PCM, 1=SDM~~. `State.mode` and `SetMode` speak the **list index** (0/1/2), not the enum ID. Ledger HQP-C-001 |
 | Filter | **INDEX** | **INDEX** | State.filter/filter1x/filterNx are indices; CLI confirms `--set-filter <index>` |
 | Shaper | **INDEX** | **INDEX** | State.shaper is index; CLI confirms `--set-shaping <index>` |
 | Rate | INDEX | INDEX | RateItem has no VALUE field anyway |
@@ -127,9 +143,11 @@ After testing with real HQPlayer, we discovered the API was leaking HQPlayer's i
 ├────────────┼──────────────┼────────────┼────────────┼────────────┤
 │ API/MCP    │ pass NAME    │ pass NAME  │ pass NAME  │ pass Hz    │
 ├────────────┼──────────────┼────────────┼────────────┼────────────┤
-│ Adapter    │ NAME→VALUE   │ NAME→INDEX │ NAME→INDEX │ Hz→INDEX   │
+│ Adapter    │ NAME→INDEX*  │ NAME→INDEX │ NAME→INDEX │ Hz→INDEX   │
 └────────────┴──────────────┴────────────┴────────────┴────────────┘
 ```
+
+\* **[retired #341]** this row read `NAME→VALUE` for Mode. It is `NAME→INDEX`: the adapter resolves a mode name to its list position. Ledger HQP-C-001.
 
 ### Design Principle
 
@@ -140,14 +158,14 @@ After testing with real HQPlayer, we discovered the API was leaking HQPlayer's i
 - Samplerate: `48000`, `96000`, etc. (Hz)
 
 **Adapter handles all HQPlayer-specific weirdness:**
-- Mode name → VALUE (-1, 0, 1) via `resolve_mode_value()`
+- ~~Mode name → VALUE (-1, 0, 1) via `resolve_mode_value()`~~ **[retired #341]** mode name → **INDEX** (0, 1, 2) via `resolve_mode_index()`; there is no `resolve_mode_value()` in the client. Ledger HQP-C-001
 - Filter name → INDEX via `resolve_filter_index()`
 - Shaper name → INDEX via `resolve_shaper_index()`
 - Rate Hz → INDEX via lookup in rates list
 
 ### Key Changes
 
-1. **`set_mode(&str)`** - Now takes name like "PCM", resolves to VALUE
+1. **`set_mode(&str)`** - Now takes name like "PCM", ~~resolves to VALUE~~ **[retired #341]** resolves to the list **INDEX**. Ledger HQP-C-001
 2. **UI SelectOptions** - Send NAME in `value` field, not index/value numbers
 3. **API handlers** - Pass strings directly to adapter methods
 4. **MCP handlers** - Simplified, no numeric parsing for mode/filter/shaper
