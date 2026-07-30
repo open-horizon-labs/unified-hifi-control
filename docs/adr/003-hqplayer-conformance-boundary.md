@@ -288,13 +288,21 @@ Because tier 2 needs hardware nobody should volunteer casually, the honest posit
   unilaterally.
 - Confirm on GitHub runners, not this sandbox, the two known full-run failure sources. Neither is a
   property of the code, and both were previously described more strongly than the evidence supports.
-  - The two `/hqp/discover` multicast 500s. These reproduced in **3 of 3** runs in this sandbox, where
+  - The two `/hqp/discover` multicast 500s. These reproduced in **3 of 4** runs in this sandbox, where
     multicast to `239.192.0.199` is unavailable, while an **independent** full run at the same head passed
-    every test binary. Earlier revisions called them "deterministic"; the property is
-    *environment-specific*, which is exactly why confirming on a runner is the action.
+    every test binary. Earlier revisions called them "deterministic", then *environment-specific*. **Both
+    are too strong, and both are withdrawn.** The fourth sandbox run, at `15281cc`, passed *both* tests and
+    the whole suite — 501 passed, 0 failed, 12 ignored, exit 0. The same sandbox therefore produces both
+    outcomes at one SHA, so the property is **intermittent**, not a fixed attribute of the environment.
+    This action is now largely discharged rather than pending: CI's own `cargo test --workspace` at
+    `15281cc` is a GitHub-runner full run and it is **green**. What a runner can establish is a *rate*; it
+    cannot return a verdict, because for an intermittent failure a green aggregate is no more proof the
+    pair is fixed than a red one is proof it is broken.
   - A pre-existing concurrency failure *family* in `adapter_integration` around
     `error_handling::lms_fails_gracefully_when_unconfigured`. The earlier "~1-in-10" characterisation was
-    wrong and is withdrawn: measured under the full suite the family fired in **2 of 2** runs, while the
+    wrong and is withdrawn: measured under the full suite the family fired in **2 of 3** runs, while the
     `adapter_integration` binary run on its own was **6/6 green**. The `4/4` figure applied only to that
-    isolated binary under `--test-threads=1` and never to the whole suite. The file is byte-identical to
+    isolated binary under `--test-threads=1` and never to the whole suite. It did **not** fire in the
+    `15281cc` sandbox run above, and an independent aggregate at that same head reported it as the *sole*
+    failing target — the same intermittency, read from both sides. The file is byte-identical to
     `v3`, so the mechanism is process-global state under concurrency, not this branch.
