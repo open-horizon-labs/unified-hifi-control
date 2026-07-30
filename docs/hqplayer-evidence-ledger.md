@@ -108,7 +108,8 @@ were **not executed** and are recorded as gaps in that comment.
 | HQP-C-001 | `SetMode value=` carries the **list index**, not the enum ID: SDM is index 2 while its enum ID is 1 | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:modes_list_distinguishes_list_index_from_enum_id · fixture:tests/fixtures/hqplayer/hqpd-6.0.4-opal/modes.xml | settled | — |
 | HQP-C-002 | Domain 1 — the **live wire** domain: `State.mode/filter/filter1x/filterNx/shaper/rate` and the **enumerated** setters (`SetMode`, `SetFilter`, `SetShaping`, `SetRate`, `SetJunkFilter`) speak a **list index** into the currently loaded enumeration. Volume is **not** in this domain — it is absolute dB (HQP-C-040) | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it · test:a_filter_name_is_not_sent_as_its_enum_id | settled | — |
 | HQP-C-003 | Domain 2 — the **persistent** domain: `hqplayerd.xml` and the 8088 config form store **enum IDs**, which are not list indices and must never be fed to the live lane | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-hqplayer-protocol-conformance.md` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_persistent_configuration_lane_stores_enum_ids_not_list_indices · test:feeding_a_persistent_enum_id_to_the_live_lane_is_rejected | settled | — |
-| HQP-C-004 | Domain 3 — the **client** domain: UHC's clients (UI, API, MCP) exchange setting-appropriate values — semantic names for mode/filter/shaper, Hz for rate, decimal dB for volume — and never list indices or enum IDs; both conversions are the adapter's job and never leave it | E6-documentary | `.oh/hqplayer-spec.md` layer table · direct · n/a · 2026-02-04 · n/a | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it | settled | — |
+| HQP-C-004 | Domain 3 — the **client** domain **as designed**: clients exchange setting-appropriate values — semantic names for mode/filter/shaper, Hz for rate, decimal dB for volume — and the adapter owns both numeric conversions. **This is the design rule, not a description of every path today**: see HQP-C-063 | E6-documentary | `.oh/hqplayer-spec.md` layer table · direct · n/a · 2026-02-04 · n/a | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it | settled | — |
+| HQP-C-063 | Raw indices **do** cross the client boundary today, in two evidenced places: the legacy numeric route `HqpSettingRequest { name: String, value: u32 }` stringifies its number for name-based lookup (`src/api/mod.rs:825-836`), and the adapter's resolvers fall back to parsing a numeric string as a direct index (`resolve_mode_index:2081`, `resolve_filter_index:2186`, `resolve_shaper_index:2247`) | E6-documentary | `src/api/mod.rs` and `src/adapters/hqplayer.rs` at this head · direct · n/a · 2026-07-30 · n/a | none:#347 removing the raw integer-string fallback from production control paths while keeping the legacy numeric HTTP contract at the compatibility boundary | open | #347 |
 | HQP-C-005 | `SetMode` does **not** reset the filter or shaper selections; the fake once modelled that and no evidence supports it | E3-derived | `.oh/issue-322-…` amendment row B14 · direct · hqplayerd 6.0.4 (Opal) · 2026-07-30 · unknown | test:set_mode_does_not_reset_the_filter_and_shaper_selections | settled | — |
 | HQP-C-006 | A mode change reloads the chain, so a list index resolved before it can name a **different** setting after it | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain · test:the_same_filter_index_selects_a_different_filter_per_loaded_chain | settled | — |
 | HQP-C-007 | Under configured `[source]` the **loaded chain** can move between PCM and SDM while `State.mode` stays 0 | E1-upstream-verified | UHC-SALVAGE-BETA-DEV via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_loaded_chain_moves_under_source_while_the_configured_mode_stays_source | settled | — |
@@ -247,6 +248,31 @@ withdrawn.
 ## Open questions register
 
 Each row below is an `open` or `pending-live` claim, with the acquisition plan the lint requires.
+
+### HQP-C-063 — the client boundary is not yet what HQP-C-004 describes
+
+HQP-C-004 previously said clients *"never"* exchange list indices or enum IDs. **That is false today**, and
+an independent review caught it. Two evidenced paths:
+
+- **The legacy numeric HTTP route.** `HqpSettingRequest` carries `value: u32`, and the handler's own
+  comment reads *"Legacy endpoint - convert numeric value to string for name-based lookups"*
+  (`src/api/mod.rs:825-836`). A client that sends `3` gets `"3"` passed to `set_mode`.
+- **The adapter's numeric-string fallback.** `resolve_mode_index`, `resolve_filter_index` and
+  `resolve_shaper_index` each try `parse::<u32>()` and treat the result as a **direct list index** when the
+  name is not in the cached enumeration (`:2081`, `:2186`, `:2247`).
+
+So HQP-C-004 is now scoped to the **design rule** and this row carries the **current fact**. #347's
+acceptance criteria own both halves precisely: *"Raw integer-string fallback is removed from production
+control paths"*, and *"Preserve the existing numeric legacy HTTP request contract … but keep that numeric
+value at the compatibility boundary and never persist or publish it as adaptive-control identity."*
+
+**Why this row has no executable proof, deliberately.** A check that asserts the fallback still exists
+would fail the moment #347 fixed it — failing on the happy path, which is a poor tripwire. HQP-C-062's
+check is the opposite shape: it fails when a *capability is added*, which genuinely warrants a ledger
+update. The asymmetry is the reason one is executable and the other is not.
+
+**What would settle it:** #347 landing both halves, after which HQP-C-004's stronger wording becomes true
+and this row retires. Until then the ledger must not describe the intended state as the shipped one.
 
 ### HQP-C-011 — does `GetFilters` renumber a name's enum ID between chains?
 
