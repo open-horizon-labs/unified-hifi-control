@@ -310,22 +310,33 @@ pub mod framing {
         let name = root_element(buf)?;
         let close = format!("</{name}>");
         let bytes = buf.as_bytes();
-        let mut in_quote = false;
+        // Which quote character opened the attribute value currently being scanned, if any. XML
+        // permits both forms, and only the *matching* character closes a value — a `"` inside a
+        // single-quoted value is content. Tracking a single bool for `"` alone would let
+        // `song='</Status>'` end the frame, so a truncated document would read as complete.
+        let mut quote: Option<u8> = None;
         let mut i = 0;
         while i < bytes.len() {
             // Regions where a closing-tag literal is content, not markup. Skipping them wholesale is
             // what stops `<!-- </Status> -->` being read as a frame boundary — which would let a
             // *truncated* document pass as complete, the one failure this whole function exists to
             // avoid. Quoting alone does not cover these: neither form is quoted.
-            if !in_quote {
+            if quote.is_none() {
                 if let Some(skip) = comment_or_cdata_len(&buf[i..]) {
                     i += skip;
                     continue;
                 }
             }
             match bytes[i] {
-                b'"' => in_quote = !in_quote,
-                b'<' if !in_quote && buf[i..].starts_with(&close) => return Some(i + close.len()),
+                b'"' | b'\'' => match quote {
+                    // Only the character that opened the value can close it.
+                    Some(open) if open == bytes[i] => quote = None,
+                    Some(_) => {}
+                    None => quote = Some(bytes[i]),
+                },
+                b'<' if quote.is_none() && buf[i..].starts_with(&close) => {
+                    return Some(i + close.len())
+                }
                 _ => {}
             }
             i += 1;
@@ -1296,7 +1307,12 @@ impl HqpAdapter {
         // unsolicited document costs the same as waiting for a wanted one.
         let deadline = tokio::time::Instant::now() + timeouts.response;
 
-        while !complete {
+        // Two nested loops on purpose. The outer one reads; the inner one drains everything the buffer
+        // already holds before the outer one is allowed to read again. Draining one document and going
+        // straight back to the socket blocks on bytes that may already be in hand — one read can carry
+        // an unsolicited push frame *and* the reply behind it, since the daemon emits those frames of
+        // its own accord.
+        'reading: while !complete {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(anyhow!("Response timeout"));
@@ -1304,125 +1320,132 @@ impl HqpAdapter {
 
             let read_result = timeout(remaining, conn.stream.read(&mut chunk)).await;
 
-            match read_result {
+            let n = match read_result {
                 Ok(Ok(0)) => break, // EOF
-                Ok(Ok(n)) => {
-                    // Checked **before** the append, against a fixed-size chunk that has already
-                    // landed on the stack. Nothing unbounded is ever allocated. Returning an error is
-                    // enough to recover: `send_command`'s wrapper marks the connection disconnected
-                    // on any inner failure, so the next command reconnects onto a clean stream rather
-                    // than reading this reply's tail.
-                    if raw.len() + n > MAX_RESPONSE_BYTES {
-                        return Err(anyhow!(
-                            "Response exceeded {} bytes awaiting a {} reply; discarding the \
-                             connection rather than accumulating further",
-                            MAX_RESPONSE_BYTES,
-                            expected_element.unwrap_or_default()
-                        ));
-                    }
-                    let fresh = &chunk[..n];
-                    raw.extend_from_slice(fresh);
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(anyhow!("Read error: {}", e)),
+                Err(_) => return Err(anyhow!("Response timeout")),
+            };
 
-                    // A newline is a **hint**, not a frame: documents are newline-terminated but may
-                    // contain internal newlines. Attempting to frame only when one arrives keeps the
-                    // classification frequency at roughly once per document, as it was when this loop
-                    // read whole lines. Classifying on every chunk instead would re-parse the whole
-                    // accumulated buffer per chunk, which is quadratic in a large reply. A reply with
-                    // no newline at all never frames — and is exactly what the ceiling above stops.
-                    if !fresh.contains(&b'\n') {
-                        continue;
-                    }
+            // Checked **before** the append, against a fixed-size chunk that has already landed on
+            // the stack. Nothing unbounded is ever allocated. Returning an error is enough to
+            // recover: `send_command`'s wrapper marks the connection disconnected on any inner
+            // failure, so the next command reconnects onto a clean stream rather than reading this
+            // reply's tail.
+            if raw.len() + n > MAX_RESPONSE_BYTES {
+                return Err(anyhow!(
+                    "Response exceeded {} bytes awaiting a {} reply; discarding the \
+                     connection rather than accumulating further",
+                    MAX_RESPONSE_BYTES,
+                    expected_element.unwrap_or_default()
+                ));
+            }
+            let fresh = &chunk[..n];
+            raw.extend_from_slice(fresh);
 
-                    // Classify the longest valid UTF-8 prefix. A multi-byte character can straddle a
-                    // chunk boundary, so the tail of `raw` may be a partial sequence; it is not
-                    // discarded, only excluded from this attempt until its remaining bytes arrive.
-                    let response = match std::str::from_utf8(&raw) {
+            // A newline is a **hint**, not a frame: documents are newline-terminated but may contain
+            // internal newlines. Attempting to frame only when one arrives keeps the classification
+            // frequency at roughly once per document, as it was when this loop read whole lines.
+            // Classifying on every chunk instead would re-parse the whole accumulated buffer per
+            // chunk, which is quadratic in a large reply. A reply with no newline at all never frames
+            // — and is exactly what the ceiling above stops.
+            if !fresh.contains(&b'\n') {
+                continue 'reading;
+            }
+
+            // Drain every document the buffer already holds before reading again.
+            loop {
+                // Classify the longest valid UTF-8 prefix. A multi-byte character can straddle a
+                // chunk boundary, so the tail of `raw` may be a partial sequence; it is not
+                // discarded, only excluded from this attempt until its remaining bytes arrive.
+                let response = match std::str::from_utf8(&raw) {
+                    Ok(s) => s,
+                    Err(e) => match std::str::from_utf8(&raw[..e.valid_up_to()]) {
                         Ok(s) => s,
-                        Err(e) => match std::str::from_utf8(&raw[..e.valid_up_to()]) {
-                            Ok(s) => s,
-                            // Unreachable by construction: `valid_up_to` is a valid boundary.
-                            Err(_) => continue,
-                        },
-                    };
+                        // Unreachable by construction: `valid_up_to` is a valid boundary.
+                        Err(_) => continue 'reading,
+                    },
+                };
 
-                    match framing::classify(response) {
-                        framing::Framing::Complete => {
-                            let got = framing::root_element(response);
-                            if expected_element.is_some() && got != expected_element {
-                                // An unsolicited document shared this read — the daemon emits
-                                // `Status` push frames of its own accord. Drop it and keep waiting
-                                // for the reply to the command actually sent, rather than answering
-                                // from someone else's document.
+                match framing::classify(response) {
+                    framing::Framing::Complete => {
+                        let got = framing::root_element(response);
+                        if expected_element.is_some() && got != expected_element {
+                            // An unsolicited document — the daemon emits `Status` push frames of its
+                            // own accord. Drop it and look at what is left, rather than answering
+                            // from someone else's document *or* going back to the socket for a reply
+                            // that may already be sitting behind it.
+                            skipped += 1;
+                            self.unsolicited_skipped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if skipped > MAX_UNSOLICITED_BACKLOG {
+                                return Err(anyhow!(
+                                    "Gave up after {} unsolicited documents while awaiting a {} \
+                                     reply (last was {:?})",
+                                    skipped,
+                                    expected_element.unwrap_or_default(),
+                                    got
+                                ));
+                            }
+                            tracing::debug!(
+                                "Skipping unsolicited HQPlayer {:?} document while awaiting {:?}",
+                                got,
+                                expected_element
+                            );
+                            // Drop only the skipped document, never the whole buffer, then look
+                            // again at the remainder. Falling back to a clear when the boundary is
+                            // unknown is unreachable — `Complete` is what got us here — and is
+                            // written as a total match rather than an unwrap.
+                            match framing::first_document_end(response) {
+                                Some(end) => {
+                                    raw.drain(..end);
+                                    // Nothing left but whitespace: the reply has not arrived yet.
+                                    if std::str::from_utf8(&raw)
+                                        .map(|r| r.trim().is_empty())
+                                        .unwrap_or(false)
+                                    {
+                                        continue 'reading;
+                                    }
+                                    continue;
+                                }
+                                None => {
+                                    raw.clear();
+                                    continue 'reading;
+                                }
+                            }
+                        }
+
+                        // The wanted reply. Anything coalesced *behind* it in the same read is an
+                        // unsolicited follower: count it and drop it here rather than leaving it in
+                        // the stream, where it is the right *element* for a later command of the same
+                        // name and could be handed over as that command's reply.
+                        if let Some(end) = framing::first_document_end(response) {
+                            let mut rest = &response[end..];
+                            while let Some(next) = framing::first_document_end(rest) {
                                 skipped += 1;
                                 self.unsolicited_skipped
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if skipped > MAX_UNSOLICITED_BACKLOG {
-                                    return Err(anyhow!(
-                                        "Gave up after {} unsolicited documents while awaiting a {} \
-                                         reply (last was {:?})",
-                                        skipped,
-                                        expected_element.unwrap_or_default(),
-                                        got
-                                    ));
-                                }
                                 tracing::debug!(
-                                    "Skipping unsolicited HQPlayer {:?} document while awaiting {:?}",
-                                    got,
+                                    "Dropping unsolicited HQPlayer document coalesced behind a {:?} \
+                                     reply",
                                     expected_element
                                 );
-                                // Drop only the skipped document, never the whole buffer. One read
-                                // can carry an unsolicited frame *and* the wanted reply behind it, so
-                                // clearing would discard a reply that had already arrived. Falling
-                                // back to a clear when the boundary is unknown is unreachable —
-                                // `Complete` is what got us here — and is written as a total match
-                                // rather than an unwrap.
-                                match framing::first_document_end(response) {
-                                    Some(end) => {
-                                        raw.drain(..end);
-                                    }
-                                    None => raw.clear(),
-                                }
-                            } else {
-                                // The wanted reply. Anything coalesced *behind* it in the same read is
-                                // an unsolicited follower: count it and drop it here rather than
-                                // leaving it in the stream.
-                                //
-                                // Leaving it was the previous behaviour, and it was worse in two ways.
-                                // A stale pushed `Status` left in the buffer is the right *element* for
-                                // a later `Status` command, so it could be handed over as that
-                                // command's reply — a stale document passing for a fresh one. And the
-                                // reply this call returned could carry a second document concatenated
-                                // onto it, which only went unnoticed because attribute reads scope to
-                                // the root tag.
-                                if let Some(end) = framing::first_document_end(response) {
-                                    let mut rest = &response[end..];
-                                    while let Some(next) = framing::first_document_end(rest) {
-                                        skipped += 1;
-                                        self.unsolicited_skipped
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        tracing::debug!(
-                                            "Dropping unsolicited HQPlayer document coalesced behind a \
-                                             {:?} reply",
-                                            expected_element
-                                        );
-                                        rest = &rest[next..];
-                                    }
-                                    raw.truncate(end);
-                                }
-                                complete = true;
+                                rest = &rest[next..];
                             }
+                            raw.truncate(end);
                         }
-                        framing::Framing::Malformed => {
-                            return Err(anyhow!(
-                                "Malformed response: {}",
-                                response.trim().chars().take(120).collect::<String>()
-                            ))
-                        }
-                        framing::Framing::Incomplete => {}
+                        complete = true;
+                        break;
                     }
+                    framing::Framing::Malformed => {
+                        return Err(anyhow!(
+                            "Malformed response: {}",
+                            response.trim().chars().take(120).collect::<String>()
+                        ))
+                    }
+                    // More bytes needed for this document; go back to the socket.
+                    framing::Framing::Incomplete => continue 'reading,
                 }
-                Ok(Err(e)) => return Err(anyhow!("Read error: {}", e)),
-                Err(_) => return Err(anyhow!("Response timeout")),
             }
         }
 

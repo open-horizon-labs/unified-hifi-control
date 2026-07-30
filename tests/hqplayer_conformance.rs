@@ -1424,9 +1424,12 @@ async fn a_setter_overridden_by_another_controller_fails_and_names_the_observed_
 /// skipped **on the existing connection**, without reconnecting.
 #[tokio::test]
 async fn a_burst_of_unsolicited_frames_is_skipped_without_dropping_the_connection() {
-    // 12 frames ~ six seconds of 2 Hz push, i.e. twice a response window. Newline-separated, because
-    // several documents sharing ONE line cost a single skip - `response.clear()` drops the rest of
-    // the line with them - so `repeat` would not exercise the bound at all.
+    // 12 frames ~ six seconds of 2 Hz push, i.e. twice a response window. Newline-separated to match
+    // what the daemon emits. Each is skipped and drained individually now: the reader drops one
+    // document's bytes and re-examines the remainder rather than clearing the buffer, so the count
+    // reflects documents rather than reads. (An earlier revision cleared the whole buffer per skip,
+    // which meant several documents sharing one line cost a single skip and hid the bound; the
+    // newline separation predates the fix and is kept because it is also what the wire does.)
     let burst = vec![PUSH_STATUS_FRAME; 12].join("\n");
     let h = Harness::with_policy(WirePolicy {
         coalesce_extra_for_element: Some(("State".to_string(), burst)),
@@ -3773,6 +3776,27 @@ fn a_closed_malformed_root_is_recovered_even_with_a_coalesced_push_frame() {
         framing::classify("</Status>"),
         framing::Framing::Malformed,
         "a leftover closing tag is still malformed"
+    );
+
+    // XML permits either quote form, and a literal inside a SINGLE-quoted attribute is data just as
+    // much as one inside a double-quoted attribute. Tracking only `"` would let `'</Status>'` end the
+    // frame, so a truncated document would read as complete.
+    assert_eq!(
+        framing::classify("<Status a='1'>\n<metadata song='</Status>'/>\n"),
+        framing::Framing::Incomplete,
+        "a closing-tag literal inside a SINGLE-quoted attribute value is data, not a frame boundary"
+    );
+    assert_eq!(
+        framing::classify("<Status a='1'>\n<metadata song='</Status>'\n</Status>\n"),
+        framing::Framing::Complete,
+        "and with a real closing tag after it, the boundary is the real one"
+    );
+    // Mixed forms: a double quote inside a single-quoted value is content and must not open a region.
+    assert_eq!(
+        framing::classify("<Status a='he said \"hi\"'>\n<metadata song='</Status>'/>\n"),
+        framing::Framing::Incomplete,
+        "a double quote inside a single-quoted value must not toggle quoting, or the scan loses track \
+         of which regions are data"
     );
 
     // A closing-tag literal inside a comment or a CDATA section is content, not markup. Quoting

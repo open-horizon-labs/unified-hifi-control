@@ -1747,7 +1747,9 @@ the checks — the first was the enum-ID renumbering the Stage 1 dissent caught.
 - **`classify` and the new `first_document_end` are projections of one walk** (`scan`), so there is a
   single traversal to keep correct. This *removes* a parser rather than adding one, which is the
   direction superego finding 5 asked for.
-- **A coalesced follower is now counted and dropped rather than left in the stream.** Leaving it was
+- **A coalesced follower is counted and dropped rather than left in the stream.** (Extended again in the
+  cleanup pass below: a follower arriving *ahead* of the reply is now also drained without a second
+  socket read.) Leaving it was
   worse in two ways: a stale pushed `Status` is the right *element* for a later `Status` command and
   could be handed over as that command's reply, and the returned reply could carry a second document
   concatenated onto it — unnoticed only because attribute reads scope to the root tag. Caught because
