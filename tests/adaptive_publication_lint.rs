@@ -332,7 +332,7 @@ fn macro_invocations(file: &File) -> Vec<String> {
 #[derive(Default)]
 struct AttributeVisitor {
     owners: Vec<String>,
-    found: Vec<(String, String)>,
+    found: Vec<(Vec<String>, String)>,
 }
 
 fn item_label(item: &Item) -> String {
@@ -373,12 +373,35 @@ impl<'ast> Visit<'ast> for AttributeVisitor {
         self.owners.pop();
     }
 
+    /// A variant is a distinct location from the enum that contains it.
+    ///
+    /// Attributing a variant's attributes to the enum let a `derive` there inherit the
+    /// enum's permission. A built-in derive in that position does not compile, but a
+    /// proc-macro attribute does — and the policy should say where an attribute *is*
+    /// rather than lean on a later compile.
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        self.owners.push(format!("variant {}", variant.ident));
+        visit::visit_variant(self, variant);
+        self.owners.pop();
+    }
+
+    /// Fields are tracked for the same reason, though with no reachable exploit today: a
+    /// field is always inside a variant or a struct, and either frame already moves the
+    /// stack away from the one permitted owner. Removing this tracking does not fail any
+    /// probe — stated rather than implied, because a mutation that changes nothing is not
+    /// evidence that the code it changed is load-bearing.
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        let label = field
+            .ident
+            .as_ref()
+            .map(|ident| format!("field {ident}"))
+            .unwrap_or_else(|| "field".to_string());
+        self.owners.push(label);
+        visit::visit_field(self, field);
+        self.owners.pop();
+    }
+
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
-        let owner = self
-            .owners
-            .last()
-            .cloned()
-            .unwrap_or_else(|| "<file>".to_string());
         let path = attr
             .path()
             .segments
@@ -386,15 +409,34 @@ impl<'ast> Visit<'ast> for AttributeVisitor {
             .map(|segment| segment.ident.to_string())
             .collect::<Vec<_>>()
             .join("::");
-        self.found.push((owner, path));
+        self.found.push((self.owners.clone(), path));
         visit::visit_attribute(self, attr);
     }
 }
 
-fn module_attributes(file: &File) -> Vec<(String, String)> {
+/// Every attribute in `file`, paired with the full owner stack that carries it.
+///
+/// The **stack**, not its last frame. Storing only the innermost label made a nested item
+/// sharing a name indistinguishable from the real one:
+///
+/// ```ignore
+/// mod inner { #[derive(GenerateAdaptiveWire)] enum AdaptiveEvent {} }
+/// #[derive(Debug, Clone)] pub enum AdaptiveEvent {}
+/// ```
+///
+/// Both derives reported the owner `enum AdaptiveEvent`, so the decoy inherited the real
+/// type's permission — and the token audit only inspects `adaptive_event_enum`, which
+/// searches top-level items, so nobody audited the decoy at all. Found by Codex at
+/// `24c9f56`.
+fn module_attributes(file: &File) -> Vec<(Vec<String>, String)> {
     let mut visitor = AttributeVisitor::default();
     visitor.visit_file(file);
     visitor.found
+}
+
+/// The one owner stack permitted to carry a `derive`.
+fn adaptive_event_owner() -> Vec<String> {
+    vec![format!("enum {ADAPTIVE_EVENT}")]
 }
 
 /// Attributes anywhere in `file` that the module-wide policy forbids.
@@ -411,16 +453,20 @@ fn module_attributes(file: &File) -> Vec<(String, String)> {
 /// This is the production gate. The enum-specific checks are kept because they name the
 /// offender more precisely, but they are no longer what carries the guarantee.
 fn disallowed_module_attributes(file: &File) -> Vec<String> {
+    let permitted = adaptive_event_owner();
     let mut rejected = Vec::new();
     for (owner, path) in module_attributes(file) {
+        let where_it_is = owner.join(" > ");
         match path.as_str() {
             "doc" => {}
-            "derive" if owner == format!("enum {ADAPTIVE_EVENT}") => {}
-            _ => rejected.push(format!("#[{path}] on {owner}")),
+            // Depth-exact: the single top-level `enum AdaptiveEvent`, and nothing that
+            // merely shares its name at some other depth.
+            "derive" if owner == permitted => {}
+            _ => rejected.push(format!("#[{path}] on {where_it_is}")),
         }
     }
-    // A derive that is in the right place but holds the wrong token is still forbidden, so
-    // the module-wide policy cannot be satisfied by relocating a bad derive onto the enum.
+    // A derive in the right place holding the wrong token is still forbidden, so the policy
+    // cannot be satisfied by relocating a bad derive onto the enum.
     if let Some(item) = adaptive_event_enum(file) {
         for token in derives_in(&item.attrs) {
             if !ADAPTIVE_EVENT_ALLOWED_DERIVES.contains(&token.as_str()) {
@@ -782,14 +828,14 @@ fn lint_the_internal_event_module_carries_only_allowed_attributes_anywhere() {
 
     // The policy must describe the module, not merely permit it: if the one real derive
     // vanished, the policy would be silently over-broad.
-    let derive_owners: Vec<String> = module_attributes(&file)
+    let derive_owners: Vec<Vec<String>> = module_attributes(&file)
         .into_iter()
         .filter(|(_, path)| path == "derive")
         .map(|(owner, _)| owner)
         .collect();
     assert_eq!(
         derive_owners,
-        vec![format!("enum {ADAPTIVE_EVENT}")],
+        vec![adaptive_event_owner()],
         "the module's derives changed; the policy now describes something else"
     );
 }
@@ -1163,6 +1209,83 @@ fn a_proc_macro_on_any_other_item_cannot_generate_for_adaptive_event() {
             "{label}: a proc macro on another item was admitted:\n{source}"
         );
     }
+}
+
+#[test]
+fn a_nested_decoy_named_adaptive_event_cannot_borrow_the_real_ones_permission() {
+    // The owner was stored as a lossy label — the last frame only — so a *nested* item that
+    // happens to share the name produced the same string as the real one and inherited its
+    // permission to derive. The token audit looks at `adaptive_event_enum`, which searches
+    // top-level items only, so the decoy's derive was audited by nobody.
+    //
+    // Found by Codex at `24c9f56`.
+    let collision = "mod inner {\n    #[derive(GenerateAdaptiveWire)]\n    enum AdaptiveEvent {}\n}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n";
+    let file = snippet(collision);
+
+    // The false pass, spelled out: the top-level enum is clean, so every enum-specific
+    // check passes.
+    let item = adaptive_event_enum(&file).expect("top-level enum located");
+    assert_eq!(
+        derives_in(&item.attrs),
+        vec!["Debug".to_string(), "Clone".to_string()],
+        "precondition failed - the top-level enum's derives were not clean"
+    );
+
+    assert!(
+        !disallowed_module_attributes(&file).is_empty(),
+        "a nested decoy sharing the name inherited permission to derive:\n{collision}"
+    );
+
+    // Depth matters, not just the name: the same decoy two modules down.
+    let deeper = "mod a {\n    mod b {\n        #[derive(GenerateAdaptiveWire)]\n        enum AdaptiveEvent {}\n    }\n}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n";
+    assert!(
+        !disallowed_module_attributes(&snippet(deeper)).is_empty(),
+        "a decoy two modules down inherited permission:\n{deeper}"
+    );
+
+    // And a decoy carrying an *allowed* derive is still wrong: permission belongs to the
+    // one top-level item, not to anything wearing its name.
+    let allowed_token_decoy = "mod inner {\n    #[derive(Debug)]\n    enum AdaptiveEvent {}\n}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n";
+    assert!(
+        !disallowed_module_attributes(&snippet(allowed_token_decoy)).is_empty(),
+        "a nested decoy was permitted to derive at all:\n{allowed_token_decoy}"
+    );
+}
+
+#[test]
+fn attributes_on_variants_and_fields_are_located_precisely() {
+    // A variant or field attribute inherited the enclosing item's label, so a `derive`
+    // there read as a derive on the enum and was permitted. A built-in derive in that
+    // position does not compile — but the policy should say where an attribute *is* rather
+    // than lean on a later compile to catch it, because a proc-macro attribute there does
+    // compile. Raised alongside the decoy finding.
+    for (label, source) in [
+        (
+            "derive on a variant",
+            "pub enum AdaptiveEvent {\n    #[derive(GenerateAdaptiveWire)]\n    A,\n}\n",
+        ),
+        (
+            "derive on a field",
+            "pub enum AdaptiveEvent {\n    A {\n        #[derive(GenerateAdaptiveWire)]\n        x: u8,\n    },\n}\n",
+        ),
+        (
+            "attribute macro on a variant",
+            "pub enum AdaptiveEvent {\n    #[generate_event_wire]\n    A,\n}\n",
+        ),
+    ] {
+        assert!(
+            !disallowed_module_attributes(&snippet(source)).is_empty(),
+            "{label}: an attribute below the item borrowed the item's permission:\n{source}"
+        );
+    }
+
+    // Doc comments in those positions remain fine.
+    let documented = "#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n    /// variant docs\n    A {\n        /// field docs\n        x: u8,\n    },\n}\n";
+    assert!(
+        disallowed_module_attributes(&snippet(documented)).is_empty(),
+        "documented variants or fields were rejected: {:?}",
+        disallowed_module_attributes(&snippet(documented))
+    );
 }
 
 #[test]
