@@ -83,19 +83,6 @@
       "write_attempt": "acknowledged_provisional",
       "outcome": "indeterminate",
       "observed": { "epoch": 7, "control_plane": 12, "state": 4207 },
-      "history": [
-        {
-          "from": "disconnected",
-          "to": "indeterminate",
-          "at": "2026-07-30T11:06:31Z",
-          "observed": { "epoch": 7, "control_plane": 12, "state": 4207 },
-          "reason": {
-            "code": "requires_connection",
-            "scope": "lane",
-            "display_text_key": "reason.transport_dropped_after_write"
-          }
-        }
-      ],
       "recovery": "awaiting_readback",
       "reason": {
         "code": "requires_connection",
