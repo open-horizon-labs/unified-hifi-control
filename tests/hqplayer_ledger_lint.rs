@@ -1265,15 +1265,29 @@ fn commands_in(text: &str) -> Vec<String> {
 
 /// Whether a cited test **exercises** `cmd`, decided from its parsed syntax tree.
 ///
-/// Text matching is retired here, and CodeRabbit's reason was decisive: a substring cannot distinguish an
-/// executable call from a mention. The proof is now a **call expression** whose method or function is the
-/// adapter method that emits the command, or a **string literal shaped like the raw wire element**
-/// (`"<SetJunkFilter …"`), which is how a raw command is actually written.
+/// The **only** accepted evidence is a call expression whose method or function is in that command's exact
+/// accepted-call set ([`accepted_calls_for`]).
+///
+/// **Raw-wire string evidence was removed rather than narrowed, and that is the point.** Each attempt to
+/// accept a `"<SetMode …/>"` literal leaked: free-floating collection credited a bare local binding, and
+/// restricting it to the arguments of an allowlisted send (`send_command`, `write_all`, …) was still
+/// **type-blind** — `some_formatter.write("<SetMode/>")`, a `File::write`, or an unrelated `send_command` on
+/// another type would all have passed, and `syn` cannot resolve a receiver's type to tell them apart.
+/// Verified before removing it: **no ledger row depends on raw-literal evidence.** With that path disabled
+/// the whole check stays green; every command-naming row is credited by a mapped adapter method or an
+/// explicit exemption; and the one live-only command claim — HQP-C-051, `SetJunkFilter` — is `open` with a
+/// `none:` proof precisely because nothing hermetic exercises it. Carrying a known false-pass surface for
+/// zero present benefit is not a trade worth making.
 ///
 /// Deliberately **not** accepted, each for a stated reason:
 ///
 /// * A bare command name in a string literal — `accept_but_ignore("SetRate")` arms the fake, it does not
 ///   send anything. Requiring the `<` makes an arrangement distinguishable from an invocation.
+/// * **A raw wire string literal, in any position whatsoever.** Removed rather than narrowed — see the
+///   paragraph above. Consequence: an **unmapped** command cannot be credited at all, and must either gain a
+///   deliberate mapping in [`accepted_calls_for`] or be named after [`ELSEWHERE_MARKER`] with where its
+///   evidence lives. Residual, stated: calls inside macro invocations such as `assert_eq!` are invisible,
+///   because `syn` does not parse macro token streams into expressions.
 /// * Anything in a comment or doc comment — a plan is not a proof.
 /// * Anything inside a **deferred context** — a closure body or an unawaited `async { … }` block. Both are
 ///   *described*, not executed, and `visit_expr_closure`/`visit_expr_async` stop the walk at each. An
@@ -1291,7 +1305,6 @@ fn test_exercises_command(file: &syn::File, test_name: &str, cmd: &str) -> Optio
         /// Whether the named function exists at all — the only thing that makes the answer `None`.
         present: bool,
         calls: Vec<String>,
-        raw_literals: Vec<String>,
     }
     impl<'ast> Visit<'ast> for Found<'_> {
         fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
@@ -1303,38 +1316,40 @@ fn test_exercises_command(file: &syn::File, test_name: &str, cmd: &str) -> Optio
             }
         }
         fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
+            let name = e.method.to_string();
             if self.in_test {
-                self.calls.push(e.method.to_string());
+                self.calls.push(name.clone());
             }
-            syn::visit::visit_expr_method_call(self, e);
+            self.visit_expr(&e.receiver);
+            for arg in &e.args {
+                self.visit_expr(arg);
+            }
         }
         fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
-            if self.in_test {
-                if let syn::Expr::Path(p) = &*e.func {
-                    if let Some(seg) = p.path.segments.last() {
-                        self.calls.push(seg.ident.to_string());
-                    }
+            let mut name = String::new();
+            if let syn::Expr::Path(p) = &*e.func {
+                if let Some(seg) = p.path.segments.last() {
+                    name = seg.ident.to_string();
                 }
             }
-            syn::visit::visit_expr_call(self, e);
-        }
-        fn visit_lit_str(&mut self, l: &'ast syn::LitStr) {
-            if self.in_test {
-                self.raw_literals.push(l.value());
+            if self.in_test && !name.is_empty() {
+                self.calls.push(name.clone());
             }
-            syn::visit::visit_lit_str(self, l);
+            self.visit_expr(&e.func);
+            for arg in &e.args {
+                self.visit_expr(arg);
+            }
         }
         /// A closure body is **described**, not executed. Not descending into it is the whole fix for the
         /// deferred-evidence false pass: `let _never_called = || h.adapter.set_mode("PCM");` credited
-        /// `SetMode`, and so did a raw `<SetMode` literal written inside such a closure — two shapes that
-        /// fail through different collectors and are both refused now.
+        /// `SetMode` even though the closure is never invoked.
         ///
         /// Deliberately narrow. An *invoked* closure — `(|| h.adapter.set_mode("x"))()` — is now a false
         /// **negative**; that is the conservative direction, and no control demonstrates a need to widen.
         fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
         /// An unawaited `async { … }` block is the same deferred-evidence class reached through a different
         /// expression: `let _never_polled = async { h.adapter.set_mode("PCM").await; };` described a command
-        /// and never ran it, and a raw `<SetMode` literal inside one behaved the same way. Both are refused.
+        /// and never ran it.
         ///
         /// This does **not** affect an `async fn` test body, which is an [`syn::ItemFn`] block rather than an
         /// `ExprAsync` — every cited test in the corpus is that shape, and a control pins it.
@@ -1346,19 +1361,14 @@ fn test_exercises_command(file: &syn::File, test_name: &str, cmd: &str) -> Optio
         in_test: false,
         present: false,
         calls: Vec::new(),
-        raw_literals: Vec::new(),
     };
     f.visit_file(file);
     if !f.present {
         // `None` means **the test is not in this file** — nothing else. An earlier revision also returned
-        // `None` when the body had no calls and no literals, which conflated "cannot answer" with
-        // "answers no": a test that exercises nothing must say so, or a caller cannot tell a missing
-        // citation from an empty one. Caught by this function's own controls.
+        // `None` when the body had no calls, which conflated "cannot answer" with "answers no": a test that
+        // exercises nothing must say so, or a caller cannot tell a missing citation from an empty one.
+        // Caught by this function's own controls.
         return None;
-    }
-    let wire = format!("<{cmd}");
-    if f.raw_literals.iter().any(|l| l.contains(&wire)) {
-        return Some(true);
     }
     // Exact membership, not a prefix. The prefix form credited `set_mode_something_else` for `SetMode`,
     // which the doc comment had claimed it would not — a contradiction between the comment and the code,
@@ -1410,8 +1420,12 @@ fn accepted_calls_for(cmd: &str) -> Option<&'static [&'static str]> {
 }
 
 /// Controls for [`test_exercises_command`], written as the exploits it must refuse.
+///
+/// Every raw-wire literal shape is a **negative** here, including the ones handed to a real send: raw
+/// literals are not evidence at all, because no type-blind name check can tell `sock.write_all` from
+/// `formatter.write`.
 #[test]
-fn a_command_is_exercised_only_by_a_call_or_a_raw_wire_literal() {
+fn a_command_is_exercised_only_by_a_call_to_a_mapped_adapter_method() {
     let parse = |src: &str| syn::parse_file(src).expect("control source parses");
     let ex = |src: &str, name: &str, cmd: &str| {
         test_exercises_command(&parse(src), name, cmd).expect("the control test is present")
@@ -1435,11 +1449,57 @@ fn a_command_is_exercised_only_by_a_call_or_a_raw_wire_literal() {
         "t",
         "SetShaping"
     ));
-    // Accepted: a raw wire element, which is how a command with no adapter method is sent.
-    assert!(ex(
-        r##"#[test] fn t() { send("<SetJunkFilter value=\"1\"/>"); }"##,
+    // Refused: a raw wire element, **even handed to a real send**. An allowlist of send names cannot be
+    // trusted, because it is type-blind: `formatter.write(…)`, `File::write`, or an unrelated
+    // `send_command` on another type are indistinguishable from the real emitter without type resolution,
+    // which `syn` does not do. No ledger row needs this path, so it is gone.
+    for src in [
+        r##"#[test] fn t() { h.adapter.send_command("<SetJunkFilter value=\"1\"/>"); }"##,
+        r##"#[test] fn t() { sock.write_all(b"<SetJunkFilter value=\"1\"/>"); }"##,
+        r##"#[test] fn t() { formatter.write("<SetJunkFilter value=\"1\"/>"); }"##,
+        r##"#[test] fn t() { unrelated.send_command("<SetJunkFilter value=\"1\"/>"); }"##,
+    ] {
+        assert!(
+            !ex(src, "t", "SetJunkFilter"),
+            "a raw wire literal is not evidence in any position: {src}"
+        );
+    }
+
+    // Refused: a raw wire literal that is merely **described** — bound, compared, collected or handed to
+    // something that is not a send. A document is not a transmission.
+    assert!(!ex(
+        r##"#[test] fn t() { let _described = "<SetMode value=\"1\"/>"; }"##,
         "t",
-        "SetJunkFilter"
+        "SetMode"
+    ));
+    assert!(!ex(
+        r##"#[test] fn t() { assert_eq!(rendered, "<SetMode value=\"1\"/>"); }"##,
+        "t",
+        "SetMode"
+    ));
+    assert!(!ex(
+        r##"#[test] fn t() { let all = vec!["<SetMode value=\"1\"/>"]; }"##,
+        "t",
+        "SetMode"
+    ));
+    assert!(!ex(
+        r##"#[test] fn t() { describe_command("<SetMode value=\"1\"/>"); }"##,
+        "t",
+        "SetMode"
+    ));
+    assert!(
+        !ex(
+            r##"#[test] fn t() { send_metrics("<SetMode value=\"1\"/>"); }"##,
+            "t",
+            "SetMode"
+        ),
+        "no call name makes a raw literal into evidence"
+    );
+    // Refused: a real send shape, but inside a deferred context.
+    assert!(!ex(
+        r##"#[test] fn t() { let _never = || h.adapter.send_command("<SetMode value=\"1\"/>"); }"##,
+        "t",
+        "SetMode"
     ));
 
     // Refused: a comment. A plan is not a proof.
@@ -1491,7 +1551,7 @@ fn a_command_is_exercised_only_by_a_call_or_a_raw_wire_literal() {
         "SetMode"
     ));
     assert!(!ex(
-        r##"#[test] fn t() { let _never_called = || send("<SetMode value=\"1\"/>"); }"##,
+        r##"#[test] fn t() { let _never_called = || h.adapter.send_command("<SetMode value=\"1\"/>"); }"##,
         "t",
         "SetMode"
     ));
@@ -1501,8 +1561,8 @@ fn a_command_is_exercised_only_by_a_call_or_a_raw_wire_literal() {
         "t",
         "SetMode"
     ));
-    assert!(ex(
-        r##"#[test] fn t() { send("<SetMode value=\"1\"/>"); }"##,
+    assert!(!ex(
+        r##"#[test] fn t() { h.adapter.send_command("<SetMode value=\"1\"/>"); }"##,
         "t",
         "SetMode"
     ));
@@ -1515,7 +1575,7 @@ fn a_command_is_exercised_only_by_a_call_or_a_raw_wire_literal() {
         "SetMode"
     ));
     assert!(!ex(
-        r##"#[test] fn t() { let _never_polled = async { send("<SetMode value=\"1\"/>"); }; }"##,
+        r##"#[test] fn t() { let _never_polled = async { h.adapter.send_command("<SetMode value=\"1\"/>"); }; }"##,
         "t",
         "SetMode"
     ));

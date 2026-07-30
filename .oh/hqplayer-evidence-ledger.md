@@ -1198,3 +1198,60 @@ ignored**. A runner establishes a rate; it does not return a verdict.
 **Nineteen defects.** Eleven were a text scan or loose match standing in for an exact one; five were wording
 outrunning proof; one a stale status; one in the verification set; and this one — deferred evidence — is the
 first where the *shape of the AST walk* was the defect rather than the comparison.
+
+### Raw-wire literal evidence: narrowed twice, then removed
+
+**CodeRabbit at `fedfb5a` (P2):** `visit_lit_str` credited **any** standalone raw-wire literal, so
+`let _described = "<SetMode value=\"1\"/>";` — a document bound to a variable and never sent — proved
+`SetMode`. RED was recorded shape by shape against `fedfb5a` before any fix:
+
+| Shape | Wanted | Got at `fedfb5a` |
+|---|---|---|
+| standalone local binding | refuse | **credited** |
+| non-send helper call `describe_command(…)` | refuse | **credited** |
+| `send_metrics(…)` — name merely starts with `send` | refuse | **credited** |
+| `sock.write_all(b"<SetMode/>")` — a real send | accept | **refused** (byte strings were never collected) |
+
+**First fix, then rejected on review.** I narrowed collection to literals in the argument position of an
+allowlisted send (`send_command`, `send_command_inner*`, `write_all`, `write`) — names taken from the code,
+matched exactly. A pre-commit audit then made the decisive objection: **an exact name check is still
+type-blind.** `formatter.write("<SetMode/>")`, a `File::write`, or an unrelated `send_command` on some other
+type are indistinguishable from the adapter's emitter without type resolution, and `syn` does not resolve
+types. The allowlist would have documented a false-pass surface instead of closing it.
+
+**Verified before removing, not assumed:** with raw-literal evidence disabled entirely, **check 34 stays
+green**. Every command-naming row is credited by a mapped adapter-method call or an explicit
+`Commands evidenced elsewhere:` marker, and the one live-only command claim — **HQP-C-051, `SetJunkFilter`,
+`open` with a `none:` proof** — has no hermetic proof by design. Rows audited individually:
+
+| Row | Status | Commands | Proof kinds |
+|---|---|---|---|
+| HQP-C-001 | settled | SetMode | test, fixture |
+| HQP-C-002 | settled | SetFilter, SetJunkFilter, SetMode, SetRate, SetShaping | test (+ marker for two) |
+| HQP-C-005, 015, 017 | settled | SetMode / SetRate | test |
+| HQP-C-029 | open | SetMode | test (+ marker) |
+| HQP-C-050 | settled | SetJunkFilter | test (+ marker) |
+| HQP-C-051 | open | SetJunkFilter | **none:** — live-only, by design |
+
+**So raw-literal evidence was removed, not narrowed.** The only accepted proof is a call whose method is in
+that command's exact accepted-call set. Fourteen shapes are pinned, and every raw-literal case is now a
+**negative** — including `send_command`, `write_all` and `formatter.write`, because no name check can tell
+them apart. The control is renamed `a_command_is_exercised_only_by_a_call_to_a_mapped_adapter_method`, and
+the diagnostic says raw literals are not evidence at all.
+
+**Consequence, deliberate:** an **unmapped** command can no longer be credited. It must gain a reviewable
+one-line mapping, or be named after the marker with where its evidence lives. That is stricter than before
+and it is the honest direction: this check's whole purpose is that a claim's proof must *execute* the thing
+the claim is about.
+
+**Bite-tested:** re-adding a raw-literal path fails the control set.
+
+**Twenty defects.** Twelve were a text scan or a loose match standing in for an exact one. Three attempts
+were needed to get raw-wire evidence right, and the answer turned out to be *not to accept it* — the
+strongest available form of "eliminate the class rather than document it."
+
+**Flake accounting at this tree:** four workspace runs — three **exit 0 (589 passed, 12 ignored)** and one
+**exit 101** whose single failure was `error_handling::lms_fails_gracefully_when_unconfigured` in
+`tests/adapter_integration.rs`, not in this PR's diff and byte-identical to `origin/v3`. That is ADR 003's
+documented `UHC_CONFIG_DIR` family, and across this session it has now fired in 2 of 8 runs. A rate, not a
+verdict.
