@@ -1528,6 +1528,19 @@ impl HqpAdapter {
                                 cursor += next;
                             }
                             conn.carry = raw[cursor..].to_vec();
+                            // Bytes before the document belong to nothing: not a document, so not
+                            // countable as a skipped one. With followers now preserved rather than
+                            // orphaned this should be unreachable, which is exactly why it is worth
+                            // saying out loud instead of dropping quietly — discarding unexplained
+                            // bytes in silence is what made the original corruption invisible.
+                            if start > 0 {
+                                tracing::warn!(
+                                    "Discarding {} byte(s) preceding a {:?} reply that belong to no \
+                                     document; this should not be reachable",
+                                    start,
+                                    expected_element
+                                );
+                            }
                             raw.drain(..start);
                             raw.truncate(end - start);
                         }
