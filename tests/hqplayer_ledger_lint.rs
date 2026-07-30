@@ -1223,10 +1223,11 @@ fn every_command_a_claim_names_is_exercised_by_one_of_its_own_proofs() {
             }
             if !command_is_exercised(&bodies, &cmd) {
                 bad.push(format!(
-                    "{} names {cmd} but no cited proof exercises it (looked for {cmd} or {} outside \
-                     comments)",
+                    "{} names {cmd} but no cited proof exercises it (looked for {cmd}, and for {} \
+                     outside comments)",
                     c.id,
                     adapter_method_for(&cmd)
+                        .map_or_else(|| "no mapped adapter method".to_string(), str::to_string)
                 ));
             }
         }
@@ -1279,25 +1280,39 @@ fn command_is_exercised(body: &str, cmd: &str) -> bool {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    code.contains(cmd) || code.contains(adapter_method_for(cmd))
+    // The raw wire name always counts, mapped or not.
+    if code.contains(cmd) {
+        return true;
+    }
+    // A method name counts only for a command whose method is *known*. The former `set_` fallback made
+    // any setter in a proof body credit any unknown command — an invented `SetFoo` would have been
+    // proven by an unrelated `set_mode` call, which is the widest false pass this check could have had.
+    adapter_method_for(cmd).is_some_and(|method| code.contains(method))
 }
 
 /// The adapter method that emits a wire command.
 ///
-/// A table, not a derivation: `SetShaping` is emitted by `set_shaper` and `SetJunkFilter` by
-/// `set_junk_filter`, neither of which a camel-to-snake rule produces. Deriving them yielded
-/// `set_shaping` and `set_junkfilter`, so a future shaper expectation would not have been credited and
-/// the check would have demanded an exemption for evidence that existed.
-fn adapter_method_for(cmd: &str) -> &'static str {
+/// A table, not a derivation, and `Option` rather than a fallback — both from defects:
+///
+/// * Deriving the name produced `set_shaping` and `set_junkfilter`, **neither of which exists**, so a
+///   future shaper expectation calling `set_shaper` would not have been credited and the check would have
+///   demanded an exemption for evidence that was there.
+/// * A `set_` fallback for unmapped commands let **any** setter in a proof body credit **any** unknown
+///   command: an invented `SetFoo` would have been proven by an unrelated `set_mode` call. `None` forces
+///   an unmapped command to be evidenced by its own raw wire name.
+fn adapter_method_for(cmd: &str) -> Option<&'static str> {
     match cmd {
-        "SetMode" => "set_mode",
-        "SetFilter" => "set_filter",
-        "SetShaping" => "set_shaper",
-        "SetRate" => "set_rate",
-        "SetJunkFilter" => "set_junk_filter",
-        "SetVolume" => "set_volume",
-        "SetAdaptiveVolume" => "set_adaptive_volume",
-        _ => "set_",
+        "SetMode" => Some("set_mode"),
+        "SetFilter" => Some("set_filter"),
+        "SetShaping" => Some("set_shaper"),
+        "SetRate" => Some("set_rate"),
+        "SetJunkFilter" => Some("set_junk_filter"),
+        "SetVolume" => Some("set_volume"),
+        "SetAdaptiveVolume" => Some("set_adaptive_volume"),
+        // Deliberately `None` rather than a `set_` prefix: an unmapped command must be evidenced by its
+        // own raw wire name. Adding a mapping here is a decision to accept a method name as evidence for
+        // a command, and that decision should be explicit and reviewable, one line at a time.
+        _ => None,
     }
 }
 
@@ -1335,6 +1350,22 @@ fn a_command_named_only_in_a_comment_is_not_exercised() {
         "    assert!(msg.contains(\"SetMode\"));",
         "SetMode"
     ));
+
+    // An **unmapped** command must require its own raw name. The `set_` fallback made any setter in a
+    // proof body credit any unknown command, which is the widest false pass this check could have: a
+    // claim could name an invented `SetFoo` and be credited by an unrelated `set_mode` call.
+    assert!(
+        !command_is_exercised("    h.adapter.set_mode(\"PCM\").await;", "SetFoo"),
+        "an unmapped command must not be credited by an unrelated setter"
+    );
+    assert!(
+        !command_is_exercised("    h.adapter.set_rate(44100).await;", "SetSomethingElse"),
+        "no partial `set_` match may stand in for evidence of an unmapped command"
+    );
+    assert!(
+        command_is_exercised("    send(\"SetFoo\");", "SetFoo"),
+        "an unmapped command is still credited by its own raw wire name"
+    );
 }
 
 /// The body of a `#[test]`/`#[tokio::test]` function in `src`, by name.

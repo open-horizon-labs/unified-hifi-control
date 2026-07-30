@@ -1006,3 +1006,34 @@ wrong thing is a small defect with a large cost, because it is read exactly when
 **Nine external passes, nine with findings.** Checks: **34 → 36**. The two guards added in response to
 findings have each already caught something their author did not: check 34 found HQP-C-064's coverage gap,
 and check 35's first run found the drift on line 466.
+
+### Two reported issues in the hardened check 34 — one real, one already fixed
+
+**Reported 1: the unknown-command fallback was a false pass. Valid, and it was the widest one this check
+could have had.** `adapter_method_for` returned `"set_"` for anything unmapped, so **any** setter in a proof
+body credited **any** unknown command — a claim naming an invented `SetFoo` would have been "proven" by an
+unrelated `set_mode` call.
+
+RED first: `command_is_exercised("h.adapter.set_mode(\"PCM\").await;", "SetFoo")` returned **true**. The
+function now returns `Option`, an unmapped command must be evidenced by **its own raw wire name**, and
+adding a mapping is a deliberate one-line decision to accept a method name as evidence. Three controls pin
+it: an unmapped command is not credited by `set_mode`, not by `set_rate`, and *is* credited by a literal
+`SetFoo` on the wire.
+
+**Reported 2: the failure message's arguments were reversed. Already fixed at the reviewed head, and worth
+being precise about rather than "fixing" twice.** The transposition was real and was caught in the same
+turn it was introduced — before the commit — as the previous section records. At `d7d95b4` the call reads
+`c.id, adapter_method_for(&cmd)`, and the observed diagnostic is
+*"HQP-C-002 names SetShaping but no cited proof exercises it (looked for SetShaping … set_shaper …)"*. The
+reviewer was reading the intermediate state of that turn, not the committed code. **The report was right
+about the defect and one commit behind on the fix**, which is exactly the kind of thing an exact-SHA
+anchoring rule exists to make visible.
+
+The message did change in this pass for a different reason: with `Option`, an unmapped command has no method
+to name, so the diagnostic now reads *"and for no mapped adapter method outside comments"* instead of
+printing a misleading `set_` prefix.
+
+**Fifteen defects on record. The count of guards that have caught something their author did not is now
+three of three:** check 34 found HQP-C-064's coverage gap, check 35's first run found the line-466 status
+drift, and check 34's own controls — added under scrutiny — found the `set_` fallback before any reviewer
+had to see it fail.
