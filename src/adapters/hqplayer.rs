@@ -1059,6 +1059,12 @@ impl HqpAdapter {
     /// Diagnostics for tier-1 live verification: the reply-element invariant says a skip should never
     /// happen against a well-behaved daemon, so a non-zero count on real hardware is the signal that
     /// the invariant does not hold as broadly as the reference implies.
+    ///
+    /// **Skipped, not received.** A follower that arrived only partly, or one sitting complete in the
+    /// connection's carry when the capture ends, is not counted until the command that consumes it runs
+    /// — so a reading can lag the frames actually delivered by however many are still unconsumed. That
+    /// is the honest semantics for evidence: a document is counted once, by whoever dropped it, rather
+    /// than counted early and possibly twice.
     pub async fn unsolicited_skipped(&self) -> u32 {
         self.unsolicited_skipped
             .load(std::sync::atomic::Ordering::Relaxed)
