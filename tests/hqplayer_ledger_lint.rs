@@ -345,17 +345,23 @@ fn is_issue_reference(cell: &str) -> bool {
 /// legislate prose length.
 const MIN_SETTLE_CHARS: usize = 20;
 
-/// The acquisition plan on an anchor's designated `**What would settle it:**` line, continued across
-/// following non-blank lines.
+/// The exact label a settle condition must carry. Nothing else counts.
+const SETTLE_MARKER: &str = "**What would settle it:**";
+
+/// The acquisition plan on an anchor's designated [`SETTLE_MARKER`] line, continued across following
+/// non-blank lines.
 ///
-/// Returns `None` when no line *begins* with the phrase, so the phrase buried in other prose does not
-/// satisfy the requirement.
+/// Returns `None` unless a line begins with the marker **exactly**. Two earlier forms were both false
+/// passes CodeRabbit found: a `contains` test let the phrase buried in unrelated prose satisfy the
+/// requirement, and a prefix test that then split on any later colon let
+/// `**What would settle it is unrelated prose:** …` through — a line that reads like the label, parses
+/// like the label, and names no acquisition action.
 fn settle_condition(section: &str) -> Option<String> {
     let lines: Vec<&str> = section.lines().collect();
     let i = lines
         .iter()
-        .position(|l| l.trim_start().starts_with("**What would settle it"))?;
-    let after = lines[i].split_once(':')?.1.trim_start_matches('*').trim();
+        .position(|l| l.trim_start().starts_with(SETTLE_MARKER))?;
+    let after = lines[i].trim_start().strip_prefix(SETTLE_MARKER)?.trim();
     let mut plan = after.to_string();
     for line in &lines[i + 1..] {
         if line.trim().is_empty() {
@@ -748,8 +754,9 @@ fn every_unsettled_claim_names_an_owner_and_what_would_settle_it() {
             None => bad.push(format!("{} has no prose anchor section", c.id)),
             Some(section) => match settle_condition(&section) {
                 None => bad.push(format!(
-                    "{} anchor has no line beginning `**What would settle it`; the phrase appearing \
-                     inside other prose does not count",
+                    "{} anchor has no line beginning with the exact marker {SETTLE_MARKER:?}; the \
+                     phrase inside other prose, or a variant label that merely parses like it, does \
+                     not count",
                     c.id
                 )),
                 Some(plan) if plan.len() < MIN_SETTLE_CHARS || plan.split_whitespace().count() < 4 => {

@@ -678,3 +678,36 @@ budget decision.
 author of the checks** — five by CodeRabbit, one by a human reviewer. The internal 27-mutation table
 caught precisely what its author thought to break, which is the whole reason the ledger says out loud
 that its checks constrain **schema, not truth**.
+
+### CodeRabbit's fifth pass at `2c74246` — the sixth false pass, in the same check for the third time
+
+**CR6 (P2) — a settle condition could carry a label that merely *parses* like the designated one.**
+`settle_condition` accepted any line *beginning with* `**What would settle it` and then took the text
+after any later colon, so `**What would settle it is unrelated prose:** …` produced a long, four-word,
+schema-valid "plan" that names no acquisition action. Proven (**M28**: `test … ok` before, fails after).
+The marker is now matched **exactly** — `SETTLE_MARKER` is a constant and the line must start with it.
+
+**This is the third false pass in one check**, which is the more interesting fact than the fix. CR3
+required the designated line to exist; CR5 stopped a *different heading* from supplying it; CR6 stops a
+*variant label* from supplying it. Each fix was correct and each left a neighbouring hole — the pattern of
+a text scan standing in for a parser, which ADR 003 already names as the standing weakness of this
+repository's lint family.
+
+### Six false passes, and what the rate means
+
+| Pass | Finding | Where |
+|---|---|---|
+| 1 | CR1 playback state never compared to the live-run registry | `first_hand_claims_match_a_recorded_live_run` |
+| 1 | CR2 any existing path satisfied a `fixture:` proof | fixture-proof check |
+| 2 | CR3 the settle phrase's mere presence counted | settle check |
+| 3 | CR4 malformed owner tokens (`#0`, `#abc1`, `#-1`) passed | owner check |
+| 4 | CR5 an anchor could be hijacked by ID prefix — **and one real instance existed** | anchor lookup |
+| 5 | CR6 a variant label parsed as the designated one | settle check |
+
+Plus one **factual** ledger error (HQP-C-023's playback state) found by a human reviewer.
+
+**Seven defects, none found by the author's own 28-mutation table.** Five external passes, and the rate has
+not fallen: every pass has found at least one. Report 6/6 predicted the fifth before it existed and called
+stopping *a budget decision, not a completeness claim*; that framing is now supported by five data points
+and applies unchanged to a sixth pass. **Anyone reading a green `hqplayer_ledger_lint` as evidence that
+the ledger is correct is making the exact inference this ledger exists to prevent.**
