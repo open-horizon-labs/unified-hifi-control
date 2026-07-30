@@ -4515,10 +4515,17 @@ async fn an_incomplete_utf8_tail_survives_in_the_carry_and_completes_on_the_next
     h.adapter.connect().await.expect("connect");
     h.model.external_change(|st| st.playback = 1);
 
-    h.adapter
+    let first = h
+        .adapter
         .get_state()
         .await
         .expect("first State, leaving an incomplete UTF-8 tail in the carry");
+    assert_eq!(
+        (first.state, first.volume),
+        (1, -24),
+        "the FIRST reply must also be clean: the partial follower behind it, ending mid-character, \
+         must not have leaked into the document returned here. Got {first:?}"
+    );
     let skipped_before = h.adapter.unsolicited_skipped().await;
 
     let state = h
