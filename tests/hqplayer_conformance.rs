@@ -2879,3 +2879,164 @@ fn the_sanitiser_emits_a_document_that_still_reparses() {
         "text must survive the round trip with its meaning intact; got {text:?} from {clean:?}"
     );
 }
+
+// =============================================================================
+// HQPTuner Stage 1 amendment — Stage 2 bites
+//
+// Every expectation below carries an explicit label:
+//
+//   * `client-conformance` — can fail against the UNMODIFIED client. RED-first, always.
+//   * `model-fidelity`     — proves a fake capability or invariant. Written alongside the
+//                            capability and NEVER claimed as a client red, because a production
+//                            stub added just to make one fail would be manufactured evidence
+//                            (see PR #337's disclosures of `bd87e21` and `d7f62c2`).
+//   * `regression-pin`     — already satisfied by the current design; present so a future change
+//                            cannot silently remove the property. Never claimed as a red.
+//
+// Plan and classification: `.oh/issue-322-hqplayer-protocol-conformance.md`, section
+// "HQPTuner Stage 1 amendment".
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// Bite 1 — recover a closed root whose children cannot be parsed
+// -----------------------------------------------------------------------------
+
+/// Upstream evidence: the daemon emits malformed XML inside `<metadata>`, and without a recovery
+/// path the receive loop runs to timeout **on every poll while a track is loaded**.
+///
+/// Inspection narrowed which shapes actually reach the client. A hostile *attribute value* does
+/// not: UHC never parses the children and scopes attribute reads to the root's opening tag, so
+/// unescaped `<`, `"`, `>` and bare `&` inside `<metadata …/>` are already tolerated — pinned by
+/// [`the_framer_already_tolerates_hostile_attribute_values_in_children`] below.
+///
+/// What does reach the client is a **structurally** malformed child: a child tag that never
+/// terminates. `</Status>` has already arrived and the root frame is closed, but the parser cannot
+/// reach it, so the buffer reads as incomplete and the command spends its whole budget waiting for
+/// bytes that already came.
+///
+/// #322 acceptance: framing "can recover a complete root when malformed metadata children would
+/// otherwise wedge every poll".
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn a_status_whose_child_tag_never_terminates_still_reports_the_root_fields() {
+    let hostile = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+        "<Status state=\"2\" track=\"3\" position=\"41\" length=\"293\" volume=\"-23.5\" ",
+        "active_rate=\"44100\" active_bits=\"24\">\n",
+        // The child tag is never terminated: no `/>` and no `>`. Nothing downstream can parse it,
+        // yet the root's own closing tag is right there.
+        "<metadata artist=\"Bill Evans\" song=\"Alice in Wonderland\"\n",
+        "</Status>"
+    );
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            malformed_for_element: Some(("Status".to_string(), hostile.to_string())),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    let status = h.adapter.get_playback_status().await.expect(
+        "a Status whose root frame is closed must be readable even when a child tag never \
+         terminates; otherwise every poll while a track is loaded costs the whole response budget",
+    );
+
+    assert_eq!(
+        (status.state, status.position, status.active_rate),
+        (2, 41, 44100),
+        "the root element's own attributes are readable by a quote-aware scan regardless of its \
+         children, so a closed root must yield the playback fields; got {status:?}"
+    );
+    h.stop();
+}
+
+/// The pure framing boundary for the same rule.
+///
+/// Recovery must be **narrow**: it applies only when the root's own matching closing tag has
+/// actually arrived. A truncated document and a mismatched-nesting document stay rejected, or the
+/// recovery has bought child tolerance at the price of the framing guarantees #322 exists to hold.
+///
+/// **Label: client-conformance** — `framing` is production code.
+#[test]
+fn the_framer_recovers_a_closed_root_whose_child_tag_never_terminates() {
+    let unterminated_child = "<Status state=\"2\">\n<metadata song=\"x\"\n</Status>";
+    assert_eq!(
+        framing::classify(unterminated_child),
+        framing::Framing::Complete,
+        "a closed root frame is a complete document even when a child tag never terminates"
+    );
+
+    // A stray `<` in child position is the same class of damage.
+    let stray_open = "<Status state=\"2\">\n< \n</Status>";
+    assert_eq!(
+        framing::classify(stray_open),
+        framing::Framing::Complete,
+        "a stray `<` among the children must not outrank the root's own closing tag"
+    );
+
+    // Without the root's closing tag, more may still arrive: recovery must not invent it.
+    assert_eq!(
+        framing::classify("<Status state=\"2\">\n<metadata song=\"x\"\n"),
+        framing::Framing::Incomplete,
+        "recovery must not invent a closing tag that has not arrived"
+    );
+
+    // Mismatched nesting stays malformed — recovery keys on the root's OWN closing tag.
+    assert_eq!(
+        framing::classify("<State state=\"2\"></Status>"),
+        framing::Framing::Malformed,
+        "recovery must not weaken the mismatched-nesting rejection"
+    );
+
+    // A stray closing tag with no root stays malformed.
+    assert_eq!(
+        framing::classify("</Status>"),
+        framing::Framing::Malformed,
+        "recovery must not rescue a leftover closing tag into a document"
+    );
+}
+
+/// Records what inspection established rather than what the salvage report implied: UHC's
+/// substring-and-root-scope design is already immune to the hostile *attribute value* class, so no
+/// production change was needed for it. HQPTuner needed `_recover_root` for these because it
+/// XML-parses whole documents; UHC does not.
+///
+/// **Label: regression-pin.** Never claimed as a client red — it passed before any change in this
+/// amendment. It exists so a future "improvement" that starts parsing children cannot silently
+/// reintroduce a poll-wedging failure.
+#[test]
+fn the_framer_already_tolerates_hostile_attribute_values_in_children() {
+    for (what, doc) in [
+        (
+            "unescaped <",
+            "<Status state=\"2\">\n<metadata song=\"Blue < Green\"/>\n</Status>",
+        ),
+        (
+            "unescaped \"",
+            "<Status state=\"2\">\n<metadata song=\"A \"quoted\" name\"/>\n</Status>",
+        ),
+        (
+            "unescaped >",
+            "<Status state=\"2\">\n<metadata song=\"a > b\"/>\n</Status>",
+        ),
+        (
+            "bare &",
+            "<Status state=\"2\">\n<metadata song=\"R & B\"/>\n</Status>",
+        ),
+    ] {
+        assert_eq!(
+            framing::classify(doc),
+            framing::Framing::Complete,
+            "a hostile attribute value in a child ({what}) must not affect framing"
+        );
+        assert_eq!(
+            framing::root_open_tag(doc),
+            Some("<Status state=\"2\">"),
+            "the root opening tag must be recovered verbatim despite a hostile child ({what})"
+        );
+    }
+}
