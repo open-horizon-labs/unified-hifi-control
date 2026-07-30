@@ -1496,25 +1496,6 @@ fn a_fixture_containing_a_command_name_in_its_metadata_is_not_proof_of_that_comm
     );
 }
 
-/// The body of a `#[test]`/`#[tokio::test]` function in `src`, by name.
-fn test_body(src: &str, name: &str) -> Option<String> {
-    let lines: Vec<&str> = src.lines().collect();
-    let start = lines.iter().position(|l| {
-        let t = l.trim_start();
-        t.strip_prefix("async fn ")
-            .or_else(|| t.strip_prefix("fn "))
-            .and_then(|r| r.split('(').next())
-            .map(str::trim)
-            == Some(name)
-    })?;
-    // A test body ends at the first line that is exactly `}` at column zero.
-    let end = lines[start + 1..]
-        .iter()
-        .position(|l| *l == "}")
-        .map_or(lines.len(), |p| start + 1 + p);
-    Some(lines[start..end].join("\n"))
-}
-
 /// Byte ranges *inside* each `~~…~~` span on one line, delimiters excluded.
 ///
 /// An unpaired trailing `~~` opens no span, so a half-written strikethrough retires nothing.

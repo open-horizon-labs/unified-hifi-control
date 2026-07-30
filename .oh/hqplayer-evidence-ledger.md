@@ -1118,3 +1118,35 @@ report. Stated rather than re-done.
 **Seventeen defects. Ten were a text scan or a loose match standing in for an exact one.** The pattern has
 not varied: every time a shortcut stood in for a parse or an exact comparison, a later reader found it, and
 every conversion to structural or exact matching has held.
+
+### A ship-gate failure in my own verification set
+
+**Codex independent audit at `d40c431`: `cargo clippy --test hqplayer_ledger_lint -- -D warnings` failed.**
+`test_body` — the line-scanning helper that found a test's body by text — became **dead code** the moment
+`test_exercises_command` replaced text matching with a parsed call walk. It was never removed.
+
+**Removed, not suppressed.** An `#[allow(dead_code)]` would have left a text-scanning tool lying beside the
+structural one that replaced it, for the next person to pick up. That is how the ninth text-scan defect
+happened; leaving the tenth in reach would be worse than the warning.
+
+**The gap was in my verification set, not in CI's.** Every prior report ran CI's invocation —
+`cargo clippy -- -D warnings`, which covers lib and bin targets — and that was and is clean. It does not
+compile test targets, so the file this PR *adds* was never clippy-checked by anything I ran. Corrected: the
+focused test-target invocation is now part of this PR's verification set.
+
+| Invocation | Result at this head | Whose |
+|---|---|---|
+| `cargo clippy -- -D warnings` | **clean** | CI's gate |
+| `cargo clippy --test hqplayer_ledger_lint -- -D warnings` | **clean** | this PR's file, now checked |
+| `cargo clippy --tests -- -D warnings` | **fails, and not on this branch's work** | baseline |
+
+The third is recorded as a **baseline constraint, distinct from this PR's result**, and attributed rather
+than asserted: it reports errors in **32 files, none of which is in this PR's five-file diff**, including
+`tests/unbounded_channel_lint.rs` and `tests/oneshot_leak_lint.rs` — both verified **byte-identical to
+`origin/v3`**. The pattern is mostly `map_or` simplifications across `src/` and the pre-existing mock
+servers. This is the same shape ADR 003 already records for `cargo clippy --all-targets`, and it is not
+this PR's to fix.
+
+**Eighteen defects. This one is the first found in the *verification* rather than in the artefact or its
+checks** — a reminder that a verification table is itself a claim, and that "clippy clean" without naming
+the invocation is exactly the kind of wording this ledger exists to make precise.
