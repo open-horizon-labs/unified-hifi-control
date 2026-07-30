@@ -1503,7 +1503,15 @@ impl HqpAdapter {
     /// `State.filter_junk` is an int index into this list, not a boolean. The wire element is
     /// `GetJunkFilters` (the CLI advertises `--set-20kfilter` but only accepts `--set-junkfilter`).
     pub async fn get_junk_filters(&self) -> Result<Vec<ListItem>> {
-        Ok(Vec::new()) // STUB - queried for real in the GREEN commit.
+        let xml = Self::build_request("GetJunkFilters", &[]);
+        let response = self.send_command(&xml).await?;
+        Ok(Self::parse_items(&response, "JunkFiltersItem", |item| {
+            ListItem {
+                index: Self::parse_attr_u32(item, "index"),
+                name: Self::parse_attr(item, "name").unwrap_or_default(),
+                value: Self::parse_attr_i32(item, "value"),
+            }
+        }))
     }
 
     /// Get available sample rates

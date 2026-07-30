@@ -140,6 +140,38 @@ impl Report {
             let _ = writeln!(out, "    {family:<16} {:>8.1?}", took);
         }
         let _ = writeln!(out, "    slowest family   {worst:>8.1?}");
+        let _ = writeln!(
+            out,
+            "    configured whole-command deadline {:?} -> overall {}",
+            self.capture.response_deadline,
+            if self.overall_within_deadline {
+                "WITHIN"
+            } else {
+                "EXCEEDED"
+            }
+        );
+        if !self.overall_within_deadline {
+            let over: Vec<&String> = self
+                .within_deadline
+                .iter()
+                .filter(|(_, ok)| !**ok)
+                .map(|(f, _)| f)
+                .collect();
+            let _ = writeln!(
+                out,
+                "    EXCEEDED by {over:?} — HqpTimeouts::response is too small for this daemon and \
+                 should be raised from this evidence, not inherited"
+            );
+        }
+        let _ = writeln!(
+            out,
+            "  current matrix profile: {}",
+            self.capture
+                .current_matrix_profile
+                .as_ref()
+                .map(|(i, n)| format!("index {i} ({n})"))
+                .unwrap_or_else(|| "none reported".to_string())
+        );
         if !self.not_captured.is_empty() {
             let _ = writeln!(out, "  NOT captured (partial coverage):");
             for n in &self.not_captured {
@@ -168,7 +200,37 @@ impl Report {
     /// the daemon said about itself and how the corpus compares. A verification artifact that leaks
     /// credentials is worse than no artifact.
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({}) // STUB - built for real in the GREEN commit.
+        serde_json::json!({
+            "schema": ARTIFACT_SCHEMA,
+            "profile": self.profile,
+            // Only what the daemon says about itself. No host, port, user or password: this artifact
+            // is meant to be committed or attached to CI, and a leaked credential would outlive the run.
+            "daemon": self.capture.identity,
+            "active_mode": {
+                "index": self.capture.active_mode_index,
+                "name": self.capture.active_mode_name,
+                "note": "enumerations below are this mode's lists only; the other mode needs SetMode (tier 2)",
+            },
+            "status_metadata_child": self.capture.status_had_metadata_child,
+            "current_matrix_profile": self.capture.current_matrix_profile
+                .as_ref()
+                .map(|(i, n)| serde_json::json!({ "index": i, "name": n })),
+            "unsolicited_skipped": self.capture.unsolicited_skipped,
+            "response_deadline_ms": self.capture.response_deadline.as_millis(),
+            "overall_within_deadline": self.overall_within_deadline,
+            "families": self.capture.latencies.iter().map(|(name, took)| serde_json::json!({
+                "name": name,
+                "delivery_ms": took.as_millis(),
+                "entries": self.capture.enumerations.get(name).map(|e| e.len()),
+                "within_deadline": self.within_deadline.get(name).copied().unwrap_or(false),
+            })).collect::<Vec<_>>(),
+            "divergences": self.divergences.iter().map(|d| serde_json::json!({
+                "family": d.family,
+                "kind": format!("{:?}", d.kind),
+                "detail": d.detail,
+            })).collect::<Vec<_>>(),
+            "not_captured": self.not_captured,
+        })
     }
 }
 
@@ -323,6 +385,21 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
     );
 
     let t = Instant::now();
+    let junk = adapter.get_junk_filters().await?;
+    timed("junkfilters", t.elapsed(), &mut c);
+    c.enumerations.insert(
+        "junkfilters".into(),
+        junk.into_iter()
+            .map(|j| EnumEntry {
+                index: j.index,
+                name: j.name,
+                enum_id: Some(j.value),
+                rate: None,
+            })
+            .collect(),
+    );
+
+    let t = Instant::now();
     let matrix = adapter.get_matrix_profiles().await?;
     timed("matrix", t.elapsed(), &mut c);
     c.enumerations.insert(
@@ -337,6 +414,22 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
             })
             .collect(),
     );
+
+    // Read-only: MatrixGetProfile reports the current selection without changing it.
+    let t = Instant::now();
+    match adapter.get_matrix_profile().await {
+        Ok(Some(p)) => {
+            timed("matrix_current", t.elapsed(), &mut c);
+            c.current_matrix_profile = Some((p.index, p.name));
+        }
+        Ok(None) => {
+            timed("matrix_current", t.elapsed(), &mut c);
+            c.current_matrix_profile = None;
+        }
+        Err(e) => tracing::warn!("tier-1: MatrixGetProfile unavailable: {e}"),
+    }
+
+    c.response_deadline = adapter.timeouts().await.response;
 
     // Persistent HTTP lane, read side only. Attempted just when credentials were supplied; a failure
     // is recorded as not-captured rather than swallowed, because "no profiles" and "could not ask"
@@ -507,6 +600,19 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
             }
         }
     }
+
+    // Per-family and overall verdict against the budget that actually applied. Latency alone does
+    // not answer the question the deadline poses.
+    for (family, took) in &capture.latencies {
+        report
+            .within_deadline
+            .insert(family.clone(), *took <= capture.response_deadline);
+    }
+    // Deliberately NOT pushed into `not_captured`: a family that delivered slowly was still
+    // captured, and conflating "too slow" with "never reached" would mislead anyone reading the
+    // artifact later. The structured verdicts above are the machine-readable signal; the operator
+    // narrative lives in `render()`.
+    report.overall_within_deadline = report.within_deadline.values().all(|ok| *ok);
 
     // The honest limit of a read-only run.
     let inactive = if capture.active_mode_index == 2 {
