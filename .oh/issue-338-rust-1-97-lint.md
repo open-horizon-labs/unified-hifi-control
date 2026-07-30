@@ -322,3 +322,160 @@ TDD order, per AGENTS.md "see it FAIL first":
 `HashMap`-ordering nondeterminism, and the gate-design fix (D).
 
 **Public API change:** none.
+
+---
+
+# Stage 2 — Execution
+
+**Updated:** 2026-07-30T02:45Z
+**Status:** complete (local); CI confirmation pending
+**Stage 1 Codex gate:** PASS at `812bc6750972033b7130e77648caa74dbe6c848a`
+**Class follow-up:** filed as #340, out of scope here
+
+## The change
+
+`src/app/pages/zones.rs:269` — `1 file changed, 1 insertion(+), 1 deletion(-)`:
+
+```diff
+-        result.sort_by(|a, b| priority(&a.0).cmp(&priority(&b.0)));
++        result.sort_by_key(|a| priority(&a.0));
+```
+
+## TDD sequence, in CI's order
+
+| Step | Command | Result |
+|---|---|---|
+| **RED** (pre-edit, pristine source) | `make css` → `cargo clippy -- -D warnings` | **exit 101** — `error: consider using sort_by_key` at `src/app/pages/zones.rs:269:9` |
+| Baseline (pre-edit) | `cargo test` | 1 pre-existing failure, recorded before editing |
+| **GREEN** step 1 | `cargo fmt --check` | **exit 0**, no output |
+| **GREEN** step 2 | `cargo clippy -- -D warnings` | **exit 0**, zero errors, zero warnings |
+| **GREEN** step 3 | `cargo test` | identical to baseline — 0 regressions |
+| API gate | `cargo test --test api_contract` | **2 passed** (`api_routes_match_contract`, `golden_file_is_sorted`) |
+
+RED was observed on unmodified source *before* the edit, per AGENTS.md. `cargo fmt
+--check` ran before clippy, per the Stage 1 dissent pre-mortem and the Codex gate
+condition.
+
+## Pre-existing test failure — reported honestly
+
+`shared_endpoints::get_hqp_discover` (`tests/client_harness.rs:1103`) fails: expected
+200, got 500. **It is pre-existing and unrelated to this change.**
+
+- A full `cargo test` baseline was captured on unmodified source *before* editing,
+  specifically so attribution would be provable rather than asserted.
+- A normalized diff of pre-fix vs post-fix results is **byte-identical**: same nine
+  passing binaries, same single failure.
+- Cause: `GET /hqp/discover` performs UDP multicast network discovery
+  (`src/api/mod.rs:1978-1979`), unavailable in this sandbox.
+- CI's Test job passed on PR #337, so this is environment-specific, not a repo defect.
+- Deliberately **not** touched — outside #338.
+
+## Behavior preservation, verified on the real source
+
+Stage 1 proofs used hand-written replicas. Stage 2 closes that gap by running the
+actual code:
+
+1. Lines 247-271 were mechanically extracted from **both** git `HEAD` and the working
+   tree. `diff` confirms the sort line is the **only** textual difference in the block.
+2. Both blocks were compiled verbatim as two functions and run against identical
+   inputs, 200 iterations:
+
+```text
+priority ordering non-decreasing in BOTH, 200 runs : true
+identical group content (order-insensitive)        : true
+distinct-priority order identical & stable         : true -> ["roon", "LMS", "openhome", "UPnP"]
+equal-priority tie order differs between the two   : true  (pre-existing HashMap nondeterminism)
+```
+
+3. The last line looks like a regression and is not. **Control experiment:**
+
+```text
+CONTROL -- OLD code vs OLD code, tie order varies : true
+CONTROL -- NEW code vs NEW code, tie order varies : true
+OLD vs OLD, documented Roon/LMS/OpenHome/UPnP order varies : false
+NEW vs NEW, documented Roon/LMS/OpenHome/UPnP order varies : false
+```
+
+Old-vs-old varies identically to new-vs-new: the nondeterminism is `HashMap` iteration
+order (a fresh `RandomState` per call), entirely pre-existing, exactly as flagged at
+Stage 1. The documented Roon → LMS → OpenHome → UPnP order never varies in either
+version. **The change preserves everything the code actually guarantees.** Without the
+control, this would have been misreported as a regression.
+
+## Scope containment (verified)
+
+`git diff --stat` = 1 file, +1/-1. Changed-file counts for forbidden paths, all zero:
+`.github` 0, `Cargo.toml` 0, `Cargo.lock` 0, `tests/` 0, `src/main.rs` 0, `src/api/` 0.
+
+Pre-existing warnings surfaced by the IDE in `tests/architecture_lint.rs`,
+`tests/mock_servers/`, and `tests/protocol_schema.rs` were left untouched — they live in
+`tests/`, which `cargo clippy` without `--all-targets` does not lint, and they match the
+77-finding Stage 1 measurement.
+
+**Public API change: none.** `tests/fixtures/api_routes.txt` unchanged;
+`api-change-approved` neither needed nor requested.
+
+## Stage 2 Review
+
+**Verdict: Continue.** Necessary (RED re-observed), aligned (one line, forbidden paths
+verified zero), sufficient (clippy's own rewrite), mechanism clear (`sort_by_key(f)` ≡
+`sort_by(|a,b| f(a).cmp(&f(b)))`, key is `i32`/`Copy` so no clone introduced), complete
+(`sort_by_key` returns `()` in place, so `grouped_zones` keeps type
+`Vec<(String, Vec<Zone>)>` and no consumer changes). No drift.
+
+**Completion gate:** intent clear ✓, diff reviewed ✓, **CI not yet run on this commit**,
+Codex conditions met ✓.
+
+## Stage 2 Dissent
+
+**Verdict: PROCEED.**
+
+The one attack with teeth — "every equivalence proof used a replica, never the real
+code" — was answered by extracting and running the real code, and the anomaly that
+surfaced was traced to a pre-existing cause by a control rather than explained away.
+
+Untested assumptions, both deferred to CI by design:
+
+- **wasm path is never linted.** `zones.rs` compiles for wasm32 (`zones.rs:146` is
+  `cfg(target_arch = "wasm32")`-gated) but `cargo clippy` on the default `server`
+  feature never sees it, and `dx build --platform web` was not run. `sort_by_key` is
+  core `std` and target-independent, so divergence is not credible — but it was not
+  tested. CI's "Build WASM Assets" job is the check.
+- **Local is macOS aarch64; CI is x86_64-linux.** `zones.rs:269` is not `cfg`-gated, so
+  divergence is not credible, but the authoritative result does not exist yet.
+
+Pre-mortem: CI reds on wasm or a linux-only lint; #337 never rebased so the unblocking
+benefit never lands (criterion 6); recurrence via floating `@stable` (#340); the
+near-miss false-confidence failure described above; and the standing risk that a
+known-red `client_harness` test makes a future genuine failure easier to wave through.
+
+**Confidence:** HIGH on behavior preservation; **MEDIUM-pending** on the end-to-end gate
+until build.yml runs on this commit.
+
+## Stage 2 Superego Review
+
+`sg review staged` (sg 0.9.4) run at the Stage 2 decision point against the staged
+change (`src/app/pages/zones.rs` +1/-1 and this artifact).
+
+**Verdict: no blocking findings.** Superego: "the change is minimal, correct,
+well-verified, and honest about what's still outstanding." It independently confirmed
+zero touches to `.github`, `Cargo.toml/lock`, `tests/`, `src/main.rs`, `src/api/`, and
+no API-contract change; credited filing #340 separately as correct scope discipline;
+and specifically credited the control experiment as "a real save" that "correctly caught
+what would've looked like a regression but wasn't."
+
+### Findings and disposition
+
+| # | Finding | Severity | Disposition |
+|---|---|---|---|
+| 1 | `.oh/.cache/` is not gitignored; worth a one-line `.gitignore` add so it is not swept into a future `git add` | P4 | **Valid; escalated, not actioned.** Pre-existing and untracked (present before this work began), unrelated to #338, and editing `.gitignore` would be an unrelated code change the Stage 2 instructions forbid. Surfaced in the Superego PR comment for a separate change. Confirmed it is untracked and therefore cannot enter this commit. |
+| 2 | Proportionality: a 137-line writeup for a one-line clippy autofix; decide once whether this structure is reserved for gated issues or becomes the default | P4 | **Accepted with reason — reserved, not a new baseline.** This structure is mandated by the Stage 1/Stage 2 gate for this specific tracked issue with an independent Codex gate; it is not the default for ordinary fixes. Superego's own framing ("if the former, no action needed") applies. Recorded as a process question for the gate owner, not a defect in this change. |
+
+No P1, P2, or P3 findings. No findings discarded without a reason.
+
+## Honest limits
+
+- **CI has not run on the Stage 2 commit.** build.yml Lint on x86_64-linux is the only
+  authoritative GREEN. Everything above is local.
+- **The wasm build was not verified locally.**
+- No claim is made about any test or job not listed in the tables above.
