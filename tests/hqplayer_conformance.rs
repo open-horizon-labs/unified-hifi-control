@@ -4114,3 +4114,55 @@ fn no_fixture_claims_uhc_verified_status_on_second_hand_evidence() {
         }
     }
 }
+
+/// An unsolicited document arriving **ahead of** the wanted reply in the *same* read must not send the
+/// client back to the socket: the reply it wants is already in the buffer.
+///
+/// The daemon pushes `Status` frames unprompted, so one landing just before a reply is ordinary
+/// traffic, and one read can deliver both. A reader that drains the follower and then immediately
+/// blocks on another read is waiting for bytes it already holds — the same class of mistake as the
+/// malformed-root wedge, one layer up: correct framing, wrong loop structure.
+///
+/// The wire falls silent after that single write, so if the client goes back to the socket it can only
+/// end in a timeout. That is what makes this observable rather than merely inefficient.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn an_unsolicited_document_ahead_of_the_reply_in_one_read_does_not_block_for_more() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            coalesce_leading_for_element: Some((
+                "State".to_string(),
+                PUSH_STATUS_FRAME.to_string(),
+            )),
+            ..WirePolicy::default()
+        },
+        HqpTimeouts {
+            // Short: if the client goes back to the socket it waits this out and fails.
+            response: Duration::from_millis(300),
+            max_attempts: 1,
+            ..fast_timeouts()
+        },
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    h.model.external_change(|s| s.playback = 2);
+
+    let state = h
+        .adapter
+        .get_state()
+        .await
+        .expect("the reply was in the same read as the unsolicited frame ahead of it");
+
+    assert_eq!(
+        state.state, 2,
+        "the client must answer from the reply already in its buffer rather than reading again; \
+         got {state:?}"
+    );
+    assert!(
+        h.adapter.unsolicited_skipped().await > 0,
+        "and the leading document must still be counted as skipped, not silently swallowed"
+    );
+    h.stop();
+}

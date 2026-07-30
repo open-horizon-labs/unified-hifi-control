@@ -89,6 +89,14 @@ pub struct WirePolicy {
     ///
     /// Fires once per server, so a test can prove the next command recovers.
     pub oversized_newline_free_for_element: Option<(String, usize)>,
+    /// `(element, leading_document)` — **prepend** an unsolicited document *before* the real reply, in
+    /// the same TCP write, so one read delivers the follower first and the wanted reply behind it.
+    ///
+    /// The mirror image of [`Self::coalesce_extra_for_element`], and the harder case. A reader that
+    /// drains the unsolicited document and then goes straight back to the socket blocks on a read it
+    /// does not need, because the reply it wants is already in the buffer. The daemon pushes `Status`
+    /// frames of its own accord, so a push landing just ahead of a reply is ordinary traffic.
+    pub coalesce_leading_for_element: Option<(String, String)>,
     /// `(element, extra_document)` — after replying to that element, append a second, unsolicited
     /// document to the **same TCP write**, so both land in the client's receive buffer together.
     ///
@@ -109,6 +117,7 @@ impl Default for WirePolicy {
             malformed_for_element: None,
             oversized_for_element: None,
             oversized_newline_free_for_element: None,
+            coalesce_leading_for_element: None,
             coalesce_extra_for_element: None,
             unsolicited_stream_for_element: None,
         }
@@ -435,6 +444,17 @@ async fn serve_connection(
         let mut bytes = reply.into_bytes();
         if !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
+        }
+
+        if let Some((ref element, ref leading)) = policy.coalesce_leading_for_element {
+            if mentions(&line, element) {
+                let mut both = leading.clone().into_bytes();
+                if !both.ends_with(b"\n") {
+                    both.push(b'\n');
+                }
+                both.extend_from_slice(&bytes);
+                bytes = both;
+            }
         }
 
         if let Some((ref element, ref extra)) = policy.coalesce_extra_for_element {
