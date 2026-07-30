@@ -841,15 +841,21 @@ async fn a_volume_below_the_daemon_floor_is_rejected() {
 }
 
 #[tokio::test]
-async fn mute_is_toggled_on_the_daemon() {
+async fn mute_is_absolute_and_idempotent_on_the_daemon() {
+    // Verified live against a real HQPlayer 6.0.2 Embedded daemon (issue #322 live validation):
+    // VolumeMute drives the output to the volume floor and is idempotent - a second and third call
+    // keep it at the floor, it never toggles back, and State exposes no separate mute flag. Unmute is a
+    // separate absolute `Volume` write, not a second VolumeMute.
     let h = Harness::verified().await;
+    let floor = h.model.state().volume_range.min_db;
     h.adapter.volume_mute().await.expect("VolumeMute");
-    let muted = h.model.state().muted;
+    let after_first = h.model.state().volume_db;
     h.adapter.volume_mute().await.expect("VolumeMute");
+    let after_second = h.model.state().volume_db;
     assert_eq!(
-        (muted, h.model.state().muted),
-        (true, false),
-        "VolumeMute is a toggle on the daemon, not an absolute set"
+        (after_first, after_second),
+        (floor, floor),
+        "VolumeMute is an absolute mute-to-floor and idempotent on the daemon, not a toggle"
     );
     h.stop();
 }
@@ -4793,10 +4799,15 @@ async fn an_attribute_lookup_without_a_root_element_reports_nothing() {
 // ===========================================================================================
 // At-most-once semantics for one-shot commands (CodeRabbit threads 4 and 17)
 //
-// `Next`, `Previous`, `VolumeUp`, `VolumeDown` and `VolumeMute` are relative or toggling: applying
-// one twice is not the same as applying it once. The protocol carries no request identity, so a
-// client that writes such a command and then loses the connection cannot learn whether it landed.
-// Retrying is therefore a *choice to double the side effect* on the chance that it did not.
+// `Next`, `Previous`, `VolumeUp` and `VolumeDown` are relative or sequential: applying one twice is
+// not the same as applying it once. The protocol carries no request identity, so a client that writes
+// such a command and then loses the connection cannot learn whether it landed. Retrying is therefore a
+// *choice to double the side effect* on the chance that it did not.
+//
+// `VolumeMute` deliberately is *not* in this family. Live validation against a real HQPlayer 6.0.2
+// Embedded daemon (issue #322) showed it is an absolute mute-to-floor and idempotent - repeated calls
+// keep the level at the floor and never toggle back - so a lost reply is safe to retry and converges.
+// See `volume_mute_retries_and_converges_when_the_reply_is_lost_after_the_daemon_applied_it`.
 //
 // These use `ApplyThenDropReplyOnce`, which is indistinguishable from `DropNextReplyOnce` at the
 // socket and the opposite of it at the model. The assertion is deliberately on the model's state and
@@ -4860,23 +4871,26 @@ async fn next_advances_one_track_when_the_reply_is_lost_after_the_daemon_applied
 }
 
 #[tokio::test]
-async fn volume_mute_toggles_once_when_the_reply_is_lost_after_the_daemon_applied_it() {
+async fn volume_mute_retries_and_converges_when_the_reply_is_lost_after_the_daemon_applied_it() {
     let h = apply_then_drop_harness().await;
-    let before = h.model.state().muted;
+    let floor = h.model.state().volume_range.min_db;
 
     let outcome = h.adapter.volume_mute().await;
 
+    // Unlike `Next`/`Previous`/`VolumeUp`/`VolumeDown`, VolumeMute is absolute and idempotent - verified
+    // live on 6.0.2, it drives the level to the floor and repeated calls keep it there. A lost reply is
+    // therefore safe to retry: the retry re-applies the same absolute mute and converges, so the call
+    // succeeds rather than surfacing an error the way a genuine one-shot must. This is the point of the
+    // fix - excluding an idempotent command from retry made a mute whose reply was lost fail needlessly.
     assert!(
-        outcome.is_err(),
-        "a lost reply must surface as an error, not a success the client cannot justify; got {outcome:?}"
+        outcome.is_ok(),
+        "VolumeMute is idempotent, so a lost reply is retried and converges to muted rather than \
+         erroring; got {outcome:?}"
     );
-
-    // A toggle retried lands back where it started, so the user presses mute and hears nothing change
-    // — the worst shape of this bug, because it looks like the command was simply ignored.
     assert_eq!(
-        h.model.state().muted,
-        !before,
-        "VolumeMute is a toggle; a retry after it applied returns it to {before}"
+        h.model.state().volume_db,
+        floor,
+        "the retry re-applies the absolute mute-to-floor and converges to {floor}"
     );
     h.stop();
 }

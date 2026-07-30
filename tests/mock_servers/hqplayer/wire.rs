@@ -63,7 +63,9 @@ pub enum Disruption {
     /// The mirror image of [`Self::DropNextReplyOnce`] and the one that matters for at-most-once
     /// semantics: from the client's side the two are **indistinguishable** — a request was written and
     /// no reply came back. The difference is invisible to it and decisive for the user, because a
-    /// blind retry of `Next`, `VolumeUp`, or `VolumeMute` applies the side effect a second time.
+    /// blind retry of `Next` or `VolumeUp` applies the side effect a second time. (`VolumeMute` is
+    /// *not* such a command: live validation showed it is an absolute mute-to-floor and idempotent, so
+    /// it is retried like any absolute setter.)
     /// `DropNextReplyOnce` alone can never expose that: it returns before the model is touched, so
     /// every retry is harmless there by construction.
     ApplyThenDropReplyOnce,

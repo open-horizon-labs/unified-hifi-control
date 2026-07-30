@@ -1392,15 +1392,19 @@ impl HqpAdapter {
 
     /// Whether one application of this command differs from two.
     ///
-    /// Relative (`VolumeUp`/`VolumeDown`), sequential (`Next`/`Previous`) and toggling (`VolumeMute`)
-    /// commands qualify. Everything else the adapter sends is absolute — `Set*` writes a value, `Play`
-    /// and `Stop` name a state, queries only read — so applying it twice lands in the same place and
-    /// retrying is safe.
+    /// Relative (`VolumeUp`/`VolumeDown`) and sequential (`Next`/`Previous`) commands qualify: applying
+    /// one twice is not the same as applying it once. Everything else the adapter sends is absolute —
+    /// `Set*` writes a value, `Volume`/`VolumeMute` drive the level to an exact target (`VolumeMute` to
+    /// the floor), `Play`/`Stop` name a state, queries only read — so applying it twice lands in the
+    /// same place and retrying is safe.
+    ///
+    /// `VolumeMute` was once listed here as "toggling", but live validation against a real HQPlayer
+    /// 6.0.2 Embedded daemon (issue #322) showed it is an absolute mute-to-floor and idempotent:
+    /// repeated calls keep the level at the floor and never toggle back, and unmute is a separate
+    /// `Volume` write. Excluding an idempotent command from retry made a mute whose reply was lost fail
+    /// needlessly, so it is treated like any other absolute setter.
     fn is_one_shot(element: &str) -> bool {
-        matches!(
-            element,
-            "Next" | "Previous" | "VolumeUp" | "VolumeDown" | "VolumeMute"
-        )
+        matches!(element, "Next" | "Previous" | "VolumeUp" | "VolumeDown")
     }
 
     /// Inner send command (without retry logic)

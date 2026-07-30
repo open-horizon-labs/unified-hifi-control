@@ -174,7 +174,6 @@ pub struct DaemonState {
     /// `GetJunkFilters` list index, reported by `State` as the `filter_junk` int.
     pub filter_junk_index: u32,
     pub volume_db: f64,
-    pub muted: bool,
     pub volume_range: VolumeRange,
     pub convolution: bool,
     pub invert: bool,
@@ -203,7 +202,6 @@ impl Default for DaemonState {
             filter_junk_index: 0,
             // Fractional negative dB by default, because that is the wire reality (AC4).
             volume_db: -23.5,
-            muted: false,
             volume_range: VolumeRange::default(),
             convolution: false,
             invert: false,
@@ -1028,11 +1026,12 @@ impl Responder for DaemonModel {
                             if db < vr.min_db || db > vr.max_db {
                                 inner.error("Volume", "out of range")
                             } else {
+                                // An explicit level is how the daemon leaves the mute floor: `Volume`
+                                // is the unmute path, not a second `VolumeMute`.
                                 inner.apply(
                                     "Volume",
                                     Box::new(move |s| {
                                         s.volume_db = db;
-                                        s.muted = false;
                                     }),
                                 )
                             }
@@ -1058,7 +1057,13 @@ impl Responder for DaemonModel {
                 }
             }
 
-            "VolumeMute" => inner.apply("VolumeMute", Box::new(|s| s.muted = !s.muted)),
+            // Absolute mute-to-floor, idempotent - verified live on a real HQPlayer 6.0.2 Embedded
+            // daemon (issue #322): repeated VolumeMute keeps State.volume at the floor, it never toggles
+            // back, and there is no separate mute flag on the wire. Unmute is a distinct `Volume` write.
+            "VolumeMute" => inner.apply(
+                "VolumeMute",
+                Box::new(|s| s.volume_db = s.volume_range.min_db),
+            ),
 
             "Play" => inner.apply("Play", Box::new(|s| s.playback = 2)),
             "Pause" => inner.apply("Pause", Box::new(|s| s.playback = 1)),
