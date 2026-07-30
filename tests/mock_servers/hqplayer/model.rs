@@ -169,6 +169,9 @@ pub struct Faults {
     pub accept_but_ignore: Vec<String>,
     /// `(element, polls)` — answer `OK` now, apply after this many `State`/`Status` reads.
     pub apply_after_polls: Vec<(String, u32)>,
+    /// Make `MatrixGetProfile` report a different name than `State.matrix_profile`, so a client can
+    /// be tested against a daemon whose two views of the same setting disagree.
+    pub matrix_current_override: Option<String>,
     pending: Vec<(u32, Change)>,
 }
 
@@ -178,6 +181,7 @@ impl std::fmt::Debug for Faults {
             .field("reject_next", &self.reject_next)
             .field("accept_but_ignore", &self.accept_but_ignore)
             .field("apply_after_polls", &self.apply_after_polls)
+            .field("matrix_current_override", &self.matrix_current_override)
             .field("pending", &self.pending.len())
             .finish()
     }
@@ -647,7 +651,11 @@ impl Responder for DaemonModel {
             "MatrixListProfiles" => inner.render_enumeration("MatrixListProfiles", "MatrixProfile"),
 
             "MatrixGetProfile" => {
-                let name = inner.state.matrix_profile.clone();
+                let name = inner
+                    .faults
+                    .matrix_current_override
+                    .clone()
+                    .unwrap_or_else(|| inner.state.matrix_profile.clone());
                 let index =
                     corpus::enum_entries(&inner.enumeration("MatrixListProfiles"), "MatrixProfile")
                         .into_iter()

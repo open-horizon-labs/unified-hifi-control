@@ -1739,3 +1739,188 @@ async fn tier1_reports_a_within_deadline_verdict_against_the_configured_budget()
     );
     h.stop();
 }
+
+/// A summary is not a capture. If the artifact records only family names and counts, a later run
+/// cannot be compared against this one without scraping the human render — which defeats the point of
+/// having a machine-readable form at all.
+#[tokio::test]
+async fn tier1_artifact_carries_the_full_normalized_enumeration_entries() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let json = tier1::diff(&capture, VERIFIED_PROFILE).to_json();
+
+    let filters = json
+        .pointer("/capture/enumerations/filters")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let first = filters.first().cloned().unwrap_or(serde_json::Value::Null);
+    assert!(
+        filters.len() > 1
+            && first.get("index").is_some()
+            && first.get("name").is_some()
+            && first.get("enum_id").is_some(),
+        "the artifact must carry every enumeration entry with index/name/enum_id, not just a count; \
+         got {} entries, first={first}",
+        filters.len()
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_artifact_carries_rate_values_and_scalar_attribute_maps() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let json = tier1::diff(&capture, VERIFIED_PROFILE).to_json();
+
+    let rate_hz = json
+        .pointer("/capture/enumerations/rates/1/rate")
+        .and_then(|v| v.as_u64());
+    let state_mode = json.pointer("/capture/scalars/state/mode");
+    let vr_min = json.pointer("/capture/scalars/volume_range/min");
+    assert!(
+        rate_hz.is_some() && state_mode.is_some() && vr_min.is_some(),
+        "rates need their Hz value and the scalar families need their attribute maps: \
+         rate_hz={rate_hz:?} state.mode={state_mode:?} volume_range.min={vr_min:?}"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_artifact_records_the_config_profile_observation_explicitly() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let json = tier1::diff(&capture, VERIFIED_PROFILE).to_json();
+    assert!(
+        json.pointer("/capture/config_profiles").is_some(),
+        "the config read side must appear in the artifact as an explicit observation — null when \
+         unreached — rather than being absent and therefore ambiguous; got {json}"
+    );
+    h.stop();
+}
+
+/// The live runner has to emit the artifact, not just the render, and it needs stable markers so a
+/// caller can lift the JSON out of captured output deterministically.
+#[tokio::test]
+async fn tier1_emits_the_artifact_between_stable_markers() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+    let block = report.artifact_block();
+
+    let inner = block
+        .split_once(tier1::ARTIFACT_BEGIN)
+        .and_then(|(_, rest)| rest.split_once(tier1::ARTIFACT_END))
+        .map(|(json, _)| json.trim().to_string())
+        .unwrap_or_default();
+    let parsed: Option<serde_json::Value> = serde_json::from_str(&inner).ok();
+    assert!(
+        parsed.as_ref().and_then(|v| v.get("schema")).is_some(),
+        "the emitted block must contain the artifact between {:?} and {:?} and parse as JSON; \
+         block={block}",
+        tier1::ARTIFACT_BEGIN,
+        tier1::ARTIFACT_END
+    );
+    h.stop();
+}
+
+/// `MatrixListProfiles` was captured but never diffed, because the matrix family was missing from the
+/// list of families the differ walks. A corpus that names a profile the daemon does not have has to be
+/// reported like any other missing entry.
+#[tokio::test]
+async fn tier1_diffs_the_matrix_profile_list_against_the_corpus() {
+    let h = Harness::start(LEGACY_PROFILE, WirePolicy::default(), fast_timeouts()).await;
+    h.adapter.connect().await.expect("connect");
+    // The legacy profile has no matrix fixture, so it falls back to the verified one; instead make the
+    // daemon's own list disagree by asking the verified corpus about a daemon serving it, then
+    // removing a name the corpus claims.
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let mut trimmed = capture.clone();
+    trimmed
+        .enumerations
+        .get_mut("matrix")
+        .expect("matrix captured")
+        .retain(|e| e.name != "Headphones");
+
+    let report = tier1::diff(&trimmed, VERIFIED_PROFILE);
+    assert!(
+        report.divergences.iter().any(|d| d.family.contains("matrix")
+            && d.kind == tier1::DivergenceKind::MissingEntry
+            && d.detail.contains("Headphones")),
+        "a matrix profile the corpus claims and the daemon lacks must be a MissingEntry divergence \
+         on the matrix family. Got: {:?}",
+        report.divergences
+    );
+    h.stop();
+}
+
+/// A current selection that is not in the daemon's own list is incoherent, and so is one that
+/// disagrees with `State.matrix_profile`. Capturing both and comparing neither would miss it.
+#[tokio::test]
+async fn tier1_reports_a_current_matrix_profile_missing_from_the_daemons_own_list() {
+    let h = Harness::verified().await;
+    h.model
+        .external_change(|s| s.matrix_profile = "Ghost".to_string());
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+    assert!(
+        report
+            .divergences
+            .iter()
+            .any(|d| d.detail.contains("Ghost") && d.family.contains("matrix")),
+        "a current profile absent from MatrixListProfiles must be a divergence. Got: {:?}",
+        report.divergences
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn tier1_reports_a_current_matrix_profile_that_disagrees_with_state() {
+    let h = Harness::verified().await;
+    // State says Default; MatrixGetProfile says Speakers. Both are in the list, so the only fault is
+    // that the daemon's two views of one setting disagree.
+    h.model
+        .arm(|f| f.matrix_current_override = Some("Speakers".to_string()));
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+    assert!(
+        report
+            .divergences
+            .iter()
+            .any(|d| d.detail.contains("State") && d.detail.contains("Speakers")),
+        "MatrixGetProfile disagreeing with State.matrix_profile must be reported, naming both. \
+         Got: {:?}",
+        report.divergences
+    );
+    h.stop();
+}
+
+/// A read failure and a daemon that legitimately reports no selection are different facts, and `None`
+/// alone cannot tell them apart. Warning to the log and moving on loses the distinction.
+#[tokio::test]
+async fn tier1_distinguishes_a_matrix_read_failure_from_no_current_selection() {
+    let h = Harness::with_policy(WirePolicy {
+        malformed_for_element: Some((
+            "MatrixGetProfile".to_string(),
+            "</MatrixGetProfile>".to_string(),
+        )),
+        ..WirePolicy::default()
+    })
+    .await;
+    let capture = tier1::capture(&h.adapter)
+        .await
+        .expect("capture survives the failure");
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+    assert!(
+        capture.matrix_current_read_failed
+            && report
+                .not_captured
+                .iter()
+                .any(|n| n.contains("MatrixGetProfile")),
+        "a MatrixGetProfile read failure must be recorded as unreached, not collapsed into None. \
+         read_failed={} not_captured={:?}",
+        capture.matrix_current_read_failed,
+        report.not_captured
+    );
+    h.stop();
+}

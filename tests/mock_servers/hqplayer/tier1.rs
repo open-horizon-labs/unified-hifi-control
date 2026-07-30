@@ -44,6 +44,9 @@ pub struct Capture {
     pub unsolicited_skipped: u32,
     /// The matrix profile the daemon reports as current, read-only via `MatrixGetProfile`.
     pub current_matrix_profile: Option<(u32, String)>,
+    /// Set when `MatrixGetProfile` could not be read at all, as distinct from a daemon that
+    /// legitimately reports no current selection. `None` alone cannot tell those apart.
+    pub matrix_current_read_failed: bool,
     /// The whole-command deadline in force during the capture, so delivery times can be judged
     /// against the budget that actually applied rather than against a remembered default.
     pub response_deadline: Duration,
@@ -193,7 +196,18 @@ impl Report {
 /// Stable identifier for the machine-readable artifact. Bump the version when the shape changes.
 pub const ARTIFACT_SCHEMA: &str = "uhc-hqp-tier1/v1";
 
+/// Markers bracketing the artifact in captured output, so a caller can lift the JSON out
+/// deterministically rather than scraping the human render. Part of the contract; do not reword.
+pub const ARTIFACT_BEGIN: &str = "----BEGIN uhc-hqp-tier1 ARTIFACT----";
+pub const ARTIFACT_END: &str = "----END uhc-hqp-tier1 ARTIFACT----";
+
 impl Report {
+    /// The artifact wrapped in stable markers, so a caller can lift it out of captured stdout
+    /// without scraping the human render. The markers are part of the contract.
+    pub fn artifact_block(&self) -> String {
+        String::new() // STUB - emitted for real in the GREEN commit. Test-side only, no src change.
+    }
+
     /// Machine-readable artifact for CI to store and later runs to compare against.
     ///
     /// Deliberately carries **no host, user, password or any other connection secret** — only what
