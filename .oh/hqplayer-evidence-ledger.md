@@ -481,3 +481,29 @@ existing one. Seventeen mutations are now on record (M1–M18, less the retired 
 them were false passes found by an external reviewer, not by this session.** That is the second time in
 this PR that an outside reader found what the internal passes missed — the first being HQP-C-023 — and
 it is the most useful thing this record can say about the value of the internal passes alone.
+
+### The base branch moved a second time — and this time it moved *because of* this ledger
+
+Three more commits landed on `feat/issue-issue-322` between the CodeRabbit remediation and the ship gate.
+Two of them cite this ledger's claim IDs:
+
+| Base commit | What it did |
+|---|---|
+| `ff8765b` | *"restore the supported `mid-playback` qualifier for the `Status.active_mode` `[source]` echo"* — **resolves HQP-C-061.** The circular de-qualification is reversed and the qualifier the `97dcc59` pass wrote is back |
+| `76b011c` | *"collapse the remaining eight `source_chain` fields and pin the closed vocabulary exactly (#341 HQP-C-057)"* — **remediates HQP-C-057**, citing the row's ID in its subject line |
+| `2b00fde` | CodeRabbit remediation on that branch: stale docs and a hardcoded `.xml` fixture lookup |
+
+Both rows are now `retired` here, with the outcome recorded in their anchors. Neither was fixed from this
+branch, which was the disposition Report 3/6 argued for, and the result is the clearest available evidence
+for it: **recording a finding with an owner and a claim ID got both fixed on the branch that owned the
+files, within the hour, without a cross-branch edit.**
+
+It is also direct evidence against the Stage-1 dissent's second pre-mortem — *"nobody opens it"*. The
+adoption signal it named (a `HQP-C-` citation appearing outside this PR) arrived before the ship gate, in
+a commit subject line. That does not make the ledger permanently useful; it does mean the failure mode is
+not the one to worry about first.
+
+**The treadmill P3-6 named is real, though.** The same file conflicted a second time and was re-synced the
+same way: this branch adopts #322's current text for the overlapping hunks and keeps only the banner and
+the paraphrases. `git merge-tree --write-tree` clean again. That is now **two** resolutions in one session
+for one file, and the structural fix remains merging #337 rather than anything available here.

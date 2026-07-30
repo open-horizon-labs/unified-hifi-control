@@ -233,11 +233,11 @@ withdrawn.
 
 | ID | Claim | Class | Provenance | Proof | Status | Owner |
 |---|---|---|---|---|---|---|
-| HQP-C-057 | Fifteen fixtures record `source_chain: read-via-report`; **eight of them still embed explanatory prose inside that closed-vocabulary field**, which the base branch's own remediation collapsed for only five | E6-documentary | `tests/fixtures/hqplayer/**` provenance headers at `bc9158e` · direct · n/a · 2026-07-30 · n/a | test:every_fixture_sourced_from_a_salvage_report_records_that_chain | open | #337 |
+| HQP-C-057 | Fifteen fixtures record `source_chain: read-via-report`; **eight of them still embed explanatory prose inside that closed-vocabulary field**, which the base branch's own remediation collapsed for only five | E6-documentary | `tests/fixtures/hqplayer/**` provenance headers at `bc9158e` · direct · n/a · 2026-07-30 · n/a | test:every_fixture_sourced_from_a_salvage_report_records_that_chain | retired | #337 |
 | HQP-C-058 | L1's **SDM enumerations and filter `description` presence are first-hand evidence** that can re-provenance specific `read-via-report` fixtures — recorded here, deliberately not acted on, because re-provenancing from a report of a run is not the same as re-provenancing from the capture | E0-uhc-live | PR #337 comment 5135836825 follow-up · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | #332:Confirm all upstream hqplayerd 6.0.4 observations on supported UHC rigs before converting them into general claims | pending-live | #332 |
 | HQP-C-059 | The `hqpd-5.x-legacy` profile is `UNVERIFIED` and exists only to vary list ordering; it is never protocol truth | E4-unverified | `tests/fixtures/hqplayer/hqpd-5.x-legacy/*` · direct · hqplayerd 5.x, unavailable for verification · 2026-07-29 · unknown | test:the_legacy_profile_is_marked_unverified_so_it_cannot_pass_as_protocol_truth | settled | — |
 | HQP-C-060 | The `synthetic-chain-hazard` profile is constructed, `never-promotable`, and every name in it is fictional so a row cannot be copied into the evidence corpus by mistake | E5-synthetic | `tests/fixtures/hqplayer/synthetic-chain-hazard/*` · direct · none — no daemon involved · 2026-07-30 · n/a | fixture:tests/fixtures/hqplayer/synthetic-chain-hazard/filters_sdm.xml | settled | — |
-| HQP-C-061 | Base-branch commit `ab18874` de-qualified the `Status.active_mode` echo's playback state citing this ledger's own (now withdrawn) `idle`, so the de-qualification rests on circular evidence rather than on the #322 session file's contemporaneous `playback active` record | E6-documentary | `ab18874` commit message and `.oh/issue-322-…:1549-1552` · direct · n/a · 2026-07-30 · n/a | none:the base branch re-deciding on the session file's record, or reading the salvage report directly | open | #337 |
+| HQP-C-061 | Base-branch commit `ab18874` de-qualified the `Status.active_mode` echo's playback state citing this ledger's own (now withdrawn) `idle`, so the de-qualification rests on circular evidence rather than on the #322 session file's contemporaneous `playback active` record | E6-documentary | `ab18874` commit message and `.oh/issue-322-…:1549-1552` · direct · n/a · 2026-07-30 · n/a | none:resolved upstream at `ff8765b`, which restored the qualifier | retired | #337 |
 
 ---
 
@@ -413,7 +413,11 @@ policy, and #348 owns it.
 **What would settle it:** #348 landing the guardrail and the notices file, naming Copyright (c) 2026
 Adam Goldsmith and preserving the MIT terms, before any HQPTuner implementation code is ported.
 
-### HQP-C-061 — a de-qualification that cites this ledger back at itself
+### HQP-C-061 — a de-qualification that cited this ledger back at itself · **resolved upstream**
+
+**Outcome first:** base-branch commit `ff8765b`, *"restore the supported 'mid-playback' qualifier for the
+Status.active_mode [source] echo"*, landed within the hour and restored it. The row is `retired`, not
+deleted, because the *mechanism* is the part worth keeping visible.
 
 `ab18874` is careful work: it refused to let an unsupported "mid-playback" qualifier stand. But its
 evidence was *this ledger's* `idle`, which was an inference from an aggregate caveat and not a reading
@@ -426,20 +430,25 @@ The de-qualification is also **partial**: `ab18874`'s own message scopes itself 
 `source_refuses_rate_pin` observation. So the base branch now carries a playback qualifier for one
 upstream probe and none for another, from the same report and the same day.
 
-**What would settle it:** the base branch re-deciding on `.oh/issue-322-…:1549-1552` — which records
-`playback active` for this probe — or someone reading the salvage report directly and settling it from
-the source. Either way the fix belongs on the branch that owns those files, not here.
+**Settled by:** the base branch re-deciding on `.oh/issue-322-…:1549-1552`, exactly as this row asked,
+in `ff8765b`. The fix belonged to the branch that owns those files and that is where it happened.
 
-### HQP-C-057 — eight fixtures still carry prose in a closed-vocabulary field
+### HQP-C-057 — eight fixtures carried prose in a closed-vocabulary field · **remediated upstream**
+
+**Outcome first:** base-branch commit `76b011c`, *"collapse the remaining eight source_chain fields and
+pin the closed vocabulary exactly (#341 HQP-C-057)"*, did it and cited this row's ID. All fifteen
+fixtures still record `read-via-report`, so the derived pending-confirmation table below is unchanged
+after the merge — verified against the base branch's fixture set, not assumed.
 
 The base branch's CodeRabbit remediation at `bc9158e` collapsed `source_chain` to exactly
 `read-via-report` in five fixtures. Eight others still embed a paragraph in that field. Validators key
 on `contains("read-via-report")`, so nothing breaks — but the field is closed-vocabulary by intent and
 half of it is prose.
 
-**What would settle it:** the same collapse applied to the remaining eight, on the branch that owns
-those files. Not done here: they are base-branch files under active review, and an edit from a stacked
-branch would conflict with #337's own remediation for no evidential gain.
+**Settled by:** `76b011c` on the base branch. Not doing it here was the right call for the stated
+reason — an edit from a stacked branch would have conflicted with #337's own remediation — and the
+outcome is the cleanest possible demonstration that recording a finding with an owner beats reaching
+across a branch boundary to fix it.
 
 ### HQP-C-058 — L1's first-hand enumerations against the second-hand corpus
 
