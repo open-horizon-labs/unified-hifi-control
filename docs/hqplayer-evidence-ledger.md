@@ -140,7 +140,7 @@ were **not executed** and are recorded as gaps in that comment.
 
 | ID | Claim | Class | Provenance | Proof | Status | Owner |
 |---|---|---|---|---|---|---|
-| HQP-C-023 | `Status.active_mode` **echoes the configured mode** under `[source]`, so it cannot resolve the loaded chain | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…:1549-1552` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · active | test:the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics | settled | — |
+| HQP-C-023 | `Status.active_mode` **echoes the configured mode** under `[source]`, so it cannot resolve the loaded chain | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…:1549-1552` and `model.rs:126`/`:146` at `bc9158e` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · active | test:the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics | settled | — |
 | HQP-C-024 | What `State.active_mode` reports under `[source]` — the loaded chain or the configured mode — is **unmeasured**, upstream and here | E4-unverified | `.oh/issue-322-…:1738-1740` · direct · unmeasured on any daemon · 2026-07-30 · unknown | test:the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics · #332:Resolve State.active_mode versus Status.active_mode under configured PCM/SDM and [source]/Auto with PCM and DSD sources | open | #332 |
 | HQP-C-025 | `Status` reports active settings as **display names** while `State` reports numbers, so the two are complementary rather than redundant | E3-derived | `tests/fixtures/hqplayer/hqpd-6.0.4-opal/status_playing_with_metadata.xml` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · unknown | test:status_reports_active_settings_as_display_names | settled | — |
 | HQP-C-026 | UHC's own comment at `src/adapters/hqplayer.rs:2473` calls `Status.active_mode` "unreliable" and instructs using `State`'s — a global rule the evidence does not support | E4-unverified | `src/adapters/hqplayer.rs:2473` · direct · n/a · 2026-07-30 · n/a | none:HQP-C-024 settling, after which the comment states a measured fact or is deleted | open | #347 |
@@ -148,9 +148,13 @@ were **not executed** and are recorded as gaps in that comment.
 #### HQP-C-023's playback state was corrected, and the wrong value had already travelled
 
 An earlier revision of this row recorded `playback: idle`, inferred from the aggregate caveat that the
-upstream probes were collected with the engine stopped. **The #322 session file records this specific
-probe as `playback active`** (`.oh/issue-322-hqplayer-protocol-conformance.md:1549-1552`), and a
-per-probe record beats an aggregate caveat. The row now says `active`.
+upstream probes were collected with the engine stopped. **Two independent in-repo records say otherwise.** The #322
+session file records this specific probe as `playback active`
+(`.oh/issue-322-hqplayer-protocol-conformance.md:1549-1552`), and `tests/mock_servers/hqplayer/model.rs`
+at `bc9158e` says it twice — *"verified upstream on hqplayerd 6.0.4, 2026-07-29, mid-playback"* (`:126`)
+and *"**Measured** for `Status.active_mode`: hqplayerd 6.0.4, 2026-07-29, playback active"* (`:146`).
+Both were written in `97dcc59`, during #322's amendment, when the salvage reports were in hand. A
+per-probe record beats an aggregate caveat, twice over. The row now says `active`.
 
 **This matters beyond one cell.** While this branch was being written, base-branch commit `ab18874`
 *removed* a "mid-playback" qualifier from `docs/hqplayer-protocol-reference.md` and
@@ -413,8 +417,14 @@ Adam Goldsmith and preserving the MIT terms, before any HQPTuner implementation 
 
 `ab18874` is careful work: it refused to let an unsupported "mid-playback" qualifier stand. But its
 evidence was *this ledger's* `idle`, which was an inference from an aggregate caveat and not a reading
-of the source report. Two documents now agree with each other because one of them copied the other,
+of the source report — and the qualifier it removed had been written in `97dcc59` by the pass that had
+the salvage reports open. Two documents now agree with each other because one of them copied the other,
 which is the failure mode the `chain` field exists to make visible.
+
+The de-qualification is also **partial**: `ab18874`'s own message scopes itself to this probe and leaves
+`model.rs:244`'s *"verified upstream 2026-07-29 mid-playback, twice"* in place for the
+`source_refuses_rate_pin` observation. So the base branch now carries a playback qualifier for one
+upstream probe and none for another, from the same report and the same day.
 
 **What would settle it:** the base branch re-deciding on `.oh/issue-322-…:1549-1552` — which records
 `playback active` for this probe — or someone reading the salvage report directly and settling it from
