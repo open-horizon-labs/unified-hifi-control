@@ -2034,3 +2034,128 @@ review rather than a fifth internal cycle.
 | `cargo test --no-fail-fast` | 473/472 passed; 3/4 failed, all attributed; 12 ignored |
 | `git ls-tree -r HEAD .oh/.cache` | **0** |
 | live tier 1 / tier 2 | **not run** — daemon offline, no mutating permission |
+
+---
+
+## Codex Stage 2 re-gate: the fragmented-follower fix (2026-07-30)
+
+**Re-gate verdict on `d8a24e1`: ADJUST** (PR #337 comment 5126624545), one blocking finding. It was
+correct, and it was a defect I introduced in the previous pass.
+
+### The defect, and why it was invisible
+
+`send_command_inner` truncated `raw` to the wanted document before returning, and the follower-counting
+loop only recognised **complete** followers. So when one read carried a reply plus only the **prefix**
+of a coalesced unsolicited frame, that prefix was discarded while its suffix stayed in the socket. The
+next command concatenated the orphan with its own reply.
+
+It needed **two** mistakes to become silent. `framing::root_element` found the expected root further
+along, so the reply passed every structural check — while `parse_attr` fell back to scanning the whole
+string when `root_open_tag` could not start at an orphaned suffix, and a whole-string scan finds
+whatever appears first. A shared attribute from the push therefore won.
+
+Reproduced at `3920ecc` from two existing `WirePolicy` knobs, so the sequence is deterministic and
+nothing asserts on elapsed time — `coalesce_extra_for_element` puts the push in the same write as every
+`State` reply, and `Chunking::AfterMarker("<Status")` cuts that joined write immediately after the
+follower's root name:
+
+```text
+assertion `left == right` failed: a shared attribute in the fragmented push must not
+override the following State reply...
+  left: -1
+ right: -24
+```
+
+One connection, one attempt, correct `state=1` beside a `volume` taken from the push. This is ordinary
+TCP behaviour: the daemon emits unsolicited `Status` documents, coalescing is an accepted wire
+condition, and TCP may split any write at any byte.
+
+### The fix, in two layers
+
+**Layer 1 — unread bytes preserved per connection.** `HqpConnection` gains `carry: Vec<u8>` holding
+everything after the returned document. `send_command_inner` seeds `raw` from it and refills it on the
+way out, so a split follower keeps its prefix, completes on a later read, and is recognised and skipped
+as the document it is. The orphan never forms.
+
+**Layer 2 — a command returns exactly the document it selected.** The framer's scan now reports a
+document **span** rather than only its end. Truncating at the end alone left anything *before* the
+document travelling with it.
+
+And the whole-string fallback is gone: `parse_attr` returns `None` when no root element can be
+identified. That fallback was what made the corruption silent.
+
+| Property | How it holds |
+|---|---|
+| Carry bounded | A suffix of an accumulation already capped at `MAX_RESPONSE_BYTES` |
+| `MAX_RESPONSE_BYTES` over carried bytes | Carried bytes are in `raw`, so the existing `raw.len() + n` check counts them |
+| `MAX_UNSOLICITED_BACKLOG` over carried bytes | Carried documents drain through the same skip branch that enforces the ceiling |
+| Reconnect resets it | `mark_disconnected` sets `*conn = None`; a fresh `HqpConnection` starts empty. Verified structurally |
+| Deadline still bounds all IO | The first pass skips only the deadline *check*, never a read; every socket read goes through the checked branch |
+| No second reader to desync | `grep` for `.stream.` finds no reader outside `send_command_inner` |
+| Attribution single | A partial follower is not counted until it completes; the command that finishes it counts it |
+
+### Audit cases, and which actually bite
+
+Verified by reverting `src` and re-running:
+
+| Case | Pre-fix |
+|---|---|
+| Different-name next reply | **FAILED** |
+| Partial-follower attribution | **FAILED** |
+| Multi-byte carried fragment | **FAILED** |
+| Reconnect starts with no carry | passed |
+
+The last is recorded as passing pre-fix rather than presented as a fourth proof — before the carry
+existed there was nothing to inherit. Its value is forward: it fails if the field is hoisted onto the
+adapter.
+
+### `/review` — one finding, applied at `d09be2b`
+
+`raw.drain(..start)` discarded pre-document bytes **silently**. They are not a document so cannot be
+counted as a skipped one, and the case should now be unreachable — which is the reason to log it, not
+to ignore it. Discarding unexplained bytes in silence is exactly what made the original corruption
+invisible. A `warn` now names the count.
+
+### `/dissent` — one finding applied at `26f89d7`, and one signal recorded
+
+Applied: the carry introduces a lag the skip counter's documentation did not admit. A partially-arrived
+follower, or one sitting in the carry when a capture ends, is not counted until consumed — so a tier-1
+reading can be lower than the frames delivered. The semantics are right (counted once, by whoever
+dropped it) but the counter is offered as *evidence about a real daemon*, and "skipped" and "received"
+are different claims.
+
+**Signal recorded rather than acted on: five gate rounds have now found five distinct defects in one
+function.** Framing at the first `/>`, a cap that bounded retention not allocation, a coalescing wedge,
+a buffered remainder, and a fragmented follower. `send_command_inner` now carries seven concerns —
+framing, deadline, cap, unsolicited skipping, follower counting, carry, span slicing — reachable only
+through a socket. That is not an argument against any individual fix; it is **evidence for the sans-io
+extraction Stage 1 catalogued as Option E and assigned to #162**, where each concern becomes separately
+and exhaustively testable without a peer. First time that plan has had five data points behind it.
+
+### `sg review pr` — no blocking findings
+
+*"Nothing here should block continuing — the code changes are good and well-tested, and the team has
+clearly been rigorous about not smuggling scope."* Its four points are standing questions it credits
+this PR for having surfaced: the read-via-report channel as a standing lesson, harness proportionality
+needing a human call, four review cycles reaching diminishing returns, and this file mixing a design
+record with a transcript. Its explicit recommendation — stop the internal loop and get a maintainer's
+proportionality judgement — matches what this amendment's own dissent concluded, and is what stopping
+here does.
+
+### Verification at the pushed HEAD
+
+| Command | Result |
+|---|---|
+| `--test hqplayer_conformance` | **172 passed; 0 failed; 0 ignored** |
+| lib unit tests | 84 passed |
+| `--test adapter_integration` / `--test zones_sha_integration` | 42 / 20 |
+| `--test api_contract` / `--test protocol_schema` | 2 / 41 — no route or payload drift |
+| `cargo fmt --check` | clean |
+| `cargo clippy -- -D warnings` | clean, 0 findings |
+| `git diff --check origin/v3...HEAD` | clean |
+| `cargo test --no-fail-fast` | **481 passed; 2 failed; 12 ignored** |
+| `git ls-tree -r HEAD .oh/.cache` | **0** |
+| live tier 1 / tier 2 | **not run** — daemon offline, no mutating permission |
+
+Both failures are the deterministic `/hqp/discover` baseline; the LMS flake family did not fire in this
+run. **#339 remains unmerged**, so PR CI may still show the known Rust 1.97 base lint failure on `v3`.
