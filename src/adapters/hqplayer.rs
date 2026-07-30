@@ -480,6 +480,10 @@ const MAX_UNSOLICITED_BACKLOG: u32 = 256;
 /// orders of magnitude of headroom, so no legitimate document can approach it. Deliberately private
 /// for the same reason as its sibling — it is protection, not policy, and nothing should tune it.
 /// It matches the ceiling the reference implementation independently chose.
+///
+/// Checked after appending a read, so the true peak is this plus one line. That is deliberate — a
+/// mid-line check would need the reader to hand back a partial line — and it is stated because
+/// "4 MiB" would otherwise read as a hard bound on the allocation rather than on the accumulation.
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// HQPlayer state information

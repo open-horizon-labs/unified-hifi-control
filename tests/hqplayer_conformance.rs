@@ -3657,3 +3657,41 @@ fn a_bare_ampersand_in_an_attribute_value_is_preserved() {
         "and a bare ampersand must not consume the words that follow it"
     );
 }
+
+/// The boundary of bite 1's recovery, made executable so it cannot be forgotten.
+///
+/// `root_frame_closed` requires the root's closing tag to be the buffer's **last** token. That is
+/// what keeps a truncated document from being credited with a tag that has not arrived, and what
+/// stops a `</Status>` inside an attribute value passing for a frame end. The cost is that recovery
+/// does **not** survive coalescing: a hostile document followed in the same buffer by one of the
+/// daemon's unsolicited push frames still reads as incomplete, and that command still waits out its
+/// deadline.
+///
+/// That combination is plausible — the daemon does push `Status` frames — so this is a **stated
+/// limit**, not an oversight. Widening the check to find the *first* matching close tag rather than
+/// requiring it last would cover it, at the cost of the two guarantees above; that trade is worth a
+/// deliberate decision rather than a quiet widening, and it belongs with whoever needs it.
+///
+/// **Label: stated-limit.** If someone improves recovery, this test fails loudly and they update it
+/// on purpose. Documented in `.oh/issue-322-hqplayer-protocol-conformance.md` under the amendment's
+/// Stage 2 record.
+#[test]
+fn root_recovery_does_not_survive_coalescing_and_that_is_a_stated_limit() {
+    let hostile_alone = "<Status state=\"2\">\n<metadata song=\"x\"\n</Status>\n";
+    assert_eq!(
+        framing::classify(hostile_alone),
+        framing::Framing::Complete,
+        "a hostile document arriving alone is recovered — trailing whitespace is trimmed"
+    );
+
+    let hostile_then_push =
+        "<Status state=\"2\">\n<metadata song=\"x\"\n</Status>\n<Status state=\"1\"/>\n";
+    assert_eq!(
+        framing::classify(hostile_then_push),
+        framing::Framing::Incomplete,
+        "but a hostile document coalesced with a following push frame is NOT recovered, because the \
+         root's closing tag is no longer the buffer's last token. Stated limit, not an oversight: \
+         widening the check would give up the truncation and attribute-value guarantees that the \
+         last-token rule buys"
+    );
+}

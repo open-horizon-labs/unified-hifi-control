@@ -494,14 +494,22 @@ impl Inner {
     /// Advance delayed-apply changes. Called on every `State`/`Status` render (AC3).
     fn tick_pending(&mut self) {
         let mut still = Vec::new();
+        let mut applied = false;
         for (remaining, change) in std::mem::take(&mut self.faults.pending) {
             if remaining <= 1 {
                 change(&mut self.state);
+                applied = true;
             } else {
                 still.push((remaining - 1, change));
             }
         }
         self.faults.pending = still;
+        // A *deferred* `SetMode` lands here rather than in the setter arm, so the chain can change
+        // without the setter's clamp having run. Re-applying the invariant here is what keeps a
+        // delayed mode change from leaving an index the new chain's enumeration cannot resolve.
+        if applied {
+            self.clamp_to_loaded_chain();
+        }
     }
 
     fn newline(&self) -> &'static str {
