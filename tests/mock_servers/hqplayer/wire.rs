@@ -345,7 +345,11 @@ async fn serve_connection(
                 // Large frames keep the line count low so the ceiling is what the test measures.
                 let filler = format!("<Junk pad=\"{}\"/>\n", "x".repeat(256 * 1024));
                 let mut written = 0usize;
-                if writer.write_all(b"<?xml version=\"1.0\"?><GetFilters>\n").await.is_err() {
+                if writer
+                    .write_all(b"<?xml version=\"1.0\"?><GetFilters>\n")
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 while written < at_least {
