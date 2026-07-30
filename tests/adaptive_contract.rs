@@ -1831,3 +1831,160 @@ mod choice_authority {
         );
     }
 }
+
+// ============================================================================
+// Coherence of published intent (specification rules C1 and C2)
+// ============================================================================
+
+mod intent_coherence {
+    use super::fixtures::{document, CANONICAL};
+    use unified_hifi_control::adaptive::{
+        ApplyLane, ChangeSetEntry, ControlId, ControlValue, EntryValidity, IntentIncoherence,
+        Timestamp, ValueLane,
+    };
+
+    #[test]
+    fn every_canonical_fixture_publishes_coherent_intent() {
+        // C1 + C2 over the shipped examples. If a fixture ever publishes a valid entry
+        // without a matching desired lane, constraints over that control would silently
+        // evaluate against the running engine instead of the draft.
+        for name in CANONICAL {
+            let doc = document(name);
+            let violations = doc.intent_coherence_violations();
+            assert!(
+                violations.is_empty(),
+                "fixture {name} publishes incoherent intent: {violations:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_entry_agrees_with_the_controls_desired_lane() {
+        // Spot-check the positive case explicitly rather than only through the aggregate.
+        let doc = document("staged_intent_multi_surface");
+        let mode = ControlId::new("hqplayer.pipeline.mode");
+        let entry = doc
+            .change_sets
+            .iter()
+            .flat_map(|set| &set.entries)
+            .find(|entry| entry.control == mode && entry.validity.may_apply())
+            .expect("a valid mode entry is staged");
+        let published = doc
+            .control(&mode)
+            .and_then(|control| control.lane(&ValueLane::Desired))
+            .and_then(|lane| lane.value.as_ref())
+            .expect("the control publishes a desired lane");
+        assert_eq!(published, &entry.desired);
+    }
+
+    #[test]
+    fn c1_a_valid_entry_without_a_desired_lane_is_a_violation() {
+        let mut doc = document("staged_intent_multi_surface");
+        let orphan = ControlId::new("hqplayer.pipeline.rate.exact");
+        // rate.exact is published with an observed lane only. Staging a *valid* entry for
+        // it without adding a desired lane is exactly the silent failure C1 forbids.
+        doc.change_sets[0].stage(
+            ChangeSetEntry {
+                control: orphan.clone(),
+                lane: ApplyLane::Staged,
+                desired: ControlValue::choice("384000"),
+                base_observed: None,
+                validity: EntryValidity::Valid,
+                extensions: Default::default(),
+            },
+            Timestamp::new("2026-07-30T11:30:00Z"),
+        );
+        assert_eq!(
+            doc.intent_coherence_violations(),
+            vec![IntentIncoherence::MissingDesiredLane {
+                control: orphan,
+                change_set: doc.change_sets[0].id.clone(),
+            }]
+        );
+    }
+
+    #[test]
+    fn c1_a_valid_entry_that_disagrees_with_the_lane_is_a_violation() {
+        let mut doc = document("staged_intent_multi_surface");
+        let mode = ControlId::new("hqplayer.pipeline.mode");
+        let entry = doc.change_sets[0]
+            .entries
+            .iter_mut()
+            .find(|entry| entry.control == mode)
+            .expect("mode entry present");
+        entry.desired = ControlValue::choice("pcm"); // the lane still publishes "sdm"
+        assert_eq!(
+            doc.intent_coherence_violations(),
+            vec![IntentIncoherence::DesiredLaneDisagrees {
+                control: mode,
+                change_set: doc.change_sets[0].id.clone(),
+            }]
+        );
+    }
+
+    #[test]
+    fn c2_two_drafts_cannot_both_hold_a_valid_entry_for_one_control() {
+        // One desired lane cannot represent two concurrent drafts, so the second draft
+        // must be marked Conflicts rather than Valid.
+        let mut doc = document("staged_intent_multi_surface");
+        let mode = ControlId::new("hqplayer.pipeline.mode");
+        let first = doc.change_sets[0].id.clone();
+        let second = doc.change_sets[1].id.clone();
+        doc.change_sets[1].stage(
+            ChangeSetEntry {
+                control: mode.clone(),
+                lane: ApplyLane::Staged,
+                desired: ControlValue::choice("sdm"),
+                base_observed: None,
+                validity: EntryValidity::Valid,
+                extensions: Default::default(),
+            },
+            Timestamp::new("2026-07-30T11:31:00Z"),
+        );
+        assert_eq!(
+            doc.intent_coherence_violations(),
+            vec![IntentIncoherence::MultipleValidDrafts {
+                control: mode,
+                change_set: second,
+                also_claimed_by: first,
+            }]
+        );
+    }
+
+    #[test]
+    fn entries_that_cannot_apply_are_exempt() {
+        // The multi-surface fixture deliberately holds stale, conflicting, draft-invalid
+        // and needs-validation entries whose values differ from the published desired
+        // lane. Apply is already blocked for those, so the effective projection over them
+        // is advisory and no lane is required.
+        let doc = document("staged_intent_multi_surface");
+        let non_applying = doc
+            .change_sets
+            .iter()
+            .flat_map(|set| &set.entries)
+            .filter(|entry| !entry.validity.may_apply())
+            .count();
+        assert!(
+            non_applying >= 4,
+            "the fixture should exercise several non-applying validities, found {non_applying}"
+        );
+        assert!(doc.intent_coherence_violations().is_empty());
+    }
+
+    #[test]
+    fn c1_a_valid_entry_for_a_removed_control_is_a_violation() {
+        // Reachable after a control-plane advance removed a control an open draft still
+        // targets. Reported distinctly so a consumer can say "this control is gone"
+        // rather than the generic "needs producer validation".
+        let mut doc = document("staged_intent_multi_surface");
+        let mode = ControlId::new("hqplayer.pipeline.mode");
+        doc.controls.retain(|control| control.id != mode);
+        assert_eq!(
+            doc.intent_coherence_violations(),
+            vec![IntentIncoherence::UnknownControl {
+                control: mode,
+                change_set: doc.change_sets[0].id.clone(),
+            }]
+        );
+    }
+}

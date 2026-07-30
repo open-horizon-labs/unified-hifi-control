@@ -101,12 +101,29 @@ adapter code — re-coupling surfaces to backends, which is what the epic remove
   `every_vocabulary_member_has_a_worked_example` proves representability, not necessity: it
   can always be satisfied by extending a fixture, so it bounds *reachability*, not size.
 
-* **#325 is the deletion gate.** When HQPlayer's mapping lands, any construct it cannot
-  populate from a real engine is a candidate for removal in v1.1 rather than permanent
-  surface every future producer must still handle. Removal within major 1 is otherwise
-  forbidden by the compatibility policy, so this is an explicit, time-boxed exception: it
-  applies only to constructs no producer has ever published, and it closes when #324 ships.
-  Current best guess at the exposed set: the `compensating` / `compensated` /
+* **#325 validates need; it does not license removal.** An earlier draft of this ADR
+  granted a "v1.1 deletion gate" that let #325 remove unused constructs. That was wrong on
+  two counts and has been withdrawn: #325 is blocked by #324, so the exception could not
+  have closed when #324 shipped as it claimed, and removal within a major version directly
+  contradicts the additive-only policy in §8 of the specification — a compatibility rule
+  cannot carry a private exception for its own author.
+
+  What #325 can legitimately do when it maps a real engine:
+
+  1. **Validate need.** Report which constructs a real producer populates. That evidence is
+     useful even when it changes nothing.
+  2. **Deprecate additively.** Mark a control, choice or field `deprecated` with a reason.
+     Deprecated things keep rendering and keep applying; nothing breaks.
+  3. **Argue for v2.** If the evidence says the shape is wrong rather than merely
+     over-provisioned, that is a major-version conversation, not a patch.
+
+  The one genuinely time-bounded window is **before any contract is released outside this
+  repository**. Until #324 publishes documents on the bus and a non-UHC consumer depends on
+  them, a breaking change costs a coordinated edit rather than a compatibility break. If
+  #325's evidence justifies reshaping v1, it should be taken then and stamped as v2 — not
+  smuggled in as a v1.1 that quietly removes surface consumers were told was stable.
+
+  Constructs most likely to attract that evidence: the `compensating` / `compensated` /
   `recovery_required` / `divergent` outcomes, multi-revision plan boundaries, the
   `in_range` / `is_grounded` / `not_eq` / `any` operators, and `held` values on producers
   with no settings interface.

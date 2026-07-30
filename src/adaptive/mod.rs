@@ -71,9 +71,9 @@ pub use control::{
     ReasonScope, RiskClass, Verification,
 };
 pub use document::{
-    admit_document, admit_document_str, DocumentRevisions, EffectiveView, Extensions, LaneHealth,
-    LaneState, ProducerDocument, ProducerEpoch, ProducerIdentity, ProducerTarget, Revision,
-    RevisionRef, TargetRole, TransportLane,
+    admit_document, admit_document_str, DocumentRevisions, EffectiveView, Extensions,
+    IntentIncoherence, LaneHealth, LaneState, ProducerDocument, ProducerEpoch, ProducerIdentity,
+    ProducerTarget, Revision, RevisionRef, TargetRole, TransportLane,
 };
 pub use value::{
     Authority, ControlValue, Divergence, DivergenceKind, Freshness, Grounding, LaneValue,

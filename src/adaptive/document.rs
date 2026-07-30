@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use super::change_set::{ChangeSet, DraftPolicy};
+use super::change_set::{ChangeSet, ChangeSetId, DraftPolicy};
 use super::command::OperationRecord;
 use super::constraint::{Constraint, ValueLookup};
 use super::control::{ControlGroup, ControlId, Reason};
@@ -347,6 +347,76 @@ impl ProducerDocument {
         paths
     }
 
+    /// Check the published-intent coherence rules C1 and C2.
+    ///
+    /// An empty result means every `valid` change-set entry agrees with the `desired` lane
+    /// of the control it targets, and no two drafts claim the same control as valid.
+    ///
+    /// This is a contract rule rather than a type invariant because a producer assembles a
+    /// document from several sources, and the failure it prevents is silent:
+    /// [`ProducerDocument::effective_view`] reads the change set for *presence* and the
+    /// control's `desired` lane for the *value*, so an entry published without a matching
+    /// lane makes constraints evaluate against the running engine instead of the draft — and
+    /// a consumer can then conclude a staged combination is valid when it is not.
+    ///
+    /// Publication-time enforcement belongs to the aggregator (issue #324): an incoherent
+    /// document must be refused or repaired, never relayed.
+    pub fn intent_coherence_violations(&self) -> Vec<IntentIncoherence> {
+        let mut violations = Vec::new();
+        let mut claimed: Vec<(&ControlId, &ChangeSetId)> = Vec::new();
+
+        for change_set in &self.change_sets {
+            for entry in &change_set.entries {
+                if !entry.validity.may_apply() {
+                    // Apply is already blocked, so the effective projection is advisory and
+                    // no lane is required. See the specification, "Coherence of published
+                    // intent".
+                    continue;
+                }
+
+                // C2: only one draft may hold a valid entry for a control.
+                if let Some((_, other)) = claimed
+                    .iter()
+                    .find(|(control, _)| *control == &entry.control)
+                {
+                    violations.push(IntentIncoherence::MultipleValidDrafts {
+                        control: entry.control.clone(),
+                        change_set: change_set.id.clone(),
+                        also_claimed_by: (*other).clone(),
+                    });
+                } else {
+                    claimed.push((&entry.control, &change_set.id));
+                }
+
+                // C1: a valid entry requires a matching grounded `desired` lane.
+                let Some(control) = self.control(&entry.control) else {
+                    violations.push(IntentIncoherence::UnknownControl {
+                        control: entry.control.clone(),
+                        change_set: change_set.id.clone(),
+                    });
+                    continue;
+                };
+                match control
+                    .lane(&ValueLane::Desired)
+                    .and_then(LaneValue::grounded_value)
+                {
+                    None => violations.push(IntentIncoherence::MissingDesiredLane {
+                        control: entry.control.clone(),
+                        change_set: change_set.id.clone(),
+                    }),
+                    Some(published) if published != &entry.desired => {
+                        violations.push(IntentIncoherence::DesiredLaneDisagrees {
+                            control: entry.control.clone(),
+                            change_set: change_set.id.clone(),
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        violations
+    }
+
     /// The editor-effective view of this document under an optional change set.
     ///
     /// Every surface evaluates constraints through this, so a web page, an MCP client
@@ -367,6 +437,48 @@ fn collect(extensions: &Extensions, prefix: &str, out: &mut Vec<String>) {
             out.push(format!("{prefix}.{key}"));
         }
     }
+}
+
+/// A way in which a document's published intent contradicts itself.
+///
+/// See the specification section "Coherence of published intent" for the two rules and why
+/// they are MUSTs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum IntentIncoherence {
+    /// C1: a `valid` entry has no grounded `desired` lane on its control.
+    MissingDesiredLane {
+        /// The control the entry targets.
+        control: ControlId,
+        /// The change set holding the entry.
+        change_set: ChangeSetId,
+    },
+    /// C1: a `valid` entry's value differs from the control's published `desired` lane.
+    DesiredLaneDisagrees {
+        /// The control the entry targets.
+        control: ControlId,
+        /// The change set holding the entry.
+        change_set: ChangeSetId,
+    },
+    /// C2: two change sets both hold a `valid` entry for the same control.
+    MultipleValidDrafts {
+        /// The contested control.
+        control: ControlId,
+        /// The change set reported second.
+        change_set: ChangeSetId,
+        /// The change set that claimed it first.
+        also_claimed_by: ChangeSetId,
+    },
+    /// A `valid` entry targets a control the document does not describe.
+    ///
+    /// Reachable after a control-plane advance removed the control while a draft still
+    /// targeted it. The draft must be revalidated, not applied.
+    UnknownControl {
+        /// The missing control.
+        control: ControlId,
+        /// The change set holding the entry.
+        change_set: ChangeSetId,
+    },
 }
 
 /// A document plus an optional change set, resolving the effective lane.

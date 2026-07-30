@@ -381,6 +381,38 @@ state moved after the base revision, the whole change set is revalidated and sta
 conflicting fields are reported **before** mutation. Silent rebasing is never permitted:
 the user staged a value against what they were shown.
 
+### Coherence of published intent (normative)
+
+A change set entry and the `desired` lane of the control it targets are two views of the
+same staged value. Nothing in the types forces them to agree, so the rules are stated here
+and enforced by `ProducerDocument::intent_coherence_violations`.
+
+**C1.** Whenever a producer publishes a `ChangeSetEntry` for control *C* whose
+`validity` is `valid`, the document **MUST** also carry a `desired`
+[`LaneValue`](#2-the-central-design-decision-five-truths-not-one-value) on *C*, grounded,
+whose value **equals** the entry's `desired`.
+
+**C2.** At most one change set in a document **MUST** carry a `valid` entry for a given
+control. Where two drafts want the same control, at most one may be `valid`; the others
+**MUST** carry `EntryValidity::Conflicts` naming that control. A single `desired` lane
+cannot represent two concurrent drafts, and a document that tries is unresolvable by any
+consumer.
+
+**Why C1 is a MUST rather than a nicety.** `ProducerDocument::effective_view` resolves the
+`effective` lane by consulting the change set for *presence* and then reading the control's
+`desired` lane for the *value*. If a producer publishes an entry without a matching
+`desired` lane, the effective lane silently falls back to `observed`, every constraint over
+that control evaluates against the running engine rather than the draft, and a consumer can
+conclude a staged combination is valid when it is not. That failure is silent, which is why
+it is a contract rule with a test rather than a comment.
+
+**Consumers, for entries that are not `valid`.** The producer has already blocked apply, so
+the `effective` projection over such an entry is advisory. A consumer must act on the
+entry's `validity` and its reason, not on the effective value.
+
+Publication-time enforcement is #324's responsibility: an aggregator must refuse or repair
+an incoherent document rather than relay it.
+
 ### Retention
 
 `survives_reconnect`, `survives_producer_restart`, `on_epoch_change`
@@ -514,7 +546,8 @@ demonstrate held intent while actually demonstrating `None` is worse than no fix
 in some fixture and round-trips. It proves **representability, not necessity**, and it
 matches on string values rather than on schema position; the positional claims are made by
 the typed assertions in `mod canonical_semantics`. Whether each construct is *needed* is
-settled by #325 - see the ADR's deletion-gate consequence.
+evidence #325 can supply — but evidence of disuse permits additive deprecation or a v2
+argument, never removal within major 1. See the ADR consequences.
 
 ### v1's wire form is JSON
 
