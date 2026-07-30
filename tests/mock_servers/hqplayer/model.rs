@@ -500,10 +500,21 @@ impl Inner {
                 // Names are copied straight back out: they arrived from a corpus document and are
                 // already in escaped wire form. Escaping again would invent the double-escaping
                 // quirk instead of reproducing the daemon.
-                (None, Some(id)) => body.push_str(&format!(
-                    "<{item_tag} index=\"{}\" name=\"{}\" value=\"{}\"/>{nl}",
-                    e.index, e.name, id
-                )),
+                (None, Some(id)) => {
+                    // arg and description are re-emitted when the corpus carries them: a fake that
+                    // drops attributes its own fixtures declare is lossier than the daemon it models,
+                    // and it would make those claims unverifiable by construction.
+                    let arg = e.arg.map(|a| format!(" arg=\"{a}\"")).unwrap_or_default();
+                    let desc = e
+                        .description
+                        .as_ref()
+                        .map(|d| format!(" description=\"{d}\""))
+                        .unwrap_or_default();
+                    body.push_str(&format!(
+                        "<{item_tag} index=\"{}\" name=\"{}\" value=\"{}\"{arg}{desc}/>{nl}",
+                        e.index, e.name, id
+                    ))
+                }
                 (None, None) => body.push_str(&format!(
                     "<{item_tag} index=\"{}\" name=\"{}\"/>{nl}",
                     e.index, e.name

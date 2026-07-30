@@ -7,9 +7,9 @@
     notes: Representative excerpt of the 77-entry SDM list. Encodes the verified fact that GetFilters returns the CURRENT mode's list only, that the PCM and SDM lists differ wholesale, that indices shift between modes, and that the SDM list has no leading none entry. Positions are excerpt-local.
 -->
 <GetFilters>
-<FiltersItem index="0" name="poly-sinc-short-lp" value="30" arg="0"/>
-<FiltersItem index="1" name="poly-sinc-gauss-long" value="40" arg="0"/>
-<FiltersItem index="2" name="poly-sinc-ext2" value="16" arg="1"/>
-<FiltersItem index="3" name="sinc-Lh" value="72" arg="0"/>
-<FiltersItem index="4" name="poly-sinc-xtr" value="61" arg="0"/>
+<FiltersItem index="0" name="poly-sinc-short-lp" value="30" arg="0" description="3/5 timbre"/>
+<FiltersItem index="1" name="poly-sinc-gauss-long" value="40" arg="0" description="5/5 timbre"/>
+<FiltersItem index="2" name="poly-sinc-ext2" value="16" arg="1" description="5/5 timbre"/>
+<FiltersItem index="3" name="sinc-Lh" value="72" arg="0" description="5/5 timbre"/>
+<FiltersItem index="4" name="poly-sinc-xtr" value="61" arg="0" description="5/5 timbre"/>
 </GetFilters>

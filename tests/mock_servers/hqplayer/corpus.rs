@@ -183,6 +183,11 @@ pub struct EnumEntry {
     pub enum_id: Option<i32>,
     /// `RatesItem` only: the rate in Hz.
     pub rate: Option<u32>,
+    /// `FiltersItem` flags bitfield; bit 0 is apodizing. ADR 003 requires this be diffed, so it must
+    /// survive the trip through the fake rather than being dropped on re-emission.
+    pub arg: Option<u32>,
+    /// The engine's own description string, when the document carries one. Presence is the claim.
+    pub description: Option<String>,
 }
 
 fn attr(fragment: &str, key: &str) -> Option<String> {
@@ -210,6 +215,8 @@ pub fn enum_entries(document: &str, item_tag: &str) -> Vec<EnumEntry> {
                 name: attr(item, "name").unwrap_or_default(),
                 enum_id: attr(item, "value").and_then(|v| v.parse().ok()),
                 rate: attr(item, "rate").and_then(|v| v.parse().ok()),
+                arg: attr(item, "arg").and_then(|v| v.parse().ok()),
+                description: attr(item, "description"),
             })
         })
         .collect()

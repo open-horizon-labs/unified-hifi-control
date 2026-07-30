@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use unified_hifi_control::adapters::hqplayer::{framing, HqpAdapter};
 
 use super::corpus::{self, EnumEntry};
+use super::raw;
 
 /// Whether a `Status` document actually carried its optional self-closing `metadata` child.
 ///
@@ -156,6 +157,56 @@ pub const REQUIRED_CLAIMS: [&str; 12] = [
     "matrix",
 ];
 
+/// Attributes `State` must carry. Values are instance-specific; presence is the contract.
+pub const STATE_REQUIRED: [&str; 17] = [
+    "state",
+    "mode",
+    "filter",
+    "filter1x",
+    "filterNx",
+    "shaper",
+    "rate",
+    "volume",
+    "active_mode",
+    "active_rate",
+    "invert",
+    "convolution",
+    "repeat",
+    "random",
+    "adaptive",
+    "filter_junk",
+    "matrix_profile",
+];
+
+/// Attributes `Status` must carry.
+pub const STATUS_REQUIRED: [&str; 14] = [
+    "state",
+    "track",
+    "track_id",
+    "position",
+    "length",
+    "volume",
+    "active_mode",
+    "active_filter",
+    "active_shaper",
+    "active_rate",
+    "active_bits",
+    "active_channels",
+    "samplerate",
+    "bitrate",
+];
+
+/// Attributes `VolumeRange` must carry. `step` is legitimately optional — the verified live sample
+/// omits it — so it is not required, but its presence is recorded either way.
+pub const VOLUME_RANGE_REQUIRED: [&str; 4] = ["min", "max", "enabled", "adaptive"];
+
+/// Attributes `GetInfo` must carry. `name` and `platform` are instance-specific in value but
+/// contractually present, so presence is checked and value is not.
+pub const GETINFO_REQUIRED: [&str; 5] = ["name", "product", "version", "platform", "engine"];
+
+/// Form fields the `/config` read side must expose.
+pub const CONFIG_FORM_REQUIRED: [&str; 2] = ["profile", "profile_name"];
+
 /// Claims a read-only run is allowed not to reach, with the reason recorded in the report.
 pub const ACCEPTED_LIMITS: [&str; 2] = ["inactive_mode_lists", "config_read_side_no_credentials"];
 
@@ -165,9 +216,16 @@ impl Report {
     }
 
     /// A merge-gate pass needs more than an empty divergence list: every required claim must have
-    /// actually been compared. STUB - computed for real in the GREEN commit.
+    /// actually been compared, and nothing required may be left unverified.
+    ///
+    /// This is the distinction the earlier version could not express — "clean" meant "found nothing",
+    /// which a differ that checked nothing also satisfies.
     pub fn merge_gate_pass(&self) -> bool {
-        true
+        self.divergences.is_empty()
+            && self.unverified.is_empty()
+            && REQUIRED_CLAIMS
+                .iter()
+                .all(|claim| self.checked.contains(*claim))
     }
 
     /// A human-readable summary for the operator running the gate.
@@ -342,7 +400,26 @@ impl Report {
                 // Explicitly null when unreached, so absent-and-ambiguous is not a possible state.
                 "config_profiles": self.capture.config_profiles,
                 "matrix_current_read_failed": self.capture.matrix_current_read_failed,
+                "status_metadata_child": format!("{:?}", self.capture.status_metadata_child),
+                "entry_shapes": self.capture.entry_shapes.iter().map(|(k, v)| (k.clone(), serde_json::json!({
+                    "arg": v.arg,
+                    "has_description": v.has_description,
+                }))).collect::<serde_json::Map<String, serde_json::Value>>(),
+                "config_form": self.capture.config_form.as_ref().map(|f| serde_json::json!({
+                    "field_names": f.field_names,
+                    "offers_default": f.offers_default,
+                    "named_profiles": f.named_profiles,
+                })),
+                // The evidence each shape diff actually used. Sanitised at capture time AND again
+                // here: defence in depth, so a document that reached the map by any other route still
+                // cannot carry a hidden input or token out.
+                "raw_documents": self.capture.raw_documents.iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(raw::sanitize(v))))
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
             },
+            "checked": self.checked,
+            "unverified": self.unverified,
+            "merge_gate_pass": self.merge_gate_pass(),
             "divergences": self.divergences.iter().map(|d| serde_json::json!({
                 "family": d.family,
                 "kind": format!("{:?}", d.kind),
@@ -391,6 +468,14 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
     let state = adapter.get_state().await?;
     timed("state", t.elapsed(), &mut c);
     let mut state_attrs = BTreeMap::new();
+    state_attrs.insert("state".into(), state.state.to_string());
+    state_attrs.insert("active_mode".into(), state.active_mode.to_string());
+    state_attrs.insert("active_rate".into(), state.active_rate.to_string());
+    state_attrs.insert("invert".into(), state.invert.to_string());
+    state_attrs.insert("convolution".into(), state.convolution.to_string());
+    state_attrs.insert("repeat".into(), state.repeat.to_string());
+    state_attrs.insert("random".into(), state.random.to_string());
+    state_attrs.insert("adaptive".into(), state.adaptive.to_string());
     state_attrs.insert("mode".into(), state.mode.to_string());
     state_attrs.insert("filter".into(), state.filter.to_string());
     state_attrs.insert(
@@ -413,15 +498,73 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
     let status = adapter.get_playback_status().await?;
     timed("status", t.elapsed(), &mut c);
     let mut status_attrs = BTreeMap::new();
+    status_attrs.insert("state".into(), status.state.to_string());
+    status_attrs.insert("track".into(), status.track.to_string());
+    status_attrs.insert("track_id".into(), status.track_id.clone());
+    status_attrs.insert("position".into(), status.position.to_string());
+    status_attrs.insert("length".into(), status.length.to_string());
+    status_attrs.insert("active_rate".into(), status.active_rate.to_string());
+    status_attrs.insert("active_bits".into(), status.active_bits.to_string());
+    status_attrs.insert("active_channels".into(), status.active_channels.to_string());
+    status_attrs.insert("samplerate".into(), status.samplerate.to_string());
+    status_attrs.insert("bitrate".into(), status.bitrate.to_string());
     status_attrs.insert("active_filter".into(), status.active_filter.clone());
     status_attrs.insert("active_shaper".into(), status.active_shaper.clone());
     status_attrs.insert("active_mode".into(), status.active_mode.clone());
     status_attrs.insert("volume".into(), format!("{}", status.volume_db));
     c.scalars.insert("status".into(), status_attrs);
     // A metadata child is the only way samplerate/bits reach Status, so their presence is the proxy.
-    // Deliberately left Unobserved here: presence is a raw-document fact and is filled by the raw
-    // lane in the GREEN commit. Inferring it from a value was the bug.
-    c.status_metadata_child = MetadataChild::Unobserved;
+    // Presence of the metadata child, and the filter/shaper wire-shape claims, are observed from raw
+    // documents. Read-only: the lane refuses anything that is not a query.
+    let conn = adapter.get_status().await;
+    if let Some(host) = conn.host.clone() {
+        let deadline = adapter.timeouts().await.response;
+        for (element, attrs, family) in [
+            ("Status", " subscribe=\"0\"", "status"),
+            ("GetFilters", "", "filters"),
+            ("GetShapers", "", "shapers"),
+            ("GetInfo", "", "getinfo"),
+        ] {
+            match raw::observe(&host, conn.port, element, attrs, deadline).await {
+                Ok(document) => {
+                    if element == "Status" {
+                        c.status_metadata_child = if raw::has_child(&document, "metadata") {
+                            MetadataChild::Present
+                        } else {
+                            MetadataChild::Absent
+                        };
+                    }
+                    if element == "GetFilters" || element == "GetShapers" {
+                        let item = if element == "GetFilters" {
+                            "FiltersItem"
+                        } else {
+                            "ShapersItem"
+                        };
+                        for attrs in raw::child_attrs(&document, item) {
+                            let map: BTreeMap<&str, &str> = attrs
+                                .iter()
+                                .map(|(k, v)| (k.as_str(), v.as_str()))
+                                .collect();
+                            if let Some(name) = map.get("name") {
+                                c.entry_shapes.insert(
+                                    format!("{family}/{name}"),
+                                    EntryShape {
+                                        arg: map.get("arg").and_then(|a| a.parse().ok()),
+                                        has_description: Some(map.contains_key("description")),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    // Sanitised before it is stored, so the sanitiser is not something a caller can
+                    // forget. Never carries the host it came from.
+                    c.raw_documents
+                        .insert(family.to_string(), raw::sanitize(&document));
+                }
+                Err(e) => tracing::warn!("tier-1 raw lane: {element} unobserved: {e}"),
+            }
+        }
+    }
 
     let t = Instant::now();
     let vr = adapter.get_volume_range().await?;
@@ -454,6 +597,8 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
                 name: m.name,
                 enum_id: Some(m.value),
                 rate: None,
+                arg: None,
+                description: None,
             })
             .collect(),
     );
@@ -470,6 +615,8 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
                 name: f.name,
                 enum_id: Some(f.value),
                 rate: None,
+                arg: None,
+                description: None,
             })
             .collect(),
     );
@@ -486,6 +633,8 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
                 name: s.name,
                 enum_id: Some(s.value),
                 rate: None,
+                arg: None,
+                description: None,
             })
             .collect(),
     );
@@ -502,6 +651,8 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
                 name: String::new(),
                 enum_id: None,
                 rate: Some(r.rate),
+                arg: None,
+                description: None,
             })
             .collect(),
     );
@@ -517,6 +668,8 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
                 name: j.name,
                 enum_id: Some(j.value),
                 rate: None,
+                arg: None,
+                description: None,
             })
             .collect(),
     );
@@ -533,6 +686,8 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
                 name: p.name,
                 enum_id: None,
                 rate: None,
+                arg: None,
+                description: None,
             })
             .collect(),
     );
@@ -564,6 +719,24 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
     // is recorded as not-captured rather than swallowed, because "no profiles" and "could not ask"
     // are different facts.
     if adapter.has_web_credentials().await {
+        // Read-side shape: which form fields exist and whether [default] is offered. Sanitised, so no
+        // hidden input or token can reach the artifact.
+        if let Ok(page) = adapter.fetch_config_page_raw().await {
+            let clean = raw::sanitize(&page);
+            let mut obs = ConfigFormObs {
+                offers_default: clean.contains("value=\"[default]\""),
+                ..ConfigFormObs::default()
+            };
+            for field in clean
+                .split("name=\"")
+                .skip(1)
+                .filter_map(|p| p.split('"').next())
+            {
+                obs.field_names.insert(field.to_string());
+            }
+            c.raw_documents.insert("config_form".to_string(), clean);
+            c.config_form = Some(obs);
+        }
         let t = Instant::now();
         match adapter.fetch_profiles().await {
             Ok(profiles) => {
@@ -597,6 +770,83 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
         capture: capture.clone(),
         ..Report::default()
     };
+
+    report.checked.insert("getinfo".into());
+    for key in GETINFO_REQUIRED {
+        if !capture.identity.contains_key(key) {
+            report.divergences.push(Divergence {
+                family: "getinfo".into(),
+                kind: DivergenceKind::AttributePresence,
+                detail: format!(
+                    "GetInfo is missing {key:?}; its value is instance-specific but its presence is \
+                     part of the contract"
+                ),
+            });
+        }
+    }
+
+    // Scalar shape contracts. There are no corpus fixtures for these families, so what is compared is
+    // the required attribute SET - values are instance-specific and comparing them would produce noise.
+    for (family, required) in [
+        ("state", STATE_REQUIRED.as_slice()),
+        ("status", STATUS_REQUIRED.as_slice()),
+        ("volume_range", VOLUME_RANGE_REQUIRED.as_slice()),
+    ] {
+        match capture.scalars.get(family) {
+            None => report.unverified.push(format!(
+                "{family} - not captured, so its shape was never compared"
+            )),
+            Some(observed) => {
+                report.checked.insert(family.to_string());
+                for key in required {
+                    if !observed.contains_key(*key) {
+                        report.divergences.push(Divergence {
+                            family: family.into(),
+                            kind: DivergenceKind::AttributePresence,
+                            detail: format!("{family} is missing required attribute {key:?}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // The metadata child is a structural claim; Unobserved is not a pass.
+    match capture.status_metadata_child {
+        MetadataChild::Unobserved => report.unverified.push(
+            "status_metadata_child - never observed; presence must be read from the raw document, \
+             never inferred from a value that has a legitimate zero"
+                .into(),
+        ),
+        MetadataChild::Present | MetadataChild::Absent => {
+            report.checked.insert("status_metadata_child".into());
+        }
+    }
+
+    // Filter arg flags and description presence, per ADR 003.
+    if capture
+        .entry_shapes
+        .keys()
+        .any(|k| k.starts_with("filters/"))
+    {
+        report.checked.insert("filters_arg".into());
+        // Only filters declare `arg`; shapers do not, so requiring it of them would manufacture noise.
+        for (key, shape) in &capture.entry_shapes {
+            if key.starts_with("filters/") && shape.arg.is_none() {
+                report.divergences.push(Divergence {
+                    family: "filters_arg".into(),
+                    kind: DivergenceKind::AttributePresence,
+                    detail: format!("{key} carries no arg attribute"),
+                });
+            }
+        }
+    } else {
+        report.unverified.push(
+            "filters_arg - the raw lane observed no filter shapes, so arg flags and description \
+             presence were not compared"
+                .into(),
+        );
+    }
 
     // Identity: the corpus profile claims a daemon. If we are looking at a different one, every
     // other comparison is against the wrong baseline and should be read that way.
@@ -645,6 +895,7 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
                 })
                 .collect();
 
+        report.checked.insert(stem.to_string());
         if stem == "rates" {
             diff_rates(&mut report, stem, &expected, observed);
             continue;
@@ -713,6 +964,29 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
         ));
     }
 
+    if let Some(form) = &capture.config_form {
+        report.checked.insert("config_form".into());
+        for field in CONFIG_FORM_REQUIRED {
+            if !form.field_names.contains(field) {
+                report.divergences.push(Divergence {
+                    family: "config_form".into(),
+                    kind: DivergenceKind::AttributePresence,
+                    detail: format!("the /config read side is missing form field {field:?}"),
+                });
+            }
+        }
+        if !form.offers_default {
+            report.divergences.push(Divergence {
+                family: "config_form".into(),
+                kind: DivergenceKind::AttributePresence,
+                detail: "the /config profile select does not offer the unnamed base \"[default]\"; \
+                         the named-versus-default distinction is load-bearing, since loading a NAMED \
+                         profile restarts the daemon and empties /backup/settings.zip"
+                    .into(),
+            });
+        }
+    }
+
     match &capture.config_profiles {
         None => report.not_captured.push(
             "config read side (/config profile list) — no web credentials supplied, or the request \
@@ -752,18 +1026,28 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
                 .into(),
         );
     } else if let Some((_, current)) = &capture.current_matrix_profile {
+        let (current_index, _) = capture
+            .current_matrix_profile
+            .as_ref()
+            .map(|(i, n)| (*i, n.clone()))
+            .unwrap_or((0, String::new()));
+        // The pair must match, not just the name: MatrixGetProfile reports an index too, and the right
+        // name at the wrong index is still an incoherent daemon.
         let listed = capture
             .enumerations
             .get("matrix")
-            .map(|list| list.iter().any(|e| &e.name == current))
+            .map(|list| {
+                list.iter()
+                    .any(|e| &e.name == current && e.index == current_index)
+            })
             .unwrap_or(false);
         if !listed {
             report.divergences.push(Divergence {
                 family: "matrix_current".into(),
                 kind: DivergenceKind::MissingEntry,
                 detail: format!(
-                    "MatrixGetProfile reports {current:?} as current, but it is absent from this \
-                     daemon's own MatrixListProfiles"
+                    "MatrixGetProfile reports ({current_index}, {current:?}) as current, but that \
+                     index/name pair is absent from this daemon's own MatrixListProfiles"
                 ),
             });
         }
@@ -812,6 +1096,29 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
 }
 
 fn diff_rates(report: &mut Report, stem: &str, expected: &[EnumEntry], observed: &[EnumEntry]) {
+    // Index 0 is rate 0, meaning auto/source-based. A daemon reporting otherwise breaks every
+    // Hz-to-index conversion that follows.
+    match observed.iter().find(|e| e.index == 0).and_then(|e| e.rate) {
+        Some(0) => {}
+        other => report.divergences.push(Divergence {
+            family: stem.into(),
+            kind: DivergenceKind::IndexMismatch,
+            detail: format!("index 0 must be rate 0 (auto/source-based); daemon reports {other:?}"),
+        }),
+    }
+    // Reverse pass: without it a daemon-only mapping is silently accepted.
+    for got in observed {
+        if !expected.iter().any(|w| w.index == got.index) {
+            report.divergences.push(Divergence {
+                family: stem.into(),
+                kind: DivergenceKind::MissingEntry,
+                detail: format!(
+                    "daemon has index {} -> {:?} Hz, corpus does not",
+                    got.index, got.rate
+                ),
+            });
+        }
+    }
     for want in expected {
         match observed.iter().find(|o| o.index == want.index) {
             None => report.divergences.push(Divergence {

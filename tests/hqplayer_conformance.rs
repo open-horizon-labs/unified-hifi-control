@@ -2231,6 +2231,8 @@ async fn tier1_reports_a_daemon_only_rate_mapping() {
             name: String::new(),
             enum_id: None,
             rate: Some(1_536_000),
+            arg: None,
+            description: None,
         });
     let report = tier1::diff(&mutated, VERIFIED_PROFILE);
     assert!(
@@ -2357,4 +2359,27 @@ async fn tier1_artifact_carries_the_raw_shape_observations_each_diff_used() {
          raw={raw:?} shapes={shapes:?}"
     );
     h.stop();
+}
+
+/// `fetch_config_page_raw` exists for tier-1 shape observation. Like the timeout seam, it has to be
+/// `pub` for an integration-test crate to reach it, so the constraint is a lint rather than a type.
+#[test]
+fn no_production_code_reads_the_raw_config_page() {
+    let callers: Vec<String> = walkdir::WalkDir::new("src")
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
+        .filter_map(|e| {
+            let body = std::fs::read_to_string(e.path()).ok()?;
+            body.matches(".fetch_config_page_raw(")
+                .count()
+                .gt(&0)
+                .then(|| e.path().display().to_string())
+        })
+        .collect();
+    assert!(
+        callers.is_empty(),
+        "fetch_config_page_raw is the tier-1 shape-observation seam; production should reach the \
+         persistent lane through fetch_profiles and friends. Called from {callers:?}"
+    );
 }

@@ -2377,6 +2377,20 @@ impl HqpAdapter {
         profiles
     }
 
+    /// Read the daemon's `/config` page verbatim.
+    ///
+    /// A narrow read-only seam over the existing digest path, so tier-1 verification can observe the
+    /// persistent lane's *shape* — which form fields exist, whether `[default]` is offered — rather
+    /// than only the values the profile parser happens to keep.
+    ///
+    /// The path is fixed rather than a parameter, deliberately: an arbitrary-path `GET` would be a
+    /// general-purpose escape hatch around the higher-level methods, and the narrowness this comment
+    /// claims should be enforced by the signature instead of by callers remembering it. `GET` only, so
+    /// no write route is reachable. Not an HTTP endpoint of ours and not part of any serialized payload.
+    pub async fn fetch_config_page_raw(&self) -> Result<String> {
+        self.web_request("/config", "GET", None).await
+    }
+
     /// Fetch available profiles from web UI
     pub async fn fetch_profiles(&self) -> Result<Vec<HqpProfile>> {
         if !self.has_web_credentials().await {
