@@ -1,6 +1,6 @@
 <!--
   provenance:
-    source: https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/tests/fake_control.py (device-dependent modes list) and hqptuner/lanes/livemap.py:64-66
+    source: UHC-SALVAGE-BETA-DEV.md section 4 (#322 recommendations), citing hqptuner tests/fake_control.py:107-115 and lanes/livemap.py:64-66,204-229 at dev ref 22dfe5cc. CORRECTED 2026-07-30: an earlier revision cited this path at stable 67557939, where tests/fake_control.py does not exist - it is a dev-era file. HQPTuner was not read directly for this fixture; the salvage report is the source.
     daemon: hqplayerd 6.0.4 (Opal), attached DAC without DSD capability
     status: derived-upstream
     date: 2026-07-29

@@ -20,6 +20,13 @@ pub const VERIFIED_PROFILE: &str = "hqpd-6.0.4-opal";
 /// version-regression coverage.
 pub const LEGACY_PROFILE: &str = "hqpd-5.x-legacy";
 
+/// Wholly **synthetic** profile. Not evidence, not derived from any capture, and never promotable.
+///
+/// It exists to construct one hazard shape — a stale index from one chain landing in range in the
+/// other and naming a different filter — which the Opal-derived corpus must not be padded to produce.
+/// Every filter name in it is fictional so a row cannot be copied into the evidence corpus by mistake.
+pub const SYNTHETIC_HAZARD_PROFILE: &str = "synthetic-chain-hazard";
+
 /// Provenance recorded in a fixture's leading XML comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provenance {
@@ -27,6 +34,13 @@ pub struct Provenance {
     pub daemon: String,
     pub status: String,
     pub date: String,
+    /// Whether any tier could ever promote this fixture's claims to UHC-qualified evidence.
+    ///
+    /// `tier-1` means a read-only live run can settle it. `tier-2-only` means settling it requires a
+    /// mutating run with a human present, so the read-only merge gate never can. `never-promotable`
+    /// marks a synthetic fixture, which is a constructed shape rather than an observation and must not
+    /// be promoted by anything. Absent in older fixtures, which default to `unspecified`.
+    pub tier: String,
     /// Playback state at capture: `active`, `idle`, or `unknown`.
     ///
     /// Required by the HQPTuner amendment, because every "live, verified" claim in the upstream
@@ -93,12 +107,23 @@ fn parse_provenance(raw: &str, path: &Path) -> Provenance {
             })
     };
 
+    let optional = |key: &str| -> Option<String> {
+        body.lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix(&format!("{key}:")))
+            .map(|v| v.trim().to_string())
+    };
+
     Provenance {
         source: field("source"),
         daemon: field("daemon"),
         status: field("status"),
         date: field("date"),
         playback: field("playback"),
+        // Optional, unlike the rest: most fixtures predate the distinction and `unspecified` is the
+        // honest reading for them. A synthetic fixture must say `never-promotable` explicitly, and
+        // `a_synthetic_profile_is_never_evidence` enforces that.
+        tier: optional("tier").unwrap_or_else(|| "unspecified".to_string()),
         notes: field("notes"),
     }
 }

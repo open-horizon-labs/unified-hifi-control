@@ -28,12 +28,14 @@ use std::time::Duration;
 use unified_hifi_control::adapters::hqplayer::{framing, HqpAdapter, HqpTimeouts};
 use unified_hifi_control::bus::create_bus;
 
-use mock_servers::hqplayer::corpus::{self, LEGACY_PROFILE, VERIFIED_PROFILE};
+use mock_servers::hqplayer::corpus::{
+    self, LEGACY_PROFILE, SYNTHETIC_HAZARD_PROFILE, VERIFIED_PROFILE,
+};
 use mock_servers::hqplayer::model::{
     request_attr, ActiveModeReporting, DaemonModel, DocumentStyle, LoadedChain, Metadata,
 };
 use mock_servers::hqplayer::tier1;
-use mock_servers::hqplayer::wire::{Chunking, Disruption, WirePolicy, WireServer};
+use mock_servers::hqplayer::wire::{Chunking, Disruption, Responder, WirePolicy, WireServer};
 
 // =============================================================================
 // Harness
@@ -2906,8 +2908,9 @@ fn the_sanitiser_emits_a_document_that_still_reparses() {
 //                            capability and NEVER claimed as a client red, because a production
 //                            stub added just to make one fail would be manufactured evidence
 //                            (see PR #337's disclosures of `bd87e21` and `d7f62c2`).
-//   * `regression-pin`     — already satisfied by the current design; present so a future change
-//                            cannot silently remove the property. Never claimed as a red.
+// Those two are the whole contract. A pre-existing property that is merely being pinned is still
+// classified under one of them and is described in prose as a regression pin; there is no third label,
+// and no label is ever attached to known-broken behaviour.
 //
 // Plan and classification: `.oh/issue-322-hqplayer-protocol-conformance.md`, section
 // "HQPTuner Stage 1 amendment".
@@ -3021,7 +3024,7 @@ fn the_framer_recovers_a_closed_root_whose_child_tag_never_terminates() {
 /// at the root tag's own `>`. The reference implementation needs a recovery path for these because it
 /// XML-parses whole documents; UHC does not.
 ///
-/// **Label: regression-pin.** This passed before the amendment and is not a fix. It exists so a future
+/// **Label: client-conformance** (a regression pin: it holds today, and is pinned so a future change cannot remove the property silently). This passed before the amendment and is not a fix. It exists so a future
 /// change that starts parsing children cannot silently reintroduce a poll-wedging failure.
 #[test]
 fn the_framer_already_tolerates_hostile_attribute_values_in_children() {
@@ -3171,16 +3174,21 @@ async fn the_loaded_chain_moves_under_source_while_the_configured_mode_stays_sou
     h.stop();
 }
 
-/// The fake must be **unable** to settle the `State.active_mode` versus `Status.active_mode`
-/// contradiction, which #341 owns. Before this bite both fields were derived from `mode_index`, so
-/// they agreed by construction and no fixture could state a disagreement.
+/// The fake must be **unable** to settle the independent, unresolved semantics of
+/// `State.active_mode` and `Status.active_mode`, which **#341** owns.
 ///
-/// This asserts expressibility in both directions rather than picking a winner: that is the whole
-/// point, and a test that asserted one reading would be the fake deciding.
+/// These are not in contradiction. `Status.active_mode` is *measured* to echo the configured mode
+/// under `[source]` — which is why the upstream client rejects it as a chain resolver and derives the
+/// chain from `Status.active_rate` instead. `State.active_mode` under `[source]` is simply
+/// *unmeasured*. Before this bite both fields were derived from `mode_index`, so they agreed by
+/// construction and the fake quietly answered the unmeasured half.
+///
+/// This asserts expressibility in both directions rather than picking a winner: a test that asserted
+/// one reading would be the fake deciding.
 ///
 /// **Label: model-fidelity.**
 #[tokio::test]
-async fn the_fake_does_not_decide_the_state_versus_status_active_mode_contradiction() {
+async fn the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics() {
     let h = Harness::verified().await;
     h.model.external_change(|s| {
         s.mode_index = 0; // configured `[source]`
@@ -3199,8 +3207,9 @@ async fn the_fake_does_not_decide_the_state_versus_status_active_mode_contradict
     assert_eq!(
         (state.active_mode, status.active_mode.as_str()),
         (2, "[source]"),
-        "with the two policies set apart, the documents must be able to disagree: State resolving \
-         the loaded SDM chain while Status echoes `[source]`"
+        "with the two policies set apart, the documents must be able to differ: State resolving the \
+         loaded SDM chain while Status echoes `[source]`. Neither reading is asserted as correct - \
+         Status echoing is measured, State resolving is unmeasured, and #341 owns settling it"
     );
 
     // Reading 2: both echo. Now they agree, and `[source]` resolves nothing on either side.
@@ -3291,105 +3300,138 @@ async fn set_mode_does_not_reset_the_filter_and_shaper_selections() {
 // Bite 4 — the stale-chain hazard, made expressible and in-range
 // -----------------------------------------------------------------------------
 
-/// The corpus invariant that makes the hazard a *silent misselection* rather than a rejection.
+/// The hazard shape, on the **synthetic** profile.
 ///
-/// A stale index from the other chain must land **in range** and name a **different** filter. If it
-/// landed out of range the daemon would answer `result="Error"`, the client would surface a failure,
-/// and the test would be proving the opposite of the hazard: a loud rejection is safe, a quiet wrong
-/// answer is not.
+/// A stale index from the other chain must land **in range** and name a **different** filter. Out of
+/// range would draw `result="Error"`, the client would surface a failure, and the test would prove the
+/// opposite of the hazard: a loud rejection is safe, a quiet wrong answer is not.
 ///
-/// `filters_sdm.xml` was extended from 5 to 9 entries for exactly this, reusing names and enum IDs
-/// verbatim from `filters_pcm.xml`. **No enum ID was renumbered.** Whether `GetFilters` renumbers a
-/// name's enum ID between chains is an open question recorded on #341; this fixture does not answer
-/// it and must not be read as answering it.
-///
-/// **Label: model-fidelity** (a corpus property, no client involved).
-#[test]
-fn a_stale_cross_chain_filter_index_lands_in_range_on_a_different_filter() {
-    let pcm = corpus::document(VERIFIED_PROFILE, "filters_pcm");
-    let sdm = corpus::document(VERIFIED_PROFILE, "filters_sdm");
-    let name = "poly-sinc-gauss-long";
-
-    let pcm_index = corpus::index_of(&pcm, "FiltersItem", name).expect("in the PCM list");
-    let sdm_entries = corpus::enum_entries(&sdm, "FiltersItem");
-    let at_stale_index = sdm_entries
-        .iter()
-        .find(|e| e.index == pcm_index)
-        .map(|e| e.name.as_str());
-
-    assert_eq!(
-        at_stale_index,
-        Some("poly-sinc-lp"),
-        "the PCM index of {name} ({pcm_index}) must exist in the SDM chain and name a DIFFERENT \
-         filter, or a stale-cache write would be rejected out of range instead of silently \
-         selecting the wrong filter"
-    );
-    assert_ne!(
-        corpus::index_of(&sdm, "FiltersItem", name),
-        Some(pcm_index),
-        "the same name must sit at a different index in the two chains, which is what makes a \
-         cached list from one chain wrong for the other"
-    );
-}
-
-/// Demonstrates the hazard end to end through the real client, and pins the half that belongs to
-/// #322: the fake can now put the daemon on a filter the caller never asked for, from a chain change
-/// the caller never made.
-///
-/// **Observed at this commit** (recorded, not asserted — see below):
-///
-/// ```text
-/// requested name 'poly-sinc-gauss-long'; cached PCM index 7; sent value=Some("7");
-/// client outcome ok=true; daemon now reports active_filter="poly-sinc-lp"
-/// ```
-///
-/// So the client reports **success** for a filter it did not select. That is a real, reproducible
-/// defect, and its fix is a loaded-chain observer that invalidates the enumeration cache — which is
-/// **#347's** first acceptance criterion, not this issue's. Per the maintainer decision on #322,
-/// adapter-facing expectations that need new production semantics travel with #347.
-///
-/// This test therefore asserts **only** the daemon-side outcome, and deliberately does *not* assert
-/// what the client returned. Asserting `outcome.is_ok()` would encode a known defect as expected
-/// behaviour, and asserting `is_err()` would fail until #347 lands. Neither belongs in a suite whose
-/// standing claim is that it encodes no defect as correct.
+/// This lives in `synthetic-chain-hazard`, whose every name is fictional (`SYN-*`). An earlier
+/// revision padded the Opal SDM fixture with rows copied from the PCM one, which was a new SDM claim
+/// even though no number changed. The evidence corpus and a constructed hazard are different things
+/// and now live in different places.
 ///
 /// **Label: model-fidelity.**
-#[tokio::test]
-async fn a_chain_change_under_source_can_put_the_daemon_on_an_unrequested_filter() {
-    let h = Harness::verified().await;
-    h.model.external_change(|s| {
+#[test]
+fn a_stale_cross_chain_filter_index_lands_in_range_on_a_different_filter() {
+    let pcm = corpus::document(SYNTHETIC_HAZARD_PROFILE, "filters_pcm");
+    let sdm = corpus::document(SYNTHETIC_HAZARD_PROFILE, "filters_sdm");
+    let pcm_entries = corpus::enum_entries(&pcm, "FiltersItem");
+    let sdm_entries = corpus::enum_entries(&sdm, "FiltersItem");
+
+    assert!(
+        !pcm_entries.is_empty() && pcm_entries.len() == sdm_entries.len(),
+        "both synthetic chains must be the same length, so every index resolves in both"
+    );
+    for entry in &pcm_entries {
+        let facing = sdm_entries
+            .iter()
+            .find(|e| e.index == entry.index)
+            .map(|e| e.name.as_str());
+        assert_eq!(
+            facing.is_some(),
+            true,
+            "index {} must exist in the other chain, or a stale write would be rejected out of \
+             range instead of silently selecting the wrong filter",
+            entry.index
+        );
+        assert_ne!(
+            facing,
+            Some(entry.name.as_str()),
+            "index {} must name a DIFFERENT filter in the other chain, which is what makes a cached \
+             list from one chain wrong for the other",
+            entry.index
+        );
+    }
+}
+
+/// The fake capability, exercised **without the adapter**.
+///
+/// The previous form of this expectation drove the real client through its stale cache and asserted
+/// the daemon ended on the wrong filter. That required today's broken cache behaviour to hold, so it
+/// would have failed the moment #347 correctly invalidates and re-enumerates — omitting an assertion
+/// on the adapter's return value did not make it client-independent. The observed probe is recorded on
+/// #347, where the fix lives.
+///
+/// What #322 owns is that the fake can serve a chain-relative list at all: the *same* `SetFilter`
+/// index must select a *different* filter depending only on which chain is loaded, with the configured
+/// mode untouched. That is asserted here straight through [`Responder`], so it stays green whatever
+/// #347 does to the client.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn the_same_filter_index_selects_a_different_filter_per_loaded_chain() {
+    let model = DaemonModel::with_profile(SYNTHETIC_HAZARD_PROFILE);
+    model.external_change(|s| {
         s.mode_index = 0; // configured `[source]`: the source decides the chain
         s.playback = 2;
     });
+    let index = 7;
 
-    // A surface reads pipeline status while the PCM chain is loaded. This is what populates the
-    // adapter's list cache (`get_pipeline_status` -> `refresh_lists`), and it is the path both
-    // `GET /hqplayer/pipeline` and the MCP status tool already take.
-    h.adapter
-        .get_pipeline_status()
-        .await
-        .expect("pipeline status");
+    let active_filter_after_setting = |chain: LoadedChain| -> String {
+        model.source_loads_chain(chain);
+        model
+            .respond(&format!("<SetFilter value=\"{index}\"/>"))
+            .expect("the fake answers SetFilter");
+        let status = model.respond("<Status/>").expect("the fake answers Status");
+        framing::root_open_tag(&status)
+            .and_then(|tag| {
+                let key = " active_filter=\"";
+                tag.find(key).map(|at| {
+                    tag[at + key.len()..]
+                        .split('"')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                })
+            })
+            .expect("Status carries active_filter")
+    };
 
-    // A DSD track follows a PCM one. The loaded chain changes; the configured mode does not, so
-    // nothing in the client is prompted to re-read anything.
-    h.model.source_loads_chain(LoadedChain::Sdm);
+    let in_pcm = active_filter_after_setting(LoadedChain::Pcm);
+    let in_sdm = active_filter_after_setting(LoadedChain::Sdm);
 
-    let _ = h.adapter.set_filter_nx("poly-sinc-gauss-long").await;
-
-    let status = h.adapter.get_playback_status().await.expect("Status");
-    assert_eq!(
-        status.active_filter, "poly-sinc-lp",
-        "the fixture must be able to express the hazard: a name resolved against the previous \
-         chain's list selects a different filter in the loaded chain, in range and without error. \
-         Got active_filter={:?}, which would mean the scenario is no longer constructible",
-        status.active_filter
+    assert_ne!(
+        in_pcm, in_sdm,
+        "the same index {index} must select a different filter per loaded chain, which is the whole \
+         reason a cached enumeration cannot outlive a chain change; got {in_pcm:?} both times"
     );
     assert_eq!(
-        h.model.state().mode_index,
+        model.state().mode_index,
         0,
-        "and the configured mode never moved, which is why no cache invalidation was triggered"
+        "and the configured mode never moved: a source change is not a mode change"
     );
-    h.stop();
+}
+
+/// A synthetic profile must never be mistaken for, or promoted to, evidence.
+///
+/// Guards the boundary the Codex gate drew: constructed hazard shapes and observed protocol evidence
+/// live in different profiles, and the corpus must be able to tell them apart mechanically rather
+/// than by a reader noticing a header.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn a_synthetic_profile_is_never_evidence() {
+    for fixture in corpus::all_in(SYNTHETIC_HAZARD_PROFILE) {
+        assert_eq!(
+            fixture.provenance.status, "synthetic",
+            "{}/{} must be marked synthetic",
+            SYNTHETIC_HAZARD_PROFILE, fixture.name
+        );
+        assert!(
+            !fixture.provenance.is_verified(),
+            "a synthetic fixture must never read as verified"
+        );
+        assert_eq!(
+            fixture.provenance.tier, "never-promotable",
+            "a synthetic fixture must be marked never-promotable, so no tier can lift it into evidence"
+        );
+        assert!(
+            fixture.document.contains("SYN-"),
+            "every synthetic name must be visibly fictional, so a row cannot be copied into the \
+             evidence corpus by mistake"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -3492,8 +3534,8 @@ async fn feeding_the_persistent_oversampling_id_to_the_live_lane_is_rejected() {
 ///
 /// **Provenance: derived-upstream, tier-2-only, pending #332.**
 ///
-/// **Label: regression-pin** for the client half (it passes today) and **model-fidelity** for the
-/// daemon half (the mode-conditional refusal is new fake capability).
+/// **Label: client-conformance** — the client half holds today and is pinned as a regression;
+/// the mode-conditional refusal it runs against is new fake capability.
 #[tokio::test]
 async fn a_nonzero_rate_pin_under_source_is_accepted_and_ignored() {
     let h = Harness::verified().await;
@@ -3624,7 +3666,9 @@ async fn a_device_without_dsd_omits_sdm_while_the_remaining_mode_indices_stay_in
 /// **Label: model-fidelity.**
 #[test]
 fn every_corpus_fixture_records_the_playback_state_it_was_captured_under() {
-    let allowed = ["active", "idle", "unknown"];
+    // `not-applicable` is for a synthetic fixture: it was never captured, so there is no playback
+    // state to record and `unknown` would wrongly imply an observation whose conditions were lost.
+    let allowed = ["active", "idle", "unknown", "not-applicable"];
     let mut checked = 0;
     for profile in corpus::profiles() {
         for fixture in corpus::all_in(&profile) {
@@ -3639,14 +3683,14 @@ fn every_corpus_fixture_records_the_playback_state_it_was_captured_under() {
         }
     }
     assert!(
-        checked >= 18,
+        checked >= 20,
         "the whole corpus must be covered, got {checked} fixtures"
     );
 }
 
 /// A bare `&` in an attribute value survives decoding rather than swallowing the text after it.
 ///
-/// **Label: regression-pin.** This passed before the amendment: `decode_entities`' fall-through
+/// **Label: client-conformance** (a regression pin: it holds today, and is pinned so a future change cannot remove the property silently). This passed before the amendment: `decode_entities`' fall-through
 /// already keeps a bare `&` and advances. Pinned because nothing covered it, so a future change to
 /// entity handling could have removed the property silently.
 #[test]
@@ -3770,5 +3814,77 @@ async fn a_newline_free_oversized_reply_is_refused_before_it_is_allocated() {
         .await
         .expect("the connection must be usable again after the refusal");
     assert_eq!(state.state, 0, "and it must read the daemon, not leftovers");
+    h.stop();
+}
+
+/// A **delayed** `SetMode` must not leave a chain-scoped index outside the newly loaded chain's lists.
+///
+/// This is the case the review found and the repair had no coverage for. `apply()` defers a delayed
+/// change onto the pending queue, so the setter arm's clamp runs against state the mode change has not
+/// touched yet; the real change lands later, inside `tick_pending`, where the invariant has to be
+/// re-applied. Without that, the fake reports an index its own enumeration cannot resolve — which is
+/// the one thing a conformance fake must never do, because every downstream assertion trusts it.
+///
+/// The synthetic chains are equal length, so this uses the Opal profile deliberately: its SDM excerpt
+/// is *shorter* than its PCM excerpt, which is what makes an out-of-range index reachable at all.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain() {
+    let h = Harness::verified().await;
+    let pcm_len = corpus::enum_entries(
+        &corpus::document(VERIFIED_PROFILE, "filters_pcm"),
+        "FiltersItem",
+    )
+    .len();
+    let sdm_len = corpus::enum_entries(
+        &corpus::document(VERIFIED_PROFILE, "filters_sdm"),
+        "FiltersItem",
+    )
+    .len();
+    assert!(
+        sdm_len < pcm_len,
+        "precondition: the SDM excerpt must be shorter than the PCM one, or no index can fall out of \
+         range across the change; got {sdm_len} and {pcm_len}"
+    );
+
+    // Sit on a PCM index that does not exist in the SDM chain.
+    let beyond_sdm = (pcm_len - 1) as u32;
+    h.model.external_change(|s| {
+        s.filter_1x_index = beyond_sdm;
+        s.filter_nx_index = beyond_sdm;
+    });
+
+    // The mode change is accepted now and applies two polls later.
+    h.model
+        .arm(|f| f.apply_after_polls.push(("SetMode".to_string(), 2)));
+    let _ = h.adapter.set_mode("SDM (DSD)").await;
+
+    // Poll until the deferred change has landed. Each State read ticks the pending queue.
+    for _ in 0..4 {
+        let _ = h.adapter.get_state().await;
+    }
+
+    let after = h.model.state();
+    assert_eq!(
+        after.loaded_chain,
+        LoadedChain::Sdm,
+        "precondition: the deferred mode change must actually have landed; got {after:?}"
+    );
+    assert!(
+        (after.filter_1x_index as usize) < sdm_len && (after.filter_nx_index as usize) < sdm_len,
+        "a delayed mode change must leave every chain-scoped index inside the newly loaded chain's \
+         list; SDM has {sdm_len} entries and the fake reports 1x={} Nx={}",
+        after.filter_1x_index,
+        after.filter_nx_index
+    );
+
+    // And the fake's own enumeration must be able to resolve what it reports.
+    let status = h.adapter.get_playback_status().await.expect("Status");
+    assert!(
+        !status.active_filter.is_empty(),
+        "an index the enumeration cannot resolve renders as an empty active_filter, which is how a \
+         self-inconsistent fake leaks into every assertion that trusts it"
+    );
     h.stop();
 }

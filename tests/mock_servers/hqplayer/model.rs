@@ -119,27 +119,36 @@ pub enum LoadedChain {
 
 /// How a renderer reports `active_mode`.
 ///
-/// `State.active_mode` and `Status.active_mode` are the subject of a live contradiction in UHC's own
-/// evidence base, and **#341 owns resolving it**:
+/// `State.active_mode` and `Status.active_mode` have **independent, unresolved semantics** in UHC's
+/// evidence base. **#341 owns settling them.** What is actually known:
 ///
-/// * `docs/hqplayer-protocol-reference.md` warns that `Status.active_mode` may report `[source]` even
-///   while DSD is being output, and says to trust `State`'s numeric `active_mode`.
-/// * The HQPTuner audit *relies* on `Status.active_mode` as its chain resolver, and separately
-///   verified (2026-07-29, mid-playback) that under `[source]` it echoes `"[source]"`.
+/// * `Status.active_mode` **does not resolve** under `[source]`: it echoes the configured mode,
+///   verified upstream on hqplayerd 6.0.4, 2026-07-29, mid-playback. The upstream client therefore
+///   *rejects* that field as a chain resolver and falls back to the `Status.active_rate` family
+///   instead (`livemap._chain_from_status`). An earlier upstream revision did build a fallback on
+///   `active_mode` and it was replaced precisely because it was wrong.
+/// * `docs/hqplayer-protocol-reference.md` warns that `Status.active_mode` may read `[source]` while
+///   DSD is being output, and says to trust `State`'s numeric `active_mode` instead. **No capture in
+///   UHC's evidence base shows what `State.active_mode` reports under `[source]`.**
 ///
-/// Both cannot be fully right. Before this amendment the model derived both fields from
-/// `mode_index`, so the fake agreed with itself by construction and quietly settled a question the
-/// project had agreed to leave open. Making the reporting a **per-profile policy** means a fixture
-/// states which behaviour it claims, and a divergence between the two sources becomes something a
-/// test can express rather than something the fake has ruled out.
+/// So the two sources are not in contradiction and it is not the case that "both cannot be right":
+/// one is measured to echo, and the other is simply **unmeasured**. An earlier revision of this
+/// comment described a contradiction, which came from propagating a superseded reading out of the
+/// stable-branch salvage report; the beta/dev delta had already corrected it.
+///
+/// Before this amendment the model derived both fields from `mode_index`, so the fake agreed with
+/// itself by construction and quietly answered the unmeasured half. Making the reporting a
+/// **per-profile policy** means a fixture states which behaviour it claims, and a divergence between
+/// the two fields becomes something a test can express rather than something the fake has ruled out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveModeReporting {
     /// Echo the **configured** mode. Under `[source]` this reports `[source]` and resolves nothing.
-    /// Verified upstream for `Status.active_mode`: hqplayerd 6.0.4, 2026-07-29, playback active.
+    /// **Measured** for `Status.active_mode`: hqplayerd 6.0.4, 2026-07-29, playback active.
     EchoesConfiguredMode,
     /// Resolve to the **loaded** chain's family — what a caller usually wants, and what
-    /// `docs/hqplayer-protocol-reference.md` claims of `State.active_mode`. **Unverified** for either
-    /// field: no capture in UHC's evidence base shows a resolving `active_mode` under `[source]`.
+    /// `docs/hqplayer-protocol-reference.md` claims of `State.active_mode`. **Unmeasured** for either
+    /// field. Note that a client wanting the loaded chain under `[source]` should derive it from
+    /// `Status.active_rate`, as the upstream client does, rather than expect this from `active_mode`.
     ResolvesLoadedChain,
 }
 
