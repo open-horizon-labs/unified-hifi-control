@@ -2383,3 +2383,298 @@ fn no_production_code_reads_the_raw_config_page() {
          persistent lane through fetch_profiles and friends. Called from {callers:?}"
     );
 }
+
+// =============================================================================
+// Tier-1 acceptance pass 4: the raw lane's own safety and fidelity
+// =============================================================================
+
+/// The lane guarded its element name against a mutating command and then interpolated a free-form
+/// attribute string straight into the request, so read-only rested on caller discipline rather than on
+/// the type. A closed request type removes the injection surface instead of policing it.
+#[test]
+fn the_raw_lane_cannot_express_a_mutating_request() {
+    use mock_servers::hqplayer::raw::Query;
+    let rendered: Vec<String> = [
+        Query::GetInfo,
+        Query::Status,
+        Query::State,
+        Query::VolumeRange,
+        Query::GetModes,
+        Query::GetFilters,
+        Query::GetShapers,
+        Query::GetRates,
+        Query::GetJunkFilters,
+        Query::MatrixListProfiles,
+        Query::MatrixGetProfile,
+    ]
+    .into_iter()
+    .map(|q| q.request())
+    .collect();
+
+    let mutating = [
+        "Set", "Volume", "Play", "Pause", "Stop", "Next", "Previous", "Seek", "Reset",
+    ];
+    let offenders: Vec<&String> = rendered
+        .iter()
+        .filter(|r| {
+            // Exactly one element, and it is not a command. Two '<' means something was appended.
+            r.matches('<').count() != 2
+                || mutating.iter().any(|m| {
+                    r.split_once(char::is_whitespace)
+                        .map(|(head, _)| head.contains(m))
+                        .unwrap_or_else(|| r.contains(m))
+                })
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "every raw query must render to exactly one query element with no room for an appended \
+         command; offenders={offenders:?} all={rendered:?}"
+    );
+}
+
+#[test]
+fn the_raw_lane_query_set_covers_every_read_only_family() {
+    use mock_servers::hqplayer::raw::Query;
+    let elements: Vec<&str> = [
+        Query::GetInfo,
+        Query::State,
+        Query::Status,
+        Query::VolumeRange,
+        Query::GetModes,
+        Query::GetFilters,
+        Query::GetShapers,
+        Query::GetRates,
+        Query::GetJunkFilters,
+        Query::MatrixListProfiles,
+        Query::MatrixGetProfile,
+    ]
+    .into_iter()
+    .map(|q| q.element())
+    .collect();
+    let missing: Vec<&str> = [
+        "GetInfo",
+        "State",
+        "Status",
+        "VolumeRange",
+        "GetModes",
+        "GetFilters",
+        "GetShapers",
+        "GetRates",
+        "GetJunkFilters",
+        "MatrixListProfiles",
+        "MatrixGetProfile",
+    ]
+    .into_iter()
+    .filter(|e| !elements.contains(e))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "the raw lane must be able to observe every read-only family the ADR names; missing {missing:?}"
+    );
+}
+
+/// Naming a reply root by assuming it equals the request element turns any family where they differ
+/// into a silent timeout. The mapping has to be explicit and asserted.
+#[test]
+fn the_raw_lane_states_the_reply_root_for_every_query() {
+    use mock_servers::hqplayer::raw::Query;
+    let pairs: Vec<(&str, &str)> = [
+        Query::GetInfo,
+        Query::State,
+        Query::Status,
+        Query::VolumeRange,
+        Query::GetModes,
+        Query::GetFilters,
+        Query::GetShapers,
+        Query::GetRates,
+        Query::GetJunkFilters,
+        Query::MatrixListProfiles,
+        Query::MatrixGetProfile,
+    ]
+    .into_iter()
+    .map(|q| (q.element(), q.reply_element()))
+    .collect();
+    let unstated: Vec<&(&str, &str)> = pairs
+        .iter()
+        .filter(|(el, reply)| *el == "STUB" || *reply == "STUB" || reply.is_empty())
+        .collect();
+    assert!(
+        unstated.is_empty(),
+        "each query must state the element the daemon actually answers with, so a naming difference \
+         is a comparison rather than a hang; unstated={unstated:?}"
+    );
+}
+
+/// Legal XML the daemon may send and this parser previously dropped on the floor.
+#[test]
+fn the_raw_attribute_parser_handles_legal_whitespace_and_both_quote_styles() {
+    use mock_servers::hqplayer::raw::root_attrs;
+    let cases = [
+        ("<X index=\"0\" name=\"none\"/>", "plain double quotes"),
+        ("<X index = \"0\" name = \"none\"/>", "whitespace around ="),
+        ("<X index='0' name='none'/>", "single quotes"),
+        ("<X index='0' name=\"none\"/>", "mixed quote styles"),
+        ("<X\n  index=\"0\"\n  name=\"none\"/>", "newline separated"),
+    ];
+    let failures: Vec<&str> = cases
+        .iter()
+        .filter(|(doc, _)| {
+            {
+                let attrs = root_attrs(doc);
+                attrs.iter().any(|(k, v)| k == "index" && v == "0")
+                    && attrs.iter().any(|(k, v)| k == "name" && v == "none")
+            }
+            .eq(&false)
+        })
+        .map(|(_, label)| *label)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "under-observing a legal document is worse than failing loudly, because the diff then reports \
+         a false absence. Failed on: {failures:?}"
+    );
+}
+
+/// Tag-level redaction left the secret between the tags. `<password>SEKRET</password>` became
+/// `<!-- redacted -->SEKRET<!-- redacted -->`.
+#[test]
+fn the_config_evidence_projection_cannot_leak_sensitive_element_text() {
+    use mock_servers::hqplayer::tier1;
+    let hostile = concat!(
+        "<html><form method=\"post\" action=\"/config\">",
+        "<select name=\"profile\"><option value=\"[default]\">[default]</option>",
+        "<option value=\"Speakers\">Living room</option></select>",
+        "<input type=\"text\" name=\"profile_name\" value=\"\"/>",
+        "<input type='hidden' name='csrf' value='S3CR3T'/>",
+        "<password>SEKRET</password>",
+        "<token>tok-abcdef</token>",
+        "<div>Authorization: Digest cnonce=DEADBEEF</div>",
+        "</form></html>"
+    );
+    let obs = tier1::project_config_form(hostile);
+    let serialized = serde_json::to_string(&serde_json::json!({
+        "field_names": obs.field_names,
+        "offers_default": obs.offers_default,
+        "named_profiles": obs.named_profiles,
+    }))
+    .expect("serialise");
+
+    let leaked: Vec<&str> = [
+        "SEKRET",
+        "S3CR3T",
+        "tok-abcdef",
+        "DEADBEEF",
+        "csrf",
+        "password",
+        "token",
+        "Authorization",
+    ]
+    .into_iter()
+    .filter(|needle| serialized.to_lowercase().contains(&needle.to_lowercase()))
+    .collect();
+    assert!(
+        leaked.is_empty(),
+        "an allowlisted projection must carry only the field names, the [default] flag and the named \
+         profiles - never element text, hidden inputs or auth material. Leaked {leaked:?} in \
+         {serialized}"
+    );
+}
+
+#[test]
+fn the_config_evidence_projection_still_observes_the_read_side_contract() {
+    use mock_servers::hqplayer::tier1;
+    let page = corpus::document(VERIFIED_PROFILE, "config_profile_form");
+    let obs = tier1::project_config_form(&page);
+    assert!(
+        obs.field_names.contains("profile")
+            && obs.field_names.contains("profile_name")
+            && obs.offers_default
+            && obs
+                .named_profiles
+                .iter()
+                .any(|(v, t)| v == "Speakers" && !t.is_empty()),
+        "the projection must still see the field names, the [default] option and each named profile's \
+         value AND title, read from the form rather than reconstructed. Got {obs:?}"
+    );
+}
+
+/// The claim set has to be a faithful rendering of ADR 003's rows, or a family can be dropped from the
+/// spec's coverage without any test noticing.
+#[test]
+fn required_claims_faithfully_renders_every_adr_003_row() {
+    use mock_servers::hqplayer::tier1;
+    let missing: Vec<&str> = tier1::ADR_CLAIM_ROWS
+        .into_iter()
+        .filter(|row| !tier1::REQUIRED_CLAIMS.contains(row))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "ADR 003 names these claims and REQUIRED_CLAIMS omits them, so a run can pass without \
+         comparing them: {missing:?}"
+    );
+}
+
+/// Without credentials the config lane is a declared accepted limit; with them it is a required claim.
+/// Collapsing those two makes an absent credential look like a satisfied contract.
+#[tokio::test]
+async fn tier1_treats_the_config_lane_as_an_accepted_limit_only_without_credentials() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let no_creds = tier1::diff(&capture, VERIFIED_PROFILE);
+
+    let mut with_form = capture.clone();
+    with_form.config_form = None;
+    with_form.config_profiles = Some(vec![("Speakers".to_string(), "Living room".to_string())]);
+    let creds_but_no_form = tier1::diff(&with_form, VERIFIED_PROFILE);
+
+    assert!(
+        no_creds
+            .not_captured
+            .iter()
+            .any(|n| n.contains("config read side"))
+            && !no_creds
+                .unverified
+                .iter()
+                .any(|u| u.contains("config_form"))
+            && creds_but_no_form
+                .unverified
+                .iter()
+                .any(|u| u.contains("config_form")),
+        "no credentials is an accepted limit; credentials present with no form observation is an \
+         unverified required claim. without={:?} with={:?}",
+        no_creds.unverified,
+        creds_but_no_form.unverified
+    );
+    h.stop();
+}
+
+/// Evidence must come off the wire through the raw lane, not be rebuilt from parsed values afterwards.
+/// The fake speaks the native protocol, so every native family can and must be observed that way.
+#[tokio::test]
+async fn tier1_observes_every_native_family_through_the_raw_lane() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let missing: Vec<&str> = [
+        "getinfo",
+        "state",
+        "status",
+        "volume_range",
+        "modes",
+        "filters",
+        "shapers",
+        "rates",
+        "junkfilters",
+        "matrix",
+        "matrix_current",
+    ]
+    .into_iter()
+    .filter(|f| !capture.raw_documents.contains_key(*f))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "every native family's evidence must be a document the raw lane read off the socket, not a \
+         reconstruction after semantic parsing; missing raw evidence for {missing:?}"
+    );
+    h.stop();
+}

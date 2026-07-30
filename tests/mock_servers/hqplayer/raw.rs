@@ -33,6 +33,46 @@ pub const READ_ONLY_QUERIES: [&str; 8] = [
     "GetRates",
 ];
 
+/// A closed set of read-only requests this lane can express.
+///
+/// Deliberately not a free-form attribute string: with `attrs: &str` interpolated into the request, a
+/// caller could close the element and append anything - `/><Volume value="0"` - and the read-only
+/// guarantee would rest on caller discipline rather than on the type. Every variant here renders to a
+/// query and there is no variant that can render a mutating command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Query {
+    GetInfo,
+    /// One-shot status. `subscribe` is fixed to 0: push mode is not something this lane may enable.
+    Status,
+    State,
+    VolumeRange,
+    GetModes,
+    GetFilters,
+    GetShapers,
+    GetRates,
+    GetJunkFilters,
+    MatrixListProfiles,
+    MatrixGetProfile,
+}
+
+impl Query {
+    /// The request element name.
+    pub fn element(self) -> &'static str {
+        "STUB"
+    }
+
+    /// The element name the daemon answers with. Usually the same, but not guaranteed for every
+    /// family, and assuming it silently turns a naming difference into a timeout.
+    pub fn reply_element(self) -> &'static str {
+        "STUB"
+    }
+
+    /// The full request document. No caller-supplied text reaches it.
+    pub fn request(self) -> String {
+        String::new()
+    }
+}
+
 /// Read one raw reply document for a query element.
 ///
 /// `element` must name a query; anything else is refused rather than sent, so the read-only guarantee

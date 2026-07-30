@@ -55,9 +55,39 @@ pub struct ConfigFormObs {
     pub field_names: BTreeSet<String>,
     /// Whether the unnamed base `[default]` option is offered.
     pub offers_default: bool,
-    /// `(value, title)` for every named profile. Title was previously discarded.
+    /// `(value, title)` for every named profile, read from the form itself rather than reconstructed
+    /// from the semantic profile parser.
     pub named_profiles: Vec<(String, String)>,
 }
+
+/// Project the `/config` page into an allowlist of observable facts.
+///
+/// An allowlisted projection rather than stored HTML: tag-level redaction left secrets in the element
+/// text between the tags, and no amount of pattern-matching on a whole page is as safe as never keeping
+/// the page. STUB - implemented in the GREEN commit.
+pub fn project_config_form(_page: &str) -> ConfigFormObs {
+    ConfigFormObs::default()
+}
+
+/// Claims REQUIRED_CLAIMS must contain, kept beside the ADR rows they render so the two cannot drift
+/// silently. STUB - the real list is asserted in the GREEN commit.
+pub const ADR_CLAIM_ROWS: [&str; 15] = [
+    "getinfo",
+    "state",
+    "status",
+    "status_metadata_child",
+    "volume_range",
+    "modes",
+    "filters",
+    "filters_arg",
+    "filters_description",
+    "shapers",
+    "shapers_description",
+    "rates",
+    "junkfilters",
+    "matrix",
+    "config_form",
+];
 
 /// What the daemon said, in the shape the corpus can be compared against.
 #[derive(Debug, Clone, Default)]
