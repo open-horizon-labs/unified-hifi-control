@@ -320,9 +320,9 @@ pub mod framing {
             // Regions where a closing-tag literal is content, not markup. Skipping them wholesale is
             // what stops `<!-- </Status> -->` being read as a frame boundary — which would let a
             // *truncated* document pass as complete, the one failure this whole function exists to
-            // avoid. Quoting alone does not cover these: neither form is quoted.
+            // avoid. Quoting alone does not cover these: none of them is quoted.
             if quote.is_none() {
-                if let Some(skip) = comment_or_cdata_len(&buf[i..]) {
+                if let Some(skip) = non_markup_region_len(&buf[i..]) {
                     i += skip;
                     continue;
                 }
@@ -344,18 +344,44 @@ pub mod framing {
         None
     }
 
-    /// Length of a comment or CDATA section starting at `rest`, if one does.
+    /// Length of a region starting at `rest` in which `<` is **not** markup, if one starts there.
     ///
-    /// An unterminated comment or CDATA consumes the remainder: there is no boundary inside something
-    /// that has not ended, and treating its contents as markup is exactly the mistake this prevents.
-    fn comment_or_cdata_len(rest: &str) -> Option<usize> {
-        for (open, close) in [("<!--", "-->"), ("<![CDATA[", "]]>")] {
+    /// This list is the whole point of the function, and it is **closed rather than open-ended**: XML
+    /// defines exactly four places a `<` can appear without opening a tag — a quoted attribute value
+    /// (handled by the caller's quote tracking), a comment, a CDATA section, and a processing
+    /// instruction. Declarations beginning `<!` that are neither comment nor CDATA — in practice a
+    /// `DOCTYPE`, which is only legal in the prologue and so already malformed here — are skipped to
+    /// their closing `>` conservatively, for the same reason.
+    ///
+    /// It was worth enumerating rather than extending one case at a time. Three of these were found
+    /// one at a time by probing, each after the previous was called complete; the fourth was found by
+    /// asking what the *set* is instead of what the next example might be. Note that
+    /// [`skip_prologue`] already knew this vocabulary for the prologue — the same knowledge simply had
+    /// not been applied mid-document.
+    ///
+    /// An unterminated region consumes the remainder: there is no boundary inside something that has
+    /// not ended, and treating its contents as markup is exactly the mistake this prevents.
+    fn non_markup_region_len(rest: &str) -> Option<usize> {
+        for (open, close) in [
+            ("<!--", "-->"),
+            ("<![CDATA[", "]]>"),
+            // Processing instruction. Must be tried before the bare `<!` fallback below, and after
+            // the two longer `<!` forms above, so the most specific prefix wins.
+            ("<?", "?>"),
+        ] {
             if let Some(body) = rest.strip_prefix(open) {
                 return Some(match body.find(close) {
                     Some(at) => open.len() + at + close.len(),
                     None => rest.len(),
                 });
             }
+        }
+        // Any other declaration: skip to its closing `>`.
+        if rest.starts_with("<!") {
+            return Some(match rest.find('>') {
+                Some(at) => at + 1,
+                None => rest.len(),
+            });
         }
         None
     }

@@ -3799,10 +3799,18 @@ fn a_closed_malformed_root_is_recovered_even_with_a_coalesced_push_frame() {
          of which regions are data"
     );
 
-    // A closing-tag literal inside a comment or a CDATA section is content, not markup. Quoting
-    // alone does not cover these, since neither form is quoted, and taking one for a boundary would
-    // let a TRUNCATED document pass as complete — the one failure recovery must never produce.
-    for (what, open, close) in [("a comment", "<!--", "-->"), ("CDATA", "<![CDATA[", "]]>")] {
+    // A closing-tag literal is content, not markup, in every region XML says so — and that set is
+    // CLOSED, not open-ended: a quoted attribute value (above), a comment, a CDATA section, and a
+    // processing instruction. Taking any of them for a boundary would let a TRUNCATED document pass
+    // as complete, the one failure recovery must never produce.
+    //
+    // Enumerated deliberately. Three of these were found one at a time by probing, each after the
+    // previous was called complete; the fourth came from asking what the whole set is.
+    for (what, open, close) in [
+        ("a comment", "<!--", "-->"),
+        ("CDATA", "<![CDATA[", "]]>"),
+        ("a processing instruction", "<?pi", "?>"),
+    ] {
         assert_eq!(
             framing::classify(&format!("<Status a=\"1\">{open} </Status> {close}")),
             framing::Framing::Incomplete,
@@ -3823,6 +3831,14 @@ fn a_closed_malformed_root_is_recovered_even_with_a_coalesced_push_frame() {
              that has not ended"
         );
     }
+
+    // A declaration that is neither comment nor CDATA — a DOCTYPE is only legal in the prologue, so
+    // one here is already malformed — is skipped to its closing `>` for the same reason.
+    assert_eq!(
+        framing::classify("<Status a=\"1\"><!DOCTYPE x [ </Status> ]>"),
+        framing::Framing::Incomplete,
+        "a closing tag inside a declaration must not end the frame"
+    );
 }
 
 /// A **newline-free** oversized reply. The cap must be a bound on what is *allocated*, not merely on
