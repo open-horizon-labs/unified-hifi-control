@@ -1498,6 +1498,14 @@ impl HqpAdapter {
         Ok(shapers)
     }
 
+    /// Get the 20 kHz "junk" filter list.
+    ///
+    /// `State.filter_junk` is an int index into this list, not a boolean. The wire element is
+    /// `GetJunkFilters` (the CLI advertises `--set-20kfilter` but only accepts `--set-junkfilter`).
+    pub async fn get_junk_filters(&self) -> Result<Vec<ListItem>> {
+        Ok(Vec::new()) // STUB - queried for real in the GREEN commit.
+    }
+
     /// Get available sample rates
     pub async fn get_rates(&self) -> Result<Vec<RateItem>> {
         let xml = Self::build_request("GetRates", &[]);

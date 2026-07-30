@@ -42,6 +42,11 @@ pub struct Capture {
     pub latencies: BTreeMap<String, Duration>,
     /// Unsolicited documents the client skipped during the capture.
     pub unsolicited_skipped: u32,
+    /// The matrix profile the daemon reports as current, read-only via `MatrixGetProfile`.
+    pub current_matrix_profile: Option<(u32, String)>,
+    /// The whole-command deadline in force during the capture, so delivery times can be judged
+    /// against the budget that actually applied rather than against a remembered default.
+    pub response_deadline: Duration,
 }
 
 /// One way the daemon and the corpus disagree.
@@ -74,6 +79,11 @@ pub struct Report {
     pub capture: Capture,
     /// Families the run could not reach, with the reason. Honest partial coverage.
     pub not_captured: Vec<String>,
+    /// Per-family verdict: did this family deliver inside the configured whole-command deadline?
+    /// Latency on its own does not answer the question the deadline poses.
+    pub within_deadline: BTreeMap<String, bool>,
+    /// True only when every captured family delivered inside the deadline.
+    pub overall_within_deadline: bool,
 }
 
 impl Report {
@@ -148,12 +158,27 @@ impl Report {
     }
 }
 
+/// Stable identifier for the machine-readable artifact. Bump the version when the shape changes.
+pub const ARTIFACT_SCHEMA: &str = "uhc-hqp-tier1/v1";
+
+impl Report {
+    /// Machine-readable artifact for CI to store and later runs to compare against.
+    ///
+    /// Deliberately carries **no host, user, password or any other connection secret** — only what
+    /// the daemon said about itself and how the corpus compares. A verification artifact that leaks
+    /// credentials is worse than no artifact.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({}) // STUB - built for real in the GREEN commit.
+    }
+}
+
 /// Families the corpus holds as enumerations, paired with their item tag.
-const ENUM_FAMILIES: [(&str, &str, &str); 4] = [
+const ENUM_FAMILIES: [(&str, &str, &str); 5] = [
     ("modes", "GetModes", "ModesItem"),
     ("filters", "GetFilters", "FiltersItem"),
     ("shapers", "GetShapers", "ShapersItem"),
     ("rates", "GetRates", "RatesItem"),
+    ("junkfilters", "GetJunkFilters", "JunkFiltersItem"),
 ];
 
 /// Read every family this tier is allowed to touch.

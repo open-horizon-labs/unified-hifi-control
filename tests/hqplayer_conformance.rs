@@ -1626,3 +1626,116 @@ async fn tier1_records_the_config_read_side_as_unreached_without_credentials() {
     );
     h.stop();
 }
+
+/// `State.filter_junk` is an int index into `GetJunkFilters`, and the corpus carries that fixture, so
+/// a tier-1 run that never asks for the list leaves the one family whose *type* the client previously
+/// got wrong entirely unverified.
+#[tokio::test]
+async fn tier1_captures_and_diffs_the_junk_filter_list() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let expected = corpus::enum_entries(
+        &corpus::document(VERIFIED_PROFILE, "junkfilters"),
+        "JunkFiltersItem",
+    );
+    assert_eq!(
+        capture
+            .enumerations
+            .get("junkfilters")
+            .map(|e| e.len())
+            .unwrap_or(0),
+        expected.len(),
+        "the junk-filter list must be captured so it can be diffed; corpus has {} entries",
+        expected.len()
+    );
+    h.stop();
+}
+
+/// `MatrixGetProfile` is read-only and reports which profile is current. Capturing the list without
+/// the current selection leaves the shape of that reply unverified.
+#[tokio::test]
+async fn tier1_captures_the_current_matrix_profile_read_only() {
+    let h = Harness::verified().await;
+    h.model
+        .external_change(|s| s.matrix_profile = "Speakers".to_string());
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    assert_eq!(
+        capture
+            .current_matrix_profile
+            .as_ref()
+            .map(|(_, name)| name.as_str()),
+        Some("Speakers"),
+        "the current matrix profile must be captured via MatrixGetProfile; got {:?}",
+        capture.current_matrix_profile
+    );
+    h.stop();
+}
+
+/// A human-readable render is for the operator in the room. CI needs something it can store and a
+/// later run can diff against, and it must carry a schema version so that comparison stays meaningful.
+#[tokio::test]
+async fn tier1_emits_a_versioned_machine_readable_artifact() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let json = tier1::diff(&capture, VERIFIED_PROFILE).to_json();
+    assert_eq!(
+        (
+            json.get("schema").and_then(|v| v.as_str()),
+            json.get("daemon").is_some(),
+            json.get("families").and_then(|v| v.as_array()).is_some(),
+            json.get("divergences").and_then(|v| v.as_array()).is_some(),
+        ),
+        (Some(tier1::ARTIFACT_SCHEMA), true, true, true),
+        "the artifact needs a stable schema id and the daemon/families/divergences sections; got {json}"
+    );
+    h.stop();
+}
+
+/// A verification artifact that leaks the credentials used to obtain it is worse than none.
+#[tokio::test]
+async fn tier1_artifact_never_contains_connection_secrets() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let text = tier1::diff(&capture, VERIFIED_PROFILE)
+        .to_json()
+        .to_string();
+    let leaked: Vec<&str> = [
+        "127.0.0.1",
+        "password",
+        "passwd",
+        "secret",
+        "digest",
+        "127.",
+    ]
+    .into_iter()
+    .filter(|needle| text.to_lowercase().contains(&needle.to_lowercase()))
+    .collect();
+    assert!(
+        leaked.is_empty(),
+        "the artifact must carry no host or credential material; found {leaked:?} in {text}"
+    );
+    h.stop();
+}
+
+/// Delivery time on its own does not answer the question the deadline poses. The report has to record
+/// the budget that actually applied and say, per family and overall, whether it was met — that is the
+/// evidence `HqpTimeouts::response` gets validated from.
+#[tokio::test]
+async fn tier1_reports_a_within_deadline_verdict_against_the_configured_budget() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+    assert_eq!(
+        (
+            capture.response_deadline,
+            report.within_deadline.len() == capture.latencies.len(),
+            report.overall_within_deadline,
+        ),
+        (fast_timeouts().response, true, true),
+        "the report must carry the configured deadline, a verdict per captured family, and an \
+         overall verdict. deadline={:?} verdicts={:?}",
+        capture.response_deadline,
+        report.within_deadline
+    );
+    h.stop();
+}
