@@ -3593,6 +3593,31 @@ fn a_synthetic_profile_is_never_evidence() {
     }
 }
 
+/// `corpus::carries` is extension-aware, not `.xml`-only (CodeRabbit review 4823413965, finding 4).
+///
+/// The stateful model's fixture lookup used to hardcode `{profile}/{stem}.xml` to decide whether a
+/// profile carried a document; a fixture the profile carries only as `.html` was therefore missed and
+/// the lookup silently fell back to the verified profile. `carries` centralises the extension/root
+/// policy `load` already owns, and this pins that it honours both extensions so the hardcoded `.xml`
+/// cannot creep back.
+///
+/// **Label: model-fidelity.**
+#[test]
+fn corpus_carries_is_extension_aware_not_xml_only() {
+    assert!(
+        corpus::carries("hqpd-6.0.4-opal", "modes"),
+        "modes is present as .xml"
+    );
+    assert!(
+        corpus::carries("hqpd-6.0.4-opal", "config_profile_form"),
+        "config_profile_form is present as .html — a .xml-only check would miss it"
+    );
+    assert!(
+        !corpus::carries("hqpd-6.0.4-opal", "no_such_fixture_stem"),
+        "a stem the profile does not carry must be false"
+    );
+}
+
 /// The `tier` vocabulary is closed (CodeRabbit review 4816484338).
 ///
 /// `tier` answers "which kind of run could promote this fixture's claims to evidence", and only one

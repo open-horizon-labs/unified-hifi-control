@@ -206,8 +206,9 @@ hardware does not verify them.
 
 ### Tier 1 — read-only live verification (the merge gate)
 
-Safe against any daemon, including someone's listening room. Extend the opt-in mode to **capture**
-and **diff against the corpus**:
+Safe against any daemon, including someone's listening room. The opt-in mode **captures** every
+read-only family and **diffs it against the corpus** (implemented as of stage 3 —
+`tier1_live_read_only_verification_when_opted_in`):
 
 | Family | What the diff must compare |
 |---|---|

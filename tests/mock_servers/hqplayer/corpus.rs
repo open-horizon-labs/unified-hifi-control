@@ -209,6 +209,20 @@ pub fn document(profile: &str, stem: &str) -> String {
     load(profile, stem).document
 }
 
+/// Whether `profile` carries a fixture with this stem, tested across the same extensions [`load`]
+/// accepts (`.xml` **and** `.html`) and rooted the same way.
+///
+/// Callers that decide "does this profile carry this document, or should I fall back?" must not
+/// re-encode the extension/root policy: hardcoding `{profile}/{stem}.xml` misses an `.html` fixture
+/// the profile does carry and silently routes the caller to a fallback, which is a divergence between
+/// two copies of the same rule waiting to happen. Keeping the check here means there is one policy.
+pub fn carries(profile: &str, stem: &str) -> bool {
+    let dir = fixtures_root().join(profile);
+    EXTENSIONS
+        .iter()
+        .any(|ext| dir.join(format!("{stem}.{ext}")).exists())
+}
+
 /// Every fixture in a version profile, sorted by file stem. Used to assert corpus-wide invariants.
 pub fn all_in(profile: &str) -> Vec<Fixture> {
     let dir = fixtures_root().join(profile);

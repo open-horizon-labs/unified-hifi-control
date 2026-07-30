@@ -631,9 +631,11 @@ const MAX_UNSOLICITED_BACKLOG: u32 = 256;
 /// for the same reason as its sibling — it is protection, not policy, and nothing should tune it.
 /// It matches the ceiling the reference implementation independently chose.
 ///
-/// Checked after appending a read, so the true peak is this plus one line. That is deliberate — a
-/// mid-line check would need the reader to hand back a partial line — and it is stated because
-/// "4 MiB" would otherwise read as a hard bound on the allocation rather than on the accumulation.
+/// Checked **before** each append, against `already_held + chunk_len`, so the accumulation never
+/// exceeds this ceiling (see the read loop in `send_command_inner`). An earlier line-based reader
+/// checked *after* appending a whole line, which put the true peak one line above the ceiling; that
+/// is no longer how framing reads — it accumulates fixed-size [`RESPONSE_READ_CHUNK`] chunks and
+/// rejects the connection before a chunk that would breach the ceiling is ever appended.
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Size of one socket read while accumulating a reply.

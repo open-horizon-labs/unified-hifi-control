@@ -282,9 +282,11 @@ impl Enumerations {
     fn load(profile: &str) -> Self {
         // A non-verified profile is deliberately partial. Fall back to the verified corpus for
         // documents it does not carry rather than inventing shapes for a version nobody observed.
+        // Whether the profile carries the document is corpus's policy, not ours: `carries` checks the
+        // same extensions and root `load` uses, so a `.html` fixture is not missed by a hardcoded
+        // `.xml` and routed to the fallback.
         let pick = |stem: &str| -> String {
-            let path = format!("tests/fixtures/hqplayer/{profile}/{stem}.xml");
-            if std::path::Path::new(&path).exists() {
+            if corpus::carries(profile, stem) {
                 corpus::document(profile, stem)
             } else {
                 corpus::document(VERIFIED_PROFILE, stem)
