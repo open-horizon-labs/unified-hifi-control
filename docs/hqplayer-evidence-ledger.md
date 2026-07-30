@@ -463,7 +463,8 @@ the expectation is missing — which is why this is a coverage gap rather than a
 
 ### HQP-C-062 — `SetJunkFilter` works and UHC does not expose it
 
-The daemon accepted the raw element and round-tripped the value on L1 (HQP-C-051, settled). The adapter
+The daemon accepted the raw element and round-tripped the value on L1 (HQP-C-051, open — observed live,
+not covered by a hermetic test). The adapter
 has no `set_junk_filter`, so the capability is unavailable to any UHC surface. This is a gap, not a
 defect — and it is now **executable**: `the_adapter_exposes_no_junk_filter_setter` **parses** the adapter with `syn` and visits every function and method signature, so
 if #329 adds the setter the check fails and this row must be updated rather than quietly outliving its

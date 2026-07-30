@@ -962,3 +962,47 @@ it was built for — and it took an external reviewer's finding to build the che
 proof**. The first mechanism yields to structural parsing — `declares_fn` via `syn` is the only helper no
 later pass reopened. The second now has check 34, which is the first guard in this file aimed at the *claim*
 rather than at the *form*. Checks: **33 → 34**. Claim rows: **63 → 64**.
+
+### Independent diff check: a status stated twice drifted, and check 34 scrutinised
+
+#### The drift, and a check for the class
+
+**HQP-C-062's anchor still read *"(HQP-C-051, settled)"*** after HQP-C-051 was moved to `open` in the same
+commit. Prose repeating a status is always the copy that goes stale.
+
+**Check 35** makes the class fail: any prose reference of the form `HQP-C-0NN, <status>` must agree with that
+row's status cell. The table is authoritative; prose may point at it but not restate it wrongly. **RED was
+the real tree** — the check's first run reported *"line 466: prose says HQP-C-051 is `settled` but its row
+says `open`"*, and M33 reproduces it.
+
+#### Check 34, scrutinised honestly — it was sound in shape and lexical in three places
+
+Asked whether the command matching is semantically sound rather than merely lexical. **It was not, in three
+specific ways. Two are now closed and one is stated.**
+
+| # | Hole | Status |
+|---|---|---|
+| 1 | **A comment counted.** A test that merely *mentioned* `SetFilter` in a comment credited the claim. Comment lines are now excluded before matching, pinned by `a_command_named_only_in_a_comment_is_not_exercised` | **Closed** |
+| 2 | **Only the conformance file was read.** A row citing a test in any other file contributed no proof body, and an empty body **skips** the row — a vacuous pass. Proof files are now resolved per citation, as the cited-test check already did | **Closed** |
+| 3 | **The adapter-method name was derived, not known.** `camel_to_snake` turned `SetShaping` into `set_shaping` and `SetJunkFilter` into `set_junkfilter` — **neither is the real method**. A future shaper expectation calling `set_shaper` would not have been credited, and the check would have demanded an exemption for evidence that existed. Replaced by an explicit table, and the derivation helper deleted as dead | **Closed** |
+| 4 | **A command in a string literal still counts.** Excluding string literals needs a Rust parse of a fragment that is not a whole item. The failure direction is over-crediting a test, never under-crediting one, so it is asserted as a limit in the control rather than hidden | **Stated** |
+| 5 | **A claim naming no `Set*` token is not checked at all.** The rule is keyed on command names; a claim phrased without one escapes it entirely | **Stated** |
+
+**Non-vacuity re-proven after the hardening**, not assumed: M32 removes one exemption and the check names the
+row, the command and the method it looked for.
+
+**One defect of my own, caught before commit:** the failure message's format arguments were transposed, so it
+read *"set_shaper names SetShaping … (looked for SetShaping or HQP-C-002)"*. A diagnostic that names the
+wrong thing is a small defect with a large cost, because it is read exactly when someone is confused.
+
+#### What the two mechanisms now look like, with fourteen defects on record
+
+| Mechanism | Count | Guard |
+|---|---|---|
+| A text scan standing in for a parser | **8** | Structural parsing where a parser exists (`syn`); focused controls where none does |
+| Wording outrunning its cited proof | **5** | **Check 34** — the first check aimed at the claim rather than the form |
+| A fact stated in two places, one going stale | **1** | **Check 35** |
+
+**Nine external passes, nine with findings.** Checks: **34 → 36**. The two guards added in response to
+findings have each already caught something their author did not: check 34 found HQP-C-064's coverage gap,
+and check 35's first run found the drift on line 466.

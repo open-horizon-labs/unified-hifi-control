@@ -1114,6 +1114,52 @@ fn the_retired_set_mode_value_claim_is_struck_where_it_still_appears() {
     }
 }
 
+/// Prose that cites another row's status must agree with that row.
+///
+/// Found by an independent diff check: HQP-C-062's anchor still read *"(HQP-C-051, settled)"* after
+/// HQP-C-051 was moved to `open` in the same commit. A status stated in two places drifts, and prose is
+/// always the copy that goes stale — so the table is authoritative and this check makes disagreement fail.
+#[test]
+fn prose_that_cites_a_row_status_agrees_with_that_row() {
+    let text = ledger();
+    let status_of: HashMap<String, String> =
+        claims().into_iter().map(|c| (c.id, c.status)).collect();
+    let mut bad = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        // A claim row states its own status in a cell; only prose references are checked here.
+        if line.trim_start().starts_with("| HQP-C-") {
+            continue;
+        }
+        for (pos, _) in line.match_indices("HQP-C-") {
+            let rest = &line[pos..];
+            let id: String = rest.chars().take("HQP-C-000".len()).collect();
+            let Some(actual) = status_of.get(&id) else {
+                continue;
+            };
+            let after = &rest[id.len()..];
+            // The checked shape is `HQP-C-0NN, <status>` — the form the drift appeared in.
+            let Some(tail) = after.strip_prefix(", ") else {
+                continue;
+            };
+            let claimed = tail
+                .split(|c: char| !c.is_alphanumeric() && c != '-')
+                .next()
+                .unwrap_or_default();
+            if STATUSES.contains(&claimed) && claimed != actual.as_str() {
+                bad.push(format!(
+                    "line {}: prose says {id} is {claimed:?} but its row says {actual:?}",
+                    i + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "the claim table is authoritative for a row's status, and prose repeating it drifts — this is \
+         the drift an independent diff check found at HQP-C-062's anchor: {bad:#?}"
+    );
+}
+
 /// Phrase after which a claim may name commands its own cited proofs do not exercise.
 ///
 /// Explicit by design: the author has to say *where* the evidence is, and a reader sees it in the same
@@ -1146,13 +1192,25 @@ fn every_command_a_claim_names_is_exercised_by_one_of_its_own_proofs() {
         for proof in c.proof.split(" · ") {
             let p = proof.trim().trim_matches('`');
             if let Some(spec) = p.strip_prefix("test:") {
-                let name = spec.rsplit("::").next().unwrap_or(spec);
-                if let Some(body) = test_body(&conformance, name) {
+                // Resolve the proof's own file. Reading only the conformance suite would silently skip
+                // any row whose proof lives elsewhere, and a skipped row is a vacuous check.
+                let (file, name) = match spec.split_once("::") {
+                    Some((f, n)) => (f.to_string(), n.to_string()),
+                    None => (DEFAULT_PROOF_FILE.to_string(), spec.to_string()),
+                };
+                let src = if file == DEFAULT_PROOF_FILE {
+                    Some(conformance.clone())
+                } else {
+                    fs::read_to_string(repo_root().join(&file)).ok()
+                };
+                if let Some(body) = src.as_deref().and_then(|src| test_body(src, &name)) {
                     bodies.push_str(&body);
+                    bodies.push('\n');
                 }
             } else if let Some(rel) = p.strip_prefix("fixture:") {
                 if let Ok(doc) = fs::read_to_string(repo_root().join(rel)) {
                     bodies.push_str(&doc);
+                    bodies.push('\n');
                 }
             }
         }
@@ -1163,14 +1221,12 @@ fn every_command_a_claim_names_is_exercised_by_one_of_its_own_proofs() {
             if exempt.contains(&cmd) {
                 continue;
             }
-            // A command counts as exercised if the proof mentions the wire element or the adapter method
-            // that emits it.
-            let method = format!("set_{}", camel_to_snake(&cmd[3..]));
-            let alt = format!("set_{}", cmd[3..].to_ascii_lowercase());
-            if !bodies.contains(&cmd) && !bodies.contains(&method) && !bodies.contains(&alt) {
+            if !command_is_exercised(&bodies, &cmd) {
                 bad.push(format!(
-                    "{} names {cmd} but no cited proof exercises it (looked for {cmd}, {method}, {alt})",
-                    c.id
+                    "{} names {cmd} but no cited proof exercises it (looked for {cmd} or {} outside \
+                     comments)",
+                    c.id,
+                    adapter_method_for(&cmd)
                 ));
             }
         }
@@ -1208,15 +1264,77 @@ fn commands_in(text: &str) -> Vec<String> {
     out
 }
 
-fn camel_to_snake(s: &str) -> String {
-    let mut out = String::new();
-    for (i, ch) in s.chars().enumerate() {
-        if ch.is_uppercase() && i > 0 {
-            out.push('_');
-        }
-        out.extend(ch.to_lowercase());
+/// Whether a proof body exercises `cmd`, by wire element or by the adapter method that emits it.
+///
+/// **Comment lines are excluded**, because a test that merely *mentions* a command in a comment does not
+/// send it — the lexical hole an independent scrutiny pass named. What remains lexical, and is stated
+/// rather than hidden: a command named in a **string literal** inside a test still counts, and a claim
+/// that names no `Set*` token at all is not checked by this rule.
+fn command_is_exercised(body: &str, cmd: &str) -> bool {
+    let code: String = body
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    code.contains(cmd) || code.contains(adapter_method_for(cmd))
+}
+
+/// The adapter method that emits a wire command.
+///
+/// A table, not a derivation: `SetShaping` is emitted by `set_shaper` and `SetJunkFilter` by
+/// `set_junk_filter`, neither of which a camel-to-snake rule produces. Deriving them yielded
+/// `set_shaping` and `set_junkfilter`, so a future shaper expectation would not have been credited and
+/// the check would have demanded an exemption for evidence that existed.
+fn adapter_method_for(cmd: &str) -> &'static str {
+    match cmd {
+        "SetMode" => "set_mode",
+        "SetFilter" => "set_filter",
+        "SetShaping" => "set_shaper",
+        "SetRate" => "set_rate",
+        "SetJunkFilter" => "set_junk_filter",
+        "SetVolume" => "set_volume",
+        "SetAdaptiveVolume" => "set_adaptive_volume",
+        _ => "set_",
     }
-    out
+}
+
+/// Controls for [`command_is_exercised`], including the limit it does not close.
+#[test]
+fn a_command_named_only_in_a_comment_is_not_exercised() {
+    assert!(command_is_exercised(
+        "    h.adapter.set_mode(\"PCM\").await;",
+        "SetMode"
+    ));
+    assert!(command_is_exercised("    send(\"SetRate\");", "SetRate"));
+    assert!(
+        command_is_exercised("    h.adapter.set_shaper(\"ASDM7\").await;", "SetShaping"),
+        "SetShaping is emitted by set_shaper, which a camel-to-snake derivation would have missed"
+    );
+    assert!(command_is_exercised(
+        "    h.adapter.set_filter_1x(\"x\").await;",
+        "SetFilter"
+    ));
+
+    assert!(!command_is_exercised(
+        "    // one day we will send SetMode here",
+        "SetMode"
+    ));
+    assert!(!command_is_exercised(
+        "/// See SetRate in the daemon docs",
+        "SetRate"
+    ));
+    assert!(!command_is_exercised("    let x = 1;", "SetJunkFilter"));
+
+    // Stated, not asserted away: a command in a string literal still counts. Excluding string
+    // literals would need a Rust parse of a fragment that is not a whole item, and the failure
+    // direction is over-crediting a test, not under-crediting one.
+    assert!(command_is_exercised(
+        "    assert!(msg.contains(\"SetMode\"));",
+        "SetMode"
+    ));
 }
 
 /// The body of a `#[test]`/`#[tokio::test]` function in `src`, by name.
