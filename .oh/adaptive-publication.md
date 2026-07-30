@@ -367,3 +367,69 @@ PR #363.
 **Verification gap:** `dx` is not installed here, so the WASM/fullstack build is proved only
 by CI's `build-wasm` job. `lint_producers_module_is_server_gated` is the host-runnable proxy
 and is the reason the module is gated at all.
+
+### Review remediation
+
+| Source | Finding | Fixed |
+|---|---|---|
+| execute review (3/6) | canonical fixture published an illegal outcome transition | `12a8e07` |
+| execute review (3/6) | lane witness ordered timestamps lexicographically | `56cd0a9` |
+| execute review (3/6) | surface lint enumerated six dirs, missed `src/mqtt` | `56cd0a9` |
+| execute review (3/6) | coherence invariant test covered 3 of 4 cases | `56cd0a9` |
+| execute review (3/6) | a refusal outlived the producer it named | `6a2ad99` |
+| execute dissent (4/6) | fixed point argued, not checked → `IrreparableIntent` | `f34f28b` |
+| execute dissent (4/6) | module doc overclaimed the structural guarantee | `f34f28b` |
+| execute dissent (4/6) | "refusal is safe" untrue for a first document | `f34f28b` |
+| execute dissent (4/6) | `ProducerRemoved` cannot retire one target of many | `f34f28b` |
+| **CodeRabbit** | `is_server_gate` accepted `any(feature="server", …)` | `f098202` |
+| **CodeRabbit** | surface sweep missed `use crate::{adaptive, producers};` | `f098202` |
+
+Both CodeRabbit findings were in the lints, both were reachable, and the second was
+reachable *using this repository's own import style* — `src/main.rs` groups its imports
+exactly that way. That is now three consecutive rounds in this epic where the defect of
+record was a lint reporting success on a violation, and the third where external review
+found it before the internal gates did.
+
+## Ship
+**Updated:** 2026-07-30
+**Status:** staged (draft PR, nothing merged, deployed or marked ready)
+
+**Delivery path.** PR #363 (draft) → base `feat/issue-323-adaptive-producer-contract`
+(PR #362, also draft) → #362 merges to `v3` → #363 retargets to `v3` → CI → maintainer
+review → squash merge. Two hops, because this is a stacked PR and the prerequisite is not
+merged.
+
+**Delivery-path tax, measured rather than guessed:**
+
+1. **This branch has no CI at all.** `build.yml` triggers on pull requests targeting
+   `master`/`v3` and on pushes to `v3` or `feature/**`. This branch is `feat/…` and the PR
+   targets `feat/issue-323-…`, so **no workflow has run on any commit here**
+   (`gh run list --branch feat/issue-324-adaptive-publication` is empty). Everything green
+   is green on a laptop. The first CI signal arrives only when the base becomes `v3`.
+2. **`api-guard` will trigger once retargeted, and this PR touches one of its paths.**
+   It watches `src/main.rs`, `src/api/**` and `tests/fixtures/api_routes.txt`; `src/main.rs`
+   changed. Read rather than assumed: the job's only assertion is whether
+   `tests/fixtures/api_routes.txt` differs from the base. It does not, so the job takes the
+   `api_changed=false` branch and reports "No API contract changes detected". No label is
+   needed and none must be added.
+3. **A pre-existing `v3` lint failure blocks merge**, not caused here:
+   `src/app/pages/zones.rs:269` trips `clippy::unnecessary_sort_by` on CI's newer
+   toolchain. Owned by #338 ("CI: restore the v3 lint baseline under Rust 1.97"), which is
+   open. #362 hit the same wall.
+4. **`docker.yml` is `master`-only**, so a `v3` merge publishes no image. Release artifacts
+   only on tag `v*` or a published release.
+5. **PR #362 is `BLOCKED`** on GitHub's own mergeability check, so the first hop is not
+   currently available regardless of this branch's state.
+
+**Rollback.** A plain revert. `src/producers/` is referenced from exactly two places outside
+itself — `pub mod producers;` in `src/lib.rs` and the construct-and-spawn in `src/main.rs` —
+and nothing publishes to it, so reverting removes a task that subscribes to two channels and
+waits. No data migration: nothing persists a producer document. The one caveat is
+`ReasonCode::ControlRemoved` and `control_removed_after_advance.json`, which are contract
+surface: reverting those after #325 maps onto them would be a compatibility break, so this
+rollback is clean only while this branch is the tip.
+
+**Verified rather than asserted:** `tests/fixtures/api_routes.txt` byte-identical to
+`origin/v3`; zero `.route(` lines added or removed in `src/main.rs`; `src/api/` and
+`src/bus/` untouched; PR #363 carries no labels; worktree clean; every commit
+forward-only, no force push.
