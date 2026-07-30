@@ -205,7 +205,43 @@ and **diff against the corpus**:
 Every mismatch either re-provenances a fixture from the capture or ships as a stated gap. A
 `derived-excerpt` or `UNVERIFIED` label surviving this pass unexamined is a finding, not a footnote.
 
-**This tier is what the real-daemon merge gate means.** It does not exist yet.
+**This tier is what the real-daemon merge gate means.** It is implemented as of stage 3 — see the
+runbook below — and awaits a reachable daemon.
+
+### Running tier 1 (implemented, stage 3)
+
+```bash
+UHC_HQP_CONFORMANCE_HOST=<daemon-ip> \
+  cargo test --test hqplayer_conformance -- --nocapture tier1_live
+```
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `UHC_HQP_CONFORMANCE_HOST` | **yes** | — | Daemon address. Absent ⇒ the gate prints that it skipped and passes, keeping CI hermetic |
+| `UHC_HQP_CONFORMANCE_PORT` | no | `4321` | Native control port |
+| `UHC_HQP_CONFORMANCE_PROFILE` | no | `hqpd-6.0.4-opal` | Corpus profile to diff against |
+| `UHC_HQP_CONFORMANCE_WEB_PORT` | no | `8088` | HTTP port for the `/config` read side |
+| `UHC_HQP_CONFORMANCE_WEB_USER` | no | — | Digest user. Supply with `_PASS` to include the persistent read lane |
+| `UHC_HQP_CONFORMANCE_WEB_PASS` | no | — | Digest password |
+
+The gate **fails on divergence** and prints the full report either way. A divergence is resolved by
+re-provenancing the fixture from the capture, or by shipping it as a stated gap — never by loosening
+the differ.
+
+What the report carries: daemon identity (product/version/engine/platform/name), the active mode and
+an explicit note that the enumerations are *that mode's* lists only, whether `Status` carried its
+`metadata` child, the count of unsolicited documents the client skipped, per-family delivery times as
+evidence for setting `HqpTimeouts::response`, every divergence with family/kind/both numbers, and a
+`NOT captured` list naming what a read-only run structurally cannot reach.
+
+**Read-only by construction.** Every call on the capture path is a query. Verified by
+`tier1_finds_no_divergence_when_the_daemon_serves_the_corpus_it_is_diffed_against`,
+`tier1_reports_index_divergence_when_the_daemon_orders_a_list_differently`,
+`tier1_records_the_inactive_mode_lists_as_not_captured`,
+`tier1_records_container_delivery_time_per_family` and
+`tier1_records_how_many_unsolicited_documents_the_client_skipped`, all of which run hermetically
+against the fake daemon. What those cannot cover is the live gate's own env-var handling and its
+connect-to-real-hardware path; those are exercised only by an actual run.
 
 ### Tier 2 — mutating verification (never a merge gate, never unattended)
 
@@ -226,10 +262,10 @@ Because tier 2 needs hardware nobody should volunteer casually, the honest posit
 
 ### Also outstanding for stage 3
 
-- Make the unsolicited-document skip count observable, so tier 1 can assert it stays at zero across
-  every command family. Deferred here because its only consumer is that assertion — and note the
-  per-command deadline, not the count, is now what bounds the wait, so this is diagnostics rather
-  than safety.
+- ~~Make the unsolicited-document skip count observable.~~ **Done in stage 3**:
+  `HqpAdapter::unsolicited_skipped()` counts them and the tier-1 report carries the figure. Zero is
+  expected against a well-behaved daemon, so a non-zero count on real hardware is the signal that the
+  reply-element invariant is narrower than the reference implies.
 - **Track tier 1 as a real follow-up, not a paragraph.** Superego's standing objection is that
   `derived-*` fixtures will accumulate dependents (#162, #328, #329) while the live verification stays
   narrated. Opening that issue belongs to the program owner, not to this PR — the issue graph under

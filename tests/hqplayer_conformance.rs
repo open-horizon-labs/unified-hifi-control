@@ -1175,38 +1175,33 @@ async fn the_matrix_profile_family_round_trips_a_name_containing_an_entity() {
 // AC8 - hermetic in CI, with a documented opt-in real-daemon mode (a smoke check, by design)
 // =============================================================================
 
-/// Opt-in real-daemon **smoke check** — deliberately narrow, and named so nobody mistakes it for
-/// more. Set `UHC_HQP_CONFORMANCE_HOST` (and optionally `UHC_HQP_CONFORMANCE_PORT`, default 4321):
+/// Opt-in **tier-1 read-only live verification** — the real-daemon merge gate from ADR 003.
 ///
 /// ```text
-/// UHC_HQP_CONFORMANCE_HOST=192.168.1.50 cargo test --test hqplayer_conformance
+/// UHC_HQP_CONFORMANCE_HOST=192.168.1.50 \
+///   cargo test --test hqplayer_conformance -- --nocapture tier1_live
 /// ```
 ///
-/// Without the variable it prints that it skipped and passes, so the default suite stays hermetic
-/// without leaving an acceptance test permanently ignored. That existence-plus-documentation
-/// property is what issue #322 AC8 asks for, and it is all this test claims to deliver.
+/// Optional environment:
+/// * `UHC_HQP_CONFORMANCE_PORT` — control port, default `4321`
+/// * `UHC_HQP_CONFORMANCE_PROFILE` — corpus profile to diff against, default the verified one
+/// * `UHC_HQP_CONFORMANCE_WEB_PORT` — HTTP port, default `8088`
+/// * `UHC_HQP_CONFORMANCE_WEB_USER` / `_PASS` — Digest credentials; supply both to include the
+///   `/config` read side. Omit them and that lane is recorded as not-captured
 ///
-/// **What it checks:** that a real daemon accepts a connection, identifies itself through `GetInfo`,
-/// and returns a multi-entry `GetFilters` container that the framer parses whole. That is enough to
-/// prove the client can talk to real hardware at all, which is the failure this catches.
+/// Without `UHC_HQP_CONFORMANCE_HOST` this prints that it skipped and passes, so the default suite
+/// stays hermetic without leaving an acceptance test permanently `#[ignore]`d.
 ///
-/// **What it does NOT check, and must not be cited as checking:** it does not read `State`,
-/// `Status`, `VolumeRange`, `GetModes`, `GetShapers`, `GetRates`, `GetJunkFilters` or the matrix
-/// family; it does not compare anything against the corpus; and it therefore settles none of the
-/// `derived-*` fixtures' list positions. Extending it into a verifier that captures and diffs the
-/// read-only protocol families is **stage 3** work and is the precondition for the real-daemon merge
-/// gate — see `docs/adr/003-hqplayer-conformance-boundary.md`.
-///
-/// **Read-only, always.** Nothing here writes to a real daemon. Any live verification of the
-/// `Set*` anchors is mutating by nature and belongs behind a separate opt-in against an expendable
-/// daemon, never against someone's listening room.
+/// **Read-only.** Every call is a query — no `Set*`, no `Volume*`, no transport, no matrix set. Safe
+/// against a daemon someone is listening to. It fails on divergence, because a divergence means the
+/// corpus needs re-provenancing before it can be trusted as protocol truth, and it prints the whole
+/// report either way so the operator can act on it.
 #[tokio::test]
-async fn real_daemon_smoke_check_when_opted_in() {
+async fn tier1_live_read_only_verification_when_opted_in() {
     let Ok(host) = std::env::var("UHC_HQP_CONFORMANCE_HOST") else {
         eprintln!(
-            "skipping the real-daemon smoke check: set UHC_HQP_CONFORMANCE_HOST to opt in. \
-             This is a connectivity/identity check only - it does not diff the corpus, which is \
-             stage-3 work"
+            "skipping tier-1 live verification: set UHC_HQP_CONFORMANCE_HOST to opt in. \
+             Read-only; it captures every read-only protocol family and diffs it against the corpus."
         );
         return;
     };
@@ -1214,29 +1209,39 @@ async fn real_daemon_smoke_check_when_opted_in() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(4321);
+    let web_port: u16 = std::env::var("UHC_HQP_CONFORMANCE_WEB_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8088);
+    let profile = std::env::var("UHC_HQP_CONFORMANCE_PROFILE")
+        .unwrap_or_else(|_| VERIFIED_PROFILE.to_string());
+    let user = std::env::var("UHC_HQP_CONFORMANCE_WEB_USER").ok();
+    let pass = std::env::var("UHC_HQP_CONFORMANCE_WEB_PASS").ok();
 
     isolate_config_dir();
     let adapter = HqpAdapter::new(create_bus());
     adapter
-        .configure(host.clone(), Some(port), None, None, None)
+        .configure(host.clone(), Some(port), Some(web_port), user, pass)
         .await;
     adapter
         .connect()
         .await
-        .unwrap_or_else(|e| panic!("connect to real HQPlayer at {host}:{port}: {e}"));
+        .unwrap_or_else(|e| panic!("connect to HQPlayer at {host}:{port}: {e}"));
 
-    let info = adapter.get_info().await.expect("GetInfo from real daemon");
-    let filters = adapter
-        .get_filters()
+    let capture = tier1::capture(&adapter)
         .await
-        .expect("GetFilters from real daemon");
+        .unwrap_or_else(|e| panic!("tier-1 capture from {host}:{port}: {e}"));
+    let report = tier1::diff(&capture, &profile);
+
+    // Printed unconditionally: the report is the deliverable, not the pass/fail bit.
+    eprintln!("\n{}", report.render());
+
     assert!(
-        !info.product.is_empty() && filters.len() > 1,
-        "a real daemon must identify itself and return a multi-entry filter container; \
-         product={:?} filters={}. This is a smoke check: passing it says the client can talk to \
-         real hardware, NOT that the corpus matches it",
-        info.product,
-        filters.len()
+        report.is_clean(),
+        "tier-1 found {} divergence(s) between the daemon and corpus profile `{profile}`. Each one \
+         must be resolved by re-provenancing the fixture from this capture or by shipping it as a \
+         stated gap - not by loosening the differ.",
+        report.divergences.len()
     );
 }
 
@@ -1566,6 +1571,58 @@ async fn tier1_records_how_many_unsolicited_documents_the_client_skipped() {
         "this daemon emits an unsolicited frame after every State, so the capture must report a \
          non-zero skip count; got {}",
         capture.unsolicited_skipped
+    );
+    h.stop();
+}
+
+/// Coverage for the identity branch of the differ, which superego correctly noted had none. A daemon
+/// reporting a different product/version than the corpus profile claims means every other comparison
+/// is against the wrong baseline, and the report should say so first.
+#[tokio::test]
+async fn tier1_reports_identity_divergence_when_the_daemon_is_a_different_build() {
+    let h = Harness::start(LEGACY_PROFILE, WirePolicy::default(), fast_timeouts()).await;
+    h.adapter.connect().await.expect("connect");
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+
+    let identity: Vec<&tier1::Divergence> = report
+        .divergences
+        .iter()
+        .filter(|d| d.kind == tier1::DivergenceKind::Identity)
+        .collect();
+    assert!(
+        identity.iter().any(|d| d.detail.contains("version"))
+            && identity.iter().any(|d| d.detail.contains("engine")),
+        "a 5.2.30 Desktop daemon diffed against the 6.0.4 Embedded corpus must report version and \
+         engine divergences, naming both sides. Got: {:?}",
+        report
+            .divergences
+            .iter()
+            .map(|d| &d.detail)
+            .collect::<Vec<_>>()
+    );
+    h.stop();
+}
+
+/// The persistent-lane branch cannot be reached hermetically — the fake daemon speaks the native
+/// protocol only, so `has_web_credentials()` is false and the capture records the lane as unreached.
+/// Pinning that keeps the honest-partial-coverage promise from silently regressing into a claim.
+#[tokio::test]
+async fn tier1_records_the_config_read_side_as_unreached_without_credentials() {
+    let h = Harness::verified().await;
+    let capture = tier1::capture(&h.adapter).await.expect("capture");
+    let report = tier1::diff(&capture, VERIFIED_PROFILE);
+    assert!(
+        capture.config_profiles.is_none()
+            && report
+                .not_captured
+                .iter()
+                .any(|n| n.contains("config read side")),
+        "without web credentials the /config lane must be reported unreached, not treated as empty. \
+         config_profiles={:?} not_captured={:?}",
+        capture.config_profiles,
+        report.not_captured
     );
     h.stop();
 }

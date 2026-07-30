@@ -679,6 +679,10 @@ pub struct HqpAdapter {
     connection: Arc<Mutex<Option<HqpConnection>>>,
     http_client: Client,
     bus: SharedBus,
+    /// Unsolicited documents skipped while awaiting command replies. Diagnostics for tier-1 live
+    /// verification: against a well-behaved daemon this should stay at zero, so a non-zero count on
+    /// real hardware is the signal that the reply-element invariant is narrower than documented.
+    unsolicited_skipped: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl HqpAdapter {
@@ -693,6 +697,7 @@ impl HqpAdapter {
             connection: Arc::new(Mutex::new(None)),
             http_client,
             bus,
+            unsolicited_skipped: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         // Load saved config synchronously at startup
         adapter.load_config_sync();
@@ -822,7 +827,8 @@ impl HqpAdapter {
     /// happen against a well-behaved daemon, so a non-zero count on real hardware is the signal that
     /// the invariant does not hold as broadly as the reference implies.
     pub async fn unsolicited_skipped(&self) -> u32 {
-        0 // STUB - counted for real in the GREEN commit.
+        self.unsolicited_skipped
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Current timeout/retry policy.
@@ -1158,6 +1164,8 @@ impl HqpAdapter {
                                 // for the reply to the command actually sent, rather than answering
                                 // from someone else's document.
                                 skipped += 1;
+                                self.unsolicited_skipped
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if skipped > MAX_UNSOLICITED_BACKLOG {
                                     return Err(anyhow!(
                                         "Gave up after {} unsolicited documents while awaiting a {} \

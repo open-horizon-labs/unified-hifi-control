@@ -313,6 +313,23 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
             .collect(),
     );
 
+    // Persistent HTTP lane, read side only. Attempted just when credentials were supplied; a failure
+    // is recorded as not-captured rather than swallowed, because "no profiles" and "could not ask"
+    // are different facts.
+    if adapter.has_web_credentials().await {
+        let t = Instant::now();
+        match adapter.fetch_profiles().await {
+            Ok(profiles) => {
+                timed("config_profiles", t.elapsed(), &mut c);
+                c.config_profiles = Some(profiles.into_iter().map(|p| p.value).collect());
+            }
+            Err(e) => {
+                c.config_profiles = None;
+                tracing::warn!("tier-1: /config read side unavailable: {e}");
+            }
+        }
+    }
+
     c.unsolicited_skipped = adapter
         .unsolicited_skipped()
         .await
@@ -327,12 +344,156 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
 /// the index and enum ID are then the things under test. That is the same rule the client itself
 /// follows, so a divergence here is exactly a divergence the client would act on.
 pub fn diff(capture: &Capture, profile: &str) -> Report {
-    // STUB - implemented in the GREEN commit. Present only so the expectations can run and fail.
-    Report {
+    let mut report = Report {
         profile: profile.to_string(),
         capture: capture.clone(),
         ..Report::default()
+    };
+
+    // Identity: the corpus profile claims a daemon. If we are looking at a different one, every
+    // other comparison is against the wrong baseline and should be read that way.
+    let expected_identity = corpus::document(profile, "getinfo");
+    for key in ["product", "version", "engine"] {
+        let want = attr_of(&expected_identity, key);
+        let got = capture.identity.get(key).cloned().unwrap_or_default();
+        if let Some(want) = want {
+            if want != got {
+                report.divergences.push(Divergence {
+                    family: "getinfo".into(),
+                    kind: DivergenceKind::Identity,
+                    detail: format!("{key}: corpus says {want:?}, daemon says {got:?}"),
+                });
+            }
+        }
     }
+
+    for (stem, _family, item_tag) in ENUM_FAMILIES {
+        let Some(observed) = capture.enumerations.get(stem) else {
+            report.not_captured.push(format!("{stem} (not in capture)"));
+            continue;
+        };
+        // Filters and shapers are mode-relative; compare against the profile document for the mode
+        // the daemon was actually in.
+        let doc_stem = match (stem, capture.active_mode_index) {
+            ("filters", 2) => "filters_sdm".to_string(),
+            ("filters", _) => "filters_pcm".to_string(),
+            ("shapers", 2) => "shapers_sdm".to_string(),
+            ("shapers", _) => "shapers_pcm".to_string(),
+            ("rates", 2) => "rates_sdm".to_string(),
+            ("rates", _) => "rates_pcm".to_string(),
+            (other, _) => other.to_string(),
+        };
+        let expected = corpus::enum_entries(&corpus::document(profile, &doc_stem), item_tag);
+
+        if stem == "rates" {
+            diff_rates(&mut report, stem, &expected, observed);
+            continue;
+        }
+
+        for want in &expected {
+            match observed.iter().find(|o| o.name == want.name) {
+                None => report.divergences.push(Divergence {
+                    family: doc_stem.clone(),
+                    kind: DivergenceKind::MissingEntry,
+                    detail: format!("corpus has {:?}, daemon does not", want.name),
+                }),
+                Some(got) => {
+                    if got.index != want.index {
+                        report.divergences.push(Divergence {
+                            family: doc_stem.clone(),
+                            kind: DivergenceKind::IndexMismatch,
+                            detail: format!(
+                                "{:?}: corpus index {}, daemon index {}",
+                                want.name, want.index, got.index
+                            ),
+                        });
+                    }
+                    if want.enum_id.is_some() && got.enum_id != want.enum_id {
+                        report.divergences.push(Divergence {
+                            family: doc_stem.clone(),
+                            kind: DivergenceKind::EnumIdMismatch,
+                            detail: format!(
+                                "{:?}: corpus enum ID {:?}, daemon enum ID {:?}",
+                                want.name, want.enum_id, got.enum_id
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        for got in observed {
+            if !got.name.is_empty() && !expected.iter().any(|w| w.name == got.name) {
+                report.divergences.push(Divergence {
+                    family: doc_stem.clone(),
+                    kind: DivergenceKind::MissingEntry,
+                    detail: format!("daemon has {:?}, corpus does not", got.name),
+                });
+            }
+        }
+    }
+
+    // Scalar shape. The corpus holds no `volume_range` fixture — the earlier ones were dropped when
+    // the model became the source of those variants — so there is nothing here to diff against and
+    // saying so is the only honest option. An earlier draft of this block pretended otherwise: it
+    // read the `engine` attribute off `getinfo`, discarded it, and claimed in a comment that step
+    // optionality was "asserted below", which it never was. A corpus/daemon disagreement about `step`
+    // would have read as an accepted gap.
+    if let Some(vr) = capture.scalars.get("volume_range") {
+        let step = vr.get("step").cloned().unwrap_or_default();
+        report.not_captured.push(format!(
+            "volume_range shape — no corpus fixture to diff against; daemon reported step={:?}, \
+             min={:?}, max={:?} for the record",
+            if step.is_empty() {
+                "<absent>".to_string()
+            } else {
+                step
+            },
+            vr.get("min").cloned().unwrap_or_default(),
+            vr.get("max").cloned().unwrap_or_default(),
+        ));
+    }
+
+    match &capture.config_profiles {
+        None => report.not_captured.push(
+            "config read side (/config profile list) — no web credentials supplied, or the request \
+             failed, so the persistent lane was not reached"
+                .into(),
+        ),
+        Some(observed) => {
+            // The corpus form is an excerpt, so only entries it names are compared; a daemon with
+            // extra profiles is normal, a daemon missing one the corpus claims is not.
+            let form = corpus::document(profile, "config_profile_form");
+            // Parsed out of the form rather than hardcoded, so a corpus that gains a profile does not
+            // silently stop being checked. `[default]` is the unnamed base, not a named profile.
+            for name in form
+                .split("value=\"")
+                .skip(1)
+                .filter_map(|part| part.split('"').next())
+                .filter(|n| !n.is_empty() && *n != "[default]" && *n != "Apply")
+                .collect::<Vec<_>>()
+            {
+                if !observed.iter().any(|o| o == name) {
+                    report.divergences.push(Divergence {
+                        family: "config_profile_form".into(),
+                        kind: DivergenceKind::MissingEntry,
+                        detail: format!("corpus form lists profile {name:?}, daemon does not"),
+                    });
+                }
+            }
+        }
+    }
+
+    // The honest limit of a read-only run.
+    let inactive = if capture.active_mode_index == 2 {
+        "PCM"
+    } else {
+        "SDM"
+    };
+    report.not_captured.push(format!(
+        "{inactive} filter/shaper/rate lists — reaching them needs SetMode, which is tier 2"
+    ));
+
+    report
 }
 
 fn diff_rates(report: &mut Report, stem: &str, expected: &[EnumEntry], observed: &[EnumEntry]) {
