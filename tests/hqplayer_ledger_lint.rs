@@ -523,22 +523,70 @@ fn every_cited_test_exists_and_is_not_ignored() {
     );
 }
 
+/// A `fixture:` proof must name a **corpus document**, not merely a path that happens to exist.
+///
+/// CodeRabbit found the existence-only version accepted `fixture:README.md`, a test source, or a
+/// directory. The documented contract is that a fixture proof points at a corpus document *carrying
+/// provenance*, so the check enforces all three: the path lives under the corpus root, it is a regular
+/// `.xml`/`.html` file, and it loads through `corpus::load`, which panics unless the file opens with a
+/// complete provenance header. Loading it is the strongest available form — it means a fixture proof
+/// cannot cite a document whose own evidence metadata is missing or malformed.
 #[test]
-fn every_cited_fixture_exists() {
-    let mut missing = Vec::new();
+fn every_cited_fixture_is_a_corpus_document_that_carries_provenance() {
+    const CORPUS_ROOT: &str = "tests/fixtures/hqplayer/";
+    let mut bad = Vec::new();
     for c in claims() {
         for proof in c.proof.split(" · ") {
             let Some(rel) = proof.trim().trim_matches('`').strip_prefix("fixture:") else {
                 continue;
             };
-            if !repo_root().join(rel).exists() {
-                missing.push(format!("{} cites {rel}", c.id));
+            let Some(tail) = rel.strip_prefix(CORPUS_ROOT) else {
+                bad.push(format!(
+                    "{} cites {rel}, which is not under {CORPUS_ROOT}",
+                    c.id
+                ));
+                continue;
+            };
+            let path = repo_root().join(rel);
+            if !path.is_file() {
+                bad.push(format!("{} cites {rel}, which is not a regular file", c.id));
+                continue;
+            }
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if ext != "xml" && ext != "html" {
+                bad.push(format!(
+                    "{} cites {rel}, whose extension {ext:?} is not a corpus document type",
+                    c.id
+                ));
+                continue;
+            }
+            let Some((profile, file)) = tail.split_once('/') else {
+                bad.push(format!(
+                    "{} cites {rel}, which is not <profile>/<stem>.<ext> under the corpus root",
+                    c.id
+                ));
+                continue;
+            };
+            let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+            // Panics with the loader's own diagnosis if the provenance header is absent, misplaced or
+            // missing a required field — which is the outcome we want a red test to report.
+            let fixture = corpus::load(profile, stem);
+            if fixture.provenance.status.is_empty() {
+                bad.push(format!(
+                    "{} cites {rel}, whose provenance records no status",
+                    c.id
+                ));
             }
         }
     }
     assert!(
-        missing.is_empty(),
-        "these claims cite a corpus fixture that is not on disk: {missing:#?}"
+        bad.is_empty(),
+        "a `fixture:` proof must name a corpus document carrying provenance, because the provenance \
+         header is what makes the citation evidence rather than a file path: {bad:#?}"
     );
 }
 
@@ -637,21 +685,31 @@ fn first_hand_claims_match_a_recorded_live_run() {
         "the ledger must carry a `Live runs` registry table; without it `E0-uhc-live` is a label \
          anybody can apply"
     );
+    // Columns of the `Live runs` table: Run | Edition / version | Date | Playback | Evidence.
+    //
+    // Compared **positionally and exactly**, not by substring over a joined row. CodeRabbit found the
+    // substring version accepted an `E0` row whose playback state contradicted the registry: flipping
+    // one row's `idle` to `active` still passed, because the joined string was only searched for the
+    // daemon and the date. Playback state is part of the provenance contract, so it is part of the
+    // match — and after HQP-C-023, a playback state nobody recorded is the specific error this ledger
+    // has already made once.
     let mut bad = Vec::new();
     for c in claims() {
         if c.class != "E0-uhc-live" {
             continue;
         }
         let matched = registry.iter().any(|row| {
-            let joined = row.join(" · ");
-            joined.contains(c.daemon()) && joined.contains(c.date())
+            let col = |n: usize| row.get(n).map(String::as_str).unwrap_or_default();
+            col(1) == c.daemon() && col(2) == c.date() && col(3) == c.playback()
         });
         if !matched {
             bad.push(format!(
-                "{} claims first-hand evidence on {:?} at {:?}, which no registry row records",
+                "{} claims first-hand evidence on {:?} at {:?} with playback {:?}; no registry row \
+                 records that exact combination",
                 c.id,
                 c.daemon(),
-                c.date()
+                c.date(),
+                c.playback()
             ));
         }
     }

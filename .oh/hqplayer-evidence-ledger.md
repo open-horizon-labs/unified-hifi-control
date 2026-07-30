@@ -452,3 +452,32 @@ demanded a `[retired #341]` marker, which #322's better wording does not carry. 
 that marker **or** a citation of `HQP-C-024`, because what the check forbids is the *unqualified*
 imperative. Insisting on this branch's own marker would have made the check reject the outcome it exists
 to produce.
+
+### CodeRabbit remediation at `3b90fe7` — two lint-integrity gaps, both valid, both false passes
+
+CodeRabbit reviewed the exact head and found **two checks that could not catch what they claimed to
+check**. Both were verified by mutation before being fixed: the mutation *passed*, which is the defect
+shape for a lint — a false absence rather than a false alarm.
+
+| # | Gap | Proof it was real (before) | Proof it is closed (after) |
+|---|---|---|---|
+| CR1 (P2) | `first_hand_claims_match_a_recorded_live_run` joined the registry row and searched it for the daemon and the date, so it never compared **playback state**. An `E0` row could contradict the registry outright | M16 — flipped one `E0` row's `idle` to `active` while the registry still said `idle`: **`test … ok`** | M16 now fails: *"no registry row records that exact combination"* |
+| CR2 (P3) | `every_cited_fixture_exists` only asked whether the path existed, so `fixture:README.md`, an unrelated source file, or a directory satisfied a fixture proof | M17 — repointed a fixture proof at `README.md`: **`test … ok`** | M17 and M18 (a directory) both fail |
+
+**CR1 matters more than its severity suggests, and for a specific reason.** The one substantive error
+this ledger has made was a wrong **playback state** (HQP-C-023), and this was the check standing next to
+that exact field with its eyes closed. It is now positional and exact against the registry's
+`Edition / version`, `Date` and `Playback` columns.
+
+**CR2's fix is stronger than the report asked for.** Rather than checking the extension and directory
+only, a `fixture:` proof now **loads through `corpus::load`**, which panics unless the file opens with a
+complete provenance header. So a fixture proof cannot cite a document whose own evidence metadata is
+missing or malformed. The check was renamed to
+`every_cited_fixture_is_a_corpus_document_that_carries_provenance`, because "exists" no longer describes
+what it enforces — the mutation table's M8 row refers to the older name.
+
+**Check count is unchanged at 23**: CR2 renamed one check rather than adding one, and CR1 strengthened an
+existing one. Seventeen mutations are now on record (M1–M18, less the retired M8 wording), and **two of
+them were false passes found by an external reviewer, not by this session.** That is the second time in
+this PR that an outside reader found what the internal passes missed — the first being HQP-C-023 — and
+it is the most useful thing this record can say about the value of the internal passes alone.
