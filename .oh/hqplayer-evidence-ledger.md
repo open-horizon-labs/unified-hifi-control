@@ -596,3 +596,36 @@ Every figure re-run at this exact SHA. **No HQPlayer daemon was contacted.**
 0. Per ADR 003 that is a **rate, not a verdict**: the documented `/hqp/discover` multicast and LMS
 concurrency flake families did not fire in any of the three, which is evidence about this sandbox on this
 evening and nothing more.
+
+### CodeRabbit's third pass at `5c97f6c` — a fourth false pass, and one hardening it could not confirm
+
+**CR4 (P2) — a malformed owner token satisfied the owner check.** Ownership was accepted when the cell
+*contained* a `#` and *contained* a digit, so `#0`, `#abc1` and `#-1` all passed. None is an issue anyone
+can open, and an owner nobody can reach is the same as no owner — which is the one thing that check
+exists to forbid.
+
+| # | Owner token on an unresolved row | Before | After |
+|---|---|---|---|
+| M22 | `#0` | `test … ok` | fails |
+| M23 | `#abc1` | `test … ok` | fails |
+| M24 | `#-1` | `test … ok` | fails |
+| M25 | `#332` (the real value) | ok | **ok** — the fix rejects malformed tokens, not valid ones |
+
+`is_issue_reference` now requires `#` followed by a non-zero decimal number, with markdown decoration
+and backticks stripped first. `not-an-issue` already failed before the fix, which is why the earlier
+proof needed the three tokens above rather than an obviously-wrong one.
+
+**The hardening CodeRabbit raised but did not confirm, done anyway.** `#[cfg(test)]` contains the
+substring `test`, so the cited-test check's attribute scan could treat a plain helper directly beneath one
+as a test function — a false pass for a citation naming no test at all. It is now matched narrowly
+(`#[test]`, `#[test(…)]`, `…::test`), and `#[ignore]` likewise. **No instance could be constructed**
+without editing a base-branch file, so unlike CR1–CR4 this one is argued rather than demonstrated, and it
+is recorded as such: one line of cost against a silent failure.
+
+### The count that matters most in this record
+
+**Four false passes, across three CodeRabbit passes, in checks written by the author of the artefact they
+check.** Plus one factual ledger error found by a human reviewer. The internal 25-mutation table caught
+everything its author thought to break; every one of the five things it missed was found by someone else.
+Anyone reading the mutation table as evidence that the ledger is *correct* is making exactly the mistake
+this ledger exists to prevent — it is evidence about **schema**, and nothing more.

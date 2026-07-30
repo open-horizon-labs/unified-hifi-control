@@ -268,10 +268,17 @@ fn test_functions(path: &Path) -> HashMap<String, bool> {
         for prev in lines[..i].iter().rev() {
             let p = prev.trim();
             if p.starts_with("#[") {
-                if p.contains("test") {
+                // Matched narrowly on purpose. `#[cfg(test)]` contains the substring `test`, so a
+                // contains-check would let a plain helper directly beneath one be accepted as a test
+                // function — a false pass for a citation that names no test at all. CodeRabbit raised
+                // this and could not confirm an instance; neither could I, because constructing one
+                // needs an edit to a base-branch file. Narrowed anyway: the cost is one line and the
+                // failure it prevents is silent.
+                let attr = p.trim_start_matches("#[").trim_end_matches(']');
+                if attr == "test" || attr.starts_with("test(") || attr.ends_with("::test") {
                     is_test = true;
                 }
-                if p.contains("ignore") {
+                if attr == "ignore" || attr.starts_with("ignore(") || attr.starts_with("ignore =") {
                     ignored = true;
                 }
                 continue;
@@ -286,6 +293,22 @@ fn test_functions(path: &Path) -> HashMap<String, bool> {
         }
     }
     out
+}
+
+/// Whether an owner cell names a usable GitHub issue: `#` followed by a non-zero decimal number, with
+/// markdown decoration and backticks stripped first.
+///
+/// CodeRabbit found the previous rule — *contains a `#` and contains a digit* — accepted `#0`, `#abc1`
+/// and `#-1`, none of which is an issue anyone can open. An owner nobody can reach is the same as no
+/// owner, which is the thing this check exists to forbid.
+fn is_issue_reference(cell: &str) -> bool {
+    let token = cell
+        .trim()
+        .trim_matches(|c| c == '*' || c == '`' || c == ' ');
+    let Some(number) = token.strip_prefix('#') else {
+        return false;
+    };
+    !number.is_empty() && !number.starts_with('0') && number.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Shortest acquisition plan that counts as one rather than as a label. Four words and twenty
@@ -679,8 +702,11 @@ fn every_unsettled_claim_names_an_owner_and_what_would_settle_it() {
         if c.status == "settled" || c.status == "retired" {
             continue;
         }
-        if !c.owner.contains('#') || !c.owner.chars().any(char::is_numeric) {
-            bad.push(format!("{} owner {:?} names no issue", c.id, c.owner));
+        if !is_issue_reference(&c.owner) {
+            bad.push(format!(
+                "{} owner {:?} is not a usable issue reference",
+                c.id, c.owner
+            ));
         }
         // The settle condition lives in the claim's prose anchor, because one table cell cannot hold
         // it honestly. The anchor is the heading that carries the ID.
