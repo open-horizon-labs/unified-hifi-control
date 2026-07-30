@@ -898,3 +898,74 @@ records why the public knob was wrong so nobody re-adds it.
 Reproduced at test scale before the fix — `continuous_unsolicited_traffic_cannot_extend_the_command_deadline`
 consumed **133 frames on a 300 ms budget** (~2.7 s), and the suite's own wall time went 0.65 s → 2.89 s.
 Both are back to normal after it.
+
+---
+
+## Stage 3 — tier-1 read-only live verification
+
+**Updated:** 2026-07-29 · **HEAD `75eeecc`** · draft PR, no live result claimed
+
+Implements the merge gate ADR 003 specifies. Read-only by construction: every call on the capture
+path is a query — no `Set*`, no `Volume*`, no transport, no matrix set — so it is safe against a
+daemon someone is listening to.
+
+| Commit | Kind | What |
+|---|---|---|
+| `bd87e21` | **RED** (with `src` stub) | Differ, skip counter, inactive-mode disclosure. `86/3` |
+| `89549d4` | GREEN | Tier-1 capture + diff, live gate, runbook |
+| `d7f62c2` | **RED** (with `src` stub) | Junk filters, current matrix profile, JSON artifact, deadline verdicts. `92/4` |
+| `7086093` | GREEN | All four |
+| `f3f8166` | **RED** (test-only) | Full capture artifact, marker emission, matrix diffing, matrix semantics, read-failure distinction. `96/8` |
+| `75eeecc` | GREEN | All six, plus two bugs the coverage exposed |
+
+Two REDs (`bd87e21`, `d7f62c2`) each added a deliberately-failing **production** stub to
+`src/adapters/hqplayer.rs` so their expectations could run rather than fail to compile —
+`unsolicited_skipped()` → `0`, and `get_junk_filters()` → `Ok(vec![])`. Both were replaced in the
+following GREEN. They are **not** test-only REDs and must not be read as such. `f3f8166` is test-only:
+`git diff -- src` is empty for it.
+
+### Two bugs the new coverage exposed, both mine
+
+`75eeecc`'s commit message was truncated by a shell-quoting accident — an unescaped ampersand — and
+the branch is already pushed, so amending it would need a force-push that AGENTS.md forbids. The full
+text belongs somewhere durable, so it is here:
+
+1. **The differ compared escaped names against decoded ones.** Corpus documents hold attribute values
+   in escaped wire form; the client returns them decoded. So a matrix profile named `Rock &amp; Roll`
+   in the fixture and returned as `Rock & Roll` by the client diverged *from itself* — two false
+   divergences, on real hardware, for any name carrying an entity. Fixed by decoding expected names
+   with `framing::decode_entities`, the same function the client uses, so the comparison is exactly
+   apples to apples. This was invisible until `MatrixListProfiles` joined the diffed families, because
+   the matrix fixture is the only one with an entity in a name.
+2. **`tier1_diffs_the_matrix_profile_list_against_the_corpus` was vacuous.** It trimmed `"Headphones"`,
+   which lives in the `/config` form fixture, not `matrix_profiles.xml`, so it removed nothing and
+   asserted on a divergence that could never appear. It now trims `"Speakers"`, which is actually in
+   the matrix family.
+
+### Verification at `75eeecc` (current head)
+
+| Command | Result |
+|---|---|
+| `cargo test --test hqplayer_conformance` | **104 passed; 0 failed; 0 ignored** (85 conformance + 19 pre-existing `mock_servers`) |
+| lib unit tests | 84 passed |
+| `--test adapter_integration` / `--test zones_sha_integration` | 42 / 20 |
+| `--test protocol_schema` / `--test api_contract` | 41 / 2 |
+| `cargo fmt --check` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `git diff --check origin/v3...HEAD` | clean |
+| opt-in gate with `UHC_HQP_CONFORMANCE_HOST` unset | skips with a note; `1 passed` |
+
+Twenty-eight expectations across the branch failed before they passed. Three known failures remain,
+all pre-existing: the two deterministic `/hqp/discover` multicast 500s and the ~1-in-10
+`error_handling::lms_fails_gracefully_when_unconfigured` concurrency flake.
+
+### What tier 1 cannot do, stated so a clean run cannot be over-read
+
+- **Per-mode enumerations.** `GetFilters`/`GetShapers`/`GetRates` are mode-relative and reaching the
+  inactive mode needs `SetMode`. Tier 1 captures whichever mode the daemon is already in and records
+  which; the other mode stays derived until tier 2.
+- **The `Set*` anchors.** Their evidence *is* a state change. Tier 2 only, with an expendable daemon,
+  a separate opt-in, capture-and-restore and a human present. Never a merge gate.
+- **The live gate's own env handling and connect path.** `capture`/`diff`/`render`/`artifact_block`
+  are all proven hermetically against the fake; the gate's variable parsing and its connection to real
+  hardware are exercised only by an actual run.
