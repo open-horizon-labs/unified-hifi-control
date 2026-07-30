@@ -461,10 +461,23 @@ exact, and the allowlist decides without needing to know what a name means. That
 load-bearing pairing — either alone is insufficient, and the previous rounds failed
 precisely because they tried detection alone.
 
-**Residual, unfixed by either architecture:** items produced by macro *expansion* are
-invisible to a parse of pre-expansion source. Macro *invocations* are visited and their
-token streams checked — exact, because tokens are post-lexing — but a macro assembling an
-`impl` from fragments escapes A and B alike. Recorded rather than papered over.
+**The residual I first recorded was not one.** I wrote that macro-generated items escape
+both architectures and accepted it. Codex rejected that: `#[event_wire] pub enum
+AdaptiveEvent {}` and `make_event_wire!(AdaptiveEvent);` are live false passes, and they
+close the same way everything else here did — by permission, not detection. Two more
+allowlists: `AdaptiveEvent` may carry only `derive` and `doc`; every macro invocation in
+`src/producers/event.rs` must be on a list holding only `tracing::trace`.
+
+The reviewer then caught a second-order error in my first attempt at that closure: I
+collected only `Item::Macro`, while Rust permits a statement-position macro to expand to
+item definitions and a trait impl is valid wherever written. The escape simply moved one
+level down into a function body — and the module's real `tracing::trace!` call sits there,
+which is why an empty allowlist had passed. Replaced with a `syn::visit::Visit` collector
+over every `syn::Macro` at any depth.
+
+**What genuinely remains:** an *allowlisted* macro could expand to anything, and expansion
+is not in this source. That is why the lists are minimal rather than convenient — the
+guarantee is that nothing generative is permitted, not that generation is understood.
 
 ### Evidence
 

@@ -55,12 +55,22 @@
 //! and the allowlist decides without needing to know what a name means. The two compose;
 //! neither is sufficient alone.
 //!
-//! Residual, recorded rather than papered over: items produced by macro *expansion* are
-//! invisible to a parse of pre-expansion source, as they were to the text scanner. Macro
-//! *invocations* are visited and their token streams checked, which is exact because tokens
-//! are post-lexing — but a macro assembling an `impl` from fragments escapes both
-//! architectures.
+//! ## Macros, which parsing alone does not close either
+//!
+//! An attribute macro (`#[event_wire] pub enum AdaptiveEvent {}`) and an item-position
+//! macro (`make_event_wire!(AdaptiveEvent);`) each generate code while leaving imports,
+//! derives and `ItemImpl` entirely clean. An earlier commit recorded that as an accepted
+//! residual; Codex was right to reject it, because it is a live false pass and it closes
+//! the same way everything else here did — by permission. `AdaptiveEvent` may carry only
+//! `derive` and `doc`; and every macro invocation in `src/producers/event.rs` — at any
+//! depth, not only item position, since a statement-position macro can expand to items —
+//! must be on an allowlist that currently holds only `tracing::trace`.
+//!
+//! What genuinely remains: a macro *already allowlisted* could expand to anything, and
+//! expansion is not in this source. That is why both lists are empty or minimal — the
+//! guarantee is that nothing generative is permitted, not that generation is understood.
 
+use proc_macro2::TokenTree;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -97,6 +107,39 @@ const EVENT_ALLOWED_IMPORTS: &[&str] = &[
 /// Needed separately from the import allowlist because a derive requires no import at all:
 /// `#[derive(crate::wire::EventWire)]` names the macro by path.
 const ADAPTIVE_EVENT_ALLOWED_DERIVES: &[&str] = &["Debug", "Clone"];
+
+/// Exactly what attributes `AdaptiveEvent` may carry.
+///
+/// The third allowlist, and the one that closes what an earlier commit merely *documented*
+/// as residual. An **attribute macro** generates code without being a derive:
+///
+/// ```ignore
+/// #[event_wire]
+/// pub enum AdaptiveEvent { … }
+/// ```
+///
+/// leaves imports, derives and `ItemImpl` entirely clean while expanding to whatever it
+/// likes, including a `Serialize` impl. Inspecting derives alone cannot see it, and no
+/// amount of inspecting *can*, because the expansion is not in this file.
+///
+/// So the decision is again permission rather than detection: `derive` and `doc` are what
+/// the type actually carries, and anything else fails until somebody adds it deliberately.
+/// `cfg_attr` is deliberately **absent** — a conditional attribute is a conditional
+/// expansion, and the condition is somebody else's build flag.
+const ADAPTIVE_EVENT_ALLOWED_ATTRIBUTES: &[&str] = &["derive", "doc"];
+
+/// Macro invocations permitted **anywhere** in `src/producers/event.rs`.
+///
+/// `make_event_wire!(AdaptiveEvent);` generates an `impl` while leaving imports, derives
+/// and `ItemImpl` clean. Restricting the check to item position is not enough: Rust lets a
+/// macro in statement position expand to item definitions, and a trait impl is valid
+/// wherever it is written — so the escape simply moves one level down, into a function
+/// body. The collector therefore visits every `syn::Macro` at any depth.
+///
+/// `tracing::trace` is the module's one real invocation, and listing it is the price of the
+/// broader net: an allowlist that excluded it would be deleted the first time somebody
+/// added a log line.
+const EVENT_ALLOWED_MACROS: &[&str] = &["tracing::trace"];
 
 /// Modules a surface may not reach.
 const FORBIDDEN_MODULES: &[&str] = &["adaptive", "producers"];
@@ -219,6 +262,62 @@ fn collect_derives(meta: &Meta, out: &mut Vec<String>) {
     }
 }
 
+/// The path of every attribute in `attrs`, as a dotted name.
+///
+/// `#[derive(Debug)]` is `derive`, `#[doc = "…"]` is `doc`, `#[event_wire]` is
+/// `event_wire`, and `#[serde::skip]` is `serde::skip`.
+fn attribute_paths(attrs: &[Attribute]) -> Vec<String> {
+    attrs
+        .iter()
+        .map(|attr| {
+            attr.path()
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::")
+        })
+        .collect()
+}
+
+/// Attributes not on [`ADAPTIVE_EVENT_ALLOWED_ATTRIBUTES`].
+fn disallowed_attributes(attrs: &[Attribute]) -> Vec<String> {
+    attribute_paths(attrs)
+        .into_iter()
+        .filter(|path| !ADAPTIVE_EVENT_ALLOWED_ATTRIBUTES.contains(&path.as_str()))
+        .collect()
+}
+
+/// Every macro invocation in `file`, at any depth, as a dotted path.
+///
+/// Item position, statement position, expression position, inside an `impl` method, inside
+/// a closure — all of them. A `syn::visit::Visit` walk reaches each one, so there is no
+/// position for a code-generating macro to hide in.
+#[derive(Default)]
+struct MacroInvocationVisitor {
+    found: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for MacroInvocationVisitor {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.found.push(
+            mac.path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::"),
+        );
+        visit::visit_macro(self, mac);
+    }
+}
+
+fn macro_invocations(file: &File) -> Vec<String> {
+    let mut visitor = MacroInvocationVisitor::default();
+    visitor.visit_file(file);
+    visitor.found
+}
+
 /// Every trait implemented for `type_name` in `file`.
 ///
 /// Inherent impls (`impl AdaptiveEvent { … }`) are not trait impls and do not appear.
@@ -314,6 +413,39 @@ impl ModuleReferenceVisitor {
             self.found.insert(format!("{root}::{module}"));
         }
     }
+
+    /// Look for an `Ident :: Ident` token sequence, recursing into groups.
+    ///
+    /// The previous implementation stringified the whole token stream and substring-matched
+    /// it, so `println!("crate::adaptive")` registered as a reference — while the comment
+    /// above it claimed a literal could not fabricate a match. It could, and did. Found by
+    /// Codex at `4129b87`.
+    ///
+    /// Walking `TokenTree` fixes it by construction rather than by exclusion: a `Literal`
+    /// is a different variant from an `Ident`, so its contents are never sequence material.
+    /// A real path inside a macro is still four tokens and is still found.
+    fn scan_tokens(&mut self, stream: &proc_macro2::TokenStream) {
+        let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
+        for window in trees.windows(4) {
+            let (
+                TokenTree::Ident(root),
+                TokenTree::Punct(first),
+                TokenTree::Punct(second),
+                TokenTree::Ident(module),
+            ) = (&window[0], &window[1], &window[2], &window[3])
+            else {
+                continue;
+            };
+            if first.as_char() == ':' && second.as_char() == ':' {
+                self.note(&root.to_string(), &module.to_string());
+            }
+        }
+        for tree in trees {
+            if let TokenTree::Group(group) = tree {
+                self.scan_tokens(&group.stream());
+            }
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for ModuleReferenceVisitor {
@@ -343,14 +475,7 @@ impl<'ast> Visit<'ast> for ModuleReferenceVisitor {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        let rendered = mac.tokens.to_string().replace(' ', "");
-        for root in CRATE_ROOTS {
-            for module in FORBIDDEN_MODULES {
-                if rendered.contains(&format!("{root}::{module}")) {
-                    self.found.insert(format!("{root}::{module}"));
-                }
-            }
-        }
+        self.scan_tokens(&mac.tokens);
         visit::visit_macro(self, mac);
     }
 }
@@ -500,6 +625,57 @@ fn lint_adaptive_event_derives_only_what_it_is_allowed_to() {
     assert!(
         !derived.is_empty(),
         "no derives were found at all, which means the parse is not reaching the type"
+    );
+}
+
+#[test]
+fn lint_adaptive_event_carries_only_allowed_attributes() {
+    // Closes what the previous commit recorded as residual. An attribute macro generates
+    // code without being a derive, so inspecting derives alone cannot see it — and nothing
+    // can, because the expansion is not in this file. Permission rather than detection.
+    let file = parse_file_at(EVENT_MODULE);
+    let item = adaptive_event_enum(&file)
+        .unwrap_or_else(|| panic!("{EVENT_MODULE} must declare `enum {ADAPTIVE_EVENT}`"));
+
+    let unexpected = disallowed_attributes(&item.attrs);
+    assert!(
+        unexpected.is_empty(),
+        "{ADAPTIVE_EVENT} carries an attribute not on the allowlist: {unexpected:?}\n\
+         Permitted: {ADAPTIVE_EVENT_ALLOWED_ATTRIBUTES:?}. An attribute macro expands to \
+         code this file does not contain, so the list is the only thing that can decide."
+    );
+    assert!(
+        !item.attrs.is_empty(),
+        "no attributes were found at all, which means the parse is not reaching the type"
+    );
+}
+
+#[test]
+fn lint_the_internal_event_module_invokes_only_allowed_macros() {
+    // A macro expands to arbitrary code - an `impl`, a `use`, another type - while
+    // imports, derives and `ItemImpl` all stay clean. Checked at *every* depth, not only
+    // item position: Rust lets a statement-position macro expand to item definitions, and
+    // a trait impl is valid wherever it is written.
+    let file = parse_file_at(EVENT_MODULE);
+    let invocations = macro_invocations(&file);
+    let unexpected: Vec<&String> = invocations
+        .iter()
+        .filter(|name| !EVENT_ALLOWED_MACROS.contains(&name.as_str()))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "{EVENT_MODULE} invokes macros not on the allowlist: {unexpected:?}\n\
+         A macro can generate an impl for {ADAPTIVE_EVENT} without appearing in any \
+         import, derive or impl. Permitted: {EVENT_ALLOWED_MACROS:?}. If another becomes \
+         necessary, add it here having checked what it expands to."
+    );
+
+    // The allowlist must describe the module rather than merely permit it: if the one real
+    // invocation disappeared, the list would be silently over-broad.
+    assert_eq!(
+        invocations,
+        vec!["tracing::trace".to_string()],
+        "the module's macro invocations changed; the allowlist now describes something else"
     );
 }
 
@@ -691,6 +867,116 @@ fn every_known_import_escape_is_rejected() {
 }
 
 #[test]
+fn code_generating_macros_cannot_target_adaptive_event() {
+    // The residual the previous commit *documented* rather than closed. Codex was right
+    // that it is a live false pass, not a theoretical one: both of these leave imports,
+    // derives and `ItemImpl` entirely clean while generating whatever they like.
+    //
+    // An attribute macro on the item:
+    let attribute_macro = "#[event_wire]\npub enum AdaptiveEvent {}\n";
+    let file = snippet(attribute_macro);
+    let item = adaptive_event_enum(&file).expect("enum located");
+    let unexpected = disallowed_attributes(&item.attrs);
+    assert!(
+        !unexpected.is_empty(),
+        "an attribute macro was admitted: {:?}\n{attribute_macro}",
+        attribute_paths(&item.attrs)
+    );
+
+    // A function-like macro in item position:
+    let item_macro = "make_event_wire!(AdaptiveEvent);\npub enum AdaptiveEvent {}\n";
+    let invocations = macro_invocations(&snippet(item_macro));
+    assert!(
+        !invocations.is_empty(),
+        "an item-position macro invocation was invisible:\n{item_macro}"
+    );
+
+    // Nested inside a module, so the walk cannot be top-level only.
+    let nested = "mod inner {\n    make_event_wire!(AdaptiveEvent);\n}\n";
+    assert!(
+        !macro_invocations(&snippet(nested)).is_empty(),
+        "a nested item macro was invisible:\n{nested}"
+    );
+
+    // Inside a function body. Rust permits a macro in statement position to expand to item
+    // definitions, and a trait impl is valid wherever it is written — so restricting the
+    // walk to item position leaves the escape open one level down. Raised by the reviewer
+    // against the first version of this closure, which did exactly that.
+    for (label, source) in [
+        (
+            "statement position",
+            "fn f() {\n    make_event_wire!(AdaptiveEvent);\n}\n",
+        ),
+        (
+            "nested block",
+            "fn f() {\n    if x {\n        make_event_wire!(AdaptiveEvent);\n    }\n}\n",
+        ),
+        (
+            "expression position",
+            "fn f() {\n    let _ = make_event_wire!(AdaptiveEvent);\n}\n",
+        ),
+        (
+            "inside an impl method",
+            "impl Bus {\n    fn f(&self) {\n        make_event_wire!(AdaptiveEvent);\n    }\n}\n",
+        ),
+        (
+            "inside a nested closure",
+            "fn f() {\n    let g = || { make_event_wire!(AdaptiveEvent); };\n}\n",
+        ),
+    ] {
+        let found = macro_invocations(&snippet(source));
+        assert!(
+            found.iter().any(|name| name == "make_event_wire"),
+            "{label}: a macro invocation below item position was invisible: {found:?}\n{source}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|name| !EVENT_ALLOWED_MACROS.contains(&name.as_str())),
+            "{label}: the allowlist admitted {found:?}\n{source}"
+        );
+    }
+
+    // Derive-adjacent attributes that are inert on their own must still be rejected,
+    // because inertness is a property of the *expansion*, which is not in this file.
+    for source in [
+        "#[serde(rename_all = \"snake_case\")]\npub enum AdaptiveEvent {}\n",
+        "#[event_wire(with = \"json\")]\npub enum AdaptiveEvent {}\n",
+        "#[cfg_attr(feature = \"x\", event_wire)]\npub enum AdaptiveEvent {}\n",
+    ] {
+        let file = snippet(source);
+        let item = adaptive_event_enum(&file).expect("enum located");
+        assert!(
+            !disallowed_attributes(&item.attrs).is_empty(),
+            "a non-derive attribute was admitted:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn the_attribute_allowlist_accepts_what_the_type_actually_carries() {
+    // Positive control. `#[derive(...)]` and doc comments are what the real enum has;
+    // rejecting either would make the list unmaintainable.
+    for source in [
+        "#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n",
+        "/// docs\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n",
+        "#[doc = \"explicit\"]\n#[derive(Debug)]\npub enum AdaptiveEvent {}\n",
+    ] {
+        let file = snippet(source);
+        let item = adaptive_event_enum(&file).expect("enum located");
+        assert!(
+            disallowed_attributes(&item.attrs).is_empty(),
+            "an allowed attribute was rejected: {:?}\n{source}",
+            disallowed_attributes(&item.attrs)
+        );
+    }
+    assert!(
+        macro_invocations(&snippet("pub enum AdaptiveEvent {}\n")).is_empty(),
+        "an item macro was invented where there is none"
+    );
+}
+
+#[test]
 fn every_known_impl_escape_is_rejected() {
     for (label, source) in [
         ("canonical", "impl Serialize for AdaptiveEvent {}"),
@@ -789,6 +1075,32 @@ fn the_inspectors_do_not_invent_findings() {
         "prose or a string literal registered as a module reference"
     );
 
+    // A string literal *inside a macro* is the same thing, and the previous
+    // implementation got it wrong: it stringified the whole token stream and
+    // substring-matched, so `println!("crate::adaptive")` registered as a reference while
+    // the doc comment above the function claimed literals could not fabricate a match.
+    // Found by Codex at `4129b87`.
+    for (label, source) in [
+        (
+            "string literal in a macro",
+            "fn f() { println!(\"crate::adaptive\"); }",
+        ),
+        (
+            "raw string literal in a macro",
+            "fn f() { println!(r#\"crate::producers\"#); }",
+        ),
+        (
+            "literal nested in a macro group",
+            "fn f() { assert_eq!(x, vec![\"crate::adaptive\"]); }",
+        ),
+    ] {
+        assert!(
+            forbidden_module_references(&snippet(source)).is_empty(),
+            "{label}: a literal inside a macro fabricated a module reference: {:?}\n{source}",
+            forbidden_module_references(&snippet(source))
+        );
+    }
+
     // A module whose name merely shares a prefix is not forbidden.
     let near_miss = "use crate::adaptive_extras::X;\nuse crate::production::Y;\n";
     assert!(
@@ -816,6 +1128,17 @@ fn module_references_are_found_in_every_position() {
         (
             "inside a macro",
             "fn f() { println!(\"{:?}\", crate::adaptive::X); }",
+        ),
+        // `syn` strips a macro's outer delimiter, so the case above puts the path at the
+        // top level of the token stream and never exercises group recursion. A mutation
+        // that deleted the recursion still passed until this case existed.
+        (
+            "nested in a group inside a macro",
+            "fn f() { assert_eq!(a, wrap(crate::adaptive::X)); }",
+        ),
+        (
+            "nested two groups deep",
+            "fn f() { assert_eq!(a, wrap(vec![crate::producers::P])); }",
         ),
         (
             "attribute-decorated use",
@@ -868,9 +1191,8 @@ fn server_gate_detection_is_structural() {
         );
     }
 
-    assert_eq!(
+    assert!(
         module_cfg_gates(&snippet("pub mod adaptive;"), PRODUCERS_MODULE).is_none(),
-        true,
         "an absent module was reported as present"
     );
 }
