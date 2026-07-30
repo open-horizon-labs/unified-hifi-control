@@ -2178,3 +2178,25 @@ from the raw document — is preserved; the manual-derived compilation is gone.
 Worth naming why this was missed for five gate rounds: the amendment's provenance work concentrated on
 *where a claim came from* (`source_chain`) and not on *what rights attach to the content itself*. Those
 are different audits, and only the first had been run. #348 owns the standing guardrail.
+
+### Verification at the third-gate SHA
+
+| Command | Result |
+|---|---|
+| `--test hqplayer_conformance` | **173 passed; 0 failed; 0 ignored** |
+| lib unit tests | 84 passed |
+| `--test adapter_integration` / `--test zones_sha_integration` | 42 / 20 |
+| `--test api_contract` / `--test protocol_schema` | 2 / 41 — no route or payload drift |
+| `cargo fmt --check` | clean |
+| `cargo clippy -- -D warnings` | clean, 0 findings |
+| `git diff --check origin/v3...HEAD` | clean |
+| `cargo test --no-fail-fast` | **482 passed; 2 failed; 12 ignored** |
+| `git ls-tree -r HEAD .oh/.cache` | **0** |
+| live tier 1 / tier 2 | **not run** — daemon offline, no mutating permission |
+
+Both failures are the deterministic `/hqp/discover` environmental baseline; the LMS flake family did not
+fire. **#339 remains unmerged**, so PR CI may still show the known Rust 1.97 base lint failure on `v3`.
+
+**No production behaviour changed in this pass.** The focused byte-split RED exposed no defect in the
+carry design, so it stands as the gate directed. The only `src` edit is the consolidated `root_frame_end`
+documentation.
