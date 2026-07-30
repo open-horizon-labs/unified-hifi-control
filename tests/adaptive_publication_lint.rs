@@ -31,6 +31,43 @@ use walkdir::WalkDir;
 
 const PRODUCERS_DECLARATION: &str = "pub mod producers;";
 const ADAPTIVE_EVENT_DECLARATION: &str = "pub enum AdaptiveEvent {";
+
+/// Exactly what `src/producers/event.rs` may import, whitespace-normalized.
+///
+/// An **allowlist**, not a denylist, and that inversion is the point. Name-based detection
+/// has now been bypassed four times, most recently by a crate-local re-export:
+///
+/// ```ignore
+/// // src/wire.rs
+/// pub use serde::Serialize as EventWire;
+/// // src/producers/event.rs
+/// use crate::wire::EventWire;
+/// #[derive(EventWire)]
+/// pub enum AdaptiveEvent { … }
+/// ```
+///
+/// That file contains no `serde`, imports nothing from `serde`, and no resolver short of a
+/// real name resolver learns that `EventWire` serializes. Verified by compiling it: the
+/// build finished clean and all 24 lints passed. Found by CodeRabbit at `993d35e`.
+///
+/// Chasing re-export chains would be a partial resolver wearing a guarantee's clothes —
+/// it would still miss `pub use` through several modules, glob re-exports, and macros. An
+/// allowlist does not care what a name means: **any** import not on this list fails, so
+/// every re-export form is closed at once. The cost is that a legitimate new import has to
+/// be added here, deliberately, which for this module is the point rather than the tax.
+const EVENT_ALLOWED_IMPORTS: &[&str] = &[
+    "use std::sync::Arc;",
+    "use tokio::sync::broadcast;",
+    "use super::admission::{AdmissionRefusal,ProducerKey};",
+    "use crate::adaptive::{DocumentRevisions,ProducerDocument};",
+];
+
+/// Exactly what `AdaptiveEvent` may derive.
+///
+/// The companion to [`EVENT_ALLOWED_IMPORTS`], and necessary because a derive needs no
+/// import at all: `#[derive(crate::wire::EventWire)]` names the macro by path. Matching on
+/// permitted names rather than forbidden ones makes the spelling irrelevant.
+const ADAPTIVE_EVENT_ALLOWED_DERIVES: &[&str] = &["Debug", "Clone"];
 /// The readable spelling, used in failure messages.
 const SERVER_GATE: &str = "#[cfg(feature = \"server\")]";
 
@@ -126,6 +163,162 @@ fn forbidden_module_references(code: &str) -> Vec<String> {
     found
 }
 
+/// If a string literal begins at `chars[index]`, the index just past its end.
+///
+/// Recognizes ordinary `"…"`, byte `b"…"`, and **raw** `r"…"` / `r#"…"#` / `r##"…"##` /
+/// `br#"…"#`. Raw strings were the gap: a scanner that leaves string mode at the first `"`
+/// reads the rest of `r##"quote: " then ] remains data"##` as code, takes the `]` for an
+/// attribute close, and silently stops joining whatever follows. Found by CodeRabbit at
+/// `993d35e`, with the exploit supplied.
+///
+/// The terminator of a raw string is `"` followed by **the same number of hashes** it
+/// opened with, so an inner `"#` inside a `r##"…"##` literal is data.
+///
+/// `None` means no literal starts here. Callers must also check that the preceding
+/// character is not part of an identifier, or the `r` in `counter` looks like a prefix.
+fn string_literal_end(chars: &[char], index: usize) -> Option<usize> {
+    let mut cursor = index;
+    if chars.get(cursor) == Some(&'b') {
+        cursor += 1;
+    }
+    let raw = chars.get(cursor) == Some(&'r');
+    if raw {
+        cursor += 1;
+    }
+    let mut hashes = 0usize;
+    if raw {
+        while chars.get(cursor) == Some(&'#') {
+            hashes += 1;
+            cursor += 1;
+        }
+    }
+    if chars.get(cursor) != Some(&'"') {
+        return None;
+    }
+
+    let mut scan = cursor + 1;
+    if raw {
+        while scan < chars.len() {
+            if chars[scan] == '"' && (1..=hashes).all(|k| chars.get(scan + k) == Some(&'#')) {
+                return Some(scan + hashes + 1);
+            }
+            scan += 1;
+        }
+        return Some(chars.len());
+    }
+    while scan < chars.len() {
+        match chars[scan] {
+            '\\' => scan += 2,
+            '"' => return Some(scan + 1),
+            _ => scan += 1,
+        }
+    }
+    Some(chars.len())
+}
+
+/// If a character literal begins at `chars[index]`, the index just past its end.
+///
+/// Distinguished from a lifetime, which is the whole difficulty: `']'` is a literal whose
+/// bracket is data, while `'de` in `impl<'de> Deserialize<'de>` is not a literal at all and
+/// must not swallow the rest of the line.
+fn char_literal_end(chars: &[char], index: usize) -> Option<usize> {
+    if chars.get(index) != Some(&'\'') {
+        return None;
+    }
+    if chars.get(index + 1) == Some(&'\\') {
+        let mut scan = index + 2;
+        while scan < chars.len() {
+            if chars[scan] == '\'' {
+                return Some(scan + 1);
+            }
+            scan += 1;
+        }
+        return None;
+    }
+    if chars.get(index + 2) == Some(&'\'') {
+        return Some(index + 3);
+    }
+    None
+}
+
+/// Whether a literal prefix at `index` is a real prefix rather than the tail of a name.
+fn starts_a_literal(chars: &[char], index: usize) -> bool {
+    index == 0 || !(chars[index - 1].is_alphanumeric() || chars[index - 1] == '_')
+}
+
+/// The index just past a literal beginning at `index`, if one does.
+fn literal_end(chars: &[char], index: usize) -> Option<usize> {
+    match chars.get(index) {
+        Some('"') => string_literal_end(chars, index),
+        Some('r') | Some('b') if starts_a_literal(chars, index) => string_literal_end(chars, index),
+        Some('\'') => char_literal_end(chars, index),
+        _ => None,
+    }
+}
+
+/// Every `use` statement in `code`, whitespace-normalized, one per statement.
+///
+/// Run over comment-stripped code and anchored at a statement boundary: a doc comment
+/// containing the word "use" produced a spurious 700-character "import" when this was
+/// first written against raw source.
+fn imports_in(code: &str) -> Vec<String> {
+    let normalized = collapse_whitespace(code);
+    let chars: Vec<char> = normalized.chars().collect();
+    let mut found = Vec::new();
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let at_boundary = index == 0
+            || matches!(chars[index - 1], ' ' | ';' | '{' | '}' | '\n')
+                && !(index >= 2 && chars[index - 2].is_alphanumeric() && chars[index - 1] == ' ');
+        let is_use = chars[index..].starts_with(&['u', 's', 'e', ' ']);
+        // `pub use …` counts too; the boundary check sits before `pub`.
+        if is_use && at_boundary {
+            let mut scan = index;
+            while scan < chars.len() && chars[scan] != ';' {
+                scan += 1;
+            }
+            let statement: String = chars[index..scan.min(chars.len())].iter().collect();
+            found.push(format!("{statement};"));
+            index = scan + 1;
+            continue;
+        }
+        index += 1;
+    }
+    found
+}
+
+/// Every trait implemented for `type_name` in `code`, as written.
+///
+/// The companion to the derive allowlist: a hand-written `impl` needs no derive and no
+/// import. Terminator-checked so `AdaptiveEventLog` is not read as `AdaptiveEvent`.
+fn trait_impls_for(code: &str, type_name: &str) -> Vec<String> {
+    let normalized = collapse_whitespace(code);
+    let needle = format!("for {type_name}");
+    let mut found = Vec::new();
+    let mut search_from = 0usize;
+
+    while let Some(at) = normalized[search_from..].find(&needle) {
+        let absolute = search_from + at;
+        let after = normalized[absolute + needle.len()..].chars().next();
+        let terminated = after.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if terminated {
+            if let Some(impl_at) = normalized[..absolute].rfind("impl") {
+                let header = normalized[impl_at + "impl".len()..absolute].trim();
+                // Strip any generic parameter list introduced by `impl<…>`.
+                let trait_part = header.strip_prefix('<').map_or(header, |rest| {
+                    rest.split_once('>').map_or(rest, |(_, tail)| tail).trim()
+                });
+                if !trait_part.is_empty() {
+                    found.push(trait_part.to_string());
+                }
+            }
+        }
+        search_from = absolute + needle.len();
+    }
+    found
+}
+
 /// Collapse whitespace runs to one space, then close it up around path punctuation.
 ///
 /// Leaves ` as ` intact — which is the whole reason this is not a plain whitespace strip.
@@ -187,54 +380,53 @@ fn split_top_level(group: &str) -> Vec<&str> {
 /// of the code. String literals are kept so a forbidden path written as a string is still
 /// caught.
 fn code_only(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    let mut in_string = false;
+    let mut index = 0usize;
     let mut block_depth = 0usize;
 
-    while let Some(c) = chars.next() {
+    while index < chars.len() {
+        let c = chars[index];
+
         if block_depth > 0 {
-            if c == '*' && chars.peek() == Some(&'/') {
-                chars.next();
+            if c == '*' && chars.get(index + 1) == Some(&'/') {
                 block_depth -= 1;
-            } else if c == '/' && chars.peek() == Some(&'*') {
-                chars.next();
+                index += 2;
+                continue;
+            }
+            if c == '/' && chars.get(index + 1) == Some(&'*') {
                 block_depth += 1;
-            } else if c == '\n' {
+                index += 2;
+                continue;
+            }
+            if c == '\n' {
                 out.push('\n');
             }
+            index += 1;
             continue;
         }
-        if in_string {
-            out.push(c);
-            if c == '\\' {
-                if let Some(escaped) = chars.next() {
-                    out.push(escaped);
-                }
-            } else if c == '"' {
-                in_string = false;
+
+        // A literal is data. `//` and `/*` inside one are not comment markers, and a `"`
+        // inside a raw string does not end it.
+        if let Some(end) = literal_end(&chars, index) {
+            out.extend(&chars[index..end.min(chars.len())]);
+            index = end;
+            continue;
+        }
+
+        if c == '/' && chars.get(index + 1) == Some(&'/') {
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
             }
             continue;
         }
-        match c {
-            '"' => {
-                in_string = true;
-                out.push(c);
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                for skipped in chars.by_ref() {
-                    if skipped == '\n' {
-                        out.push('\n');
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                block_depth += 1;
-            }
-            _ => out.push(c),
+        if c == '/' && chars.get(index + 1) == Some(&'*') {
+            block_depth += 1;
+            index += 2;
+            continue;
         }
+        out.push(c);
+        index += 1;
     }
     out
 }
@@ -283,24 +475,23 @@ fn join_wrapped_attributes(code: &str) -> String {
     let mut out = String::with_capacity(code.len());
     let mut index = 0usize;
     let mut depth = 0usize;
-    let mut in_string = false;
 
     while index < chars.len() {
-        let c = chars[index];
-        if in_string {
-            out.push(c);
-            if c == '\\' && index + 1 < chars.len() {
-                out.push(chars[index + 1]);
-                index += 2;
-                continue;
+        // A literal is copied through whole, whatever it contains. This is the raw-string
+        // fix: `r##"quote: " then ] remains data"##` no longer ends at its embedded quote,
+        // so its `]` is data rather than an attribute close.
+        if let Some(end) = literal_end(&chars, index) {
+            let slice: String = chars[index..end.min(chars.len())].iter().collect();
+            if depth > 0 {
+                out.push_str(&slice.replace('\n', " "));
+            } else {
+                out.push_str(&slice);
             }
-            if c == '"' {
-                in_string = false;
-            }
-            index += 1;
+            index = end;
             continue;
         }
-        // `#[` and `#![` both open an attribute.
+
+        let c = chars[index];
         if c == '#' {
             let bracket = if chars.get(index + 1) == Some(&'!') {
                 index + 2
@@ -315,10 +506,6 @@ fn join_wrapped_attributes(code: &str) -> String {
             }
         }
         match c {
-            '"' => {
-                in_string = true;
-                out.push(c);
-            }
             '[' if depth > 0 => {
                 depth += 1;
                 out.push(c);
@@ -342,65 +529,54 @@ fn join_wrapped_attributes(code: &str) -> String {
 /// rather than truncated at the first `]`.
 fn attributes_in(text: &str) -> Vec<String> {
     let mut found = Vec::new();
-    let bytes: Vec<char> = text.chars().collect();
+    let chars: Vec<char> = text.chars().collect();
     let mut index = 0usize;
-    while index + 1 < bytes.len() {
-        if bytes[index] != '#' || (bytes[index + 1] != '[' && bytes[index + 1] != '!') {
+
+    while index + 1 < chars.len() {
+        if chars[index] != '#' || (chars[index + 1] != '[' && chars[index + 1] != '!') {
             index += 1;
             continue;
         }
-        // `#![...]` is an inner attribute; it applies to the enclosing module, not to the
-        // next item, so it is skipped rather than attributed to a declaration below it.
-        let open = if bytes[index + 1] == '!' {
+        let open = if chars[index + 1] == '!' {
             index + 2
         } else {
             index + 1
         };
-        if open >= bytes.len() || bytes[open] != '[' {
+        if chars.get(open) != Some(&'[') {
             index += 1;
             continue;
         }
-        let inner = bytes[index + 1] == '!';
+        let inner = chars[index + 1] == '!';
         let mut depth = 0usize;
-        let mut in_string = false;
         let mut cursor = open;
         let mut end = None;
-        while cursor < bytes.len() {
-            let c = bytes[cursor];
-            if in_string {
-                if c == '\\' {
-                    cursor += 2;
-                    continue;
-                }
-                if c == '"' {
-                    in_string = false;
-                }
-            } else {
-                match c {
-                    '"' => in_string = true,
-                    '[' => depth += 1,
-                    ']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = Some(cursor);
-                            break;
-                        }
+        while cursor < chars.len() {
+            if let Some(past) = literal_end(&chars, cursor) {
+                cursor = past;
+                continue;
+            }
+            match chars[cursor] {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(cursor);
+                        break;
                     }
-                    _ => {}
                 }
+                _ => {}
             }
             cursor += 1;
         }
         match end {
             Some(close) => {
                 if !inner {
-                    found.push(bytes[index..=close].iter().collect());
+                    found.push(chars[index..=close].iter().collect());
                 }
                 index = close + 1;
             }
-            // Unterminated. Record what is there rather than dropping an attribute.
             None => {
-                found.push(bytes[index..].iter().collect());
+                found.push(chars[index..].iter().collect());
                 break;
             }
         }
@@ -795,6 +971,79 @@ fn lint_adaptive_event_derives_no_serialization() {
 }
 
 #[test]
+fn lint_the_internal_event_module_imports_only_what_it_is_allowed_to() {
+    // The durable half. Every name-based guard in this file has now been bypassed —
+    // aliases, wrapped attributes, raw strings, and finally a crate-local re-export that
+    // leaves no trace of serde in the file at all. Detection loses that race by
+    // construction; permission does not.
+    //
+    // Anything not on `EVENT_ALLOWED_IMPORTS` fails, whatever it is named and wherever it
+    // was re-exported from.
+    let event = fs::read_to_string("src/producers/event.rs").expect("src/producers/event.rs");
+    let imports = imports_in(&code_only(&event));
+
+    let unexpected: Vec<&String> = imports
+        .iter()
+        .filter(|import| !EVENT_ALLOWED_IMPORTS.contains(&import.as_str()))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "src/producers/event.rs imports something not on the allowlist: {unexpected:?}\n\
+         This module holds the one producer type that must not reach a wire. A new import \
+         may be entirely fine — add it to EVENT_ALLOWED_IMPORTS deliberately, having \
+         checked it is not a serialization trait re-exported under another name."
+    );
+    assert!(
+        !imports.is_empty(),
+        "no imports were found at all, which means the scanner is not reading the file"
+    );
+}
+
+#[test]
+fn lint_adaptive_event_derives_only_what_it_is_allowed_to() {
+    // A derive needs no import: `#[derive(crate::wire::EventWire)]` names the macro by
+    // path, so the import allowlist alone does not close it. Permitting `Debug` and `Clone`
+    // and nothing else closes every spelling at once.
+    let event = fs::read_to_string("src/producers/event.rs").expect("src/producers/event.rs");
+    let attributes =
+        attributes_attached_to(&event, ADAPTIVE_EVENT_DECLARATION).unwrap_or_else(|| {
+            panic!("src/producers/event.rs must declare `{ADAPTIVE_EVENT_DECLARATION}`")
+        });
+
+    let derived: Vec<String> = attributes.iter().flat_map(|a| derive_tokens(a)).collect();
+    let unexpected: Vec<&String> = derived
+        .iter()
+        .filter(|token| !ADAPTIVE_EVENT_ALLOWED_DERIVES.contains(&token.as_str()))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "AdaptiveEvent derives something not on the allowlist: {unexpected:?}\n\
+         Permitted: {ADAPTIVE_EVENT_ALLOWED_DERIVES:?}. A derive under an alias or a \
+         re-exported path is indistinguishable from any other name, so the list is what \
+         decides."
+    );
+    assert!(
+        !derived.is_empty(),
+        "no derives were found at all, which means the scanner is not reading the type"
+    );
+}
+
+#[test]
+fn lint_adaptive_event_implements_no_traits() {
+    // The third surface a name-based guard has to cover, and the one a re-export hides
+    // best: `impl EventWire for AdaptiveEvent` needs neither serde in the file nor a
+    // derive. AdaptiveEvent implements nothing by hand today, so the allowlist is empty.
+    let event = fs::read_to_string("src/producers/event.rs").expect("src/producers/event.rs");
+    let impls = trait_impls_for(&code_only(&event), "AdaptiveEvent");
+    assert!(
+        impls.is_empty(),
+        "AdaptiveEvent has hand-written trait impls: {impls:?}\n\
+         None are expected. If one becomes necessary, allow it here having checked it is \
+         not a serialization trait under another name."
+    );
+}
+
+#[test]
 fn lint_the_internal_event_module_imports_no_serialization_trait() {
     // The structural half, and the one that makes aliasing moot rather than merely detected.
     //
@@ -1034,6 +1283,192 @@ fn a_non_serializing_adaptive_event_is_accepted() {
             "the scanner invented a serialization derive in:\n{source}\nfound: {offenders:?}"
         );
     }
+}
+
+#[test]
+fn a_crate_local_re_export_is_rejected_by_the_allowlists() {
+    // The exploit CodeRabbit supplied at `993d35e`, verbatim in shape. `src/wire.rs` does
+    // `pub use serde::Serialize as EventWire;` and `event.rs` imports `crate::wire::EventWire`
+    // — no `serde` anywhere in the file, and nothing short of a real name resolver learns
+    // what `EventWire` is. Verified by compiling it: the build was clean and all 24 lints
+    // passed.
+    //
+    // The allowlists do not try to learn. They refuse the import and refuse the derive.
+    let re_export_derive = "use crate::wire::EventWire;\nuse std::sync::Arc;\n#[derive(EventWire)]\npub enum AdaptiveEvent {\n}\n";
+    let imports = imports_in(&code_only(re_export_derive));
+    assert!(
+        imports
+            .iter()
+            .any(|import| !EVENT_ALLOWED_IMPORTS.contains(&import.as_str())),
+        "the re-exported import was admitted: {imports:?}"
+    );
+    let attributes = attributes_attached_to(re_export_derive, ADAPTIVE_EVENT_DECLARATION)
+        .expect("declaration found");
+    let derived: Vec<String> = attributes.iter().flat_map(|a| derive_tokens(a)).collect();
+    assert!(
+        derived
+            .iter()
+            .any(|token| !ADAPTIVE_EVENT_ALLOWED_DERIVES.contains(&token.as_str())),
+        "the re-exported derive was admitted: {derived:?}"
+    );
+
+    // A derive by fully-qualified path needs no import at all, so the import allowlist
+    // alone would not have closed it.
+    let qualified = "#[derive(crate::wire::EventWire)]\npub enum AdaptiveEvent {\n}\n";
+    let attributes =
+        attributes_attached_to(qualified, ADAPTIVE_EVENT_DECLARATION).expect("declaration");
+    let derived: Vec<String> = attributes.iter().flat_map(|a| derive_tokens(a)).collect();
+    assert!(
+        derived
+            .iter()
+            .any(|token| !ADAPTIVE_EVENT_ALLOWED_DERIVES.contains(&token.as_str())),
+        "a fully-qualified re-exported derive was admitted: {derived:?}"
+    );
+
+    // The hand-written form, which has the same gap and no derive to catch.
+    for source in [
+        "use crate::wire::EventWire;\nimpl EventWire for AdaptiveEvent {}\n",
+        "impl crate::wire::EventWire for AdaptiveEvent {}\n",
+        "impl<'de> crate::wire::EventRead<'de> for AdaptiveEvent {}\n",
+    ] {
+        let impls = trait_impls_for(&code_only(source), "AdaptiveEvent");
+        assert!(
+            !impls.is_empty(),
+            "a re-exported hand-written impl was admitted:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn the_allowlists_accept_the_module_as_it_actually_is() {
+    // Positive control, and the one that keeps the allowlists honest rather than merely
+    // strict: the real module must pass without exception. A list that only ever fails is
+    // as useless as one that only ever passes.
+    let event = fs::read_to_string("src/producers/event.rs").expect("src/producers/event.rs");
+    let code = code_only(&event);
+
+    for import in imports_in(&code) {
+        assert!(
+            EVENT_ALLOWED_IMPORTS.contains(&import.as_str()),
+            "the allowlist rejects an import the module legitimately has: {import:?}"
+        );
+    }
+    assert!(
+        trait_impls_for(&code, "AdaptiveEvent").is_empty(),
+        "the impl scanner invented an impl in the real module"
+    );
+
+    // And an unrelated impl for a *different* type in the same file must not register.
+    let other = "impl Default for AdaptiveBus {}\nimpl AdaptiveEvent {}\n";
+    assert!(
+        trait_impls_for(other, "AdaptiveEvent").is_empty(),
+        "an inherent impl or another type's impl was counted: {:?}",
+        trait_impls_for(other, "AdaptiveEvent")
+    );
+}
+
+#[test]
+fn raw_strings_do_not_break_the_shared_lexer() {
+    // A raw string ends at `"` followed by its own hash count, not at the first `"`. A
+    // scanner that leaves string mode at an embedded quote then reads the following `]` as
+    // the attribute close, so the attribute ends early, the next wrapped attribute is never
+    // joined, and the line walk discards it. Found by CodeRabbit at `993d35e`, which also
+    // supplied the working exploit.
+    let raw_then_wrapped = "#[doc = r##\"quote: \" then ] remains data\"##]\n\
+                            #[cfg_attr(\n    feature = \"x\",\n    derive(serde::Serialize)\n)]\n\
+                            pub enum AdaptiveEvent {\n}\n";
+
+    // Asserted on the property rather than on exact spacing: the wrapped attribute and its
+    // derive must end up on one line. Indentation inside the attribute is preserved, so a
+    // literal comparison would pin formatting rather than behaviour.
+    let joined = join_wrapped_attributes(raw_then_wrapped);
+    let cfg_line = joined
+        .lines()
+        .find(|line| line.contains("#[cfg_attr("))
+        .unwrap_or_default();
+    assert!(
+        cfg_line.contains("derive(serde::Serialize)") && cfg_line.trim_end().ends_with(")]"),
+        "a raw string ended the attribute early, so the wrapped derive was never joined:\n{joined}"
+    );
+
+    let names = serialization_names(raw_then_wrapped);
+    let attributes = attributes_attached_to(raw_then_wrapped, ADAPTIVE_EVENT_DECLARATION)
+        .expect("declaration found");
+    assert!(
+        attributes
+            .iter()
+            .any(|attribute| introduces_serialization(attribute, &names).is_some()),
+        "a raw doc attribute hid a serializing derive:\n{attributes:?}"
+    );
+
+    // The same limitation in `code_only`: a `//` or `/*` inside a raw string is data, not a
+    // comment, and treating it as one silently deletes the rest of the line.
+    let raw_with_comment_markers = "#[doc = r\"a // b /* c\"]\nuse crate::adaptive::X;\n";
+    assert!(
+        code_only(raw_with_comment_markers).contains("use crate::adaptive::X;"),
+        "a raw string containing comment markers swallowed the code after it: {:?}",
+        code_only(raw_with_comment_markers)
+    );
+
+    // Hash-count matching: an inner `"#` must not terminate a `r##"…"##` literal.
+    let nested_hashes = "#[doc = r##\"ends with \"# not here\"##]\n#[derive(Serialize)]\npub enum AdaptiveEvent {\n}\n";
+    let attributes =
+        attributes_attached_to(nested_hashes, ADAPTIVE_EVENT_DECLARATION).expect("declaration");
+    assert!(
+        attributes.iter().any(|attribute| introduces_serialization(
+            attribute,
+            &["Serialize".to_string()]
+        )
+        .is_some()),
+        "hash-count matching failed, hiding the derive:\n{attributes:?}"
+    );
+
+    // Char literals are the same class: `']'` is data, not a bracket.
+    let char_bracket =
+        "#[doc = \"x\"]\n#[cfg_attr(all(unix), derive(Serialize))]\npub enum AdaptiveEvent {\n}\n";
+    let attributes =
+        attributes_attached_to(char_bracket, ADAPTIVE_EVENT_DECLARATION).expect("declaration");
+    assert!(
+        attributes.iter().any(|attribute| introduces_serialization(
+            attribute,
+            &["Serialize".to_string()]
+        )
+        .is_some()),
+        "attribute scan lost the derive:\n{attributes:?}"
+    );
+}
+
+#[test]
+fn raw_string_lexing_does_not_over_consume() {
+    // Positive controls for the lexer. Over-consuming is as bad as under-consuming: it would
+    // swallow real code into a phantom string and hide whatever came next.
+    let ordinary = "#[doc = \"plain\"]\n#[derive(Debug)]\npub enum AdaptiveEvent {\n}\n";
+    let attributes =
+        attributes_attached_to(ordinary, ADAPTIVE_EVENT_DECLARATION).expect("declaration");
+    assert_eq!(
+        attributes.len(),
+        2,
+        "ordinary strings mis-lexed: {attributes:?}"
+    );
+
+    // `r` as the tail of an identifier is not a raw-string prefix.
+    let identifier_r = "let counter = 1; let other = \"x\";\nuse crate::adaptive::Y;\n";
+    assert!(
+        code_only(identifier_r).contains("use crate::adaptive::Y;"),
+        "an identifier ending in `r` was read as a raw string: {:?}",
+        code_only(identifier_r)
+    );
+
+    // A lifetime is not a char literal.
+    let lifetime = "impl<'de> Deserialize<'de> for AdaptiveEvent {}\n";
+    assert!(
+        handwritten_serialization_impl(lifetime, "AdaptiveEvent", &["Deserialize".to_string()])
+            .is_some(),
+        "a lifetime was mistaken for a char literal and lost the impl"
+    );
+
+    // Comments still get stripped when they are actually comments.
+    assert!(!code_only("// crate::adaptive\nlet x = 1;\n").contains("crate::adaptive"));
 }
 
 #[test]
