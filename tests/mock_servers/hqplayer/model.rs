@@ -99,13 +99,64 @@ impl Metadata {
     }
 }
 
+/// Which DSP chain the engine currently has **loaded**.
+///
+/// Distinct from the configured mode, and that distinction is the point. Under `[source]`
+/// (`mode_index == 0`) a chain *is* loaded and takes filter and shaper edits live, but which one
+/// depends on the material the source is feeding — so the configured mode cannot answer it. Deriving
+/// the chain from `mode_index`, as this model did before the HQPTuner amendment, makes a
+/// source-following session inexpressible. Chain liveness and pin family are not one question.
+///
+/// **Provenance: derived-upstream, tier-2-only.** Source-following is an upstream observation on
+/// hqplayerd 6.0.4 (Opal), one host, and is *not* UHC-qualified — see #332. It is also not
+/// promotable by the tier-1 read-only gate: tier 1 captures whichever chain the daemon already has
+/// loaded, and reaching the other one needs `SetMode`, which mutates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadedChain {
+    Pcm,
+    Sdm,
+}
+
+/// How a renderer reports `active_mode`.
+///
+/// `State.active_mode` and `Status.active_mode` are the subject of a live contradiction in UHC's own
+/// evidence base, and **#341 owns resolving it**:
+///
+/// * `docs/hqplayer-protocol-reference.md` warns that `Status.active_mode` may report `[source]` even
+///   while DSD is being output, and says to trust `State`'s numeric `active_mode`.
+/// * The HQPTuner audit *relies* on `Status.active_mode` as its chain resolver, and separately
+///   verified (2026-07-29, mid-playback) that under `[source]` it echoes `"[source]"`.
+///
+/// Both cannot be fully right. Before this amendment the model derived both fields from
+/// `mode_index`, so the fake agreed with itself by construction and quietly settled a question the
+/// project had agreed to leave open. Making the reporting a **per-profile policy** means a fixture
+/// states which behaviour it claims, and a divergence between the two sources becomes something a
+/// test can express rather than something the fake has ruled out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveModeReporting {
+    /// Echo the **configured** mode. Under `[source]` this reports `[source]` and resolves nothing.
+    /// Verified upstream for `Status.active_mode`: hqplayerd 6.0.4, 2026-07-29, playback active.
+    EchoesConfiguredMode,
+    /// Resolve to the **loaded** chain's family — what a caller usually wants, and what
+    /// `docs/hqplayer-protocol-reference.md` claims of `State.active_mode`. **Unverified** for either
+    /// field: no capture in UHC's evidence base shows a resolving `active_mode` under `[source]`.
+    ResolvesLoadedChain,
+}
+
 /// The daemon's observable state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DaemonState {
     /// 0 stopped, 1 paused, 2 playing, 3 stop requested.
     pub playback: u8,
-    /// `ModesItem` **list index**: 0 `[source]`, 1 PCM, 2 SDM.
+    /// The **configured** `ModesItem` list index: 0 `[source]`, 1 PCM, 2 SDM.
+    ///
+    /// For which chain is loaded, read [`Self::loaded_chain`] — under `[source]` these differ.
     pub mode_index: u32,
+    /// The chain the engine has loaded, independent of [`Self::mode_index`].
+    ///
+    /// A configured PCM or SDM mode pins this. Under `[source]` the source decides, so a test moves
+    /// it with [`DaemonModel::external_change`] while `mode_index` stays 0.
+    pub loaded_chain: LoadedChain,
     pub filter_1x_index: u32,
     pub filter_nx_index: u32,
     pub shaper_index: u32,
@@ -134,6 +185,8 @@ impl Default for DaemonState {
         Self {
             playback: 0,
             mode_index: 1, // PCM
+            // Consistent with the configured mode: a configured PCM mode pins the PCM chain.
+            loaded_chain: LoadedChain::Pcm,
             filter_1x_index: 6,
             filter_nx_index: 6,
             shaper_index: 4,
@@ -231,6 +284,12 @@ struct Inner {
     state: DaemonState,
     faults: Faults,
     style: DocumentStyle,
+    /// How `State.active_mode` reports. Separate from the `Status` policy **because the contradiction
+    /// is precisely that the two may disagree** — one shared field would re-impose the agreement the
+    /// amendment removed.
+    state_active_mode: ActiveModeReporting,
+    /// How `Status.active_mode` reports.
+    status_active_mode: ActiveModeReporting,
     enums: Enumerations,
     /// Every request line received, in order, so a test can assert on the value the client actually
     /// put on the wire (AC5) instead of on timing.
@@ -254,6 +313,13 @@ impl DaemonModel {
             state: DaemonState::default(),
             faults: Faults::default(),
             style: DocumentStyle::default(),
+            // Defaults reproduce the *current* shipped model exactly, so no existing expectation
+            // changes meaning. They are not a ruling on the contradiction: `EchoesConfiguredMode`
+            // happens to be the verified behaviour for `Status` (hqplayerd 6.0.4, 2026-07-29) and is
+            // merely the status quo for `State`, whose resolving claim is unverified. A fixture that
+            // wants either behaviour must now say so.
+            state_active_mode: ActiveModeReporting::EchoesConfiguredMode,
+            status_active_mode: ActiveModeReporting::EchoesConfiguredMode,
             enums: Enumerations::load(profile),
             requests: Vec::new(),
         };
@@ -279,6 +345,31 @@ impl DaemonModel {
 
     pub fn set_style(&self, style: DocumentStyle) {
         self.lock().style = style;
+    }
+
+    /// Declare how each renderer reports `active_mode`.
+    ///
+    /// A fixture must state this rather than inherit it, because the two sources are the subject of
+    /// an unresolved evidence contradiction that **#341** owns. See [`ActiveModeReporting`].
+    pub fn set_active_mode_reporting(
+        &self,
+        state: ActiveModeReporting,
+        status: ActiveModeReporting,
+    ) {
+        let mut inner = self.lock();
+        inner.state_active_mode = state;
+        inner.status_active_mode = status;
+    }
+
+    /// Move the **loaded chain** without touching the configured mode, as a source change does under
+    /// `[source]`. Chain-scoped indices are clamped into the new chain's lists, which is a
+    /// self-consistency invariant and not a claim that the daemon preserves selections.
+    ///
+    /// **Provenance: derived-upstream, tier-2-only** — see [`LoadedChain`].
+    pub fn source_loads_chain(&self, chain: LoadedChain) {
+        let mut inner = self.lock();
+        inner.state.loaded_chain = chain;
+        inner.clamp_to_loaded_chain();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -331,8 +422,31 @@ impl DaemonModel {
 }
 
 impl Inner {
+    /// Whether the **loaded chain** is SDM.
+    ///
+    /// Reads `loaded_chain`, deliberately not `mode_index`. Before the amendment this was
+    /// `mode_index == 2`, which meant `[source]` served the PCM lists unconditionally and no fixture
+    /// could express a source-following session.
     fn sdm(&self) -> bool {
-        self.state.mode_index == 2
+        self.state.loaded_chain == LoadedChain::Sdm
+    }
+
+    /// Clamp every chain-scoped index into the currently loaded chain's list bounds.
+    ///
+    /// This is a **self-consistency invariant, not a behavioural claim**: a real daemon never reports
+    /// an index outside its own list, and the two chains' lists differ in length. It deliberately
+    /// does *not* assert that the daemon preserves a selection across a chain change, which is
+    /// unobserved — it only keeps the model from reporting an index its own enumeration cannot
+    /// resolve. `with_profile` applies the same invariant at construction.
+    fn clamp_to_loaded_chain(&mut self) {
+        let clamp = |value: u32, count: u32| if count == 0 { 0 } else { value.min(count - 1) };
+        let filters = self.entry_count("GetFilters", "FiltersItem");
+        let shapers = self.entry_count("GetShapers", "ShapersItem");
+        let rates = self.entry_count("GetRates", "RatesItem");
+        self.state.filter_1x_index = clamp(self.state.filter_1x_index, filters);
+        self.state.filter_nx_index = clamp(self.state.filter_nx_index, filters);
+        self.state.shaper_index = clamp(self.state.shaper_index, shapers);
+        self.state.rate_index = clamp(self.state.rate_index, rates);
     }
 
     fn enumeration(&self, family: &str) -> String {
@@ -387,8 +501,21 @@ impl Inner {
         format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>{document}")
     }
 
+    /// The mode index the *loaded* chain corresponds to: 1 PCM, 2 SDM. Used only by a resolving
+    /// [`ActiveModeReporting`] policy.
+    fn loaded_chain_mode_index(&self) -> u32 {
+        match self.state.loaded_chain {
+            LoadedChain::Pcm => 1,
+            LoadedChain::Sdm => 2,
+        }
+    }
+
     fn render_state(&mut self) -> String {
         self.tick_pending();
+        let active_mode_index = match self.state_active_mode {
+            ActiveModeReporting::EchoesConfiguredMode => self.state.mode_index,
+            ActiveModeReporting::ResolvesLoadedChain => self.loaded_chain_mode_index(),
+        };
         let s = &self.state;
         let doc = format!(
             concat!(
@@ -408,7 +535,10 @@ impl Inner {
             shaper = s.shaper_index,
             rate = s.rate_index,
             volume = format_db(s.volume_db),
-            active_mode = s.mode_index,
+            // Policy-driven, never derived from `mode_index` directly: see `ActiveModeReporting`.
+            // `State.active_mode` is numeric, so a resolving policy reports the loaded chain's own
+            // mode index rather than the configured one.
+            active_mode = active_mode_index,
             active_rate = s.active_rate_hz,
             conv = flag(s.convolution),
             invert = flag(s.invert),
@@ -428,7 +558,13 @@ impl Inner {
             self.name_at_index("GetFilters", "FiltersItem", self.state.filter_nx_index);
         let active_shaper =
             self.name_at_index("GetShapers", "ShapersItem", self.state.shaper_index);
-        let active_mode = self.name_at_index("GetModes", "ModesItem", self.state.mode_index);
+        // Policy-driven: `Status.active_mode` is a display string, so an echoing policy names the
+        // configured mode (`[source]` included) while a resolving one names the loaded chain.
+        let active_mode_index = match self.status_active_mode {
+            ActiveModeReporting::EchoesConfiguredMode => self.state.mode_index,
+            ActiveModeReporting::ResolvesLoadedChain => self.loaded_chain_mode_index(),
+        };
+        let active_mode = self.name_at_index("GetModes", "ModesItem", active_mode_index);
         let nl = self.newline();
         let s = self.state.clone();
 
@@ -695,18 +831,33 @@ impl Responder for DaemonModel {
             }
 
             "SetMode" => match request_u32(request, "value") {
-                Some(index) if index < inner.entry_count("GetModes", "ModesItem") => inner.apply(
-                    "SetMode",
-                    Box::new(move |s| {
-                        s.mode_index = index;
-                        // A mode change swaps the enumerations wholesale and resets rate to auto.
-                        s.rate_index = 0;
-                        s.active_rate_hz = 0;
-                        s.filter_1x_index = 0;
-                        s.filter_nx_index = 0;
-                        s.shaper_index = 0;
-                    }),
-                ),
+                Some(index) if index < inner.entry_count("GetModes", "ModesItem") => {
+                    let reply = inner.apply(
+                        "SetMode",
+                        Box::new(move |s| {
+                            s.mode_index = index;
+                            // Verified: `SetMode` clears the single rate pin outright, and does so
+                            // even when the mode does not change. Measured upstream 2026-07-28.
+                            s.rate_index = 0;
+                            s.active_rate_hz = 0;
+                            // A configured PCM or SDM mode pins the loaded chain. `[source]` does
+                            // not: the source keeps deciding, so the chain is left where it was.
+                            match index {
+                                1 => s.loaded_chain = LoadedChain::Pcm,
+                                2 => s.loaded_chain = LoadedChain::Sdm,
+                                _ => {}
+                            }
+                            // NOTE: this deliberately no longer resets filter and shaper indices to
+                            // 0. That reset was an unevidenced invention of this fake — upstream says
+                            // `SetMode` clears the *rate pin* and reloads the chain, and says nothing
+                            // about filters returning to the first entry. Keeping indices consistent
+                            // with the newly loaded chain's list is handled by the clamp below, which
+                            // is an invariant rather than a behavioural claim.
+                        }),
+                    );
+                    inner.clamp_to_loaded_chain();
+                    reply
+                }
                 _ => inner.error("SetMode", "invalid mode"),
             },
 

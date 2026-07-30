@@ -29,7 +29,9 @@ use unified_hifi_control::adapters::hqplayer::{framing, HqpAdapter, HqpTimeouts}
 use unified_hifi_control::bus::create_bus;
 
 use mock_servers::hqplayer::corpus::{self, LEGACY_PROFILE, VERIFIED_PROFILE};
-use mock_servers::hqplayer::model::{request_attr, DaemonModel, DocumentStyle, Metadata};
+use mock_servers::hqplayer::model::{
+    request_attr, ActiveModeReporting, DaemonModel, DocumentStyle, LoadedChain, Metadata,
+};
 use mock_servers::hqplayer::tier1;
 use mock_servers::hqplayer::wire::{Chunking, Disruption, WirePolicy, WireServer};
 
@@ -3107,6 +3109,167 @@ async fn an_unbounded_reply_is_rejected_by_an_explicit_byte_cap_and_the_next_com
         state.state, 0,
         "the recovered command must read the daemon's real state, not leftovers from the \
          oversized reply; got {state:?}"
+    );
+    h.stop();
+}
+
+// -----------------------------------------------------------------------------
+// Bite 3 — the loaded-chain axis
+//
+// Capability, not client behaviour. #347 owns every client-side consequence: noticing a chain
+// change, invalidating enumerations, suppressing a rate pin under `[source]`, skipping a no-op mode
+// write. The tests below prove the fake can now *express* those situations, which is what unblocks
+// #347. They are model-fidelity and are not client reds — no production stub was added to make any
+// of them fail first, because a stub would be manufactured evidence rather than a defect.
+// -----------------------------------------------------------------------------
+
+/// Before this bite, `Inner::sdm()` was `mode_index == 2`, so `[source]` served the PCM lists
+/// unconditionally and a source-following session was inexpressible.
+///
+/// Provenance of the behaviour being modelled: **derived-upstream, tier-2-only.** Source-following is
+/// an upstream observation on hqplayerd 6.0.4 (Opal), one host, not UHC-qualified (#332), and the
+/// tier-1 read-only gate cannot promote it — tier 1 sees only the chain already loaded.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn the_loaded_chain_moves_under_source_while_the_configured_mode_stays_source() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| s.mode_index = 0); // configured `[source]`
+
+    let pcm_filters = h.model.current_enumeration("GetFilters");
+    h.model.source_loads_chain(LoadedChain::Sdm);
+    let sdm_filters = h.model.current_enumeration("GetFilters");
+
+    assert_eq!(
+        h.model.state().mode_index,
+        0,
+        "the configured mode must be untouched: a source change is not a mode change"
+    );
+    assert_ne!(
+        pcm_filters, sdm_filters,
+        "the enumeration served must follow the LOADED chain, so a source change swaps the lists \
+         while `State.mode` stays 0"
+    );
+    assert_eq!(
+        sdm_filters,
+        corpus::document(VERIFIED_PROFILE, "filters_sdm"),
+        "under a loaded SDM chain the SDM list is the one in force"
+    );
+    h.stop();
+}
+
+/// The fake must be **unable** to settle the `State.active_mode` versus `Status.active_mode`
+/// contradiction, which #341 owns. Before this bite both fields were derived from `mode_index`, so
+/// they agreed by construction and no fixture could state a disagreement.
+///
+/// This asserts expressibility in both directions rather than picking a winner: that is the whole
+/// point, and a test that asserted one reading would be the fake deciding.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn the_fake_does_not_decide_the_state_versus_status_active_mode_contradiction() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`
+        s.playback = 2;
+    });
+    h.model.source_loads_chain(LoadedChain::Sdm);
+
+    // Reading 1: Status echoes the configured mode (verified upstream), State resolves the loaded
+    // chain (the claim in UHC's own reference document). The two therefore disagree.
+    h.model.set_active_mode_reporting(
+        ActiveModeReporting::ResolvesLoadedChain,
+        ActiveModeReporting::EchoesConfiguredMode,
+    );
+    let state = h.adapter.get_state().await.expect("State");
+    let status = h.adapter.get_playback_status().await.expect("Status");
+    assert_eq!(
+        (state.active_mode, status.active_mode.as_str()),
+        (2, "[source]"),
+        "with the two policies set apart, the documents must be able to disagree: State resolving \
+         the loaded SDM chain while Status echoes `[source]`"
+    );
+
+    // Reading 2: both echo. Now they agree, and `[source]` resolves nothing on either side.
+    h.model.set_active_mode_reporting(
+        ActiveModeReporting::EchoesConfiguredMode,
+        ActiveModeReporting::EchoesConfiguredMode,
+    );
+    let state = h.adapter.get_state().await.expect("State");
+    let status = h.adapter.get_playback_status().await.expect("Status");
+    assert_eq!(
+        (state.active_mode, status.active_mode.as_str()),
+        (0, "[source]"),
+        "with both policies echoing, neither source resolves the loaded chain — which is the \
+         behaviour the reference document warns about"
+    );
+    h.stop();
+}
+
+/// `SetMode` clears the single rate pin **even when the mode does not change**. Measured upstream
+/// 2026-07-28.
+///
+/// **Label: model-fidelity.** Deliberately so: no client code reads the pin after a mode write, so
+/// there is nothing here that could fail for a client reason. #347 owns the consequence — skipping a
+/// mode write that is already running, rather than destroying the user's pin.
+///
+/// Provenance: **derived-upstream**, pending #332.
+#[tokio::test]
+async fn a_same_mode_set_mode_still_clears_the_rate_pin() {
+    let h = Harness::verified().await;
+    h.adapter.set_rate(44100).await.expect("pin a PCM rate");
+    let pinned = h.model.state();
+    assert_ne!(
+        pinned.rate_index, 0,
+        "precondition: the pin must actually be set before a mode write can clear it"
+    );
+
+    // The mode is already PCM. This write changes nothing about the mode.
+    h.adapter.set_mode("PCM").await.expect("same-mode SetMode");
+
+    let after = h.model.state();
+    assert_eq!(
+        (after.mode_index, after.rate_index, after.active_rate_hz),
+        (1, 0, 0),
+        "a no-op mode write still clears the pin, so a reconciliation loop that writes the mode \
+         unconditionally destroys user state; got {after:?}"
+    );
+    h.stop();
+}
+
+/// Records the removal of unevidenced fake behaviour.
+///
+/// The model used to reset `filter_1x`, `filter_nx` and `shaper` to index 0 on every `SetMode`.
+/// Upstream says `SetMode` clears the *rate pin* and reloads the chain; nothing says selections
+/// return to the first entry. A fake that invents behaviour is the failure mode this issue exists to
+/// end — inventing it in `tests/` is only harder to see.
+///
+/// Indices are still kept inside the loaded chain's list bounds, which is a self-consistency
+/// invariant (a daemon never reports an index outside its own list) and not a claim that selections
+/// survive a chain change.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn set_mode_does_not_reset_the_filter_and_shaper_selections() {
+    let h = Harness::verified().await;
+    let chosen = corpus::index_of(
+        &corpus::document(VERIFIED_PROFILE, "filters_pcm"),
+        "FiltersItem",
+        "poly-sinc-gauss-long",
+    )
+    .expect("the name is in the observed PCM list");
+    h.adapter
+        .set_filter_nx("poly-sinc-gauss-long")
+        .await
+        .expect("SetFilter");
+    assert_eq!(h.model.state().filter_nx_index, chosen, "precondition");
+
+    h.adapter.set_mode("PCM").await.expect("same-mode SetMode");
+
+    assert_eq!(
+        h.model.state().filter_nx_index,
+        chosen,
+        "a mode write must not invent a return to the first filter: that reset was never observed"
     );
     h.stop();
 }
