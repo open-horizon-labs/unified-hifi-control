@@ -1037,3 +1037,53 @@ printing a misleading `set_` prefix.
 three of three:** check 34 found HQP-C-064's coverage gap, check 35's first run found the line-466 status
 drift, and check 34's own controls — added under scrutiny — found the `set_` fallback before any reviewer
 had to see it fail.
+
+### CodeRabbit at `c9954ef`: check 34 repeated the very failure mode this PR exists to name
+
+The comment landed while two later commits were already pushed, and its finding was not addressed by
+either: **check 34 matched source text, so it could not distinguish an executable call from a mention** —
+in comments, string literals, fixture metadata or fake setup. Its instruction was explicit: parse the cited
+function with `syn` and require a **call expression**, and define separately what a fixture proof can prove.
+
+**It was right, and the live consequence was worse than the report:**
+
+> **HQP-C-001's `SetMode` claim was being credited by the word `SetMode` inside `modes.xml`'s provenance
+> comment.** The test it cited — `modes_list_distinguishes_list_index_from_enum_id` — never calls
+> `set_mode`; verified by parsing its 13-line body. A command claim was resting on a word in a fixture's
+> metadata: the weakest possible evidence, dressed as the strongest.
+
+#### The rewrite
+
+`test_exercises_command` parses the cited test and accepts exactly two things: a **call expression** whose
+method or function is the adapter method that emits the command (prefix-matched, so `set_filter` credits
+`set_filter_1x`), or a **string literal shaped like the raw wire element** (`"<SetJunkFilter …"`), which is
+how a command with no adapter method is actually sent.
+
+Refused, each for a stated reason, and each pinned as a control:
+
+| Refused | Why |
+|---|---|
+| A comment | A plan is not a proof |
+| A **bare** command name in a string literal | `accept_but_ignore("SetRate")` *arms* the fake; it sends nothing. Requiring the `<` separates an arrangement from an invocation — the distinction a substring match cannot make |
+| An unrelated setter for an unmapped command | Closed earlier, still pinned |
+| A state **read** | `get_state()` is not sending a command |
+| **A fixture, at all** | `FIXTURES_NEVER_EXERCISE`: a fixture is a document, an invocation is an action. Wrong in kind, not a near-miss — and it was the live defect above |
+
+`a_fixture_containing_a_command_name_in_its_metadata_is_not_proof_of_that_command` is a tripwire on the real
+`modes.xml`: it asserts the word is present in the file and absent from the parsed document, so re-admitting
+fixture text as command evidence fails.
+
+**HQP-C-001 now cites `a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain`**, which does call
+`set_mode`. Non-vacuity re-proven by removing that citation and watching the check name the row again.
+
+#### One defect of my own, found by my own controls
+
+The first version returned `None` when a test had **no calls and no literals**, conflating *"cannot answer"*
+with *"answers no"* — a caller could not tell a missing citation from an empty one. `None` now means the
+test is **absent**, and only that; a test that exercises nothing answers `false`. Two controls pin both.
+
+**Sixteen defects on record. The mechanism count is now decisive: nine of the sixteen were a text scan
+standing in for a parser** — and this one was in a check written *to guard against wording outrunning
+evidence*, which is the same trap one level up. Every text-matching helper that has been converted to
+structural parsing has stayed converted; none of the parsed ones has been reopened by a later pass.
+Checks: **36 → 37**.

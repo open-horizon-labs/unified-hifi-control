@@ -1188,46 +1188,42 @@ fn every_command_a_claim_names_is_exercised_by_one_of_its_own_proofs() {
         if named.is_empty() {
             continue;
         }
-        let mut bodies = String::new();
+        // Only test proofs are considered: `FIXTURES_NEVER_EXERCISE`.
+        let mut cited: Vec<(String, String)> = Vec::new();
         for proof in c.proof.split(" · ") {
             let p = proof.trim().trim_matches('`');
             if let Some(spec) = p.strip_prefix("test:") {
-                // Resolve the proof's own file. Reading only the conformance suite would silently skip
-                // any row whose proof lives elsewhere, and a skipped row is a vacuous check.
-                let (file, name) = match spec.split_once("::") {
-                    Some((f, n)) => (f.to_string(), n.to_string()),
-                    None => (DEFAULT_PROOF_FILE.to_string(), spec.to_string()),
-                };
-                let src = if file == DEFAULT_PROOF_FILE {
-                    Some(conformance.clone())
-                } else {
-                    fs::read_to_string(repo_root().join(&file)).ok()
-                };
-                if let Some(body) = src.as_deref().and_then(|src| test_body(src, &name)) {
-                    bodies.push_str(&body);
-                    bodies.push('\n');
-                }
-            } else if let Some(rel) = p.strip_prefix("fixture:") {
-                if let Ok(doc) = fs::read_to_string(repo_root().join(rel)) {
-                    bodies.push_str(&doc);
-                    bodies.push('\n');
+                match spec.split_once("::") {
+                    Some((f, n)) => cited.push((f.to_string(), n.to_string())),
+                    None => cited.push((DEFAULT_PROOF_FILE.to_string(), spec.to_string())),
                 }
             }
         }
-        if bodies.is_empty() {
-            continue; // no executable proof to check against; see the doc comment
+        if cited.is_empty() {
+            continue; // nothing executable to check against; see the doc comment
         }
         for cmd in named {
             if exempt.contains(&cmd) {
                 continue;
             }
-            if !command_is_exercised(&bodies, &cmd) {
+            let exercised = cited.iter().any(|(file, name)| {
+                let src = if file == DEFAULT_PROOF_FILE {
+                    Some(conformance.clone())
+                } else {
+                    fs::read_to_string(repo_root().join(file)).ok()
+                };
+                src.and_then(|src| syn::parse_file(&src).ok())
+                    .and_then(|ast| test_exercises_command(&ast, name, &cmd))
+                    .unwrap_or(false)
+            });
+            if !exercised {
                 bad.push(format!(
-                    "{} names {cmd} but no cited proof exercises it (looked for {cmd}, and for {} \
-                     outside comments)",
+                    "{} names {cmd} but no cited test *calls* it — looked for a call to {} or a raw \
+                     `<{cmd}` literal, in the parsed body of {:?}. {FIXTURES_NEVER_EXERCISE}",
                     c.id,
                     adapter_method_for(&cmd)
-                        .map_or_else(|| "no mapped adapter method".to_string(), str::to_string)
+                        .map_or_else(|| "no mapped adapter method".to_string(), str::to_string),
+                    cited.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>()
                 ));
             }
         }
@@ -1265,30 +1261,97 @@ fn commands_in(text: &str) -> Vec<String> {
     out
 }
 
-/// Whether a proof body exercises `cmd`, by wire element or by the adapter method that emits it.
+/// Whether a cited test **exercises** `cmd`, decided from its parsed syntax tree.
 ///
-/// **Comment lines are excluded**, because a test that merely *mentions* a command in a comment does not
-/// send it — the lexical hole an independent scrutiny pass named. What remains lexical, and is stated
-/// rather than hidden: a command named in a **string literal** inside a test still counts, and a claim
-/// that names no `Set*` token at all is not checked by this rule.
-fn command_is_exercised(body: &str, cmd: &str) -> bool {
-    let code: String = body
-        .lines()
-        .filter(|l| {
-            let t = l.trim_start();
-            !t.starts_with("//")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    // The raw wire name always counts, mapped or not.
-    if code.contains(cmd) {
-        return true;
+/// Text matching is retired here, and CodeRabbit's reason was decisive: a substring cannot distinguish an
+/// executable call from a mention. The proof is now a **call expression** whose method or function is the
+/// adapter method that emits the command, or a **string literal shaped like the raw wire element**
+/// (`"<SetJunkFilter …"`), which is how a raw command is actually written.
+///
+/// Deliberately **not** accepted, each for a stated reason:
+///
+/// * A bare command name in a string literal — `accept_but_ignore("SetRate")` arms the fake, it does not
+///   send anything. Requiring the `<` makes an arrangement distinguishable from an invocation.
+/// * Anything in a comment or doc comment — a plan is not a proof.
+/// * Anything in a **fixture**, at all. See [`FIXTURES_NEVER_EXERCISE`].
+fn test_exercises_command(file: &syn::File, test_name: &str, cmd: &str) -> Option<bool> {
+    use syn::visit::Visit;
+
+    struct Found<'a> {
+        target: &'a str,
+        in_test: bool,
+        /// Whether the named function exists at all — the only thing that makes the answer `None`.
+        present: bool,
+        calls: Vec<String>,
+        raw_literals: Vec<String>,
     }
-    // A method name counts only for a command whose method is *known*. The former `set_` fallback made
-    // any setter in a proof body credit any unknown command — an invented `SetFoo` would have been
-    // proven by an unrelated `set_mode` call, which is the widest false pass this check could have had.
-    adapter_method_for(cmd).is_some_and(|method| code.contains(method))
+    impl<'ast> Visit<'ast> for Found<'_> {
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            if f.sig.ident == self.target {
+                self.present = true;
+                self.in_test = true;
+                syn::visit::visit_item_fn(self, f);
+                self.in_test = false;
+            }
+        }
+        fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
+            if self.in_test {
+                self.calls.push(e.method.to_string());
+            }
+            syn::visit::visit_expr_method_call(self, e);
+        }
+        fn visit_expr_call(&mut self, e: &'ast syn::ExprCall) {
+            if self.in_test {
+                if let syn::Expr::Path(p) = &*e.func {
+                    if let Some(seg) = p.path.segments.last() {
+                        self.calls.push(seg.ident.to_string());
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, e);
+        }
+        fn visit_lit_str(&mut self, l: &'ast syn::LitStr) {
+            if self.in_test {
+                self.raw_literals.push(l.value());
+            }
+            syn::visit::visit_lit_str(self, l);
+        }
+    }
+
+    let mut f = Found {
+        target: test_name,
+        in_test: false,
+        present: false,
+        calls: Vec::new(),
+        raw_literals: Vec::new(),
+    };
+    f.visit_file(file);
+    if !f.present {
+        // `None` means **the test is not in this file** — nothing else. An earlier revision also returned
+        // `None` when the body had no calls and no literals, which conflated "cannot answer" with
+        // "answers no": a test that exercises nothing must say so, or a caller cannot tell a missing
+        // citation from an empty one. Caught by this function's own controls.
+        return None;
+    }
+    let wire = format!("<{cmd}");
+    if f.raw_literals.iter().any(|l| l.contains(&wire)) {
+        return Some(true);
+    }
+    Some(adapter_method_for(cmd).is_some_and(|method| {
+        // `set_filter` must credit `set_filter_1x`; `set_mode` must not credit `set_mode_something_else`,
+        // and no such method exists, so a prefix match is the right width here.
+        f.calls.iter().any(|c| c.starts_with(method))
+    }))
 }
+
+/// Why a `fixture:` proof can never satisfy a command claim.
+///
+/// A fixture is a **document**; exercising a command is an **action**. Searching fixture text was not a
+/// near-miss, it was wrong in kind — and it was live: **HQP-C-001's `SetMode` was credited by the word
+/// `SetMode` appearing in `modes.xml`'s provenance comment**, while its cited test never calls `set_mode`.
+/// A command name in fixture metadata is the weakest possible evidence dressed as the strongest.
+const FIXTURES_NEVER_EXERCISE: &str =
+    "a fixture is a document, not an action; only a test can exercise a command";
 
 /// The adapter method that emits a wire command.
 ///
@@ -1316,55 +1379,91 @@ fn adapter_method_for(cmd: &str) -> Option<&'static str> {
     }
 }
 
-/// Controls for [`command_is_exercised`], including the limit it does not close.
+/// Controls for [`test_exercises_command`], written as the exploits it must refuse.
 #[test]
-fn a_command_named_only_in_a_comment_is_not_exercised() {
-    assert!(command_is_exercised(
-        "    h.adapter.set_mode(\"PCM\").await;",
+fn a_command_is_exercised_only_by_a_call_or_a_raw_wire_literal() {
+    let parse = |src: &str| syn::parse_file(src).expect("control source parses");
+    let ex = |src: &str, name: &str, cmd: &str| {
+        test_exercises_command(&parse(src), name, cmd).expect("the control test is present")
+    };
+
+    // Accepted: the adapter method that emits the command.
+    assert!(ex(
+        r#"#[test] fn t() { h.adapter.set_mode("PCM"); }"#,
+        "t",
         "SetMode"
     ));
-    assert!(command_is_exercised("    send(\"SetRate\");", "SetRate"));
-    assert!(
-        command_is_exercised("    h.adapter.set_shaper(\"ASDM7\").await;", "SetShaping"),
-        "SetShaping is emitted by set_shaper, which a camel-to-snake derivation would have missed"
-    );
-    assert!(command_is_exercised(
-        "    h.adapter.set_filter_1x(\"x\").await;",
+    // Accepted: `set_filter` credits `set_filter_1x`, which is the method that emits `SetFilter`.
+    assert!(ex(
+        r#"#[test] fn t() { h.adapter.set_filter_1x("x"); }"#,
+        "t",
         "SetFilter"
     ));
+    // Accepted: `SetShaping` is emitted by `set_shaper` — a derivation would have missed this.
+    assert!(ex(
+        r#"#[test] fn t() { h.adapter.set_shaper("ASDM7"); }"#,
+        "t",
+        "SetShaping"
+    ));
+    // Accepted: a raw wire element, which is how a command with no adapter method is sent.
+    assert!(ex(
+        r##"#[test] fn t() { send("<SetJunkFilter value=\"1\"/>"); }"##,
+        "t",
+        "SetJunkFilter"
+    ));
 
-    assert!(!command_is_exercised(
-        "    // one day we will send SetMode here",
+    // Refused: a comment. A plan is not a proof.
+    assert!(!ex(
+        r#"#[test] fn t() { // one day: h.adapter.set_mode("PCM")
+        let x = 1; }"#,
+        "t",
         "SetMode"
     ));
-    assert!(!command_is_exercised(
-        "/// See SetRate in the daemon docs",
+    // Refused: a **bare** command name in a string literal. `accept_but_ignore("SetRate")` arms the
+    // fake; it sends nothing. This is the case a substring match could never separate.
+    assert!(!ex(
+        r#"#[test] fn t() { h.model.accept_but_ignore("SetRate"); }"#,
+        "t",
         "SetRate"
     ));
-    assert!(!command_is_exercised("    let x = 1;", "SetJunkFilter"));
-
-    // Stated, not asserted away: a command in a string literal still counts. Excluding string
-    // literals would need a Rust parse of a fragment that is not a whole item, and the failure
-    // direction is over-crediting a test, not under-crediting one.
-    assert!(command_is_exercised(
-        "    assert!(msg.contains(\"SetMode\"));",
+    // Refused: an unrelated setter standing in for an unmapped command.
+    assert!(!ex(
+        r#"#[test] fn t() { h.adapter.set_mode("PCM"); }"#,
+        "t",
+        "SetFoo"
+    ));
+    // Refused: reading state is not sending a command.
+    assert!(!ex(
+        r#"#[test] fn t() { let s = h.adapter.get_state(); assert_eq!(s.mode, 2); }"#,
+        "t",
         "SetMode"
     ));
 
-    // An **unmapped** command must require its own raw name. The `set_` fallback made any setter in a
-    // proof body credit any unknown command, which is the widest false pass this check could have: a
-    // claim could name an invented `SetFoo` and be credited by an unrelated `set_mode` call.
-    assert!(
-        !command_is_exercised("    h.adapter.set_mode(\"PCM\").await;", "SetFoo"),
-        "an unmapped command must not be credited by an unrelated setter"
+    // `None` means absent, and only absent.
+    assert!(test_exercises_command(&parse("#[test] fn other() { }"), "t", "SetMode").is_none());
+    // A test that exists and exercises nothing answers `false`, not `None` — otherwise a caller cannot
+    // tell a missing citation from an empty one.
+    assert_eq!(
+        test_exercises_command(&parse("#[test] fn t() { let x = 1; }"), "t", "SetMode"),
+        Some(false)
     );
+}
+
+/// The fixture rule, stated as a test so it cannot be quietly relaxed.
+///
+/// `modes.xml` contains the word `SetMode` **in its provenance comment**, and that is what used to credit
+/// HQP-C-001. If a later change re-admits fixture text as proof of a command, this control is the tripwire.
+#[test]
+fn a_fixture_containing_a_command_name_in_its_metadata_is_not_proof_of_that_command() {
+    let modes = read(&repo_root().join("tests/fixtures/hqplayer/hqpd-6.0.4-opal/modes.xml"));
     assert!(
-        !command_is_exercised("    h.adapter.set_rate(44100).await;", "SetSomethingElse"),
-        "no partial `set_` match may stand in for evidence of an unmapped command"
+        modes.contains("SetMode"),
+        "precondition: the fixture really does contain the word, in its provenance header"
     );
+    let doc = corpus::load("hqpd-6.0.4-opal", "modes").document;
     assert!(
-        command_is_exercised("    send(\"SetFoo\");", "SetFoo"),
-        "an unmapped command is still credited by its own raw wire name"
+        !doc.contains("SetMode"),
+        "the word is in the provenance comment, not the document — {FIXTURES_NEVER_EXERCISE}"
     );
 }
 
