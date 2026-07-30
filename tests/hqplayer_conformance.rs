@@ -3040,3 +3040,73 @@ fn the_framer_already_tolerates_hostile_attribute_values_in_children() {
         );
     }
 }
+
+// -----------------------------------------------------------------------------
+// Bite 2 — an explicit accumulated-response byte cap, and recovery after it
+// -----------------------------------------------------------------------------
+
+/// The client accumulates a reply into a `String` per command. Before this, the only thing bounding
+/// that buffer was the response deadline — a **time** bound, not a **memory** bound. A daemon whose
+/// container never closes therefore grows the buffer for as long as the deadline allows, at whatever
+/// rate the link sustains.
+///
+/// Two properties are asserted together, because a cap that wedges the connection is not a fix:
+/// the oversized reply must fail *naming the ceiling*, and the very next command must succeed.
+///
+/// Ownership: the maintainer decision on issue #322 assigns the bounded framing primitive to this
+/// issue because this PR already owns the framer; #347 inherits it rather than reimplementing it.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn an_unbounded_reply_is_rejected_by_an_explicit_byte_cap_and_the_next_command_still_works() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            // Comfortably past any real document: the largest observed container is a 77-entry
+            // filter list, a few KB.
+            oversized_for_element: Some(("GetFilters".to_string(), 6 * 1024 * 1024)),
+            ..WirePolicy::default()
+        },
+        HqpTimeouts {
+            // Deliberately generous. A deadline this long means a timeout would be the WRONG
+            // answer: the cap has to be what ends this, and the assertion below checks which did.
+            response: Duration::from_secs(4),
+            max_attempts: 1,
+            ..fast_timeouts()
+        },
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    let err = h
+        .adapter
+        .get_filters()
+        .await
+        .expect_err("a reply that never closes must not be accumulated without limit");
+    let message = err.to_string();
+
+    assert!(
+        message.contains("exceeded") && message.contains("bytes"),
+        "the failure must name the byte ceiling it hit, so an operator can tell an oversized reply \
+         from a slow one; a bare timeout here would mean the buffer is still unbounded and only the \
+         clock stopped it. Got: {message}"
+    );
+    assert!(
+        h.server.oversized_fired(),
+        "the oversized reply must actually have been served"
+    );
+
+    // Recovery: the fault is one-shot, so the next command meets a healthy daemon. It can only
+    // succeed if the failed command left no junk in the client's stream.
+    let state = h
+        .adapter
+        .get_state()
+        .await
+        .expect("an oversized reply must not wedge the connection for later commands");
+    assert_eq!(
+        state.state, 0,
+        "the recovered command must read the daemon's real state, not leftovers from the \
+         oversized reply; got {state:?}"
+    );
+    h.stop();
+}

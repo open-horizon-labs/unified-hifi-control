@@ -68,6 +68,17 @@ pub struct WirePolicy {
     /// a per-read timeout resets on every one of these, so without an overall per-command deadline
     /// the client stays alive for as long as the stream continues.
     pub unsolicited_stream_for_element: Option<(String, String, Duration)>,
+    /// `(element, at_least_bytes)` — answer that element with a root element that **never closes**,
+    /// padded past `at_least_bytes`, then fall silent while leaving the connection open.
+    ///
+    /// Models a daemon whose reply is unbounded — a corrupted or runaway container. The client is
+    /// accumulating a `String` per command, so without an explicit byte ceiling the only thing
+    /// bounding that buffer is the response deadline, which is a time bound and not a memory bound.
+    /// A cap turns unbounded growth into a reported error.
+    ///
+    /// Fires **once** per server so a test can prove the *next* command still works, which is the
+    /// recovery half of the requirement.
+    pub oversized_for_element: Option<(String, usize)>,
     /// `(element, extra_document)` — after replying to that element, append a second, unsolicited
     /// document to the **same TCP write**, so both land in the client's receive buffer together.
     ///
@@ -86,6 +97,7 @@ impl Default for WirePolicy {
             disruption: Disruption::None,
             silent_for_element: None,
             malformed_for_element: None,
+            oversized_for_element: None,
             coalesce_extra_for_element: None,
             unsolicited_stream_for_element: None,
         }
@@ -152,6 +164,9 @@ pub struct WireServer {
     /// One-shot disruption budget shared across connections, so `DropNextReplyOnce` fires once for
     /// the whole server rather than once per connection.
     disruptions_left: Arc<AtomicU32>,
+    /// One-shot budget for `oversized_for_element`, shared across connections for the same reason:
+    /// a test proves the *next* command recovers, which needs the fault to stop after firing.
+    oversized_left: Arc<AtomicU32>,
     accept_task: JoinHandle<()>,
 }
 
@@ -166,9 +181,15 @@ impl WireServer {
         // Disruptions start unarmed so connection setup is never the thing under test; a test
         // calls `arm_drop()` once it is connected.
         let disruptions_left = Arc::new(AtomicU32::new(0));
+        // The oversized fault, in contrast, is armed by declaring it in the policy: it answers a
+        // named element rather than "whatever comes next", so it cannot disturb connection setup.
+        let oversized_left = Arc::new(AtomicU32::new(u32::from(
+            policy.oversized_for_element.is_some(),
+        )));
 
         let accept_stats = stats.clone();
         let accept_budget = disruptions_left.clone();
+        let accept_oversized = oversized_left.clone();
         let accept_task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 accept_stats.connections.fetch_add(1, Ordering::SeqCst);
@@ -176,8 +197,9 @@ impl WireServer {
                 let policy = policy.clone();
                 let stats = accept_stats.clone();
                 let budget = accept_budget.clone();
+                let oversized = accept_oversized.clone();
                 tokio::spawn(async move {
-                    serve_connection(stream, responder, policy, stats, budget).await;
+                    serve_connection(stream, responder, policy, stats, budget, oversized).await;
                 });
             }
         });
@@ -186,8 +208,14 @@ impl WireServer {
             addr,
             stats,
             disruptions_left,
+            oversized_left,
             accept_task,
         }
+    }
+
+    /// Whether the one-shot oversized reply has been served.
+    pub fn oversized_fired(&self) -> bool {
+        self.oversized_left.load(Ordering::SeqCst) == 0
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -244,6 +272,7 @@ async fn serve_connection(
     policy: WirePolicy,
     stats: Arc<WireStats>,
     disruptions_left: Arc<AtomicU32>,
+    oversized_left: Arc<AtomicU32>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -295,6 +324,37 @@ async fn serve_connection(
                     tokio::time::sleep(interval).await;
                 }
                 return;
+            }
+        }
+
+        if let Some((ref element, at_least)) = policy.oversized_for_element {
+            if mentions(&line, element)
+                && oversized_left
+                    .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                // A root element that never closes, padded past the requested size. Newlines keep
+                // the client's line-oriented reads progressing, so it accumulates rather than
+                // blocking on one enormous read — which is the shape that makes an unbounded buffer
+                // a memory hazard rather than merely a slow reply.
+                let filler = format!("<Junk pad=\"{}\"/>\n", "x".repeat(1024));
+                let mut written = 0usize;
+                if writer.write_all(b"<?xml version=\"1.0\"?><GetFilters>\n").await.is_err() {
+                    return;
+                }
+                while written < at_least {
+                    if writer.write_all(filler.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    written += filler.len();
+                }
+                if writer.flush().await.is_err() {
+                    return;
+                }
+                stats.replies.fetch_add(1, Ordering::SeqCst);
+                // Deliberately never send `</GetFilters>` and leave the connection open: only a
+                // byte ceiling can end this, and the client must then recover for the next command.
+                continue;
             }
         }
 
