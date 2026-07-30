@@ -122,8 +122,8 @@ impl Query {
 
 /// Read one raw reply document for a query element.
 ///
-/// `element` must name a query; anything else is refused rather than sent, so the read-only guarantee
-/// is enforced here and not left to the caller's care.
+/// Only [`Query`] can be expressed, so the read-only guarantee is structural rather than left to the
+/// caller's care.
 pub async fn observe(
     host: &str,
     port: u16,

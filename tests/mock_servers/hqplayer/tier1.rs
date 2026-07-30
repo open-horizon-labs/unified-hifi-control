@@ -99,7 +99,14 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
                     })
                     .collect();
                 let name = attrs.get("name").cloned().unwrap_or_default();
-                let is_hidden = attrs.get("type").map(|t| t == "hidden").unwrap_or(false);
+                // Case-insensitive, matching `raw::is_hostile_tag`. Attribute *keys* are lowercased
+                // above but values are not, so an exact compare let `type="Hidden"` past the drop and
+                // recorded the field name. Two spellings of one privacy rule is how the guarantee ends
+                // up depending on the daemon's capitalisation.
+                let is_hidden = attrs
+                    .get("type")
+                    .map(|t| t.eq_ignore_ascii_case("hidden"))
+                    .unwrap_or(false);
 
                 match tag.as_str() {
                     "input" | "select" | "textarea" => {
@@ -1112,7 +1119,11 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
         ));
     }
 
-    if capture.config_form.is_none() && capture.config_profiles.is_none() {
+    // Branching on the recorded fact rather than on absence. `config_form: None` cannot distinguish a
+    // run with no credentials from a credentialed run whose reads both failed — both `/config` reads only
+    // `warn!` — so the accepted-limit branch fired for the failure case too and marked a required claim
+    // *checked*. `Report::checked` exists precisely so that "clean" cannot mean "never looked".
+    if !capture.has_web_credentials {
         // No credentials: a declared accepted limit, recorded in not_captured rather than as an
         // unverified required claim.
         report.checked.insert("config_form".into());
@@ -1182,13 +1193,20 @@ pub fn diff(capture: &Capture, profile: &str) -> Report {
             let form = corpus::document(profile, "config_profile_form");
             // Parsed out of the form rather than hardcoded, so a corpus that gains a profile does not
             // silently stop being checked. `[default]` is the unnamed base, not a named profile.
-            for name in form
-                .split("value=\"")
-                .skip(1)
-                .filter_map(|part| part.split('"').next())
-                .filter(|n| !n.is_empty() && *n != "[default]" && *n != "Apply")
-                .collect::<Vec<_>>()
-            {
+            // Parsed with quick-xml for the same reason `attr_of` is: splitting on `value="` assumes one
+            // quote style and would read nothing at all from `value='Night'`, dropping the comparison
+            // without reporting anything.
+            let names: Vec<String> = raw::child_attrs(&form, "option")
+                .into_iter()
+                .filter_map(|attrs| {
+                    attrs
+                        .into_iter()
+                        .find(|(k, _)| k == "value")
+                        .map(|(_, v)| v)
+                })
+                .filter(|n| !n.is_empty() && n != "[default]" && n != "Apply")
+                .collect();
+            for name in &names {
                 if !observed.iter().any(|(v, _)| v == name) {
                     report.divergences.push(Divergence {
                         family: "config_profile_form".into(),
@@ -1325,10 +1343,15 @@ fn diff_rates(report: &mut Report, stem: &str, expected: &[EnumEntry], observed:
     }
 }
 
+/// One root attribute, parsed rather than scanned.
+///
+/// Built on [`raw::root_attrs`] because hand-rolled scanning is what `raw.rs` records as the cause of a
+/// silent under-observation: it assumes double quotes and no whitespace around `=`, so `index = '0'`
+/// yields nothing and the diff reports a false *absence*. Failing quietly is what makes it dangerous
+/// here — the comparison disappears instead of erroring, and the report still reads clean.
 pub fn attr_of(document: &str, key: &str) -> Option<String> {
-    let pat = format!(" {key}=\"");
-    let start = document.find(&pat)? + pat.len();
-    let rest = &document[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    raw::root_attrs(document)
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
 }

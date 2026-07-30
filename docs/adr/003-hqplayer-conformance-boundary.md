@@ -156,8 +156,14 @@ Accepted costs, with the measured numbers rather than the estimates:
 
 ## Notes
 
-Protocol evidence is HQPTuner's audit of `hqp-control` 6.0.1 sources with findings verified against a
-live `hqplayerd` 6.0.4 (Opal), pinned at commit `6755793`:
+Protocol evidence reaches this ADR **read-via-report**: the immediate sources are the 2026-07-29
+comparative salvage reports, which describe an HQPTuner audit of `hqp-control` 6.0.1 sources with
+findings verified against a live `hqplayerd` 6.0.4 (Opal), pinned at commit `6755793`. The upstream
+files below were not read directly — they are the reports' citation. "Verified" in the corpus therefore
+means *verified upstream and read via report*, never verified by this project, which is why no fixture
+carries a bare `verified` status and 14 record `source_chain: read-via-report`. Two factual errors in
+this amendment came from treating a report's citation as though it had been read, so the distinction is
+load-bearing rather than pedantic:
 
 - <https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md>
 - <https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/testing.md>
@@ -280,7 +286,11 @@ Because tier 2 needs hardware nobody should volunteer casually, the honest posit
   narrated. Opening that issue belongs to the program owner, not to this PR — the issue graph under
   #310 is maintained deliberately — so it is recorded here as a pre-merge action rather than filed
   unilaterally.
-- Confirm on GitHub runners, not this sandbox, the three known full-run failures: the two
-  deterministic `/hqp/discover` multicast 500s, and the pre-existing ~1-in-10
-  `error_handling::lms_fails_gracefully_when_unconfigured` concurrency flake in `adapter_integration`
-  (green 4/4 under `--test-threads=1`; the file is byte-identical to `v3`).
+- Confirm on GitHub runners, not this sandbox, the known full-run failures: the two deterministic
+  `/hqp/discover` multicast 500s, and a pre-existing concurrency failure *family* in
+  `adapter_integration` around `error_handling::lms_fails_gracefully_when_unconfigured`. The earlier
+  "~1-in-10" characterisation was wrong and is withdrawn: measured under the full suite the family
+  fired in **2 of 2** runs, while the `adapter_integration` binary run on its own was **6/6 green**.
+  The `4/4` figure applied only to that isolated binary under `--test-threads=1` and never to the whole
+  suite. The file is byte-identical to `v3`, so the mechanism is process-global state under
+  concurrency, not this branch.

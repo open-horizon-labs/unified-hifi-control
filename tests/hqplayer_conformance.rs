@@ -8,16 +8,26 @@
 //!
 //! Ground rules, all of them load-bearing:
 //!
-//! * Every assertion goes through the adapter's public surface, so a later sans-io extraction
-//!   (#162) cannot invalidate the suite.
+//! * Adapter-facing behaviour is asserted through the adapter's public surface, so a later sans-io
+//!   extraction (#162) cannot invalidate those tests. The suite also exercises `framing`, `corpus` and
+//!   `DaemonModel` directly, where the adapter cannot reach the mechanism: a test that only checks the
+//!   outcome can pass for a different reason than its name gives, which has happened here more than
+//!   once.
 //! * **No test asserts elapsed wall-clock time.** Timeout and reconnect behaviour is exercised
 //!   through the injectable [`HqpTimeouts`] seam and asserted on outcomes and attempt counts.
 //! * The suite is hermetic: it needs no HQPlayer. The opt-in real-daemon mode is
-//!   [`real_daemon_smoke_check_when_opted_in`], and it is a connectivity/identity smoke check only —
-//!   diffing the corpus against live hardware is stage-3 work.
+//!   [`tier1_live_read_only_verification_when_opted_in`], gated on `UHC_HQP_CONFORMANCE_HOST`, and it
+//!   is **not** a smoke check: it captures every read-only protocol family, diffs it against a corpus
+//!   profile, and fails on divergence. `merge_gate_pass` additionally requires that every claim ADR 003
+//!   lists was actually compared, because a differ that checks nothing also reports no divergences.
+//!   Read-only by construction — no `Set*`, no `Volume*`, no transport, no matrix set. Tier 2, the
+//!   mutating anchors, is never a merge gate.
 //! * Protocol truth is the corpus under `tests/fixtures/hqplayer/`, cross-checked against
+//!   the 2026-07-29 salvage reports, which cite
 //!   <https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md>.
-//!   Current Rust behaviour is never treated as the specification.
+//!   That upstream was read **via those reports**, not directly, which is what fixture
+//!   `source_chain: read-via-report` records. Current Rust behaviour is never treated as the
+//!   specification.
 
 mod mock_servers;
 
@@ -1223,18 +1233,19 @@ async fn tier1_live_read_only_verification_when_opted_in() {
         );
         return;
     };
-    let port: u16 = std::env::var("UHC_HQP_CONFORMANCE_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(4321);
-    let web_port: u16 = std::env::var("UHC_HQP_CONFORMANCE_WEB_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8088);
+    // Misconfiguration fails the gate instead of quietly changing what it verifies. Both ports are
+    // strict about an *explicit* value and silent about an absent one, so the hermetic default is
+    // unchanged.
+    let port = tier1_port("UHC_HQP_CONFORMANCE_PORT", 4321).unwrap_or_else(|e| panic!("{e}"));
+    let web_port =
+        tier1_port("UHC_HQP_CONFORMANCE_WEB_PORT", 8088).unwrap_or_else(|e| panic!("{e}"));
     let profile = std::env::var("UHC_HQP_CONFORMANCE_PROFILE")
         .unwrap_or_else(|_| VERIFIED_PROFILE.to_string());
-    let user = std::env::var("UHC_HQP_CONFORMANCE_WEB_USER").ok();
-    let pass = std::env::var("UHC_HQP_CONFORMANCE_WEB_PASS").ok();
+    let (user, pass) = tier1_credentials(
+        std::env::var("UHC_HQP_CONFORMANCE_WEB_USER").ok(),
+        std::env::var("UHC_HQP_CONFORMANCE_WEB_PASS").ok(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
 
     isolate_config_dir();
     let adapter = HqpAdapter::new(create_bus());
@@ -2600,9 +2611,22 @@ fn required_claims_faithfully_renders_every_adr_003_row() {
 async fn tier1_treats_the_config_lane_as_an_accepted_limit_only_without_credentials() {
     let h = Harness::verified().await;
     let capture = tier1::capture(&h.adapter).await.expect("capture");
-    let no_creds = tier1::diff(&capture, VERIFIED_PROFILE);
+
+    // Both halves state the credential fact outright instead of inheriting it. `isolate_config_dir`
+    // shares one directory across this binary and `configure` persists what it is given, so an adapter
+    // built with no credentials can still observe a previous test's — which made this comparison depend
+    // on test order once the differ started reading the flag. Set explicitly, the two cases are the two
+    // classifications and nothing else.
+    let mut without = capture.clone();
+    without.has_web_credentials = false;
+    let no_creds = tier1::diff(&without, VERIFIED_PROFILE);
 
     let mut with_form = capture.clone();
+    // Stated as the fact itself rather than implied by a non-empty profile list. Inferring credentials
+    // from `config_profiles.is_some()` is what let a credentialed run that observed nothing be read as
+    // the accepted no-credentials limit: the proxy is absent in exactly the failure case it needed to
+    // detect.
+    with_form.has_web_credentials = true;
     with_form.config_form = None;
     with_form.config_profiles = Some(vec![("Speakers".to_string(), "Living room".to_string())]);
     let creds_but_no_form = tier1::diff(&with_form, VERIFIED_PROFILE);
@@ -2757,14 +2781,34 @@ impl FakeConfigWeb {
             while let Ok((mut sock, _)) = listener.accept().await {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 4096];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                    // Longest path first: `/config` is a prefix of `/config/profile/load`.
-                    let body = if head.contains("/config/profile/load") {
-                        profile_page
-                    } else {
-                        config_page
+                    // Accumulate until the header terminator. TCP does not promise the request line
+                    // arrives in one read, and `/config` is a prefix of `/config/profile/load`, so
+                    // routing on a partial head can serve the wrong page for a request that was fine —
+                    // a latent nondeterminism in every test that reads this lane. Capped so a client
+                    // that never terminates its head cannot grow this buffer without bound.
+                    let mut head = Vec::new();
+                    loop {
+                        let mut chunk = [0u8; 1024];
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 || head.len() + n > 16 * 1024 {
+                            return;
+                        }
+                        head.extend_from_slice(&chunk[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    // Routed on the parsed request target rather than a substring of the whole head, so
+                    // a path appearing in a header value cannot decide the route either.
+                    let request = String::from_utf8_lossy(&head);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1));
+                    let body = match path {
+                        Some("/config/profile/load") => profile_page,
+                        Some("/config") => config_page,
+                        _ => return,
                     };
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -3499,7 +3543,10 @@ async fn feeding_the_persistent_oversampling_id_to_the_live_lane_is_rejected() {
         .parse()
         .expect("numeric");
 
-    // Put the SDM chain in force, so this is the live lane the stored SDM domain corresponds to.
+    // Put the SDM chain in force, so this is the live lane the stored SDM domain corresponds to. The
+    // source only decides the chain in configured `[source]` mode, so that is set first rather than
+    // asserting a configured-PCM/loaded-SDM state no daemon produces.
+    h.model.external_change(|s| s.mode_index = 0);
     h.model.source_loads_chain(LoadedChain::Sdm);
     let sdm_entries = corpus::enum_entries(
         &corpus::document(VERIFIED_PROFILE, "filters_sdm"),
@@ -4039,6 +4086,11 @@ async fn a_rate_valid_in_one_chain_is_refused_in_the_other() {
         .await
         .expect("a PCM rate resolves while the PCM chain is loaded");
 
+    // Configured `[source]` first. Only in `[source]` does the *source* decide the loaded chain, which
+    // is what this scenario needs; asking for an SDM chain while PCM is the configured mode describes a
+    // daemon that cannot exist, and a test resting on it would prove nothing about the client. The model
+    // refuses it at the setter, so the mode is set here rather than the invariant relaxed.
+    h.model.external_change(|s| s.mode_index = 0);
     // The SDM chain is now in force, and the same Hz value has no index in it.
     h.model.source_loads_chain(LoadedChain::Sdm);
     let refused = h.adapter.set_rate(pcm_only_hz).await;
@@ -4762,7 +4814,20 @@ async fn a_follower_burst_past_the_ceiling_is_refused_like_a_leading_burst() {
     // arrival order is not a ceiling.
     //
     // 300 > MAX_UNSOLICITED_BACKLOG (256), coalesced into the same write as the reply.
-    let follower = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Status state=\"2\"/>\n".repeat(300);
+    //
+    // Deliberately minimal documents. The ceiling counts what one command *sees*, and the client reads
+    // in 8 KiB chunks, so a burst of full-size documents spills past the first read and is carried into
+    // later commands a few hundred bytes at a time — never reaching the ceiling within one command. The
+    // first draft of this test used a 55-byte document and passed for exactly that reason: it proved the
+    // followers were drained, not that the bound was enforced.
+    let one = "<Status/>\n";
+    let follower = one.repeat(300);
+    assert!(
+        follower.len() < 8 * 1024,
+        "premise: the whole burst must fit inside one 8 KiB read for the per-command ceiling to see \
+         it; {} bytes",
+        follower.len()
+    );
     let h = Harness::start(
         VERIFIED_PROFILE,
         WirePolicy {
@@ -5013,7 +5078,9 @@ async fn the_fake_config_web_routes_a_request_head_split_across_reads() {
     {
         use tokio::io::AsyncWriteExt;
         // Split *inside* the path, after a prefix that is itself a legal route.
-        sock.write_all(b"GET /config/profile/lo").await.expect("first half");
+        sock.write_all(b"GET /config/profile/lo")
+            .await
+            .expect("first half");
         sock.flush().await.expect("flush first half");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         sock.write_all(b"ad HTTP/1.1\r\nHost: localhost\r\n\r\n")

@@ -1,6 +1,7 @@
 <!--
   provenance:
     source: UHC-SALVAGE-BETA-DEV.md section 4 (#322 recommendations), citing hqptuner tests/fake_control.py:107-115 and lanes/livemap.py:64-66,204-229 at dev ref 22dfe5cc. CORRECTED 2026-07-30: an earlier revision cited this path at stable 67557939, where tests/fake_control.py does not exist - it is a dev-era file. HQPTuner was not read directly for this fixture; the salvage report is the source.
+    source_chain: read-via-report. The upstream files were NOT read directly for this fixture; the salvage report is the immediate source and the upstream paths are the report's own citation. Recorded as a field and not only in the sentence above, because prose is not auditable: this fixture asserted the same fact in words while `Provenance::source_chain` still read `unrecorded`, and the existing citation test only inspects fixtures naming a github.com URL - which this one does not.
     daemon: hqplayerd 6.0.4 (Opal), attached DAC without DSD capability
     status: derived-upstream
     date: 2026-07-29

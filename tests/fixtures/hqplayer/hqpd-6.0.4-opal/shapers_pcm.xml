@@ -6,7 +6,7 @@
     status: derived-excerpt
     date: 2026-07-29
     playback: unknown
-    notes: PCM mode dithers. Verified: the PCM list has 10 entries beginning none/NS1/NS4/NS5/NS9/LNS15 and ending TPDF/Gauss1/shaped. Enum IDs are derived, not live-observed.
+    notes: PCM mode dithers. INCOMPLETE EXCERPT - 9 of a reported 10 entries. The salvage report states the PCM list has 10 entries and then names only these 9 (none/NS1/NS4/NS5/NS9/LNS15/TPDF/Gauss1/shaped), so the tenth is unaccounted for in the evidence and is NOT invented here. The discrepancy is left visible rather than normalised to 9, because the missing entry is a real gap in provenance and closing it needs a live GetShapers capture (#332). Nothing may treat this list as complete: status is derived-excerpt and the conformance test parses whatever the fixture holds rather than asserting a count. Enum IDs are derived, not live-observed.
 -->
 <GetShapers>
 <ShapersItem index="0" name="none" value="0"/>

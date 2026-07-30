@@ -391,6 +391,15 @@ impl DaemonModel {
     /// **Provenance: derived-upstream, tier-2-only** — see [`LoadedChain`].
     pub fn source_loads_chain(&self, chain: LoadedChain) {
         let mut inner = self.lock();
+        // `[source]` is the only configured mode whose loaded chain the source decides; in PCM or SDM
+        // the configured mode *is* the chain. Letting the two disagree produces a daemon state that
+        // does not exist — SDM enumerations served while PCM is reported configured — and
+        // `armed_upstream_claims` does not flag it, so a test built on it would prove nothing about the
+        // client. Refused at the setter, where the misuse is.
+        assert_eq!(
+            inner.state.mode_index, 0,
+            "source_loads_chain requires configured [source] mode"
+        );
         inner.state.loaded_chain = chain;
         inner.clamp_to_loaded_chain();
     }

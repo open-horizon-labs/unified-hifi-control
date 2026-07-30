@@ -8,8 +8,11 @@
 > This page was written from `hqp-control` v5.2.30 sources with no live verification, and it was
 > wrong by omission in ways that shipped defects: it never mentioned the `result` attribute, so the
 > implementation it authorised reported success for commands the daemon had rejected. The
-> corrections below are marked **[corrected #322]** and are cross-checked against HQPTuner's audit of
-> `hqp-control` 6.0.1 with findings verified on a live `hqplayerd` 6.0.4 (Opal):
+> corrections below are marked **[corrected #322]** and are cross-checked against the 2026-07-29
+> comparative salvage reports (`UHC-SALVAGE-UI-DATA-INTEGRATION.md`, `UHC-SALVAGE-BETA-DEV.md`), which
+> report an HQPTuner audit of `hqp-control` 6.0.1 with findings verified on a live `hqplayerd` 6.0.4
+> (Opal). **The upstream repository was not read directly for this page**; the URL below is the reports'
+> own citation, and the live verification it describes is HQPTuner's, not this project's:
 > <https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md>
 
 ## Corrections from #322

@@ -1307,6 +1307,10 @@ impl HqpAdapter {
     async fn send_command(&self, xml: &str) -> Result<String> {
         let timeouts = self.timeouts().await;
         let mut last_error = None;
+        // Relative and toggling commands carry a side effect that is not the same applied twice.
+        let one_shot = framing::root_element(xml)
+            .map(|e| Self::is_one_shot(&e))
+            .unwrap_or(false);
 
         for attempt in 0..timeouts.max_attempts {
             // Ensure we're connected
@@ -1323,7 +1327,11 @@ impl HqpAdapter {
             }
 
             // Try to send command
-            match self.send_command_inner(xml).await {
+            let mut request_written = false;
+            match self
+                .send_command_inner_tracking(xml, &mut request_written)
+                .await
+            {
                 Ok(response) => {
                     // An explicit rejection is terminal: retrying an invalid value cannot help,
                     // and the connection is still good.
@@ -1334,6 +1342,24 @@ impl HqpAdapter {
                     // Mark as disconnected so next attempt will reconnect
                     self.mark_disconnected().await;
                     last_error = Some(e);
+
+                    // At-most-once for one-shot commands. Once the request is on the wire the daemon
+                    // may already have applied it: the protocol carries no request identity, so a lost
+                    // reply and a lost request are indistinguishable from here. Retrying is not
+                    // "recovering", it is choosing to skip a second track or step the volume twice on
+                    // the chance that nothing happened. Failing is the honest outcome, and it is the
+                    // one the user can correct; a silent double-apply is not.
+                    //
+                    // Failures *before* the write are unambiguous and still retry, which is where the
+                    // real recovery value is — a stale socket is discovered by writing to it. Queries
+                    // are unaffected: reading twice costs nothing.
+                    if one_shot && request_written {
+                        tracing::warn!(
+                            "Not retrying one-shot HQPlayer command after a post-write failure; it may \
+                             already have been applied and retrying would apply it twice"
+                        );
+                        break;
+                    }
 
                     if attempt + 1 < timeouts.max_attempts {
                         tracing::debug!(
@@ -1349,8 +1375,36 @@ impl HqpAdapter {
         Err(last_error.unwrap_or_else(|| anyhow!("Failed to send command after retries")))
     }
 
+    /// Whether one application of this command differs from two.
+    ///
+    /// Relative (`VolumeUp`/`VolumeDown`), sequential (`Next`/`Previous`) and toggling (`VolumeMute`)
+    /// commands qualify. Everything else the adapter sends is absolute — `Set*` writes a value, `Play`
+    /// and `Stop` name a state, queries only read — so applying it twice lands in the same place and
+    /// retrying is safe.
+    fn is_one_shot(element: &str) -> bool {
+        matches!(
+            element,
+            "Next" | "Previous" | "VolumeUp" | "VolumeDown" | "VolumeMute"
+        )
+    }
+
     /// Inner send command (without retry logic)
     async fn send_command_inner(&self, xml: &str) -> Result<String> {
+        let mut written = false;
+        self.send_command_inner_tracking(xml, &mut written).await
+    }
+
+    /// [`Self::send_command_inner`], reporting whether the request reached the socket.
+    ///
+    /// `request_written` is set once the bytes are flushed, which is the boundary between "the daemon
+    /// certainly never saw this" and "it may have applied it". `send_command` needs that distinction to
+    /// keep one-shot commands at-most-once; nothing else does, so the plain wrapper above stays the
+    /// normal entry point.
+    async fn send_command_inner_tracking(
+        &self,
+        xml: &str,
+        request_written: &mut bool,
+    ) -> Result<String> {
         let timeouts = self.timeouts().await;
         let mut conn_guard = self.connection.lock().await;
         let conn = conn_guard
@@ -1361,6 +1415,8 @@ impl HqpAdapter {
         conn.write_half.write_all(xml.as_bytes()).await?;
         conn.write_half.write_all(b"\n").await?;
         conn.write_half.flush().await?;
+        // Past this point the daemon may have acted on the request, whatever happens to the reply.
+        *request_written = true;
 
         // The element the daemon must answer with. Setters echo the request element and queries
         // return a container of the same name, so a reply's root element always matches its
@@ -1525,6 +1581,18 @@ impl HqpAdapter {
                                 skipped += 1;
                                 self.unsolicited_skipped
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // The same ceiling the leading path enforces. Counting without checking
+                                // made the bound depend on arrival order: a burst ahead of the reply was
+                                // refused at 256, the identical burst behind it was drained in full. A
+                                // ceiling that a daemon can evade by reordering is not a ceiling.
+                                if skipped > MAX_UNSOLICITED_BACKLOG {
+                                    return Err(anyhow!(
+                                        "Gave up after {} unsolicited documents while awaiting a {} \
+                                         reply (coalesced behind it)",
+                                        skipped,
+                                        expected_element.unwrap_or_default()
+                                    ));
+                                }
                                 tracing::debug!(
                                     "Dropping unsolicited HQPlayer document coalesced behind a {:?} \
                                      reply",
