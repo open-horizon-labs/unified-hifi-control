@@ -539,3 +539,60 @@ reports names the head it was measured at.
 **Three false passes across two CodeRabbit passes, all in checks written by the author of the artefact they
 check.** That is now the most useful sentence in this record: the mutation table proves what its author
 thought to break, and an external reviewer found what he did not.
+
+## Ship
+**Updated:** 2026-07-30T22:20Z
+**Status:** staged — **not deployed, not delivered, not merged**
+
+### Delivery path, named honestly
+
+`local` → **draft PR #364 (here)** → CodeRabbit + human review → #337 merges to `v3` first → this PR
+retargets to `v3` → merge → tagged release build → binaries / Docker / packages → user install.
+
+**This PR is at step two of eight.** A draft stacked PR is *staged*. Nothing is deployed, no user has
+anything, and no deployment checkbox is ticked below. The content is documentation and one test target,
+so even after merge no user-visible behaviour changes — the audience is contributors.
+
+### Delivery-path tax
+
+| Friction | Cost, measured |
+|---|---|
+| **Merge order** | Hard blocker. #337 must merge first; this PR cites tests and fixtures that exist only on its branch |
+| **Base-branch churn** | Six commits landed on the base during this session, three touching the one file this PR also edits. Two conflicts, two forward-only resolutions, and finally the authorised forward-merge below |
+| **Base CI lint** | #339 unmerged; the base's Rust 1.97 `unnecessary_sort_by` warning keeps the required Lint check red, independently of this PR |
+| **External review latency** | CodeRabbit reviewed twice and found three false passes; its included-review quota briefly rate-limited the third request |
+| **Human approval** | Required, and correctly not automatable |
+
+### Forward-merge of the base at `76b011c`
+
+Authorised explicitly. **Not a rebase, not a force-push** — history is append-only, and the project
+squash-merges anyway. Done because local `HEAD` lacked the base's newest conformance changes, so a
+full-suite run here was not an integrated-stack check.
+
+One conflict, `docs/hqplayer-protocol-reference.md`, resolved **in the base's favour for every
+overlapping hunk**, so the restored `mid-playback` qualifier from `ff8765b` survives — this branch must
+not regress evidence it argued for. This branch's only remaining delta in that file is the retirement
+banner and the three paraphrases.
+
+### Verification at the merged head `7ca50be661b5fd685c1120146696db31d65d7b47`
+
+Every figure re-run at this exact SHA. **No HQPlayer daemon was contacted.**
+
+| Command | Result |
+|---|---|
+| `cargo test --test hqplayer_ledger_lint` | **23 passed; 0 failed** |
+| `cargo test --test hqplayer_conformance` | **215 passed; 0 failed** — including the base's new `source_chain_is_exactly_a_closed_vocabulary_token` |
+| `cargo test --test api_contract` | **2 passed** — no route or payload change |
+| `cargo test --workspace --no-fail-fast` | **exit 0 — 575 passed; 0 failed; 12 ignored** (integrated stack) |
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy -- -D warnings` (CI's invocation) | exit 0, clean |
+| `git diff --check` base…HEAD | clean |
+| base-relative diff | **5 files, +2070 / −39**; no `src/`, no API-surface, no web-composition path |
+| `dx build` | **not required** — no `src/app/`, `assets/`, `public/` or `Dioxus.toml` path in the delta |
+| local `HEAD` vs `origin/…` vs worktree | equal; worktree clean |
+| live tier 1 / tier 2 | **NOT RUN** — out of scope for #341 by instruction |
+
+**Two full-suite runs at the pre-merge head `799c4c0` both exited 0**, and the merged head's run exited
+0. Per ADR 003 that is a **rate, not a verdict**: the documented `/hqp/discover` multicast and LMS
+concurrency flake families did not fire in any of the three, which is evidence about this sandbox on this
+evening and nothing more.
