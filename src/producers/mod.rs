@@ -15,9 +15,16 @@
 //! ## Why the aggregator is a gate rather than a store
 //!
 //! [`admit`] is the only way a [`crate::adaptive::ProducerDocument`] enters
-//! [`ProducerAggregator`], and the aggregator is the only holder of an admitted one. That
-//! makes "an incoherent document never reaches a consumer" a property of the store rather
-//! than of a code path: there is no other object of that type in the process to obtain.
+//! [`ProducerAggregator`], so every document the aggregator serves has passed the gate, and
+//! the aggregator is the only thing in this repository that holds producer state.
+//!
+//! Stated precisely, because the loose version is the kind of claim that survives into the
+//! next issue's assumptions: this does **not** mean an unadmitted document cannot exist.
+//! `ProducerDocument` is a public type in a shared module and
+//! [`crate::adaptive::admit_document_str`] hands one to any caller. What is true is that a
+//! consumer reading state *from the aggregator* cannot receive one — and since no surface
+//! may reach an adapter (`docs/ARCHITECTURE.md`, `tests/architecture_lint.rs`), the
+//! aggregator is the only place to read it from.
 //!
 //! Two policies split the work, and the split is the load-bearing decision:
 //!
@@ -26,6 +33,13 @@
 //!   inconsistent lane value, an illegal recorded outcome transition. Refusal is safe
 //!   *because the previous snapshot is retained*: it fails to advance a producer rather
 //!   than blanking one.
+//!
+//!   That argument holds from the **second** document onward. On a producer's first
+//!   document there is nothing to retain, and every refusal reason is reachable there — an
+//!   unprefixed zone id most obviously — so a refusal means the producer never appears at
+//!   all. This is accepted rather than mitigated: a producer whose very first document is
+//!   malformed has nothing correct to show, and the refusal is retained and queryable via
+//!   [`ProducerAggregator::refusals`] precisely so that case is diagnosable.
 //! * **Published-intent incoherence demotes, never refuses** — because the only repair
 //!   that preserves `valid` would be inventing a `desired` lane, and that fabricates
 //!   intent the user never staged. Demotion lowers validity and touches nothing else.

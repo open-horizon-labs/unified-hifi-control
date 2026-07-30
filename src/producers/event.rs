@@ -33,7 +33,15 @@ pub enum AdaptiveEvent {
     /// A producer is gone. Distinct from a disconnected producer, which keeps publishing
     /// documents marked stale.
     ProducerRemoved {
-        /// Stable producer id; every target of that producer is removed.
+        /// Stable producer id.
+        ///
+        /// **Known limit, recorded for #325.** This removes *every* target of that
+        /// producer. A producer that publishes several documents — say an `instance`-scoped
+        /// one and a `dsp_engine` one bound to a zone — cannot retire one target and keep
+        /// another, because the event carries no [`ProducerKey`]. Not fixed here: no
+        /// producer has more than one target yet, and adding a key to the event without a
+        /// caller that needs it would be guessing at the shape. #325 will meet this first,
+        /// and the fix is additive (a variant carrying a key).
         producer_id: String,
     },
     /// The aggregator admitted a document. Carries a pointer, never a payload: a consumer

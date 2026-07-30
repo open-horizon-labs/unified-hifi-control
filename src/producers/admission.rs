@@ -108,6 +108,17 @@ pub enum AdmissionRefusal {
         /// Which way.
         detail: LaneDefect,
     },
+    /// Coherence repair did not converge.
+    ///
+    /// Unreachable while every [`IntentIncoherence`] arises from an entry that is currently
+    /// `Valid`, because demoting all of those is a fixed point. It exists so that if a
+    /// later minor version of the contract adds a violation kind that does not have that
+    /// property, the document is refused rather than served incoherent — the failure this
+    /// whole gate exists to prevent, arriving by a route this branch cannot foresee.
+    IrreparableIntent {
+        /// What survived the repair.
+        violations: Vec<IntentIncoherence>,
+    },
     /// A recorded outcome transition the contract calls impossible.
     IllegalOutcomeHistory {
         /// The operation.
@@ -216,6 +227,20 @@ pub fn admit(previous: Option<&ProducerDocument>, incoming: ProducerDocument) ->
     }
 
     let (document, repairs) = repair_intent(incoming);
+
+    // The repair is a fixed point *given* that every violation arises from an entry that is
+    // currently `Valid` — which is true of today's `intent_coherence_violations`. That is a
+    // property of a function in another module, owned by another issue, and a later minor
+    // version could add a violation kind that arises from a non-`Valid` entry. Rather than
+    // rely on reasoning that this branch cannot enforce, the result is re-checked: if
+    // anything survived the repair, the document is refused instead of served incoherent.
+    // Costs one extra pass on a path that already clones.
+    let survivors = document.intent_coherence_violations();
+    if !survivors.is_empty() {
+        return Admission::Refused(AdmissionRefusal::IrreparableIntent {
+            violations: survivors,
+        });
+    }
 
     let kind = match previous {
         None => AdmissionKind::Fresh,
