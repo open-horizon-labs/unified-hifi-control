@@ -196,13 +196,19 @@ fn rust_sources_under(root: &str) -> Vec<(String, String)> {
 /// variants rather than characters to be recognized. `#[allow(unused_imports)] pub use
 /// a::B as C;` is an `ItemUse` exactly as `use a::B;` is.
 fn imports_of(file: &File) -> Vec<String> {
-    let mut found = Vec::new();
-    for item in &file.items {
-        if let Item::Use(item_use) = item {
-            found.extend(flatten_use_tree(&item_use.tree));
+    #[derive(Default)]
+    struct ImportVisitor {
+        found: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for ImportVisitor {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            self.found.extend(flatten_use_tree(&item.tree));
+            visit::visit_item_use(self, item);
         }
     }
-    found
+    let mut visitor = ImportVisitor::default();
+    visitor.visit_file(file);
+    visitor.found
 }
 
 fn flatten_use_tree(tree: &UseTree) -> Vec<String> {
@@ -481,23 +487,35 @@ fn disallowed_module_attributes(file: &File) -> Vec<String> {
 ///
 /// Inherent impls (`impl AdaptiveEvent { … }`) are not trait impls and do not appear.
 fn trait_impls_for(file: &File, type_name: &str) -> Vec<String> {
-    file.items
-        .iter()
-        .filter_map(|item| match item {
-            Item::Impl(item_impl) => {
-                let (_, path, _) = item_impl.trait_.as_ref()?;
-                let target = match item_impl.self_ty.as_ref() {
-                    syn::Type::Path(type_path) => type_path.path.segments.last()?.ident.to_string(),
-                    _ => return None,
-                };
-                if target != type_name {
-                    return None;
+    struct ImplVisitor<'a> {
+        type_name: &'a str,
+        found: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for ImplVisitor<'_> {
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if let Some((_, path, _)) = item.trait_.as_ref() {
+                if let syn::Type::Path(type_path) = item.self_ty.as_ref() {
+                    let target = type_path
+                        .path
+                        .segments
+                        .last()
+                        .map(|segment| segment.ident.to_string());
+                    if target.as_deref() == Some(self.type_name) {
+                        if let Some(last) = path.segments.last() {
+                            self.found.push(last.ident.to_string());
+                        }
+                    }
                 }
-                Some(path.segments.last()?.ident.to_string())
             }
-            _ => None,
-        })
-        .collect()
+            visit::visit_item_impl(self, item);
+        }
+    }
+    let mut visitor = ImplVisitor {
+        type_name,
+        found: Vec::new(),
+    };
+    visitor.visit_file(file);
+    visitor.found
 }
 
 /// Every `#[cfg(...)]` argument applying to module `name`, including from an enclosing
@@ -564,12 +582,25 @@ fn gate_is_server_only(meta: &Meta) -> bool {
 #[derive(Default)]
 struct ModuleReferenceVisitor {
     found: BTreeSet<String>,
+    /// Names that address this crate's root, including aliases bound in this file.
+    roots: BTreeSet<String>,
 }
 
 impl ModuleReferenceVisitor {
     fn note(&mut self, root: &str, module: &str) {
-        if CRATE_ROOTS.contains(&root) && FORBIDDEN_MODULES.contains(&module) {
+        if self.roots.contains(root) && FORBIDDEN_MODULES.contains(&module) {
             self.found.insert(format!("{root}::{module}"));
+        }
+    }
+
+    /// Check every adjacent segment pair, not only the first two.
+    ///
+    /// A root is not always the leading segment: `super::internal::adaptive::X` puts the
+    /// aliased root second. Scanning pairs also covers `self::`, and costs nothing because
+    /// a pair only matches when its left half is a known root.
+    fn note_pairs(&mut self, segments: &[String]) {
+        for window in segments.windows(2) {
+            self.note(&window[0], &window[1]);
         }
     }
 
@@ -610,13 +641,13 @@ impl ModuleReferenceVisitor {
 impl<'ast> Visit<'ast> for ModuleReferenceVisitor {
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         for leaf in flatten_use_tree(&item.tree) {
-            let mut segments = leaf.split("::");
-            if let (Some(root), Some(module)) = (segments.next(), segments.next()) {
-                // `use crate::adaptive as contract;` renders its leaf as `adaptive as
-                // contract`, so the alias is trimmed before comparison.
-                let module = module.split(" as ").next().unwrap_or(module);
-                self.note(root, module);
-            }
+            // `use crate::adaptive as contract;` renders its leaf as `adaptive as
+            // contract`, so the alias is trimmed before comparison.
+            let segments: Vec<String> = leaf
+                .split("::")
+                .map(|part| part.split(" as ").next().unwrap_or(part).trim().to_string())
+                .collect();
+            self.note_pairs(&segments);
         }
         visit::visit_item_use(self, item);
     }
@@ -627,9 +658,7 @@ impl<'ast> Visit<'ast> for ModuleReferenceVisitor {
             .iter()
             .map(|segment| segment.ident.to_string())
             .collect();
-        if segments.len() >= 2 {
-            self.note(&segments[0], &segments[1]);
-        }
+        self.note_pairs(&segments);
         visit::visit_path(self, path);
     }
 
@@ -639,8 +668,40 @@ impl<'ast> Visit<'ast> for ModuleReferenceVisitor {
     }
 }
 
+/// Names bound to this crate's root in `file`, including `use crate as internal;`.
+///
+/// `use crate as internal;` then `internal::adaptive::X` reached the forbidden module
+/// through a root the visitor had never heard of: the alias statement has a single path
+/// segment so it registered nothing, and the reference began with `internal`. Found by
+/// CodeRabbit at `59523f8`.
+fn crate_root_names(file: &File) -> BTreeSet<String> {
+    #[derive(Default)]
+    struct AliasVisitor {
+        aliases: BTreeSet<String>,
+    }
+    impl<'ast> Visit<'ast> for AliasVisitor {
+        fn visit_use_tree(&mut self, tree: &'ast UseTree) {
+            if let UseTree::Rename(rename) = tree {
+                if CRATE_ROOTS.contains(&rename.ident.to_string().as_str()) {
+                    self.aliases.insert(rename.rename.to_string());
+                }
+            }
+            visit::visit_use_tree(self, tree);
+        }
+    }
+    let mut visitor = AliasVisitor::default();
+    visitor.visit_file(file);
+    let mut roots: BTreeSet<String> = CRATE_ROOTS.iter().map(|r| (*r).to_string()).collect();
+    roots.extend(visitor.aliases);
+    roots
+}
+
+/// Forbidden module references in `file`, resolving crate-root aliases first.
 fn forbidden_module_references(file: &File) -> Vec<String> {
-    let mut visitor = ModuleReferenceVisitor::default();
+    let mut visitor = ModuleReferenceVisitor {
+        found: BTreeSet::new(),
+        roots: crate_root_names(file),
+    };
     visitor.visit_file(file);
     visitor.found.into_iter().collect()
 }
@@ -866,6 +927,39 @@ fn lint_the_internal_event_module_invokes_only_allowed_macros() {
         invocations,
         vec!["tracing::trace".to_string()],
         "the module's macro invocations changed; the allowlist now describes something else"
+    );
+}
+
+#[test]
+fn lint_no_module_anywhere_implements_a_trait_for_adaptive_event() {
+    // The crate-wide half. Rust lets an external trait be implemented for a crate-local
+    // type from *any* module, and `src/producers/aggregator.rs` already imports
+    // `AdaptiveEvent` — so a sibling can make it serializable while every `event.rs`
+    // allowlist stays clean: no new import, derive, attribute, macro or impl in that file.
+    //
+    // The stated invariant is that the internal event cannot become serializable by
+    // accident. That invariant is crate-wide, so the check is too. Found by CodeRabbit at
+    // `59523f8`.
+    let mut violations = Vec::new();
+    let mut swept = 0usize;
+    for (path, text) in rust_sources_under("src") {
+        swept += 1;
+        let file = parse_source(&path, &text);
+        for implemented in trait_impls_for(&file, ADAPTIVE_EVENT) {
+            violations.push(format!("{path}: impl {implemented} for {ADAPTIVE_EVENT}"));
+        }
+    }
+    assert!(
+        swept > 50,
+        "the sweep covered only {swept} files, which means it is not walking src/"
+    );
+    assert!(
+        violations.is_empty(),
+        "{ADAPTIVE_EVENT} has hand-written trait impls somewhere in the crate: \
+         {violations:?}\nAn external trait implemented for a crate-local type is legal from \
+         any module, so this guarantee cannot be enforced in one file. If an impl becomes \
+         necessary, allow it here having checked it is not a serialization trait under \
+         another name."
     );
 }
 
@@ -1347,6 +1441,170 @@ fn the_attribute_allowlist_accepts_what_the_type_actually_carries() {
         macro_invocations(&snippet("pub enum AdaptiveEvent {}\n")).is_empty(),
         "an item macro was invented where there is none"
     );
+}
+
+#[test]
+fn a_nested_module_cannot_hide_an_import_or_a_trait_impl() {
+    // `imports_of` and `trait_impls_for` iterated `File.items` only, so a nested module was
+    // a blind spot for both at once:
+    //
+    //     mod wire {
+    //         impl serde::Serialize for super::AdaptiveEvent { … }
+    //     }
+    //
+    // No new attribute, no derive, no macro invocation - and `AdaptiveEvent` is crate-local
+    // while serde is already a dependency, so the impl is legal. Found by CodeRabbit at
+    // `59523f8`.
+    let exploit = "mod wire {\n    use serde::Serialize;\n    impl serde::Serialize for super::AdaptiveEvent {}\n}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n";
+    let file = snippet(exploit);
+
+    assert!(
+        !trait_impls_for(&file, ADAPTIVE_EVENT).is_empty(),
+        "a nested trait impl for AdaptiveEvent was invisible:\n{exploit}"
+    );
+    let imports = imports_of(&file);
+    assert!(
+        imports.iter().any(|i| i == "serde::Serialize"),
+        "an import inside a nested module was invisible: {imports:?}\n{exploit}"
+    );
+    assert!(
+        imports
+            .iter()
+            .any(|i| !EVENT_ALLOWED_IMPORTS.contains(&i.as_str())),
+        "the allowlist admitted a nested import: {imports:?}"
+    );
+
+    // Deeper nesting, and an impl written without the `super::` qualifier.
+    for (label, source) in [
+        (
+            "two modules deep",
+            "mod a {\n    mod b {\n        impl Serialize for crate::producers::event::AdaptiveEvent {}\n    }\n}\n",
+        ),
+        (
+            "nested import only",
+            "mod wire {\n    use crate::wire::EventWire;\n}\n",
+        ),
+        (
+            "nested inside an inline module with items after it",
+            "mod wire {\n    impl Serialize for super::AdaptiveEvent {}\n}\nfn after() {}\n",
+        ),
+    ] {
+        let file = snippet(source);
+        let hit = !trait_impls_for(&file, ADAPTIVE_EVENT).is_empty()
+            || imports_of(&file)
+                .iter()
+                .any(|i| !EVENT_ALLOWED_IMPORTS.contains(&i.as_str()));
+        assert!(hit, "{label}: nesting hid the escape:\n{source}");
+    }
+}
+
+#[test]
+fn a_sibling_module_cannot_implement_a_trait_for_adaptive_event() {
+    // The no-trait-impl guarantee was enforced only inside `event.rs`. Rust allows an
+    // external trait to be implemented for a crate-local type from anywhere in the crate,
+    // and `src/producers/aggregator.rs` already imports `AdaptiveEvent` — so a sibling can
+    // make it serializable while all four `event.rs` allowlists stay clean: no new import,
+    // derive, attribute, macro or impl *in that file*. Found by CodeRabbit at `59523f8`.
+    for (label, source) in [
+        (
+            "sibling importing the type by name",
+            "use super::event::AdaptiveEvent;\nimpl serde::Serialize for AdaptiveEvent {}\n",
+        ),
+        (
+            "sibling using a qualified self type",
+            "impl serde::Serialize for super::event::AdaptiveEvent {}\n",
+        ),
+        (
+            "sibling using the full crate path",
+            "impl serde::Serialize for crate::producers::event::AdaptiveEvent {}\n",
+        ),
+        (
+            "sibling with the impl nested in a module",
+            "mod helper {\n    impl serde::Serialize for crate::producers::event::AdaptiveEvent {}\n}\n",
+        ),
+    ] {
+        assert!(
+            !trait_impls_for(&snippet(source), ADAPTIVE_EVENT).is_empty(),
+            "{label}: a sibling module's impl for AdaptiveEvent was invisible:\n{source}"
+        );
+    }
+
+    // Positive control: an impl for a *different* type in a sibling must not register.
+    for source in [
+        "impl serde::Serialize for super::event::AdaptiveEventLog {}\n",
+        "impl Default for AdaptiveBus {}\n",
+        "impl AdaptiveEvent {}\n",
+    ] {
+        assert!(
+            trait_impls_for(&snippet(source), ADAPTIVE_EVENT).is_empty(),
+            "the scanner invented an impl in:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn a_crate_root_alias_cannot_launder_a_forbidden_module_reference() {
+    // `use crate as internal;` then `internal::adaptive::X`. The alias statement has a
+    // single path segment so it registered nothing, and the reference begins with a root
+    // the visitor had never heard of. Found by CodeRabbit at `59523f8`.
+    for (label, source) in [
+        (
+            "aliased crate root in expression position",
+            "use crate as internal;\nfn handler() { let _ = internal::adaptive::ProducerDocument; }\n",
+        ),
+        (
+            "aliased crate root reaching the publication layer",
+            "use crate as internal;\nfn handler() { let _ = internal::producers::ProducerAggregator; }\n",
+        ),
+        (
+            "aliased crate root in type position",
+            "use crate as internal;\nfn f(x: internal::adaptive::X) {}\n",
+        ),
+        (
+            "aliased crate root inside a macro token stream",
+            "use crate as internal;\nfn f() { println!(\"{:?}\", internal::producers::P); }\n",
+        ),
+        (
+            "aliased external crate root",
+            "use unified_hifi_control as uhc;\nfn f() { let _ = uhc::adaptive::X; }\n",
+        ),
+        (
+            "aliased root used in a nested module",
+            "use crate as internal;\nmod inner {\n    fn f() { let _ = super::internal::adaptive::X; }\n}\n",
+        ),
+    ] {
+        assert!(
+            !forbidden_module_references(&snippet(source)).is_empty(),
+            "{label}: an aliased crate root laundered the reference:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn unrelated_crate_aliases_do_not_false_positive() {
+    // Positive controls for the alias tracking. Aliasing something else, or aliasing the
+    // crate and then not reaching a forbidden module, must stay clean.
+    for (label, source) in [
+        (
+            "alias of another crate",
+            "use std as s;\nfn f() { let _ = s::fmt::Debug; }\n",
+        ),
+        (
+            "crate alias used for something permitted",
+            "use crate as internal;\nfn f() { let _ = internal::bus::SharedBus; }\n",
+        ),
+        ("the alias statement alone", "use crate as internal;\n"),
+        (
+            "a module whose name merely shares a prefix, through an alias",
+            "use crate as internal;\nfn f() { let _ = internal::adaptive_extras::X; }\n",
+        ),
+    ] {
+        assert!(
+            forbidden_module_references(&snippet(source)).is_empty(),
+            "{label}: alias tracking invented a reference: {:?}\n{source}",
+            forbidden_module_references(&snippet(source))
+        );
+    }
 }
 
 #[test]
