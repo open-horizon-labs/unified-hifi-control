@@ -414,6 +414,34 @@ impl DaemonModel {
         f(&mut self.lock().faults);
     }
 
+    /// Which currently-armed behaviours are **not UHC-qualified**, named so a test cannot claim a
+    /// real daemon combination by accident.
+    ///
+    /// Every entry is derived from upstream observation on one daemon, one host, and is pending #332.
+    /// A default model returns an empty list: nothing unqualified is on unless a fixture asked for it.
+    /// The point is that arming such a behaviour is visible rather than implicit — a fake with more
+    /// switches than evidence can otherwise be configured into a daemon that has never existed, and a
+    /// conformance verdict about an impossible daemon is worse than no verdict.
+    pub fn armed_upstream_claims(&self) -> Vec<&'static str> {
+        let inner = self.lock();
+        let mut armed = Vec::new();
+        if inner.faults.source_refuses_rate_pin {
+            armed.push("source_refuses_rate_pin (derived-upstream, tier-2-only, pending #332)");
+        }
+        if inner.state.loaded_chain != LoadedChain::Pcm && inner.state.mode_index == 0 {
+            armed.push(
+                "loaded chain moved under [source] (derived-upstream, tier-2-only, pending #332)",
+            );
+        }
+        if inner.state_active_mode == ActiveModeReporting::ResolvesLoadedChain {
+            armed.push("State.active_mode resolving (UNMEASURED - no capture supports it)");
+        }
+        if inner.status_active_mode == ActiveModeReporting::ResolvesLoadedChain {
+            armed.push("Status.active_mode resolving (contradicts the measured echo behaviour)");
+        }
+        armed
+    }
+
     /// Full request lines the client has sent, in order.
     pub fn requests(&self) -> Vec<String> {
         self.lock().requests.clone()

@@ -3888,3 +3888,122 @@ async fn a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain() {
     );
     h.stop();
 }
+
+/// The **source** rate and the **output** rate are different facts and must not collapse into one.
+///
+/// `Status` carries the source's `samplerate` (mirrored from the `metadata` child) alongside
+/// `active_rate`, which is what the engine is actually clocking the output at. Reading either for the
+/// other misreports the signal path: a 44.1 kHz source upsampled to 705.6 kHz is one stream with two
+/// true rates, and `active_bits` belongs to the output rather than the source.
+///
+/// The upstream audit found its own UI inferring output depth from the rate and having to be corrected
+/// to read `Status.active_bits`. UHC already parses all three fields separately, so this pins the
+/// property rather than fixing it.
+///
+/// The *consuming* semantics — which rate a zone publishes, and how a surface labels them — belong to
+/// **#328**. #322 owns the fixture being able to tell them apart at all.
+///
+/// **Label: client-conformance** (a regression pin: it holds today, and is pinned so a future change
+/// cannot collapse the two rates silently).
+#[tokio::test]
+async fn the_source_rate_and_the_output_rate_are_reported_separately() {
+    let h = Harness::verified().await;
+    // A 44.1 kHz source being clocked out at 705.6 kHz: deliberately different numbers, and an
+    // output depth that could not have been inferred from either rate.
+    h.model.external_change(|s| {
+        s.playback = 2;
+        s.active_rate_hz = 705_600;
+        s.metadata = Some(Metadata {
+            samplerate: 44_100,
+            bits: 24,
+            ..Metadata::sample()
+        });
+    });
+
+    let status = h.adapter.get_playback_status().await.expect("Status");
+
+    assert_eq!(
+        (status.samplerate, status.active_rate),
+        (44_100, 705_600),
+        "the source rate and the output rate must both survive as themselves; collapsing them would \
+         make an upsampled stream indistinguishable from a native one. Got {status:?}"
+    );
+    assert_eq!(
+        status.active_bits, 24,
+        "and the output depth is a reported field, not something inferred from a rate"
+    );
+    h.stop();
+}
+
+/// Rate resolution is **chain-relative**: the same Hz value is a valid selection in one chain and
+/// absent from the other.
+///
+/// The PCM and SDM rate enumerations do not overlap at all — 44.1 kHz–768 kHz against
+/// 2.8 MHz–24.6 MHz — so a client resolving Hz to an index must resolve against the list currently in
+/// force. Upstream states the dependency is on mode *and* selected filter, so mode alone is not the
+/// whole story; the filter half is recorded as a gap below rather than modelled here.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn a_rate_valid_in_one_chain_is_refused_in_the_other() {
+    let h = Harness::verified().await;
+    let pcm_only_hz = 705_600;
+    let sdm_rates = corpus::enum_entries(
+        &corpus::document(VERIFIED_PROFILE, "rates_sdm"),
+        "RatesItem",
+    );
+    assert!(
+        !sdm_rates.iter().any(|e| e.rate == Some(pcm_only_hz)),
+        "precondition: {pcm_only_hz} Hz must be absent from the SDM enumeration"
+    );
+
+    h.adapter
+        .set_rate(pcm_only_hz)
+        .await
+        .expect("a PCM rate resolves while the PCM chain is loaded");
+
+    // The SDM chain is now in force, and the same Hz value has no index in it.
+    h.model.source_loads_chain(LoadedChain::Sdm);
+    let refused = h.adapter.set_rate(pcm_only_hz).await;
+
+    assert!(
+        refused.is_err(),
+        "a rate absent from the loaded chain's enumeration must not resolve to some other chain's \
+         index; rate resolution is relative to the list in force"
+    );
+    h.stop();
+}
+
+/// A default fake claims nothing that is not UHC-qualified.
+///
+/// The fake now carries several switches whose behaviour rests on upstream observation of one daemon
+/// on one host rather than on a UHC capture. Nothing prevents a test combining them into a daemon
+/// that has never existed, and a conformance verdict about an impossible daemon is worse than none.
+/// This makes the unqualified surface enumerable, so arming it is a visible act rather than an
+/// implicit one, and pins that the default arms nothing.
+///
+/// **Label: model-fidelity.**
+#[tokio::test]
+async fn a_default_fake_arms_no_unqualified_upstream_claim() {
+    let h = Harness::verified().await;
+    assert_eq!(
+        h.model.armed_upstream_claims(),
+        Vec::<&str>::new(),
+        "a default model must claim nothing beyond what UHC has qualified, so any test relying on an \
+         upstream-only behaviour has to ask for it where a reader can see the request"
+    );
+
+    // Arming one makes it enumerable rather than silent.
+    h.model.arm(|f| f.source_refuses_rate_pin = true);
+    let armed = h.model.armed_upstream_claims();
+    assert_eq!(
+        armed.len(),
+        1,
+        "arming an upstream-only behaviour must show up in the claim list; got {armed:?}"
+    );
+    assert!(
+        armed[0].contains("#332"),
+        "and each entry must name the qualification it is still waiting on; got {armed:?}"
+    );
+    h.stop();
+}
