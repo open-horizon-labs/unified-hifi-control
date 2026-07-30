@@ -87,10 +87,29 @@ adapter code — re-coupling surfaces to backends, which is what the epic remove
 
 ### Accepted
 
-* Roughly 3.2k lines of model, fixtures and tests before any producer publishes. Justified
-  by this being the cheapest moment to change the shape, and bounded by a test requiring
-  every vocabulary member to have a worked example in a canonical fixture — anything
-  unreachable by a fixture would have been cut.
+* **Size, stated plainly.** `src/adaptive/` is 3262 lines, of which 2022 are non-blank
+  non-comment — so about 38% is documentation of *why*. Tests add 2034 lines and fixtures
+  1960. For scale, `src/adapters/hqplayer.rs` is 2622 lines for one backend's live protocol.
+
+  The acceptance criteria mandate the *concepts*; this implementation chose the fullest
+  representation of each, and that was a judgment call rather than a forced move.
+  `constraint.rs` is the clearest case: at 625 lines it is a fifth of the module, and a
+  three-operator vocabulary with the same degradation rules would have satisfied every
+  criterion in roughly 250. The extra operators exist because they were cheap to add while
+  the serializer was being written, which is a reason to write code, not to ship it.
+
+  `every_vocabulary_member_has_a_worked_example` proves representability, not necessity: it
+  can always be satisfied by extending a fixture, so it bounds *reachability*, not size.
+
+* **#325 is the deletion gate.** When HQPlayer's mapping lands, any construct it cannot
+  populate from a real engine is a candidate for removal in v1.1 rather than permanent
+  surface every future producer must still handle. Removal within major 1 is otherwise
+  forbidden by the compatibility policy, so this is an explicit, time-boxed exception: it
+  applies only to constructs no producer has ever published, and it closes when #324 ships.
+  Current best guess at the exposed set: the `compensating` / `compensated` /
+  `recovery_required` / `divergent` outcomes, multi-revision plan boundaries, the
+  `in_range` / `is_grounded` / `not_eq` / `any` operators, and `held` values on producers
+  with no settings interface.
 * Non-Rust consumers get canonical fixtures and normative prose now; a generated JSON
   Schema is owed to the first issue that needs it (#314 or #326).
 * Consumers must handle an `Unrecognized` arm for every vocabulary. That is the cost of

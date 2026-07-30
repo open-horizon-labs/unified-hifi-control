@@ -53,23 +53,27 @@ pub mod version;
 pub mod vocab;
 
 pub use change_set::{
-    ActorClass, ChangeSet, ChangeSetEntry, ChangeSetId, ChangeSetState, DraftMode, DraftPolicy,
-    EntryValidity, Origin, Retention, RetireOutcome, Staleness, Surface,
+    ActorClass, ChangeSet, ChangeSetEntry, ChangeSetId, ChangeSetState, ConflictPolicy,
+    DetachedChangeSet, DraftMode, DraftPolicy, EntryValidity, EpochPolicy, Origin, Retention,
+    RetireOutcome, Staleness, Surface,
 };
 pub use command::{
     CommandOutcome, OperationId, OperationRecord, OutcomeTransition, PlanStep, RecoveryState,
     TransitionRejected, WriteAttempt,
 };
-pub use constraint::{Constraint, ConstraintEffect, Evaluation, Expr, Permission, Visibility};
+pub use constraint::{
+    Constraint, ConstraintEffect, Evaluation, Expr, ExprLimit, Permission, ValueLookup, Visibility,
+    MAX_EXPR_DEPTH, MAX_EXPR_NODES,
+};
 pub use control::{
     ApplyEffect, ApplyLane, ApplySemantics, Availability, AvailabilityState, Choice, ChoiceSet,
     Control, ControlGroup, ControlId, ControlKind, Disruption, NumericRange, Reason, ReasonCode,
     ReasonScope, RiskClass, Verification,
 };
 pub use document::{
-    admit_document, admit_document_str, DocumentRevisions, Extensions, LaneHealth, LaneState,
-    ProducerDocument, ProducerEpoch, ProducerIdentity, ProducerTarget, Revision, RevisionRef,
-    TargetRole, TransportLane,
+    admit_document, admit_document_str, DocumentRevisions, EffectiveView, Extensions, LaneHealth,
+    LaneState, ProducerDocument, ProducerEpoch, ProducerIdentity, ProducerTarget, Revision,
+    RevisionRef, TargetRole, TransportLane,
 };
 pub use value::{
     Authority, ControlValue, Divergence, DivergenceKind, Freshness, Grounding, LaneValue,

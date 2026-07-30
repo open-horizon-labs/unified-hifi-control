@@ -510,6 +510,31 @@ renaming or deleting one breaks another issue's tests. Canonical (1.0) fixtures 
 round-trip exactly and must contain no unrecognized fields — a fixture claiming to
 demonstrate held intent while actually demonstrating `None` is worse than no fixture.
 
+`every_vocabulary_member_has_a_worked_example` proves that every vocabulary member appears
+in some fixture and round-trips. It proves **representability, not necessity**, and it
+matches on string values rather than on schema position; the positional claims are made by
+the typed assertions in `mod canonical_semantics`. Whether each construct is *needed* is
+settled by #325 - see the ADR's deletion-gate consequence.
+
+### v1's wire form is JSON
+
+#323 treats the serialization used at individual boundaries as a *soft* constraint. v1
+hardens it: `ControlValue` and `Expr` have hand-written deserializers that route through
+`serde_json::Value`, because that is what lets an unknown value type or an unknown operator
+degrade to `Unrecognized` with its payload intact instead of failing the parse. The cost is
+that those two types are JSON-specific. A future binary transport for constrained devices
+(CBOR, MessagePack) is therefore a **known, scoped rewrite of roughly 300 lines**, not a
+configuration change. Every other type in the module is transport-agnostic serde.
+
+### Constraints are not a selection language
+
+`Expr` expresses producer *safety and validity*. Layout and data matchers (#326) answer a
+different question - which controls a given surface should present - and **must not reuse
+`Expr`**. Two reasons: a matcher's vocabulary can be unbounded where a safety vocabulary
+cannot, and sharing the type would invite a matcher to evaluate a constraint and act on the
+result, which sections 4 and 5 forbid. A matcher selects a presentation; it can never
+override producer validity.
+
 ### Known gap: no machine-readable schema for non-Rust consumers
 
 The Rust model is the normative source. Firmware (C) and iOS (Swift) consumers cannot read
