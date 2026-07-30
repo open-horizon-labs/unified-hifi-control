@@ -215,16 +215,71 @@ pub mod framing {
                         return Framing::Complete;
                     }
                 }
-                // Ran out of bytes with an element still open, or with none opened yet (so far only
-                // a declaration or whitespace). Either way, more is coming.
-                Ok(Event::Eof) => return Framing::Incomplete,
+                // Ran out of bytes. Normally that means more is coming — but if the root's own
+                // closing tag is sitting at the end of the buffer, the frame *is* closed and only
+                // the children are unreadable. See `root_frame_closed`.
+                Ok(Event::Eof) => {
+                    return if root_frame_closed(buf) {
+                        Framing::Complete
+                    } else {
+                        Framing::Incomplete
+                    }
+                }
                 // Declaration, text, comments and processing instructions carry no framing weight.
                 Ok(_) => {}
                 // quick_xml cannot distinguish "truncated mid-token" from "genuinely broken", so a
-                // parse error means keep reading; the response timeout bounds the wait.
-                Err(_) => return Framing::Incomplete,
+                // parse error means keep reading unless the frame is demonstrably closed.
+                Err(_) => {
+                    return if root_frame_closed(buf) {
+                        Framing::Complete
+                    } else {
+                        Framing::Incomplete
+                    }
+                }
             }
         }
+    }
+
+    /// Whether the buffer ends with the root element's own closing tag.
+    ///
+    /// This is the recovery boundary for a document whose *children* cannot be parsed. The daemon
+    /// emits malformed XML inside `<metadata>`, and a child tag that never terminates makes a parser
+    /// consume the `</Status>` that follows it as part of the child's own attribute soup — so the
+    /// closing tag is in the buffer but was never seen as an end event. Without recovery such a
+    /// reply reads as incomplete and the command burns its whole deadline waiting for bytes it
+    /// already holds, on **every** poll while a track is loaded.
+    ///
+    /// Deliberately narrow. Each clause protects a framing guarantee #322 exists to hold:
+    ///
+    /// * It keys on the root's **own** name, so `<State …></Status>` is not rescued — mismatched
+    ///   nesting is decided by the name-comparison path above, which is reached first.
+    /// * It requires the closing tag to be the buffer's **last** token, so a document truncated
+    ///   mid-child stays incomplete instead of being credited with a tag that has not arrived, and
+    ///   a `</Status>` appearing inside an attribute value cannot pass for a frame end.
+    /// * It is consulted only when the parse could not complete on its own, so every well-formed
+    ///   document takes the unchanged path.
+    ///
+    /// Reaching here with the buffer ending in `</root>` is itself the diagnosis: had that tag been
+    /// parsed as an end event, the element stack would have emptied and `Complete` would already
+    /// have been returned.
+    ///
+    /// Attribute reads stay correct either way — [`root_open_tag`] is a quote-aware scan that stops
+    /// at the root tag's own `>`, so it never looks at a child.
+    fn root_frame_closed(buf: &str) -> bool {
+        let Some(open) = root_open_tag(buf) else {
+            return false;
+        };
+        // A self-closing root has no separate closing tag and cannot reach here: quick_xml reports
+        // it as `Event::Empty`, which the loop above answers before any child is read.
+        let Some(name) = open
+            .trim_start_matches('<')
+            .split([' ', '\t', '\r', '\n', '>', '/'])
+            .next()
+            .filter(|n| !n.is_empty())
+        else {
+            return false;
+        };
+        buf.trim_end().ends_with(&format!("</{name}>"))
     }
 
     /// Skip leading whitespace, XML declarations, comments and processing instructions.
