@@ -295,6 +295,11 @@ impl ProducerAggregator {
     ///
     /// Removal is not disconnection. A producer that has lost its transport keeps
     /// publishing documents marked `stale`, and those stay visible as last-known.
+    ///
+    /// The retained refusal goes with the producer. Refusals outlive *successes*, so a
+    /// producer author can see that its documents were dropped even after one lands — but
+    /// outliving the producer itself would make `refusals()` name something that no longer
+    /// exists, and a surface listing "producers with problems" would show a ghost.
     pub async fn remove(&self, producer_id: &str) -> usize {
         let mut store = self.store.write().await;
         let doomed: Vec<ProducerKey> = store
@@ -306,6 +311,9 @@ impl ProducerAggregator {
         for key in &doomed {
             store.producers.remove(key);
         }
+        store
+            .refusals
+            .retain(|key, _| key.producer_id != producer_id);
         doomed.len()
     }
 
@@ -329,6 +337,10 @@ impl ProducerAggregator {
         for key in &doomed {
             store.producers.remove(key);
         }
+        // Same reasoning as `remove`: a refusal must not outlive the producer it names.
+        store
+            .refusals
+            .retain(|key, _| !doomed.iter().any(|gone| gone == key));
         doomed.len()
     }
 

@@ -1252,6 +1252,24 @@ mod refusal_observability {
     }
 
     #[tokio::test]
+    async fn a_refusal_does_not_outlive_the_producer_it_names() {
+        // Refusals outlive successes deliberately, so a producer author can see its
+        // documents were dropped. Outliving the producer itself is different: a surface
+        // listing "producers with problems" would show something that no longer exists.
+        let aggregator = ProducerAggregator::detached();
+        let mut document = pipeline();
+        document.target.zone_id = Some("no-prefix".to_string());
+        aggregator.ingest(document).await;
+        assert_eq!(aggregator.refusals().await.len(), 1);
+
+        aggregator.remove("hqplayer:living-room").await;
+        assert!(
+            aggregator.refusals().await.is_empty(),
+            "a refusal survived the removal of the producer it names"
+        );
+    }
+
+    #[tokio::test]
     async fn a_later_success_does_not_erase_the_record_of_a_refusal() {
         let aggregator = ProducerAggregator::detached();
         let key = ProducerKey::of(&pipeline());
