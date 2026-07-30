@@ -942,7 +942,7 @@ text belongs somewhere durable, so it is here:
    asserted on a divergence that could never appear. It now trims `"Speakers"`, which is actually in
    the matrix family.
 
-### Verification at `75eeecc` (current head)
+### Verification at `75eeecc` (historical — superseded, see the final section)
 
 | Command | Result |
 |---|---|
@@ -969,3 +969,90 @@ all pre-existing: the two deterministic `/hqp/discover` multicast 500s and the ~
 - **The live gate's own env handling and connect path.** `capture`/`diff`/`render`/`artifact_block`
   are all proven hermetically against the fake; the gate's variable parsing and its connection to real
   hardware are exercised only by an actual run.
+
+---
+
+## Fourth Codex acceptance audit — closure at `698bdf3`
+
+The audit named seven findings. Six were closed in `5d12c3c`. Two survived it, and both were found by
+my own post-fix audit rather than by a test — which is itself the finding worth recording.
+
+### The record `5d12c3c` got wrong
+
+Its message stated *"The page never enters the capture."* That was false when written. A string
+replacement in that commit had silently failed, so `tier1.rs` still ran
+`c.raw_documents.insert("config_form".to_string(), clean)` — the sanitised `/config` page was retained,
+which is exactly the vector finding 3 named. No test asserted the page's *absence*, so nothing failed.
+The commit could not be amended (no force-push), so the correction lives in `698bdf3`'s message.
+
+### Two defects that survived the fix for them
+
+| # | Defect | Evidence |
+|---|---|---|
+| 3 | `sanitize()` redacted *tags* only, stranding secret element text. `<password>SEKRET</password>` → `<!-- redacted -->SEKRET<!-- redacted -->` | RED: the leak test listed every hostile document whose secret survived |
+| 7 | `capture()` sourced `config_profiles` from the **semantic** parser — assigned from the raw `/config` projection, then unconditionally overwritten in *both* arms of the `fetch_profiles()` match | RED: `got ["semantic-z"]` where the raw lane had served `raw-a`/`raw-b` |
+
+Finding 7 is the more instructive one: *evidence reconstructed after semantic parsing* is the exact
+thing Codex told me not to do, and I reintroduced it inside the commit that claimed to fix it. The raw
+lane is now authoritative and `fetch_profiles()` is demoted to a cross-check under
+`config_profiles_semantic`; when the two lanes disagree the differ raises
+`DivergenceKind::LaneDisagreement` rather than resolving it in either side's favour. A disagreement
+between lanes is a finding about the *client*, and a conformance tool that silently picks a winner has
+destroyed the only evidence that mattered.
+
+### Why both survived: no hermetic coverage of the web lane
+
+Every other family had a fake. The `/config` read side had none — it was reachable only from live
+hardware, so nothing exercised it in CI, and two defects sat in it undetected. `FakeConfigWeb` now
+serves `/config` and `/config/profile/load` with deliberately different profile names, which makes the
+*source* of the evidence observable rather than merely its content.
+
+### The drift the fix nearly introduced
+
+Consolidating revealed the redaction marker list had become **three copies**, already diverged
+(`"apikey"` in the sanitiser, `"key"` in the config projection). That is the same failure mode the list
+exists to prevent: extend one copy, miss the others, reopen the hole. Now one
+`raw::SENSITIVE_MARKERS`/`is_sensitive` using the union, with
+`the_redaction_marker_list_has_exactly_one_definition` as a standing lint. The hostile-tag test was
+likewise duplicated across the `Start` and `Empty` arms and is now one `is_hostile_tag()`.
+
+Two deliberate accepted trade-offs, recorded rather than left implicit:
+
+- `"key"` is broad and now drives *text* redaction too, so an element named `monkey` would lose its
+  text. Accepted: HQPlayer's vocabulary (`State`, `Status`, `FiltersItem`, `index`, `value`, `arg`,
+  `rate`) contains no such name, and over-redaction costs evidence while under-redaction costs a secret.
+- `"hidden"` matching was *narrowed* to `type="hidden"` specifically, so an unrelated `status="Hidden"`
+  no longer costs a whole element. Secret-*named* attributes remain covered by `is_sensitive`.
+
+### Verification at `698bdf3` (final head of this stage)
+
+| Command | Result |
+|---|---|
+| `cargo test --test hqplayer_conformance` | **138 passed; 0 failed; 0 ignored** (was 132) |
+| `cargo test --no-fail-fast` (whole suite) | **447 passed** |
+| `cargo test --test api_contract` | 2 passed — public routes and payloads untouched |
+| `cargo fmt --check` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `git diff --check` | clean |
+| `sg review` | no blocking concerns; every point it raised was fixed, not deferred |
+
+Three `sg review` findings were acted on rather than acknowledged: the dead `config_profiles`
+assignment (which *was* defect 7), the unescaped-text well-formedness regression, and the
+over-broad `"hidden"` match. Sanitised output must still reparse — the artifact embeds these documents
+as evidence, and output that no longer parses is not evidence.
+
+**Two suite failures remain and are not from this branch.**
+`protocol_integration::api_endpoints::hqp_discover_returns_json` and
+`client_harness::shared_endpoints::get_hqp_discover` both reproduce identically on an untouched `v3`
+worktree (`0a1b02c`): `/hqp/discover` returns 500 in this sandbox, where network discovery is
+unavailable. Verified by building and running `v3` in a throwaway worktree, not inferred.
+
+A quiet semantic change worth flagging: the `config_profiles` latency key now measures the `/config`
+page fetch, and the semantic call's timing moved to `config_profiles_semantic`. Both are test-only —
+no production timing path or `HqpTimeouts` value reads either.
+
+### Still at the hardware gate
+
+Nothing here has touched a real daemon. Every tier-1 result to date is hermetic, against the fake.
+The corpus cannot be settled until the gate below is run on hardware, and no live claim will be made
+before then.
