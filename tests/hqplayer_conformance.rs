@@ -55,9 +55,6 @@ fn fast_timeouts() -> HqpTimeouts {
         response: Duration::from_millis(300),
         reconnect_delay: Duration::from_millis(10),
         max_attempts: 2,
-        // Production default, deliberately not shrunk: the burst expectation below is about the
-        // shipped ceiling, so overriding it here would test the harness instead of the client.
-        max_unsolicited: HqpTimeouts::default().max_unsolicited,
     }
 }
 
@@ -1417,6 +1414,40 @@ async fn a_burst_of_unsolicited_frames_is_skipped_without_dropping_the_connectio
          skip bound was exhausted and the retry loop papered over it. min={}, new connections={}",
         range.min,
         h.server.stats().connections() - connections_before
+    );
+    h.stop();
+}
+
+/// `response` bounds a single read, so every skipped document resets it. Without an overall
+/// per-command deadline, a daemon that streams unsolicited `Status` frames and never answers keeps
+/// the command alive for as long as the stream lasts — at a verified 1-2 Hz that is tens of seconds,
+/// far worse than the no-reply case it was supposed to protect.
+///
+/// Client expectation: unsolicited traffic cannot extend how long a command waits. Asserted on the
+/// **count** of frames the client consumed, not on elapsed time: bounded by the deadline, that count
+/// stays small, whereas a per-read reset lets it run to whatever ceiling the skip logic allows.
+#[tokio::test]
+async fn continuous_unsolicited_traffic_cannot_extend_the_command_deadline() {
+    let h = Harness::with_policy(WirePolicy {
+        unsolicited_stream_for_element: Some((
+            "VolumeRange".to_string(),
+            PUSH_STATUS_FRAME.to_string(),
+            Duration::from_millis(20),
+        )),
+        ..WirePolicy::default()
+    })
+    .await;
+    let before = h.server.stats().replies();
+
+    let result = h.adapter.get_volume_range().await;
+    let consumed = h.server.stats().replies() - before;
+
+    assert!(
+        result.is_err() && consumed < 60,
+        "a command that is never answered must be bounded by its own deadline, not by the length of \
+         the push stream. err={} frames_streamed={consumed} (a 300ms deadline at one frame per 20ms \
+         should consume well under 60 across both attempts)",
+        result.is_err()
     );
     h.stop();
 }

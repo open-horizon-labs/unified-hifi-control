@@ -61,6 +61,13 @@ pub struct WirePolicy {
     pub silent_for_element: Option<String>,
     /// Append these raw bytes instead of a reply for this element, to model a malformed document.
     pub malformed_for_element: Option<(String, String)>,
+    /// `(element, document, interval)` — on a request for that element, stream `document`
+    /// repeatedly at `interval` and **never** send the real reply.
+    ///
+    /// Models the daemon pushing `Status` frames while a command goes unanswered. The point is that
+    /// a per-read timeout resets on every one of these, so without an overall per-command deadline
+    /// the client stays alive for as long as the stream continues.
+    pub unsolicited_stream_for_element: Option<(String, String, Duration)>,
     /// `(element, extra_document)` — after replying to that element, append a second, unsolicited
     /// document to the **same TCP write**, so both land in the client's receive buffer together.
     ///
@@ -80,6 +87,7 @@ impl Default for WirePolicy {
             silent_for_element: None,
             malformed_for_element: None,
             coalesce_extra_for_element: None,
+            unsolicited_stream_for_element: None,
         }
     }
 }
@@ -282,6 +290,25 @@ async fn serve_connection(
         if let Some(ref element) = policy.silent_for_element {
             if mentions(&line, element) {
                 continue;
+            }
+        }
+
+        if let Some((ref element, ref doc, interval)) = policy.unsolicited_stream_for_element {
+            if mentions(&line, element) {
+                // Bounded so a stuck test cannot leak an unbounded task; far more than any deadline
+                // should allow the client to consume.
+                for _ in 0..400 {
+                    let mut bytes = doc.clone().into_bytes();
+                    if !bytes.ends_with(b"\n") {
+                        bytes.push(b'\n');
+                    }
+                    if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                        return;
+                    }
+                    stats.replies.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(interval).await;
+                }
+                return;
             }
         }
 

@@ -366,7 +366,10 @@ pub mod framing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HqpTimeouts {
     pub connect: Duration,
-    /// Per-read ceiling while awaiting a reply.
+    /// Overall ceiling on one command: how long `send_command_inner` may spend between writing the
+    /// request and holding its complete reply. Deliberately a *whole-command* budget rather than a
+    /// per-read one, so a daemon streaming unsolicited documents cannot keep a reply-less command
+    /// alive indefinitely by resetting the clock on every frame.
     pub response: Duration,
     /// Backoff between reconnect attempts. **Also** paces `verify_applied`'s readback polling: one
     /// value covers both network retry backoff and daemon apply-latency backoff. That reuse avoids a
@@ -374,9 +377,6 @@ pub struct HqpTimeouts {
     /// of reconnect backoff, split them then rather than discovering it the hard way.
     pub reconnect_delay: Duration,
     pub max_attempts: u32,
-    /// Ceiling on unsolicited documents skipped while awaiting a command's own reply. See
-    /// [`DEFAULT_MAX_UNSOLICITED`] for how the default is derived from the daemon's push cadence.
-    pub max_unsolicited: u32,
 }
 
 impl Default for HqpTimeouts {
@@ -386,7 +386,6 @@ impl Default for HqpTimeouts {
             response: RESPONSE_TIMEOUT,
             reconnect_delay: RECONNECT_DELAY,
             max_attempts: MAX_RECONNECT_ATTEMPTS,
-            max_unsolicited: DEFAULT_MAX_UNSOLICITED,
         }
     }
 }
@@ -400,14 +399,19 @@ const PROFILE_PATH: &str = "/config/profile/load";
 const MAX_RECONNECT_ATTEMPTS: u32 = 2;
 /// Delay between reconnection attempts (HQPlayer can be overwhelmed by rapid connections)
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
-/// Default ceiling on unsolicited documents skipped while awaiting a command's own reply.
+/// Backlog ceiling on unsolicited documents skipped within one command. **Not** the time bound.
 ///
-/// Derived rather than guessed. During active playback the daemon pushes `Status` frames at a
-/// verified ~1-2 Hz, and the shipped response timeout is 3 s, so one slow command can legitimately
-/// have ~6 frames land behind it. An earlier value of 8 left almost no margin: exceeding it does not
-/// hang, because the retry loop reconnects, but it costs a dropped connection per burst. 64 is an
-/// order of magnitude above the plausible burst while still bounding a runaway.
-const DEFAULT_MAX_UNSOLICITED: u32 = 64;
+/// The time bound is the per-command deadline in `send_command_inner`: skipping a document consumes
+/// the same budget as waiting for one, so unsolicited traffic cannot extend how long a command waits.
+/// This constant only stops unbounded work if frames arrive faster than the deadline is noticed, so
+/// it is deliberately private and generous — it is CPU protection, not policy, and nothing should
+/// need to tune it.
+///
+/// An earlier revision made this a public, derived `max_unsolicited = 64` instead of fixing the
+/// deadline. That was wrong: `response` bounds a single *read*, so every skip reset it and a steady
+/// 1-2 Hz push stream kept a reply-less command alive for tens of seconds — worse than the 8 it
+/// replaced.
+const MAX_UNSOLICITED_BACKLOG: u32 = 256;
 
 /// HQPlayer state information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1119,9 +1123,18 @@ impl HqpAdapter {
         let mut complete = false;
         let mut skipped = 0u32;
 
+        // One budget for the whole command. Each read gets what is left of it, so skipping an
+        // unsolicited document costs the same as waiting for a wanted one.
+        let deadline = tokio::time::Instant::now() + timeouts.response;
+
         while !complete {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("Response timeout"));
+            }
+
             let mut line = String::new();
-            let read_result = timeout(timeouts.response, conn.stream.read_line(&mut line)).await;
+            let read_result = timeout(remaining, conn.stream.read_line(&mut line)).await;
 
             match read_result {
                 Ok(Ok(0)) => break, // EOF
@@ -1136,7 +1149,7 @@ impl HqpAdapter {
                                 // for the reply to the command actually sent, rather than answering
                                 // from someone else's document.
                                 skipped += 1;
-                                if skipped > timeouts.max_unsolicited {
+                                if skipped > MAX_UNSOLICITED_BACKLOG {
                                     return Err(anyhow!(
                                         "Gave up after {} unsolicited documents while awaiting a {} \
                                          reply (last was {:?})",
