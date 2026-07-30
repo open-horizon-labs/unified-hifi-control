@@ -1218,8 +1218,10 @@ fn every_command_a_claim_names_is_exercised_by_one_of_its_own_proofs() {
             });
             if !exercised {
                 bad.push(format!(
-                    "{} names {cmd} but no cited test *calls* it — looked for a call to {} or a raw \
-                     `<{cmd}` literal, in the parsed body of {:?}. {FIXTURES_NEVER_EXERCISE}",
+                    "{} names {cmd} but no cited test *calls* it — looked for a call to {} in the parsed \
+                     body of {:?}. Raw wire string literals never count, in any position; an unmapped \
+                     command has no executable proof until a mapping is added deliberately. \
+                     {FIXTURES_NEVER_EXERCISE}",
                     c.id,
                     accepted_calls_for(&cmd).map_or_else(
                         || "no mapped adapter method".to_string(),
@@ -1281,13 +1283,14 @@ fn commands_in(text: &str) -> Vec<String> {
 ///
 /// Deliberately **not** accepted, each for a stated reason:
 ///
-/// * A bare command name in a string literal — `accept_but_ignore("SetRate")` arms the fake, it does not
-///   send anything. Requiring the `<` makes an arrangement distinguishable from an invocation.
-/// * **A raw wire string literal, in any position whatsoever.** Removed rather than narrowed — see the
-///   paragraph above. Consequence: an **unmapped** command cannot be credited at all, and must either gain a
-///   deliberate mapping in [`accepted_calls_for`] or be named after [`ELSEWHERE_MARKER`] with where its
-///   evidence lives. Residual, stated: calls inside macro invocations such as `assert_eq!` are invisible,
-///   because `syn` does not parse macro token streams into expressions.
+/// * **A string literal, in any position and of any shape** — a bare command name such as
+///   `accept_but_ignore("SetRate")`, which arms the fake and sends nothing, and equally a wire-shaped
+///   `"<SetRate …/>"` handed to something that looks like a send. Neither counts, because no name check can
+///   tell a real emitter from a formatter or an unrelated type. Consequence: an **unmapped** command has no
+///   executable proof at all, and must either gain a deliberate mapping in [`accepted_calls_for`] or be
+///   named after [`ELSEWHERE_MARKER`] with where its evidence lives. Residual, stated: calls inside macro
+///   invocations such as `assert_eq!` are invisible, because `syn` does not parse macro token streams into
+///   expressions.
 /// * Anything in a comment or doc comment — a plan is not a proof.
 /// * Anything inside a **deferred context** — a closure body or an unawaited `async { … }` block. Both are
 ///   *described*, not executed, and `visit_expr_closure`/`visit_expr_async` stop the walk at each. An
@@ -1396,8 +1399,9 @@ const FIXTURES_NEVER_EXERCISE: &str =
 ///   future shaper expectation calling `set_shaper` would not have been credited and the check would have
 ///   demanded an exemption for evidence that was there.
 /// * A `set_` fallback for unmapped commands let **any** setter in a proof body credit **any** unknown
-///   command: an invented `SetFoo` would have been proven by an unrelated `set_mode` call. `None` forces
-///   an unmapped command to be evidenced by its own raw wire name.
+///   command: an invented `SetFoo` would have been proven by an unrelated `set_mode` call. `None` now means
+///   an unmapped command has **no executable proof** — a raw wire literal never stands in for one — so it
+///   needs either a mapping added here or the evidenced-elsewhere marker.
 /// * A **prefix** match credited `set_mode_something_else` for `SetMode` — while the doc comment claimed
 ///   it would not. The comment was right about the intent and the code did the opposite, so membership is
 ///   now exact and the near-prefix case is a control.
@@ -1412,18 +1416,19 @@ fn accepted_calls_for(cmd: &str) -> Option<&'static [&'static str]> {
         "SetJunkFilter" => Some(&["set_junk_filter"]),
         "SetVolume" => Some(&["set_volume", "set_volume_db"]),
         "SetAdaptiveVolume" => Some(&["set_adaptive_volume"]),
-        // Deliberately `None` rather than a `set_` prefix or a pattern: an unmapped command must be
-        // evidenced by its own raw wire name. Adding a name here is a decision to accept that method as
-        // evidence for that command, and it should be explicit, exact and reviewable one line at a time.
+        // Deliberately `None` rather than a `set_` prefix or a pattern. An unmapped command has no
+        // executable proof at all — a raw wire literal is never evidence — so it must gain a mapping here
+        // or be declared evidenced elsewhere. Adding a name is a decision to accept that method as evidence
+        // for that command, and it should be explicit, exact and reviewable one line at a time.
         _ => None,
     }
 }
 
 /// Controls for [`test_exercises_command`], written as the exploits it must refuse.
 ///
-/// Every raw-wire literal shape is a **negative** here, including the ones handed to a real send: raw
-/// literals are not evidence at all, because no type-blind name check can tell `sock.write_all` from
-/// `formatter.write`.
+/// Every string-literal shape is a **negative** here, including wire-shaped literals handed to something
+/// that looks like a send: **literals never count**, because no type-blind name check can tell
+/// `sock.write_all` from `formatter.write`.
 #[test]
 fn a_command_is_exercised_only_by_a_call_to_a_mapped_adapter_method() {
     let parse = |src: &str| syn::parse_file(src).expect("control source parses");
@@ -1461,7 +1466,7 @@ fn a_command_is_exercised_only_by_a_call_to_a_mapped_adapter_method() {
     ] {
         assert!(
             !ex(src, "t", "SetJunkFilter"),
-            "a raw wire literal is not evidence in any position: {src}"
+            "a wire-shaped literal never counts, whatever it is passed to: {src}"
         );
     }
 
@@ -1493,7 +1498,7 @@ fn a_command_is_exercised_only_by_a_call_to_a_mapped_adapter_method() {
             "t",
             "SetMode"
         ),
-        "no call name makes a raw literal into evidence"
+        "no call name turns a literal into evidence"
     );
     // Refused: a real send shape, but inside a deferred context.
     assert!(!ex(
@@ -1509,8 +1514,8 @@ fn a_command_is_exercised_only_by_a_call_to_a_mapped_adapter_method() {
         "t",
         "SetMode"
     ));
-    // Refused: a **bare** command name in a string literal. `accept_but_ignore("SetRate")` arms the
-    // fake; it sends nothing. This is the case a substring match could never separate.
+    // Refused: a command name in a string literal. `accept_but_ignore("SetRate")` arms the fake; it sends
+    // nothing. No literal is evidence, wire-shaped or not — this is one instance of that rule.
     assert!(!ex(
         r#"#[test] fn t() { h.model.accept_but_ignore("SetRate"); }"#,
         "t",
@@ -1543,8 +1548,8 @@ fn a_command_is_exercised_only_by_a_call_to_a_mapped_adapter_method() {
     ));
 
     // Refused: evidence inside an **uninvoked closure**. The visitor recursed into closure bodies, so a
-    // command that is only *described* for later execution was credited as sent. Both shapes are here
-    // because they fail through different collectors — the method call and the raw literal.
+    // call that is only *described* for later execution was credited as sent. Only the method-call shape
+    // remains testable here, since a literal is no longer evidence in any position.
     assert!(!ex(
         r#"#[test] fn t() { let _never_called = || h.adapter.set_mode("PCM"); }"#,
         "t",

@@ -1255,3 +1255,34 @@ strongest available form of "eliminate the class rather than document it."
 `tests/adapter_integration.rs`, not in this PR's diff and byte-identical to `origin/v3`. That is ADR 003's
 documented `UHC_CONFIG_DIR` family, and across this session it has now fired in 2 of 8 runs. A rate, not a
 verdict.
+
+### Nine stale statements survived the removal, in the same file that did the removing
+
+A pre-commit audit of the pushed head `f1afede` found that **removing raw-literal evidence had left nine
+statements still describing it as accepted** — in the diagnostic a failing run prints, in the function's own
+doc bullets, in `accepted_calls_for`'s doc and inline comment, in the controls' header, and in two control
+comments.
+
+**The worst of them was the diagnostic**, because it is read exactly when someone is debugging a failure:
+
+> *"…looked for a call to `one of ["set_shaper"]` **or a raw `<SetShaping` literal**, in the parsed body of …"*
+
+A reader following that would have gone looking for a way to write a literal that satisfied the check. There
+is none. It now reads *"Raw wire string literals never count, in any position; an unmapped command has no
+executable proof until a mapping is added deliberately."*
+
+Also corrected: the bullet still justifying the `<` prefix as *"making an arrangement distinguishable from an
+invocation"* — a rule that no longer exists; `accepted_calls_for`'s claim that `None` *"forces an unmapped
+command to be evidenced by its own raw wire name"*, which is now the opposite of the truth; and a control
+comment describing *"two collectors — the method call and the raw literal"* when only one collector remains.
+
+**One invariant, stated the same way everywhere now:** *a string literal is never evidence, in any position
+and of any shape; only a call to a mapped adapter method counts; an unmapped command has no executable proof
+until a mapping is added deliberately.* The three generic mentions of literals being *parsed structurally*
+(in `declares_fn`'s parse-ladder docs) are about how fragments are analysed, not about what counts as
+evidence, and are unchanged.
+
+**This is the fifth finding in this session that turned on stale or contradictory *description* rather than
+logic** — and the second where a correction left its own documentation behind. The pattern is now
+unmistakable: a change that removes a capability has to sweep every statement that described it, and my own
+sweeps have twice been the thing that missed. **Twenty-one defects.**
