@@ -223,10 +223,18 @@ UHC_HQP_CONFORMANCE_HOST=<daemon-ip> \
 | `UHC_HQP_CONFORMANCE_WEB_PORT` | no | `8088` | HTTP port for the `/config` read side |
 | `UHC_HQP_CONFORMANCE_WEB_USER` | no | — | Digest user. Supply with `_PASS` to include the persistent read lane |
 | `UHC_HQP_CONFORMANCE_WEB_PASS` | no | — | Digest password |
+| `UHC_HQP_CONFORMANCE_ARTIFACT` | no | — | Path to write the JSON artifact to. Without it the artifact still goes to stderr between `----BEGIN uhc-hqp-tier1 ARTIFACT----` and `----END uhc-hqp-tier1 ARTIFACT----`, so CI can lift it from captured output either way |
 
 The gate **fails on divergence** and prints the full report either way. A divergence is resolved by
 re-provenancing the fixture from the capture, or by shipping it as a stated gap — never by loosening
 the differ.
+
+Both output forms are emitted: `render()` for whoever is in the room, and the marker-bracketed
+`uhc-hqp-tier1/v1` JSON artifact for CI to store and a later run to diff against. The artifact embeds
+the full normalized capture — every enumeration entry's index/name/enum ID/rate, the scalar attribute
+maps, the config-profile observation as an explicit value — so a comparison never has to scrape human
+output. It carries **no host, port, user or password**, and a `MatrixGetProfile` read failure is
+recorded as a distinct fact rather than collapsed into "no selection".
 
 What the report carries: daemon identity (product/version/engine/platform/name), the active mode and
 an explicit note that the enumerations are *that mode's* lists only, whether `Status` carried its
