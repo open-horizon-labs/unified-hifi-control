@@ -4709,8 +4709,24 @@ async fn an_attribute_lookup_without_a_root_element_reports_nothing() {
 //
 // These use `ApplyThenDropReplyOnce`, which is indistinguishable from `DropNextReplyOnce` at the
 // socket and the opposite of it at the model. The assertion is deliberately on the model's state and
-// not on the call's `Result`: failing the call is the honest outcome, but it is the duplicate side
-// effect that harms the user.
+// on the call's `Result` together. Both halves are the contract: exactly one side effect, and an *error*
+// rather than a success the client cannot justify. Epic #311's no-false-success rule applies here as
+// much as to a rejected setter — the reply was lost, so the client does not know the command landed, and
+// reporting `Ok` would assert something it cannot know. Asserting only the side effect would let a future
+// implementation swallow the ambiguity and return `Ok`.
+//
+// **What these tests do not cover.** They exercise the *reply-loss* half only: the request was fully
+// written and flushed, and the reply vanished. The production guard is deliberately wider — it treats a
+// one-shot as possibly-applied from the moment the write is attempted, because `write_all` can put part
+// of the request on the stream before erroring and `flush` can fail after bytes have left for the peer.
+// Verified: moving the flag back to after the flush leaves all four of these tests green, so they are
+// insensitive to that boundary and must not be read as proving it.
+//
+// That half is not covered because this harness cannot schedule it. A write error needs the peer to RST
+// between the adapter's two `write_all` calls; closing the server instead lets the small request into
+// the kernel buffer, so the failure surfaces on the *read* as EOF — the case already covered above. The
+// boundary is therefore argued from the `tokio::io` contract rather than demonstrated, and it is a strict
+// widening: it can only ever refuse a retry that the narrower rule would have allowed, never permit one.
 // ===========================================================================================
 
 /// Arrange a daemon that applies the next command and then vanishes without replying.
@@ -4735,10 +4751,13 @@ async fn next_advances_one_track_when_the_reply_is_lost_after_the_daemon_applied
     let h = apply_then_drop_harness().await;
     let before = h.model.state().track;
 
-    // Either outcome is defensible for the caller: reporting failure is honest, and reporting success
-    // would be a lie. What is not defensible is skipping two tracks.
-    let _ = h.adapter.next().await;
+    let outcome = h.adapter.next().await;
 
+    assert!(
+        outcome.is_err(),
+        "the reply was lost, so the client cannot know Next landed; reporting success would assert what \
+         it does not know. Got {outcome:?}"
+    );
     assert_eq!(
         h.model.state().track,
         before + 1,
@@ -4754,7 +4773,12 @@ async fn volume_mute_toggles_once_when_the_reply_is_lost_after_the_daemon_applie
     let h = apply_then_drop_harness().await;
     let before = h.model.state().muted;
 
-    let _ = h.adapter.volume_mute().await;
+    let outcome = h.adapter.volume_mute().await;
+
+    assert!(
+        outcome.is_err(),
+        "a lost reply must surface as an error, not a success the client cannot justify; got {outcome:?}"
+    );
 
     // A toggle retried lands back where it started, so the user presses mute and hears nothing change
     // — the worst shape of this bug, because it looks like the command was simply ignored.
@@ -4777,7 +4801,12 @@ async fn volume_up_steps_once_when_the_reply_is_lost_after_the_daemon_applied_it
         .step_db
         .expect("the verified profile publishes a volume step");
 
-    let _ = h.adapter.volume_up().await;
+    let outcome = h.adapter.volume_up().await;
+
+    assert!(
+        outcome.is_err(),
+        "a lost reply must surface as an error, not a success the client cannot justify; got {outcome:?}"
+    );
 
     let after = h.model.state().volume_db;
     assert!(

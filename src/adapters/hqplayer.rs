@@ -1327,9 +1327,9 @@ impl HqpAdapter {
             }
 
             // Try to send command
-            let mut request_written = false;
+            let mut request_attempted = false;
             match self
-                .send_command_inner_tracking(xml, &mut request_written)
+                .send_command_inner_tracking(xml, &mut request_attempted)
                 .await
             {
                 Ok(response) => {
@@ -1343,17 +1343,19 @@ impl HqpAdapter {
                     self.mark_disconnected().await;
                     last_error = Some(e);
 
-                    // At-most-once for one-shot commands. Once the request is on the wire the daemon
-                    // may already have applied it: the protocol carries no request identity, so a lost
-                    // reply and a lost request are indistinguishable from here. Retrying is not
-                    // "recovering", it is choosing to skip a second track or step the volume twice on
-                    // the chance that nothing happened. Failing is the honest outcome, and it is the
-                    // one the user can correct; a silent double-apply is not.
+                    // At-most-once for one-shot commands. Once the write has been *attempted* the daemon
+                    // may already have applied the request: the protocol carries no request identity, so
+                    // a lost reply, a lost request and a half-written request are indistinguishable from
+                    // here. Retrying is not "recovering", it is choosing to skip a second track or step
+                    // the volume twice on the chance that nothing happened. Failing is the honest
+                    // outcome, and it is the one the user can correct; a silent double-apply is not.
                     //
-                    // Failures *before* the write are unambiguous and still retry, which is where the
-                    // real recovery value is — a stale socket is discovered by writing to it. Queries
-                    // are unaffected: reading twice costs nothing.
-                    if one_shot && request_written {
+                    // The flag is set before the first write, so this covers a partial write and a failed
+                    // flush as well as a lost reply. Failures before that point — `ensure_connected`
+                    // above, or the `Not connected` guard — are unambiguously pre-write and still retry,
+                    // which is where the real recovery value is: a stale socket is discovered by writing
+                    // to it. Queries are unaffected, since reading twice costs nothing.
+                    if one_shot && request_attempted {
                         tracing::warn!(
                             "Not retrying one-shot HQPlayer command after a post-write failure; it may \
                              already have been applied and retrying would apply it twice"
@@ -1390,20 +1392,31 @@ impl HqpAdapter {
 
     /// Inner send command (without retry logic)
     async fn send_command_inner(&self, xml: &str) -> Result<String> {
-        let mut written = false;
-        self.send_command_inner_tracking(xml, &mut written).await
+        let mut attempted = false;
+        self.send_command_inner_tracking(xml, &mut attempted).await
     }
 
-    /// [`Self::send_command_inner`], reporting whether the request reached the socket.
+    /// [`Self::send_command_inner`], reporting whether the request could have reached the daemon.
     ///
-    /// `request_written` is set once the bytes are flushed, which is the boundary between "the daemon
-    /// certainly never saw this" and "it may have applied it". `send_command` needs that distinction to
-    /// keep one-shot commands at-most-once; nothing else does, so the plain wrapper above stays the
-    /// normal entry point.
+    /// `request_attempted` is set **before the first write**, not after the flush, and that placement is
+    /// the whole point. `write_all` is not atomic: it can put part of the request on the stream and then
+    /// error, and `flush` can fail after bytes have already left for the peer. Setting the flag after the
+    /// flush therefore reported "the daemon certainly never saw this" for two cases where it may well
+    /// have — and `send_command` would then retry a one-shot on that assurance.
+    ///
+    /// So the boundary is deliberately conservative: once a *connected* command enters the write
+    /// attempt, every later failure — partial write, failed flush, timeout, EOF, malformed reply — is
+    /// ambiguous and counts as possibly-applied. The only failures that are unambiguously pre-write are
+    /// the ones that happen before this point: `ensure_connected` failing in the caller, and the
+    /// `Not connected` guard below. Those still retry, which is where the recovery value is.
+    ///
+    /// The cost of being wrong in this direction is a spurious error on a command that never landed; the
+    /// cost in the other direction is silently skipping two tracks. Only `send_command` needs the
+    /// distinction, so the plain wrapper above stays the normal entry point.
     async fn send_command_inner_tracking(
         &self,
         xml: &str,
-        request_written: &mut bool,
+        request_attempted: &mut bool,
     ) -> Result<String> {
         let timeouts = self.timeouts().await;
         let mut conn_guard = self.connection.lock().await;
@@ -1411,12 +1424,15 @@ impl HqpAdapter {
             .as_mut()
             .ok_or_else(|| anyhow!("Not connected"))?;
 
+        // Past this point the daemon may have seen some or all of the request, so a one-shot command is
+        // no longer safe to retry. Set before the first write rather than after the flush: neither
+        // `write_all` nor `flush` guarantees that nothing reached the peer when it returns an error.
+        *request_attempted = true;
+
         // Send command
         conn.write_half.write_all(xml.as_bytes()).await?;
         conn.write_half.write_all(b"\n").await?;
         conn.write_half.flush().await?;
-        // Past this point the daemon may have acted on the request, whatever happens to the reply.
-        *request_written = true;
 
         // The element the daemon must answer with. Setters echo the request element and queries
         // return a container of the same name, so a reply's root element always matches its
