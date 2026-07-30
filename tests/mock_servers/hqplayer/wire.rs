@@ -337,7 +337,13 @@ async fn serve_connection(
                 // the client's line-oriented reads progressing, so it accumulates rather than
                 // blocking on one enormous read — which is the shape that makes an unbounded buffer
                 // a memory hazard rather than merely a slow reply.
-                let filler = format!("<Junk pad=\"{}\"/>\n", "x".repeat(1024));
+                //
+                // Frames are deliberately large. The client re-classifies its **whole** accumulated
+                // buffer after every line, so accumulation costs O(bytes × lines): with 1 KiB frames
+                // the client cannot reach a multi-megabyte buffer inside any sane deadline, and the
+                // test would then pass or fail on parser throughput instead of on the byte ceiling.
+                // Large frames keep the line count low so the ceiling is what the test measures.
+                let filler = format!("<Junk pad=\"{}\"/>\n", "x".repeat(256 * 1024));
                 let mut written = 0usize;
                 if writer.write_all(b"<?xml version=\"1.0\"?><GetFilters>\n").await.is_err() {
                     return;

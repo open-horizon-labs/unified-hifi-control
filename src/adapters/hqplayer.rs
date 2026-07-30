@@ -468,6 +468,20 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// replaced.
 const MAX_UNSOLICITED_BACKLOG: u32 = 256;
 
+/// Byte ceiling on one command's accumulated reply. The **memory** bound, and the third of three.
+///
+/// The other two are the per-command deadline (time) and [`MAX_UNSOLICITED_BACKLOG`] (frame count).
+/// Neither bounds memory: a container that never closes grows this buffer for as long as the
+/// deadline allows, at whatever rate the link sustains, and a fast link can deliver a great deal in
+/// a few seconds. Distinguishing "oversized" from "slow" also matters diagnostically — a timeout
+/// sends an operator looking at the network, and this sends them looking at the reply.
+///
+/// 4 MiB against a largest-observed container of a 77-entry filter list, a few KB: roughly three
+/// orders of magnitude of headroom, so no legitimate document can approach it. Deliberately private
+/// for the same reason as its sibling — it is protection, not policy, and nothing should tune it.
+/// It matches the ceiling the reference implementation independently chose.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
 /// HQPlayer state information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HqpState {
@@ -1210,6 +1224,19 @@ impl HqpAdapter {
                 Ok(Ok(0)) => break, // EOF
                 Ok(Ok(_)) => {
                     response.push_str(&line);
+                    // Memory bound, checked before classification: an unbounded container must not
+                    // be allowed to grow for the whole deadline. Returning an error here is enough
+                    // to recover, because `send_command`'s wrapper marks the connection
+                    // disconnected on any inner failure, so the next command reconnects onto a
+                    // clean stream rather than reading this reply's tail.
+                    if response.len() > MAX_RESPONSE_BYTES {
+                        return Err(anyhow!(
+                            "Response exceeded {} bytes awaiting a {} reply; discarding the \
+                             connection rather than accumulating further",
+                            MAX_RESPONSE_BYTES,
+                            expected_element.unwrap_or_default()
+                        ));
+                    }
                     match framing::classify(&response) {
                         framing::Framing::Complete => {
                             let got = framing::root_element(&response);
