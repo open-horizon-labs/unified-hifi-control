@@ -1604,13 +1604,13 @@ Three holes, all found by reviewing the six bites rather than by the suite, all 
    landed later in `tick_pending()` with no clamp at all — leaving an index the newly loaded chain's
    enumeration could not resolve. Unexercised today, which is why it was worth finding rather than
    waiting for.
-2. **Root recovery does not survive coalescing.** Probed: `hostile alone → Complete`,
-   `hostile + coalesced push → Incomplete`. Now an executable **stated-limit** test naming what would
-   fix it (find the *first* matching close tag instead of requiring it last) and why that trade
-   deserves a deliberate decision, rather than prose in this file.
-3. **The cap's true peak is 4 MiB plus one line**, because it is checked after appending a read.
-   Deliberate — a mid-line check would need the reader to hand back a partial line — and now stated,
-   because "4 MiB" otherwise reads as a bound on the allocation rather than on the accumulation.
+2. ~~**Root recovery does not survive coalescing.**~~ **SUPERSEDED — see the Codex-adjustment
+   section.** This shipped as a passing `stated-limit` test asserting `Incomplete`, which encoded a
+   known defect as expected behaviour. The Codex Stage 2 gate rejected it and recovery now finds the
+   first defensible boundary instead.
+3. ~~**The cap's true peak is 4 MiB plus one line.**~~ **SUPERSEDED — the reasoning was wrong.**
+   One line is unbounded, so naming the hole did not close it. The cap is now a bound on allocation;
+   see the Codex-adjustment section.
 
 ### Stage-2 amendment `/dissent` — verdict PROCEED, with the value framing corrected
 
@@ -1697,3 +1697,93 @@ field on the model layer and the byte cap is a bound in the framing path — nei
 decision the ADR records, and the capability-versus-expectation labelling is a suite convention rather
 than an architectural one. Amending it would add words without changing a decision. Recorded here so
 the Stage 2 gate can see the judgement rather than infer an omission.
+
+---
+
+## Codex Stage 2 gate adjustment (2026-07-30)
+
+**Gate verdict on `ff70554`: ADJUST** (PR #337 comment 5126227665), eight blocking findings. All
+eight are addressed below. **The prior attempt above is left intact**; claims it made that turned out
+to be wrong are struck through in place and corrected here rather than deleted, because the reasoning
+that produced them is the part worth keeping visible.
+
+**Implementation HEAD:** `5f37974` at time of writing this section.
+
+### The gate was right on all eight, and two were my own factual errors
+
+| # | Finding | Resolution |
+|---|---|---|
+| 1 | The 4 MiB cap is **not a memory bound** — `read_line` allocates an unbounded newline-free line before the check | **Fixed, RED first.** `send_command_inner` now accumulates a `Vec<u8>` from fixed 8 KiB stack reads and checks `held + n` *before* appending. Newline stays a framing *hint*; UTF-8 split handling via `valid_up_to()`; deadline and unsolicited/coalesced behaviour preserved. My prior comment made this worse by naming the hole as though naming closed it |
+| 2 | A realistic malformed-plus-push sequence still wedges, and the suite **encoded that defect as a passing test** | **Fixed, RED first.** Recovery finds the **first defensible** root-frame boundary, quote-aware, so a `</Status>` literal inside an attribute value is still not a boundary and truncated/mismatched roots are still rejected. The `stated-limit` test is replaced by a client-conformance success case |
+| 3 | The stale-chain test drives today's broken adapter cache and will regress when #347 fixes it | **Removed.** Replaced by `the_same_filter_index_selects_a_different_filter_per_loaded_chain`, which drives the fake through `Responder` with **no adapter**. The observed probe is recorded on #347 |
+| 4 | The Opal SDM fixture is **padded with invented cross-chain rows** | **Reverted** to its 5 Opal-derived rows. The hazard moved to `synthetic-chain-hazard`: fictional `SYN-*` names, `status: synthetic`, `tier: never-promotable` |
+| 5 | Two statements are **factually wrong** | **Both corrected** — see below |
+| 6 | The delayed-`SetMode` repair has no focused regression | **Added**, and verified non-vacuous by disabling the clamp: *"SDM has 5 entries and the fake reports 1x=11 Nx=11"* |
+| 7 | The agreed fidelity tail is incomplete | Source-vs-output rate **added**; mode-varying rate resolution **added**; empty rate list **reclassified to #341** with the exact gap |
+| 8 | Four labels drifted from the binding two | **Normalised.** 20 contract labels, 0 non-contract. A pinned pre-existing property is `client-conformance` and described as a regression pin in prose |
+
+### My two factual errors, stated plainly
+
+**`tests/fake_control.py` does not exist at stable `67557939`.** I cited it there; it is a dev-era
+file, present at `22dfe5cc`. The fixture now cites the salvage report at the dev ref and says
+explicitly that HQPTuner was not read directly — every upstream claim in this amendment came from a
+report *about* the repo.
+
+**HQPTuner does not rely on `Status.active_mode` as its chain resolver.** It *rejects* that field and
+falls back to the `Status.active_rate` family in `livemap._chain_from_status`. I took "HQPTuner
+*relies* on `Status.active_mode`… Both cannot be fully right" from the stable-branch salvage report
+(§C3) — and the beta/dev delta had already superseded it: `0eeb1ae` built a fallback on `active_mode`,
+`c646bc1` replaced it with `active_rate`, and the delta records "the intermediate state was wrong."
+
+So the correct framing is **independent unresolved semantics, not a contradiction**: `Status.active_mode`
+echoing under `[source]` is *measured*; `State.active_mode` under `[source]` is simply *unmeasured*.
+"Both cannot be right" was wrong, and the `ActiveModeReporting` prose and test name now say so.
+
+This is the second time in this amendment that a stale reading from a *report about* a repository beat
+the checks — the first was the enum-ID renumbering the Stage 1 dissent caught. Same channel, twice.
+
+### Two improvements the rewrite forced
+
+- **`classify` and the new `first_document_end` are projections of one walk** (`scan`), so there is a
+  single traversal to keep correct. This *removes* a parser rather than adding one, which is the
+  direction superego finding 5 asked for.
+- **A coalesced follower is now counted and dropped rather than left in the stream.** Leaving it was
+  worse in two ways: a stale pushed `Status` is the right *element* for a later `Status` command and
+  could be handed over as that command's reply, and the returned reply could carry a second document
+  concatenated onto it — unnoticed only because attribute reads scope to the root tag. Caught because
+  `tier1_records_how_many_unsolicited_documents_the_client_skipped` dropped to 0 after the read change.
+
+### Blocker 7 disposition, in full
+
+| Case | Disposition |
+|---|---|
+| Source `metadata.samplerate` ≠ `Status.active_rate` | **Covered.** `the_source_rate_and_the_output_rate_are_reported_separately`, with `active_bits` as an output-domain field. Consuming semantics are **#328**'s |
+| Mode-varying rate resolution | **Covered.** `a_rate_valid_in_one_chain_is_refused_in_the_other`; the two enumerations do not overlap at all |
+| **Empty** rate enumeration | **Reclassified to #341.** Issue #322's AC says the list "can vary by mode, filter, device, and playback state or be empty", but **neither audited salvage report contains any observation of an empty `GetRates`** — searching both returns only unrelated backup-archive and now-playing matches. Modelling one would invent a device claim |
+| Filter-varying rate list | **Reclassified to #341.** Evidenced (`livelane.py:33-38`: the list depends on mode **and** selected filter) but unmodelled; the corpus has no filter→rates dependency and adding one needs a capture |
+
+### Verification at `5f37974`
+
+| Command | Result |
+|---|---|
+| `--test hqplayer_conformance` | **162 passed; 0 failed; 0 ignored** (157 at `ff70554`, 138 at `6b8e97f`) |
+| lib unit tests | 84 passed |
+| `--test adapter_integration` / `--test zones_sha_integration` | 42 / 20 |
+| `--test api_contract` / `--test protocol_schema` | 2 / 41 — no route or payload drift |
+| `cargo fmt --check` | clean |
+| `cargo clippy -- -D warnings` | clean, 0 findings |
+| `git diff --check origin/v3...HEAD` | clean |
+| `cargo test --no-fail-fast` | **471 passed; 2 failed; 12 ignored** |
+| live tier 1 / tier 2 | **not run** — daemon offline, no mutating permission |
+
+The two failures remain the reproduced `/hqp/discover` baseline: 500 in this sandbox, direct probe
+`multicast send FAILED: [Errno 65] No route to host`, and neither failing test file touched by this
+amendment. **#339 remains unmerged**, so PR CI may still show the known Rust 1.97 base lint failure on
+`v3`.
+
+### Scope still held
+
+One `src` file — `src/adapters/hqplayer.rs`, the `framing` module and `send_command_inner`. No route,
+request, response or payload change; `api-change-approved` not applied. **No #347 change was
+implemented.** ADR 003 still not amended: the framing internals were restructured, but the decision it
+records — three layers, asserted through the adapter's public surface — is unchanged.
