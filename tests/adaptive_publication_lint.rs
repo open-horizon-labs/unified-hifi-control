@@ -725,7 +725,9 @@ fn scope_delta(
 
         for item in items {
             match item {
-                Item::Use(item_use) => collect_crate_aliases(&item_use.tree, &roots, &mut aliases),
+                Item::Use(item_use) => {
+                    collect_crate_aliases(&item_use.tree, &roots, false, &mut aliases)
+                }
                 // `extern crate self as internal;` binds the crate root without being a
                 // `use` at all, and `extern crate unified_hifi_control as uhc;` does the
                 // same by name.
@@ -751,28 +753,52 @@ fn scope_delta(
 
 /// Names bound to a known crate root by a use tree.
 ///
-/// The source is matched against the roots known *so far* rather than against the two
-/// original spellings, which is what lets `use self::internal as also;` bind through an
-/// alias. A leading `self::` is transparent, so both `use internal as also;` and
-/// `use self::internal as also;` are recognized.
-fn collect_crate_aliases(tree: &UseTree, roots: &BTreeSet<String>, out: &mut BTreeSet<String>) {
+/// `at_root` records whether the subtree being walked is rooted at a known crate root, which
+/// is what makes grouped `self` work: in `use crate::{self as internal};` the rename's source
+/// ident is `self`, not a root name, so matching only against `roots` binds nothing. Inside a
+/// group under `crate`, `self` *is* the crate root. Raised by an independent audit at
+/// `6980b7b`; both that form and `use internal::{self as also};` compile clean.
+///
+/// The source is matched against the roots known *so far* rather than the two original
+/// spellings, which is what lets an alias be bound from another alias.
+///
+/// Prefixes stay strict: a leading `self::` is transparent for lookup but is not itself the
+/// crate root, and any other prefix stops the descent - `use foo::{self as also};` renames
+/// `foo`, so recognizing grouped `self` must not make every group transparent.
+fn collect_crate_aliases(
+    tree: &UseTree,
+    roots: &BTreeSet<String>,
+    at_root: bool,
+    out: &mut BTreeSet<String>,
+) {
     match tree {
         UseTree::Rename(rename) => {
-            if roots.contains(&rename.ident.to_string()) {
+            let source = rename.ident.to_string();
+            if roots.contains(&source) || (at_root && source == "self") {
                 out.insert(rename.rename.to_string());
             }
         }
         UseTree::Group(group) => {
             for item in &group.items {
-                collect_crate_aliases(item, roots, out);
+                collect_crate_aliases(item, roots, at_root, out);
             }
         }
         UseTree::Path(path) => {
-            // `self::x` and `crate::x` are transparent prefixes for this purpose; any
-            // other prefix means the rename below it is not naming a crate root.
             let head = path.ident.to_string();
-            if head == "self" || roots.contains(&head) {
-                collect_crate_aliases(&path.tree, roots, out);
+            if roots.contains(&head) {
+                // Descending through a crate root: a `self` below it names that root.
+                collect_crate_aliases(&path.tree, roots, true, out);
+            } else if head == "self" {
+                // `self::x` looks up in the current module; transparent for finding a
+                // rename of a known alias, but `self` here is not the crate root.
+                //
+                // Passing `false` rather than `true` is semantically right and currently
+                // unobservable: the only shape that would distinguish them is
+                // `use self::{self as x};`, which rustc rejects with
+                // `error[E0432]: unresolved import self`. Flipping it fails no probe.
+                // Stated rather than implied, so nobody mistakes the surviving mutation
+                // for dead code.
+                collect_crate_aliases(&path.tree, roots, false, out);
             }
         }
         _ => {}
@@ -1762,6 +1788,30 @@ fn extern_crate_self_and_transitive_aliases_are_crate_roots_too() {
             "transitive without the self:: prefix",
             "use crate as internal;\nuse internal as also;\nfn f() { let _ = also::adaptive::X; }\n",
         ),
+        // `use crate::{self as internal};` binds the crate root through a *group*, where the
+        // rename's source ident is `self` rather than a root name. Both of these compile
+        // clean under `rustc --crate-type lib`. Raised by an independent audit at
+        // `6980b7b`.
+        (
+            "grouped self",
+            "use crate::{self as internal};\nfn f() { let _ = internal::adaptive::X; }\n",
+        ),
+        (
+            "grouped self reaching the publication layer",
+            "use crate::{self as internal};\nfn f() { let _ = internal::producers::P; }\n",
+        ),
+        (
+            "transitive grouped self",
+            "use crate::{self as internal};\nuse internal::{self as also};\nfn f() { let _ = also::producers::P; }\n",
+        ),
+        (
+            "grouped self alongside a sibling leaf",
+            "use crate::{self as internal, bus};\nfn f() { let _ = internal::adaptive::X; }\n",
+        ),
+        (
+            "grouped self from the external crate name",
+            "use unified_hifi_control::{self as uhc};\nfn f() { let _ = uhc::adaptive::X; }\n",
+        ),
     ] {
         assert!(
             !forbidden_module_references(&snippet(source)).is_empty(),
@@ -1801,6 +1851,20 @@ fn extended_alias_forms_remain_scope_aware_and_shadowable() {
         (
             "a rename under an unrelated path prefix",
             "use crate as internal;\nmod foo {\n    pub mod internal { pub mod adaptive {} }\n}\nuse foo::internal as also;\nfn f() { let _ = also::adaptive::X; }\n",
+        ),
+        // The same guard for the grouped form: `foo::{self as also}` renames `foo`, not the
+        // crate root, so recognizing grouped `self` must not make every group transparent.
+        (
+            "grouped self under an unrelated prefix",
+            "mod foo {\n    pub mod adaptive {}\n}\nuse foo::{self as also};\nfn f() { let _ = also::adaptive::X; }\n",
+        ),
+        (
+            "grouped self under an unrelated alias chain",
+            "use std::{self as s};\nuse s::{self as t};\nfn f() { let _ = t::fmt::Debug; }\n",
+        ),
+        (
+            "grouped self scoped to a sibling module",
+            "mod a {\n    use crate::{self as internal};\n}\nmod b {\n    fn f() { let _ = internal::adaptive::X; }\n}\n",
         ),
     ] {
         assert!(
