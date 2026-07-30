@@ -62,7 +62,10 @@
 //! derives and `ItemImpl` entirely clean. An earlier commit recorded that as an accepted
 //! residual; Codex was right to reject it, because it is a live false pass and it closes
 //! the same way everything else here did — by permission. `AdaptiveEvent` may carry only
-//! `derive` and `doc`; and every macro invocation in `src/producers/event.rs` — at any
+//! `derive` and `doc`; every attribute **anywhere in the module** is policed, because a
+//! proc macro emits arbitrary items rather than only code about what it annotates, so
+//! `#[generate_event_wire] fn helper() {}` elsewhere can emit an impl for `AdaptiveEvent`
+//! with every enum-specific check clean; and every macro invocation — at any
 //! depth, not only item position, since a statement-position macro can expand to items —
 //! must be on an allowlist that currently holds only `tracing::trace`.
 //!
@@ -316,6 +319,116 @@ fn macro_invocations(file: &File) -> Vec<String> {
     let mut visitor = MacroInvocationVisitor::default();
     visitor.visit_file(file);
     visitor.found
+}
+
+/// Every attribute in `file`, at any depth, paired with the item that owns it.
+///
+/// Attributes on functions, structs, impl blocks, fields, variants and nested modules all
+/// appear. The enum-specific checks audit only `AdaptiveEvent`'s own attributes, and a
+/// procedural macro emits arbitrary *items* rather than only code about the thing it
+/// annotates — so `#[generate_event_wire] fn helper() {}` elsewhere in the module can emit
+/// `impl Serialize for AdaptiveEvent` with every enum-specific check clean. Found by Codex
+/// at `4a817c9`.
+#[derive(Default)]
+struct AttributeVisitor {
+    owners: Vec<String>,
+    found: Vec<(String, String)>,
+}
+
+fn item_label(item: &Item) -> String {
+    match item {
+        Item::Enum(inner) => format!("enum {}", inner.ident),
+        Item::Struct(inner) => format!("struct {}", inner.ident),
+        Item::Fn(inner) => format!("fn {}", inner.sig.ident),
+        Item::Mod(inner) => format!("mod {}", inner.ident),
+        Item::Impl(inner) => match inner.self_ty.as_ref() {
+            syn::Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .map(|segment| format!("impl {}", segment.ident))
+                .unwrap_or_else(|| "impl".to_string()),
+            _ => "impl".to_string(),
+        },
+        Item::Type(inner) => format!("type {}", inner.ident),
+        Item::Const(inner) => format!("const {}", inner.ident),
+        Item::Static(inner) => format!("static {}", inner.ident),
+        Item::Trait(inner) => format!("trait {}", inner.ident),
+        Item::Use(_) => "use".to_string(),
+        Item::Macro(inner) => inner
+            .mac
+            .path
+            .segments
+            .last()
+            .map(|segment| format!("{}!", segment.ident))
+            .unwrap_or_else(|| "macro".to_string()),
+        _ => "item".to_string(),
+    }
+}
+
+impl<'ast> Visit<'ast> for AttributeVisitor {
+    fn visit_item(&mut self, item: &'ast Item) {
+        self.owners.push(item_label(item));
+        visit::visit_item(self, item);
+        self.owners.pop();
+    }
+
+    fn visit_attribute(&mut self, attr: &'ast Attribute) {
+        let owner = self
+            .owners
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "<file>".to_string());
+        let path = attr
+            .path()
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+        self.found.push((owner, path));
+        visit::visit_attribute(self, attr);
+    }
+}
+
+fn module_attributes(file: &File) -> Vec<(String, String)> {
+    let mut visitor = AttributeVisitor::default();
+    visitor.visit_file(file);
+    visitor.found
+}
+
+/// Attributes anywhere in `file` that the module-wide policy forbids.
+///
+/// The policy, location-aware because a blanket list would have to permit `derive`
+/// everywhere and that is exactly the hole:
+///
+/// * `doc` — anywhere. Doc comments desugar to it and the module is heavily documented.
+/// * `derive` — **only** on `enum AdaptiveEvent`, and only holding
+///   [`ADAPTIVE_EVENT_ALLOWED_DERIVES`]. A custom derive on a helper struct emits arbitrary
+///   items just as an attribute macro does.
+/// * anything else — rejected, wherever it appears.
+///
+/// This is the production gate. The enum-specific checks are kept because they name the
+/// offender more precisely, but they are no longer what carries the guarantee.
+fn disallowed_module_attributes(file: &File) -> Vec<String> {
+    let mut rejected = Vec::new();
+    for (owner, path) in module_attributes(file) {
+        match path.as_str() {
+            "doc" => {}
+            "derive" if owner == format!("enum {ADAPTIVE_EVENT}") => {}
+            _ => rejected.push(format!("#[{path}] on {owner}")),
+        }
+    }
+    // A derive that is in the right place but holds the wrong token is still forbidden, so
+    // the module-wide policy cannot be satisfied by relocating a bad derive onto the enum.
+    if let Some(item) = adaptive_event_enum(file) {
+        for token in derives_in(&item.attrs) {
+            if !ADAPTIVE_EVENT_ALLOWED_DERIVES.contains(&token.as_str()) {
+                rejected.push(format!("derive({token}) on enum {ADAPTIVE_EVENT}"));
+            }
+        }
+    }
+    rejected
 }
 
 /// Every trait implemented for `type_name` in `file`.
@@ -651,6 +764,37 @@ fn lint_adaptive_event_carries_only_allowed_attributes() {
 }
 
 #[test]
+fn lint_the_internal_event_module_carries_only_allowed_attributes_anywhere() {
+    // The production gate for attribute-driven generation. The enum-specific check below
+    // audits only `AdaptiveEvent`'s own attributes, and a procedural macro emits arbitrary
+    // items rather than only code about what it annotates — so an attribute macro on a
+    // helper function, or a custom derive on a helper struct, could emit
+    // `impl Serialize for AdaptiveEvent` with every enum-specific check clean.
+    let file = parse_file_at(EVENT_MODULE);
+    let rejected = disallowed_module_attributes(&file);
+    assert!(
+        rejected.is_empty(),
+        "{EVENT_MODULE} carries attributes the module-wide policy forbids: {rejected:?}\n\
+         Policy: `doc` anywhere; `derive` only on `enum {ADAPTIVE_EVENT}` holding only \
+         {ADAPTIVE_EVENT_ALLOWED_DERIVES:?}; nothing else. A proc macro anywhere in this \
+         module can emit an impl for {ADAPTIVE_EVENT}, so permission is module-wide."
+    );
+
+    // The policy must describe the module, not merely permit it: if the one real derive
+    // vanished, the policy would be silently over-broad.
+    let derive_owners: Vec<String> = module_attributes(&file)
+        .into_iter()
+        .filter(|(_, path)| path == "derive")
+        .map(|(owner, _)| owner)
+        .collect();
+    assert_eq!(
+        derive_owners,
+        vec![format!("enum {ADAPTIVE_EVENT}")],
+        "the module's derives changed; the policy now describes something else"
+    );
+}
+
+#[test]
 fn lint_the_internal_event_module_invokes_only_allowed_macros() {
     // A macro expands to arbitrary code - an `impl`, a `use`, another type - while
     // imports, derives and `ItemImpl` all stay clean. Checked at *every* depth, not only
@@ -951,6 +1095,112 @@ fn code_generating_macros_cannot_target_adaptive_event() {
             "a non-derive attribute was admitted:\n{source}"
         );
     }
+}
+
+#[test]
+fn a_proc_macro_on_any_other_item_cannot_generate_for_adaptive_event() {
+    // The enum-specific checks audit `AdaptiveEvent`'s own attributes. A procedural macro
+    // emits arbitrary *items*, not only code about the thing it annotates — so an
+    // attribute macro on a helper function, or a custom derive on a helper struct, can emit
+    // `impl Serialize for AdaptiveEvent` while the enum's attrs, the imports, the
+    // `ItemImpl` list and the function-like macro allowlist all stay clean.
+    //
+    // Found by Codex at `4a817c9`. Each case asserts both halves: that the enum-only check
+    // passes it (the false pass), and that the module-wide policy rejects it (the fix).
+    for (label, source) in [
+        (
+            "attribute macro on a helper fn",
+            "#[generate_event_wire]\nfn helper() {}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n",
+        ),
+        (
+            "custom derive on a helper struct",
+            "#[derive(GenerateAdaptiveWire)]\nstruct Helper;\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n",
+        ),
+        (
+            "attribute macro on an impl block",
+            "#[generate_event_wire]\nimpl Helper {}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n",
+        ),
+        (
+            "attribute macro on a nested item",
+            "mod inner {\n    #[generate_event_wire]\n    fn helper() {}\n}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n",
+        ),
+        (
+            "custom derive on a helper enum",
+            "#[derive(GenerateAdaptiveWire)]\nenum Helper { A }\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n",
+        ),
+        (
+            "attribute macro on a struct field",
+            "struct Helper {\n    #[generate_event_wire]\n    field: u8,\n}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n",
+        ),
+    ] {
+        let file = snippet(source);
+
+        // The false pass: every enum-specific check is clean.
+        let item = adaptive_event_enum(&file).expect("enum located");
+        assert!(
+            disallowed_attributes(&item.attrs).is_empty(),
+            "{label}: precondition failed - the enum's own attrs were not clean"
+        );
+        assert!(
+            derives_in(&item.attrs)
+                .iter()
+                .all(|token| ADAPTIVE_EVENT_ALLOWED_DERIVES.contains(&token.as_str())),
+            "{label}: precondition failed - the enum's derives were not clean"
+        );
+        assert!(
+            imports_of(&file).is_empty() && trait_impls_for(&file, ADAPTIVE_EVENT).is_empty(),
+            "{label}: precondition failed - imports or impls were not clean"
+        );
+        assert!(
+            macro_invocations(&file).is_empty(),
+            "{label}: precondition failed - a function-like macro was present"
+        );
+
+        // The fix: the module-wide policy rejects it.
+        let rejected = disallowed_module_attributes(&file);
+        assert!(
+            !rejected.is_empty(),
+            "{label}: a proc macro on another item was admitted:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn the_module_wide_attribute_policy_accepts_the_module_as_it_is() {
+    // Positive control. Doc comments anywhere, and one `derive` on `AdaptiveEvent` holding
+    // only `Debug` and `Clone`, is exactly what `src/producers/event.rs` carries — so the
+    // policy describes the module rather than merely constraining it.
+    for (label, source) in [
+        ("bare enum", "#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n"),
+        (
+            "doc comments on helpers and variants",
+            "/// helper docs\nfn helper() {}\n/// enum docs\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {\n    /// variant docs\n    A,\n}\n",
+        ),
+        (
+            "doc on a struct field",
+            "struct Helper {\n    /// field docs\n    field: u8,\n}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n",
+        ),
+        (
+            "an inherent impl with documented methods",
+            "impl Helper {\n    /// method docs\n    fn f(&self) {}\n}\n#[derive(Debug, Clone)]\npub enum AdaptiveEvent {}\n",
+        ),
+    ] {
+        assert!(
+            disallowed_module_attributes(&snippet(source)).is_empty(),
+            "{label}: the policy rejected something the module legitimately has: {:?}\n{source}",
+            disallowed_module_attributes(&snippet(source))
+        );
+    }
+
+    // And a derive on the enum that is *not* allowlisted is still rejected module-wide, so
+    // the two checks agree rather than one masking the other.
+    assert!(
+        !disallowed_module_attributes(&snippet(
+            "#[derive(Debug, Serialize)]\npub enum AdaptiveEvent {}\n"
+        ))
+        .is_empty(),
+        "a forbidden derive on the enum passed the module-wide policy"
+    );
 }
 
 #[test]

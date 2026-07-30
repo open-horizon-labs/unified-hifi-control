@@ -475,9 +475,19 @@ level down into a function body — and the module's real `tracing::trace!` call
 which is why an empty allowlist had passed. Replaced with a `syn::visit::Visit` collector
 over every `syn::Macro` at any depth.
 
-**What genuinely remains:** an *allowlisted* macro could expand to anything, and expansion
-is not in this source. That is why the lists are minimal rather than convenient — the
-guarantee is that nothing generative is permitted, not that generation is understood.
+A third round found the closure still too narrow. The checks audited `AdaptiveEvent`'s own
+attributes, but a proc macro emits arbitrary *items* rather than only code about what it
+annotates — so `#[generate_event_wire] fn helper() {}` or
+`#[derive(GenerateAdaptiveWire)] struct Helper;` elsewhere in the module can emit
+`impl Serialize for AdaptiveEvent` with the enum's attrs, the imports, the `ItemImpl` list
+and the macro allowlist all clean. Closed with a location-aware module-wide policy: `doc`
+anywhere, `derive` only on `enum AdaptiveEvent` and only holding `Debug`/`Clone`, nothing
+else anywhere. That is now the production gate; the enum-specific checks are kept only
+because they name an offender more precisely.
+
+**What genuinely remains:** an *allowlisted* macro or derive could expand to anything, and
+expansion is not in this source. That is why the lists are minimal rather than convenient —
+the guarantee is that nothing generative is permitted, not that generation is understood.
 
 ### Evidence
 
