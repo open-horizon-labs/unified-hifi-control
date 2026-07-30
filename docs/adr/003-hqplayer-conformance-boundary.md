@@ -286,11 +286,15 @@ Because tier 2 needs hardware nobody should volunteer casually, the honest posit
   narrated. Opening that issue belongs to the program owner, not to this PR — the issue graph under
   #310 is maintained deliberately — so it is recorded here as a pre-merge action rather than filed
   unilaterally.
-- Confirm on GitHub runners, not this sandbox, the known full-run failures: the two deterministic
-  `/hqp/discover` multicast 500s, and a pre-existing concurrency failure *family* in
-  `adapter_integration` around `error_handling::lms_fails_gracefully_when_unconfigured`. The earlier
-  "~1-in-10" characterisation was wrong and is withdrawn: measured under the full suite the family
-  fired in **2 of 2** runs, while the `adapter_integration` binary run on its own was **6/6 green**.
-  The `4/4` figure applied only to that isolated binary under `--test-threads=1` and never to the whole
-  suite. The file is byte-identical to `v3`, so the mechanism is process-global state under
-  concurrency, not this branch.
+- Confirm on GitHub runners, not this sandbox, the two known full-run failure sources. Neither is a
+  property of the code, and both were previously described more strongly than the evidence supports.
+  - The two `/hqp/discover` multicast 500s. These reproduced in **3 of 3** runs in this sandbox, where
+    multicast to `239.192.0.199` is unavailable, while an **independent** full run at the same head passed
+    every test binary. Earlier revisions called them "deterministic"; the property is
+    *environment-specific*, which is exactly why confirming on a runner is the action.
+  - A pre-existing concurrency failure *family* in `adapter_integration` around
+    `error_handling::lms_fails_gracefully_when_unconfigured`. The earlier "~1-in-10" characterisation was
+    wrong and is withdrawn: measured under the full suite the family fired in **2 of 2** runs, while the
+    `adapter_integration` binary run on its own was **6/6 green**. The `4/4` figure applied only to that
+    isolated binary under `--test-threads=1` and never to the whole suite. The file is byte-identical to
+    `v3`, so the mechanism is process-global state under concurrency, not this branch.
