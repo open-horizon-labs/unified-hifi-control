@@ -100,8 +100,9 @@ second consumer crate actually exists.
 **Accepted trade-offs:**
 - Non-Rust consumers get canonical JSON fixtures and normative prose now; a generated
   JSON Schema is deferred to the issue that first needs it.
-- More types than a minimal HQPlayer payload would need. Justified by the four distinct
-  value lanes, eight command outcomes and per-lane health the audits on #323 require.
+- More types than a minimal HQPlayer payload would need. Justified by the five distinct
+  value lanes (`ValueLane`), fifteen command outcomes (`CommandOutcome`) and per-lane health
+  the audits on #323 require.
 - The model is *shared* (not `#[cfg(feature = "server")]`) so web/WASM consumers can use
   it. That constrains `src/adaptive/` to serde + std only, enforced by a lint test.
 
@@ -122,7 +123,7 @@ second consumer crate actually exists.
 3. Grounding is explicit: `Grounded(value)` vs `Ungrounded(reason)` so an empty/default
    preset identity cannot collapse into `null`.
 4. Availability and disablement are reason-carrying data, never a bare boolean.
-5. Command outcomes are a closed set of eight terminal/non-terminal states including
+5. Command outcomes are a closed set of fifteen terminal/non-terminal states including
    `Indeterminate` (write attempted, transport dropped, possibly applied).
 6. Constraints are pure data with a bounded operator vocabulary; unknown operators fail
    *open* for visibility (value still shown, control still escapable) and never hide state.
@@ -162,6 +163,55 @@ normative spec text rather than prose:
 **Drift check:** none. No routes touched, `tests/fixtures/api_routes.txt` unchanged,
 `api-change-approved` never applied, no user-owned file modified. 390 tests pass.
 
+### Remediation of CodeRabbit review (2026-07-30)
+
+Thirteen findings: five actionable threads, eight review-body nitpicks. Twelve accepted,
+one rejected with evidence. 407 tests pass (was 397); the ten new tests were written and
+seen failing before the fixes, and the three lint fixes were verified against probes that
+demonstrated each blind spot on the pre-remediation code.
+
+Three of the accepted findings changed the contract, so the specification and ADR 003 moved
+with them rather than after them:
+
+| Finding | Change | Contract text |
+|---|---|---|
+| `stage()` only reopened `Detached` | returns `StageOutcome`; `detached`/`validating`/`applying` reopen, closed states refuse and touch nothing | spec §6 "Which states accept staging", ADR decision table |
+| `Expr` bounds never enforced on the admission path | `admit_document` refuses with `ConstraintTooComplex`, naming the constraint | spec §5 and §8, ADR decision table |
+| C2 could report a change set as conflicting with itself | the claim lookup excludes the current change set | spec §6, C2 now states it constrains drafts rather than entries |
+
+The reviewer's patch for `stage()` was **not** taken. It proposed `debug_assert!(false, …)`
+for terminal states, which panics in debug builds inside a module whose own lint forbids
+panicking paths; its accompanying instruction was the opposite — reopen *every* non-draft
+state, which would let a change set whose audit trail says `applied` silently become a draft
+again. Refusing, and naming the state that refused, keeps both the audit fact and
+retry-as-a-new-plan.
+
+**Rejected:** `ProducerTarget.zone_id` as `bus::events::PrefixedZoneId`. `pub mod bus` is
+`#[cfg(feature = "server")]` in `src/lib.rs:46` while `pub mod adaptive` is deliberately
+shared, so the reference would not compile for `dx build --platform web` — and
+`tests/adaptive_dependency_lint.rs` forbids `crate::bus` here for exactly that reason. It
+also would not deliver the invariant it promises: `PrefixedZoneId` is
+`#[serde(transparent)]`, so its derived `Deserialize` never calls `parse`, and
+deserialization is the only path by which a zone id reaches that field. Prefix validation
+belongs to whoever admits the document into the aggregator (#324). Recorded at the field.
+
+Two findings were fixture patches that would have removed a vocabulary member's only worked
+example if taken literally, so each was resolved the other way the reviewer offered and the
+choice is now enforced by a test rather than a comment:
+
+* `persisted_vs_desired` on `hqplayer.volume.level` cited an unpublished lane. Adding the
+  `persisted` lane preserves the only worked example of that `DivergenceKind`; rewriting the
+  divergence to `observed_vs_desired` would have deleted it and broken
+  `every_vocabulary_member_has_a_worked_example`. New test:
+  `every_declared_divergence_names_lanes_the_control_publishes`.
+* `in_range` had no grounded operand. Repointing it at `persisted` also matches the
+  scenario — the pending-restart divergence is observed-versus-persisted. New test:
+  `every_operator_reaches_a_definite_verdict_over_the_canonical_document`.
+
+`lane_unconfigured` → `requires_connection` in `hqplayer_degraded_lanes.json` was safe to
+take as written: the code keeps a worked example in `command_outcomes.json:365`, verified
+before changing it.
+
 **Verification gap:** `dx` is not installed in this environment, so the WASM/fullstack
 build is proved only by CI's `build-wasm` job (`.github/workflows/build.yml:488`). The
 dependency lint is the host-runnable proxy.
@@ -198,5 +248,14 @@ errors - report 3 filed a contract defect as a downstream hazard, report 4 recom
 v1.1 deletion gate that contradicted the compatibility policy in the same PR. Both fixed at
 `a5cae03`. Durable record is ADR 003 plus the specification, not the PR comments.
 
-Raised on #324: C1/C2 publication-time enforcement, and ownership of the pre-publication
-reshaping window.
+Raised on #324: C1/C2 publication-time enforcement, ownership of the pre-publication
+reshaping window, and prefix validation for `ProducerTarget.zone_id` — the contract layer
+cannot reach the bus type that owns the prefix vocabulary, and that type does not validate
+on deserialize anyway.
+
+CodeRabbit's completed review added a seventh gate. Its two most useful findings were both
+about *published* invariants that nothing enforced — the expression bounds and the change-set
+lifecycle — which is the same class of defect the execute gate caught earlier in this issue
+(a specification stating an invariant the implementation depended on but never checked). The
+pattern worth carrying forward: when this contract publishes a bound or a state machine,
+check it at admission or in the method, not in prose.

@@ -290,7 +290,9 @@ an MCP client, with no cost bound and no way to audit it.
 
 So constraints are **bounded pure data**: operators `eq`, `not_eq`, `one_of`, `in_range`,
 `is_grounded`, `all`, `any`, `not`; maximum depth 8; maximum 128 nodes. A producer needing
-deeper logic must reproject the change set server-side instead.
+deeper logic must reproject the change set server-side instead. The bounds are enforced at
+**admission** and a document that breaks them is refused whole — see
+[§8](#8-compatibility-policy).
 
 Effects: `invalidates`, `makes_inert`, `requires_restart`, `hides_choice`. `hides_choice`
 hides *a choice*, never the control.
@@ -362,6 +364,29 @@ Every change set has a stable `id`, an `origin` (`actor_class` × `surface` × o
 Retry after a partial application is therefore a **new plan over a changed producer
 revision**, not a replay.
 
+### Which states accept staging (normative)
+
+`stage()` returns `StageOutcome`, because whether an edit may join a change set is decided
+by that change set's lifecycle state and a refusal is an ordinary outcome — a producer
+serving several surfaces will race a discard or a completion against a stage.
+
+| State | `stage()` | Why |
+|---|---|---|
+| `draft` | **Staged** | accepting edits |
+| `detached`, `validating`, `applying` | **Staged**, and the state returns to `draft` | a snapshot is in flight; the edit belongs to a generation that operation never saw, so leaving the state as `applying` would claim it is executing entries it does not hold |
+| `applied`, `partially_applied`, `rejected`, `superseded`, `expired`, `discarded` | **Closed** — nothing is pushed, the generation does not move, `updated_at` is untouched | the change set has closed; the caller opens a new draft |
+| `Unrecognized(_)` | **Closed** | a state a newer minor added has semantics this build cannot know; permission fails closed here exactly as it does for an unknown constraint operator |
+
+Both halves of the closed rule matter. Accepting the entry and leaving `state` alone lets a
+change set reporting `applied` accumulate unapplied intent under an id whose audit trail
+says the work is done. Silently reopening it as a `draft` instead destroys the fact that
+distinguishes "was never applied" from "was applied, then edited again" — and it is what
+makes retry-as-a-new-plan enforceable rather than advisory. So a closed change set refuses,
+and the refusal names the state that refused it.
+
+This is decided inside `stage()` rather than delegated to callers so a web page, an MCP
+client and a device cannot reach different conclusions about whether an edit landed.
+
 ### Addressing and ownership
 
 Apply, discard, retry and inspect all target a **named** change set. There is no "the
@@ -397,6 +422,14 @@ control. Where two drafts want the same control, at most one may be `valid`; the
 **MUST** carry `EntryValidity::Conflicts` naming that control. A single `desired` lane
 cannot represent two concurrent drafts, and a document that tries is unresolvable by any
 consumer.
+
+C2 constrains *drafts*, not *entries*. A single change set may hold `valid` entries for the
+same control on two different `ApplyLane`s — `ChangeSet::stage` dedups on `(control, lane)`,
+and a producer mirroring one write to the running engine and to persisted configuration is
+doing exactly that. One `desired` lane describes both, so C1 is satisfied and the document
+is coherent. A draft cannot contest itself, and reporting
+`MultipleValidDrafts { change_set: X, also_claimed_by: X }` would make an aggregator refuse
+or repair a document that is in fact fine.
 
 **Why C1 is a MUST rather than a nicety.** `ProducerDocument::effective_view` resolves the
 `effective` lane by consulting the change set for *presence* and then reading the control's
@@ -491,10 +524,20 @@ major 1, minor 4); anything else is refused.
 | any other major | **Refused** (`UnsupportedMajor`) |
 | unparsable `schema_version` | **Refused** (`UnparsableVersion`) |
 | missing `schema_version` | **Refused** (`MissingVersion`) |
+| body does not match the schema | **Refused** (`Malformed`) |
+| a constraint expression over depth 8 or 128 nodes | **Refused** (`ConstraintTooComplex`) |
 
 `admit_document` inspects the version on the **raw value before parsing**. Deserializing
 first would make a v2 document surface as a confusing schema error, or partially succeed —
 and a consumer could not tell an unsupported generation from corruption.
+
+It then enforces the published expression bounds on the parsed body, naming the offending
+constraint's `id`. Admission is the only place that check belongs: an admitted document is
+evaluated by every surface that renders it, so a bound enforced only where a caller
+remembers to call `Expr::validate` is not a bound. Forward compatibility is not a way past
+it — an unknown operator still fails *open* for visibility, which means it still gets
+evaluated, so a deep tree of unknown operators is refused exactly like a deep tree of known
+ones. The bound is inclusive: depth 8 and 128 nodes are admitted, 9 and 129 are not.
 
 **A refused document is never partially rendered.** A control plane built from
 half-understood data is worse than an explicit "unsupported" message, because the user
@@ -583,9 +626,9 @@ fixtures are the reference, which is why their exactness is tested.
 
 | Fixture | Demonstrates |
 |---|---|
-| `hqplayer_pipeline_v1.json` | transport actions; dB volume with a verified-pending provisional write; mode enumeration; runtime-authoritative filter list including an option no catalog knows; adaptive output that invalidates exact rate; exact rate unavailable in source-following mode with two machine-readable reasons; restart-required persistent buffer setting; composite fixed volume with a retained dormant level and a `preserves` assertion; chain-scoped control with held dormant intent; grounded-empty matrix profile; all four constraint effects and all eight operators |
-| `hqplayer_degraded_lanes.json` | degraded persistence and disconnected telemetry while native control stays fully usable; ungrounded `persisted` with `requires_connection` and `lane_unconfigured`; a setting that becomes `read_only` with a lane-scoped reason |
-| `staged_intent_multi_surface.json` | ten change-set lifecycle states across web, MCP, device, HTTP and internal surfaces; human, automation, device and agent actors; a stale base reporting `observed_now`; a conflicting entry; a draft-invalid entry; an entry needing producer validation; retention and expiry; an orphan draft from an earlier epoch |
+| `hqplayer_pipeline_v1.json` | transport actions; dB volume with a verified-pending provisional write; mode enumeration; runtime-authoritative filter list including an option no catalog knows; adaptive output that invalidates exact rate; exact rate unavailable in source-following mode with two machine-readable reasons; restart-required persistent buffer setting; composite fixed volume with a retained dormant level and a `preserves` assertion; chain-scoped control with held dormant intent; grounded-empty matrix profile; all four constraint effects and all eight operators, each on a **grounded** operand so every comparison is exercised rather than only its unevaluatable path |
+| `hqplayer_degraded_lanes.json` | degraded persistence and disconnected telemetry while native control stays fully usable; ungrounded `persisted` with `requires_connection` on both affected controls, since the persistent lane is configured but failing rather than absent; a setting that becomes `read_only` with a lane-scoped reason |
+| `staged_intent_multi_surface.json` | ten change-set lifecycle states across web, MCP, device, HTTP and internal surfaces; human, automation, device and agent actors; a stale base reporting `observed_now`; a conflicting entry; a draft-invalid entry; an entry needing producer validation; retention and expiry; an orphan draft from an earlier epoch; a `persisted_vs_desired` divergence whose **both** lanes are published, so a consumer has something to render for each side |
 | `command_outcomes.json` | every outcome, write-attempt state and recovery state; an indeterminate write awaiting readback; a multi-revision plan with declared boundaries and per-step revisions; held intent expiring visibly |
 | `forward_compatible_additions.json` | a 1.7 document a 1.0 consumer must render: unknown target role, control kind, value type, availability state, reason code, transport lane, and constraint operators nested inside `all`; unknown fields preserved at container level |
 | `unsupported_major.json` | a 2.0 document, shaped nothing like v1, that must be refused before any parsing |

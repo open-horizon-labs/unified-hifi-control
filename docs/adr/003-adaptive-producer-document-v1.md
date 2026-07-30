@@ -48,8 +48,10 @@ Load-bearing choices, each with the alternative it displaced:
 | Two revisions (`control_plane`, `state`) | one monotonic revision | a polling producer would churn control identity and make every draft look stale |
 | `Staleness` precedence epoch ▸ control plane ▸ state | consumers compare revisions | with two counters, a consumer comparing the wrong pair acts on a stale catalog |
 | Constraints as bounded pure data (8 deep, 128 nodes) | serialized predicate functions | shipping producer code to a browser, an ESP32 and an MCP client is unauditable and unbounded |
+| The bounds enforced at **admission**, refusing the document | checked wherever a caller calls `Expr::validate` | an admitted document is evaluated by every surface that renders it, so a bound nothing checks at the door is not a bound |
 | Visibility fails open, permission fails closed | one degradation rule | fail-open is right for what the user sees and wrong for what the system accepts |
 | Change-set generations; retire only what you detached | clear pending on success | reproduces the recorded lost-update race |
+| `stage()` reopens the three executing states and **refuses** the closed ones | reopen every non-`draft` state, or accept the entry and leave `state` alone | accepting silently lets a change set reporting `applied` hold unapplied intent; reopening destroys the audit fact that it already completed, and with it retry-as-a-new-plan |
 | Fifteen command outcomes incl. `indeterminate` | success/failure | a dropped transport after a write is possibly-applied, which is neither |
 | Append-only outcome history | current outcome only | otherwise "never applied" and "applied then replaced" are indistinguishable |
 | Vocabularies as enums with an `Unrecognized` arm | plain string enums, or open strings | exhaustive `match` *and* forward compatibility; open strings lose the compiler's help |
@@ -87,9 +89,9 @@ adapter code — re-coupling surfaces to backends, which is what the epic remove
 
 ### Accepted
 
-* **Size, stated plainly.** `src/adaptive/` is 3262 lines, of which 2022 are non-blank
-  non-comment — so about 38% is documentation of *why*. Tests add 2034 lines and fixtures
-  1960. For scale, `src/adapters/hqplayer.rs` is 2622 lines for one backend's live protocol.
+* **Size, stated plainly.** `src/adaptive/` is 3542 lines, of which 2159 are non-blank
+  non-comment — so about 39% is documentation of *why*. Tests add 2743 lines and fixtures
+  1966. For scale, `src/adapters/hqplayer.rs` is 2622 lines for one backend's live protocol.
 
   The acceptance criteria mandate the *concepts*; this implementation chose the fullest
   representation of each, and that was a judgment call rather than a forced move.
