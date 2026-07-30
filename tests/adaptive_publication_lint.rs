@@ -33,15 +33,146 @@ const PRODUCERS_DECLARATION: &str = "pub mod producers;";
 /// The readable spelling, used in failure messages.
 const SERVER_GATE: &str = "#[cfg(feature = \"server\")]";
 
-/// Whether an extracted attribute is the server gate, whitespace notwithstanding.
+/// Whether an extracted attribute gates its item on the `server` feature and nothing looser.
 ///
-/// `#[cfg(feature="server")]` is the same gate as `#[cfg(feature = "server")]`. A substring
-/// match against one spelling silently accepts the other, which is the blind spot
-/// `1577948` fixed in `tests/adaptive_dependency_lint.rs` — and which
-/// `gate_scanner_detects_a_gate_it_must_not_miss` caught in this file before it shipped.
+/// Two ways to get this wrong, both of which accept a gate that is not server-only:
+///
+/// 1. **Whitespace.** `#[cfg(feature="server")]` is the same gate as
+///    `#[cfg(feature = "server")]`; matching one spelling silently accepts the other. That
+///    is the blind spot `1577948` fixed in `tests/adaptive_dependency_lint.rs`, and
+///    `gate_scanner_detects_a_gate_it_must_not_miss` caught it here before it shipped.
+/// 2. **Disjunction.** `#[cfg(any(feature = "server", feature = "web"))]` *contains*
+///    `feature="server"` while compiling the module for `web` **without** `server` — which
+///    is exactly the WASM breakage this lint exists to prevent, admitted by the lint that
+///    was supposed to prevent it. Found by CodeRabbit at `86e5bd2`.
+///
+/// So: the normalized attribute must mention the server feature and must contain neither
+/// `any(` nor `not(`. A stricter conjunctive gate (`all(feature = "server", unix)`) is still
+/// server-only and is accepted; loosening it later has to be deliberate, because the lint
+/// fails until someone edits this function.
 fn is_server_gate(attribute: &str) -> bool {
     let squeezed: String = attribute.chars().filter(|c| !c.is_whitespace()).collect();
     squeezed.contains("feature=\"server\"")
+        && !squeezed.contains("any(")
+        && !squeezed.contains("not(")
+}
+
+/// The module paths a source file reaches, including through grouped `use` trees.
+///
+/// A needle scan for `crate::adaptive` misses `use crate::{adaptive, producers};`, which
+/// names neither literal. That is not hypothetical: `src/main.rs` imports this repository's
+/// modules in exactly that style, so a surface adopting the house style would have slipped
+/// straight past the boundary check. Found by CodeRabbit at `86e5bd2`.
+fn forbidden_module_references(code: &str) -> Vec<String> {
+    const ROOTS: &[&str] = &["crate", "unified_hifi_control"];
+    const FORBIDDEN: &[&str] = &["adaptive", "producers"];
+    let mut found = Vec::new();
+
+    // Fully-spelled paths, anywhere - `use`, a turbofish, a type position.
+    for root in ROOTS {
+        for module in FORBIDDEN {
+            let needle = format!("{root}::{module}");
+            if code.contains(&needle) {
+                found.push(needle);
+            }
+        }
+    }
+
+    // Grouped use trees: `use <root>::{ a, b::c, d as e };`
+    //
+    // Whitespace is collapsed rather than removed. Removing it entirely turns
+    // `adaptive as contract` into `adaptiveascontract`, so the alias can no longer be split
+    // off and the item stops matching - a probe caught exactly that here.
+    let normalized = collapse_whitespace(code);
+    for root in ROOTS {
+        let opener = format!("use {root}::{{");
+        let mut rest = normalized.as_str();
+        while let Some(at) = rest.find(&opener) {
+            let after = &rest[at + opener.len()..];
+            let mut depth = 1usize;
+            let mut end = after.len();
+            for (index, c) in after.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = index;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for item in split_top_level(&after[..end]) {
+                let head = item
+                    .split("::")
+                    .next()
+                    .unwrap_or_default()
+                    .split(" as ")
+                    .next()
+                    .unwrap_or_default();
+                if FORBIDDEN.contains(&head) {
+                    found.push(format!("{root}::{{… {head} …}}"));
+                }
+            }
+            rest = &after[end.min(after.len())..];
+        }
+    }
+
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Collapse whitespace runs to one space, then close it up around path punctuation.
+///
+/// Leaves ` as ` intact — which is the whole reason this is not a plain whitespace strip.
+fn collapse_whitespace(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut last_was_space = false;
+    for c in code.chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(c);
+            last_was_space = false;
+        }
+    }
+    for token in ["::", "{", "}", ",", ";"] {
+        out = out.replace(&format!(" {token}"), token);
+        out = out.replace(&format!("{token} "), token);
+    }
+    out
+}
+
+/// Split a brace group on commas that are not inside a nested group.
+fn split_top_level(group: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, c) in group.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                items.push(&group[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < group.len() {
+        items.push(&group[start..]);
+    }
+    items
+        .into_iter()
+        .map(str::trim)
+        .filter(|i| !i.is_empty())
+        .collect()
 }
 
 // =============================================================================
@@ -256,16 +387,8 @@ fn lint_only_the_composition_root_names_the_contract_or_the_publication_layer() 
             continue;
         }
         swept += 1;
-        let code = code_only(&text);
-        for needle in [
-            "crate::adaptive",
-            "crate::producers",
-            "unified_hifi_control::adaptive",
-            "unified_hifi_control::producers",
-        ] {
-            if code.contains(needle) {
-                violations.push(format!("{path}: references `{needle}`"));
-            }
+        for reference in forbidden_module_references(&code_only(&text)) {
+            violations.push(format!("{path}: references `{reference}`"));
         }
     }
     assert!(
@@ -352,7 +475,10 @@ fn lint_publication_layer_is_reachable_only_from_the_composition_root() {
         if path.starts_with("src/producers") || path == "src/lib.rs" || path == "src/main.rs" {
             continue;
         }
-        if code_only(&text).contains("crate::producers") {
+        if forbidden_module_references(&code_only(&text))
+            .iter()
+            .any(|reference| reference.contains("producers"))
+        {
             referrers.push(path);
         }
     }
@@ -411,6 +537,13 @@ fn gate_scanner_does_not_invent_a_gate_that_is_not_there() {
         "#[cfg_attr(feature = \"server\", allow(dead_code))]\npub mod producers;\n",
         // A different feature is not the server gate.
         "#[cfg(feature = \"web\")]\npub mod producers;\n",
+        // Disjunctive: contains `feature="server"` but compiles the module for `web`
+        // *without* `server`, which is the WASM breakage this lint exists to prevent.
+        // Passed the pre-fix scanner. Found by CodeRabbit at `86e5bd2`.
+        "#[cfg(any(feature = \"server\", feature = \"web\"))]\npub mod producers;\n",
+        "#[cfg(any(feature=\"server\",feature=\"web\"))]\npub mod producers;\n",
+        // Negation, for the same reason in the opposite direction.
+        "#[cfg(not(feature = \"server\"))]\npub mod producers;\n",
     ] {
         let gates = declaration_gates(source, PRODUCERS_DECLARATION)
             .unwrap_or_else(|| panic!("declaration not found in:\n{source}"));
@@ -432,6 +565,59 @@ fn declaration_scanner_reports_absence_rather_than_guessing() {
         declaration_gates("/// pub mod producers;\n", PRODUCERS_DECLARATION),
         None
     );
+}
+
+#[test]
+fn a_stricter_conjunctive_gate_is_still_server_only() {
+    // `all(feature = "server", unix)` compiles the module in strictly fewer configurations
+    // than the plain gate, so it cannot reintroduce the WASM breakage. Accepted, unlike the
+    // disjunctive form above - the distinction is which direction the gate is loosened.
+    let source = "#[cfg(all(feature = \"server\", unix))]\npub mod producers;\n";
+    let gates = declaration_gates(source, PRODUCERS_DECLARATION).expect("declaration found");
+    assert!(gates.iter().any(|gate| is_server_gate(gate)));
+}
+
+#[test]
+fn grouped_use_trees_do_not_hide_a_forbidden_module() {
+    // A needle scan for `crate::adaptive` misses every one of these. This is the house
+    // style in this repository - `src/main.rs` imports its modules exactly this way - so a
+    // surface writing idiomatic code would have slipped past the boundary check entirely.
+    // Found by CodeRabbit at `86e5bd2`.
+    for source in [
+        "use crate::{adaptive, bus};",
+        "use crate::{bus, producers};",
+        "use unified_hifi_control::{adaptive, producers};",
+        "use unified_hifi_control::{\n    adapters, aggregator, api,\n    producers,\n};",
+        // Nested and aliased forms.
+        "use crate::{producers::ProducerAggregator, bus::SharedBus};",
+        "use crate::{adaptive as contract};",
+        "use crate::{bus::{SharedBus, BusEvent}, adaptive};",
+    ] {
+        let found = forbidden_module_references(source);
+        assert!(
+            !found.is_empty(),
+            "a grouped import hid a forbidden module:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn grouped_use_trees_do_not_produce_false_positives() {
+    // The scanner must not fire on modules that merely share a prefix, on unrelated
+    // groups, or on a group belonging to a different root.
+    for source in [
+        "use crate::{bus, config};",
+        "use crate::{adapters, aggregator};",
+        "use std::{collections::BTreeMap, sync::Arc};",
+        "use serde::{Deserialize, Serialize};",
+        "use other_crate::{adaptive, producers};",
+    ] {
+        let found = forbidden_module_references(source);
+        assert!(
+            found.is_empty(),
+            "the scanner invented a reference in:\n{source}\nfound: {found:?}"
+        );
+    }
 }
 
 #[test]
