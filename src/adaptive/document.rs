@@ -229,7 +229,17 @@ pub struct ProducerIdentity {
 pub struct ProducerTarget {
     /// The role this producer plays for the target.
     pub role: TargetRole,
-    /// The prefixed zone id, when the producer is bound to a zone.
+    /// The prefixed zone id (`source:raw_id`), when the producer is bound to a zone.
+    ///
+    /// Deliberately a plain `String` rather than `bus::events::PrefixedZoneId`. That type
+    /// lives behind `#[cfg(feature = "server")] pub mod bus;` in `src/lib.rs`, and this
+    /// module is shared with the WASM/web build — naming it here would not compile for
+    /// `dx build --platform web`, and `tests/adaptive_dependency_lint.rs` forbids
+    /// `crate::bus` from this layer for that reason. It would also not buy the invariant:
+    /// `PrefixedZoneId` is `#[serde(transparent)]`, so its derived `Deserialize` accepts any
+    /// string without calling `parse` — and deserialization is the only way a zone id
+    /// reaches this field. Validating the prefix belongs to whoever admits the document
+    /// into the aggregator (#324), where the vocabulary of valid prefixes lives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_id: Option<String>,
     /// Additive fields from a newer minor version, preserved for pass-through.
@@ -374,18 +384,29 @@ impl ProducerDocument {
                     continue;
                 }
 
-                // C2: only one draft may hold a valid entry for a control.
-                if let Some((_, other)) = claimed
-                    .iter()
-                    .find(|(control, _)| *control == &entry.control)
-                {
-                    violations.push(IntentIncoherence::MultipleValidDrafts {
+                // C2: only one *draft* may hold a valid entry for a control. A draft cannot
+                // contest itself: `ChangeSet::stage` dedups on `(control, lane)`, so one
+                // change set legitimately holds two valid entries for one control on two
+                // apply lanes — a producer mirroring a write to the running engine and to
+                // persisted configuration. Both are described by the single `desired` lane
+                // C1 requires, so the document is coherent and must not be refused.
+                let contested = claimed.iter().find(|(control, owner)| {
+                    *control == &entry.control && *owner != &change_set.id
+                });
+                match contested {
+                    Some((_, other)) => violations.push(IntentIncoherence::MultipleValidDrafts {
                         control: entry.control.clone(),
                         change_set: change_set.id.clone(),
                         also_claimed_by: (*other).clone(),
-                    });
-                } else {
-                    claimed.push((&entry.control, &change_set.id));
+                    }),
+                    None => {
+                        let already_ours = claimed.iter().any(|(control, owner)| {
+                            *control == &entry.control && *owner == &change_set.id
+                        });
+                        if !already_ours {
+                            claimed.push((&entry.control, &change_set.id));
+                        }
+                    }
                 }
 
                 // C1: a valid entry requires a matching grounded `desired` lane.
@@ -524,6 +545,13 @@ impl ValueLookup for EffectiveView<'_> {
 /// *then* checking the version would mean a v2 document either fails with a confusing
 /// schema error or, worse, partially succeeds — and a consumer cannot tell an
 /// unsupported generation from corruption.
+///
+/// The published constraint-expression bounds are then enforced on the parsed body. They
+/// exist so evaluation cost is predictable on the smallest consumer, and every surface that
+/// renders an admitted document evaluates its constraints — so the check belongs at the
+/// door rather than at each evaluation site. It is deliberately *after* deserialization:
+/// [`Expr`](super::constraint::Expr) is what carries the depth, and JSON nesting itself is
+/// already bounded by the parser's own recursion limit.
 pub fn admit_document(raw: &serde_json::Value) -> Result<ProducerDocument, Refusal> {
     let stamped = raw.get("schema_version").ok_or(Refusal::MissingVersion)?;
     let text = stamped.as_str().ok_or_else(|| Refusal::UnparsableVersion {
@@ -537,9 +565,21 @@ pub fn admit_document(raw: &serde_json::Value) -> Result<ProducerDocument, Refus
         return Err(refusal.clone());
     }
 
-    serde_json::from_value(raw.clone()).map_err(|error| Refusal::Malformed {
-        detail: error.to_string(),
-    })
+    let document: ProducerDocument =
+        serde_json::from_value(raw.clone()).map_err(|error| Refusal::Malformed {
+            detail: error.to_string(),
+        })?;
+
+    for constraint in &document.constraints {
+        constraint
+            .validate()
+            .map_err(|limit| Refusal::ConstraintTooComplex {
+                constraint: constraint.id.clone(),
+                limit,
+            })?;
+    }
+
+    Ok(document)
 }
 
 /// Admit a producer document from JSON text.

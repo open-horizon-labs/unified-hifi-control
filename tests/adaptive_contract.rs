@@ -227,7 +227,14 @@ mod fixtures {
     ];
 
     pub fn raw(name: &str) -> serde_json::Value {
-        let path = format!("tests/fixtures/adaptive/{name}.json");
+        // Anchored on the manifest directory rather than the process working directory, so
+        // the fixtures still resolve if this crate is ever moved into a workspace or the
+        // test binary is run from elsewhere. The fixtures are #324/#325/#326 contract
+        // inputs; a path that only works from the package root is a trap for them.
+        let path = format!(
+            "{}/tests/fixtures/adaptive/{name}.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
             panic!("fixture {path} must be readable: {error}");
         });
@@ -275,6 +282,35 @@ mod fixtures {
                 "canonical fixture {name} has unrecognized fields (likely typos): {strays:?}"
             );
         }
+    }
+
+    #[test]
+    fn every_declared_divergence_names_lanes_the_control_publishes() {
+        // A divergence is a renderable disagreement between two lanes. Citing a lane the
+        // control does not publish leaves a consumer following the `lanes` array with
+        // nothing to show for one side, so the fixture would claim to demonstrate a
+        // divergence a surface cannot actually draw.
+        let mut gaps = Vec::new();
+        for name in CANONICAL {
+            let doc = document(name);
+            for control in &doc.controls {
+                for divergence in &control.divergences {
+                    for lane in &divergence.lanes {
+                        if control.lane(lane).is_none() {
+                            gaps.push(format!(
+                                "{name}: {} declares {} but publishes no {lane} lane",
+                                control.id, divergence.kind
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            gaps.is_empty(),
+            "every divergence must name lanes the control publishes:\n{}",
+            gaps.join("\n")
+        );
     }
 
     #[test]
@@ -953,7 +989,7 @@ mod change_sets {
     use super::fixtures::document;
     use unified_hifi_control::adaptive::{
         ApplyLane, ChangeSet, ChangeSetEntry, ChangeSetId, ChangeSetState, ControlId, ControlValue,
-        EntryValidity, RetireOutcome, Staleness, Timestamp,
+        EntryValidity, RetireOutcome, StageOutcome, Staleness, Timestamp,
     };
 
     fn draft() -> ChangeSet {
@@ -986,13 +1022,18 @@ mod change_sets {
             assert!(!set.id.as_str().is_empty());
             assert!(!set.producer_id.is_empty());
         }
-        // Distinct surfaces own distinct drafts.
-        let surfaces: Vec<_> = doc
+        // Distinct surfaces own distinct drafts. Deduplicated deliberately: `surfaces` has
+        // one element per change set, so counting the raw list would restate
+        // `change_sets.len() > 1` and pass even if every draft came from the web UI.
+        let surfaces: std::collections::BTreeSet<_> = doc
             .change_sets
             .iter()
             .map(|set| set.origin.surface.clone())
             .collect();
-        assert!(surfaces.len() > 2);
+        assert!(
+            surfaces.len() > 2,
+            "several distinct surfaces must own drafts, found {surfaces:?}"
+        );
     }
 
     #[test]
@@ -1003,8 +1044,13 @@ mod change_sets {
             entry("hqplayer.volume.level", -9.0),
             Timestamp::new("2026-07-30T11:10:00Z"),
         );
-        assert_eq!(after, before + 1);
-        assert_eq!(set.generation, after);
+        assert_eq!(
+            after,
+            StageOutcome::Staged {
+                generation: before + 1
+            }
+        );
+        assert_eq!(set.generation, after.generation());
     }
 
     #[test]
@@ -1015,10 +1061,13 @@ mod change_sets {
         let mut set = draft();
         let detached = set.detach();
         assert_eq!(set.state, ChangeSetState::Detached);
-        let staged_during_execution = set.stage(
-            entry("hqplayer.pipeline.rate.exact", 384000.0),
-            Timestamp::new("2026-07-30T11:10:05Z"),
-        );
+        let staged_during_execution = set
+            .stage(
+                entry("hqplayer.pipeline.rate.exact", 384000.0),
+                Timestamp::new("2026-07-30T11:10:05Z"),
+            )
+            .staged()
+            .unwrap_or_else(|| panic!("staging onto a detached draft must land"));
         assert_eq!(staged_during_execution, detached.generation + 1);
         assert_eq!(
             set.state,
@@ -1053,13 +1102,104 @@ mod change_sets {
     }
 
     #[test]
+    fn staging_reopens_every_executing_state_not_only_detached() {
+        // The specification says staging during execution produces a successor generation
+        // and reopens the draft. `Detached` is not the only executing state: preflight is
+        // `Validating` and execution is `Applying`. A draft left reporting either while
+        // holding an edit the in-flight operation never saw is the same lost-update shape
+        // the generation counter exists to foreclose - the state would claim the entries
+        // are being executed when one of them is not.
+        for state in [
+            ChangeSetState::Detached,
+            ChangeSetState::Validating,
+            ChangeSetState::Applying,
+        ] {
+            let mut set = draft();
+            set.state = state.clone();
+            let before = set.generation;
+            let outcome = set.stage(
+                entry("hqplayer.volume.level", -9.0),
+                Timestamp::new("2026-07-30T11:20:00Z"),
+            );
+            assert_eq!(
+                outcome,
+                StageOutcome::Staged {
+                    generation: before + 1
+                },
+                "staging while {state} must land as a successor generation"
+            );
+            assert_eq!(
+                set.state,
+                ChangeSetState::Draft,
+                "{state} must reopen as a draft once new intent lands in it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closed_change_set_refuses_new_intent_rather_than_misreporting_its_state() {
+        // The alternative - reopening a terminal change set as a draft - is worse than a
+        // refusal. A change set whose audit trail says `applied` or `discarded` would
+        // start accumulating unapplied entries under the same id, and every consumer that
+        // trusts the state would be wrong about what the producer is holding. Retry after
+        // a partial application is a new plan over a changed revision, not a replay, so
+        // `partially_applied` is closed too. An `Unrecognized` state from a newer minor
+        // version is closed because this build cannot know its semantics: permission
+        // fails closed here exactly as it does for an unknown constraint operator.
+        for state in [
+            ChangeSetState::Applied,
+            ChangeSetState::PartiallyApplied,
+            ChangeSetState::Rejected,
+            ChangeSetState::Superseded,
+            ChangeSetState::Expired,
+            ChangeSetState::Discarded,
+            ChangeSetState::Unrecognized("garbage_collected".to_string()),
+        ] {
+            let mut set = draft();
+            set.state = state.clone();
+            let entries = set.entries.clone();
+            let generation = set.generation;
+            let updated_at = set.updated_at.clone();
+
+            let outcome = set.stage(
+                entry("hqplayer.volume.level", -9.0),
+                Timestamp::new("2026-07-30T11:21:00Z"),
+            );
+            assert_eq!(
+                outcome,
+                StageOutcome::Closed {
+                    state: state.clone(),
+                    generation
+                },
+                "staging onto {state} must be refused, naming the state that refused it"
+            );
+            assert_eq!(
+                set.state, state,
+                "a refused stage must not change the state"
+            );
+            assert_eq!(
+                set.entries, entries,
+                "a refused stage must not add an entry to {state}"
+            );
+            assert_eq!(
+                set.generation, generation,
+                "a refused stage must not move the generation"
+            );
+            assert_eq!(
+                set.updated_at, updated_at,
+                "a refused stage must not touch updated_at"
+            );
+        }
+    }
+
+    #[test]
     fn detach_snapshots_the_entries_it_will_execute() {
         // Preflight and execution operate on the snapshot, so "the operation applied
         // what it displayed" is true even under concurrent staging.
         let mut set = draft();
         let detached = set.detach();
         let count = detached.entries.len();
-        set.stage(
+        let _ = set.stage(
             entry("hqplayer.volume.level", -3.0),
             Timestamp::new("2026-07-30T11:11:00Z"),
         );
@@ -1075,11 +1215,11 @@ mod change_sets {
     fn restaging_the_same_control_and_lane_replaces_rather_than_duplicates() {
         let mut set = draft();
         let control = ControlId::new("hqplayer.volume.level");
-        set.stage(
+        let _ = set.stage(
             entry("hqplayer.volume.level", -9.0),
             Timestamp::new("2026-07-30T11:12:00Z"),
         );
-        set.stage(
+        let _ = set.stage(
             entry("hqplayer.volume.level", -8.0),
             Timestamp::new("2026-07-30T11:12:01Z"),
         );
@@ -1388,13 +1528,13 @@ mod outcomes {
 // ============================================================================
 
 mod constraints {
-    use super::fixtures::document;
+    use super::fixtures::{document, raw};
     use unified_hifi_control::adaptive::constraint::{ValueLookup, MAX_EXPR_DEPTH, MAX_EXPR_NODES};
     use unified_hifi_control::adaptive::control::{Reason, ReasonScope};
     use unified_hifi_control::adaptive::value::ValueLane;
     use unified_hifi_control::adaptive::{
-        Constraint, ControlId, ControlValue, Evaluation, Expr, LaneValue, Permission, Provenance,
-        ReasonCode, Visibility,
+        admit_document, Constraint, ControlId, ControlValue, Evaluation, Expr, ExprLimit,
+        LaneValue, Permission, Provenance, ReasonCode, Refusal, Visibility,
     };
 
     /// A minimal lookup so evaluation can be tested without a whole document.
@@ -1639,6 +1779,68 @@ mod constraints {
         ));
     }
 
+    /// The operator names in `expr` that reach a definite verdict against `view`.
+    fn definite_operators(
+        expr: &Expr,
+        view: &dyn ValueLookup,
+        out: &mut std::collections::BTreeSet<&'static str>,
+    ) {
+        let operator = match expr {
+            Expr::Eq { .. } => "eq",
+            Expr::NotEq { .. } => "not_eq",
+            Expr::OneOf { .. } => "one_of",
+            Expr::InRange { .. } => "in_range",
+            Expr::IsGrounded { .. } => "is_grounded",
+            Expr::All(_) => "all",
+            Expr::Any(_) => "any",
+            Expr::Not(_) => "not",
+            Expr::Unrecognized { .. } => "unrecognized",
+        };
+        if !matches!(expr.evaluate(view), Evaluation::Unevaluatable { .. }) {
+            out.insert(operator);
+        }
+        match expr {
+            Expr::All(children) | Expr::Any(children) => {
+                for child in children {
+                    definite_operators(child, view, out);
+                }
+            }
+            Expr::Not(child) => definite_operators(child, view, out),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn every_operator_reaches_a_definite_verdict_over_the_canonical_document() {
+        // Stronger than "every operator appears somewhere". An operator whose operand is
+        // never grounded in the canonical document only ever runs the unevaluatable path, so
+        // nothing proves its comparison works - which is what the `in_range` example on
+        // `hqplayer.settings.buffer_time` did while it pointed at a `desired` lane the
+        // control does not publish.
+        let doc = document("hqplayer_pipeline_v1");
+        let effective = doc.effective_view(None);
+        let mut definite = std::collections::BTreeSet::new();
+        for subject in &doc.constraints {
+            definite_operators(&subject.when, &effective, &mut definite);
+        }
+        for operator in [
+            "eq",
+            "not_eq",
+            "one_of",
+            "in_range",
+            "is_grounded",
+            "all",
+            "any",
+            "not",
+        ] {
+            assert!(
+                definite.contains(operator),
+                "`{operator}` never reaches a definite verdict in the canonical document; \
+                 it is only exercised on the unevaluatable path. Definite: {definite:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_operator_evaluates_over_the_canonical_document() {
         let doc = document("hqplayer_pipeline_v1");
@@ -1661,6 +1863,124 @@ mod constraints {
             .find(|found| found.id == "hqplayer.constraint.exact_rate_requires_explicit_mode")
             .expect("constraint present");
         assert_eq!(exact_rate.when.evaluate(&effective), Evaluation::True);
+    }
+
+    /// A `d`-deep expression: an `is_grounded` leaf wrapped in `d - 1` `all` nodes.
+    fn nested(depth: usize) -> serde_json::Value {
+        let mut node = serde_json::json!({
+            "op": "is_grounded",
+            "control": "hqplayer.pipeline.mode",
+            "lane": "observed"
+        });
+        for _ in 1..depth {
+            node = serde_json::json!({ "op": "all", "of": [node] });
+        }
+        node
+    }
+
+    /// A depth-2 expression with `leaves + 1` nodes.
+    fn wide(leaves: usize) -> serde_json::Value {
+        let leaf = serde_json::json!({
+            "op": "is_grounded",
+            "control": "hqplayer.pipeline.mode",
+            "lane": "observed"
+        });
+        serde_json::json!({ "op": "all", "of": vec![leaf; leaves] })
+    }
+
+    /// The canonical document with one extra constraint appended.
+    fn with_constraint(id: &str, when: serde_json::Value) -> serde_json::Value {
+        let mut document = raw("hqplayer_pipeline_v1");
+        let constraint = serde_json::json!({
+            "id": id,
+            "applies_to": ["hqplayer.pipeline.mode"],
+            "when": when,
+            "effect": "invalidates",
+            "reason": { "code": "draft_invalid", "scope": "draft" }
+        });
+        document
+            .get_mut("constraints")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap_or_else(|| panic!("the canonical fixture has a constraints array"))
+            .push(constraint);
+        document
+    }
+
+    #[test]
+    fn an_expression_over_the_published_bounds_is_refused_at_admission() {
+        // The bounds exist so evaluation cost is predictable on the smallest consumer. A
+        // document that has been admitted will be evaluated by every surface that renders
+        // it, so publishing the bound and then not checking it at the door means the bound
+        // does not exist: `Expr::validate` was reachable but nothing on the admission path
+        // called it. Refusal is machine-readable and names the offending constraint, so a
+        // producer can find it without diffing the whole document.
+        let too_deep = admit_document(&with_constraint(
+            "test.constraint.too_deep",
+            nested(MAX_EXPR_DEPTH + 1),
+        ))
+        .expect_err("an over-deep constraint must be refused");
+        assert_eq!(
+            too_deep,
+            Refusal::ConstraintTooComplex {
+                constraint: "test.constraint.too_deep".to_string(),
+                limit: ExprLimit::DepthExceeded {
+                    depth: MAX_EXPR_DEPTH + 1,
+                    max: MAX_EXPR_DEPTH,
+                },
+            }
+        );
+
+        let too_wide = admit_document(&with_constraint(
+            "test.constraint.too_wide",
+            wide(MAX_EXPR_NODES),
+        ))
+        .expect_err("an over-wide constraint must be refused");
+        assert_eq!(
+            too_wide,
+            Refusal::ConstraintTooComplex {
+                constraint: "test.constraint.too_wide".to_string(),
+                limit: ExprLimit::NodesExceeded {
+                    nodes: MAX_EXPR_NODES + 1,
+                    max: MAX_EXPR_NODES,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn an_expression_exactly_at_the_published_bounds_is_admitted() {
+        // The bound is inclusive, and a refusal one node early would silently narrow the
+        // contract every producer was told it could use.
+        admit_document(&with_constraint(
+            "test.constraint.at_max_depth",
+            nested(MAX_EXPR_DEPTH),
+        ))
+        .unwrap_or_else(|refusal| panic!("depth {MAX_EXPR_DEPTH} must be admitted: {refusal}"));
+        admit_document(&with_constraint(
+            "test.constraint.at_max_nodes",
+            wide(MAX_EXPR_NODES - 1),
+        ))
+        .unwrap_or_else(|refusal| panic!("{MAX_EXPR_NODES} nodes must be admitted: {refusal}"));
+    }
+
+    #[test]
+    fn an_unrecognized_operator_is_still_bounded() {
+        // Unknown operators fail open for visibility, which means they get evaluated. An
+        // over-deep tree of unknown operators must therefore be refused at the door too,
+        // or forward compatibility becomes the way past the bound.
+        let mut node = serde_json::json!({ "op": "matches_regex", "pattern": "^sdm" });
+        for _ in 1..=MAX_EXPR_DEPTH {
+            node = serde_json::json!({ "op": "not", "of": node });
+        }
+        let refusal = admit_document(&with_constraint("test.constraint.deep_unknown", node))
+            .expect_err("an over-deep unknown-operator tree must be refused");
+        assert!(matches!(
+            refusal,
+            Refusal::ConstraintTooComplex {
+                limit: ExprLimit::DepthExceeded { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1840,8 +2160,19 @@ mod intent_coherence {
     use super::fixtures::{document, CANONICAL};
     use unified_hifi_control::adaptive::{
         ApplyLane, ChangeSetEntry, ControlId, ControlValue, EntryValidity, IntentIncoherence,
-        Timestamp, ValueLane,
+        StageOutcome, Timestamp, ValueLane,
     };
+
+    fn valid_entry(control: &ControlId, lane: ApplyLane, desired: ControlValue) -> ChangeSetEntry {
+        ChangeSetEntry {
+            control: control.clone(),
+            lane,
+            desired,
+            base_observed: None,
+            validity: EntryValidity::Valid,
+            extensions: Default::default(),
+        }
+    }
 
     #[test]
     fn every_canonical_fixture_publishes_coherent_intent() {
@@ -1883,17 +2214,11 @@ mod intent_coherence {
         let orphan = ControlId::new("hqplayer.pipeline.rate.exact");
         // rate.exact is published with an observed lane only. Staging a *valid* entry for
         // it without adding a desired lane is exactly the silent failure C1 forbids.
-        doc.change_sets[0].stage(
-            ChangeSetEntry {
-                control: orphan.clone(),
-                lane: ApplyLane::Staged,
-                desired: ControlValue::choice("384000"),
-                base_observed: None,
-                validity: EntryValidity::Valid,
-                extensions: Default::default(),
-            },
+        let staged = doc.change_sets[0].stage(
+            valid_entry(&orphan, ApplyLane::Staged, ControlValue::choice("384000")),
             Timestamp::new("2026-07-30T11:30:00Z"),
         );
+        assert!(matches!(staged, StageOutcome::Staged { .. }));
         assert_eq!(
             doc.intent_coherence_violations(),
             vec![IntentIncoherence::MissingDesiredLane {
@@ -1930,17 +2255,11 @@ mod intent_coherence {
         let mode = ControlId::new("hqplayer.pipeline.mode");
         let first = doc.change_sets[0].id.clone();
         let second = doc.change_sets[1].id.clone();
-        doc.change_sets[1].stage(
-            ChangeSetEntry {
-                control: mode.clone(),
-                lane: ApplyLane::Staged,
-                desired: ControlValue::choice("sdm"),
-                base_observed: None,
-                validity: EntryValidity::Valid,
-                extensions: Default::default(),
-            },
+        let staged = doc.change_sets[1].stage(
+            valid_entry(&mode, ApplyLane::Staged, ControlValue::choice("sdm")),
             Timestamp::new("2026-07-30T11:31:00Z"),
         );
+        assert!(matches!(staged, StageOutcome::Staged { .. }));
         assert_eq!(
             doc.intent_coherence_violations(),
             vec![IntentIncoherence::MultipleValidDrafts {
@@ -1948,6 +2267,41 @@ mod intent_coherence {
                 change_set: second,
                 also_claimed_by: first,
             }]
+        );
+    }
+
+    #[test]
+    fn c2_one_draft_may_hold_valid_entries_for_one_control_on_two_apply_lanes() {
+        // C2 is about two *drafts* contesting a control. A draft cannot contest itself.
+        // `ChangeSet::stage` dedups on `(control, lane)`, so a producer mirroring a write
+        // to the running engine and to persisted configuration legitimately holds two
+        // valid entries for one control in one change set. Reporting that as
+        // `MultipleValidDrafts { change_set: X, also_claimed_by: X }` would make an
+        // aggregator refuse or repair a document that is in fact coherent - and C1 is
+        // already satisfied, because a single `desired` lane describes both lanes' intent.
+        let mut doc = document("staged_intent_multi_surface");
+        let mode = ControlId::new("hqplayer.pipeline.mode");
+        let staged = doc.change_sets[0].stage(
+            valid_entry(&mode, ApplyLane::Persistent, ControlValue::choice("sdm")),
+            Timestamp::new("2026-07-30T11:32:00Z"),
+        );
+        assert!(matches!(staged, StageOutcome::Staged { .. }));
+
+        let mirrored: Vec<_> = doc.change_sets[0]
+            .entries
+            .iter()
+            .filter(|entry| entry.control == mode && entry.validity.may_apply())
+            .map(|entry| entry.lane.clone())
+            .collect();
+        assert_eq!(
+            mirrored,
+            vec![ApplyLane::Staged, ApplyLane::Persistent],
+            "one draft holds the same control on two apply lanes"
+        );
+        assert_eq!(
+            doc.intent_coherence_violations(),
+            vec![],
+            "a change set must not be reported as conflicting with itself"
         );
     }
 

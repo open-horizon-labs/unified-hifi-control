@@ -583,6 +583,15 @@ pub struct Constraint {
 }
 
 impl Constraint {
+    /// Check this constraint's expression against the published bounds.
+    ///
+    /// Called on the admission path ([`super::document::admit_document`]) rather than left
+    /// to whoever remembers: a document that has been admitted is evaluated by every
+    /// surface that renders it, so a bound nothing checks at the door is not a bound.
+    pub fn validate(&self) -> Result<(), ExprLimit> {
+        self.when.validate()
+    }
+
     /// What a consumer may show, given an evaluation of [`Constraint::when`].
     ///
     /// Never hides. An undecidable constraint yields an annotation, not a disappearance.

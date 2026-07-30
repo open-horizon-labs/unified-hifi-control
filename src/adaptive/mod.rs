@@ -55,7 +55,7 @@ pub mod vocab;
 pub use change_set::{
     ActorClass, ChangeSet, ChangeSetEntry, ChangeSetId, ChangeSetState, ConflictPolicy,
     DetachedChangeSet, DraftMode, DraftPolicy, EntryValidity, EpochPolicy, Origin, Retention,
-    RetireOutcome, Staleness, Surface,
+    RetireOutcome, StageOutcome, Staleness, Surface,
 };
 pub use command::{
     CommandOutcome, OperationId, OperationRecord, OutcomeTransition, PlanStep, RecoveryState,

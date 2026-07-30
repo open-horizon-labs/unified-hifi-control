@@ -125,6 +125,37 @@ semantic_enum! {
     }
 }
 
+impl ChangeSetState {
+    /// Whether an operation is holding a detached generation of this change set.
+    ///
+    /// [`ChangeSetState::Detached`] is not the only one: preflight is `Validating` and
+    /// execution is `Applying`, and all three mean "a snapshot is in flight". Staging into
+    /// any of them produces a successor generation the in-flight operation has never seen,
+    /// which is why the draft reopens rather than continuing to claim it is executing
+    /// entries that are no longer the ones it holds.
+    pub fn is_executing(&self) -> bool {
+        matches!(self, Self::Detached | Self::Validating | Self::Applying)
+    }
+
+    /// Whether this state may still accumulate staged intent.
+    ///
+    /// False for every closed state. A change set whose audit trail says `applied` or
+    /// `discarded` must not start holding unapplied entries under the same id: every
+    /// consumer that trusts the state would then be wrong about what the producer holds,
+    /// and the honest repair — silently reopening it as a draft — would erase the record
+    /// that distinguishes "was never applied" from "was applied, then edited again".
+    /// `PartiallyApplied` is closed for the same reason retry is a new plan rather than a
+    /// replay.
+    ///
+    /// False for [`ChangeSetState::Unrecognized`] too: a state a newer minor version added
+    /// has semantics this build cannot know, and mutating on a guess is exactly what the
+    /// generation counter exists to prevent. Permission fails closed here as it does for an
+    /// unknown constraint operator.
+    pub fn accepts_staging(&self) -> bool {
+        matches!(self, Self::Draft) || self.is_executing()
+    }
+}
+
 /// Who staged this, from where.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Origin {
@@ -292,6 +323,48 @@ pub struct DetachedChangeSet {
     pub entries: Vec<ChangeSetEntry>,
 }
 
+/// Result of attempting to stage an edit.
+///
+/// Fallible because a change set's lifecycle state decides whether new intent may join
+/// it, and a refusal is not a programmer error: a producer assembling a document from
+/// concurrent surfaces will legitimately race a discard or a completion against a stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub enum StageOutcome {
+    /// The edit landed. The successor generation is one the in-flight operation, if any,
+    /// has never seen — and therefore may not retire.
+    Staged {
+        /// The generation the change set is now at.
+        generation: u64,
+    },
+    /// Refused. The change set has reached a state that may not accumulate new intent, so
+    /// nothing was pushed, the generation did not move and `updated_at` is unchanged. The
+    /// caller must open a new draft; see [`ChangeSetState::accepts_staging`].
+    Closed {
+        /// The state that refused the edit.
+        state: ChangeSetState,
+        /// The generation the change set remains at.
+        generation: u64,
+    },
+}
+
+impl StageOutcome {
+    /// The generation the change set is at after the attempt, staged or refused.
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Staged { generation } | Self::Closed { generation, .. } => *generation,
+        }
+    }
+
+    /// The successor generation, if the edit landed.
+    pub fn staged(&self) -> Option<u64> {
+        match self {
+            Self::Staged { generation } => Some(*generation),
+            Self::Closed { .. } => None,
+        }
+    }
+}
+
 /// Result of attempting to retire a generation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetireOutcome {
@@ -310,10 +383,31 @@ pub enum RetireOutcome {
 impl ChangeSet {
     /// Stage an edit, producing a successor generation.
     ///
-    /// Returns the new generation. If the draft is currently detached or executing, the
-    /// edit still lands — it simply belongs to a generation the in-flight operation has
-    /// never seen, and that operation may not retire it.
-    pub fn stage(&mut self, entry: ChangeSetEntry, at: Timestamp) -> u64 {
+    /// If the draft is currently detached, being validated or being applied, the edit still
+    /// lands — it simply belongs to a generation the in-flight operation has never seen, and
+    /// that operation may not retire it. The draft reopens, because a change set reporting
+    /// `applying` while holding an entry the running operation never received is claiming
+    /// something untrue.
+    ///
+    /// If the change set has closed — `applied`, `partially_applied`, `rejected`,
+    /// `superseded`, `expired`, `discarded`, or a state this build does not recognize — the
+    /// edit is **refused** and nothing is touched: no entry, no generation, no timestamp.
+    /// The alternative is worse than a refusal in both directions. Accepting the entry while
+    /// leaving `state` alone lets a change set reporting `applied` accumulate unapplied
+    /// intent; reopening it as a draft destroys the audit fact that it already completed.
+    /// The caller opens a new draft instead, which is also what a retry after a partial
+    /// application must do — a new plan over a changed producer revision, not a replay.
+    ///
+    /// Decided in `stage` rather than left to callers so that a web page, an MCP client and
+    /// a device cannot reach different conclusions about whether an edit landed. See
+    /// [`ChangeSetState::accepts_staging`].
+    pub fn stage(&mut self, entry: ChangeSetEntry, at: Timestamp) -> StageOutcome {
+        if !self.state.accepts_staging() {
+            return StageOutcome::Closed {
+                state: self.state.clone(),
+                generation: self.generation,
+            };
+        }
         if let Some(existing) = self
             .entries
             .iter_mut()
@@ -325,11 +419,13 @@ impl ChangeSet {
         }
         self.generation += 1;
         self.updated_at = at;
-        if self.state == ChangeSetState::Detached {
+        if self.state.is_executing() {
             // Staging during execution reopens the draft as a successor generation.
             self.state = ChangeSetState::Draft;
         }
-        self.generation
+        StageOutcome::Staged {
+            generation: self.generation,
+        }
     }
 
     /// Detach an immutable snapshot for preflight and execution.

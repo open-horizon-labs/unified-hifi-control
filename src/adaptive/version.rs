@@ -15,6 +15,8 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+use super::constraint::ExprLimit;
+
 /// The document schema version this build of the contract implements.
 pub const CONSUMER_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 0 };
 
@@ -159,6 +161,19 @@ pub enum Refusal {
         /// Deserialization detail, for logs rather than for users.
         detail: String,
     },
+    /// A constraint expression exceeds the published depth or node bounds.
+    ///
+    /// Refused at admission rather than at evaluation. The bounds exist so evaluation
+    /// cost is predictable on the smallest consumer, and an admitted document is
+    /// evaluated by every surface that renders it — so a bound checked only where
+    /// somebody remembers to call [`super::constraint::Expr::validate`] is not a bound.
+    ConstraintTooComplex {
+        /// The `id` of the constraint whose expression exceeded a bound, so a producer
+        /// can find it without diffing the whole document.
+        constraint: String,
+        /// Which bound was exceeded, and by how much.
+        limit: ExprLimit,
+    },
 }
 
 impl fmt::Display for Refusal {
@@ -173,6 +188,10 @@ impl fmt::Display for Refusal {
             }
             Self::MissingVersion => f.write_str("producer document has no schema_version"),
             Self::Malformed { detail } => write!(f, "malformed producer document: {detail}"),
+            Self::ConstraintTooComplex { constraint, limit } => write!(
+                f,
+                "constraint {constraint:?} exceeds the published expression bounds: {limit:?}"
+            ),
         }
     }
 }

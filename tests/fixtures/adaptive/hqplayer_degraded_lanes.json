@@ -101,7 +101,7 @@
         {
           "lane": "persisted",
           "grounding": "ungrounded",
-          "ungrounded_reason": "lane_unconfigured",
+          "ungrounded_reason": "requires_connection",
           "provenance": { "authority": "persisted_config", "source": "config_file" }
         }
       ],

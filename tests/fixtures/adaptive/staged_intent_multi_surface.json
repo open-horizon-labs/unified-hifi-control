@@ -70,6 +70,12 @@
           "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4207 }
         },
         {
+          "lane": "persisted",
+          "grounding": "grounded",
+          "value": { "type": "decimal", "value": -14.0 },
+          "provenance": { "authority": "persisted_config", "source": "config_file", "revision": 12 }
+        },
+        {
           "lane": "desired",
           "grounding": "grounded",
           "value": { "type": "decimal", "value": -12.0 },

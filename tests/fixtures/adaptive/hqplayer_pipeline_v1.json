@@ -750,7 +750,7 @@
       "when": {
         "op": "in_range",
         "control": "hqplayer.settings.buffer_time",
-        "lane": "desired",
+        "lane": "persisted",
         "min": 10.0,
         "max": 2000.0
       },
