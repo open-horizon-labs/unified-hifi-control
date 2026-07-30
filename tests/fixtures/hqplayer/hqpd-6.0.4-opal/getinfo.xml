@@ -1,11 +1,12 @@
 <!--
   provenance:
     source: UHC-SALVAGE-UI-DATA-INTEGRATION.md and UHC-SALVAGE-BETA-DEV.md (2026-07-29 comparative salvage reports), which cite https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 6, GetInfo)
-    source_chain: read-via-report. The upstream file was NOT read directly for this fixture; the salvage report is the immediate source and the upstream ref is the report's own citation. Recorded because two errors in this amendment came from treating a report's citation as if it had been read: a path that does not exist at the ref given, and a superseded claim the report's own newer companion had already corrected.
+    source_chain: read-via-report
     daemon: hqplayerd 6.0.4 (Opal), engine 6.0.4
     status: verified-upstream
     date: 2026-07-29
     playback: unknown
-    notes: Byte-for-byte the GetInfo response recorded on a live 6.0.4 Opal daemon. version is the major version; engine carries the full version string.
+    tier: tier-1
+    notes: Byte-for-byte the GetInfo response recorded on a live 6.0.4 Opal daemon. version is the major version; engine carries the full version string. Source chain: read-via-report - the upstream file was NOT read directly for this fixture; the salvage report is the immediate source and the upstream ref is the report's own citation, recorded because two errors in this amendment came from treating a report's citation as if it had been read (a path that did not exist at the ref given, and a superseded claim the report's own newer companion had already corrected).
 -->
 <GetInfo engine="6.0.4" name="Opal" platform="Linux" product="Signalyst HQPlayer Embedded" version="6"/>

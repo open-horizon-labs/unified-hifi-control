@@ -330,7 +330,12 @@ fn split(document: &[u8], chunking: &Chunking) -> Vec<Vec<u8>> {
 }
 
 fn mentions(line: &str, element: &str) -> bool {
-    line.contains(&format!("<{element}"))
+    // Exact match on the request's root element, not a substring. `line.contains("<Volume")` also
+    // fired for `<VolumeUp>`, `<VolumeMute>` and `<VolumeRange>`, so a disruption armed for `Volume`
+    // silently swallowed those unrelated commands - a false absence manufactured inside the boundary
+    // built to catch them. `element_name` parses the root element (skipping any XML declaration), so
+    // only the intended command is affected.
+    super::corpus::element_name(line).as_deref() == Some(element)
 }
 
 async fn serve_connection(

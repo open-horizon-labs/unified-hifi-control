@@ -427,6 +427,28 @@ async fn a_silent_daemon_surfaces_a_timeout_rather_than_hanging() {
 }
 
 #[tokio::test]
+async fn silencing_volume_does_not_silence_volumeup() {
+    // `Volume` and `VolumeUp` are distinct protocol elements. A disruption armed for one must not
+    // affect the other. The harness matched the element by substring (`"<Volume"` is a prefix of
+    // `"<VolumeUp"`), so silencing `Volume` silently swallowed `VolumeUp`, `VolumeMute` and
+    // `VolumeRange` too — a harness that manufactures a false absence, the exact class this boundary
+    // exists to prevent. Assert that with `Volume` silenced, an unrelated `VolumeUp` still gets its
+    // reply and the call succeeds.
+    let h = Harness::with_policy(WirePolicy {
+        silent_for_element: Some("Volume".to_string()),
+        ..WirePolicy::default()
+    })
+    .await;
+    let result = h.adapter.volume_up().await;
+    assert!(
+        result.is_ok(),
+        "silent_for_element=\"Volume\" must not silence VolumeUp; only an exact element match may. \
+         Got {result:?}"
+    );
+    h.stop();
+}
+
+#[tokio::test]
 async fn a_silent_daemon_is_retried_exactly_the_configured_number_of_times() {
     let h = Harness::with_policy(WirePolicy {
         silent_for_element: Some("State".to_string()),
