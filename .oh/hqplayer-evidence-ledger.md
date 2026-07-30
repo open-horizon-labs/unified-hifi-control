@@ -1087,3 +1087,34 @@ standing in for a parser** — and this one was in a check written *to guard aga
 evidence*, which is the same trap one level up. Every text-matching helper that has been converted to
 structural parsing has stayed converted; none of the parsed ones has been reopened by a later pass.
 Checks: **36 → 37**.
+
+### The doc comment was right and the code did the opposite
+
+Reported while the structural rewrite was still in flight: `test_exercises_command`'s comment said
+*"`set_mode` must not credit `set_mode_something_else`"* — and the implementation was
+`c.starts_with(method)`, which credits exactly that. **The comment stated the intent correctly and the code
+contradicted it**, which is the reverse of the four stale-description findings and, if anything, more
+dangerous: a reader checking the comment would have believed the guarantee.
+
+RED first, from the control the comment implied:
+
+| Control | Before | After |
+|---|---|---|
+| `set_mode_something_else` credits `SetMode` | **true** | false |
+| `set_rate_limit` credits `SetRate` | true | false |
+| `set_filter_nx` credits `SetFilter` | true | **true** — this is why the rule is a *set*, not one string |
+
+`accepted_calls_for` now returns an **exact set** per command: `SetFilter` accepts `set_filter`,
+`set_filter_1x` and `set_filter_nx` — the three real emitters — and `SetMode` accepts `set_mode` and nothing
+else. Adding a name is a deliberate, exact, one-line decision, and `None` still forces an unmapped command to
+be evidenced by its own raw wire name. The diagnostic now prints the accepted set, so a failure says
+*"looked for a call to one of [\"set_mode\"]"* rather than naming a single method that was really a prefix.
+
+**Also reported, and already committed at `889b601`:** that a cited test which exists but has zero calls and
+zero literals must answer `Some(false)` rather than the `None` of a missing test. It does, with two controls
+pinning both halves — the fix and its controls went in with the structural rewrite, one commit before the
+report. Stated rather than re-done.
+
+**Seventeen defects. Ten were a text scan or a loose match standing in for an exact one.** The pattern has
+not varied: every time a shortcut stood in for a parse or an exact comparison, a later reader found it, and
+every conversion to structural or exact matching has held.

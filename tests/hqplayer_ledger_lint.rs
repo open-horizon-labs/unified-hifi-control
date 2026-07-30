@@ -1221,8 +1221,10 @@ fn every_command_a_claim_names_is_exercised_by_one_of_its_own_proofs() {
                     "{} names {cmd} but no cited test *calls* it — looked for a call to {} or a raw \
                      `<{cmd}` literal, in the parsed body of {:?}. {FIXTURES_NEVER_EXERCISE}",
                     c.id,
-                    adapter_method_for(&cmd)
-                        .map_or_else(|| "no mapped adapter method".to_string(), str::to_string),
+                    accepted_calls_for(&cmd).map_or_else(
+                        || "no mapped adapter method".to_string(),
+                        |set| format!("one of {set:?}")
+                    ),
                     cited.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>()
                 ));
             }
@@ -1337,11 +1339,13 @@ fn test_exercises_command(file: &syn::File, test_name: &str, cmd: &str) -> Optio
     if f.raw_literals.iter().any(|l| l.contains(&wire)) {
         return Some(true);
     }
-    Some(adapter_method_for(cmd).is_some_and(|method| {
-        // `set_filter` must credit `set_filter_1x`; `set_mode` must not credit `set_mode_something_else`,
-        // and no such method exists, so a prefix match is the right width here.
-        f.calls.iter().any(|c| c.starts_with(method))
-    }))
+    // Exact membership, not a prefix. The prefix form credited `set_mode_something_else` for `SetMode`,
+    // which the doc comment had claimed it would not — a contradiction between the comment and the code,
+    // found by writing the control the comment implied.
+    Some(
+        accepted_calls_for(cmd)
+            .is_some_and(|accepted| f.calls.iter().any(|c| accepted.contains(&c.as_str()))),
+    )
 }
 
 /// Why a `fixture:` proof can never satisfy a command claim.
@@ -1353,9 +1357,9 @@ fn test_exercises_command(file: &syn::File, test_name: &str, cmd: &str) -> Optio
 const FIXTURES_NEVER_EXERCISE: &str =
     "a fixture is a document, not an action; only a test can exercise a command";
 
-/// The adapter method that emits a wire command.
+/// The exact set of call names that count as emitting a wire command.
 ///
-/// A table, not a derivation, and `Option` rather than a fallback — both from defects:
+/// A table of **sets**, not a derivation and not a prefix — each shape came from a defect:
 ///
 /// * Deriving the name produced `set_shaping` and `set_junkfilter`, **neither of which exists**, so a
 ///   future shaper expectation calling `set_shaper` would not have been credited and the check would have
@@ -1363,18 +1367,23 @@ const FIXTURES_NEVER_EXERCISE: &str =
 /// * A `set_` fallback for unmapped commands let **any** setter in a proof body credit **any** unknown
 ///   command: an invented `SetFoo` would have been proven by an unrelated `set_mode` call. `None` forces
 ///   an unmapped command to be evidenced by its own raw wire name.
-fn adapter_method_for(cmd: &str) -> Option<&'static str> {
+/// * A **prefix** match credited `set_mode_something_else` for `SetMode` — while the doc comment claimed
+///   it would not. The comment was right about the intent and the code did the opposite, so membership is
+///   now exact and the near-prefix case is a control.
+fn accepted_calls_for(cmd: &str) -> Option<&'static [&'static str]> {
     match cmd {
-        "SetMode" => Some("set_mode"),
-        "SetFilter" => Some("set_filter"),
-        "SetShaping" => Some("set_shaper"),
-        "SetRate" => Some("set_rate"),
-        "SetJunkFilter" => Some("set_junk_filter"),
-        "SetVolume" => Some("set_volume"),
-        "SetAdaptiveVolume" => Some("set_adaptive_volume"),
-        // Deliberately `None` rather than a `set_` prefix: an unmapped command must be evidenced by its
-        // own raw wire name. Adding a mapping here is a decision to accept a method name as evidence for
-        // a command, and that decision should be explicit and reviewable, one line at a time.
+        "SetMode" => Some(&["set_mode"]),
+        // Three real methods emit `SetFilter`, which is why this is a set and not one string. `set_filter`
+        // itself is the low-level form; the `_1x`/`_nx` pair are what call sites use.
+        "SetFilter" => Some(&["set_filter", "set_filter_1x", "set_filter_nx"]),
+        "SetShaping" => Some(&["set_shaper"]),
+        "SetRate" => Some(&["set_rate"]),
+        "SetJunkFilter" => Some(&["set_junk_filter"]),
+        "SetVolume" => Some(&["set_volume", "set_volume_db"]),
+        "SetAdaptiveVolume" => Some(&["set_adaptive_volume"]),
+        // Deliberately `None` rather than a `set_` prefix or a pattern: an unmapped command must be
+        // evidenced by its own raw wire name. Adding a name here is a decision to accept that method as
+        // evidence for that command, and it should be explicit, exact and reviewable one line at a time.
         _ => None,
     }
 }
@@ -1432,6 +1441,26 @@ fn a_command_is_exercised_only_by_a_call_or_a_raw_wire_literal() {
         "t",
         "SetFoo"
     ));
+    // Refused: a **near-prefix** method name. `set_mode_something_else` is not `set_mode`, and a prefix
+    // match credited it — the doc comment claimed otherwise, which is how the contradiction was found.
+    assert!(!ex(
+        r#"#[test] fn t() { h.adapter.set_mode_something_else("PCM"); }"#,
+        "t",
+        "SetMode"
+    ));
+    assert!(!ex(
+        r#"#[test] fn t() { h.adapter.set_rate_limit(3); }"#,
+        "t",
+        "SetRate"
+    ));
+    // Accepted, and the reason the rule is a *set* rather than an exact string: these are the real
+    // methods that emit `SetFilter`.
+    assert!(ex(
+        r#"#[test] fn t() { h.adapter.set_filter_nx("x"); }"#,
+        "t",
+        "SetFilter"
+    ));
+
     // Refused: reading state is not sending a command.
     assert!(!ex(
         r#"#[test] fn t() { let s = h.adapter.get_state(); assert_eq!(s.mode, 2); }"#,
