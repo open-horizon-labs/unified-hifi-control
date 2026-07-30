@@ -282,3 +282,88 @@ been released outside this repository, so this completes 1.0 rather than adding 
     serde.
 11. No route changes. `tests/fixtures/api_routes.txt` untouched, `api-change-approved` never
     applied.
+
+## Execute
+**Updated:** 2026-07-30
+**Status:** complete
+
+Prerequisite #323 was remediated twice during this session. This branch was merged
+forward-only onto `d6da952` at `49a55ed`; reports 1/6 and 2/6 were re-anchored there.
+
+**TDD evidence.** `tests/adaptive_publication.rs` was written first against a deliberately
+naive stub (admit everything, store blindly). RED: **29 failed, 24 passed**. After the real
+gate and aggregator: **53 passed, 0 failed**. Full suite 408 → **472 passed, 0 failed**
+across 24 binaries. `cargo fmt --check` clean; `cargo clippy --lib` clean.
+
+### What the two new invariants found on day one
+
+Enforcing decision 4 immediately refused a **canonical #323 fixture**.
+`command_outcomes.json` recorded `disconnected -> indeterminate` on `op-provisional-9001`,
+which `CommandOutcome::may_transition_to` forbids — nothing may regress into an unresolved
+state — and which contradicted the same operation's `write_attempt:
+acknowledged_provisional`, since `disconnected` means the transport was down *before* the
+write was attempted. Nothing may legally transition *into* `indeterminate`, so that
+operation's history is correctly empty.
+
+The defect was load-bearing for a passing test:
+`a_new_operation_cannot_erase_the_audit_trail` asserted `history` was non-empty and that
+some transition had `to == Indeterminate`, which only the illegal entry could satisfy. It is
+retargeted at `op-divergent-9015` and asserts `from == Indeterminate`, which is what the
+comment above it always claimed to be testing.
+
+This is the argument for the invariant, not an argument against it: a rule the contract
+published and no code path applied had already produced a wrong fixture and a test shaped
+around it.
+
+### Decisions taken during execution
+
+* **Equal revisions (obligation A4).** Neither binary. A republication at the same revision
+  whose difference is confined to `lanes`/`stale` is admitted as `HealthRefresh`; anything
+  else at the same revision is refused as `NotAdvanced`. Demanding a `state` bump for lane
+  transitions would invalidate every open change set on every lane flap, because drafts are
+  validated against the state revision. Checked by rebuilding the incoming document with the
+  held lane health and comparing for equality.
+* **Lane-value predicate (obligation A3).** `LaneValue::is_consistent` is **not** used at the
+  door: it returns `false` for `Grounding::Unrecognized`, so admission would refuse a
+  forward-compatible document wholesale. The gate refuses only recognized-grounding defects.
+  `CommandOutcome::may_transition_to` needs no such narrowing — it already returns `true` for
+  unrecognized outcomes, so decision 4 is forward-compatible as written.
+* **C2 demotes both claimants (D2).** `draft_policy.on_conflict` is deliberately not
+  consulted: it governs staging, and #324 implements no staging path. Tested with a document
+  declaring `last_actor_takeover`.
+* **`ReasonCode::ControlRemoved`** added, forced by the requirement that a removed control be
+  distinguishable from one awaiting validation. `every_vocabulary_member_has_a_worked_example`
+  then forced the fixture #324's acceptance criteria already demanded:
+  `control_removed_after_advance.json`, a draft whose base predates the advance that removed
+  its target. No `CONSUMER_SCHEMA_VERSION` bump: 1.0 has never left this repository.
+
+### Obligations discharged
+
+| # | Where |
+|---|---|
+| A1, A8 | `tests/adaptive_publication_lint.rs` — 11 tests, bidirectional probes |
+| A2 | `ProducerAggregator::run` handles `Lagged` and continues; `record_lag`; `a_lagging_aggregator_keeps_running_rather_than_exiting` |
+| A3 | `first_lane_defect`; `an_unrecognized_grounding_from_a_newer_minor_is_admitted_not_refused` |
+| A4 | `ordering()` health-refresh branch; two `envelope::republishing_*` tests |
+| A5, P2-2 | demotion keyed on `(change_set, control)`; `one_draft_holding_one_control_on_two_apply_lanes_is_left_alone` |
+| A6 | every `AdmissionRefusal` names its offender; asserted in the envelope and lane-value tests |
+| A7 | every test document originates from a canonical #323 fixture |
+| D2 | `a_declared_last_actor_takeover_policy_does_not_change_publication_time_repair` |
+| D4 | `apply_demotions` writes only `entry.validity`; `repair_changes_validity_and_nothing_else` |
+| D5 | `IllegalOutcomeHistory` names operation and transition pair; `tracing::warn!` on refusal |
+| D6 | `poll_loop::a_sequence_of_polls_always_serves_exactly_one_published_document` |
+
+D1, D3, D7 are records rather than code and are discharged in this file and ADR 003.
+
+**The probe earned its keep immediately.** `gate_scanner_detects_a_gate_it_must_not_miss`
+failed on first run: `is_server_gate` compared against the spaced spelling only, so
+`#[cfg(feature="server")]` read as absent — the same whitespace blind spot `1577948` fixed
+in the sibling lint, caught here before it shipped rather than by a later review.
+
+**Drift check:** none. `tests/fixtures/api_routes.txt` byte-identical to `v3`; zero `.route(`
+lines added or removed in `src/main.rs`; `src/api/` and `src/bus/` untouched; no label on
+PR #363.
+
+**Verification gap:** `dx` is not installed here, so the WASM/fullstack build is proved only
+by CI's `build-wasm` job. `lint_producers_module_is_server_gated` is the host-runnable proxy
+and is the reason the module is gated at all.
