@@ -4190,3 +4190,50 @@ async fn an_unsolicited_document_ahead_of_the_reply_in_one_read_does_not_block_f
     );
     h.stop();
 }
+
+/// The skip ceiling must actually trip.
+///
+/// The inner drain loop iterates once per buffered document without touching the socket, so the
+/// per-command deadline — which only gates socket reads — cannot bound it. `MAX_UNSOLICITED_BACKLOG`
+/// is the only thing that does, which makes it load-bearing in a way it was not when every skip cost
+/// a read. A burst larger than the ceiling must therefore end in a reported error rather than a spin.
+///
+/// The existing burst expectation uses twelve frames, comfortably under the ceiling, so it proves the
+/// skipping works and says nothing about the bound.
+///
+/// **Label: client-conformance.**
+#[tokio::test]
+async fn a_burst_larger_than_the_skip_ceiling_is_reported_rather_than_drained_forever() {
+    // Comfortably past the 256 ceiling, delivered ahead of the reply in one write so the whole burst
+    // lands in the buffer and the drain loop has to deal with all of it without reading again.
+    let burst = vec![PUSH_STATUS_FRAME; 400].join("\n");
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            coalesce_leading_for_element: Some(("State".to_string(), burst)),
+            ..WirePolicy::default()
+        },
+        HqpTimeouts {
+            response: Duration::from_secs(4),
+            max_attempts: 1,
+            ..fast_timeouts()
+        },
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    let err = h
+        .adapter
+        .get_state()
+        .await
+        .expect_err("a burst past the ceiling must be reported");
+    let message = err.to_string();
+
+    assert!(
+        message.contains("Gave up after") && message.contains("unsolicited"),
+        "the failure must name the skip ceiling it hit. A timeout would mean the deadline stopped it, \
+         and the deadline only gates socket reads — it cannot bound a loop that never reads. Got: \
+         {message}"
+    );
+    h.stop();
+}
