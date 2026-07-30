@@ -1411,3 +1411,289 @@ merge, no ready-for-review, no auto-merge, no API route or payload change, no
 `api-change-approved`, no force push. **No live verification is claimed anywhere in this amendment**
 — the suite was not run in this turn, and no HQPlayer daemon was contacted. Every classification is
 sourced to a file and line read at `6b8e97f`.
+
+---
+
+## Amendment Stage 2 — execution record
+
+**Updated:** 2026-07-29 · **Planning HEAD:** `34dcfbb` · **Implementation HEAD:** `63e6bc0`
+**Codex Stage 1 amendment gate: PASS** (PR #337 comment 5125951929)
+
+Six bites, all landed. `cargo test` was run throughout; **no HQPlayer daemon was contacted and no
+tier-1 or tier-2 live run was performed** — the rig is offline and no mutating permission exists.
+
+### Binding resolutions carried in
+
+From the gate and the three issue comments (#322 5125948519, #341 5125948432, #347 5125915480):
+
+| Resolution | Where it landed |
+|---|---|
+| #322 owns the accumulated-response byte cap and oversized recovery | Bite 2 — `MAX_RESPONSE_BYTES` |
+| Keep the loaded-chain model in #322 | Bite 3 — `LoadedChain` on `DaemonState` |
+| Every new expectation labelled | All 20 carry `client-conformance`, `model-fidelity` or `regression-pin` in the doc comment |
+| Model unit tests allowed for fake capability; adapter-facing semantics stay in #347 | Bites 3–6 assert daemon-side facts; no #347 behaviour implemented |
+| Stale index must be an **in-range silent misselection** | Bite 4 — `filters_sdm.xml` extended 5 → 9 so PCM index 7 exists in SDM and names `poly-sinc-lp` |
+| Do **not** renumber live `GetFilters` enum IDs | No enum ID changed; live-lane question left on #341 |
+| Add the separately-numbered persistent `oversampling` domain | Bite 5 — `persistent_config.xml` gains `oversampling="38"` |
+| `active_mode` fixture/profile-driven | Bite 3 — two independent `ActiveModeReporting` policies |
+| Chain claims `derived-upstream` + `tier-2-only` | Fixture provenance and doc comments on every chain behaviour |
+| Retarget the numeric-fallback-dependent test | Bite 6 — now uses low-level `set_filter` |
+| Remove the unevidenced `SetMode` filter/shaper reset | Bite 3 |
+| Preserve UHC's wire/framing design; port no HQPTuner code | Held — `wire.rs` unchanged in shape; nothing ported |
+
+### Commit chain — RED before GREEN for every client-conformance bite
+
+| SHA | Kind | What |
+|---|---|---|
+| `6d96004` | **RED** (test-only) | A closed root wedges every poll when a child tag never terminates |
+| `38b706e` | GREEN | `framing::root_frame_closed` — narrow root recovery |
+| `c96d050` | **RED** (test-only) | An unbounded reply is bounded only by the clock |
+| `dd2cb46` | GREEN | `MAX_RESPONSE_BYTES` byte ceiling |
+| `97dcc59` | capability | Loaded-chain axis; policy-driven `active_mode`; unevidenced reset removed |
+| `333bae4` | fixture + capability | Stale-chain hazard made in-range and expressible |
+| `8dd2c0b` | fixture + expectation | Persistent lane's second numbering domain |
+| `e0315eb` | corrections + tail | `[source]` rate refusal, device modes, `playback` provenance, retarget |
+| `829256f` | style | `cargo fmt` |
+| `d4fec9b` | fix | Deferred-`SetMode` clamp hole; coalescing stated-limit test; cap peak documented |
+| `e92f46d` | test | Assert the source-pin failure *mechanism*, not just that it failed |
+| `63e6bc0` | refactor | Share one tokeniser; process narration out of permanent comments |
+
+`git diff HEAD^..HEAD -- src` is **empty** for `6d96004`, `c96d050`, `97dcc59`, `333bae4`, `8dd2c0b`
+and `e0315eb`. **No production stub was ever added to manufacture a red** — the two REDs are
+test-only and failed for behavioural reasons, and every model-fidelity expectation was written
+alongside its capability and is labelled as not being a client red.
+
+### Bite 1 — root recovery. RED observed, then GREEN
+
+The plan called this the highest-value client-conformance item. **Its premise was wrong, and the
+correction is the finding.** A hostile *attribute value* — unescaped `<`, `"`, `>`, bare `&` inside
+`<metadata …/>` — is already tolerated: UHC never parses the children and scopes attribute reads to
+the root's opening tag, so it is immune where HQPTuner needed `_recover_root` (which XML-parses whole
+documents). That is pinned as a **regression-pin**, not claimed as a fix.
+
+What *does* reach the client is a **structurally** malformed child. Probing found the real boundary:
+
+| Hostile shape | `classify` before |
+|---|---|
+| unescaped `<`, `"`, `>`, bare `&` in a child attribute | `Complete` — already fine |
+| **child tag never terminates** | **`Incomplete`** → waits out the deadline |
+| **stray `<` among the children** | **`Incomplete`** → waits out the deadline |
+| nested unclosed child | `Malformed` — a hard error, does not wedge |
+
+Observed RED at `6d96004`:
+
+```text
+test the_framer_recovers_a_closed_root_whose_child_tag_never_terminates ... FAILED
+test a_status_whose_child_tag_never_terminates_still_reports_the_root_fields ... FAILED
+  assertion `left == right` failed: a closed root frame is a complete document even
+    when a child tag never terminates
+  a Status whose root frame is closed must be readable …: Response timeout
+test result: FAILED. 139 passed; 2 failed; 0 ignored
+```
+
+`Response timeout` is the signature: the reply was complete on the wire and the client waited out its
+deadline anyway. The mechanism turned out to be subtler than predicted — an unterminated child makes
+quick_xml swallow the following `</Status>` into the child's own attribute soup, so the parse reaches
+`Eof` with children still open and the closing tag sits in the buffer never having been seen as an end
+event. Reaching that state with the buffer ending in `</root>` *is* the diagnosis.
+
+`framing::root_frame_closed` recovers it, narrowly: keyed on the root's **own** name (so
+`<State …></Status>` stays a mismatched-nesting rejection), requiring the closing tag to be the
+buffer's **last** token (so a truncated document stays incomplete and a `</Status>` inside an
+attribute value cannot pass for a frame end), and consulted only when the parse could not complete on
+its own (so every well-formed document takes the unchanged path).
+
+### Bite 2 — byte cap. RED observed, then GREEN
+
+Observed RED at `c96d050`, with a deliberately generous 4 s budget so a timeout would be the *wrong*
+answer:
+
+```text
+test an_unbounded_reply_is_rejected_by_an_explicit_byte_cap_and_the_next_command_still_works ... FAILED
+  the failure must name the byte ceiling it hit … a bare timeout here would mean the buffer
+  is still unbounded and only the clock stopped it. Got: Response timeout
+test result: FAILED. 0 passed; 1 failed; finished in 4.03s
+```
+
+`MAX_RESPONSE_BYTES = 4 MiB` is the third of three bounds and the only one that bounds **memory**;
+the deadline bounds time and `MAX_UNSOLICITED_BACKLOG` bounds frame count. Recovery needed no new
+code — `send_command`'s wrapper already marks the connection disconnected on any inner failure — but
+the expectation asserts it rather than assuming it, since a cap that wedges the connection is not a
+fix.
+
+**One cost shape recorded rather than fixed:** `framing::classify` re-parses the *whole* accumulated
+buffer after every line, so accumulation is O(bytes × lines). That is why the fake's oversized frames
+are 256 KiB rather than 1 KiB — with small frames the client cannot reach a multi-megabyte buffer
+inside any sane deadline and the test would measure parser throughput instead of the ceiling.
+Worst-case CPU is now bounded by the cap. #347 inherits the primitive and should know this.
+
+### Re-estimate after bite 2, as the amendment required
+
+| Bite | Estimated | Actual | Ratio |
+|---|---|---|---|
+| 1 | 120–160 | **221** | 1.4–1.8× |
+| 2 | 80–110 | **164** | 1.5–2.1× |
+| Cumulative | 200–270 | **385** | ~1.45× |
+
+Extrapolated total at that rate: **≈1,240–1,545** against the plan's 790–1,070. The overrun driver was
+consistent and is not scope creep: doc-comment density, and the label/provenance discipline the
+amendment itself mandated. Judgement recorded at the checkpoint: continue, because bites 3–5 are
+load-bearing and bite 6 is the trimmable tail. **Final actual: 1,257 insertions across 23 files** —
+just under the extrapolation's low end, and the tail did not need trimming. The extra 61 lines over the
+first count are the review, dissent and superego adjustments below.
+
+### Bites 3–6
+
+**Bite 3 — the loaded-chain axis.** `Inner::sdm()` was `mode_index == 2`; it now reads
+`DaemonState::loaded_chain`. `source_loads_chain()` moves the chain with the configured mode
+untouched. `State.active_mode` and `Status.active_mode` are driven by **two separate**
+`ActiveModeReporting` policies — one shared field would re-impose the agreement this removes.
+Defaults reproduce today's behaviour exactly, and each variant records whether it is verified
+(`Status` echoing `[source]`: hqplayerd 6.0.4, 2026-07-29, playback active) or unverified (either
+field resolving). The unevidenced `SetMode` reset of filter/shaper to index 0 is **gone**; upstream
+says `SetMode` clears the rate pin and reloads the chain and says nothing about selections returning
+to the first entry. `clamp_to_loaded_chain()` replaces it, stated as a self-consistency invariant — a
+daemon never reports an index outside its own list — and explicitly *not* a claim that selections
+survive a chain change.
+
+**Bite 4 — the stale-chain hazard.** `filters_sdm.xml` extended 5 → 9 entries reusing names and enum
+IDs verbatim from `filters_pcm.xml`, so PCM index 7 exists in SDM and names `poly-sinc-lp`. Observed
+through the real client while writing it:
+
+```text
+requested name 'poly-sinc-gauss-long'; cached PCM index 7; sent value=Some("7");
+client outcome ok=true; daemon now reports active_filter="poly-sinc-lp"
+```
+
+The client reports **success** for a filter it did not select. The realistic trigger is ordinary:
+`get_pipeline_status()` populates the list cache via `refresh_lists()`, which is the path both
+`GET /hqplayer/pipeline` and the MCP status tool already take; then the source moves the chain, the
+configured mode never changes, and nothing prompts a re-read. The fix is a loaded-chain observer —
+**#347's** first acceptance criterion — so the committed test asserts only the daemon-side outcome and
+deliberately does not assert what the client returned. Asserting success would encode a defect as
+expected; asserting failure would fail until #347 lands.
+
+Worth recording: a first probe of this scenario sent the **correct** index, because `get_filters()`
+does not populate the cache at all — only `refresh_lists()` does. Without first taking a
+cache-populating path the hazard does not reproduce. A fixture built from prose would have got that
+wrong.
+
+**Bite 5 — the persistent lane's second numbering domain.** `persistent_config.xml` gains
+`oversampling="38"`, the SDM chain's separate stored-ID domain for the same semantic filter that
+`filter="40"` names in PCM. Its provenance states that the upstream evidence names the persistent
+*field names* and is not a `GetFilters` capture, that the live-lane question is open on #341, and that
+this corpus therefore still reports `value="40"` in both live chain lists rather than answering it.
+
+**Bite 6 — the tail.** Mode-conditional `Faults::source_refuses_rate_pin` (distinct from the
+unconditional `accept_but_ignore`, which cannot express "deaf *in this mode*"), covering both the
+nonzero pin and the Auto case #347 comment 5125915480 asked for. The nonzero case errors today
+because readback compares the requested index against 0 — the test says plainly that this is the
+floor holding by arithmetic rather than by understanding. The Auto case compares 0 to 0 and reports
+success, so it asserts daemon-side facts only. New device profile
+`hqpd-6.0.4-pcm-only-dac` omits SDM with surviving indices 0 and 1 intact. `Provenance` gains a
+**required** `playback` field, backfilled across all 18 fixtures; most say `unknown` because they are
+derived from a protocol reference rather than captured from a session, and **that most say `unknown`
+is the finding**. Bare `&` pinned as a regression-pin.
+
+### Stage-2 amendment `/review` — verdict ADJUST, adjustments applied
+
+Three holes, all found by reviewing the six bites rather than by the suite, all closed in `d4fec9b`:
+
+1. **A deferred `SetMode` escaped the chain invariant.** `apply()` defers a delayed change onto
+   `faults.pending`, so the setter arm's clamp ran against *unchanged* state and the real mode change
+   landed later in `tick_pending()` with no clamp at all — leaving an index the newly loaded chain's
+   enumeration could not resolve. Unexercised today, which is why it was worth finding rather than
+   waiting for.
+2. **Root recovery does not survive coalescing.** Probed: `hostile alone → Complete`,
+   `hostile + coalesced push → Incomplete`. Now an executable **stated-limit** test naming what would
+   fix it (find the *first* matching close tag instead of requiring it last) and why that trade
+   deserves a deliberate decision, rather than prose in this file.
+3. **The cap's true peak is 4 MiB plus one line**, because it is checked after appending a read.
+   Deliberate — a mid-line check would need the reader to hand back a partial line — and now stated,
+   because "4 MiB" otherwise reads as a bound on the allocation rather than on the accumulation.
+
+### Stage-2 amendment `/dissent` — verdict PROCEED, with the value framing corrected
+
+**The honest accounting, which is the dissent's main product:** of the new expectations, **two** went
+red against unmodified production code, both in framing (bites 1–2, 385 lines). Bites 3–6 are **811
+lines and zero client defects**. The review predicted three biters; bite 4's stale index turned out to
+be #347's and became model-fidelity. So the amendment's product is overwhelmingly a **capability whose
+consumer does not exist yet**, and its justification now rests on #347 actually using the axis rather
+than writing its own fixtures. That is the original Stage-1 pre-mortem 2, and it should be checked once
+rather than assumed twice.
+
+Applied: assert the source-pin failure *mechanism* rather than bare `is_err()` (`e92f46d`) — the old
+assertion was satisfied by any error at all, so it passed while saying nothing about why.
+
+Recorded, not resolved:
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | **Four labels where the gate specified two.** `regression-pin` and `stated-limit` were added mid-flight. The refinement is defensible — a test that passed before the amendment neither proves fake capability nor can fail for a new reason — but it is a deviation from a binding instruction | **Flagged for the gate to accept or reject.** Not treated as settled |
+| 2 | **`clamp_to_loaded_chain` is unevidenced behaviour replacing unevidenced behaviour.** A real daemon might keep the filter by name and remap the index, reset to a device default, or refuse the mode change. Clamping is a fourth behaviour nobody observed; "invariant, not a claim" is a modelling argument | Belongs on **#341** as a one-capture tier-2 question: set a filter, switch mode, read `State.filter` |
+| 3 | **The fake now has more switches than evidence, and no coherence check.** Nothing stops a test configuring a daemon that has never existed — `ResolvesLoadedChain` on both fields, or `source_refuses_rate_pin` with a configured PCM mode. Defaults reproduce the status quo and every variant names its provenance, but the space is combinatorial and unguarded | Recorded. A conformance verdict about an impossible daemon is worse than none |
+| 4 | The shipped recovery reduces but does not close the poll wedge (finding 2 above) | #347 inherits the framing primitive and should decide whether to widen |
+
+### Stage-2 amendment `sg review` (superego 0.9.4) disposition
+
+Run as `sg review pr` against `v3`, so it assessed the **whole branch**, not only the amendment. Seven
+findings; the two that concern this amendment's own additions were **fixed** rather than
+dispositioned:
+
+| # | Finding | Disposition |
+|---|---|---|
+| 3 | Agent-review narration inside permanent comments | **Fixed** in `63e6bc0`. Four doc-comment blocks named the pass that produced them; rewritten as plain rationale. Fixture provenance, capture dates and issue references were deliberately kept — provenance is a #322 acceptance criterion, and the issue references are the ownership boundary that stops #347's semantics reading as #322's |
+| 5 | Three parsing implementations that must stay in sync | **Partly fixed** in `63e6bc0`: `root_frame_closed` had a hand-rolled root-name scan and now uses `framing::root_element`, so no fourth tokeniser was added. The pre-existing production/`model.rs`/`raw.rs` triple stands and is a real standing risk |
+| 4 | Should the amendment have been its own issue? | **Already decided.** Issue #322 comment 5125948519: *"No split: keep the loaded-chain model in #322."* Raised by the Stage-1 amendment as maintainer decision 2 and answered before Stage 2 began |
+| 7 | Why not lean on HQPTuner more directly? | **Already done for the state model** — the loaded chain, command-keyed deafness and mode-conditional refusal are its design, adapted. A literal code port stays blocked on #348: no `THIRD-PARTY-NOTICES` exists, and its fake's framing (4096-byte read split at `?>`) satisfies none of #322's criteria |
+| 1 | ~8,000 lines of harness against a small production diff | Acknowledged, and it is the whole branch rather than this amendment, whose share is 1,257 lines. Already a standing maintainer question in the PR body ("Is this size acceptable?") |
+| 2 | The `.oh` file has become a process novel | Acknowledged, and it restates an open documentation-policy question the PR body already flags — superego previously suggested the ADR be authoritative and this file a frozen transcript. This stage's instruction required the artifact carry implementation, RED/GREEN, provenance, scope and verification evidence, so it could not be thinned here. **Maintainer decision** |
+| 6 | "verified" density may over-claim | Partly addressed: the amendment made `playback` a required field (mostly `unknown`) and added `tier` markers, which weakens rather than strengthens the verified language. A single corpus-directory legend is a good suggestion and is recorded for the maintainer |
+
+### Verification at `63e6bc0`
+
+| Command | Result |
+|---|---|
+| `cargo test --test hqplayer_conformance` | **156 passed; 0 failed; 0 ignored** (was 138 at `6b8e97f`) |
+| lib unit tests | 84 passed |
+| `--test adapter_integration` / `--test zones_sha_integration` | 42 / 20 — both `MockHqpServer` facade consumers intact |
+| `--test protocol_schema` / `--test api_contract` | 41 / 2 — no route or payload drift |
+| `cargo fmt --check` | clean |
+| `cargo clippy -- -D warnings` | clean, 0 findings (CI's invocation) |
+| `git diff --check origin/v3...HEAD` | clean |
+| `cargo test --no-fail-fast` | **465 passed; 2 failed; 12 ignored** |
+| live tier 1 / tier 2 | **not run** — daemon offline, no mutating permission |
+
+**The two failures are environmental and pre-existing.**
+`client_harness::shared_endpoints::get_hqp_discover` and
+`protocol_integration::api_endpoints::hqp_discover_returns_json` both fail on `/hqp/discover`
+returning 500. Attributed rather than assumed: a direct probe in this sandbox gives
+`multicast send FAILED: [Errno 65] No route to host` for `239.192.0.199`, and
+`git diff --name-only 34dcfbb..HEAD -- tests/client_harness.rs tests/protocol_integration.rs` returns
+**zero files** — neither test was touched by this amendment. Both were previously verified to
+reproduce identically on an untouched `v3` worktree (`0a1b02c`). The
+`error_handling::lms_fails_gracefully_when_unconfigured` flake did not fire in this run.
+
+**#339 remains unmerged**, so PR CI may still show the known Rust 1.97 base lint failure on `v3`.
+That is a base dependency, not a defect in this work, and it is not hidden.
+
+### Scope held
+
+One `src` file changed — `src/adapters/hqplayer.rs`, +92 lines, entirely inside the `framing` path and
+`send_command_inner`. `git diff --name-only 34dcfbb..HEAD -- src/api src/app src/main.rs src/mcp
+tests/fixtures/api_routes.txt` returns **zero files**. No route, request schema, response schema or
+payload changed; `api-change-approved` was not applied.
+
+**No #347 change was implemented.** Not source-rate suppression, not no-op `SetMode` skipping, not
+loaded-chain cache refresh, not sibling-safe filter writes, not numeric-fallback removal, not semantic
+alias matching, not volume readback. Every one of those remains a #347 row, and the amendment's
+classification table above still describes them accurately.
+
+### ADR 003
+
+**Not amended.** The capability boundary that landed is the one ADR 003 already describes: three
+layers, corpus/wire/model, asserted through the adapter's public surface. The loaded-chain axis is a
+field on the model layer and the byte cap is a bound in the framing path — neither changes the
+decision the ADR records, and the capability-versus-expectation labelling is a suite convention rather
+than an architectural one. Amending it would add words without changing a decision. Recorded here so
+the Stage 2 gate can see the judgement rather than infer an omission.
