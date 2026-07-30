@@ -1150,3 +1150,51 @@ this PR's to fix.
 **Eighteen defects. This one is the first found in the *verification* rather than in the artefact or its
 checks** — a reminder that a verification table is itself a claim, and that "clippy clean" without naming
 the invocation is exactly the kind of wording this ledger exists to make precise.
+
+### Deferred evidence: a described command is not a sent one
+
+**CodeRabbit at `c2cf67b` (P2), then extended by an independent audit.** `test_exercises_command` recursed
+into **deferred contexts**, so a command that was only *described* for later execution counted as sent:
+
+```text
+let _never_called = || h.adapter.set_mode("PCM");        // credited SetMode
+let _never_called = || send("<SetMode value=\"1\"/>");    // credited SetMode
+let _never_polled = async { h.adapter.set_mode("PCM").await; };   // credited SetMode
+let _never_polled = async { send("<SetMode value=\"1\"/>"); };     // credited SetMode
+```
+
+Four false passes, two expression kinds × two collectors. **All four were reproduced RED before the fix**,
+and each is now a control. `visit_expr_closure` and `visit_expr_async` stop the walk; a closure body and an
+unawaited `async` block are descriptions, not executions.
+
+**Each override is proven load-bearing separately.** Reverting `visit_expr_closure` alone fails the control
+set; reverting `visit_expr_async` alone fails it too. Neither is decorative.
+
+**What is deliberately unaffected, with a control:** an `async fn` test body is a `syn::ItemFn` block, not an
+`ExprAsync`, so a direct call inside one is still evidence — and that is the shape of **every** cited test in
+the corpus. `#[tokio::test] async fn t() { h.adapter.set_mode("PCM").await; }` is pinned as a positive case,
+because a fix that stopped crediting real tests would be worse than the defect.
+
+**Residual, stated precisely rather than left as "unhandled":** an *invoked* closure —
+`(|| h.adapter.set_mode("x"))()` — and an inline awaited block are now false **negatives**. That is the
+conservative direction, no control demonstrates a need to widen, and widening on speculation is how the
+prefix-match defect got in.
+
+### The workspace suite failed once, and the honest reading is a rate
+
+One run during this pass: **exit 101, 3 failures**, all in `tests/adapter_integration.rs` —
+`error_handling::lms_fails_gracefully_when_unconfigured`,
+`lms_integration::control_fails_when_disconnected`,
+`lms_integration::volume_control_fails_when_disconnected`. That file is **not in this PR's diff** and is
+byte-identical to `origin/v3`; the family and its mechanism (process-global `UHC_CONFIG_DIR` under
+cross-binary concurrency) are ADR 003's documented flake.
+
+**One thing sharpens the record rather than excusing it:** the *isolated* `adapter_integration` binary also
+failed that time, **2 of 52** — and earlier passes in this session reported the isolated binary as green.
+So the earlier "isolated is green either way" reading was too favourable, exactly as ADR 003 warns about
+running tallies. Three subsequent workspace runs at this tree were **exit 0, 589 passed, 0 failed, 12
+ignored**. A runner establishes a rate; it does not return a verdict.
+
+**Nineteen defects.** Eleven were a text scan or loose match standing in for an exact one; five were wording
+outrunning proof; one a stale status; one in the verification set; and this one — deferred evidence — is the
+first where the *shape of the AST walk* was the defect rather than the comparison.

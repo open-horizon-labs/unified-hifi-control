@@ -1275,6 +1275,12 @@ fn commands_in(text: &str) -> Vec<String> {
 /// * A bare command name in a string literal — `accept_but_ignore("SetRate")` arms the fake, it does not
 ///   send anything. Requiring the `<` makes an arrangement distinguishable from an invocation.
 /// * Anything in a comment or doc comment — a plan is not a proof.
+/// * Anything inside a **deferred context** — a closure body or an unawaited `async { … }` block. Both are
+///   *described*, not executed, and `visit_expr_closure`/`visit_expr_async` stop the walk at each. An
+///   `async fn` test body is unaffected: it is an `ItemFn` block, not an `ExprAsync`, which is the shape
+///   every cited test in the corpus has, and a control pins that. Residual, stated: an *invoked* closure or
+///   an awaited block written inline is now a false **negative** — the conservative direction, and no
+///   control demonstrates a need to widen.
 /// * Anything in a **fixture**, at all. See [`FIXTURES_NEVER_EXERCISE`].
 fn test_exercises_command(file: &syn::File, test_name: &str, cmd: &str) -> Option<bool> {
     use syn::visit::Visit;
@@ -1318,6 +1324,21 @@ fn test_exercises_command(file: &syn::File, test_name: &str, cmd: &str) -> Optio
             }
             syn::visit::visit_lit_str(self, l);
         }
+        /// A closure body is **described**, not executed. Not descending into it is the whole fix for the
+        /// deferred-evidence false pass: `let _never_called = || h.adapter.set_mode("PCM");` credited
+        /// `SetMode`, and so did a raw `<SetMode` literal written inside such a closure — two shapes that
+        /// fail through different collectors and are both refused now.
+        ///
+        /// Deliberately narrow. An *invoked* closure — `(|| h.adapter.set_mode("x"))()` — is now a false
+        /// **negative**; that is the conservative direction, and no control demonstrates a need to widen.
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        /// An unawaited `async { … }` block is the same deferred-evidence class reached through a different
+        /// expression: `let _never_polled = async { h.adapter.set_mode("PCM").await; };` described a command
+        /// and never ran it, and a raw `<SetMode` literal inside one behaved the same way. Both are refused.
+        ///
+        /// This does **not** affect an `async fn` test body, which is an [`syn::ItemFn`] block rather than an
+        /// `ExprAsync` — every cited test in the corpus is that shape, and a control pins it.
+        fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
     }
 
     let mut f = Found {
@@ -1459,6 +1480,51 @@ fn a_command_is_exercised_only_by_a_call_or_a_raw_wire_literal() {
         r#"#[test] fn t() { h.adapter.set_filter_nx("x"); }"#,
         "t",
         "SetFilter"
+    ));
+
+    // Refused: evidence inside an **uninvoked closure**. The visitor recursed into closure bodies, so a
+    // command that is only *described* for later execution was credited as sent. Both shapes are here
+    // because they fail through different collectors — the method call and the raw literal.
+    assert!(!ex(
+        r#"#[test] fn t() { let _never_called = || h.adapter.set_mode("PCM"); }"#,
+        "t",
+        "SetMode"
+    ));
+    assert!(!ex(
+        r##"#[test] fn t() { let _never_called = || send("<SetMode value=\"1\"/>"); }"##,
+        "t",
+        "SetMode"
+    ));
+    // And the positive counterparts, so the fix cannot be "stop crediting anything".
+    assert!(ex(
+        r#"#[test] fn t() { h.adapter.set_mode("PCM").await.expect("set"); }"#,
+        "t",
+        "SetMode"
+    ));
+    assert!(ex(
+        r##"#[test] fn t() { send("<SetMode value=\"1\"/>"); }"##,
+        "t",
+        "SetMode"
+    ));
+
+    // Refused: evidence inside an **unawaited `async` block** — the same deferred-evidence class as the
+    // closure, reached through a different expression. Both collectors again.
+    assert!(!ex(
+        r#"#[test] fn t() { let _never_polled = async { h.adapter.set_mode("PCM").await; }; }"#,
+        "t",
+        "SetMode"
+    ));
+    assert!(!ex(
+        r##"#[test] fn t() { let _never_polled = async { send("<SetMode value=\"1\"/>"); }; }"##,
+        "t",
+        "SetMode"
+    ));
+    // And the case this must not break: an `async fn` test body is an `ItemFn` block, not an `ExprAsync`,
+    // so a direct call inside one is still evidence. Every real cited test in the corpus is this shape.
+    assert!(ex(
+        r#"#[tokio::test] async fn t() { h.adapter.set_mode("PCM").await.expect("set"); }"#,
+        "t",
+        "SetMode"
     ));
 
     // Refused: reading state is not sending a command.
