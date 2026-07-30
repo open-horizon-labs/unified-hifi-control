@@ -197,6 +197,15 @@ semantic_enum! {
         Superseded => "superseded",
         /// Retention expired before this could be applied.
         Expired => "expired",
+        /// The control this refers to is no longer described by the document.
+        ///
+        /// Reachable whenever a control-plane advance removes a control an open draft
+        /// still targets. Deliberately distinct from `draft_invalid` and from
+        /// `EntryValidity::RequiresProducerValidation`: a user must be told "this control
+        /// no longer exists" rather than "this needs validating", because no amount of
+        /// revalidation will bring it back. Applied at publication by #324's admission
+        /// gate, from [`super::IntentIncoherence::UnknownControl`].
+        ControlRemoved => "control_removed",
     }
 }
 

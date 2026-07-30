@@ -7,7 +7,7 @@
 mod server {
     use unified_hifi_control::{
         adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
-        mdns,
+        mdns, producers,
     };
 
     // Import Startable trait for adapter lifecycle methods
@@ -316,6 +316,26 @@ mod server {
             aggregator_for_spawn.run().await;
         });
         tracing::info!("ZoneAggregator started");
+
+        // Initialize the adaptive producer publication path (#324).
+        //
+        // The internal bus is deliberately separate from `bus`: `GET /events` serializes
+        // every BusEvent verbatim, so carrying producer documents there would change a
+        // public endpoint's payload and publish the v1 contract outside this repository.
+        // `adaptive_bus` is handed to producing adapters by #325; nothing publishes on it
+        // yet, and no surface reads the aggregator yet (#326). It is wired now so that
+        // ownership of producer state lives in one place from the first producer onward,
+        // rather than being retrofitted around one.
+        let adaptive_bus = producers::create_adaptive_bus();
+        let producer_aggregator = Arc::new(producers::ProducerAggregator::new(
+            bus.clone(),
+            adaptive_bus.clone(),
+        ));
+        let producers_for_spawn = producer_aggregator.clone();
+        tokio::spawn(async move {
+            producers_for_spawn.run().await;
+        });
+        tracing::info!("ProducerAggregator started");
 
         // Clone Roon adapter for shutdown access (cheap - just Arc clones)
         let roon_for_shutdown = roon.clone();

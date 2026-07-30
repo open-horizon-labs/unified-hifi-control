@@ -59,3 +59,7 @@ pub mod knobs;
 pub mod mcp;
 #[cfg(feature = "server")]
 pub mod mdns;
+// Adaptive producer publication: internal bus + aggregator-owned state (#324).
+// Server-only: it necessarily touches both `crate::bus` and `crate::adaptive`.
+#[cfg(feature = "server")]
+pub mod producers;
