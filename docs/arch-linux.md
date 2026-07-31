@@ -43,7 +43,9 @@ Open your browser to: **http://localhost:8088**
 
 ## Configuration
 
-Configuration files are stored in `/etc/unified-hifi-control/`.
+Settings, adapter configuration, and pairing state are stored in
+`/var/lib/unified-hifi-control/`. systemd creates this directory and grants the
+service's dynamic user access to it.
 
 ### Environment Variables
 
@@ -52,8 +54,7 @@ The systemd service supports these environment variables (edit the service file 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8088` | HTTP server port |
-| `CONFIG_DIR` | `/etc/unified-hifi-control` | Configuration directory |
-| `DATA_DIR` | `/var/lib/unified-hifi-control` | State/data directory |
+| `CONFIG_DIR` | `/var/lib/unified-hifi-control` | Settings, adapter configuration, and persistent state directory |
 | `RUST_LOG` | `info` | Log level (trace, debug, info, warn, error) |
 
 To customize, create a drop-in:
@@ -70,15 +71,34 @@ Environment=PORT=9000
 Environment=RUST_LOG=debug
 ```
 
+### Upgrading from packages that used `/etc`
+
+Older package versions pointed `CONFIG_DIR` at `/etc/unified-hifi-control/`.
+The service could read administrator-created files there, but its dynamic user
+could not update them. If that directory contains configuration you still use,
+move it into the systemd-managed state directory before restarting:
+
+```bash
+# Start once so systemd provisions the state directory with the dynamic user's ownership.
+sudo systemctl start unified-hifi-control
+sudo systemctl stop unified-hifi-control
+sudo cp -a /etc/unified-hifi-control/. /var/lib/unified-hifi-control/
+sudo chown -R -H --reference=/var/lib/unified-hifi-control /var/lib/unified-hifi-control
+sudo systemctl start unified-hifi-control
+```
+
+After confirming the migrated settings work, the legacy `/etc` directory can
+be removed. Existing drop-ins that override `CONFIG_DIR` remain compatible.
+
 ## File Locations
 
 | Path | Description |
 |------|-------------|
 | `/usr/bin/unified-hifi-control` | Binary |
-| `/usr/share/unified-hifi-control/public/` | Web assets |
-| `/etc/unified-hifi-control/` | Configuration |
-| `/var/lib/unified-hifi-control/` | Runtime state, Roon tokens |
+| `/var/lib/unified-hifi-control/` | Settings, adapter configuration, and persistent state |
 | `/usr/lib/systemd/system/unified-hifi-control.service` | Systemd service |
+
+Web assets are embedded in the binary; no separate web asset directory is installed.
 
 ## Uninstallation
 
@@ -90,10 +110,9 @@ yay -Rns unified-hifi-control-bin
 sudo pacman -Rns unified-hifi-control-bin
 ```
 
-Configuration and state directories are preserved. Remove manually if no longer needed:
+Configuration and state are preserved. Remove them manually if no longer needed:
 
 ```bash
-sudo rm -rf /etc/unified-hifi-control
 sudo rm -rf /var/lib/unified-hifi-control
 ```
 
@@ -104,15 +123,13 @@ If you prefer to build from source instead of using the binary package:
 ### Prerequisites
 
 ```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# Install build tools and Rust
+sudo pacman -S --needed base-devel rustup
+rustup default stable
 rustup target add wasm32-unknown-unknown
 
 # Install Dioxus CLI
-cargo install dioxus-cli
-
-# Install Node.js (for Tailwind CSS)
-sudo pacman -S nodejs npm
+cargo install dioxus-cli@0.7.10 --locked
 ```
 
 ### Build
@@ -125,14 +142,16 @@ git checkout v3
 # Build CSS
 make css
 
-# Build web assets
+# Build the fullstack server and WASM hydration bundle
 dx build --release --platform web --features web
-
-# Build server binary
-cargo build --release
 ```
 
-The binary will be at `target/release/unified-hifi-control`.
+The runnable server and its hydration assets will be under
+`target/dx/unified-hifi-control/release/web/`. Start it with:
+
+```bash
+./target/dx/unified-hifi-control/release/web/server
+```
 
 ## RoPieee / AudioLinux Integration
 
@@ -140,6 +159,6 @@ For RoPieee and AudioLinux developers: this package follows standard Arch packag
 
 Key considerations:
 - Binary is statically linked (musl) with no runtime dependencies
-- Web assets are required at `/usr/share/unified-hifi-control/public/` (symlinked to state dir)
+- Web assets are embedded in the binary
 - Systemd service uses `DynamicUser=yes` for security
-- Configuration persists in `/etc/unified-hifi-control/`
+- Configuration and state persist in `/var/lib/unified-hifi-control/`
