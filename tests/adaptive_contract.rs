@@ -224,6 +224,12 @@ mod fixtures {
         "hqplayer_degraded_lanes",
         "staged_intent_multi_surface",
         "command_outcomes",
+        // Added by #324: a draft whose base predates a control-plane advance that removed
+        // the control it targets. This is the *post-repair* state a consumer actually
+        // sees, which is why the entry is `draft_invalid` rather than `valid` — the
+        // publication gate demotes it, and the reason must stay distinguishable from
+        // "needs producer validation".
+        "control_removed_after_advance",
     ];
 
     pub fn raw(name: &str) -> serde_json::Value {
@@ -1437,7 +1443,14 @@ mod outcomes {
 
     #[test]
     fn a_new_operation_cannot_erase_the_audit_trail() {
-        let mut record = operation("op-provisional-9001");
+        // Retargeted from `op-provisional-9001` by #324. That operation's history recorded
+        // `disconnected -> indeterminate`, which `CommandOutcome::may_transition_to`
+        // forbids — nothing may regress into an unresolved state — and which contradicted
+        // its own `write_attempt: acknowledged_provisional`, since `disconnected` means the
+        // transport was down *before* the write was attempted. Nothing may legally
+        // transition *into* `indeterminate`, so that operation's history is correctly
+        // empty; `op-divergent-9015` is the worked example of a resolved indeterminate.
+        let mut record = operation("op-divergent-9015");
         let original = record.history.clone();
         assert!(!original.is_empty());
         record
@@ -1458,7 +1471,7 @@ mod outcomes {
         assert!(record
             .history
             .iter()
-            .any(|transition| transition.to == CommandOutcome::Indeterminate));
+            .any(|transition| transition.from == CommandOutcome::Indeterminate));
     }
 
     #[test]

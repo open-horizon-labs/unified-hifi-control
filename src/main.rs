@@ -7,7 +7,7 @@
 mod server {
     use unified_hifi_control::{
         adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
-        mdns,
+        mdns, producers,
     };
 
     // Import Startable trait for adapter lifecycle methods
@@ -306,6 +306,27 @@ mod server {
             upnp.clone(),
         ];
 
+        // Fail before starting adapters or the adaptive actor if the public socket cannot be
+        // acquired. After this point every fallible server exit goes through explicit teardown.
+        let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+
+        // SSE closes as soon as graceful HTTP shutdown begins. Adaptive ingress remains open
+        // until producing adapters have stopped, then drains under its own non-lossy token.
+        let shutdown_token = CancellationToken::new();
+        let producer_shutdown_token = CancellationToken::new();
+
+        // Construct the bounded command actor before any producer can publish. The handle is
+        // retained for the process lifetime and will be handed to producing adapters by #325;
+        // the read-only view is consumed by #326. No adaptive payload enters the public
+        // BusEvent/SSE contract.
+        let (_adaptive_handle, producer_actor, _adaptive_view) =
+            producers::AdaptiveRuntime::build(producer_shutdown_token.clone(), 1024);
+        let producer_actor_task = tokio::spawn(async move {
+            producer_actor.run().await;
+        });
+        tracing::info!("ProducerActor started");
+
         // Single loop to start all enabled adapters
         coord.start_all_enabled(&startable_adapters).await;
 
@@ -319,9 +340,6 @@ mod server {
 
         // Clone Roon adapter for shutdown access (cheap - just Arc clones)
         let roon_for_shutdown = roon.clone();
-
-        // Create shutdown token for graceful SSE termination (fixes #73)
-        let shutdown_token = CancellationToken::new();
 
         // Build application state (clone Arcs so we can access adapters for shutdown)
         let state = api::AppState::new(
@@ -557,7 +575,6 @@ mod server {
         };
 
         // Start server with graceful shutdown
-        let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
         tracing::info!("Listening on http://{}", addr);
 
         // Advertise via mDNS for knob discovery
@@ -593,8 +610,6 @@ mod server {
             None
         };
 
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-
         // Create shutdown future that cancels token before graceful shutdown (fixes #73)
         let graceful_shutdown = {
             let token = shutdown_token.clone();
@@ -616,12 +631,16 @@ mod server {
             }
         };
 
-        axum::serve(
+        let server_result = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(graceful_shutdown)
-        .await?;
+        .await;
+
+        // Graceful signal handling already cancels this token. Cancel again unconditionally so
+        // an Axum error closes SSE streams too.
+        shutdown_token.cancel();
 
         // Cleanup: publish ShuttingDown event and stop adapters
         tracing::info!("Shutting down adapters...");
@@ -631,9 +650,6 @@ mod server {
             reason: Some("User requested shutdown".to_string()),
         });
 
-        // Give listeners a moment to react to ShuttingDown
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
         // Stop adapters
         roon_for_shutdown.stop().await;
         if let Some(ref fw) = firmware_service {
@@ -642,8 +658,18 @@ mod server {
         lms.stop().await;
         openhome.stop().await;
         upnp.stop().await;
+
+        // No producer remains after adapters stop. Close ingress, drain every command already
+        // accepted by the bounded actor, and join it. Public-bus listeners are independently
+        // responsible for their own shutdown; no arbitrary sleep can prove they observed a
+        // broadcast.
+        producer_shutdown_token.cancel();
+        if let Err(error) = producer_actor_task.await {
+            tracing::warn!(%error, "ProducerActor exited with a join error");
+        }
         tracing::info!("Shutdown complete");
 
+        server_result?;
         Ok(())
     }
 
