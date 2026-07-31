@@ -24,13 +24,14 @@ else
     TAILWIND_BINARY := tailwindcss-linux-x64
 endif
 
-.PHONY: help setup-tailwind css css-watch clean
+.PHONY: help setup-tailwind css css-watch synology-test clean
 
 help:
 	@echo "Available targets:"
 	@echo "  setup-tailwind  - Download Tailwind CSS standalone CLI"
 	@echo "  css             - Build Tailwind CSS"
 	@echo "  css-watch       - Watch and rebuild Tailwind CSS"
+	@echo "  synology-test   - Validate SPK structure and unprivileged lifecycle"
 	@echo "  clean           - Remove generated files"
 
 setup-tailwind:
@@ -49,6 +50,10 @@ css: setup-tailwind
 
 css-watch: setup-tailwind
 	./tailwindcss -i src/input.css -o public/tailwind.css --content "src/app/**/*.rs" --watch
+
+synology-test:
+	tests/synology_package_contract.sh
+	tests/synology_package_lifecycle.sh
 
 clean:
 	rm -f public/tailwind.css
