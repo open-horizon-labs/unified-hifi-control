@@ -130,6 +130,7 @@
   /* Mobile menu toggle button */
   .nav-mobile-toggle {
     @apply inline-flex size-11 items-center justify-center rounded-md;
+
     color: var(--text-muted);
   }
   .nav-mobile-toggle:hover {

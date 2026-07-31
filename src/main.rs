@@ -66,6 +66,13 @@ mod server {
 
     /// Resolve the primary address other devices use to reach this host.
     /// Connecting a UDP socket selects the default route without sending data.
+    fn is_trusted_lan_ip(ip: &std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(ip) => ip.is_private(),
+            std::net::IpAddr::V6(ip) => ip.is_unique_local(),
+        }
+    }
+
     fn primary_non_loopback_ip() -> Option<std::net::IpAddr> {
         let routed_ip = std::net::UdpSocket::bind("0.0.0.0:0")
             .and_then(|socket| {
@@ -74,7 +81,7 @@ mod server {
             })
             .ok()
             .map(|addr| addr.ip())
-            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+            .filter(is_trusted_lan_ip);
 
         routed_ip.or_else(|| {
             if_addrs::get_if_addrs()
@@ -82,13 +89,46 @@ mod server {
                 .into_iter()
                 .filter(|interface| !interface.is_loopback() && !interface.is_link_local())
                 .map(|interface| interface.ip())
+                .filter(is_trusted_lan_ip)
                 .min_by_key(|ip| match ip {
-                    std::net::IpAddr::V4(ip) if ip.is_private() => 0,
-                    std::net::IpAddr::V4(_) => 1,
-                    std::net::IpAddr::V6(ip) if ip.is_unique_local() => 2,
-                    std::net::IpAddr::V6(_) => 3,
+                    std::net::IpAddr::V4(_) => 0,
+                    std::net::IpAddr::V6(_) => 1,
                 })
         })
+    }
+
+    #[cfg(test)]
+    mod address_tests {
+        use super::is_trusted_lan_ip;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        #[test]
+        fn trusted_lan_addresses_are_private_or_unique_local() {
+            assert!(is_trusted_lan_ip(&IpAddr::V4(Ipv4Addr::new(
+                192, 168, 1, 2
+            ))));
+            assert!(is_trusted_lan_ip(&IpAddr::V4(Ipv4Addr::new(
+                10, 20, 30, 40
+            ))));
+            assert!(is_trusted_lan_ip(&IpAddr::V6(Ipv6Addr::new(
+                0xfd12, 0x3456, 0x789a, 0, 0, 0, 0, 1
+            ))));
+        }
+
+        #[test]
+        fn public_and_local_only_addresses_are_not_advertised() {
+            assert!(!is_trusted_lan_ip(&IpAddr::V4(Ipv4Addr::new(
+                203, 0, 113, 10
+            ))));
+            assert!(!is_trusted_lan_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            assert!(!is_trusted_lan_ip(&IpAddr::V4(Ipv4Addr::new(
+                169, 254, 1, 2
+            ))));
+            assert!(!is_trusted_lan_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+            assert!(!is_trusted_lan_ip(&IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0x0db8, 0, 0, 0, 0, 0, 1
+            ))));
+        }
     }
 
     pub async fn run() -> Result<()> {

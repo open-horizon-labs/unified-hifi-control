@@ -72,6 +72,7 @@ mod hqplayer_integration {
     use super::*;
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn adapter_starts_disconnected() {
         let (bus, _rx) = test_bus();
         let adapter = HqpAdapter::new(bus);
@@ -83,6 +84,7 @@ mod hqplayer_integration {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn configure_sets_host() {
         let (bus, _rx) = test_bus();
         let adapter = HqpAdapter::new(bus);
@@ -96,6 +98,7 @@ mod hqplayer_integration {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn control_action_parsing() {
         let (bus, _rx) = test_bus();
         let adapter = HqpAdapter::new(bus);
@@ -119,6 +122,7 @@ mod hqplayer_integration {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn volume_range_is_correct() {
         // HQPlayer uses 0-100 for volume
         let (bus, _rx) = test_bus();
@@ -467,6 +471,7 @@ mod error_handling {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn hqp_handles_connection_timeout() {
         let (bus, _rx) = test_bus();
         let adapter = HqpAdapter::new(bus);
