@@ -26,6 +26,9 @@
 //! - GET /hqp/status
 //! - POST /hqp/profiles/load with JSON body {profile}
 
+#[allow(dead_code, unused_imports, unused_variables)]
+mod mock_servers;
+
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -176,6 +179,11 @@ struct HqpLoadProfileRequest {
 
 /// Create a test app with disconnected/mock adapters
 async fn create_test_app() -> Router {
+    create_test_app_with_state().await.0
+}
+
+/// Same client router plus the adapter state for protocol-boundary race tests.
+async fn create_test_app_with_state() -> (Router, AppState) {
     let bus = create_bus();
 
     // Create coordinator (tests don't need real lifecycle management)
@@ -214,7 +222,7 @@ async fn create_test_app() -> Router {
     );
 
     // Build router with all routes (same as main.rs)
-    Router::new()
+    let app = Router::new()
         // Health check
         .route("/status", get(api::status_handler))
         // Roon routes
@@ -320,7 +328,8 @@ async fn create_test_app() -> Router {
         .route("/lms", get(ui_stubs::stub_page))
         .route("/knobs", get(ui_stubs::stub_page))
         .route("/settings", get(ui_stubs::stub_page))
-        .with_state(state)
+        .with_state(state.clone());
+    (app, state)
 }
 
 /// Helper to make a GET request and return body as string
@@ -1332,6 +1341,99 @@ mod integration {
 #[cfg(test)]
 mod hqplayer_setting_route_contract {
     use super::*;
+    use std::time::Duration;
+
+    use mock_servers::hqplayer::corpus::VERIFIED_PROFILE;
+    use mock_servers::hqplayer::model::DaemonModel;
+    use mock_servers::hqplayer::wire::{ReplyGate, WirePolicy, WireServer};
+    use tokio::sync::Notify;
+    use unified_hifi_control::adapters::hqplayer::HqpTimeouts;
+
+    /// The actual frozen HTTP request shares one operation lease with its numeric resolution and
+    /// semantic write. This is the client boundary; adapter-only coverage cannot prove the route
+    /// did not split those calls again.
+    #[tokio::test]
+    async fn numeric_setting_request_cannot_resolve_on_a_and_write_on_b() {
+        let first = WireServer::start(
+            Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+            WirePolicy::default(),
+        )
+        .await;
+        let second = WireServer::start(
+            Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+            WirePolicy::default(),
+        )
+        .await;
+        let (app, state) = create_test_app_with_state().await;
+        state
+            .hqplayer
+            .configure(
+                "127.0.0.1".to_string(),
+                Some(first.port()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        state
+            .hqplayer
+            .set_timeouts(HqpTimeouts {
+                connect: Duration::from_millis(100),
+                response: Duration::from_millis(750),
+                reconnect_delay: Duration::from_millis(10),
+                max_attempts: 1,
+            })
+            .await;
+        state.hqplayer.connect().await.expect("connect endpoint A");
+        let gate = ReplyGate::new("GetModes");
+        first.set_policy(WirePolicy {
+            reply_gate: Some(gate.clone()),
+            ..WirePolicy::default()
+        });
+
+        let request = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                post_json(
+                    &app,
+                    "/hqplayer/setting",
+                    &json!({ "name": "mode", "value": 2 }),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_reached())
+            .await
+            .expect("HTTP request reaches the manually gated GetModes");
+        let second_port = second.port();
+        let configure_started = Arc::new(Notify::new());
+        let reconfigure = {
+            let adapter = state.hqplayer.clone();
+            let configure_started = configure_started.clone();
+            tokio::spawn(async move {
+                configure_started.notify_one();
+                adapter
+                    .configure("127.0.0.1".to_string(), Some(second_port), None, None, None)
+                    .await;
+            })
+        };
+        configure_started.notified().await;
+        assert!(
+            !reconfigure.is_finished(),
+            "configure must remain pending while the numeric HTTP operation holds its endpoint lease"
+        );
+        gate.release();
+
+        let (status, body) = request.await.expect("HTTP task joins");
+        reconfigure.await.expect("configure follows request");
+        assert_eq!(status, StatusCode::OK, "unchanged success contract: {body}");
+        assert_eq!(assert_json("numeric setting", &body), json!({ "ok": true }));
+        assert_eq!(first.stats().element_count("SetMode"), 1);
+        assert_eq!(second.stats().element_count("SetMode"), 0);
+
+        first.stop();
+        second.stop();
+    }
 
     /// `dither` is not a name this route has ever accepted, and it must still be refused **by the
     /// route**, before anything reaches the adapter.

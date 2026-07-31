@@ -6737,9 +6737,10 @@ async fn a_malformed_reply_does_not_wedge_later_polling() {
 /// `State` before it writes — so an unscoped "drop the next reply" would vanish during the read and
 /// the write would never happen.
 ///
-/// **Label: client-red.** Before #347 the send's error propagated and the state was never read back.
+/// **Label: client-red.** #368 supersedes #347's reconnecting readback: a replacement native session
+/// cannot prove what the original session did, even when this in-process model knows it applied.
 #[tokio::test]
-async fn a_write_whose_reply_is_lost_after_the_daemon_applied_it_is_reported_as_applied() {
+async fn a_write_whose_reply_is_lost_is_not_verified_on_a_replacement_session() {
     let h = Harness::start(
         VERIFIED_PROFILE,
         WirePolicy {
@@ -6770,10 +6771,14 @@ async fn a_write_whose_reply_is_lost_after_the_daemon_applied_it_is_reported_as_
         3,
         "precondition: the daemon did apply it — NS5 is index 3 in the observed PCM list"
     );
+    assert!(
+        matches!(outcome, SettingOutcome::Ambiguous { .. }),
+        "a replacement session cannot prove the original session's write: {outcome:?}"
+    );
     assert_eq!(
-        outcome,
-        SettingOutcome::Applied,
-        "the readback finds the setting in place, so the write landed however its reply was lost"
+        h.server.stats().connections(),
+        1,
+        "the operation must not reconnect to reinterpret the lost reply"
     );
     h.stop();
 }
@@ -7349,9 +7354,9 @@ async fn a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles
         "precondition: the pre-load shapers are cached, got {stale:?}"
     );
 
-    // The profile load succeeds; the refresh that follows it cannot complete. Armed only now, after
-    // the cache above filled successfully — otherwise the test would be about a daemon that never
-    // worked rather than one that stopped.
+    // The POST is accepted; the recovery refresh that follows it cannot complete. Armed only now,
+    // after the cache above filled successfully — otherwise the test would be about a daemon that
+    // never worked rather than one whose profile outcome cannot be verified.
     h.model.arm(|f| {
         // One rejection breaks the eager post-load refresh; two more cover the read path's bounded
         // retry. On the broken implementation only the first is consumed because the stale cache
@@ -7364,10 +7369,15 @@ async fn a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles
             ));
         }
     });
-    h.adapter
+    let load_error = h
+        .adapter
         .load_profile("raw-a")
         .await
-        .expect("the POST succeeded, so the profile load did");
+        .expect_err("a POST without coherent native recovery cannot be reported as success");
+    assert!(
+        load_error.to_string().contains("ambiguous"),
+        "the failure must preserve that the profile may have applied: {load_error}"
+    );
 
     match h.adapter.get_pipeline_status().await {
         Err(e) => assert!(
@@ -8108,20 +8118,19 @@ async fn a_mode_write_is_proved_against_the_enumeration_served_after_it() {
     h.stop();
 }
 
-/// **The retry is a correction, not just a second way to fail.**
+/// **A moved post-write enumeration is ambiguity, not permission to replay.**
 ///
 /// `poly-sinc-short-lp` exists in both of the verified corpus's filter chains and at *different*
 /// positions — 3 in PCM, 0 in SDM. So a chain change after `GetFilters` sends position 3 into the SDM
-/// chain, where it is in range and names `sinc-Lh`; the bracket sees the enumeration move, resolves
-/// the same name against the list the daemon serves now, and writes position 0.
+/// chain, where it is in range and names `sinc-Lh`. The bracket sees the enumeration move, but cannot
+/// safely correct by sending position 0: the first write already reached the wire.
 ///
-/// Both halves are asserted: the outcome is a success *and* the daemon is on the filter that was
-/// asked for. A test that only checked the outcome would pass for a client that refused, and one that
-/// only checked the daemon would pass for a client that lied about it.
+/// The explicit ambiguous outcome and the single write are both asserted. A replacement session or
+/// changed setting universe cannot prove what the original write meant.
 ///
 /// **Label: client-red.** Before the bracket this returned `Applied` with the daemon on `sinc-Lh`.
 #[tokio::test]
-async fn a_chain_change_after_the_filter_list_is_corrected_by_the_retry() {
+async fn a_chain_change_after_a_filter_write_is_ambiguous_without_replay() {
     let h = Harness::verified().await;
     h.model.external_change(|s| {
         s.mode_index = 0; // configured `[source]`
@@ -8138,13 +8147,12 @@ async fn a_chain_change_after_the_filter_list_is_corrected_by_the_retry() {
     h.model
         .switch_chain_after_request("GetFilters", LoadedChain::Sdm);
 
-    h.adapter
+    let outcome = h
+        .adapter
         .set_filter_pair("poly-sinc-short-lp")
         .await
-        .applied()
-        .expect(
-            "the filter is offered by the chain the daemon settles on, so the retry can land it",
-        );
+        .expect("a moved post-write enumeration is an explicit outcome");
+    assert!(matches!(outcome, SettingOutcome::Ambiguous { .. }));
 
     let daemon = h.model.state();
     assert_eq!(
@@ -8154,9 +8162,8 @@ async fn a_chain_change_after_the_filter_list_is_corrected_by_the_retry() {
             "FiltersItem",
             daemon.filter_1x_index
         ),
-        "poly-sinc-short-lp",
-        "reporting success means the daemon is on the requested filter, not on whatever the \
-         previous chain's position named"
+        "sinc-Lh",
+        "the first-session write is not replayed after its enumeration moves"
     );
     assert_eq!(
         daemon.filter_1x_index, daemon.filter_nx_index,
@@ -8164,28 +8171,23 @@ async fn a_chain_change_after_the_filter_list_is_corrected_by_the_retry() {
     );
     assert_eq!(
         h.model.request_count("SetFilter"),
-        2,
-        "bounded at one retry: the first write went to the position the previous chain gave the \
-         name, the second to the position the loaded one does. A third would mean the bound is not a \
-         bound"
+        1,
+        "once a write was attempted, correction must not replay its position in a changed universe"
     );
     h.stop();
 }
 
-/// A retry that discovers the requested semantic value already selected must not erase the fact
-/// that the first attempt sent a write. `AlreadySet` is a promise that nothing was sent; returning it
-/// here would make the bounded correction semantically dishonest even though the final value is
-/// right.
+/// A post-write chain change must preserve the fact that a write was sent even when the requested
+/// name happens to resolve to the selected position in the new chain.
 ///
 /// `none` is position 0 in both shaper chains. The first attempt writes it in PCM and the daemon then
-/// moves to SDM, so the bracket retries because the *enumeration* changed. The retry correctly sends
-/// nothing because SDM also reports `none` at 0. The operation as a whole is nevertheless `Applied`,
-/// not `AlreadySet`, because one `SetShaping` reached the wire.
+/// moves to SDM. The final semantic value happens to be `none`, but the changed universe cannot prove
+/// the original operation; the result is ambiguous and the request is not replayed.
 ///
 /// **Label: client-pin.** Found by independent review of the CodeRabbit correction; it is a RED
 /// against the first `SemanticFamily` implementation, not against the pre-#347 client.
 #[tokio::test]
-async fn a_retry_no_op_does_not_hide_the_write_sent_by_the_first_attempt() {
+async fn a_post_write_chain_change_is_ambiguous_even_when_the_name_still_matches() {
     let h = Harness::verified().await;
     h.model.external_change(|s| {
         s.mode_index = 0;
@@ -8199,19 +8201,14 @@ async fn a_retry_no_op_does_not_hide_the_write_sent_by_the_first_attempt() {
         .adapter
         .set_shaper("none")
         .await
-        .expect("the requested semantic value is established after the bounded retry");
+        .expect("the post-write transition has an explicit outcome");
 
     assert_eq!(
         h.model.request_count("SetShaping"),
         1,
-        "the first attempt wrote and the retry was a semantic no-op"
+        "the first write must not be replayed"
     );
-    assert_eq!(
-        outcome,
-        SettingOutcome::Applied,
-        "the operation sent a write, so it may not claim AlreadySet even though the retry found the \
-         final semantic value already selected"
-    );
+    assert!(matches!(outcome, SettingOutcome::Ambiguous { .. }));
     assert_eq!(
         daemon_name_at(
             &h.model,
@@ -8262,11 +8259,8 @@ async fn a_chain_that_moves_on_the_setter_and_on_its_retry_is_reported_as_ambigu
         SettingOutcome::Ambiguous { what, reason } => {
             assert_eq!(what, "filter");
             assert!(
-                reason.contains("enumeration")
-                    && reason.contains("retry")
-                    && reason.contains("wire"),
-                "the reason must say what could not be settled and that the bound was reached, got: \
-                 {reason}"
+                reason.contains("enumeration") && reason.contains("wire"),
+                "the reason must say what could not be settled after the write, got: {reason}"
             );
         }
         other => panic!(

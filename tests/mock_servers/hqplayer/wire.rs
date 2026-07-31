@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -70,6 +71,53 @@ pub enum Disruption {
     /// `DropNextReplyOnce` alone can never expose that: it returns before the model is touched, so
     /// every retry is harmless there by construction.
     ApplyThenDropReplyOnce,
+}
+
+/// A one-shot manual gate after a named request has been applied and before its reply is written.
+///
+/// Race tests use the two explicit edges rather than hoping a wall-clock chunk delay is long enough:
+/// [`Self::wait_until_reached`] proves the server has received and applied the request, and
+/// [`Self::release`] is the only event that lets the reply continue. The atomic budget makes a gate
+/// shared by multiple connections fire exactly once.
+#[derive(Debug, Clone)]
+pub struct ReplyGate {
+    element: String,
+    reached: Arc<Notify>,
+    release: Arc<Notify>,
+    remaining: Arc<AtomicU32>,
+}
+
+impl ReplyGate {
+    pub fn new(element: impl Into<String>) -> Self {
+        Self {
+            element: element.into(),
+            reached: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            remaining: Arc::new(AtomicU32::new(1)),
+        }
+    }
+
+    /// Wait until the named request has reached the fake and its responder has applied it.
+    pub async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Allow the gated reply to continue.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+
+    async fn hold_if_matches(&self, request: &str) {
+        if mentions(request, &self.element)
+            && self
+                .remaining
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            self.reached.notify_one();
+            self.release.notified().await;
+        }
+    }
 }
 
 /// The wire's byte-level policy.
@@ -135,6 +183,8 @@ pub struct WirePolicy {
     /// solicited reply. The reference client copes because it splits its receive buffer and feeds
     /// each document to a streaming parser rather than assuming one read is one reply.
     pub coalesce_extra_for_element: Option<(String, String)>,
+    /// One named request is held after model application and before its reply is written.
+    pub reply_gate: Option<ReplyGate>,
 }
 
 impl Default for WirePolicy {
@@ -151,6 +201,7 @@ impl Default for WirePolicy {
             coalesce_leading_for_element: None,
             coalesce_extra_for_element: None,
             unsolicited_stream_for_element: None,
+            reply_gate: None,
         }
     }
 }
@@ -580,6 +631,10 @@ async fn serve_connection(
         let Some(reply) = responder.respond(&line) else {
             continue;
         };
+
+        if let Some(ref gate) = policy.reply_gate {
+            gate.hold_if_matches(&line).await;
+        }
 
         // The command has now been applied. Vanishing here is the ambiguous case the client cannot
         // resolve: it wrote a request and got nothing back, exactly as in `DropNextReplyOnce`, but the

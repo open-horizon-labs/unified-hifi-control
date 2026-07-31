@@ -2000,7 +2000,7 @@ fn no_production_comment_settles_the_active_mode_question_by_fiat() {
 /// `resolve_shaper_index` and used the result as a direct list position, so a stale or guessed number
 /// selected whatever now sat there. The legacy numeric HTTP contracts still exist and are still
 /// honoured — but the number is resolved to a name at the boundary
-/// (`HqpAdapter::legacy_index_to_name`) and what travels inward is the name.
+/// (`HqpAdapter::apply_legacy_index`) and what travels inward is the name.
 ///
 /// Decided by **parsing** the adapter, not by scanning its text. An earlier revision of this check
 /// hand-rolled a brace matcher to carve function bodies out of the source, which is the helper shape
@@ -2034,7 +2034,7 @@ fn no_production_control_path_parses_a_setting_name_as_an_index() {
         "a resolver or setter that parses a semantic name into a list index has reinstated \
          HQP-C-063: a number arriving where a name belongs comes from another chain, another daemon, \
          or a guess, and using it as a position silently selects a different setting. The legacy \
-         numeric contracts are served by `legacy_index_to_name` at the HTTP boundary instead. \
+         numeric contracts are served by `apply_legacy_index` at the HTTP boundary instead. \
          Offenders: {offenders:#?}"
     );
 }

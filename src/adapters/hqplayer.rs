@@ -788,6 +788,36 @@ impl std::fmt::Display for HqpRejected {
 
 impl std::error::Error for HqpRejected {}
 
+/// A semantic operation was about to continue on a different native transport.
+///
+/// This is deliberately typed: a caller can restart safely before a write, while a caller that has
+/// already attempted a write must report ambiguity. Matching error text would erase that boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HqpSessionChanged {
+    expected: u64,
+    actual: u64,
+}
+
+impl std::fmt::Display for HqpSessionChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.expected == self.actual {
+            write!(
+                f,
+                "HQPlayer native session generation {} is no longer installed",
+                self.expected
+            )
+        } else {
+            write!(
+                f,
+                "HQPlayer native session changed from generation {} to {}",
+                self.expected, self.actual
+            )
+        }
+    }
+}
+
+impl std::error::Error for HqpSessionChanged {}
+
 /// The semantic family of a mode entry, so a caller never depends on a list position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModeFamily {
@@ -807,6 +837,29 @@ pub enum LegacySettingFamily {
     Mode,
     Filter,
     Shaper,
+}
+
+/// The semantic operation selected by a legacy numeric request.
+///
+/// Unlike [`LegacySettingFamily`], this retains which filter side the frozen HTTP contract named so
+/// index resolution and the resulting write can execute under one endpoint operation lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacySettingTarget {
+    Mode,
+    FilterPair,
+    Filter1x,
+    FilterNx,
+    Shaper,
+}
+
+impl LegacySettingTarget {
+    fn family(self) -> LegacySettingFamily {
+        match self {
+            Self::Mode => LegacySettingFamily::Mode,
+            Self::FilterPair | Self::Filter1x | Self::FilterNx => LegacySettingFamily::Filter,
+            Self::Shaper => LegacySettingFamily::Shaper,
+        }
+    }
 }
 
 /// Which half of the filter pair a one-sided request is aimed at.
@@ -1006,6 +1059,44 @@ struct HqpConnection {
     /// suffix of an accumulation already capped at [`MAX_RESPONSE_BYTES`], and it lives on the
     /// connection, so a reconnect starts empty and cannot inherit another socket's bytes.
     carry: Vec<u8>,
+}
+
+/// Owns the native socket while one request/reply conversation is in flight.
+///
+/// Async cancellation skips ordinary error handling. If this guard is dropped while it still owns
+/// the socket, it synchronously marks the transport poisoned before dropping the socket; the next
+/// native operation performs the async state/bus cleanup before reconnecting.
+struct InFlightConnection {
+    connection: Option<HqpConnection>,
+    poisoned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl InFlightConnection {
+    fn new(connection: HqpConnection, poisoned: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            connection: Some(connection),
+            poisoned,
+        }
+    }
+
+    fn connection_mut(&mut self) -> Result<&mut HqpConnection> {
+        self.connection
+            .as_mut()
+            .ok_or_else(|| anyhow!("in-flight HQPlayer connection was already consumed"))
+    }
+
+    fn restore(mut self, slot: &mut Option<HqpConnection>) {
+        *slot = self.connection.take();
+    }
+}
+
+impl Drop for InFlightConnection {
+    fn drop(&mut self) {
+        if self.connection.is_some() {
+            self.poisoned
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// Profile info from web UI
@@ -1283,6 +1374,13 @@ struct HqpAdapterState {
     web_port: u16,
     web_username: Option<String>,
     web_password: Option<String>,
+    /// Monotonic identity of the configured native + persistent endpoint.
+    ///
+    /// Internal provenance only. The operation mutex prevents this changing inside a semantic
+    /// operation; the generation makes that invariant inspectable without exposing a public field.
+    endpoint_generation: u64,
+    /// Monotonic identity of the installed native socket, including same-address replacement.
+    transport_generation: u64,
     connected: bool,
     /// Monotonic identity of the last connection that completed a coherent handshake.
     ///
@@ -1349,6 +1447,8 @@ impl Default for HqpAdapterState {
             web_port: DEFAULT_WEB_PORT,
             web_username: None,
             web_password: None,
+            endpoint_generation: 0,
+            transport_generation: 0,
             connected: false,
             producer_epoch: 0,
             info: None,
@@ -1377,6 +1477,13 @@ impl Default for HqpAdapterState {
 pub struct HqpAdapter {
     state: Arc<RwLock<HqpAdapterState>>,
     connection: Arc<Mutex<Option<HqpConnection>>>,
+    /// Serializes endpoint mutation with a complete semantic operation.
+    ///
+    /// Native conversations are already serialized one request at a time, so allowing two
+    /// multi-request setting operations to overlap has no throughput benefit. A FIFO mutex keeps
+    /// the root lease non-reentrant and avoids the queued-writer self-deadlock a fair `RwLock`
+    /// permits when a leased public method calls another leased public method.
+    operation_lock: Arc<Mutex<()>>,
     /// Serializes socket establishment. The command mutex serializes an existing connection, but
     /// without this two concurrent first requests can both observe `None` and install two sessions.
     connect_lock: Arc<Mutex<()>>,
@@ -1386,6 +1493,8 @@ pub struct HqpAdapter {
     /// this lease `configure` can publish a new host while an old-host response is still in flight,
     /// and a poll can combine State/Status/VolumeRange around a local command.
     conversation_lock: Arc<Mutex<()>>,
+    /// Set synchronously when an in-flight native future is cancelled.
+    transport_poisoned: Arc<std::sync::atomic::AtomicBool>,
     http_client: Client,
     bus: SharedBus,
     /// Unsolicited documents skipped while awaiting command replies. Diagnostics for tier-1 live
@@ -1404,8 +1513,10 @@ impl HqpAdapter {
         let adapter = Self {
             state: Arc::new(RwLock::new(HqpAdapterState::default())),
             connection: Arc::new(Mutex::new(None)),
+            operation_lock: Arc::new(Mutex::new(())),
             connect_lock: Arc::new(Mutex::new(())),
             conversation_lock: Arc::new(Mutex::new(())),
+            transport_poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             http_client,
             bus,
             unsolicited_skipped: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1479,13 +1590,24 @@ impl HqpAdapter {
         web_username: Option<String>,
         web_password: Option<String>,
     ) {
+        let _operation_guard = self.operation_lock.lock().await;
         let _conversation_guard = self.conversation_lock.lock().await;
-        let (changed, old_reachable) = {
+        let (native_changed, old_reachable) = {
             let mut state = self.state.write().await;
             let port = port.unwrap_or(DEFAULT_PORT);
-
-            let changed = state.host.as_ref() != Some(&host) || state.port != port;
-            let old_reachable = changed.then(|| {
+            let web_port = web_port.unwrap_or(DEFAULT_WEB_PORT);
+            let host_changed = state.host.as_ref() != Some(&host);
+            let native_changed = host_changed || state.port != port;
+            let credentials_changed = web_username
+                .as_ref()
+                .is_some_and(|value| state.web_username.as_ref() != Some(value))
+                || web_password
+                    .as_ref()
+                    .is_some_and(|value| state.web_password.as_ref() != Some(value));
+            let persistent_changed =
+                host_changed || state.web_port != web_port || credentials_changed;
+            let endpoint_changed = native_changed || persistent_changed;
+            let old_reachable = native_changed.then(|| {
                 (
                     state.connected,
                     state.host.clone(),
@@ -1494,7 +1616,7 @@ impl HqpAdapter {
             });
             state.host = Some(host);
             state.port = port;
-            state.web_port = web_port.unwrap_or(DEFAULT_WEB_PORT);
+            state.web_port = web_port;
 
             // Only update credentials if new values are provided (preserve existing)
             if web_username.is_some() {
@@ -1504,13 +1626,15 @@ impl HqpAdapter {
                 state.web_password = web_password;
             }
 
-            // Reset auth state when reconfiguring
-            state.digest_auth = None;
-            state.cookies.clear();
+            if endpoint_changed {
+                state.endpoint_generation = state.endpoint_generation.wrapping_add(1);
+                state.digest_auth = None;
+                state.cookies.clear();
+            }
 
-            if changed {
+            if native_changed {
                 state.connected = false;
-                // Clear ALL instance-specific cached data when switching hosts
+                // Clear every native-session cache when switching native endpoints.
                 state.info = None;
                 state.last_state = None;
                 // Through the common helper rather than by hand. The lists, the fingerprints that
@@ -1520,16 +1644,22 @@ impl HqpAdapter {
                 // *another* daemon's chain had moved.
                 Self::clear_chain_cache(&mut state);
                 state.volume_range = None;
+            }
+            if persistent_changed {
+                // Hidden fields and profile values belong to one web endpoint and credential
+                // context. Reusing either against another persistent lane can submit a stale form.
                 state.profiles.clear();
                 state.hidden_fields.clear();
                 state.config_title = None;
             }
-            (changed, old_reachable)
+            (native_changed, old_reachable)
         };
 
-        if changed {
+        if native_changed {
             let mut conn = self.connection.lock().await;
             *conn = None;
+            self.transport_poisoned
+                .store(false, std::sync::atomic::Ordering::Release);
         }
 
         if let Some((true, Some(old_host), instance_name)) = old_reachable {
@@ -1587,12 +1717,15 @@ impl HqpAdapter {
     /// Get connection status
     pub async fn get_status(&self) -> HqpConnectionStatus {
         let state = self.state.read().await;
+        let poisoned = self
+            .transport_poisoned
+            .load(std::sync::atomic::Ordering::Acquire);
         HqpConnectionStatus {
-            connected: state.connected,
+            connected: state.connected && !poisoned,
             host: state.host.clone(),
             port: state.port,
             web_port: state.web_port,
-            info: state.info.clone(),
+            info: (!poisoned).then(|| state.info.clone()).flatten(),
         }
     }
 
@@ -1602,6 +1735,19 @@ impl HqpAdapter {
     /// serialized by any existing HTTP, SSE or MCP payload.
     pub async fn producer_epoch(&self) -> u64 {
         self.state.read().await.producer_epoch
+    }
+
+    /// Monotonic identity of the configured native + persistent endpoint.
+    ///
+    /// Internal provenance seam for hermetic operation-lease tests. It is not serialized by an
+    /// HTTP, SSE, adaptive-control, or MCP payload.
+    pub async fn endpoint_generation(&self) -> u64 {
+        self.state.read().await.endpoint_generation
+    }
+
+    /// Identity of the currently installed native transport.
+    async fn transport_generation(&self) -> u64 {
+        self.state.read().await.transport_generation
     }
 
     /// Establish only the serialized native transport.
@@ -1634,7 +1780,11 @@ impl HqpAdapter {
         // A new native session inherits nothing. It is transport-usable immediately, but it is not
         // yet a publishable producer session and therefore does not advance `producer_epoch` or set
         // `connected`.
-        self.invalidate_chain_cache().await;
+        {
+            let mut state = self.state.write().await;
+            Self::clear_chain_cache(&mut state);
+            state.transport_generation = state.transport_generation.wrapping_add(1);
+        }
         let (read_half, write_half) = stream.into_split();
         let reader = BufReader::new(read_half);
         *self.connection.lock().await = Some(HqpConnection {
@@ -1647,8 +1797,10 @@ impl HqpAdapter {
 
     /// Connect to HQPlayer
     pub async fn connect(&self) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock().await;
         let _conversation_guard = self.conversation_lock.lock().await;
         let _connect_guard = self.connect_lock.lock().await;
+        self.reconcile_cancelled_transport().await;
 
         // A second caller may have completed the session while this caller waited for the guard.
         let has_connection = self.connection.lock().await.is_some();
@@ -1737,6 +1889,7 @@ impl HqpAdapter {
 
     /// Disconnect
     pub async fn disconnect(&self) {
+        let _operation_guard = self.operation_lock.lock().await;
         let _conversation_guard = self.conversation_lock.lock().await;
         let (was_connected, host, instance_name) = {
             let mut state = self.state.write().await;
@@ -1756,6 +1909,8 @@ impl HqpAdapter {
             let mut conn = self.connection.lock().await;
             *conn = None;
         }
+        self.transport_poisoned
+            .store(false, std::sync::atomic::Ordering::Release);
 
         if was_connected {
             let Some(ref h) = host else {
@@ -2039,6 +2194,14 @@ impl HqpAdapter {
         Ok(modes)
     }
 
+    async fn fresh_modes_with_generation(&self) -> Result<(Vec<ListItem>, u64)> {
+        let since = self.chain_generation().await;
+        let (modes, generation) = self.get_modes_with_generation().await?;
+        self.publish_fresh_family(FreshFamily::Modes(modes.clone()), since)
+            .await?;
+        Ok((modes, generation))
+    }
+
     /// Fetch the loaded chain's filter list from the daemon and cache it.
     async fn fresh_filters(&self) -> Result<Vec<FilterItem>> {
         let since = self.chain_generation().await;
@@ -2048,6 +2211,14 @@ impl HqpAdapter {
         Ok(filters)
     }
 
+    async fn fresh_filters_with_generation(&self) -> Result<(Vec<FilterItem>, u64)> {
+        let since = self.chain_generation().await;
+        let (filters, generation) = self.get_filters_with_generation().await?;
+        self.publish_fresh_family(FreshFamily::Filters(filters.clone()), since)
+            .await?;
+        Ok((filters, generation))
+    }
+
     /// Fetch the loaded chain's shaper list from the daemon and cache it.
     async fn fresh_shapers(&self) -> Result<Vec<ListItem>> {
         let since = self.chain_generation().await;
@@ -2055,6 +2226,14 @@ impl HqpAdapter {
         self.publish_fresh_family(FreshFamily::Shapers(shapers.clone()), since)
             .await?;
         Ok(shapers)
+    }
+
+    async fn fresh_shapers_with_generation(&self) -> Result<(Vec<ListItem>, u64)> {
+        let since = self.chain_generation().await;
+        let (shapers, generation) = self.get_shapers_with_generation().await?;
+        self.publish_fresh_family(FreshFamily::Shapers(shapers.clone()), since)
+            .await?;
+        Ok((shapers, generation))
     }
 
     /// Fetch the loaded chain's rate list from the daemon and cache it.
@@ -2068,12 +2247,12 @@ impl HqpAdapter {
     /// harmless — it costs a refetch of lists that were about to be re-read anyway. The opposite
     /// direction, a chain move that leaves the rate list byte-identical, is what would be missed, and
     /// no observation suggests it is reachable.
-    async fn fresh_rates(&self) -> Result<Vec<RateItem>> {
+    async fn fresh_rates_with_generation(&self) -> Result<(Vec<RateItem>, u64)> {
         let since = self.chain_generation().await;
-        let rates = self.get_rates().await?;
+        let (rates, generation) = self.get_rates_with_generation().await?;
         self.publish_fresh_family(FreshFamily::Rates(rates.clone()), since)
             .await?;
-        Ok(rates)
+        Ok((rates, generation))
     }
 
     /// Fingerprint of a name-keyed list — modes and shapers.
@@ -2221,20 +2400,25 @@ impl HqpAdapter {
     /// A failure is not the read's failure. The range is not chain-scoped and nothing joins it to a
     /// list index; a daemon that will not answer `VolumeRange` still has settings worth reporting, and
     /// the default renders as a fixed-volume device rather than as a wrong one.
-    async fn ensure_volume_range(&self) -> VolumeRange {
-        let cached = { self.state.read().await.volume_range.clone() };
-        if let Some(range) = cached {
-            return range;
+    async fn ensure_volume_range(&self) -> (VolumeRange, u64) {
+        {
+            let state = self.state.read().await;
+            if let Some(range) = state.volume_range.clone() {
+                return (range, state.transport_generation);
+            }
         }
-        match self.get_volume_range().await {
-            Ok(range) => {
+        match self.get_volume_range_with_generation().await {
+            Ok((range, generation)) => {
                 let mut state = self.state.write().await;
-                state.volume_range = Some(range.clone());
-                range
+                // Do not date a value from the previous socket as if the replacement served it.
+                if state.transport_generation == generation {
+                    state.volume_range = Some(range.clone());
+                }
+                (range, generation)
             }
             Err(e) => {
                 tracing::debug!("HQPlayer volume range unavailable ({e}); reporting fixed volume");
-                VolumeRange::default()
+                (VolumeRange::default(), self.transport_generation().await)
             }
         }
     }
@@ -2403,6 +2587,7 @@ impl HqpAdapter {
 
     /// Ensure a native socket exists. The caller owns the conversation lease.
     async fn ensure_transport(&self) -> Result<()> {
+        self.reconcile_cancelled_transport().await;
         // Check if already connected
         {
             let conn = self.connection.lock().await;
@@ -2415,6 +2600,16 @@ impl HqpAdapter {
         // until `connect()` completes and publishes its coherent initial snapshot.
         let _connect_guard = self.connect_lock.lock().await;
         self.establish_transport_locked().await
+    }
+
+    /// Complete the async half of cancellation cleanup while the conversation lease is held.
+    async fn reconcile_cancelled_transport(&self) {
+        if self
+            .transport_poisoned
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.mark_disconnected().await;
+        }
     }
 
     /// Mark connection as broken (called on communication errors)
@@ -2437,6 +2632,11 @@ impl HqpAdapter {
             let mut conn = self.connection.lock().await;
             *conn = None;
         }
+        // Clear poison only after every status/cache field and the shared socket are invalid. A
+        // status reader holding the state read lock can otherwise observe the old connected state
+        // after poison has already gone false.
+        self.transport_poisoned
+            .store(false, std::sync::atomic::Ordering::Release);
 
         if was_connected {
             let Some(ref h) = host else {
@@ -2477,6 +2677,56 @@ impl HqpAdapter {
     async fn send_command(&self, xml: &str) -> Result<String> {
         let _conversation_guard = self.conversation_lock.lock().await;
         self.send_command_serialized(xml).await
+    }
+
+    /// Return a reply with the transport generation captured before releasing the conversation.
+    async fn send_command_with_generation(&self, xml: &str) -> Result<(String, u64)> {
+        let _conversation_guard = self.conversation_lock.lock().await;
+        let response = self.send_command_serialized(xml).await?;
+        let generation = self.transport_generation().await;
+        Ok((response, generation))
+    }
+
+    /// Send exactly once on the native transport a semantic operation enumerated against.
+    ///
+    /// Unlike [`Self::send_command`], this never reconnects. Retrying an index-bearing write on a
+    /// replacement socket can apply that index to a different daemon or setting universe. A caller
+    /// may restart before a write; after a write attempt it must preserve ambiguity.
+    async fn send_command_on_transport(
+        &self,
+        xml: &str,
+        expected_generation: u64,
+    ) -> Result<String> {
+        let _conversation_guard = self.conversation_lock.lock().await;
+        self.reconcile_cancelled_transport().await;
+        let actual_generation = self.transport_generation().await;
+        let has_connection = self.connection.lock().await.is_some();
+        if !has_connection || actual_generation != expected_generation {
+            return Err(HqpSessionChanged {
+                expected: expected_generation,
+                actual: actual_generation,
+            }
+            .into());
+        }
+
+        let mut request_attempted = false;
+        match self
+            .send_command_inner_tracking(xml, &mut request_attempted)
+            .await
+        {
+            Ok(response) => {
+                Self::check_result(&response)?;
+                Ok(response)
+            }
+            Err(error) => {
+                self.mark_disconnected().await;
+                Err(error.context(if request_attempted {
+                    "HQPlayer native session failed after the request was attempted"
+                } else {
+                    "HQPlayer native session failed before the request was attempted"
+                }))
+            }
+        }
     }
 
     /// Retry one command while the caller owns the instance conversation lease.
@@ -2599,10 +2849,20 @@ impl HqpAdapter {
         request_attempted: &mut bool,
     ) -> Result<String> {
         let timeouts = self.timeouts().await;
-        let mut conn_guard = self.connection.lock().await;
-        let conn = conn_guard
-            .as_mut()
+        // Move the transport out of shared state for the complete in-flight conversation. This is
+        // the cancellation guard: ordinary errors reach the caller's `mark_disconnected`, but a
+        // dropped future executes no async cleanup branch. Keeping `Some(connection)` in shared
+        // state in that case leaves a late reply queued for the next command — especially dangerous
+        // when it has the same root element. With ownership local, cancellation drops the socket and
+        // shared state remains `None`; only a fully framed reply installs it again below.
+        let conn = self
+            .connection
+            .lock()
+            .await
+            .take()
             .ok_or_else(|| anyhow!("Not connected"))?;
+        let mut in_flight = InFlightConnection::new(conn, self.transport_poisoned.clone());
+        let conn = in_flight.connection_mut()?;
 
         // Past this point the daemon may have seen some or all of the request, so a one-shot command is
         // no longer safe to retry. Set before the first write rather than after the flush: neither
@@ -2837,7 +3097,10 @@ impl HqpAdapter {
 
         // Lossless: the loop only completes on a buffer whose valid UTF-8 prefix framed a document, so
         // any trailing partial sequence belongs to a coalesced follower and not to this reply.
-        Ok(String::from_utf8_lossy(&raw).trim().to_string())
+        let response = String::from_utf8_lossy(&raw).trim().to_string();
+        let mut slot = self.connection.lock().await;
+        in_flight.restore(&mut slot);
+        Ok(response)
     }
 
     // =========================================================================
@@ -3103,6 +3366,21 @@ impl HqpAdapter {
         Ok(Self::parse_state_response(&response))
     }
 
+    async fn get_state_with_generation(&self) -> Result<(HqpState, u64)> {
+        let xml = Self::build_request("State", &[]);
+        let (response, generation) = self.send_command_with_generation(&xml).await?;
+        Ok((Self::parse_state_response(&response), generation))
+    }
+
+    /// Read State without allowing transparent reconnect to cross a semantic operation's session.
+    async fn get_state_on_transport(&self, expected_generation: u64) -> Result<HqpState> {
+        let xml = Self::build_request("State", &[]);
+        let response = self
+            .send_command_on_transport(&xml, expected_generation)
+            .await?;
+        Ok(Self::parse_state_response(&response))
+    }
+
     /// Get playback status
     pub async fn get_playback_status(&self) -> Result<HqpStatus> {
         let xml = Self::build_request("Status", &[("subscribe", "0")]);
@@ -3128,6 +3406,12 @@ impl HqpAdapter {
         let xml = Self::build_request("VolumeRange", &[]);
         let response = self.send_command(&xml).await?;
         Ok(Self::parse_volume_range_response(&response))
+    }
+
+    async fn get_volume_range_with_generation(&self) -> Result<(VolumeRange, u64)> {
+        let xml = Self::build_request("VolumeRange", &[]);
+        let (response, generation) = self.send_command_with_generation(&xml).await?;
+        Ok((Self::parse_volume_range_response(&response), generation))
     }
 
     /// Parse multi-item response
@@ -3160,6 +3444,19 @@ impl HqpAdapter {
         }))
     }
 
+    async fn get_modes_with_generation(&self) -> Result<(Vec<ListItem>, u64)> {
+        let xml = Self::build_request("GetModes", &[]);
+        let (response, generation) = self.send_command_with_generation(&xml).await?;
+        Ok((
+            Self::parse_items(&response, "ModesItem", |item| ListItem {
+                index: Self::parse_attr_u32(item, "index"),
+                name: Self::parse_attr(item, "name").unwrap_or_default(),
+                value: Self::parse_attr_i32(item, "value"),
+            }),
+            generation,
+        ))
+    }
+
     /// Get available filters
     pub async fn get_filters(&self) -> Result<Vec<FilterItem>> {
         let xml = Self::build_request("GetFilters", &[]);
@@ -3187,6 +3484,20 @@ impl HqpAdapter {
         }
 
         Ok(filters)
+    }
+
+    async fn get_filters_with_generation(&self) -> Result<(Vec<FilterItem>, u64)> {
+        let xml = Self::build_request("GetFilters", &[]);
+        let (response, generation) = self.send_command_with_generation(&xml).await?;
+        Ok((
+            Self::parse_items(&response, "FiltersItem", |item| FilterItem {
+                index: Self::parse_attr_u32(item, "index"),
+                name: Self::parse_attr(item, "name").unwrap_or_default(),
+                value: Self::parse_attr_i32(item, "value"),
+                arg: Self::parse_attr_u32(item, "arg"),
+            }),
+            generation,
+        ))
     }
 
     /// Get available shapers
@@ -3217,6 +3528,19 @@ impl HqpAdapter {
         Ok(shapers)
     }
 
+    async fn get_shapers_with_generation(&self) -> Result<(Vec<ListItem>, u64)> {
+        let xml = Self::build_request("GetShapers", &[]);
+        let (response, generation) = self.send_command_with_generation(&xml).await?;
+        Ok((
+            Self::parse_items(&response, "ShapersItem", |item| ListItem {
+                index: Self::parse_attr_u32(item, "index"),
+                name: Self::parse_attr(item, "name").unwrap_or_default(),
+                value: Self::parse_attr_i32(item, "value"),
+            }),
+            generation,
+        ))
+    }
+
     /// Get the 20 kHz "junk" filter list.
     ///
     /// `State.filter_junk` is an int index into this list, not a boolean. The wire element is
@@ -3242,6 +3566,18 @@ impl HqpAdapter {
             index: Self::parse_attr_u32(item, "index"),
             rate: Self::parse_attr_u32(item, "rate"),
         }))
+    }
+
+    async fn get_rates_with_generation(&self) -> Result<(Vec<RateItem>, u64)> {
+        let xml = Self::build_request("GetRates", &[]);
+        let (response, generation) = self.send_command_with_generation(&xml).await?;
+        Ok((
+            Self::parse_items(&response, "RatesItem", |item| RateItem {
+                index: Self::parse_attr_u32(item, "index"),
+                rate: Self::parse_attr_u32(item, "rate"),
+            }),
+            generation,
+        ))
     }
 
     /// The name a modes or shapers list gives a position, for a report rather than for a decision.
@@ -3393,12 +3729,12 @@ impl HqpAdapter {
     /// `State` is read before the second list on purpose. Read after it, the observation would sit
     /// outside the bracket and the two identities would bound a window it was not in.
     ///
-    /// **Bounded at one retry, and it is a retry rather than a second chance to fail.** A transition
-    /// caught once is ordinary — the source moved and the setter re-resolves against the chain that
-    /// is now loaded, which is the self-correcting outcome. Caught twice, the outcome is
-    /// [`SettingOutcome::Ambiguous`]: the write may or may not have landed on the requested value and
-    /// saying either would be a claim. What is never returned from here is `Applied` or `AlreadySet`
-    /// for a value that was not established.
+    /// **Bounded at one restart before a write.** If a session or enumeration moves while the
+    /// decision is still a no-op, the operation may resolve once more against the settled universe.
+    /// Once any write reached or may have reached the wire, it is never replayed: a changed session,
+    /// failed proof, or moved enumeration returns [`SettingOutcome::Ambiguous`]. A replacement
+    /// session cannot establish what the original session did, and the same numeric position may
+    /// mean something else there.
     ///
     /// **This is not a compare-and-set.** The protocol has no atomic one: resolution and the write
     /// are separate commands and another controller can move the daemon between them (#162). An
@@ -3406,9 +3742,9 @@ impl HqpAdapter {
     /// bracket establishes only "the enumeration did not *visibly* move across this operation and
     /// the daemon's position resolves to what was asked", which is strictly weaker than atomicity.
     ///
-    /// The bounded correction amplifies requests: an ordinary semantic write adds a closing list
-    /// read, while one visible transition can perform a second decision/write plus its proof. That
-    /// cost is deliberately capped at one retry.
+    /// The proof amplifies requests: an ordinary semantic write adds a closing list read, while one
+    /// visible pre-write transition can perform a second no-op decision plus its proof. The restart
+    /// is deliberately capped at one and never repeats a mutation.
     async fn proven_setting<T, R, Fetch, FetchFut, Decide, DecideFut>(
         &self,
         family: &SemanticFamily<T, R>,
@@ -3419,8 +3755,31 @@ impl HqpAdapter {
     where
         R: std::fmt::Display + ?Sized,
         Fetch: Fn() -> FetchFut,
-        FetchFut: std::future::Future<Output = Result<Vec<T>>>,
-        Decide: Fn(u32) -> DecideFut,
+        FetchFut: std::future::Future<Output = Result<(Vec<T>, u64)>>,
+        Decide: Fn(u32, u64) -> DecideFut,
+        DecideFut: std::future::Future<Output = Result<SettingOutcome>>,
+    {
+        let _operation_guard = self.operation_lock.lock().await;
+        self.proven_setting_under_operation(family, requested, fetch, decide)
+            .await
+    }
+
+    /// [`Self::proven_setting`] while the caller already owns the root operation lease.
+    ///
+    /// Kept separate because a fair non-reentrant lock plus a public-to-public nested call is a
+    /// deadlock as soon as reconfiguration queues between them.
+    async fn proven_setting_under_operation<T, R, Fetch, FetchFut, Decide, DecideFut>(
+        &self,
+        family: &SemanticFamily<T, R>,
+        requested: &R,
+        fetch: Fetch,
+        decide: Decide,
+    ) -> Result<SettingOutcome>
+    where
+        R: std::fmt::Display + ?Sized,
+        Fetch: Fn() -> FetchFut,
+        FetchFut: std::future::Future<Output = Result<(Vec<T>, u64)>>,
+        Decide: Fn(u32, u64) -> DecideFut,
         DecideFut: std::future::Future<Output = Result<SettingOutcome>>,
     {
         let what = family.what;
@@ -3436,11 +3795,10 @@ impl HqpAdapter {
         // operation can never truthfully become AlreadySet or Suppressed.
         let mut attempted_write = false;
         let mut acknowledged_write = false;
-        let mut delivery_uncertain = false;
 
-        // Two attempts: one retry, the same bound the read path uses.
+        // Two attempts: at most one pre-write restart. A mutation is never replayed.
         for _ in 0..2 {
-            let before = match fetch().await {
+            let (before, attempt_generation) = match fetch().await {
                 Ok(before) => before,
                 Err(error) if attempted_write => {
                     return Ok(SettingOutcome::Ambiguous {
@@ -3470,8 +3828,17 @@ impl HqpAdapter {
                 Err(error) => return Err(error),
             };
 
-            let outcome = match decide(index).await {
+            let outcome = match decide(index, attempt_generation).await {
                 Ok(outcome) => outcome,
+                Err(error)
+                    if error.downcast_ref::<HqpSessionChanged>().is_some() && !attempted_write =>
+                {
+                    unsettled = Some(format!(
+                        "the native session changed after the {what} enumeration and before any \
+                         write ({error})"
+                    ));
+                    continue;
+                }
                 Err(error) if attempted_write => {
                     return Ok(SettingOutcome::Ambiguous {
                         what: what.to_string(),
@@ -3489,10 +3856,10 @@ impl HqpAdapter {
                     attempted_write = true;
                     acknowledged_write = true;
                 }
-                SettingOutcome::Ambiguous { .. } => {
-                    attempted_write = true;
-                    delivery_uncertain = true;
-                }
+                // A session-fenced write returns Ambiguous only when its delivery or same-session
+                // verification cannot be established. Continuing the generic proof would reconnect
+                // and let a replacement daemon reinterpret the original session's result.
+                SettingOutcome::Ambiguous { .. } => return Ok(outcome),
                 SettingOutcome::AlreadySet => {}
                 SettingOutcome::Suppressed { .. } if attempted_write => {
                     return Ok(SettingOutcome::Ambiguous {
@@ -3505,8 +3872,36 @@ impl HqpAdapter {
                 SettingOutcome::Suppressed { .. } => return Ok(outcome),
             }
 
-            let mut state = match self.get_state().await {
+            let generation_after_decision = self.transport_generation().await;
+            if generation_after_decision != attempt_generation {
+                if attempted_write {
+                    return Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "a {what} write reached or may have reached native session generation \
+                             {attempt_generation}, but verification reached generation \
+                             {generation_after_decision}; the result is not established"
+                        ),
+                    });
+                }
+                unsettled = Some(format!(
+                    "the native session changed from generation {attempt_generation} to \
+                     {generation_after_decision} before any {what} write"
+                ));
+                continue;
+            }
+
+            let mut state = match self.get_state_on_transport(attempt_generation).await {
                 Ok(state) => state,
+                Err(e) if attempted_write => {
+                    return Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "a {what} write reached or may have reached the wire, but same-session \
+                             State verification failed ({e})"
+                        ),
+                    });
+                }
                 Err(e) => {
                     unsettled = Some(format!(
                         "the daemon's State could not be read back after the {what} decision ({e})"
@@ -3532,7 +3927,7 @@ impl HqpAdapter {
                 // that reconnect-capable request so a controller changing mode immediately after
                 // the earlier proof reply cannot leave us proving rate through stale mode/rate
                 // fields. The remaining post-State race is the protocol's non-atomic boundary.
-                state = match self.get_state().await {
+                state = match self.get_state_on_transport(attempt_generation).await {
                     Ok(state) => state,
                     Err(error) if attempted_write => {
                         return Ok(SettingOutcome::Ambiguous {
@@ -3565,8 +3960,17 @@ impl HqpAdapter {
                     });
                 }
             }
-            let after = match fetch().await {
+            let (after, closing_generation) = match fetch().await {
                 Ok(after) => after,
+                Err(e) if attempted_write => {
+                    return Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "a {what} write reached or may have reached the wire, but the closing \
+                             enumeration failed ({e})"
+                        ),
+                    });
+                }
                 Err(e) => {
                     unsettled = Some(format!(
                         "the {what} enumeration could not be re-read after the decision ({e})"
@@ -3575,7 +3979,34 @@ impl HqpAdapter {
                 }
             };
 
+            if closing_generation != attempt_generation {
+                if attempted_write {
+                    return Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "a {what} write reached or may have reached native session generation \
+                             {attempt_generation}, but the closing enumeration came from \
+                             generation {closing_generation}; the result is not established"
+                        ),
+                    });
+                }
+                unsettled = Some(format!(
+                    "the native session changed from generation {attempt_generation} to \
+                     {closing_generation} during the {what} proof"
+                ));
+                continue;
+            }
+
             if (family.fingerprint)(&after) != identity {
+                if attempted_write {
+                    return Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "a {what} write reached or may have reached the wire, but its \
+                             enumeration changed before final proof"
+                        ),
+                    });
+                }
                 tracing::info!(
                     "HQPlayer's {what} enumeration moved while {what} was being set, so the \
                      position that was written or compared no longer names what was asked for; \
@@ -3602,6 +4033,7 @@ impl HqpAdapter {
                 }
                 Err(error) => return Err(error),
             };
+
             return match (family.selected)(&state) {
                 SemanticSelection::Position(current) if current == index_now => {
                     if attempted_write {
@@ -3609,22 +4041,6 @@ impl HqpAdapter {
                     } else {
                         Ok(outcome)
                     }
-                }
-                SemanticSelection::Position(current) if delivery_uncertain => {
-                    Ok(SettingOutcome::Ambiguous {
-                        what: what.to_string(),
-                        reason: format!(
-                            "a {what} write was attempted with uncertain delivery, and the stable \
-                             semantic readback is {} rather than {requested_display}; the write may \
-                             or may not have been delivered",
-                            if family.paired {
-                                let value = (family.describe)(&after, current);
-                                format!("1x={value},Nx={value}")
-                            } else {
-                                (family.describe)(&after, current)
-                            }
-                        ),
-                    })
                 }
                 SemanticSelection::Position(current) if acknowledged_write => {
                     let observed = (family.describe)(&after, current);
@@ -3646,17 +4062,6 @@ impl HqpAdapter {
                         (family.describe)(&after, current)
                     ),
                 }),
-                SemanticSelection::Split(one_x, nx) if delivery_uncertain => {
-                    Ok(SettingOutcome::Ambiguous {
-                        what: what.to_string(),
-                        reason: format!(
-                            "a {what} write was attempted with uncertain delivery, and State now \
-                             reports a split pair 1x={},Nx={} rather than {requested}",
-                            (family.describe)(&after, one_x),
-                            (family.describe)(&after, nx)
-                        ),
-                    })
-                }
                 SemanticSelection::Split(one_x, nx) if acknowledged_write => {
                     Ok(SettingOutcome::Ignored {
                         what: what.to_string(),
@@ -3703,28 +4108,12 @@ impl HqpAdapter {
         })
     }
 
-    /// Confirm a setting actually applied, by reading the authoritative `State` field back.
-    ///
-    /// Verified daemon behaviour: a setter can return `result="OK"` without the setting actually
-    /// applying, so `OK` alone is never proof (HQP-C-028). A change can also land a poll later than the
-    /// acknowledgement, so this polls rather than checking once, reusing the injected retry policy
-    /// instead of introducing another knob.
-    ///
-    /// Returns [`SettingOutcome::Ignored`] rather than an error when the value never appears: a write
-    /// the daemon acknowledged and dropped is a different fact from one it rejected, and a caller that
-    /// wants them collapsed asks for that with [`SettingOutcome::into_applied_result`].
-    ///
-    /// When the authoritative field is **absent** rather than merely different, the answer is
-    /// [`SettingOutcome::Ambiguous`] instead. Those are not the same fact: a field reporting another
-    /// value proves the write did not take, while a field the daemon does not report at all proves
-    /// nothing either way, and calling the second "ignored" would assert a failure that was never
-    /// observed.
-    ///
-    /// `observe` must read the field that *is* the setting. It deliberately has no fallback to a
-    /// related field: reading a sibling when the authoritative one is absent is how a readback confirms
-    /// something it never checked.
-    async fn verify_applied<T, F>(
+    /// Read back an index-bearing write without allowing verification to reconnect to another
+    /// native session. Once the write was attempted, losing this session is ambiguity, not a reason
+    /// to inspect a replacement daemon and call that the result.
+    async fn verify_applied_on_transport<T, F>(
         &self,
+        expected_generation: u64,
         what: &str,
         expected: T,
         observe: F,
@@ -3740,7 +4129,7 @@ impl HqpAdapter {
             if attempt > 0 {
                 tokio::time::sleep(timeouts.reconnect_delay).await;
             }
-            let state = self.get_state().await?;
+            let state = self.get_state_on_transport(expected_generation).await?;
             let seen = observe(&state);
             if seen.as_ref() == Some(&expected) {
                 return Ok(SettingOutcome::Applied);
@@ -3766,26 +4155,10 @@ impl HqpAdapter {
         }
     }
 
-    /// Write a setting and establish what it did, including when the reply never arrives.
-    ///
-    /// Three outcomes come out of the send itself:
-    ///
-    /// * a reply — the ordinary path, and readback decides between `Applied` and `Ignored`;
-    /// * an explicit [`HqpRejected`] — terminal, propagated as the error it is, nothing changed;
-    /// * anything else (timeout, dropped connection, malformed reply) — **ambiguous delivery**. On
-    ///   HQPlayer Embedded 6.0.4 a `SetMode` was accepted, logged and acted on while the daemon sent
-    ///   no response and later dropped the connection (HQP-C-029), so treating silence as failure is
-    ///   as wrong as treating `OK` as success. The state is read back regardless: if the setting is
-    ///   there, the write landed and is reported as applied; if it is not, the outcome is
-    ///   `Ambiguous` — which is neither a success nor a claim that nothing happened.
-    ///
-    /// The readback reconnects on its own (`get_state` goes through `ensure_connected`), so this is
-    /// also the recovery path, not just the reporting one.
-    ///
-    /// Only absolute writes reach here. A relative one-shot is never retried after its write is
-    /// attempted (HQP-C-030), and `send_command` enforces that separately.
-    async fn write_setting<T, F>(
+    /// Write and verify on the exact transport whose enumeration supplied the wire position.
+    async fn write_setting_on_transport<T, F>(
         &self,
+        expected_generation: u64,
         xml: &str,
         what: &str,
         expected: T,
@@ -3795,25 +4168,33 @@ impl HqpAdapter {
         T: PartialEq + std::fmt::Display + Clone,
         F: Fn(&HqpState) -> Option<T>,
     {
-        match self.send_command(xml).await {
-            Ok(_) => self.verify_applied(what, expected, observe).await,
-            Err(e) if e.downcast_ref::<HqpRejected>().is_some() => Err(e),
-            Err(e) => {
-                tracing::warn!(
-                    "HQPlayer {what} write got no usable reply ({e}); reading the state back, \
-                     because a lost reply is not proof the daemon did not apply it"
-                );
-                match self.verify_applied(what, expected, observe).await {
-                    Ok(SettingOutcome::Applied) => Ok(SettingOutcome::Applied),
-                    _ => Ok(SettingOutcome::Ambiguous {
-                        what: what.to_string(),
-                        reason: format!(
-                            "the write was attempted but drew no usable reply ({e}), and the \
-                             daemon's state does not show it; it may or may not have been applied"
-                        ),
-                    }),
-                }
-            }
+        match self
+            .send_command_on_transport(xml, expected_generation)
+            .await
+        {
+            Ok(_) => match self
+                .verify_applied_on_transport(expected_generation, what, expected, observe)
+                .await
+            {
+                Ok(outcome) => Ok(outcome),
+                Err(error) => Ok(SettingOutcome::Ambiguous {
+                    what: what.to_string(),
+                    reason: format!(
+                        "the write was attempted on native session generation \
+                         {expected_generation}, but same-session verification failed ({error})"
+                    ),
+                }),
+            },
+            Err(error) if error.downcast_ref::<HqpRejected>().is_some() => Err(error),
+            Err(error) if error.downcast_ref::<HqpSessionChanged>().is_some() => Err(error),
+            Err(error) => Ok(SettingOutcome::Ambiguous {
+                what: what.to_string(),
+                reason: format!(
+                    "the write was attempted on native session generation {expected_generation} \
+                     but drew no usable reply ({error}); it may or may not have been applied, and \
+                     verification was not moved to a replacement session"
+                ),
+            }),
         }
     }
 
@@ -3902,12 +4283,17 @@ impl HqpAdapter {
     /// not move" is the shape of reasoning this issue exists to remove, so mode is proved like the
     /// rest.
     pub async fn set_mode(&self, mode_name: &str) -> Result<SettingOutcome> {
-        self.proven_setting(
+        let _operation_guard = self.operation_lock.lock().await;
+        self.set_mode_under_operation(mode_name).await
+    }
+
+    async fn set_mode_under_operation(&self, mode_name: &str) -> Result<SettingOutcome> {
+        self.proven_setting_under_operation(
             &Self::MODE,
             mode_name,
-            || self.fresh_modes(),
-            |mode_index| async move {
-                let state = self.get_state().await?;
+            || self.fresh_modes_with_generation(),
+            |mode_index, generation| async move {
+                let state = self.get_state_on_transport(generation).await?;
                 if u32::from(state.mode) == mode_index {
                     tracing::debug!(
                         "HQPlayer is already in mode {mode_index}; not writing it, because SetMode \
@@ -3918,7 +4304,9 @@ impl HqpAdapter {
 
                 let xml = Self::build_request("SetMode", &[("value", &mode_index.to_string())]);
                 let outcome = self
-                    .write_setting(&xml, "mode", mode_index, |s| Some(u32::from(s.mode)))
+                    .write_setting_on_transport(generation, &xml, "mode", mode_index, |s| {
+                        Some(u32::from(s.mode))
+                    })
                     .await?;
                 // A mode change reloads the chain whatever the readback said, so nothing cached
                 // about it survives. This is also what makes the cleared pin honest: there is no
@@ -3967,11 +4355,19 @@ impl HqpAdapter {
     /// suite's cross-lane checks, which feed a persistent-domain enum ID to the live lane and require
     /// it to be refused.
     pub async fn set_filter(&self, value_nx: u32, value1x: u32) -> Result<SettingOutcome> {
+        let _operation_guard = self.operation_lock.lock().await;
+        let (_, generation) = self.get_state_with_generation().await?;
         tracing::debug!("SetFilter: value={value_nx} (Nx), value1x={value1x} (1x)");
         let expected = format!("1x={value1x},Nx={value_nx}");
         let xml = Self::filter_request(value_nx, value1x);
-        self.write_setting(&xml, "filter", expected, Self::filter_pair_observation)
-            .await
+        self.write_setting_on_transport(
+            generation,
+            &xml,
+            "filter",
+            expected,
+            Self::filter_pair_observation,
+        )
+        .await
     }
 
     /// Set only the 1x filter, preserving the Nx filter the daemon reports.
@@ -3994,12 +4390,17 @@ impl HqpAdapter {
     /// It also needs no sibling: both sides are being written, so nothing has to be read out of
     /// `State` first and the refusal in [`Self::set_filter_side`] does not apply here.
     pub async fn set_filter_pair(&self, filter_name: &str) -> Result<SettingOutcome> {
-        self.proven_setting(
+        let _operation_guard = self.operation_lock.lock().await;
+        self.set_filter_pair_under_operation(filter_name).await
+    }
+
+    async fn set_filter_pair_under_operation(&self, filter_name: &str) -> Result<SettingOutcome> {
+        self.proven_setting_under_operation(
             &Self::FILTER_PAIR,
             filter_name,
-            || self.fresh_filters(),
-            |index| async move {
-                let state = self.get_state().await?;
+            || self.fresh_filters_with_generation(),
+            |index, generation| async move {
+                let state = self.get_state_on_transport(generation).await?;
                 if state.filter1x == Some(index) && state.filter_nx == Some(index) {
                     return Ok(SettingOutcome::AlreadySet);
                 }
@@ -4010,8 +4411,14 @@ impl HqpAdapter {
                 let expected = format!("1x={index},Nx={index}");
                 tracing::debug!("SetFilter (both sides): value={index}, value1x={index}");
                 let xml = Self::filter_request(index, index);
-                self.write_setting(&xml, "filter", expected, Self::filter_pair_observation)
-                    .await
+                self.write_setting_on_transport(
+                    generation,
+                    &xml,
+                    "filter",
+                    expected,
+                    Self::filter_pair_observation,
+                )
+                .await
             },
         )
         .await
@@ -4025,17 +4432,27 @@ impl HqpAdapter {
     /// overwrote the setting the caller did not touch. When the sibling cannot be established the
     /// write is refused with a reason and nothing is sent.
     async fn set_filter_side(&self, side: FilterSide, filter_name: &str) -> Result<SettingOutcome> {
+        let _operation_guard = self.operation_lock.lock().await;
+        self.set_filter_side_under_operation(side, filter_name)
+            .await
+    }
+
+    async fn set_filter_side_under_operation(
+        &self,
+        side: FilterSide,
+        filter_name: &str,
+    ) -> Result<SettingOutcome> {
         let family = match side {
             FilterSide::OneX => &Self::FILTER_1X,
             FilterSide::Nx => &Self::FILTER_NX,
         };
         let what = side.field();
-        self.proven_setting(
+        self.proven_setting_under_operation(
             family,
             filter_name,
-            || self.fresh_filters(),
-            |index| async move {
-                let state = self.get_state().await?;
+            || self.fresh_filters_with_generation(),
+            |index, generation| async move {
+                let state = self.get_state_on_transport(generation).await?;
                 let (Some(current_1x), Some(current_nx)) = (state.filter1x, state.filter_nx) else {
                     return Ok(SettingOutcome::Suppressed {
                         what: what.to_string(),
@@ -4060,7 +4477,7 @@ impl HqpAdapter {
                 };
                 tracing::debug!("SetFilter: value={send_nx} (Nx), value1x={send_1x} (1x)");
                 let xml = Self::filter_request(send_nx, send_1x);
-                self.write_setting(&xml, what, index, |s| match side {
+                self.write_setting_on_transport(generation, &xml, what, index, |s| match side {
                     FilterSide::OneX => s.filter1x,
                     FilterSide::Nx => s.filter_nx,
                 })
@@ -4117,19 +4534,26 @@ impl HqpAdapter {
 
     /// Set the shaper (the modulator, under an SDM chain) by semantic name.
     pub async fn set_shaper(&self, shaper_name: &str) -> Result<SettingOutcome> {
-        self.proven_setting(
+        let _operation_guard = self.operation_lock.lock().await;
+        self.set_shaper_under_operation(shaper_name).await
+    }
+
+    async fn set_shaper_under_operation(&self, shaper_name: &str) -> Result<SettingOutcome> {
+        self.proven_setting_under_operation(
             &Self::SHAPER,
             shaper_name,
-            || self.fresh_shapers(),
-            |shaper_index| async move {
-                if self.get_state().await?.shaper == shaper_index {
+            || self.fresh_shapers_with_generation(),
+            |shaper_index, generation| async move {
+                if self.get_state_on_transport(generation).await?.shaper == shaper_index {
                     return Ok(SettingOutcome::AlreadySet);
                 }
 
                 let xml =
                     Self::build_request("SetShaping", &[("value", &shaper_index.to_string())]);
-                self.write_setting(&xml, "shaper", shaper_index, |s| Some(s.shaper))
-                    .await
+                self.write_setting_on_transport(generation, &xml, "shaper", shaper_index, |s| {
+                    Some(s.shaper)
+                })
+                .await
             },
         )
         .await
@@ -4168,10 +4592,10 @@ impl HqpAdapter {
         self.proven_setting(
             &Self::RATE,
             &rate_value,
-            || self.fresh_rates(),
-            |index| async move {
+            || self.fresh_rates_with_generation(),
+            |index, generation| async move {
                 let modes = self.fresh_modes().await?;
-                let state = self.get_state().await?;
+                let state = self.get_state_on_transport(generation).await?;
                 if let Some(mode_name) = Self::configured_source_mode(&modes, &state) {
                     return Ok(SettingOutcome::Suppressed {
                         what: "rate".to_string(),
@@ -4187,8 +4611,10 @@ impl HqpAdapter {
                 }
 
                 let xml = Self::build_request("SetRate", &[("value", &index.to_string())]);
-                self.write_setting(&xml, "rate", index, |s| Some(s.rate))
-                    .await
+                self.write_setting_on_transport(generation, &xml, "rate", index, |s| {
+                    Some(s.rate)
+                })
+                .await
             },
         )
         .await
@@ -4206,6 +4632,16 @@ impl HqpAdapter {
     /// an error rather than something forwarded and hoped about — which is what the removed
     /// `parse::<u32>()` fallback did, and why a stale number could select a different setting.
     pub async fn legacy_index_to_name(
+        &self,
+        family: LegacySettingFamily,
+        index: u32,
+    ) -> Result<String> {
+        let _operation_guard = self.operation_lock.lock().await;
+        self.legacy_index_to_name_under_operation(family, index)
+            .await
+    }
+
+    async fn legacy_index_to_name_under_operation(
         &self,
         family: LegacySettingFamily,
         index: u32,
@@ -4250,6 +4686,34 @@ impl HqpAdapter {
                 count
             )
         })
+    }
+
+    /// Resolve and apply one frozen numeric setting contract under one endpoint operation lease.
+    ///
+    /// Keeping this bracket inside the adapter prevents a handler from resolving endpoint A's list
+    /// position, releasing the lease, and then invoking a separately leased named setter on B.
+    pub async fn apply_legacy_index(
+        &self,
+        target: LegacySettingTarget,
+        index: u32,
+    ) -> Result<SettingOutcome> {
+        let _operation_guard = self.operation_lock.lock().await;
+        let name = self
+            .legacy_index_to_name_under_operation(target.family(), index)
+            .await?;
+        match target {
+            LegacySettingTarget::Mode => self.set_mode_under_operation(&name).await,
+            LegacySettingTarget::FilterPair => self.set_filter_pair_under_operation(&name).await,
+            LegacySettingTarget::Filter1x => {
+                self.set_filter_side_under_operation(FilterSide::OneX, &name)
+                    .await
+            }
+            LegacySettingTarget::FilterNx => {
+                self.set_filter_side_under_operation(FilterSide::Nx, &name)
+                    .await
+            }
+            LegacySettingTarget::Shaper => self.set_shaper_under_operation(&name).await,
+        }
     }
 
     /// Set volume in whole dB.
@@ -4356,6 +4820,7 @@ impl HqpAdapter {
 
     /// Get full pipeline status
     pub async fn get_pipeline_status(&self) -> Result<PipelineStatus> {
+        let _operation_guard = self.operation_lock.lock().await;
         // `State` reports settings as **list indices**, and an index means nothing apart from the list
         // it came from. So this read has one job beyond fetching: to establish that the `State` it
         // publishes and the lists it resolves that state through describe **the same loaded chain**,
@@ -4399,7 +4864,7 @@ impl HqpAdapter {
         let (state, playback_status, snapshot, vol_range) = loop {
             // (1) Reconnect-capable, so it goes ahead of everything the proof will cover. On the
             // first read of a connection this is always a real request.
-            let vol_range = self.ensure_volume_range().await;
+            let (vol_range, attempt_generation) = self.ensure_volume_range().await;
 
             // (2) asks one question: *is there a complete set, and what is its identity*. Lazy-fill
             // only if there is not — on the first read after connect
@@ -4472,7 +4937,30 @@ impl HqpAdapter {
 
             // (5) The proof hands back the values it proved. Nothing below re-reads the cache.
             match self.verified_chain_snapshot(captured, &probe).await {
-                Ok(snapshot) => break (observed, observed_status, snapshot, vol_range),
+                Ok(snapshot) => {
+                    let closing_generation = self.transport_generation().await;
+                    let transport_poisoned = self
+                        .transport_poisoned
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    if transport_poisoned || closing_generation != attempt_generation {
+                        if !retried {
+                            tracing::info!(
+                                "HQPlayer's native session changed or became unavailable while its \
+                                 pipeline was being read (opening generation {attempt_generation}, \
+                                 closing generation {closing_generation}, poisoned \
+                                 {transport_poisoned}); restarting the complete read"
+                            );
+                            retried = true;
+                            continue;
+                        }
+                        return Err(anyhow!(
+                            "HQPlayer's native session changed or became unavailable while its \
+                             pipeline was being read, and again during the re-read; refusing a \
+                             result assembled from more than one producer session"
+                        ));
+                    }
+                    break (observed, observed_status, snapshot, vol_range);
+                }
                 Err(reason) if !retried => {
                     tracing::info!(
                         "HQPlayer's settings did not hold still while they were being read \
@@ -4944,11 +5432,17 @@ impl HqpAdapter {
     /// claims should be enforced by the signature instead of by callers remembering it. `GET` only, so
     /// no write route is reachable. Not an HTTP endpoint of ours and not part of any serialized payload.
     pub async fn fetch_config_page_raw(&self) -> Result<String> {
+        let _operation_guard = self.operation_lock.lock().await;
         self.web_request("/config", "GET", None).await
     }
 
     /// Fetch available profiles from web UI
     pub async fn fetch_profiles(&self) -> Result<Vec<HqpProfile>> {
+        let _operation_guard = self.operation_lock.lock().await;
+        self.fetch_profiles_under_operation().await
+    }
+
+    async fn fetch_profiles_under_operation(&self) -> Result<Vec<HqpProfile>> {
         if !self.has_web_credentials().await {
             return Err(anyhow!("Web credentials not configured"));
         }
@@ -4968,13 +5462,33 @@ impl HqpAdapter {
         Ok(profiles)
     }
 
+    /// Clear every cached value a profile switch can replace or make unsafe to reuse.
+    ///
+    /// This also runs for post-dispatch ambiguity: once the POST left this process, a missing or 5xx
+    /// response cannot prove the daemon did not apply it.
+    async fn invalidate_profile_dependent_cache(&self) {
+        let mut state = self.state.write().await;
+        Self::clear_chain_cache(&mut state);
+        state.last_state = None;
+        state.volume_range = None;
+        state.hidden_fields.clear();
+        state.profiles.clear();
+        state.config_title = None;
+    }
+
     /// Get cached profiles
     pub async fn get_cached_profiles(&self) -> Vec<HqpProfile> {
         self.state.read().await.profiles.clone()
     }
 
-    /// Load a profile via web UI form submission
+    /// Load a profile via web UI form submission.
+    ///
+    /// The current daemon surface exposes no authoritative active-profile readback, so a dispatched
+    /// POST never returns success. After an accepted POST this method still waits for coherent
+    /// native recovery and a fresh persistent form, then reports recovered-but-unverified ambiguity.
+    /// #330 owns the transactional readback needed to make this operation provable.
     pub async fn load_profile(&self, profile_value: &str) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock().await;
         if profile_value.is_empty() || profile_value.to_lowercase() == "default" {
             return Err(anyhow!("Profile value is required"));
         }
@@ -4988,7 +5502,7 @@ impl HqpAdapter {
             let state = self.state.read().await;
             if state.hidden_fields.is_empty() || state.profiles.is_empty() {
                 drop(state);
-                self.fetch_profiles().await?;
+                self.fetch_profiles_under_operation().await?;
             }
         }
 
@@ -5023,7 +5537,16 @@ impl HqpAdapter {
             request = request.header("Authorization", auth_header);
         }
 
-        let response = request.body(body.clone()).send().await?;
+        let response = match request.body(body.clone()).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                self.invalidate_profile_dependent_cache().await;
+                return Err(anyhow!(
+                    "HQPlayer profile POST outcome is ambiguous: the request may have been applied, \
+                     but no usable response established its result ({error})"
+                ));
+            }
+        };
 
         // Handle 401 retry
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -5043,8 +5566,26 @@ impl HqpAdapter {
                         request = request.header("Authorization", auth_header);
                     }
 
-                    let response = request.body(body).send().await?;
-                    if response.status().is_client_error() || response.status().is_server_error() {
+                    let response = match request.body(body).send().await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            self.invalidate_profile_dependent_cache().await;
+                            return Err(anyhow!(
+                                "HQPlayer profile POST retry outcome is ambiguous: the request may \
+                                 have been applied, but no usable response established its result \
+                                 ({error})"
+                            ));
+                        }
+                    };
+                    if response.status().is_server_error() {
+                        self.invalidate_profile_dependent_cache().await;
+                        return Err(anyhow!(
+                            "HQPlayer profile POST retry outcome is ambiguous: server returned {} \
+                             after receiving the mutating request",
+                            response.status()
+                        ));
+                    }
+                    if response.status().is_client_error() {
                         return Err(anyhow!("Profile load failed: {}", response.status()));
                     }
                     // A profile replaces the daemon's settings wholesale, so everything cached from
@@ -5057,32 +5598,65 @@ impl HqpAdapter {
                     // invalidates. That is a side effect of a different concern, and the rate-based
                     // chain check would not have caught what it missed — a profile can change filters
                     // and shapers while leaving the rate list alone. CodeRabbit found the gap.
-                    self.invalidate_chain_cache().await;
+                    self.invalidate_profile_dependent_cache().await;
                     if !self.refresh_lists().await {
-                        tracing::warn!(
-                            "HQPlayer profile loaded, but its setting lists did not settle; the \
-                             next read will refill them"
-                        );
+                        return Err(anyhow!(
+                            "HQPlayer profile POST was accepted, but the native setting universe \
+                             did not recover coherently; the outcome is ambiguous"
+                        ));
                     }
-                    return Ok(());
+                    self.fetch_profiles_under_operation()
+                        .await
+                        .map_err(|error| {
+                            anyhow!(
+                            "HQPlayer profile POST was accepted and native settings recovered, but \
+                             the persistent form did not recover for readback; the outcome is \
+                             ambiguous ({error})"
+                        )
+                        })?;
+                    return Err(anyhow!(
+                        "HQPlayer profile POST was accepted and the server recovered, but the \
+                         supported protocol exposes no authoritative active-profile readback; \
+                         whether profile {profile_value:?} was applied is ambiguous"
+                    ));
                 }
             }
             return Err(anyhow!("Authentication failed"));
         }
 
-        if response.status().is_client_error() || response.status().is_server_error() {
+        if response.status().is_server_error() {
+            self.invalidate_profile_dependent_cache().await;
+            return Err(anyhow!(
+                "HQPlayer profile POST outcome is ambiguous: server returned {} after receiving \
+                 the mutating request",
+                response.status()
+            ));
+        }
+        if response.status().is_client_error() {
             return Err(anyhow!("Profile load failed: {}", response.status()));
         }
 
         // Drop then refresh; see the note on the retry path above for why the order matters.
-        self.invalidate_chain_cache().await;
+        self.invalidate_profile_dependent_cache().await;
         if !self.refresh_lists().await {
-            tracing::warn!(
-                "HQPlayer profile loaded, but its setting lists did not settle; the next read will \
-                 refill them"
-            );
+            return Err(anyhow!(
+                "HQPlayer profile POST was accepted, but the native setting universe did not \
+                 recover coherently; the outcome is ambiguous"
+            ));
         }
-        Ok(())
+        self.fetch_profiles_under_operation()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "HQPlayer profile POST was accepted and native settings recovered, but the \
+                 persistent form did not recover for readback; the outcome is ambiguous ({error})"
+                )
+            })?;
+        Err(anyhow!(
+            "HQPlayer profile POST was accepted and the server recovered, but the supported \
+             protocol exposes no authoritative active-profile readback; whether profile \
+             {profile_value:?} was applied is ambiguous"
+        ))
     }
 
     /// Check if this is HQPlayer Embedded (supports profiles)
@@ -5117,6 +5691,18 @@ impl HqpAdapter {
         }))
     }
 
+    async fn get_matrix_profiles_with_generation(&self) -> Result<(Vec<MatrixProfile>, u64)> {
+        let xml = Self::build_request("MatrixListProfiles", &[]);
+        let (response, generation) = self.send_command_with_generation(&xml).await?;
+        Ok((
+            Self::parse_items(&response, "MatrixProfile", |item| MatrixProfile {
+                index: Self::parse_attr_u32(item, "index"),
+                name: Self::parse_attr(item, "name").unwrap_or_default(),
+            }),
+            generation,
+        ))
+    }
+
     /// The matrix profile the daemon currently has selected.
     ///
     /// The authority is the observed **`State.matrix_profile`** field, not `MatrixGetProfile`: #341
@@ -5129,20 +5715,31 @@ impl HqpAdapter {
     /// some other entry's index: nothing in the list is selected, and reporting index 0 would name
     /// whatever sits first, which on the observed corpus is `Default`.
     pub async fn get_matrix_profile(&self) -> Result<Option<MatrixProfile>> {
-        let current = self.get_state().await?.matrix_profile;
+        Ok(self.get_matrix_profiles_and_current().await?.1)
+    }
+
+    /// Return the matrix list and selected entry from one configured endpoint and native session.
+    pub async fn get_matrix_profiles_and_current(
+        &self,
+    ) -> Result<(Vec<MatrixProfile>, Option<MatrixProfile>)> {
+        let _operation_guard = self.operation_lock.lock().await;
+        let (profiles, generation) = self.get_matrix_profiles_with_generation().await?;
+        let current = self
+            .get_state_on_transport(generation)
+            .await?
+            .matrix_profile;
         if current.is_empty() {
             // No selection. The empty field is the default identity and is not list position 0.
-            return Ok(None);
+            return Ok((profiles, None));
         }
-        let profiles = self.get_matrix_profiles().await?;
-        let resolved = profiles.into_iter().find(|p| p.name == current);
+        let resolved = profiles.iter().find(|p| p.name == current).cloned();
         if resolved.is_none() {
             tracing::warn!(
                 "HQPlayer reports matrix profile {current:?}, which its own MatrixListProfiles does \
                  not contain; reporting no selection rather than another profile's index"
             );
         }
-        Ok(resolved)
+        Ok((profiles, resolved))
     }
 
     /// Ask the daemon what `MatrixGetProfile` reports.
@@ -5178,7 +5775,8 @@ impl HqpAdapter {
     /// and immediately turned into the semantic name that goes on the wire. The number is never
     /// stored, never published as identity, and never reaches the daemon.
     pub async fn set_matrix_profile(&self, profile_index: u32) -> Result<SettingOutcome> {
-        let profiles = self.get_matrix_profiles().await?;
+        let _operation_guard = self.operation_lock.lock().await;
+        let (profiles, generation) = self.get_matrix_profiles_with_generation().await?;
         let name = profiles
             .iter()
             .find(|p| p.index == profile_index)
@@ -5189,7 +5787,8 @@ impl HqpAdapter {
                     profile_index
                 )
             })?;
-        self.set_matrix_profile_named(&name).await
+        self.set_matrix_profile_named_under_operation(&name, generation)
+            .await
     }
 
     /// Select a matrix profile by name, verifying against the authoritative `State` field.
@@ -5197,11 +5796,39 @@ impl HqpAdapter {
     /// `MatrixSetProfile` takes the name, and like every other setter its `result="OK"` is not proof
     /// of application (HQP-C-028) — so the write is confirmed by reading `State.matrix_profile` back.
     pub async fn set_matrix_profile_named(&self, name: &str) -> Result<SettingOutcome> {
-        if self.get_state().await?.matrix_profile == name {
+        let _operation_guard = self.operation_lock.lock().await;
+        let (state, generation) = self.get_state_with_generation().await?;
+        if state.matrix_profile == name {
             return Ok(SettingOutcome::AlreadySet);
         }
+        self.write_matrix_profile_on_transport(name, generation)
+            .await
+    }
+
+    async fn set_matrix_profile_named_under_operation(
+        &self,
+        name: &str,
+        generation: u64,
+    ) -> Result<SettingOutcome> {
+        if self
+            .get_state_on_transport(generation)
+            .await?
+            .matrix_profile
+            == name
+        {
+            return Ok(SettingOutcome::AlreadySet);
+        }
+        self.write_matrix_profile_on_transport(name, generation)
+            .await
+    }
+
+    async fn write_matrix_profile_on_transport(
+        &self,
+        name: &str,
+        generation: u64,
+    ) -> Result<SettingOutcome> {
         let xml = Self::build_request("MatrixSetProfile", &[("value", name)]);
-        self.write_setting(&xml, "matrix profile", name.to_string(), |s| {
+        self.write_setting_on_transport(generation, &xml, "matrix profile", name.to_string(), |s| {
             Some(s.matrix_profile.clone())
         })
         .await

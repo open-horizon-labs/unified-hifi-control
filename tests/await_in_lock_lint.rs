@@ -245,6 +245,14 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "_conversation_guard",
         "HQPlayer instance conversations must be linearized",
     ),
+    // A semantic setting is a multi-request operation: enumeration, decision/write and verification
+    // must remain on one configured native + persistent endpoint. Configure/connect/disconnect take
+    // this FIFO root lease before the conversation lease, and nested helpers never reacquire it.
+    (
+        "adapters/hqplayer.rs",
+        "_operation_guard",
+        "HQPlayer endpoint identity must remain stable for a complete semantic operation",
+    ),
     // Socket establishment is itself one operation. Releasing this lease during TcpStream::connect
     // lets concurrent first callers install different sessions; every call acquires it only after
     // the conversation lease, giving the pair one documented lock order.

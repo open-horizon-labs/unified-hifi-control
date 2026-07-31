@@ -837,42 +837,32 @@ async fn hqp_apply_legacy_setting(
     setting: &str,
     value: u32,
 ) -> anyhow::Result<()> {
-    use crate::adapters::hqplayer::LegacySettingFamily;
+    use crate::adapters::hqplayer::LegacySettingTarget;
 
     let hqp = &state.hqplayer;
     let outcome = match setting {
         "mode" => {
-            let name = hqp
-                .legacy_index_to_name(LegacySettingFamily::Mode, value)
-                .await?;
-            hqp.set_mode(&name).await?
+            hqp.apply_legacy_index(LegacySettingTarget::Mode, value)
+                .await?
         }
         "filter" => {
             // Both sides to the same filter, in **one** `SetFilter`. Two one-sided writes could
             // half-apply — the first lands, the second is rejected or lost — leaving the daemon on a
             // pair nobody asked for; a single request carrying both indices cannot.
-            let name = hqp
-                .legacy_index_to_name(LegacySettingFamily::Filter, value)
-                .await?;
-            hqp.set_filter_pair(&name).await?
+            hqp.apply_legacy_index(LegacySettingTarget::FilterPair, value)
+                .await?
         }
         "filter1x" => {
-            let name = hqp
-                .legacy_index_to_name(LegacySettingFamily::Filter, value)
-                .await?;
-            hqp.set_filter_1x(&name).await?
+            hqp.apply_legacy_index(LegacySettingTarget::Filter1x, value)
+                .await?
         }
         "filterNx" | "filternx" => {
-            let name = hqp
-                .legacy_index_to_name(LegacySettingFamily::Filter, value)
-                .await?;
-            hqp.set_filter_nx(&name).await?
+            hqp.apply_legacy_index(LegacySettingTarget::FilterNx, value)
+                .await?
         }
         "shaper" | "dither" => {
-            let name = hqp
-                .legacy_index_to_name(LegacySettingFamily::Shaper, value)
-                .await?;
-            hqp.set_shaper(&name).await?
+            hqp.apply_legacy_index(LegacySettingTarget::Shaper, value)
+                .await?
         }
         // By contract this number is Hz, not a list position.
         "samplerate" | "rate" => hqp.set_rate(value).await?,
@@ -1084,11 +1074,8 @@ pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl 
             .into_response();
     }
 
-    let profiles = state.hqplayer.get_matrix_profiles().await;
-    let current = state.hqplayer.get_matrix_profile().await;
-
-    match (profiles, current) {
-        (Ok(profiles), Ok(current)) => (
+    match state.hqplayer.get_matrix_profiles_and_current().await {
+        Ok((profiles, current)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "profiles": profiles,
@@ -1096,7 +1083,7 @@ pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl 
             })),
         )
             .into_response(),
-        (Err(e), _) | (_, Err(e)) => (
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: e.to_string(),
@@ -1894,11 +1881,8 @@ pub async fn hqp_instance_matrix_profiles_handler(
         }
     };
 
-    let profiles = adapter.get_matrix_profiles().await;
-    let current = adapter.get_matrix_profile().await;
-
-    match (profiles, current) {
-        (Ok(profiles), Ok(current)) => (
+    match adapter.get_matrix_profiles_and_current().await {
+        Ok((profiles, current)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "instance": name,
@@ -1907,7 +1891,7 @@ pub async fn hqp_instance_matrix_profiles_handler(
             })),
         )
             .into_response(),
-        (Err(e), _) | (_, Err(e)) => (
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: e.to_string(),
