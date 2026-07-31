@@ -80,6 +80,12 @@ pub struct WirePolicy {
     pub disruption: Disruption,
     /// Requests for this element draw no reply at all, so the client must hit its response timeout.
     pub silent_for_element: Option<String>,
+    /// Like [`Self::silent_for_element`], but only once [`WireServer::arm_element_silence`] is called.
+    ///
+    /// Some faults must arrive *after* a client has already succeeded at something — a cache filled,
+    /// a profile loaded — and a policy that holds from the first byte cannot express that. Declaring
+    /// it does not arm it, so setup is never the thing under test.
+    pub silent_for_element_when_armed: Option<String>,
     /// Apply this element to the model, then close the connection without replying — **once**.
     ///
     /// The element-scoped mirror of [`Disruption::ApplyThenDropReplyOnce`], which fires on whichever
@@ -143,6 +149,7 @@ impl Default for WirePolicy {
             chunk_delay: Duration::from_millis(20),
             disruption: Disruption::None,
             silent_for_element: None,
+            silent_for_element_when_armed: None,
             apply_then_drop_reply_for_element: None,
             malformed_for_element: None,
             oversized_for_element: None,
@@ -220,6 +227,9 @@ pub struct WireServer {
     /// One-shot budget for `apply_then_drop_reply_for_element`. Element-scoped, so like the oversized
     /// fault it is armed by being declared and cannot disturb connection setup.
     element_drops_left: Arc<AtomicU32>,
+    /// Whether `silent_for_element_when_armed` is live. Shared across connections, because a client
+    /// that reconnects must still meet the fault.
+    element_silence_armed: Arc<AtomicU32>,
     accept_task: JoinHandle<()>,
 }
 
@@ -248,7 +258,9 @@ impl WireServer {
         let accept_stats = stats.clone();
         let accept_budget = disruptions_left.clone();
         let accept_oversized = oversized_left.clone();
+        let element_silence_armed = Arc::new(AtomicU32::new(0));
         let accept_element_drops = element_drops_left.clone();
+        let accept_element_silence = element_silence_armed.clone();
         let accept_task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 accept_stats.connections.fetch_add(1, Ordering::SeqCst);
@@ -258,6 +270,7 @@ impl WireServer {
                 let budget = accept_budget.clone();
                 let oversized = accept_oversized.clone();
                 let element_drops = accept_element_drops.clone();
+                let element_silence = accept_element_silence.clone();
                 tokio::spawn(async move {
                     serve_connection(
                         stream,
@@ -267,6 +280,7 @@ impl WireServer {
                         budget,
                         oversized,
                         element_drops,
+                        element_silence,
                     )
                     .await;
                 });
@@ -279,8 +293,15 @@ impl WireServer {
             disruptions_left,
             oversized_left,
             element_drops_left,
+            element_silence_armed,
             accept_task,
         }
+    }
+
+    /// Make `silent_for_element_when_armed` live. Call once the client has got as far as the fault is
+    /// meant to interrupt.
+    pub fn arm_element_silence(&self) {
+        self.element_silence_armed.store(1, Ordering::SeqCst);
     }
 
     /// Whether the one-shot element-scoped apply-then-drop has fired.
@@ -379,6 +400,7 @@ async fn serve_connection(
     disruptions_left: Arc<AtomicU32>,
     oversized_left: Arc<AtomicU32>,
     element_drops_left: Arc<AtomicU32>,
+    element_silence_armed: Arc<AtomicU32>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -410,6 +432,12 @@ async fn serve_connection(
 
         if let Some(ref element) = policy.silent_for_element {
             if mentions(&line, element) {
+                continue;
+            }
+        }
+
+        if let Some(ref element) = policy.silent_for_element_when_armed {
+            if element_silence_armed.load(Ordering::SeqCst) == 1 && mentions(&line, element) {
                 continue;
             }
         }

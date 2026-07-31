@@ -1210,6 +1210,14 @@ impl HqpAdapter {
                 state.filters.clear();
                 state.shapers.clear();
                 state.rates.clear();
+                // The fingerprints go with the lists they describe. Left behind, they would be one
+                // daemon's enumeration identity used to judge whether *another* daemon's chain had
+                // moved — a comparison with no meaning, and the presence check downstream would be
+                // the only thing left standing between that and a published answer.
+                state.modes_fingerprint = None;
+                state.filters_fingerprint = None;
+                state.shapers_fingerprint = None;
+                state.rates_fingerprint = None;
                 state.volume_range = None;
                 state.profiles.clear();
                 state.hidden_fields.clear();
@@ -1512,6 +1520,21 @@ impl HqpAdapter {
                 .zip(labels.iter())
                 .map(|(r, label)| (r.index, label.as_str())),
         )
+    }
+
+    /// Whether any chain-scoped family is missing from the cache.
+    ///
+    /// Separate from [`Self::chain_still_matches_cache`] because they answer different questions and
+    /// conflating them is how an empty cache passed for an unchanged one: that check is about
+    /// *movement*, and with nothing cached there is no movement to report. This one is about
+    /// *presence*, and it has to be asked again after the reads — a reconnect between the two
+    /// empties the cache behind the answer.
+    async fn chain_lists_incomplete(&self) -> bool {
+        let cached = self.state.read().await;
+        cached.modes.is_empty()
+            || cached.filters.is_empty()
+            || cached.shapers.is_empty()
+            || cached.rates.is_empty()
     }
 
     /// Whether the daemon's chain still matches the one the cache was filled from, **publishing
@@ -3024,13 +3047,7 @@ impl HqpAdapter {
         let mut retried = false;
         let (state, playback_status) = loop {
             // Lazy-fill whatever is missing — on the first read after connect, that is all of it.
-            let needs_lists = {
-                let cached = self.state.read().await;
-                cached.modes.is_empty()
-                    || cached.filters.is_empty()
-                    || cached.shapers.is_empty()
-                    || cached.rates.is_empty()
-            };
+            let needs_lists = self.chain_lists_incomplete().await;
             // A *required* fill that does not settle is the read's failure, not a quieter version of
             // success. With nothing cached there is no previous fingerprint for the chain check to
             // contradict, so it correctly answers "unchanged" — it is a check about movement — and
@@ -3053,6 +3070,27 @@ impl HqpAdapter {
             let observed_status = self.get_playback_status().await.unwrap_or_default();
 
             match self.chain_still_matches_cache().await {
+                // The chain has not moved — but "has not moved" is not "is there". The fill decision
+                // above was made before these reads, and a reconnect during them empties the cache
+                // behind it: `mark_disconnected` and `connect` both invalidate, because a session's
+                // list indices must not outlive it. The check then waves the read through *correctly*,
+                // since with no previous fingerprint there is no movement to report — it is a check
+                // about change, not about presence. So presence is checked here, where it is known.
+                Ok(true) if self.chain_lists_incomplete().await => {
+                    if !retried {
+                        tracing::info!(
+                            "HQPlayer's setting lists were dropped while its state was being read, \
+                             most likely by a reconnect; re-reading"
+                        );
+                        retried = true;
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "HQPlayer's setting lists could not be read as one coherent set; refusing to \
+                         report a pipeline with no settings in it, which is not what this daemon \
+                         offers"
+                    ));
+                }
                 Ok(true) => break (observed, observed_status),
                 Ok(false) if !retried => {
                     tracing::info!(
@@ -3649,10 +3687,17 @@ impl HqpAdapter {
                     if response.status().is_client_error() || response.status().is_server_error() {
                         return Err(anyhow!("Profile load failed: {}", response.status()));
                     }
-                    // Refresh cached lists after profile change. A refresh that does not settle
-                    // leaves the cache empty rather than stale, and the next pipeline read is what
-                    // reports that — the profile load itself succeeded and saying otherwise would
-                    // be a different lie.
+                    // A profile replaces the daemon's settings wholesale, so everything cached from
+                    // before it describes a configuration that no longer exists. Dropped *first*,
+                    // because `refresh_lists` deliberately leaves an existing cache alone when it
+                    // cannot publish a coherent replacement — right for a transient read, and here it
+                    // would preserve exactly the lists that just stopped being true.
+                    //
+                    // This held by accident before: a failing refresh times out, and the timeout path
+                    // invalidates. That is a side effect of a different concern, and the rate-based
+                    // chain check would not have caught what it missed — a profile can change filters
+                    // and shapers while leaving the rate list alone. CodeRabbit found the gap.
+                    self.invalidate_chain_cache().await;
                     if !self.refresh_lists().await {
                         tracing::warn!(
                             "HQPlayer profile loaded, but its setting lists did not settle; the \
@@ -3669,7 +3714,8 @@ impl HqpAdapter {
             return Err(anyhow!("Profile load failed: {}", response.status()));
         }
 
-        // Refresh cached lists after profile change; see the note on the retry path above.
+        // Drop then refresh; see the note on the retry path above for why the order matters.
+        self.invalidate_chain_cache().await;
         if !self.refresh_lists().await {
             tracing::warn!(
                 "HQPlayer profile loaded, but its setting lists did not settle; the next read will \

@@ -2999,15 +2999,15 @@ async fn tier1_takes_the_config_profile_evidence_from_the_raw_page_not_the_seman
     let web = FakeConfigWeb::start(CONFIG_PAGE_RAW_LANE, PROFILE_PAGE_SEMANTIC_LANE).await;
     let h = Harness::start(VERIFIED_PROFILE, WirePolicy::default(), fast_timeouts()).await;
     h.adapter.connect().await.expect("connect to fake daemon");
-    h.adapter
-        .configure(
-            "127.0.0.1".to_string(),
-            Some(h.server.port()),
-            Some(web.port),
-            Some("conformance".to_string()),
-            Some("conformance".to_string()),
-        )
-        .await;
+    configure_without_persisting(
+        &h.adapter,
+        "127.0.0.1",
+        h.server.port(),
+        web.port,
+        "conformance",
+        "conformance",
+    )
+    .await;
 
     let capture = tier1::capture(&h.adapter).await.expect("capture");
     let profiles = capture
@@ -3038,15 +3038,15 @@ async fn tier1_reports_a_divergence_when_the_semantic_parser_disagrees_with_the_
     let web = FakeConfigWeb::start(CONFIG_PAGE_RAW_LANE, PROFILE_PAGE_SEMANTIC_LANE).await;
     let h = Harness::start(VERIFIED_PROFILE, WirePolicy::default(), fast_timeouts()).await;
     h.adapter.connect().await.expect("connect to fake daemon");
-    h.adapter
-        .configure(
-            "127.0.0.1".to_string(),
-            Some(h.server.port()),
-            Some(web.port),
-            Some("conformance".to_string()),
-            Some("conformance".to_string()),
-        )
-        .await;
+    configure_without_persisting(
+        &h.adapter,
+        "127.0.0.1",
+        h.server.port(),
+        web.port,
+        "conformance",
+        "conformance",
+    )
+    .await;
 
     let capture = tier1::capture(&h.adapter).await.expect("capture");
     let report = tier1::diff(&capture, VERIFIED_PROFILE);
@@ -7277,6 +7277,213 @@ async fn a_chain_that_moves_on_both_the_read_and_the_retry_is_reported_rather_th
                  caller cannot tell that from a daemon that genuinely offers nothing",
                 published.settings.filter1x.selected.value,
                 published.settings.filter1x.options.len()
+            );
+        }
+    }
+    h.stop();
+}
+
+/// A profile load replaces the daemon's settings wholesale — filters, shapers and rates can all
+/// change — so the enumerations cached from before it are describing a configuration that no longer
+/// exists. `refresh_lists` deliberately leaves an existing cache alone when it cannot publish a
+/// coherent replacement, which is right for a *transient* read and wrong here: what it preserves is
+/// the pre-load lists, and the next read then finds them non-empty, skips its required fill, and
+/// resolves the new profile's `State` indices through the old profile's options.
+///
+/// The chain check does not save it. That check compares **rates**, and a profile that changes
+/// filters or shapers while leaving the rate list alone passes it — so the stale answer is not just
+/// published, it is published confidently.
+///
+/// **Label: client-red.** Found by CodeRabbit at `d4acddf`, and it falsified a comment I had just
+/// written claiming a failed post-load refresh "leaves the cache empty rather than stale".
+#[tokio::test]
+async fn a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles_lists_in_place() {
+    // This test is what made the shared-config coupling bite: supplying credentials leaked them to
+    // every adapter built afterwards, and `tier1_checks_every_family_adr_003_requires` then attempted
+    // a config read against a web server that had already stopped, recording `config_form` as neither
+    // compared nor an accepted limit. See `configure_without_persisting`.
+    let web = FakeConfigWeb::start(CONFIG_PAGE_RAW_LANE, PROFILE_PAGE_SEMANTIC_LANE).await;
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            // Declared, not yet live: the cache below has to fill successfully first, or the test
+            // would be about a daemon that never worked rather than one that stopped.
+            silent_for_element_when_armed: Some("GetShapers".to_string()),
+            ..WirePolicy::default()
+        },
+        HqpTimeouts {
+            max_attempts: 1,
+            ..fast_timeouts()
+        },
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    configure_without_persisting(
+        &h.adapter,
+        "127.0.0.1",
+        h.server.port(),
+        web.port,
+        "conformance",
+        "conformance",
+    )
+    .await;
+    h.adapter
+        .connect()
+        .await
+        .expect("reconnect after configure");
+
+    let before = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("the cache fills while the daemon is healthy");
+    let stale: Vec<&str> = before
+        .settings
+        .shaper
+        .options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect();
+    assert!(
+        stale.contains(&"NS9"),
+        "precondition: the pre-load shapers are cached, got {stale:?}"
+    );
+
+    // The profile load succeeds; the refresh that follows it cannot complete.
+    h.server.arm_element_silence();
+    h.adapter
+        .load_profile("raw-a")
+        .await
+        .expect("the POST succeeded, so the profile load did");
+
+    match h.adapter.get_pipeline_status().await {
+        Err(e) => assert!(
+            e.to_string().contains("lists"),
+            "the read must say the setting lists could not be established. Got: {e}"
+        ),
+        Ok(published) => {
+            let offered: Vec<&str> = published
+                .settings
+                .shaper
+                .options
+                .iter()
+                .map(|o| o.value.as_str())
+                .collect();
+            panic!(
+                "after a profile load, the previous profile's options must never be published as \
+                 the current ones — and the rate-based chain check cannot catch this, because a \
+                 profile can change filters and shapers while leaving rates alone. Offered \
+                 {offered:?}"
+            );
+        }
+    }
+    h.stop();
+    web.stop();
+}
+
+/// Run `configure` with the persisted-config path pointed somewhere nothing else reads.
+///
+/// **`configure` persists web credentials to one file per process, and every `HqpAdapter::new` reads
+/// it.** So a test that supplies credentials hands them to every adapter built afterwards — pointing
+/// at a web port that dies with that test — and because `configure` never *clears* credentials, the
+/// next test's own `configure` re-saves the inherited ones and the leak outlives its source. A
+/// tier-1 capture that inherits them then attempts a `/config` read that cannot succeed, and records
+/// a required claim as unverified: `tier1_checks_every_family_adr_003_requires` fails.
+///
+/// Two narrower attempts failed before this one, and the reason is worth keeping. Deleting the file
+/// after `configure`, and snapshot-and-restore around it, both only *narrow* the window — it stays as
+/// wide as the gap between two syscalls, and with hundreds of tests building adapters concurrently
+/// that gap is hit. Measured: the suite failed roughly four runs in eight.
+///
+/// This instead makes the race **benign**. While the credentialed write happens, the shared path
+/// points at a scratch directory: a concurrent `HqpAdapter::new` reads an absent file and gets no
+/// credentials, which is exactly what it should have; a concurrent `configure` writes a config
+/// nothing reads back, and nothing in this suite asserts that the file survives —
+/// `isolate_config_dir` exists to protect a real user's config, not to test persistence.
+///
+/// The adapter keeps its credentials in memory throughout, which is what the caller actually needs.
+async fn configure_without_persisting(
+    adapter: &HqpAdapter,
+    host: &str,
+    port: u16,
+    web_port: u16,
+    user: &str,
+    password: &str,
+) {
+    let previous = std::env::var("UHC_CONFIG_DIR").expect("the suite isolates the config dir");
+    let scratch = std::path::Path::new(&previous).join(format!(
+        "no-persist-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&scratch).expect("scratch config dir");
+    std::env::set_var("UHC_CONFIG_DIR", &scratch);
+    adapter
+        .configure(
+            host.to_string(),
+            Some(port),
+            Some(web_port),
+            Some(user.to_string()),
+            Some(password.to_string()),
+        )
+        .await;
+    std::env::set_var("UHC_CONFIG_DIR", &previous);
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// The lazy fill is decided **before** the reads, and a reconnect during them empties the cache
+/// behind that decision: both `mark_disconnected` and `connect` invalidate, because a session's list
+/// indices must not outlive it. So a read that found the cache complete can reach the publish step
+/// holding nothing — and the chain check waves it through, correctly, because with no previous
+/// fingerprint there is no *movement* to report. It is a check about change, not about presence.
+///
+/// Found while probing why the profile-load case would not go red: the mechanism that saved it there
+/// is this same invalidation, and following it the other way turns up a live hole rather than a
+/// theoretical one.
+///
+/// **Label: client-red.**
+#[tokio::test]
+async fn a_reconnect_during_the_reads_does_not_publish_the_cache_it_emptied() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            disruption: Disruption::DropNextReplyOnce,
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    let before = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("the cache fills while the daemon is healthy");
+    assert_eq!(
+        published_families(&before).len(),
+        4,
+        "precondition: a complete cache, so the fill below is skipped"
+    );
+
+    // The next request draws no reply. The client reconnects and retries inside `send_command` — and
+    // both halves of that invalidate, so by the time the read reaches the publish step the cache the
+    // fill decision was made against is gone.
+    h.server.arm_disruption();
+
+    match h.adapter.get_pipeline_status().await {
+        Err(e) => assert!(
+            e.to_string().contains("lists") || e.to_string().contains("chain"),
+            "the failure must name what could not be established. Got: {e}"
+        ),
+        Ok(published) => {
+            let families = published_families(&published);
+            assert_eq!(
+                families.len(),
+                4,
+                "a read may recover and publish a complete set, but it must never publish the \
+                 remains of a cache a reconnect emptied under it. Published {families:?}, with \
+                 filter1x selected as {:?}",
+                published.settings.filter1x.selected.value
             );
         }
     }
