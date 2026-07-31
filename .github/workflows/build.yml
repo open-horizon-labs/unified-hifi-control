@@ -981,6 +981,11 @@ jobs:
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          # v0.17 expands Cargo's Rust argfiles before spawning rustc, which
+          # exceeds Windows' command-line limit for crates such as web-sys.
+          # Remove this pin once https://github.com/mozilla/sccache/issues/2787 is fixed.
+          version: v0.16.0
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
