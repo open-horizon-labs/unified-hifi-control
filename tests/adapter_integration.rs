@@ -72,6 +72,7 @@ mod hqplayer_integration {
     use super::*;
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn adapter_starts_disconnected() {
         let (bus, _rx) = test_bus();
         let adapter = HqpAdapter::new(bus);
@@ -83,6 +84,7 @@ mod hqplayer_integration {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn configure_sets_host() {
         let (bus, _rx) = test_bus();
         let adapter = HqpAdapter::new(bus);
@@ -96,6 +98,7 @@ mod hqplayer_integration {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn control_action_parsing() {
         let (bus, _rx) = test_bus();
         let adapter = HqpAdapter::new(bus);
@@ -119,6 +122,7 @@ mod hqplayer_integration {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn volume_range_is_correct() {
         // HQPlayer uses 0-100 for volume
         let (bus, _rx) = test_bus();
@@ -140,6 +144,7 @@ mod lms_integration {
     use super::*;
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn adapter_starts_disconnected() {
         let (bus, _rx) = test_bus();
         let adapter = LmsAdapter::new(bus);
@@ -151,6 +156,7 @@ mod lms_integration {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn configure_sets_host_and_port() {
         let (bus, _rx) = test_bus();
         let adapter = LmsAdapter::new(bus);
@@ -165,6 +171,7 @@ mod lms_integration {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn cached_players_empty_when_not_connected() {
         clear_lms_config(); // Ensure no config from parallel tests
         let (bus, _rx) = test_bus();
@@ -175,6 +182,7 @@ mod lms_integration {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn control_fails_when_disconnected() {
         clear_lms_config(); // Ensure no config from parallel tests
         let (bus, _rx) = test_bus();
@@ -185,6 +193,7 @@ mod lms_integration {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn volume_control_fails_when_disconnected() {
         clear_lms_config(); // Ensure no config from parallel tests
         let (bus, _rx) = test_bus();
@@ -200,6 +209,7 @@ mod lms_integration {
     /// This test verifies the update_players() method emits proper bus events
     /// when metadata changes, including when metadata is cleared.
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn polling_emits_now_playing_changed_including_cleared() {
         use mock_servers::lms::MockLmsServer;
 
@@ -406,6 +416,7 @@ mod cross_adapter {
     use super::*;
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn multiple_adapters_share_bus() {
         let (bus, mut rx) = test_bus();
 
@@ -460,6 +471,7 @@ mod error_handling {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn hqp_handles_connection_timeout() {
         let (bus, _rx) = test_bus();
         let adapter = HqpAdapter::new(bus);
@@ -481,7 +493,7 @@ mod error_handling {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
+    #[serial_test::serial(lms_config)]
     async fn lms_fails_gracefully_when_unconfigured() {
         // Use temp config dir to ensure no saved config interferes
         let _guard = EnvGuard::set(
@@ -511,6 +523,7 @@ mod mock_server_tests {
     use crate::mock_servers::{MockHqpServer, MockLmsServer, MockOpenHomeDevice, MockUpnpRenderer};
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn lms_connects_to_mock_server() {
         // Start mock LMS server
         let mock = MockLmsServer::start().await;
@@ -557,6 +570,7 @@ mod mock_server_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn lms_mock_responds_to_status_query() {
         let mock = MockLmsServer::start().await;
         mock.add_player("aa:bb:cc:dd:ee:ff", "Test Player").await;
@@ -677,6 +691,7 @@ mod mock_server_tests {
     /// starting from stopped AND resuming from pause. The adapter can simply
     /// send "play" without checking cached state.
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn lms_adapter_play_resumes_from_pause() {
         // Start mock server with player in paused state
         let mock = MockLmsServer::start().await;
@@ -723,6 +738,7 @@ mod mock_server_tests {
     ///
     /// This ensures the fix for resume-from-pause doesn't break play-from-stopped.
     #[tokio::test]
+    #[serial_test::serial(lms_config)]
     async fn lms_adapter_play_starts_from_stopped() {
         // Start mock server with player in stopped state
         let mock = MockLmsServer::start().await;

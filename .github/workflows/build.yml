@@ -463,11 +463,11 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/dx
-          key: dx-cli-0.7.3
+          key: dx-cli-0.7.10
 
       - name: Install Dioxus CLI
         if: steps.check-cache.outputs.needs_build == 'true' && steps.cache-dx.outputs.cache-hit != 'true'
-        run: cargo install dioxus-cli@0.7.3 --locked
+        run: cargo install dioxus-cli@0.7.10 --locked
 
       - name: Cache generated CSS
         if: steps.check-cache.outputs.needs_build == 'true'
