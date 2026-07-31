@@ -1496,8 +1496,8 @@ async fn a_setter_overridden_by_another_controller_fails_and_names_the_observed_
         .expect_err("a setting we cannot confirm is not a success, however it came to differ");
 
     assert!(
-        err.to_string().contains('7'),
-        "the error must name the value the daemon actually reports, so an override is \
+        err.to_string().contains("Gauss1"),
+        "the error must name the semantic value the daemon actually reports, so an override is \
          distinguishable from a dropped command; got: {err}"
     );
     h.stop();
@@ -7113,7 +7113,8 @@ async fn a_both_sides_filter_write_that_is_ignored_reports_both_sides() {
 
     let message = err.to_string();
     assert!(
-        message.contains("1x=11,Nx=11") && message.contains("1x=6,Nx=6"),
+        message.contains("1x=poly-sinc-xtr,Nx=poly-sinc-xtr")
+            && message.contains("1x=poly-sinc-lp,Nx=poly-sinc-lp"),
         "the error must name the pair asked for and the pair observed, so a half-applied write and \
          an ignored one are distinguishable. Got: {message}"
     );
@@ -7708,6 +7709,904 @@ async fn a_lost_volume_range_reply_does_not_publish_the_cache_its_reconnect_empt
                 published.settings.filter1x.options.len()
             );
         }
+    }
+    h.stop();
+}
+
+// -----------------------------------------------------------------------------
+// A semantic setter reports the *name* it was asked for, not the index it sent
+// -----------------------------------------------------------------------------
+
+/// The name the daemon's **currently loaded** enumeration gives an index.
+///
+/// Read straight off the model rather than through the adapter, because the whole hazard is that the
+/// adapter's own idea of what an index means can be the previous chain's.
+fn daemon_name_at(model: &DaemonModel, family: &str, item_tag: &str, index: u32) -> String {
+    corpus::enum_entries(&model.current_enumeration(family), item_tag)
+        .into_iter()
+        .find(|e| e.index == index)
+        .map(|e| e.name)
+        .unwrap_or_else(|| format!("<no entry at index {index}>"))
+}
+
+/// A semantic setter's outcome, asserted to be anything other than "the requested value is set".
+///
+/// `Err` is a legitimate answer and so is `Ignored`/`Ambiguous`/`Suppressed`; what is forbidden is
+/// [`SettingOutcome::is_applied`], which is what the HTTP and MCP surfaces collapse to `{"ok":true}`.
+#[track_caller]
+fn assert_not_reported_as_set(
+    outcome: &anyhow::Result<SettingOutcome>,
+    requested: &str,
+    daemon_holds: &str,
+    context: &str,
+) {
+    eprintln!("PROBE {context}: {outcome:?}");
+    if let Ok(o) = outcome {
+        assert!(
+            !o.is_applied(),
+            "{context}: `{requested}` was reported as set ({o:?}) while the daemon is on \
+             `{daemon_holds}`. A setter that resolves a name to an index and then compares only the \
+             index cannot tell those apart, and a caller reading {{\"ok\":true}} has been told its \
+             filter is loaded when a different one is"
+        );
+    }
+}
+
+#[track_caller]
+fn assert_ambiguous_after_wire(outcome: &anyhow::Result<SettingOutcome>, what: &str) {
+    match outcome {
+        Ok(SettingOutcome::Ambiguous {
+            what: actual,
+            reason,
+        }) => {
+            assert_eq!(actual, what);
+            assert!(
+                reason.contains("wire"),
+                "an ambiguity after a write must disclose that a wire attempt already happened; \
+                 got: {reason}"
+            );
+        }
+        other => panic!(
+            "a later lookup failure may not erase an earlier {what} write; expected a wire-aware \
+             Ambiguous outcome, got: {other:?}"
+        ),
+    }
+}
+
+/// **The headline gap: a no-op decision taken in the previous chain's list.**
+///
+/// `set_filter_pair` fetches `GetFilters`, resolves the requested name to a position in it, then
+/// reads `State` and compares **numbers**. Under configured `[source]` the loaded chain can move
+/// between those two requests, and on the synthetic hazard profile every position exists in both
+/// chains and names a different filter there — so the comparison succeeds, `AlreadySet` comes back,
+/// and the daemon is sitting on a filter nobody asked for.
+///
+/// Nothing is written on this path, so no cache writer competes and no generation moves: the fence
+/// added at `412f20c` cannot see this at all.
+///
+/// **Label: client-red.** Found by CodeRabbit at `412f20c`.
+#[tokio::test]
+async fn a_stale_cross_chain_filter_index_is_never_reported_as_already_set() {
+    let h = Harness::start(
+        SYNTHETIC_HAZARD_PROFILE,
+        WirePolicy::default(),
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`: the source decides which chain is loaded
+        s.playback = 2;
+        s.filter_1x_index = 7;
+        s.filter_nx_index = 7;
+    });
+    assert_eq!(
+        daemon_name_at(&h.model, "GetFilters", "FiltersItem", 7),
+        "SYN-pcm-7",
+        "precondition: the PCM chain is loaded and position 7 is the filter being asked for"
+    );
+
+    // The source moves the chain the instant the filter list has been served. From here on position
+    // 7 is `SYN-sdm-7`, and the client's freshly fetched list already says `SYN-pcm-7`.
+    h.model
+        .switch_chain_after_request("GetFilters", LoadedChain::Sdm);
+
+    let outcome = h.adapter.set_filter_pair("SYN-pcm-7").await;
+
+    let daemon_holds = daemon_name_at(
+        &h.model,
+        "GetFilters",
+        "FiltersItem",
+        h.model.state().filter_1x_index,
+    );
+    assert_ne!(
+        daemon_holds, "SYN-pcm-7",
+        "precondition: the daemon must have ended on a different filter, or there is no hazard to \
+         report"
+    );
+    assert_eq!(
+        h.model.request_count("SetFilter"),
+        0,
+        "precondition: this is the no-op path, so nothing was written"
+    );
+    assert_not_reported_as_set(
+        &outcome,
+        "SYN-pcm-7",
+        &daemon_holds,
+        "a chain change after GetFilters, on the AlreadySet path",
+    );
+    h.stop();
+}
+
+/// The same gap on the **post-write** path: the index is sent, the daemon applies it in the chain it
+/// has now, and the readback compares that same number against `State` and agrees with itself.
+///
+/// **Label: client-red.** Found by CodeRabbit at `412f20c`.
+#[tokio::test]
+async fn a_cross_chain_filter_write_is_never_reported_as_applied() {
+    let h = Harness::start(
+        SYNTHETIC_HAZARD_PROFILE,
+        WirePolicy::default(),
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+        // Not the requested position, so a write actually happens.
+        s.filter_1x_index = 3;
+        s.filter_nx_index = 3;
+    });
+    h.model
+        .switch_chain_after_request("GetFilters", LoadedChain::Sdm);
+
+    let outcome = h.adapter.set_filter_pair("SYN-pcm-7").await;
+
+    let daemon_holds = daemon_name_at(
+        &h.model,
+        "GetFilters",
+        "FiltersItem",
+        h.model.state().filter_1x_index,
+    );
+    assert_ne!(
+        daemon_holds, "SYN-pcm-7",
+        "precondition: the position went to the daemon and selected a different filter in the chain \
+         it had loaded by then"
+    );
+    assert_not_reported_as_set(
+        &outcome,
+        "SYN-pcm-7",
+        &daemon_holds,
+        "a chain change after GetFilters, on the Applied path",
+    );
+    assert_ambiguous_after_wire(&outcome, "filter");
+    h.stop();
+}
+
+/// And on the one-sided path, which carries the sibling read out of `State` alongside it.
+///
+/// **Label: client-red.** Found by CodeRabbit at `412f20c`.
+#[tokio::test]
+async fn a_one_sided_cross_chain_filter_write_is_never_reported_as_applied() {
+    let h = Harness::start(
+        SYNTHETIC_HAZARD_PROFILE,
+        WirePolicy::default(),
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+        s.filter_1x_index = 3;
+        s.filter_nx_index = 3;
+    });
+    h.model
+        .switch_chain_after_request("GetFilters", LoadedChain::Sdm);
+
+    let outcome = h.adapter.set_filter_1x("SYN-pcm-7").await;
+
+    let daemon_holds = daemon_name_at(
+        &h.model,
+        "GetFilters",
+        "FiltersItem",
+        h.model.state().filter_1x_index,
+    );
+    assert_ne!(
+        daemon_holds, "SYN-pcm-7",
+        "precondition: the 1x side ended on a different filter"
+    );
+    assert_not_reported_as_set(
+        &outcome,
+        "SYN-pcm-7",
+        &daemon_holds,
+        "a chain change after GetFilters, on the one-sided Applied path",
+    );
+    assert_ambiguous_after_wire(&outcome, "filter1x");
+    h.stop();
+}
+
+/// The shaper family has the same gap, and it needs **no synthetic profile**: the verified corpus's
+/// two shaper lists are the same length and every position but `none` names a different modulator in
+/// the other chain — `NS9` and `ASDM5` are both position 4.
+///
+/// The no-op path, where the daemon's shaper already reads 4 because it is on `NS9` in PCM.
+///
+/// **Label: client-red.** Found by CodeRabbit at `412f20c`.
+#[tokio::test]
+async fn a_stale_cross_chain_shaper_index_is_never_reported_as_already_set() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`
+        s.playback = 2;
+        s.shaper_index = 4;
+    });
+    assert_eq!(
+        daemon_name_at(&h.model, "GetShapers", "ShapersItem", 4),
+        "NS9",
+        "precondition: the PCM chain is loaded and position 4 is the shaper being asked for"
+    );
+
+    h.model
+        .switch_chain_after_request("GetShapers", LoadedChain::Sdm);
+
+    let outcome = h.adapter.set_shaper("NS9").await;
+
+    let daemon_holds = daemon_name_at(
+        &h.model,
+        "GetShapers",
+        "ShapersItem",
+        h.model.state().shaper_index,
+    );
+    assert_ne!(
+        daemon_holds, "NS9",
+        "precondition: position 4 must name a different modulator in the SDM chain"
+    );
+    assert_eq!(
+        h.model.request_count("SetShaping"),
+        0,
+        "precondition: this is the no-op path, so nothing was written"
+    );
+    assert_not_reported_as_set(
+        &outcome,
+        "NS9",
+        &daemon_holds,
+        "a chain change after GetShapers, on the AlreadySet path",
+    );
+    h.stop();
+}
+
+/// The shaper family's post-write path.
+///
+/// **Label: client-red.** Found by CodeRabbit at `412f20c`.
+#[tokio::test]
+async fn a_cross_chain_shaper_write_is_never_reported_as_applied() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+        s.shaper_index = 1; // not the requested position, so a write happens
+    });
+    h.model
+        .switch_chain_after_request("GetShapers", LoadedChain::Sdm);
+
+    let outcome = h.adapter.set_shaper("NS9").await;
+
+    let daemon_holds = daemon_name_at(
+        &h.model,
+        "GetShapers",
+        "ShapersItem",
+        h.model.state().shaper_index,
+    );
+    assert_ne!(
+        daemon_holds, "NS9",
+        "precondition: the position went to the daemon and selected a different modulator"
+    );
+    assert_not_reported_as_set(
+        &outcome,
+        "NS9",
+        &daemon_holds,
+        "a chain change after GetShapers, on the Applied path",
+    );
+    assert_ambiguous_after_wire(&outcome, "shaper");
+    h.stop();
+}
+
+/// **The rate family, whose mapping shape is Hz to position rather than name to position.**
+///
+/// The source-driven transition cannot reach this setter: a source change only happens under a
+/// configured `[source]` mode, and under `[source]` a rate pin is *suppressed and never sent*
+/// (HQP-C-018/019). So there is no cross-chain rate write to catch, and the only reachable claim is
+/// the structural one — that the pin's semantic value is established against the enumeration the
+/// daemon serves **after** the write rather than against the one it served before it.
+///
+/// Asserted on the wire, in order, because that is the difference between a setter that proves its
+/// value and one that trusts a number it resolved earlier.
+///
+/// **Label: client-red.** Before the proof there was exactly one `GetRates`, and it came before the
+/// write.
+#[tokio::test]
+async fn a_rate_pin_is_proved_against_the_enumeration_served_after_the_write() {
+    let h = Harness::verified().await;
+    // Configured SDM, which is a mode a rate pin is actually sent in.
+    h.model.external_change(|s| {
+        s.mode_index = 2;
+        s.loaded_chain = LoadedChain::Sdm;
+        s.playback = 2;
+    });
+    assert!(
+        h.model.armed_upstream_claims().is_empty(),
+        "a configured SDM mode with the SDM chain loaded is the ordinary consistent case and must \
+         claim nothing unqualified: {:?}",
+        h.model.armed_upstream_claims()
+    );
+
+    h.adapter
+        .set_rate(2_822_400)
+        .await
+        .applied()
+        .expect("a rate the loaded SDM chain offers");
+
+    let requests = h.model.requests();
+    let wrote_at = requests
+        .iter()
+        .rposition(|r| r.contains("<SetRate"))
+        .expect("precondition: the pin reached the wire");
+    assert!(
+        requests[wrote_at + 1..]
+            .iter()
+            .any(|r| r.contains("<GetRates")),
+        "a rate reported as applied must have had its Hz value re-established against the rate list \
+         the daemon serves after the write; the index alone cannot say which rate it names. \
+         Requests: {requests:#?}"
+    );
+    h.stop();
+}
+
+/// **Mode, for the same structural reason and not for the chain one.**
+///
+/// `GetModes` is device-scoped: the fake serves the same modes document whichever chain is loaded,
+/// which is the daemon's own behaviour — the offered modes follow the DAC's capabilities, not the
+/// material. So a source-driven transition cannot move this mapping and the CodeRabbit hazard is
+/// unreachable here.
+///
+/// What is reachable is the general one: the modes list is not immutable. A PCM-only DAC's list has
+/// **no** SDM entry and the survivors keep their own positions (HQP-C-013), so a profile or device
+/// change reshapes it — and an *external* one moves no UHC cache and bumps no generation, which is
+/// exactly the hole the fence cannot cover. An exemption argued from "this family does not move" is
+/// the shape of reasoning this issue exists to remove, so mode is proved like the rest.
+///
+/// **Label: client-red.** Before the proof there was exactly one `GetModes`, and it came before the
+/// write.
+#[tokio::test]
+async fn a_mode_write_is_proved_against_the_enumeration_served_after_it() {
+    let h = Harness::verified().await;
+
+    h.adapter
+        .set_mode("DSD")
+        .await
+        .applied()
+        .expect("the daemon offers SDM (DSD)");
+
+    let requests = h.model.requests();
+    let wrote_at = requests
+        .iter()
+        .rposition(|r| r.contains("<SetMode"))
+        .expect("precondition: the mode write reached the wire");
+    assert!(
+        requests[wrote_at + 1..]
+            .iter()
+            .any(|r| r.contains("<GetModes")),
+        "a mode reported as applied must have had its name re-established against the modes list the \
+         daemon serves after the write. Requests: {requests:#?}"
+    );
+    h.stop();
+}
+
+/// **The retry is a correction, not just a second way to fail.**
+///
+/// `poly-sinc-short-lp` exists in both of the verified corpus's filter chains and at *different*
+/// positions — 3 in PCM, 0 in SDM. So a chain change after `GetFilters` sends position 3 into the SDM
+/// chain, where it is in range and names `sinc-Lh`; the bracket sees the enumeration move, resolves
+/// the same name against the list the daemon serves now, and writes position 0.
+///
+/// Both halves are asserted: the outcome is a success *and* the daemon is on the filter that was
+/// asked for. A test that only checked the outcome would pass for a client that refused, and one that
+/// only checked the daemon would pass for a client that lied about it.
+///
+/// **Label: client-red.** Before the bracket this returned `Applied` with the daemon on `sinc-Lh`.
+#[tokio::test]
+async fn a_chain_change_after_the_filter_list_is_corrected_by_the_retry() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`
+        s.playback = 2;
+        s.filter_1x_index = 1;
+        s.filter_nx_index = 1;
+    });
+    assert_eq!(
+        daemon_name_at(&h.model, "GetFilters", "FiltersItem", 3),
+        "poly-sinc-short-lp",
+        "precondition: position 3 is the requested filter in the loaded PCM chain"
+    );
+
+    h.model
+        .switch_chain_after_request("GetFilters", LoadedChain::Sdm);
+
+    h.adapter
+        .set_filter_pair("poly-sinc-short-lp")
+        .await
+        .applied()
+        .expect(
+            "the filter is offered by the chain the daemon settles on, so the retry can land it",
+        );
+
+    let daemon = h.model.state();
+    assert_eq!(
+        daemon_name_at(
+            &h.model,
+            "GetFilters",
+            "FiltersItem",
+            daemon.filter_1x_index
+        ),
+        "poly-sinc-short-lp",
+        "reporting success means the daemon is on the requested filter, not on whatever the \
+         previous chain's position named"
+    );
+    assert_eq!(
+        daemon.filter_1x_index, daemon.filter_nx_index,
+        "and both sides of the pair, which is what was requested"
+    );
+    assert_eq!(
+        h.model.request_count("SetFilter"),
+        2,
+        "bounded at one retry: the first write went to the position the previous chain gave the \
+         name, the second to the position the loaded one does. A third would mean the bound is not a \
+         bound"
+    );
+    h.stop();
+}
+
+/// A retry that discovers the requested semantic value already selected must not erase the fact
+/// that the first attempt sent a write. `AlreadySet` is a promise that nothing was sent; returning it
+/// here would make the bounded correction semantically dishonest even though the final value is
+/// right.
+///
+/// `none` is position 0 in both shaper chains. The first attempt writes it in PCM and the daemon then
+/// moves to SDM, so the bracket retries because the *enumeration* changed. The retry correctly sends
+/// nothing because SDM also reports `none` at 0. The operation as a whole is nevertheless `Applied`,
+/// not `AlreadySet`, because one `SetShaping` reached the wire.
+///
+/// **Label: client-pin.** Found by independent review of the CodeRabbit correction; it is a RED
+/// against the first `SemanticFamily` implementation, not against the pre-#347 client.
+#[tokio::test]
+async fn a_retry_no_op_does_not_hide_the_write_sent_by_the_first_attempt() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+        s.shaper_index = 1;
+    });
+    h.model
+        .switch_chain_after_request("SetShaping", LoadedChain::Sdm);
+
+    let outcome = h
+        .adapter
+        .set_shaper("none")
+        .await
+        .expect("the requested semantic value is established after the bounded retry");
+
+    assert_eq!(
+        h.model.request_count("SetShaping"),
+        1,
+        "the first attempt wrote and the retry was a semantic no-op"
+    );
+    assert_eq!(
+        outcome,
+        SettingOutcome::Applied,
+        "the operation sent a write, so it may not claim AlreadySet even though the retry found the \
+         final semantic value already selected"
+    );
+    assert_eq!(
+        daemon_name_at(
+            &h.model,
+            "GetShapers",
+            "ShapersItem",
+            h.model.state().shaper_index,
+        ),
+        "none",
+        "the semantic proof still establishes the requested value in the settled chain"
+    );
+    h.stop();
+}
+
+/// A chain that moves during the resolve **and** during the retry.
+///
+/// The bracket is one retry, not a loop, so a source flapping faster than the client can read has to
+/// end somewhere — and it ends on [`SettingOutcome::Ambiguous`], which is what "the write may or may
+/// not have landed on the requested value" honestly is. Not `Applied`, and not `Ignored` either:
+/// nothing was observed contradicting the request, only nothing establishing it.
+///
+/// **Label: client-red.** Before the bracket the first straddle was invisible and `Applied` came
+/// back.
+#[tokio::test]
+async fn a_chain_that_moves_on_the_setter_and_on_its_retry_is_reported_as_ambiguous() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+        s.filter_1x_index = 1;
+        s.filter_nx_index = 1;
+    });
+
+    // One switch per filter-list read: the resolve and the proof of each of the two attempts.
+    h.model
+        .switch_chain_after_request("GetFilters", LoadedChain::Sdm);
+    h.model
+        .switch_chain_after_request("GetFilters", LoadedChain::Pcm);
+    h.model
+        .switch_chain_after_request("GetFilters", LoadedChain::Sdm);
+
+    let outcome = h
+        .adapter
+        .set_filter_pair("poly-sinc-short-lp")
+        .await
+        .expect("a flapping chain is not a protocol error");
+
+    match &outcome {
+        SettingOutcome::Ambiguous { what, reason } => {
+            assert_eq!(what, "filter");
+            assert!(
+                reason.contains("enumeration")
+                    && reason.contains("retry")
+                    && reason.contains("wire"),
+                "the reason must say what could not be settled and that the bound was reached, got: \
+                 {reason}"
+            );
+        }
+        other => panic!(
+            "a value the client could not establish must be reported as ambiguous rather than as \
+             set or as refused, got: {other:?}"
+        ),
+    }
+    assert!(
+        !outcome.is_applied(),
+        "and it must not collapse to {{\"ok\":true}} at the HTTP or MCP boundary"
+    );
+    h.stop();
+}
+
+/// **The value check, on its own.** The bracket answers "did the enumeration move"; this answers "does
+/// the position the daemon holds resolve to what was asked for", and they are not the same question.
+///
+/// A `SetMode` clears the exact-rate pin even when the mode does not change (HQP-C-017), and the
+/// daemon can apply an acknowledged write a poll later than the acknowledgement (HQP-C-028's sibling
+/// behaviour, modelled by `apply_after_polls`). Put together: another controller's mode write lands
+/// between this client's rate readback and its proof, the rate pin it just set is cleared, and the
+/// rate enumeration never moves — so nothing about the *lists* is wrong and only comparing the
+/// semantic value catches it.
+///
+/// The mode is written straight through [`Responder`] rather than through the adapter, so the deferred
+/// change is armed without consuming any of the polls it is counted in. `requested` is the
+/// discriminator that keeps this from passing for the wrong reason: the readback inside
+/// `write_setting` reports the **position** it wrote, and only the proof reports the **Hz** that was
+/// asked for.
+///
+/// **Label: client-red.** Before the proof this returned `Applied` for a pin the daemon no longer
+/// held.
+#[tokio::test]
+async fn a_rate_pin_cleared_after_the_readback_is_not_reported_as_applied() {
+    let h = Harness::verified().await;
+    // Configured PCM, PCM chain loaded: the ordinary consistent case, and one a rate pin is sent in.
+    assert_eq!(
+        h.model.state().mode_index,
+        1,
+        "precondition: configured PCM"
+    );
+    assert_eq!(
+        h.model.state().rate_index,
+        0,
+        "precondition: no pin yet, so the pin below is a real write"
+    );
+
+    // Three `State`/`Status` renders from now, which is this client's proof read: the mode write lands
+    // and takes the rate pin with it. `[source]` is chosen because it leaves the loaded chain alone —
+    // so the rate enumeration is untouched and the bracket has nothing to notice.
+    h.model
+        .arm(|f| f.apply_after_polls.push(("SetMode".to_string(), 3)));
+    h.model
+        .respond("<SetMode value=\"0\"/>")
+        .expect("the fake answers SetMode");
+
+    let outcome = h
+        .adapter
+        .set_rate(44_100)
+        .await
+        .expect("a rate the loaded PCM chain offers is not a protocol error");
+
+    let daemon = h.model.state();
+    assert_eq!(
+        (daemon.mode_index, daemon.rate_index),
+        (0, 0),
+        "precondition: the other controller's mode write landed and cleared the pin. If this fails \
+         the poll budget has drifted and the test is no longer about what it says"
+    );
+    match &outcome {
+        SettingOutcome::Ignored {
+            what,
+            requested,
+            observed,
+        } => {
+            assert_eq!(
+                (what.as_str(), requested.as_str(), observed.as_str()),
+                ("rate", "44100", "Auto"),
+                "the proof must report the Hz that was asked for against the Hz the daemon now \
+                 holds. A `requested` of \"1\" would be the position, which means this came from the \
+                 readback inside the write rather than from the proof"
+            );
+        }
+        other => panic!(
+            "a pin the daemon stopped holding must be reported as ignored rather than applied, got: \
+             {other:?}"
+        ),
+    }
+    h.stop();
+}
+
+/// A stable split pair is evidence that an acknowledged pair write did not establish the request;
+/// it is not the same as an absent field. The report stays in the semantic name domain.
+///
+/// **Label: client-red.** The first semantic proof collapsed split and missing pairs to `None` and
+/// reported both as ambiguous.
+#[tokio::test]
+async fn an_acknowledged_filter_pair_that_remains_split_is_semantically_ignored() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.filter_1x_index = 6;
+        s.filter_nx_index = 5;
+    });
+    h.model
+        .arm(|f| f.accept_but_ignore.push("SetFilter".to_string()));
+
+    let expected_observed = format!(
+        "1x={},Nx={}",
+        daemon_name_at(&h.model, "GetFilters", "FiltersItem", 6),
+        daemon_name_at(&h.model, "GetFilters", "FiltersItem", 5)
+    );
+    let outcome = h
+        .adapter
+        .set_filter_pair("poly-sinc-xtr")
+        .await
+        .expect("an acknowledged refusal is an outcome");
+
+    assert_eq!(
+        outcome,
+        SettingOutcome::Ignored {
+            what: "filter".to_string(),
+            requested: "1x=poly-sinc-xtr,Nx=poly-sinc-xtr".to_string(),
+            observed: expected_observed,
+        },
+        "both reported sides disprove application and must be named semantically"
+    );
+    h.stop();
+}
+
+/// Missing pair fields prove neither application nor refusal, even after an acknowledgement.
+///
+/// **Label: client-pin.** The parser already admits this client-contract shape.
+#[tokio::test]
+async fn a_filter_pair_with_missing_authoritative_fields_is_ambiguous() {
+    let h = Harness::verified().await;
+    h.model
+        .set_filter_field_reporting(FilterFieldReporting::CombinedOnly);
+
+    let outcome = h
+        .adapter
+        .set_filter_pair("poly-sinc-xtr")
+        .await
+        .expect("missing evidence is an outcome");
+
+    match outcome {
+        SettingOutcome::Ambiguous { what, reason } => {
+            assert_eq!(what, "filter");
+            assert!(
+                reason.contains("does not report") && reason.contains("State"),
+                "absence must be reported as missing evidence, got: {reason}"
+            );
+        }
+        other => panic!("an absent pair is not an observed split or a success: {other:?}"),
+    }
+    h.stop();
+}
+
+/// A no-op decision is never evidence that a write was ignored. If another controller changes the
+/// stable semantic value before the closing observation, the outcome must say no write was sent.
+///
+/// **Label: client-red.** The first semantic proof returned `Ignored`, whose contract promises an
+/// acknowledged wire write.
+#[tokio::test]
+async fn a_stale_no_op_that_sent_nothing_is_not_reported_as_ignored() {
+    let h = Harness::verified().await;
+    assert_eq!(
+        daemon_name_at(
+            &h.model,
+            "GetShapers",
+            "ShapersItem",
+            h.model.state().shaper_index,
+        ),
+        "NS9",
+        "precondition: the adapter will initially choose the no-op path"
+    );
+    h.model
+        .arm(|f| f.apply_after_polls.push(("SetShaping".to_string(), 2)));
+    h.model
+        .respond("<SetShaping value=\"3\"/>")
+        .expect("the other controller's delayed write is accepted");
+    let external_writes = h.model.request_count("SetShaping");
+
+    let outcome = h
+        .adapter
+        .set_shaper("NS9")
+        .await
+        .expect("a raced no-op is an outcome");
+
+    assert_eq!(
+        h.model.request_count("SetShaping"),
+        external_writes,
+        "the adapter itself must not have sent a write"
+    );
+    match outcome {
+        SettingOutcome::Suppressed { what, reason } => {
+            assert_eq!(what, "shaper");
+            assert!(
+                reason.contains("nothing was sent") && reason.contains("NS5"),
+                "the report must disclose the never-sent decision and the semantic value observed; \
+                 got: {reason}"
+            );
+        }
+        other => panic!("a never-sent operation cannot be Ignored or Applied: {other:?}"),
+    }
+    h.stop();
+}
+
+/// Numeric readback outcomes from the inner write are normalized through the semantic list before
+/// they leave a name-based one-sided setter.
+///
+/// **Label: client-red.** The first proof returned the inner numeric `Ignored` unchanged.
+#[tokio::test]
+async fn an_ignored_one_sided_filter_write_reports_filter_names() {
+    let h = Harness::verified().await;
+    let observed = daemon_name_at(
+        &h.model,
+        "GetFilters",
+        "FiltersItem",
+        h.model.state().filter_1x_index,
+    );
+    h.model
+        .arm(|f| f.accept_but_ignore.push("SetFilter".to_string()));
+
+    let outcome = h
+        .adapter
+        .set_filter_1x("poly-sinc-xtr")
+        .await
+        .expect("an acknowledged refusal is an outcome");
+
+    assert_eq!(
+        outcome,
+        SettingOutcome::Ignored {
+            what: "filter1x".to_string(),
+            requested: "poly-sinc-xtr".to_string(),
+            observed,
+        }
+    );
+    h.stop();
+}
+
+/// Mode and rate use the same semantic descriptor path as filters. In particular rate position zero
+/// is `Auto`, not the ambiguous numeric string `0`.
+///
+/// **Label: client-red.** The first proof returned numeric inner outcomes and rendered rate zero as
+/// `0`.
+#[tokio::test]
+async fn ignored_mode_and_rate_writes_report_names_and_hertz() {
+    let h = Harness::verified().await;
+    h.model.arm(|f| {
+        f.accept_but_ignore.push("SetMode".to_string());
+        f.accept_but_ignore.push("SetRate".to_string());
+    });
+
+    let mode = h
+        .adapter
+        .set_mode("DSD")
+        .await
+        .expect("an ignored mode is an outcome");
+    assert_eq!(
+        mode,
+        SettingOutcome::Ignored {
+            what: "mode".to_string(),
+            requested: "DSD".to_string(),
+            observed: "PCM".to_string(),
+        }
+    );
+
+    let rate = h
+        .adapter
+        .set_rate(44_100)
+        .await
+        .expect("an ignored rate is an outcome");
+    assert_eq!(
+        rate,
+        SettingOutcome::Ignored {
+            what: "rate".to_string(),
+            requested: "44100".to_string(),
+            observed: "Auto".to_string(),
+        }
+    );
+    h.stop();
+}
+
+/// Source-mode refusal is re-evaluated by the retry. The first rate write happens while PCM is
+/// configured; an external delayed mode change and source-driven chain move make the bracket retry
+/// under `[source]`, where no second `SetRate` may be sent.
+///
+/// **Label: client-red.** Suppression outside the bracket was checked only once.
+#[tokio::test]
+async fn a_rate_retry_that_enters_source_never_sends_a_second_pin() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+    });
+    h.model
+        .arm(|f| f.apply_after_polls.push(("SetMode".to_string(), 1)));
+    h.model
+        .respond("<SetMode value=\"1\"/>")
+        .expect("the delayed PCM transition is accepted");
+    h.model.arm(|f| {
+        f.apply_after_polls.clear();
+        f.apply_after_polls.push(("SetRate".to_string(), 1));
+    });
+    h.model
+        .respond("<SetRate value=\"1\"/>")
+        .expect("the external PCM pin is accepted for the same poll");
+    h.model.arm(|f| {
+        f.apply_after_polls.clear();
+        f.apply_after_polls.push(("SetMode".to_string(), 3));
+    });
+    h.model
+        .respond("<SetMode value=\"0\"/>")
+        .expect("the delayed source transition is accepted");
+    h.model.arm(|f| f.source_refuses_rate_pin = true);
+    // The first decision's State keeps PCM loaded; the write readback then moves the loaded chain,
+    // and the proof State applies the pending source configuration before rendering it.
+    h.model
+        .switch_chain_after_request("State", LoadedChain::Pcm);
+    h.model
+        .switch_chain_after_request("State", LoadedChain::Sdm);
+    let external_rate_writes = h.model.request_count("SetRate");
+
+    let outcome = h
+        .adapter
+        .set_rate(0)
+        .await
+        .expect("a bounded transition is an outcome");
+
+    assert_eq!(
+        h.model.request_count("SetRate"),
+        external_rate_writes + 1,
+        "the first PCM attempt may write, but the retry must re-check `[source]` and suppress a \
+         second pin"
+    );
+    match outcome {
+        SettingOutcome::Ambiguous { what, reason } => {
+            assert_eq!(what, "rate");
+            assert!(
+                reason.contains("earlier attempt") && reason.contains("suppressed"),
+                "the operation must disclose both the prior wire attempt and retry refusal; got: \
+                 {reason}"
+            );
+        }
+        other => panic!("a write followed by a suppressed retry is ambiguous: {other:?}"),
     }
     h.stop();
 }

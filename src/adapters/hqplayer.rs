@@ -1075,14 +1075,13 @@ impl FreshFamily {
     }
 
     /// The identity of these contents, derived from them and from nothing else.
+    ///
+    /// Delegates to the same per-family functions [`SemanticFamily`] carries, so a setter's proof and
+    /// the cache cannot disagree about what makes two enumerations the same enumeration.
     fn fingerprint(&self) -> u64 {
         match self {
-            Self::Modes(items) | Self::Shapers(items) => {
-                HqpAdapter::fingerprint(items.iter().map(|i| (i.index, i.name.as_str())))
-            }
-            Self::Filters(items) => {
-                HqpAdapter::fingerprint(items.iter().map(|i| (i.index, i.name.as_str())))
-            }
+            Self::Modes(items) | Self::Shapers(items) => HqpAdapter::list_fingerprint(items),
+            Self::Filters(items) => HqpAdapter::filters_fingerprint(items),
             Self::Rates(items) => HqpAdapter::rates_fingerprint(items),
         }
     }
@@ -1170,6 +1169,57 @@ impl FreshFamily {
             }
         }
     }
+}
+
+/// **What a semantic setter has to prove, gathered per setting family.**
+///
+/// A setter that accepts a *name* and speaks *positions* holds two domains together, and the join is
+/// not durable. `resolve` reads a position out of the enumeration the daemon serves at that moment;
+/// every comparison after it — the `AlreadySet` no-op check, the post-write readback — compares that
+/// **number** against `State`. Under a configured `[source]` mode the loaded chain moves when the
+/// source material does (HQP-C-007), so it can move between those two requests, and where two chains'
+/// lists are the same length a stale position is *in range* and names a different setting
+/// (HQP-C-009). The number then agrees with itself and the setter reports `AlreadySet` or `Applied`
+/// for a value the daemon does not hold.
+///
+/// **The cache generation cannot see this one.** A source-driven transition has no competing cache
+/// writer: nothing invalidates, nothing is overtaken, every guard in
+/// [`HqpAdapter::publish_fresh_family`] passes. What detects it is re-reading the enumeration and
+/// finding a different one.
+///
+/// The five pieces live in one value rather than arriving as five arguments because they have to
+/// agree with each other: `resolve` and `describe` are the two directions of a single mapping,
+/// `fingerprint` is the identity that mapping is only valid inside, and `selected` names the one
+/// `State` field that is authoritative for the setting. Three spellings of "which family is this" is
+/// the shape [`FreshFamily`] was introduced to remove.
+struct SemanticFamily<T: 'static, R: ?Sized + 'static> {
+    /// The setting, named as a caller sees it, for the outcome it reports.
+    what: &'static str,
+    /// Whether one semantic request addresses both 1x and Nx and therefore must name both in a
+    /// negative report.
+    paired: bool,
+    /// Identity of an enumeration: equal for two lists exactly when they resolve every position the
+    /// same way.
+    fingerprint: fn(&[T]) -> u64,
+    /// The position the requested semantic value occupies in a given list.
+    resolve: fn(&[T], &R) -> Result<u32>,
+    /// What the daemon currently holds, read from the field that *is* this setting. A paired setting
+    /// must preserve the difference between two reported positions and an absent position: the
+    /// former disproves application while the latter proves nothing.
+    selected: fn(&HqpState) -> SemanticSelection,
+    /// The semantic value at a position, for the report a human reads.
+    describe: fn(&[T], u32) -> String,
+}
+
+/// The authoritative state observed for one semantic setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticSelection {
+    /// The setting is reported as one list position.
+    Position(u32),
+    /// A paired setting reports two different positions.
+    Split(u32, u32),
+    /// The authoritative field (or one side of a pair) is absent.
+    Missing,
 }
 
 /// Why a read could not join the `State` it observed to the lists it holds.
@@ -1795,6 +1845,21 @@ impl HqpAdapter {
         self.publish_fresh_family(FreshFamily::Rates(rates.clone()), since)
             .await?;
         Ok(rates)
+    }
+
+    /// Fingerprint of a name-keyed list — modes and shapers.
+    ///
+    /// Its own function for the reason [`Self::rates_fingerprint`] is: the cache and every semantic
+    /// setter's proof compare enumerations, and two spellings of "the same enumeration" is a silent
+    /// way for those two to disagree.
+    fn list_fingerprint(items: &[ListItem]) -> u64 {
+        Self::fingerprint(items.iter().map(|i| (i.index, i.name.as_str())))
+    }
+
+    /// Fingerprint of a filter list. Separate from [`Self::list_fingerprint`] only because
+    /// [`FilterItem`] is a distinct type; the identity is the same `(index, name)` sequence.
+    fn filters_fingerprint(items: &[FilterItem]) -> u64 {
+        Self::fingerprint(items.iter().map(|i| (i.index, i.name.as_str())))
     }
 
     /// Fingerprint of a rate list. Its own function because it is compared in three places and a
@@ -2845,6 +2910,408 @@ impl HqpAdapter {
         }))
     }
 
+    /// The name a modes or shapers list gives a position, for a report rather than for a decision.
+    ///
+    /// A position the list does not have is described as exactly that. It is never rendered as a bare
+    /// number, because a number in a report reads like a value the caller could ask for again.
+    fn list_name_at(items: &[ListItem], index: u32) -> String {
+        items
+            .iter()
+            .find(|i| i.index == index)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| format!("no entry at position {index}"))
+    }
+
+    /// [`Self::list_name_at`] for a filter list.
+    fn filter_name_at(items: &[FilterItem], index: u32) -> String {
+        items
+            .iter()
+            .find(|i| i.index == index)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| format!("no entry at position {index}"))
+    }
+
+    /// The rate in Hz a rate list gives a position.
+    fn rate_at(items: &[RateItem], index: u32) -> String {
+        items
+            .iter()
+            .find(|i| i.index == index)
+            .map(|i| {
+                if i.rate == 0 {
+                    "Auto".to_string()
+                } else {
+                    i.rate.to_string()
+                }
+            })
+            .unwrap_or_else(|| format!("no entry at position {index}"))
+    }
+
+    /// Resolve a rate in **Hz** against the list the daemon is serving now (HQP-C-015).
+    ///
+    /// The requested value is a `u32` the caller supplied as Hz, so nothing here turns a string into a
+    /// position: this is the Hz-keyed sibling of [`Self::resolve_filter`], not the numeric fallback
+    /// HQP-C-063 records.
+    fn resolve_rate(rates: &[RateItem], requested: &u32) -> Result<u32> {
+        rates
+            .iter()
+            .find(|r| r.rate == *requested)
+            .map(|r| r.index)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Rate {} is not offered for the chain this daemon has loaded",
+                    requested
+                )
+            })
+    }
+
+    /// The mode family: `GetModes` positions against `State.mode`.
+    const MODE: SemanticFamily<ListItem, str> = SemanticFamily {
+        what: "mode",
+        paired: false,
+        fingerprint: Self::list_fingerprint,
+        resolve: Self::resolve_mode,
+        selected: |s| SemanticSelection::Position(u32::from(s.mode)),
+        describe: Self::list_name_at,
+    };
+
+    /// Both filter sides at once. Split and missing pairs are different observations and remain so.
+    const FILTER_PAIR: SemanticFamily<FilterItem, str> = SemanticFamily {
+        what: "filter",
+        paired: true,
+        fingerprint: Self::filters_fingerprint,
+        resolve: Self::resolve_filter,
+        selected: |s| match (s.filter1x, s.filter_nx) {
+            (Some(one_x), Some(nx)) if one_x == nx => SemanticSelection::Position(one_x),
+            (Some(one_x), Some(nx)) => SemanticSelection::Split(one_x, nx),
+            _ => SemanticSelection::Missing,
+        },
+        describe: Self::filter_name_at,
+    };
+
+    /// The 1x side alone.
+    const FILTER_1X: SemanticFamily<FilterItem, str> = SemanticFamily {
+        what: "filter1x",
+        paired: false,
+        fingerprint: Self::filters_fingerprint,
+        resolve: Self::resolve_filter,
+        selected: |s| {
+            s.filter1x
+                .map_or(SemanticSelection::Missing, SemanticSelection::Position)
+        },
+        describe: Self::filter_name_at,
+    };
+
+    /// The Nx side alone.
+    const FILTER_NX: SemanticFamily<FilterItem, str> = SemanticFamily {
+        what: "filterNx",
+        paired: false,
+        fingerprint: Self::filters_fingerprint,
+        resolve: Self::resolve_filter,
+        selected: |s| {
+            s.filter_nx
+                .map_or(SemanticSelection::Missing, SemanticSelection::Position)
+        },
+        describe: Self::filter_name_at,
+    };
+
+    /// The shaper family. On the verified corpus its two chains are the same length and every
+    /// position but `none` names a different modulator in the other chain — `NS9` and `ASDM5` are
+    /// both position 4 — so this family needs no synthetic profile to be wrong quietly.
+    const SHAPER: SemanticFamily<ListItem, str> = SemanticFamily {
+        what: "shaper",
+        paired: false,
+        fingerprint: Self::list_fingerprint,
+        resolve: Self::resolve_shaper,
+        selected: |s| SemanticSelection::Position(s.shaper),
+        describe: Self::list_name_at,
+    };
+
+    /// The rate family, whose request domain is **Hz** rather than a name. Same proof, different
+    /// mapping shape.
+    const RATE: SemanticFamily<RateItem, u32> = SemanticFamily {
+        what: "rate",
+        paired: false,
+        fingerprint: Self::rates_fingerprint,
+        resolve: Self::resolve_rate,
+        selected: |s| SemanticSelection::Position(s.rate),
+        describe: Self::rate_at,
+    };
+
+    /// **Run a semantic setter and prove the semantic value, not the position it travelled as.**
+    ///
+    /// `decide` is the setter itself: it receives the position the request resolved to against a list
+    /// fetched now, and answers with what it did — a no-op, a verified write, a refusal. Everything
+    /// around it is the proof, and the proof is what [`SemanticFamily`] exists for.
+    ///
+    /// The shape is a **bracket**. The enumeration is read, the decision is taken, `State` is read,
+    /// and the enumeration is read again. If the two enumeration identities agree, then no visible
+    /// transition straddled the operation and the `State` observation — which sits between them —
+    /// belongs to that enumeration; the request is then resolved against *that* list and compared
+    /// with the position the daemon actually holds. That comparison is the semantic one. Without it,
+    /// `AlreadySet` and `Applied` rest on a number compared against itself.
+    ///
+    /// `State` is read before the second list on purpose. Read after it, the observation would sit
+    /// outside the bracket and the two identities would bound a window it was not in.
+    ///
+    /// **Bounded at one retry, and it is a retry rather than a second chance to fail.** A transition
+    /// caught once is ordinary — the source moved and the setter re-resolves against the chain that
+    /// is now loaded, which is the self-correcting outcome. Caught twice, the outcome is
+    /// [`SettingOutcome::Ambiguous`]: the write may or may not have landed on the requested value and
+    /// saying either would be a claim. What is never returned from here is `Applied` or `AlreadySet`
+    /// for a value that was not established.
+    ///
+    /// **This is not a compare-and-set.** The protocol has no atomic one: resolution and the write
+    /// are separate commands and another controller can move the daemon between them (#162). An
+    /// out-and-back (ABA) transition can also leave equal opening and closing fingerprints. The
+    /// bracket establishes only "the enumeration did not *visibly* move across this operation and
+    /// the daemon's position resolves to what was asked", which is strictly weaker than atomicity.
+    ///
+    /// The bounded correction amplifies requests: an ordinary semantic write adds a closing list
+    /// read, while one visible transition can perform a second decision/write plus its proof. That
+    /// cost is deliberately capped at one retry.
+    async fn proven_setting<T, R, Fetch, FetchFut, Decide, DecideFut>(
+        &self,
+        family: &SemanticFamily<T, R>,
+        requested: &R,
+        fetch: Fetch,
+        decide: Decide,
+    ) -> Result<SettingOutcome>
+    where
+        R: std::fmt::Display + ?Sized,
+        Fetch: Fn() -> FetchFut,
+        FetchFut: std::future::Future<Output = Result<Vec<T>>>,
+        Decide: Fn(u32) -> DecideFut,
+        DecideFut: std::future::Future<Output = Result<SettingOutcome>>,
+    {
+        let what = family.what;
+        let requested_display = if family.paired {
+            format!("1x={requested},Nx={requested}")
+        } else {
+            requested.to_string()
+        };
+        let mut unsettled: Option<String> = None;
+        // Outcome vocabulary describes the whole operation, not merely its final attempt.
+        // Applied/Ignored mean sent, Ambiguous means delivery was attempted, and
+        // AlreadySet/Suppressed mean no send. Once any attempt may have reached the wire, the whole
+        // operation can never truthfully become AlreadySet or Suppressed.
+        let mut attempted_write = false;
+        let mut acknowledged_write = false;
+        let mut delivery_uncertain = false;
+
+        // Two attempts: one retry, the same bound the read path uses.
+        for _ in 0..2 {
+            let before = match fetch().await {
+                Ok(before) => before,
+                Err(error) if attempted_write => {
+                    return Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "an earlier attempt may have reached the wire, but the retry could not \
+                             fetch the {what} enumeration ({error}); whether the daemon now holds \
+                             {requested} is not established"
+                        ),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            let identity = (family.fingerprint)(&before);
+            let index = match (family.resolve)(&before, requested) {
+                Ok(index) => index,
+                Err(error) if attempted_write => {
+                    return Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "an earlier attempt may have reached the wire, but the retry could not \
+                             resolve {requested} in the {what} enumeration ({error}); whether the \
+                             daemon now holds it is not established"
+                        ),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+
+            let outcome = match decide(index).await {
+                Ok(outcome) => outcome,
+                Err(error) if attempted_write => {
+                    return Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "an earlier attempt may have reached the wire, but the retry's {what} \
+                             decision failed ({error}); whether the daemon now holds {requested} is \
+                             not established"
+                        ),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            match &outcome {
+                SettingOutcome::Applied | SettingOutcome::Ignored { .. } => {
+                    attempted_write = true;
+                    acknowledged_write = true;
+                }
+                SettingOutcome::Ambiguous { .. } => {
+                    attempted_write = true;
+                    delivery_uncertain = true;
+                }
+                SettingOutcome::AlreadySet => {}
+                SettingOutcome::Suppressed { .. } if attempted_write => {
+                    return Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: "an earlier attempt may have reached the wire, but the retry was \
+                                 suppressed before the semantic result could be established"
+                            .to_string(),
+                    });
+                }
+                SettingOutcome::Suppressed { .. } => return Ok(outcome),
+            }
+
+            let state = match self.get_state().await {
+                Ok(state) => state,
+                Err(e) => {
+                    unsettled = Some(format!(
+                        "the daemon's State could not be read back after the {what} decision ({e})"
+                    ));
+                    continue;
+                }
+            };
+            let after = match fetch().await {
+                Ok(after) => after,
+                Err(e) => {
+                    unsettled = Some(format!(
+                        "the {what} enumeration could not be re-read after the decision ({e})"
+                    ));
+                    continue;
+                }
+            };
+
+            if (family.fingerprint)(&after) != identity {
+                tracing::info!(
+                    "HQPlayer's {what} enumeration moved while {what} was being set, so the \
+                     position that was written or compared no longer names what was asked for; \
+                     resolving again against the list it serves now"
+                );
+                unsettled = Some(format!(
+                    "the {what} enumeration the request was resolved against is not the one the \
+                     daemon serves now, so the position that was compared does not name {requested} \
+                     any more"
+                ));
+                continue;
+            }
+
+            let index_now = match (family.resolve)(&after, requested) {
+                Ok(index) => index,
+                Err(error) if attempted_write => {
+                    return Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "a write may have reached the wire, but {requested} could not be \
+                             resolved in the closing {what} enumeration ({error})"
+                        ),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+            return match (family.selected)(&state) {
+                SemanticSelection::Position(current) if current == index_now => {
+                    if attempted_write {
+                        Ok(SettingOutcome::Applied)
+                    } else {
+                        Ok(outcome)
+                    }
+                }
+                SemanticSelection::Position(current) if delivery_uncertain => {
+                    Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "a {what} write was attempted with uncertain delivery, and the stable \
+                             semantic readback is {} rather than {requested_display}; the write may \
+                             or may not have been delivered",
+                            if family.paired {
+                                let value = (family.describe)(&after, current);
+                                format!("1x={value},Nx={value}")
+                            } else {
+                                (family.describe)(&after, current)
+                            }
+                        ),
+                    })
+                }
+                SemanticSelection::Position(current) if acknowledged_write => {
+                    let observed = (family.describe)(&after, current);
+                    Ok(SettingOutcome::Ignored {
+                        what: what.to_string(),
+                        requested: requested_display.clone(),
+                        observed: if family.paired {
+                            format!("1x={observed},Nx={observed}")
+                        } else {
+                            observed
+                        },
+                    })
+                }
+                SemanticSelection::Position(current) => Ok(SettingOutcome::Suppressed {
+                    what: what.to_string(),
+                    reason: format!(
+                        "nothing was sent: the no-op decision was resolved against a stale mapping; \
+                         the stable semantic value is {} rather than {requested}",
+                        (family.describe)(&after, current)
+                    ),
+                }),
+                SemanticSelection::Split(one_x, nx) if delivery_uncertain => {
+                    Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "a {what} write was attempted with uncertain delivery, and State now \
+                             reports a split pair 1x={},Nx={} rather than {requested}",
+                            (family.describe)(&after, one_x),
+                            (family.describe)(&after, nx)
+                        ),
+                    })
+                }
+                SemanticSelection::Split(one_x, nx) if acknowledged_write => {
+                    Ok(SettingOutcome::Ignored {
+                        what: what.to_string(),
+                        requested: requested_display.clone(),
+                        observed: format!(
+                            "1x={},Nx={}",
+                            (family.describe)(&after, one_x),
+                            (family.describe)(&after, nx)
+                        ),
+                    })
+                }
+                SemanticSelection::Split(one_x, nx) => Ok(SettingOutcome::Suppressed {
+                    what: what.to_string(),
+                    reason: format!(
+                        "nothing was sent: the no-op decision was resolved against a stale mapping; \
+                         State reports the split pair 1x={},Nx={} rather than {requested}",
+                        (family.describe)(&after, one_x),
+                        (family.describe)(&after, nx)
+                    ),
+                }),
+                SemanticSelection::Missing => Ok(SettingOutcome::Ambiguous {
+                    what: what.to_string(),
+                    reason: format!(
+                        "the daemon does not report {what} as one value, so whether it now holds \
+                         {requested} cannot be established from its State"
+                    ),
+                }),
+            };
+        }
+
+        Ok(SettingOutcome::Ambiguous {
+            what: what.to_string(),
+            reason: format!(
+                "{}, and the retry met the same thing, so whether the daemon now holds {requested} \
+                 is not established; {}",
+                unsettled.unwrap_or_else(|| format!("the {what} enumeration would not settle"))
+                ,
+                if attempted_write {
+                    "at least one write reached or may have reached the wire"
+                } else {
+                    "no write reached the wire"
+                }
+            ),
+        })
+    }
+
     /// Confirm a setting actually applied, by reading the authoritative `State` field back.
     ///
     /// Verified daemon behaviour: a setter can return `result="OK"` without the setting actually
@@ -3036,28 +3503,40 @@ impl HqpAdapter {
     /// when the mode does not change (HQP-C-017), so an unconditional write destroys a user's pinned
     /// rate for nothing. When a write is performed the chain reloads, so every chain-scoped list is
     /// dropped and the pin the daemon just cleared is re-read rather than remembered.
+    /// The chain-transition hazard [`SemanticFamily`] describes cannot reach *this* family: `GetModes`
+    /// is device-scoped, so the loaded chain moving does not renumber it. What can reshape it is a
+    /// device or profile change — a PCM-only DAC's list has **no** SDM entry and the survivors keep
+    /// their own positions (HQP-C-013) — and an *external* one moves no UHC cache and bumps no
+    /// generation, so the fence does not cover it either. An exemption argued from "this family does
+    /// not move" is the shape of reasoning this issue exists to remove, so mode is proved like the
+    /// rest.
     pub async fn set_mode(&self, mode_name: &str) -> Result<SettingOutcome> {
-        let modes = self.fresh_modes().await?;
-        let mode_index = Self::resolve_mode(&modes, mode_name)?;
+        self.proven_setting(
+            &Self::MODE,
+            mode_name,
+            || self.fresh_modes(),
+            |mode_index| async move {
+                let state = self.get_state().await?;
+                if u32::from(state.mode) == mode_index {
+                    tracing::debug!(
+                        "HQPlayer is already in mode {mode_index}; not writing it, because SetMode \
+                         clears the rate pin even when the mode does not change"
+                    );
+                    return Ok(SettingOutcome::AlreadySet);
+                }
 
-        let state = self.get_state().await?;
-        if u32::from(state.mode) == mode_index {
-            tracing::debug!(
-                "HQPlayer is already in mode {mode_index}; not writing it, because SetMode clears \
-                 the rate pin even when the mode does not change"
-            );
-            return Ok(SettingOutcome::AlreadySet);
-        }
-
-        let xml = Self::build_request("SetMode", &[("value", &mode_index.to_string())]);
-        let outcome = self
-            .write_setting(&xml, "mode", mode_index, |s| Some(u32::from(s.mode)))
-            .await?;
-        // A mode change reloads the chain whatever the readback said, so nothing cached about it
-        // survives. This is also what makes the cleared pin honest: there is no remembered rate to
-        // report, only the one the daemon now holds.
-        self.invalidate_chain_cache().await;
-        Ok(outcome)
+                let xml = Self::build_request("SetMode", &[("value", &mode_index.to_string())]);
+                let outcome = self
+                    .write_setting(&xml, "mode", mode_index, |s| Some(u32::from(s.mode)))
+                    .await?;
+                // A mode change reloads the chain whatever the readback said, so nothing cached
+                // about it survives. This is also what makes the cleared pin honest: there is no
+                // remembered rate to report, only the one the daemon now holds.
+                self.invalidate_chain_cache().await;
+                Ok(outcome)
+            },
+        )
+        .await
     }
 
     /// The request both sides of the pair travel in, built in one place so they cannot drift.
@@ -3124,22 +3603,27 @@ impl HqpAdapter {
     /// It also needs no sibling: both sides are being written, so nothing has to be read out of
     /// `State` first and the refusal in [`Self::set_filter_side`] does not apply here.
     pub async fn set_filter_pair(&self, filter_name: &str) -> Result<SettingOutcome> {
-        let filters = self.fresh_filters().await?;
-        let index = Self::resolve_filter(&filters, filter_name)?;
+        self.proven_setting(
+            &Self::FILTER_PAIR,
+            filter_name,
+            || self.fresh_filters(),
+            |index| async move {
+                let state = self.get_state().await?;
+                if state.filter1x == Some(index) && state.filter_nx == Some(index) {
+                    return Ok(SettingOutcome::AlreadySet);
+                }
 
-        let state = self.get_state().await?;
-        if state.filter1x == Some(index) && state.filter_nx == Some(index) {
-            return Ok(SettingOutcome::AlreadySet);
-        }
-
-        // Both sides are the setting here, so both are verified. Rendered as one value because the
-        // pair is what was requested and reporting half of it back would be the same mistake as
-        // writing half of it.
-        let expected = format!("1x={index},Nx={index}");
-        tracing::debug!("SetFilter (both sides): value={index}, value1x={index}");
-        let xml = Self::filter_request(index, index);
-        self.write_setting(&xml, "filter", expected, Self::filter_pair_observation)
-            .await
+                // Both sides are the setting here, so both are verified. Rendered as one value
+                // because the pair is what was requested and reporting half of it back would be the
+                // same mistake as writing half of it.
+                let expected = format!("1x={index},Nx={index}");
+                tracing::debug!("SetFilter (both sides): value={index}, value1x={index}");
+                let xml = Self::filter_request(index, index);
+                self.write_setting(&xml, "filter", expected, Self::filter_pair_observation)
+                    .await
+            },
+        )
+        .await
     }
 
     /// One side of the filter pair, carrying the authoritative other side with it.
@@ -3150,39 +3634,48 @@ impl HqpAdapter {
     /// overwrote the setting the caller did not touch. When the sibling cannot be established the
     /// write is refused with a reason and nothing is sent.
     async fn set_filter_side(&self, side: FilterSide, filter_name: &str) -> Result<SettingOutcome> {
-        let filters = self.fresh_filters().await?;
-        let index = Self::resolve_filter(&filters, filter_name)?;
+        let family = match side {
+            FilterSide::OneX => &Self::FILTER_1X,
+            FilterSide::Nx => &Self::FILTER_NX,
+        };
         let what = side.field();
+        self.proven_setting(
+            family,
+            filter_name,
+            || self.fresh_filters(),
+            |index| async move {
+                let state = self.get_state().await?;
+                let (Some(current_1x), Some(current_nx)) = (state.filter1x, state.filter_nx) else {
+                    return Ok(SettingOutcome::Suppressed {
+                        what: what.to_string(),
+                        reason: "the daemon's State does not report both filter1x and filterNx, and \
+                                 SetFilter writes both sides at once; sending it would overwrite the \
+                                 sibling with a guess"
+                            .to_string(),
+                    });
+                };
 
-        let state = self.get_state().await?;
-        let (Some(current_1x), Some(current_nx)) = (state.filter1x, state.filter_nx) else {
-            return Ok(SettingOutcome::Suppressed {
-                what: what.to_string(),
-                reason: "the daemon's State does not report both filter1x and filterNx, and \
-                         SetFilter writes both sides at once; sending it would overwrite the sibling \
-                         with a guess"
-                    .to_string(),
-            });
-        };
+                let current = match side {
+                    FilterSide::OneX => current_1x,
+                    FilterSide::Nx => current_nx,
+                };
+                if current == index {
+                    return Ok(SettingOutcome::AlreadySet);
+                }
 
-        let current = match side {
-            FilterSide::OneX => current_1x,
-            FilterSide::Nx => current_nx,
-        };
-        if current == index {
-            return Ok(SettingOutcome::AlreadySet);
-        }
-
-        let (send_nx, send_1x) = match side {
-            FilterSide::OneX => (current_nx, index),
-            FilterSide::Nx => (index, current_1x),
-        };
-        tracing::debug!("SetFilter: value={send_nx} (Nx), value1x={send_1x} (1x)");
-        let xml = Self::filter_request(send_nx, send_1x);
-        self.write_setting(&xml, what, index, |s| match side {
-            FilterSide::OneX => s.filter1x,
-            FilterSide::Nx => s.filter_nx,
-        })
+                let (send_nx, send_1x) = match side {
+                    FilterSide::OneX => (current_nx, index),
+                    FilterSide::Nx => (index, current_1x),
+                };
+                tracing::debug!("SetFilter: value={send_nx} (Nx), value1x={send_1x} (1x)");
+                let xml = Self::filter_request(send_nx, send_1x);
+                self.write_setting(&xml, what, index, |s| match side {
+                    FilterSide::OneX => s.filter1x,
+                    FilterSide::Nx => s.filter_nx,
+                })
+                .await
+            },
+        )
         .await
     }
 
@@ -3233,16 +3726,22 @@ impl HqpAdapter {
 
     /// Set the shaper (the modulator, under an SDM chain) by semantic name.
     pub async fn set_shaper(&self, shaper_name: &str) -> Result<SettingOutcome> {
-        let shapers = self.fresh_shapers().await?;
-        let shaper_index = Self::resolve_shaper(&shapers, shaper_name)?;
+        self.proven_setting(
+            &Self::SHAPER,
+            shaper_name,
+            || self.fresh_shapers(),
+            |shaper_index| async move {
+                if self.get_state().await?.shaper == shaper_index {
+                    return Ok(SettingOutcome::AlreadySet);
+                }
 
-        if self.get_state().await?.shaper == shaper_index {
-            return Ok(SettingOutcome::AlreadySet);
-        }
-
-        let xml = Self::build_request("SetShaping", &[("value", &shaper_index.to_string())]);
-        self.write_setting(&xml, "shaper", shaper_index, |s| Some(s.shaper))
-            .await
+                let xml =
+                    Self::build_request("SetShaping", &[("value", &shaper_index.to_string())]);
+                self.write_setting(&xml, "shaper", shaper_index, |s| Some(s.shaper))
+                    .await
+            },
+        )
+        .await
     }
 
     /// Whether the daemon's **configured** mode is the source-following one.
@@ -3271,38 +3770,37 @@ impl HqpAdapter {
     /// rate is already 0 compares 0 against 0, so a readback reports success for a command that did
     /// nothing (HQP-C-019).
     pub async fn set_rate(&self, rate_value: u32) -> Result<SettingOutcome> {
-        let modes = self.fresh_modes().await?;
-        let state = self.get_state().await?;
-        if let Some(mode_name) = Self::configured_source_mode(&modes, &state) {
-            return Ok(SettingOutcome::Suppressed {
-                what: "rate".to_string(),
-                reason: format!(
-                    "the configured mode is '{mode_name}', in which the daemon acknowledges a rate \
-                     pin and applies nothing — the rate is governed by persistent configuration \
-                     there, so the write was not sent"
-                ),
-            });
-        }
+        // The pin is a name-to-position problem like every other setter's, so it is proved like one.
+        // Source-mode suppression lives inside the decision so every retry re-evaluates it before a
+        // write; checking only once outside the bracket would let a transition to `[source]` during
+        // the first attempt send a pin on the retry.
+        self.proven_setting(
+            &Self::RATE,
+            &rate_value,
+            || self.fresh_rates(),
+            |index| async move {
+                let modes = self.fresh_modes().await?;
+                let state = self.get_state().await?;
+                if let Some(mode_name) = Self::configured_source_mode(&modes, &state) {
+                    return Ok(SettingOutcome::Suppressed {
+                        what: "rate".to_string(),
+                        reason: format!(
+                            "the configured mode is '{mode_name}', in which the daemon acknowledges \
+                             a rate pin and applies nothing — the rate is governed by persistent \
+                             configuration there, so the write was not sent"
+                        ),
+                    });
+                }
+                if state.rate == index {
+                    return Ok(SettingOutcome::AlreadySet);
+                }
 
-        let rates = self.fresh_rates().await?;
-        let index = rates
-            .iter()
-            .find(|r| r.rate == rate_value)
-            .map(|r| r.index)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Rate {} is not offered for the chain this daemon has loaded",
-                    rate_value
-                )
-            })?;
-
-        if state.rate == index {
-            return Ok(SettingOutcome::AlreadySet);
-        }
-
-        let xml = Self::build_request("SetRate", &[("value", &index.to_string())]);
-        self.write_setting(&xml, "rate", index, |s| Some(s.rate))
-            .await
+                let xml = Self::build_request("SetRate", &[("value", &index.to_string())]);
+                self.write_setting(&xml, "rate", index, |s| Some(s.rate))
+                    .await
+            },
+        )
+        .await
     }
 
     /// Turn a legacy numeric setting value into the semantic name it denotes **right now**.
