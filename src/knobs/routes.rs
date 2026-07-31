@@ -640,7 +640,24 @@ async fn control_hqplayer(
     };
 
     // The aggregator is the only state source consulted here.
-    let zone = state.aggregator.get_zone(zone_id).await;
+    //
+    // Its absence is decisive rather than merely inconvenient: the aggregator withdraws the zone when
+    // the producer stops, so a zone it does not hold is one no surface will show and none of this
+    // function's capability checks can be evaluated against. The transport arms below consulted the
+    // zone only for `next`/`previous`, so `play`, `pause` and `stop` were accepted — and answered
+    // `{"ok":true}` — for a withdrawn zone whose instance still happened to exist in the manager's
+    // map. Found by the review pass, pinned by
+    // `transport_is_refused_for_a_zone_the_aggregator_has_withdrawn`.
+    let Some(zone) = state.aggregator.get_zone(zone_id).await else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("zone {} is not currently published", zone_id),
+                "error_code": "ZONE_NOT_FOUND",
+            })),
+        ));
+    };
+    let zone = Some(zone);
 
     let result = match action {
         "play" => adapter.play().await,
@@ -737,7 +754,7 @@ async fn control_hqplayer(
             // the daemon's step — which the verified live sample does not even send — and would
             // ignore the user's configured `volume_step_override`.
             let target = (f64::from(vc.value) + delta).clamp(f64::from(vc.min), f64::from(vc.max));
-            adapter.set_volume_db(target).await
+            adapter.set_volume_db(quantise_db(target)).await
         }
         "vol_abs" | "volume" => {
             let vc = require_volume_control(zone.as_ref())?;
@@ -751,7 +768,9 @@ async fn control_hqplayer(
                 ));
             };
             adapter
-                .set_volume_db(requested.clamp(f64::from(vc.min), f64::from(vc.max)))
+                .set_volume_db(quantise_db(
+                    requested.clamp(f64::from(vc.min), f64::from(vc.max)),
+                ))
                 .await
         }
         "mute" => {
@@ -777,6 +796,22 @@ async fn control_hqplayer(
             Json(serde_json::json!({"error": e.to_string()})),
         )),
     }
+}
+
+/// Round a computed dB level to a hundredth of a decibel before it reaches the wire.
+///
+/// The published zone carries `value`, `min`, `max` and `step` as `f32` (`crate::bus::VolumeControl`),
+/// so widening them back to `f64` to do arithmetic reintroduces the representation error as trailing
+/// digits. A daemon reporting a 0.1 dB step turned `-23.5 + 0.1` into `-23.399999998509884`, and
+/// `set_volume_db` formats with `{}` — so that is what would have gone out on the wire, where the
+/// reference client sends `-23.4`.
+///
+/// A hundredth of a dB is far below audibility and below the finest step any observed daemon reports,
+/// so this cannot quantise away a real distinction; it only removes float noise. It is deliberately
+/// **not** a clamp and does not decide any bound — the clamp against the zone's observed range has
+/// already happened by the time this is called.
+fn quantise_db(db: f64) -> f64 {
+    (db * 100.0).round() / 100.0
 }
 
 /// The zone's published volume control, or a refusal.

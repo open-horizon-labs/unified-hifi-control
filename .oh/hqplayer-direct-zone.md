@@ -262,12 +262,69 @@ excerpts.
 
 | Gate | Command | Result |
 |------|---------|--------|
-| RED, targeted | `cargo test --test hqplayer_direct_zone` | recorded in the Execute checkpoint comment |
-| GREEN, targeted | `cargo test --test hqplayer_direct_zone` | recorded |
-| Client harness | `cargo test --test client_harness` | recorded |
-| Conformance | `cargo test --test hqplayer_conformance` | recorded |
-| Architecture / API / lints | `cargo test --test architecture_lint --test api_contract --test aggregator_lint --test adaptive_dependency_lint` | recorded |
-| Whole suite | `cargo test --all-features` | recorded |
-| Clippy | `cargo clippy --all-targets --all-features -- -D warnings` | recorded |
-| Format | `cargo fmt --check` | recorded |
-| UI build | `dx build --release --platform web --features web` | recorded / justified if skipped |
+| **RED, targeted** | `cargo test --test hqplayer_direct_zone` @ `74b24d6` | **33 passed, 19 failed** — tests + seams only, no behaviour |
+| GREEN, targeted | `cargo test --test hqplayer_direct_zone` | **56 passed, 0 failed** |
+| Conformance | `cargo test --test hqplayer_conformance` | **290 passed, 0 failed** |
+| Volume safety | `cargo test --test volume_safety` | **16 passed** (2 new, both proven non-vacuous by mutation) |
+| API contract | `cargo test --test api_contract` | **2 passed**; `api_routes.txt` byte-identical |
+| Whole suite | `cargo test --all-features` | **1,250 passed, 0 failed, 13 ignored** across 32 targets |
+| Clippy | `cargo clippy --all-targets --all-features -- -D warnings` | **Not green, and not made green.** 397 pre-existing errors at base `a178b76` (the #338 backlog). One new finding introduced and fixed. Findings in `src/knobs/routes.rs`: **0**. In `src/adapters/hqplayer.rs`: **3**, all pre-existing in its `#[cfg(test)]` module, none on an edited line. |
+| Format | `cargo fmt --all --check` | **clean** |
+| Release UI | `dx build --release --platform web --features web` | **Client + Server build completed successfully** |
+| Live | — | **Not run.** Hermetic fixtures only, per constraint. |
+
+### Environment faults hit on the way (not code defects)
+
+* `public/tailwind.css` is a gitignored build artifact and absent from a fresh worktree; nothing
+  compiles until `make css` generates it.
+* `dx build` first failed with `Missing rust target wasm32-unknown-unknown`. Two causes stacked:
+  `sccache` (set as `rustc-wrapper` in `~/.cargo/config.toml`) corrupts `dx`'s rustc probe, and
+  `/opt/homebrew/bin/rustc` 1.93.1 — which has no wasm std — shadows the rustup `stable` toolchain
+  that does. Green with `RUSTC_WRAPPER=` and the rustup `stable` bin ahead on `PATH`. Same family as
+  the rig-side faults recorded against #337: the tree was fine and the host was not.
+
+---
+
+## Review pass — what falsification actually found
+
+Four defects, all in code written earlier in this same session. Each is now pinned by a named test.
+
+1. **The volume-step safety floor coarsened a finer reported step.** The floor was applied as
+   `.max(MIN_PUBLISHED_VOLUME_STEP_DB)` *over the reported value*, so a daemon offering 0.1 dB was
+   published as offering 0.5 dB. A fabrication in the opposite direction from the one the floor
+   exists to prevent, and the most embarrassing of the four: the fix for "never publish an unusable
+   step" quietly became "never publish an accurate one". Now the floor applies only when nothing
+   usable was reported. → `a_finer_reported_step_is_not_coarsened_by_the_safety_floor`
+2. **Float representation error reached the wire.** The published zone carries level and step as
+   `f32`; widening them back to `f64` to add turned `-23.5 + 0.1` into `-23.399999998509884`, and
+   `set_volume_db` formats with `{}`. Fixed by quantising to 0.01 dB — below audibility and below the
+   finest observed step, so it removes noise without quantising away a real distinction. →
+   `a_computed_level_reaches_the_wire_without_float_noise`
+3. **A raw `>` in an attribute value truncated the metadata scan.** XML forbids `<` and `&` in
+   attribute values but *permits a bare `>`*, so `song="a/>b"` is well-formed; the plain search for
+   the child's `/>` cut inside the value and silently lost the title, the album *and* the source bit
+   depth. The terminator search is now quote-aware. Note the direction of the miss: this was
+   introduced by the very bound added to stop a malformed child swallowing `</Status>`. →
+   `a_raw_terminator_inside_an_attribute_value_does_not_truncate_the_metadata_scan`
+4. **Transport was accepted for a withdrawn zone.** `play`/`pause`/`stop` did not consult the
+   published zone at all, so they answered `{"ok":true}` for a zone the aggregator had withdrawn,
+   purely because the instance remained in the manager's map. Now every arm requires the published
+   zone. → `transport_is_refused_for_a_zone_the_aggregator_has_withdrawn`
+
+Two hypotheses the pass **failed** to confirm, recorded because a review that only reports hits is
+not evidence of much:
+
+* That `trim_start_matches("hqplayer:")` mishandles an instance name containing a colon. It does
+  not — `hqplayer:a:b` yields `a:b`, which is the correct key. (It *would* strip a repeated prefix,
+  but an instance literally named `hqplayer:x` is not a reachable configuration.)
+* That an attribute value containing an encoded `&gt;` truncates the scan. It does not: the raw
+  document contains `&gt;`, not `>`. Only the *unencoded* form was a hazard, which is what sharpened
+  the probe into finding 3.
+
+### What the review did not close
+
+* The one-poll-interval staleness on `play_pause` and relative volume (Known limitations 4 and 5).
+  Confirmed reachable; not fixed, because both available fixes are forbidden — a surface reading
+  adapter state, or a daemon-side compare-and-set the protocol lacks.
+* Whether any real daemon populates `composer`/`genre`/`uri`. Unfalsifiable hermetically, and
+  deliberately not claimed either way: the parser reads what arrives.

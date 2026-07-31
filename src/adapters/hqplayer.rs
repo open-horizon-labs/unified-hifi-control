@@ -4263,13 +4263,15 @@ impl HqpAdapter {
             return attrs;
         };
         let rest = &response[start..];
-        // The child is self-closing in every observed document, but bound the scan at whichever
-        // terminator arrives first so a child missing its `/>` cannot swallow the closing `</Status>`
-        // and start reporting root attributes as source metadata.
-        let end = rest
-            .find("/>")
-            .or_else(|| rest.find('>'))
-            .unwrap_or(rest.len());
+        // Bound the scan at the child's own terminator, so a child missing its `/>` cannot swallow
+        // the closing `</Status>` and start reporting root attributes as source metadata.
+        //
+        // The search is **quote-aware**, and that is not defensive padding: XML forbids `<` and `&`
+        // in an attribute value but *permits a bare `>`*, so `song="a/>b"` is well-formed. A plain
+        // `find("/>")` cuts inside that value and silently loses every attribute after it — verified
+        // by `probe_raw_terminator_inside_an_attribute_value`, which lost the title, the album and
+        // the source bit depth to a track name containing a slash before a bracket.
+        let end = Self::element_open_tag_end(rest);
         let scope = &rest[..end];
 
         // Walk ` name="value"` pairs. An unterminated value ends the walk rather than the document:
@@ -4295,6 +4297,22 @@ impl HqpAdapter {
             cursor = &quoted[close + 1..];
         }
         attrs
+    }
+
+    /// Byte offset just past an element's open tag, ignoring `>` inside quoted attribute values.
+    ///
+    /// Returns the slice length when the tag never terminates, so a truncated document yields
+    /// "everything present" rather than nothing.
+    fn element_open_tag_end(tag: &str) -> usize {
+        let mut in_quotes = false;
+        for (offset, ch) in tag.char_indices() {
+            match ch {
+                '"' => in_quotes = !in_quotes,
+                '>' if !in_quotes => return offset,
+                _ => {}
+            }
+        }
+        tag.len()
     }
 
     /// Typed source-domain reading of one metadata attribute.
@@ -7361,15 +7379,21 @@ impl HqpAdapter {
         };
 
         let volume_control = if vol_range.enabled {
-            // The step the daemon actually sent, and only if it is usable. The verified live sample
+            // The step the daemon actually sent, if it sent a usable one. The verified live sample
             // sends **no** `step` attribute at all, so `step_db` is routinely `None`; the integer
             // sibling is already `.max(1)` at parse time. A zero or negative step would reach a knob
             // as "turning me changes nothing", which is why this cannot be a bare `unwrap_or`.
-            let step = vol_range
-                .step_db
-                .filter(|db| *db > 0.0)
-                .unwrap_or(f64::from(vol_range.step))
-                .max(Self::MIN_PUBLISHED_VOLUME_STEP_DB);
+            //
+            // The floor applies **only when nothing usable was reported**. An earlier version of this
+            // took `.max(MIN_PUBLISHED_VOLUME_STEP_DB)` over the reported value, which silently
+            // coarsened a daemon's genuine 0.1 dB step to 0.5 dB — a fabrication in the opposite
+            // direction from the one the floor exists to prevent, and a fine-step user would have
+            // felt it immediately. Caught by review, pinned by
+            // `a_finer_reported_step_is_not_coarsened_by_the_safety_floor`.
+            let step = match vol_range.step_db.filter(|db| *db > 0.0) {
+                Some(reported) => reported,
+                None => f64::from(vol_range.step).max(Self::MIN_PUBLISHED_VOLUME_STEP_DB),
+            };
 
             // Clamped into the observed range before publication. An out-of-range level is a
             // disagreement between two daemon reads (`Status.volume` and `VolumeRange`), and a client

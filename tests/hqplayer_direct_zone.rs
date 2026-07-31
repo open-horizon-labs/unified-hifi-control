@@ -1301,3 +1301,187 @@ fn the_zone_filter_matches_the_prefix_hqplayer_zones_are_actually_published_with
 // axum versions, so name it once rather than conditionally importing it.
 #[allow(dead_code)]
 fn _addr_type_is_used(_: Option<SocketAddr>) {}
+
+// =============================================================================
+// review — defects found by the falsification pass, pinned so they stay fixed
+// =============================================================================
+
+/// **Found by review.** The safety floor on the published volume step must not coarsen a *finer*
+/// step the daemon actually reported.
+///
+/// The first version of the #328 projection took `.max(MIN_PUBLISHED_VOLUME_STEP_DB)` over the
+/// reported value, so a daemon offering 0.1 dB was published as offering 0.5 dB. That is a
+/// fabrication in the opposite direction from the one the floor exists to prevent, and a
+/// fine-step user would feel it on the first turn of the knob. The floor is for a step that was
+/// never reported, not for one that was.
+#[tokio::test]
+async fn a_finer_reported_step_is_not_coarsened_by_the_safety_floor() {
+    let model = playing_daemon();
+    model.external_change(|s| {
+        s.volume_db = -23.5;
+        s.volume_range.min_db = -60.0;
+        s.volume_range.max_db = 0.0;
+        s.volume_range.step_db = Some(0.1);
+    });
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    let zone = rig.zone_when(|z| z.volume_control.is_some()).await;
+
+    assert_eq!(
+        zone.volume_control.expect("control").step,
+        0.1,
+        "the daemon reported 0.1 dB; publishing 0.5 dB overstates its granularity"
+    );
+
+    let (status, _) = rig
+        .post_control(json!({"zone_id":"hqplayer:rig","action":"vol_up"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        mock_servers::hqplayer::model::request_attr(
+            &model.last_request("Volume").expect("a Volume write"),
+            "value"
+        )
+        .as_deref(),
+        Some("-23.4"),
+        "one 0.1 dB step up from -23.5 dB is -23.4 dB"
+    );
+
+    rig.shutdown().await;
+    server.stop();
+}
+
+/// **Found by review.** A computed level must reach the wire as a clean decimal, not as the
+/// `f32`→`f64` representation error of the arithmetic that produced it.
+///
+/// The published zone carries the level and step as `f32`. Widening them back to `f64` and adding
+/// turned `-23.5 + 0.1` into `-23.399999998509884`, and `set_volume_db` formats with `{}` — so that
+/// is the string the daemon would have received, where the reference client sends `-23.4`.
+#[tokio::test]
+async fn a_computed_level_reaches_the_wire_without_float_noise() {
+    let model = playing_daemon();
+    model.external_change(|s| {
+        s.volume_db = -23.5;
+        s.volume_range.min_db = -60.0;
+        s.volume_range.max_db = 0.0;
+        s.volume_range.step_db = Some(0.1);
+    });
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|z| z.volume_control.is_some()).await;
+
+    for action in ["vol_up", "vol_down"] {
+        let (status, _) = rig
+            .post_control(json!({"zone_id":"hqplayer:rig","action":action}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let value = mock_servers::hqplayer::model::request_attr(
+            &model.last_request("Volume").expect("a Volume write"),
+            "value",
+        )
+        .expect("a value attribute");
+        let decimals = value.split_once('.').map(|(_, d)| d.len()).unwrap_or(0);
+        assert!(
+            decimals <= 2,
+            "`{action}` put {decimals} decimal places on the wire ({value}); a dB level is not a \
+             place to leak float representation error"
+        );
+    }
+
+    rig.shutdown().await;
+    server.stop();
+}
+
+/// **Found by review.** A raw `>` inside an attribute value must not truncate the metadata scan.
+///
+/// XML forbids `<` and `&` in attribute values but **permits a bare `>`**, so `song="a/>b"` is
+/// well-formed. A plain search for the child's `/>` terminator cut inside that value and silently
+/// lost every attribute after it — here the title, the album *and* the source bit depth, to a track
+/// name containing a slash before a bracket.
+#[test]
+fn a_raw_terminator_inside_an_attribute_value_does_not_truncate_the_metadata_scan() {
+    let doc = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Status state="2" track="1" track_id="x" position="5" length="60" volume="-12.5" "#,
+        r#"samplerate="44100" bitrate="1411">"#,
+        "\n",
+        r#"<metadata artist="Nine Inch Nails" song="a/>b" album="Broken" bits="24"/>"#,
+        "\n</Status>",
+    );
+
+    let status = HqpAdapter::parse_status_for_test(doc);
+    assert_eq!(status.artist.as_deref(), Some("Nine Inch Nails"));
+    assert_eq!(status.title.as_deref(), Some("a/>b"));
+    assert_eq!(
+        status.album.as_deref(),
+        Some("Broken"),
+        "attributes after a value containing `/>` must still be read"
+    );
+    assert_eq!(status.source_bits, Some(24));
+
+    // And the bound still holds in the direction it was added for: a child that never terminates
+    // must not start reporting the root's own attributes as source metadata.
+    let unterminated = concat!(
+        r#"<?xml version="1.0"?>"#,
+        r#"<Status state="2" track="1" track_id="x" position="5" length="60" volume="-12.5" "#,
+        r#"active_bits="32" samplerate="44100">"#,
+        "\n",
+        r#"<metadata artist="Bill Evans"#,
+        "\n</Status>",
+    );
+    let status = HqpAdapter::parse_status_for_test(unterminated);
+    assert_eq!(status.state, 2, "the root survives");
+    assert_eq!(status.volume_db, -12.5);
+    assert_eq!(
+        status.source_bits, None,
+        "the root's output active_bits must never be read as the source depth"
+    );
+}
+
+/// **Found by review.** A command for a zone the aggregator has withdrawn must be refused.
+///
+/// The capability checks are evaluated against the published zone, so with no published zone there
+/// is nothing to evaluate — but the `play`/`pause`/`stop` arms did not consult it at all and
+/// answered `{"ok":true}` for a zone that had already been withdrawn, purely because the instance
+/// still existed in the manager's map. A client that shows no such zone should not be able to
+/// command it.
+#[tokio::test]
+async fn transport_is_refused_for_a_zone_the_aggregator_has_withdrawn() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+
+    // Stopping the producer withdraws the zone; the instance itself remains configured.
+    rig.manager.stop().await;
+    for _ in 0..200 {
+        if rig.aggregator.get_zone("hqplayer:rig").await.is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        rig.aggregator.get_zone("hqplayer:rig").await.is_none(),
+        "the RED needs the zone actually withdrawn"
+    );
+
+    for action in ["play", "pause", "stop", "next", "seek", "vol_up", "mute"] {
+        let mut body = json!({"zone_id":"hqplayer:rig","action":action});
+        if action == "seek" {
+            body["value"] = json!(10);
+        }
+        let (status, response) = rig.post_control(body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "`{action}` on a withdrawn zone must be refused; got {response}"
+        );
+    }
+
+    rig.bus.publish(BusEvent::ShuttingDown { reason: None });
+    let _ = rig.aggregator_task.await;
+    server.stop();
+}
