@@ -79,6 +79,8 @@ could not update them. If that directory contains configuration you still use,
 move it into the systemd-managed state directory before restarting:
 
 ```bash
+# Start once so systemd provisions the state directory with the dynamic user's ownership.
+sudo systemctl start unified-hifi-control
 sudo systemctl stop unified-hifi-control
 sudo cp -a /etc/unified-hifi-control/. /var/lib/unified-hifi-control/
 sudo chown -R -H --reference=/var/lib/unified-hifi-control /var/lib/unified-hifi-control
