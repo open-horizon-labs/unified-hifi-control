@@ -266,7 +266,7 @@ pub fn Zones() -> Element {
             }
         };
         let mut result: Vec<_> = groups.into_iter().collect();
-        result.sort_by(|a, b| priority(&a.0).cmp(&priority(&b.0)));
+        result.sort_by_key(|a| priority(&a.0));
         result
     };
 
