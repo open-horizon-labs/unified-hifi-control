@@ -18,6 +18,7 @@ use unified_hifi_control::adapters::hqplayer::{
     HqpRecoveryConfig, HqpTimeouts, HqpWorkerPhase, HqpWorkerStatus,
 };
 use unified_hifi_control::adapters::Startable;
+use unified_hifi_control::adaptive::TargetRole;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState, Zone};
 use unified_hifi_control::producers::hqplayer::HqpAdaptivePublisher;
@@ -523,6 +524,101 @@ async fn removing_one_adaptive_instance_retires_only_its_producer() {
 }
 
 #[tokio::test]
+async fn stopped_manager_removal_retires_and_same_name_readd_advances_the_producer_epoch() {
+    isolate_config_dir();
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let bus = create_bus();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (handle, actor, view) = AdaptiveRuntime::build(shutdown.clone(), 32);
+    let actor_task = tokio::spawn(async move { actor.run().await });
+    let manager = adaptive_manager(bus, handle);
+    let adapter = manager
+        .add_instance(
+            "rig".to_string(),
+            "127.0.0.1".to_string(),
+            Some(server.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    adapter.set_timeouts(fast_timeouts()).await;
+    adapter.set_recovery_config(fast_recovery()).await;
+    manager.start().await.expect("start managed instance");
+
+    let key = ProducerKey {
+        producer_id: "hqplayer:rig".to_string(),
+        role: TargetRole::DspEngine,
+        zone_id: None,
+    };
+    let retired_epoch = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(snapshot) = view.snapshot(&key) {
+                break snapshot.document.producer.epoch;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("initial producer admitted");
+
+    manager.stop().await;
+    assert!(
+        manager.remove_instance("rig").await,
+        "a configured instance can be definitively removed while its manager is stopped"
+    );
+    assert!(
+        view.snapshot(&key).is_none(),
+        "stopped-manager removal still applies adaptive retirement"
+    );
+
+    let replacement = manager
+        .add_instance(
+            "rig".to_string(),
+            "127.0.0.1".to_string(),
+            Some(server.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    replacement.set_timeouts(fast_timeouts()).await;
+    replacement.set_recovery_config(fast_recovery()).await;
+    assert_eq!(
+        replacement.producer_epoch().await,
+        retired_epoch.0,
+        "replacement inherits the logical producer epoch floor before its first connection"
+    );
+    manager.start().await.expect("restart replacement instance");
+
+    let replacement_epoch = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(snapshot) = view.snapshot(&key) {
+                if snapshot.presence == ProducerPresence::Live {
+                    break snapshot.document.producer.epoch;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("same-name replacement clears the retirement floor");
+    assert!(
+        replacement_epoch.0 == retired_epoch.0 + 1,
+        "same-name replacement's first coherent session advances exactly once past retirement"
+    );
+
+    manager.stop().await;
+    shutdown.cancel();
+    actor_task.await.expect("actor drains");
+    server.stop();
+}
+
+#[tokio::test]
 async fn failed_adaptive_retirement_rolls_back_instance_removal() {
     isolate_config_dir();
     let server = WireServer::start(
@@ -594,6 +690,7 @@ async fn failed_adaptive_retirement_rolls_back_instance_removal() {
     server.stop();
 }
 
+#[cfg(debug_assertions)]
 #[tokio::test]
 async fn accepted_adaptive_retirement_retry_does_not_restore_the_removed_instance() {
     isolate_config_dir();

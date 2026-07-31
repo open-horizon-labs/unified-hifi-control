@@ -2123,6 +2123,16 @@ impl HqpAdapter {
         self.state.read().await.producer_epoch
     }
 
+    /// Carry a retired logical producer's epoch floor into a replacement adapter object.
+    ///
+    /// Instance names are producer identities. Removing and re-adding the same name must therefore
+    /// reconnect at an epoch strictly newer than the adaptive retirement tombstone, even though a
+    /// fresh adapter object's local counter would otherwise restart at zero.
+    async fn seed_producer_epoch_floor(&self, floor: u64) {
+        let mut state = self.state.write().await;
+        state.producer_epoch = state.producer_epoch.max(floor);
+    }
+
     /// Monotonic identity of the configured native + persistent endpoint.
     ///
     /// Internal provenance seam for hermetic operation-lease tests. It is not serialized by an
@@ -7194,6 +7204,11 @@ struct HqpManagedWorker {
 
 pub struct HqpInstanceManager {
     instances: Arc<RwLock<HashMap<String, Arc<HqpAdapter>>>>,
+    /// Highest producer epoch retired for each logical instance name in this process.
+    ///
+    /// The adaptive aggregator retains the corresponding tombstone for the same lifetime, so this
+    /// map deliberately has matching lifetime: a same-name replacement must start above that floor.
+    producer_epoch_floors: Arc<RwLock<HashMap<String, u64>>>,
     bus: SharedBus,
     running: Arc<AtomicBool>,
     workers: Arc<Mutex<HashMap<String, HqpManagedWorker>>>,
@@ -7224,6 +7239,7 @@ impl HqpInstanceManager {
     ) -> Self {
         Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
+            producer_epoch_floors: Arc::new(RwLock::new(HashMap::new())),
             bus,
             running: Arc::new(AtomicBool::new(false)),
             workers: Arc::new(Mutex::new(HashMap::new())),
@@ -7283,15 +7299,29 @@ impl HqpInstanceManager {
         save_hqp_configs(&configs);
     }
 
-    /// Get or create an instance by name
-    pub async fn get_or_create(&self, name: &str) -> Arc<HqpAdapter> {
+    /// Get or create an instance by name while the manager lifecycle transaction is held.
+    async fn get_or_create_locked(&self, name: &str) -> Arc<HqpAdapter> {
         // Prepare outside the map lock, then use the entry as the atomic winner. Two callers may
         // prepare candidates, but they can no longer return different adapters for the same name.
         let adapter = Arc::new(HqpAdapter::new(self.bus.clone()));
         adapter.set_instance_name(name.to_string()).await;
+        let epoch_floor = self
+            .producer_epoch_floors
+            .read()
+            .await
+            .get(name)
+            .copied()
+            .unwrap_or(0);
+        adapter.seed_producer_epoch_floor(epoch_floor).await;
 
         let mut instances = self.instances.write().await;
         instances.entry(name.to_string()).or_insert(adapter).clone()
+    }
+
+    /// Get or create an instance by name.
+    pub async fn get_or_create(&self, name: &str) -> Arc<HqpAdapter> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        self.get_or_create_locked(name).await
     }
 
     /// Get an instance by name (if it exists)
@@ -7407,7 +7437,7 @@ impl HqpInstanceManager {
         password: Option<String>,
     ) -> Arc<HqpAdapter> {
         let _lifecycle_guard = self.lifecycle_lock.lock().await;
-        let adapter = self.get_or_create(&name).await;
+        let adapter = self.get_or_create_locked(&name).await;
         adapter
             .configure(host, port, web_port, username, password)
             .await;
@@ -7428,14 +7458,18 @@ impl HqpInstanceManager {
             return false;
         };
 
+        let producer_epoch = adapter.producer_epoch().await;
+        {
+            let mut floors = self.producer_epoch_floors.write().await;
+            let floor = floors.entry(name.to_string()).or_insert(producer_epoch);
+            *floor = (*floor).max(producer_epoch);
+        }
+
         self.stop_worker(name).await;
         // A removed instance is unlike a temporary native outage: its producer identity is gone.
         // Join first so no child can report a same-run observation behind this retirement.
         if let Some(sink) = &self.native_sink {
-            if let Err(error) = sink
-                .instance_removed(name, adapter.producer_epoch().await)
-                .await
-            {
+            if let Err(error) = sink.instance_removed(name, producer_epoch).await {
                 tracing::warn!(%error, instance = %name, "HQPlayer native observation sink could not retire removed instance; rolling removal back");
                 // Retirement and removal are one transaction. Reporting success after the adapter
                 // disappeared but its retained producer survived would leave a document that no

@@ -24,7 +24,7 @@
 use std::fs;
 use std::path::Path;
 use syn::visit::Visit;
-use syn::{Expr, File, Pat, Stmt};
+use syn::{Expr, File, Macro, Pat, Stmt};
 use walkdir::WalkDir;
 
 /// Visitor that detects `let _ = something.send(...)` patterns
@@ -53,6 +53,25 @@ impl IgnoredSendVisitor {
 }
 
 impl<'ast> Visit<'ast> for IgnoredSendVisitor {
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        // `syn::visit` deliberately treats macro bodies as opaque token streams. Channel actors
+        // commonly live inside `tokio::select!`, so an AST-only statement visitor would miss the
+        // exact failure pattern this lint exists to prevent. Token rendering preserves statement
+        // separators and punctuation with normalized whitespace, which is sufficient to identify
+        // a wildcard binding whose expression contains a `.send(...)` call.
+        let rendered = mac.tokens.to_string();
+        for statement in rendered.split(';') {
+            if statement.contains("let _ =") && statement.contains(". send") {
+                self.violations.push((
+                    self.current_file.clone(),
+                    "let _ = ...send(...) inside macro - ignoring send result hides failures"
+                        .to_string(),
+                ));
+            }
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
         // Look for `let _ = expr` statements
         if let Stmt::Local(local) = stmt {
@@ -167,6 +186,28 @@ fn detects_bare_send_statement() {
     assert!(
         !visitor.violations.is_empty(),
         "Should detect bare send statement"
+    );
+}
+
+#[test]
+fn detects_ignored_send_inside_macro_tokens() {
+    let bad_code = r#"
+        async fn example(mut commands: Receiver<Command>) {
+            tokio::select! {
+                command = commands.recv() => {
+                    let _ = command.reply.send(Ok(()));
+                }
+            }
+        }
+    "#;
+
+    let syntax: File = syn::parse_file(bad_code).unwrap();
+    let mut visitor = IgnoredSendVisitor::new("test.rs".to_string());
+    visitor.visit_file(&syntax);
+
+    assert!(
+        !visitor.violations.is_empty(),
+        "Should detect ignored send results hidden inside macro token streams"
     );
 }
 

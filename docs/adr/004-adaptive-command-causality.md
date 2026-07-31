@@ -55,7 +55,27 @@ first; global identity eviction can therefore discard only history already made 
 admitted at retirement. Once retirement intent is recorded, coordinator retries are part of the
 committed removal transaction: the observation sink reports success so the instance manager cannot
 restore a worker that the coordinator is still committed to retire. A refusal before retirement
-intent is accepted remains an error and permits manager rollback.
+intent is accepted remains an error and permits manager rollback. Ordinary manager stop retains
+last-known documents and ends its publication run, but a later definitive instance removal still
+creates a coordinator-owned one-command run and awaits aggregator retirement before it can compact
+the producer into private history. A retirement already committed for retry also keeps the ordinary
+run alive until that request clears. Thus successful removal has the same public meaning whether the
+manager is running or stopped.
+
+Producer epoch belongs to the logical instance name for the lifetime of the manager and adaptive
+aggregator, not to a replaceable `HqpAdapter` allocation. The instance manager retains the highest
+removed epoch as long as the aggregator retains its retirement tombstone and seeds a same-name
+replacement at that floor. Its first coherent native session therefore publishes exactly one epoch
+above retirement; it does not manufacture reconnect failures to rediscover the floor. While an old
+lifetime's retirement is pending, observations from a replacement are refused so they cannot
+inherit the retiring tracker, operation ledger, or correlation namespace.
+
+Typed terminal admission and subsequent retirement are two commit points. Once completion is
+admitted, a retryable retirement failure is retained as coordinator-owned retirement debt and the
+completion reply remains successful; callers must never be told an admitted receipt was
+unpublished. Coordinator oneshot replies are likewise handled explicitly: a cancelled receiver is
+observable in tracing, and lint coverage descends into actor macro token streams so reply failures
+cannot regress to silently discarded `send` results.
 
 `CommandOutcome::Pending` is an explicit non-terminal state. It is not evidence of producer state, sets `awaits_convergence`, and may transition to Applied, Ignored, Rejected, Superseded, Disconnected, TimedOut, Indeterminate, or a future recognized terminal outcome. No terminal outcome can regress to Pending.
 
@@ -104,6 +124,8 @@ Deferred. A producer actor owning observation, command execution, and publicatio
 - Operation history survives polls, reconnect handling, and concurrent observations.
 - Stale completions, duplicate gestures, and ended adapter runs cannot send or overwrite newer truth.
 - Caller cancellation and orderly shutdown cannot strand Pending or retain a conflict set forever.
+- Stopped-manager deletion retires public state, and same-name replacement advances on its first
+  coherent session without inheriting prior command history.
 - Native attempt evidence remains typed and testable without adaptive contract leakage into adapters.
 - Coupled HQPlayer controls serialize according to actual wire semantics.
 
