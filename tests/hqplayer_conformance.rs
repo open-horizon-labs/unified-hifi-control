@@ -8310,13 +8310,13 @@ async fn a_rate_pin_cleared_after_the_readback_is_not_reported_as_applied() {
         "precondition: no pin yet, so the pin below is a real write"
     );
 
-    // Three `State`/`Status` renders from now, which is this client's proof read: the mode write lands
-    // and takes the rate pin with it. `[source]` is chosen because it leaves the loaded chain alone —
-    // so the rate enumeration is untouched and the bracket has nothing to notice.
+    // Three `State`/`Status` renders from now, which is this client's proof read: the same-mode write
+    // lands and takes the rate pin with it. PCM is deliberately written again so the loaded chain and
+    // rate enumeration stay untouched and only the semantic value comparison can notice the clear.
     h.model
         .arm(|f| f.apply_after_polls.push(("SetMode".to_string(), 3)));
     h.model
-        .respond("<SetMode value=\"0\"/>")
+        .respond("<SetMode value=\"1\"/>")
         .expect("the fake answers SetMode");
 
     let outcome = h
@@ -8328,7 +8328,7 @@ async fn a_rate_pin_cleared_after_the_readback_is_not_reported_as_applied() {
     let daemon = h.model.state();
     assert_eq!(
         (daemon.mode_index, daemon.rate_index),
-        (0, 0),
+        (1, 0),
         "precondition: the other controller's mode write landed and cleared the pin. If this fails \
          the poll budget has drifted and the test is no longer about what it says"
     );
@@ -8601,12 +8601,59 @@ async fn a_rate_retry_that_enters_source_never_sends_a_second_pin() {
         SettingOutcome::Ambiguous { what, reason } => {
             assert_eq!(what, "rate");
             assert!(
-                reason.contains("earlier attempt") && reason.contains("suppressed"),
-                "the operation must disclose both the prior wire attempt and retry refusal; got: \
-                 {reason}"
+                reason.contains("wire")
+                    && reason.contains("final proof")
+                    && reason.contains("[source]"),
+                "the operation must disclose both the prior wire attempt and final source-mode \
+                 refusal; got: {reason}"
             );
         }
         other => panic!("a write followed by a suppressed retry is ambiguous: {other:?}"),
+    }
+    h.stop();
+}
+
+/// The source check and `SetRate` are separate protocol commands. Another controller can select
+/// `[source]` after the decision's `State` reply; the daemon then acknowledges Auto, applies no pin,
+/// and keeps rate position zero. Numeric readback and an unchanged rate list both look successful.
+///
+/// **Label: client-red.** Found by CodeRabbit at `78c8e97`.
+#[tokio::test]
+async fn a_rate_write_that_enters_source_after_the_decision_is_not_applied() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.rate_index = 1;
+        s.active_rate_hz = 44_100;
+    });
+    h.model.arm(|f| f.source_refuses_rate_pin = true);
+    h.model.switch_mode_after_request("State", 0);
+
+    let outcome = h
+        .adapter
+        .set_rate(0)
+        .await
+        .expect("a raced source transition is an outcome");
+
+    assert_eq!(
+        h.model.request_count("SetRate"),
+        1,
+        "the decision saw PCM and therefore reached the wire"
+    );
+    assert_eq!(
+        (h.model.state().mode_index, h.model.state().rate_index),
+        (0, 0),
+        "the external source transition landed before the ignored Auto pin"
+    );
+    match outcome {
+        SettingOutcome::Ambiguous { what, reason } => {
+            assert_eq!(what, "rate");
+            assert!(
+                reason.contains("source") && reason.contains("wire"),
+                "the outcome must disclose both the final source mode and prior wire attempt; got: \
+                 {reason}"
+            );
+        }
+        other => panic!("a rate pin attempted under final `[source]` is not applied: {other:?}"),
     }
     h.stop();
 }

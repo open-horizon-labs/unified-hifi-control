@@ -1198,6 +1198,9 @@ struct SemanticFamily<T: 'static, R: ?Sized + 'static> {
     /// Whether one semantic request addresses both 1x and Nx and therefore must name both in a
     /// negative report.
     paired: bool,
+    /// Whether the final proof must reject configured source-following mode. Rate pins are accepted
+    /// and ignored there, including the numerically indistinguishable Auto case.
+    refuses_source_mode: bool,
     /// Identity of an enumeration: equal for two lists exactly when they resolve every position the
     /// same way.
     fingerprint: fn(&[T]) -> u64,
@@ -2968,6 +2971,7 @@ impl HqpAdapter {
     const MODE: SemanticFamily<ListItem, str> = SemanticFamily {
         what: "mode",
         paired: false,
+        refuses_source_mode: false,
         fingerprint: Self::list_fingerprint,
         resolve: Self::resolve_mode,
         selected: |s| SemanticSelection::Position(u32::from(s.mode)),
@@ -2978,6 +2982,7 @@ impl HqpAdapter {
     const FILTER_PAIR: SemanticFamily<FilterItem, str> = SemanticFamily {
         what: "filter",
         paired: true,
+        refuses_source_mode: false,
         fingerprint: Self::filters_fingerprint,
         resolve: Self::resolve_filter,
         selected: |s| match (s.filter1x, s.filter_nx) {
@@ -2992,6 +2997,7 @@ impl HqpAdapter {
     const FILTER_1X: SemanticFamily<FilterItem, str> = SemanticFamily {
         what: "filter1x",
         paired: false,
+        refuses_source_mode: false,
         fingerprint: Self::filters_fingerprint,
         resolve: Self::resolve_filter,
         selected: |s| {
@@ -3005,6 +3011,7 @@ impl HqpAdapter {
     const FILTER_NX: SemanticFamily<FilterItem, str> = SemanticFamily {
         what: "filterNx",
         paired: false,
+        refuses_source_mode: false,
         fingerprint: Self::filters_fingerprint,
         resolve: Self::resolve_filter,
         selected: |s| {
@@ -3020,6 +3027,7 @@ impl HqpAdapter {
     const SHAPER: SemanticFamily<ListItem, str> = SemanticFamily {
         what: "shaper",
         paired: false,
+        refuses_source_mode: false,
         fingerprint: Self::list_fingerprint,
         resolve: Self::resolve_shaper,
         selected: |s| SemanticSelection::Position(s.shaper),
@@ -3031,6 +3039,7 @@ impl HqpAdapter {
     const RATE: SemanticFamily<RateItem, u32> = SemanticFamily {
         what: "rate",
         paired: false,
+        refuses_source_mode: true,
         fingerprint: Self::rates_fingerprint,
         resolve: Self::resolve_rate,
         selected: |s| SemanticSelection::Position(s.rate),
@@ -3174,6 +3183,40 @@ impl HqpAdapter {
                     continue;
                 }
             };
+            if family.refuses_source_mode {
+                let modes = match self.fresh_modes().await {
+                    Ok(modes) => modes,
+                    Err(error) if attempted_write => {
+                        return Ok(SettingOutcome::Ambiguous {
+                            what: what.to_string(),
+                            reason: format!(
+                                "a {what} write may have reached the wire, but the configured mode \
+                                 could not be resolved during final proof ({error})"
+                            ),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(mode_name) = Self::configured_source_mode(&modes, &state) {
+                    if attempted_write {
+                        return Ok(SettingOutcome::Ambiguous {
+                            what: what.to_string(),
+                            reason: format!(
+                                "a {what} write reached or may have reached the wire, but final \
+                                 proof observed configured mode '{mode_name}', where the daemon \
+                                 acknowledges rate pins and applies nothing"
+                            ),
+                        });
+                    }
+                    return Ok(SettingOutcome::Suppressed {
+                        what: what.to_string(),
+                        reason: format!(
+                            "nothing was sent, and final proof observed configured mode \
+                             '{mode_name}', where a rate pin cannot be established"
+                        ),
+                    });
+                }
+            }
             let after = match fetch().await {
                 Ok(after) => after,
                 Err(e) => {

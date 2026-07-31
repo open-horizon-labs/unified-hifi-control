@@ -348,6 +348,9 @@ struct Inner {
     /// be caught in, and "the chain moved during the retry as well" is the case a bounded retry must
     /// answer for. One slot could only ever express the first.
     chain_switch_after: Vec<(String, LoadedChain)>,
+    /// `(element, mode index)` queue — an external controller changes configured mode immediately
+    /// after the named reply, before the client's next command.
+    mode_switch_after: Vec<(String, u32)>,
     enums: Enumerations,
     /// Every request line received, in order, so a test can assert on the value the client actually
     /// put on the wire (AC5) instead of on timing.
@@ -380,6 +383,7 @@ impl DaemonModel {
             status_active_mode: ActiveModeReporting::EchoesConfiguredMode,
             filter_fields: FilterFieldReporting::default(),
             chain_switch_after: Vec::new(),
+            mode_switch_after: Vec::new(),
             enums: Enumerations::load(profile),
             requests: Vec::new(),
         };
@@ -470,6 +474,18 @@ impl DaemonModel {
              source_loads_chain does: in PCM or SDM the configured mode *is* the chain"
         );
         inner.chain_switch_after.push((element.to_string(), chain));
+    }
+
+    /// Change configured mode between two client commands, as another controller can.
+    pub fn switch_mode_after_request(&self, element: &str, mode_index: u32) {
+        let mut inner = self.lock();
+        assert!(
+            mode_index < inner.entry_count("GetModes", "ModesItem"),
+            "switch_mode_after_request requires a mode the daemon offers"
+        );
+        inner
+            .mode_switch_after
+            .push((element.to_string(), mode_index));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1181,6 +1197,24 @@ impl Responder for DaemonModel {
         if due {
             let (_, chain) = inner.chain_switch_after.remove(0);
             inner.state.loaded_chain = chain;
+            inner.clamp_to_loaded_chain();
+        }
+
+        let mode_due = inner
+            .mode_switch_after
+            .first()
+            .is_some_and(|(el, _)| *el == element);
+        if mode_due {
+            let (_, mode_index) = inner.mode_switch_after.remove(0);
+            inner.state.mode_index = mode_index;
+            // Match the measured SetMode side effect: every configured-mode change clears the pin.
+            inner.state.rate_index = 0;
+            inner.state.active_rate_hz = 0;
+            match mode_index {
+                1 => inner.state.loaded_chain = LoadedChain::Pcm,
+                2 => inner.state.loaded_chain = LoadedChain::Sdm,
+                _ => {}
+            }
             inner.clamp_to_loaded_chain();
         }
 
