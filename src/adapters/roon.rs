@@ -134,6 +134,22 @@ type LoadRequest = oneshot::Sender<Result<LoadResult>>;
 // out the full `BROWSE_TIMEOUT` and then reported "Browse request timed out" -
 // the same thing an unreachable Core produces. The types below carry the
 // Core's actual answer back to the caller, promptly and distinguishably.
+//
+// Two things about the delivery path, both established by reading the pinned
+// fork and neither observable from here, so they are recorded rather than
+// assumed:
+//
+// - Services are tried in order with a `break` on the first that claims a
+//   message (fork `src/lib.rs:597-631`), and Transport is tried before Browse.
+//   `Transport::parse_msg` gates every push on its own subscription ids, so it
+//   returns an empty `Vec` for a browse message and declines to claim it
+//   (fork `src/transport.rs:451-540`). If that ever changes, browse errors get
+//   swallowed inside the dependency and nothing here can see it.
+// - `Browse::parse_msg` matches four literal error names against `msg["name"]`
+//   (fork `src/browse.rs:174-188`). A Core that spells one differently yields
+//   `Parsed::None`, which the fork drops, and the caller times out as it did
+//   before - with this module's tests still green. That half is wire-level and
+//   is #408's to pin.
 
 /// Which browse/load rejection Roon Core reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +157,12 @@ pub enum RoonBrowseErrorKind {
     /// The `item_key` is not valid in the browse session it was used in: it has
     /// expired, the session was reset, or it was minted somewhere else.
     /// Recoverable - re-acquire the key (search or browse again) and retry.
+    ///
+    /// The recovery instruction in [`RoonBrowseErrorKind::explain`] is written
+    /// for a caller that holds a key - `play_item` and `/roon/browse`. `search`
+    /// mints and consumes its own keys internally, so a rejection there reaches
+    /// a client that never held one; retrying the search is still the right
+    /// move, but a caller-facing surface may want to reword it (#395, #396).
     InvalidItemKey,
     /// The `level` / `pop_levels` in the request do not exist in this session.
     /// Recoverable - browse again from a level the caller still holds.
@@ -435,10 +457,14 @@ impl RoonState {
     /// long-lived browse tree is ever built on one session key (#399), stamp the
     /// pending entries with a connection generation instead.
     ///
-    /// Resolution is exactly-once: every path removes the entry before sending,
-    /// so a repeated rejection finds nothing and a waiter can never be resolved
-    /// twice. A `KeyMismatch` leaves the entry for the caller's own timeout to
-    /// clean up, so no path strands one.
+    /// Resolution is exactly-once because every path removes the entry before
+    /// sending *and* every mutation of these maps is synchronous while the one
+    /// state `RwLock` is held - so a caller's timeout cleanup and this routing
+    /// can interleave but never overlap. A repeated rejection finds nothing; a
+    /// caller that timed out first leaves nothing to find. A `KeyMismatch`
+    /// deliberately does **not** remove: that entry belongs to a caller still
+    /// inside its `BROWSE_TIMEOUT`, whose own cleanup owns it. Removing it here
+    /// would be the strand, not the fix.
     ///
     /// Both maps are searched for an entry where *both* the request id and the
     /// session key match before any mismatch is reported. A mismatched entry in
@@ -2410,7 +2436,17 @@ mod tests {
     // tests exercise the real routing functions, the real `oneshot` channels
     // and the real `BROWSE_TIMEOUT`. They do not exercise the fork's
     // `parse_msg`, nor the three-line result match in `browse()`/`load()` that
-    // hands the oneshot payload back to the caller.
+    // hands the oneshot payload back to the caller. In particular, nothing here
+    // proves that a real Core's error names match the four literals the fork
+    // matches on - if they did not, these tests would stay green and the
+    // ten-second hang would be live. That half is #408's.
+    //
+    // Which evidence supports which claim, since it is easy to conflate:
+    // `a_rejected_item_key_resolves_far_inside_the_browse_timeout` is the
+    // promptness proof; `browse_rejection_resolves_only_the_matching_waiter`
+    // and `a_mismatched_entry_in_one_map_does_not_hide_a_match_in_the_other`
+    // are the correlation proofs. A fast suite alone would not have caught an
+    // implementation that promptly resolved the *wrong* waiter.
 
     use std::time::Instant;
     use tokio::sync::oneshot::error::TryRecvError;
