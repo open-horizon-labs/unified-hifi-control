@@ -23,7 +23,7 @@
 mod lifecycle;
 pub use lifecycle::{HqpRecoveryConfig, HqpWorkerPhase, HqpWorkerStatus};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Writer;
 use regex::Regex;
@@ -35,7 +35,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock};
@@ -1003,6 +1003,102 @@ pub struct PipelineStatus {
     pub settings: PipelineSettings,
 }
 
+/// One HQPlayer native observation whose state, runtime enumerations, transport identity and
+/// volume capability have passed the same generation fence. This is intentionally private: the
+/// legacy HTTP pipeline payload remains [`PipelineStatus`], while the managed adaptive producer
+/// needs facts that payload historically rounds or omits.
+#[derive(Debug, Clone)]
+struct CoherentPipelineSnapshot {
+    legacy: PipelineStatus,
+    state: HqpState,
+    playback_status: HqpStatus,
+    chain: ChainSnapshot,
+    volume_range: VolumeRange,
+    info: HqpInfo,
+    host: String,
+    instance_name: String,
+    producer_epoch: u64,
+    observed_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+struct CoherentSessionIdentity {
+    info: HqpInfo,
+    host: String,
+    instance_name: String,
+    producer_epoch: u64,
+}
+
+/// Contract-free observation exported by the native adapter. Publication policy and adaptive
+/// schema projection belong to the composition layer in `src/producers`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HqpNativeObservation {
+    pub instance_name: String,
+    pub instance_label: Option<String>,
+    pub product_version: Option<String>,
+    pub producer_epoch: u64,
+    pub observed_at: SystemTime,
+    pub transport: HqpNativeTransportState,
+    pub metadata: HqpNativeMetadata,
+    pub volume: HqpNativeVolume,
+    pub mode_is_source: bool,
+    pub mode: HqpNativeSelection,
+    pub filter_1x: HqpNativeSelection,
+    pub filter_nx: HqpNativeSelection,
+    pub shaper: HqpNativeSelection,
+    pub rate: HqpNativeSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HqpNativeTransportState {
+    Stopped,
+    Paused,
+    Playing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HqpNativeMetadata {
+    pub track_id: Option<String>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HqpNativeVolume {
+    pub value_db: f64,
+    pub min_db: f64,
+    pub max_db: f64,
+    pub step_db: Option<f64>,
+    pub enabled: bool,
+    pub adaptive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HqpNativeSelection {
+    pub selected: String,
+    pub choices: Vec<String>,
+}
+
+/// Dependency-inversion seam for managed native observations. The adapter reports facts and
+/// lifecycle only; the injected composition-root implementation owns schema projection,
+/// revisions, publication leases, retention and retirement.
+#[async_trait::async_trait]
+pub trait HqpNativeObservationSink: Send + Sync {
+    async fn manager_started(&self) -> Result<()>;
+    async fn observed(&self, observation: HqpNativeObservation) -> Result<()>;
+    async fn transient_failure(&self, instance_name: &str, observed_at: SystemTime) -> Result<()>;
+    async fn instance_removed(&self, instance_name: &str, producer_epoch: u64) -> Result<()>;
+    async fn manager_stopped(&self) -> Result<()>;
+}
+
+#[derive(Clone)]
+struct HqpNativeWorker {
+    sink: Arc<dyn HqpNativeObservationSink>,
+    instance_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineState {
     pub state: String,
@@ -1775,6 +1871,31 @@ impl HqpAdapter {
         self.state.read().await.transport_generation
     }
 
+    /// Capture the envelope fields for a coherent observation under the same native-session
+    /// fence as its State, Status, volume range and chain lists. This helper deliberately reads no
+    /// chain cache: the verified `ChainSnapshot` remains the only source of list data.
+    async fn coherent_session_identity(
+        &self,
+        expected_generation: u64,
+    ) -> Option<CoherentSessionIdentity> {
+        let state = self.state.read().await;
+        let poisoned = self
+            .transport_poisoned
+            .load(std::sync::atomic::Ordering::Acquire);
+        if poisoned || !state.connected || state.transport_generation != expected_generation {
+            return None;
+        }
+        Some(CoherentSessionIdentity {
+            info: state.info.clone()?,
+            host: state.host.clone()?,
+            instance_name: state
+                .instance_name
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+            producer_epoch: state.producer_epoch,
+        })
+    }
+
     /// Establish only the serialized native transport.
     ///
     /// The managed producer's reachability contract is deliberately stronger than this: it becomes
@@ -1823,6 +1944,16 @@ impl HqpAdapter {
     /// Connect to HQPlayer
     pub async fn connect(&self) -> Result<()> {
         let _operation_guard = self.operation_lock.lock().await;
+        self.connect_with_operation_held().await
+    }
+
+    /// Complete a coherent managed handshake while the caller already owns `operation_lock`.
+    ///
+    /// The coherent pipeline reader uses this only after command recovery replaced the native
+    /// socket during its first bounded attempt. Re-entering [`Self::connect`] there would deadlock
+    /// on the operation lease; skipping the handshake would leave a transport-usable but
+    /// unpublished session with no identity or producer epoch.
+    async fn connect_with_operation_held(&self) -> Result<()> {
         let _conversation_guard = self.conversation_lock.lock().await;
         let _connect_guard = self.connect_lock.lock().await;
         self.reconcile_cancelled_transport().await;
@@ -1950,11 +2081,67 @@ impl HqpAdapter {
         }
     }
 
-    /// Observe and publish one complete direct-zone snapshot.
-    ///
-    /// `ZoneDiscovered` is intentionally an upsert in the aggregator. Publishing the whole zone is
-    /// what lets a definitive server clear remove now-playing metadata or volume capability; the
-    /// narrower delta events cannot express either transition.
+    /// Publish a legacy direct-zone update and the adaptive producer from the same coherent
+    /// native observation. The two projections may differ in shape, never in the daemon moment
+    /// they claim to describe.
+    async fn observe_and_publish_managed(
+        &self,
+        native_worker: Option<&HqpNativeWorker>,
+    ) -> Result<()> {
+        let snapshot = self.read_coherent_pipeline().await?;
+
+        {
+            let mut state = self.state.write().await;
+            if state.producer_epoch != snapshot.producer_epoch {
+                return Err(anyhow!(
+                    "HQPlayer session changed between coherent pipeline observation and direct-zone publication"
+                ));
+            }
+            state.last_state = Some(snapshot.state.clone());
+            state.volume_range = Some(snapshot.volume_range.clone());
+        }
+
+        let zone = Self::hqp_status_to_zone(
+            &snapshot.host,
+            Some(&snapshot.instance_name),
+            &snapshot.info,
+            &snapshot.playback_status,
+            &snapshot.volume_range,
+        );
+        self.bus.publish(BusEvent::ZoneDiscovered { zone });
+        self.bus.publish(BusEvent::HqpStateChanged {
+            host: snapshot.host.clone(),
+            state: match snapshot.playback_status.state {
+                0 => "stopped",
+                1 => "paused",
+                2 => "playing",
+                _ => "unknown",
+            }
+            .to_string(),
+        });
+        self.bus.publish(BusEvent::HqpPipelineChanged {
+            host: snapshot.host.clone(),
+            filter: (!snapshot.playback_status.active_filter.is_empty())
+                .then_some(snapshot.playback_status.active_filter.clone()),
+            shaper: (!snapshot.playback_status.active_shaper.is_empty())
+                .then_some(snapshot.playback_status.active_shaper.clone()),
+            rate: (snapshot.playback_status.active_rate != 0)
+                .then_some(snapshot.playback_status.active_rate.to_string()),
+        });
+
+        if let Some(worker) = native_worker {
+            worker
+                .sink
+                .observed(Self::native_observation(&snapshot)?)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Legacy direct-zone observer retained for callers that instantiate the manager without the
+    /// adaptive runtime (the compatibility test harness and standalone adapter use). Production
+    /// construction uses [`Self::observe_and_publish_managed`] so the adaptive document and zone
+    /// share the stricter coherent pipeline observation.
     async fn observe_and_publish_zone(&self) -> Result<()> {
         if !self.get_status().await.connected {
             self.connect().await?;
@@ -1965,16 +2152,10 @@ impl HqpAdapter {
         let epoch = self.producer_epoch().await;
         let observed_state = self.get_state_inner().await?;
         let status = self.get_playback_status_inner().await?;
-        // Re-read the range rather than treating it as process-lifetime configuration. A restarted
-        // daemon or an external configuration change can alter fixed/adaptive/range policy.
         let volume_range = self.get_volume_range_inner().await?;
-
         let (host, instance_name, info) = {
             let mut state = self.state.write().await;
             if state.producer_epoch != epoch {
-                // One of the reconnect-capable reads established a new session and `connect()`
-                // already published that session's coherent initial zone. Never combine a State
-                // from before that edge with Status/VolumeRange from after it.
                 return Ok(());
             }
             state.last_state = Some(observed_state);
@@ -1991,7 +2172,6 @@ impl HqpAdapter {
                     .ok_or_else(|| anyhow!("HQPlayer session has no coherent identity"))?,
             )
         };
-
         let zone = Self::hqp_status_to_zone(
             &host,
             instance_name.as_deref(),
@@ -2019,6 +2199,127 @@ impl HqpAdapter {
         Ok(())
     }
 
+    fn native_observation(snapshot: &CoherentPipelineSnapshot) -> Result<HqpNativeObservation> {
+        let mode = snapshot
+            .chain
+            .modes
+            .iter()
+            .find(|item| item.index == u32::from(snapshot.state.mode))
+            .ok_or_else(|| {
+                anyhow!("HQPlayer State.mode is absent from its verified runtime modes")
+            })?;
+        let filter_1x_index = snapshot.state.filter1x.unwrap_or(snapshot.state.filter);
+        let filter_nx_index = snapshot.state.filter_nx.unwrap_or(snapshot.state.filter);
+        let filter_1x = snapshot
+            .chain
+            .filters
+            .iter()
+            .find(|item| item.index == filter_1x_index)
+            .ok_or_else(|| {
+                anyhow!("HQPlayer State.filter1x is absent from its verified runtime filters")
+            })?;
+        let filter_nx = snapshot
+            .chain
+            .filters
+            .iter()
+            .find(|item| item.index == filter_nx_index)
+            .ok_or_else(|| {
+                anyhow!("HQPlayer State.filterNx is absent from its verified runtime filters")
+            })?;
+        let shaper = snapshot
+            .chain
+            .shapers
+            .iter()
+            .find(|item| item.index == snapshot.state.shaper)
+            .ok_or_else(|| {
+                anyhow!("HQPlayer State.shaper is absent from its verified runtime shapers")
+            })?;
+        let rate = snapshot
+            .chain
+            .rates
+            .iter()
+            .find(|item| item.index == snapshot.state.rate)
+            .ok_or_else(|| {
+                anyhow!("HQPlayer State.rate is absent from its verified runtime rates")
+            })?;
+
+        Ok(HqpNativeObservation {
+            instance_name: snapshot.instance_name.clone(),
+            instance_label: Some(snapshot.info.name.clone()).filter(|name| !name.is_empty()),
+            product_version: Some(snapshot.info.version.clone())
+                .filter(|version| !version.is_empty()),
+            producer_epoch: snapshot.producer_epoch,
+            observed_at: snapshot.observed_at,
+            transport: match snapshot.playback_status.state {
+                0 => HqpNativeTransportState::Stopped,
+                1 => HqpNativeTransportState::Paused,
+                2 => HqpNativeTransportState::Playing,
+                _ => HqpNativeTransportState::Unknown,
+            },
+            metadata: HqpNativeMetadata {
+                track_id: (!snapshot.playback_status.track_id.is_empty())
+                    .then_some(snapshot.playback_status.track_id.clone()),
+                title: snapshot.playback_status.title.clone(),
+                artist: snapshot.playback_status.artist.clone(),
+                album: snapshot.playback_status.album.clone(),
+            },
+            volume: HqpNativeVolume {
+                value_db: snapshot.state.volume_db,
+                min_db: snapshot.volume_range.min_db,
+                max_db: snapshot.volume_range.max_db,
+                step_db: snapshot.volume_range.step_db,
+                enabled: snapshot.volume_range.enabled,
+                adaptive: snapshot.volume_range.adaptive,
+            },
+            mode_is_source: Self::mode_family(&mode.name) == Some(ModeFamily::Source),
+            mode: HqpNativeSelection {
+                selected: mode.name.clone(),
+                choices: snapshot
+                    .chain
+                    .modes
+                    .iter()
+                    .map(|item| item.name.clone())
+                    .collect(),
+            },
+            filter_1x: HqpNativeSelection {
+                selected: filter_1x.name.clone(),
+                choices: snapshot
+                    .chain
+                    .filters
+                    .iter()
+                    .map(|item| item.name.clone())
+                    .collect(),
+            },
+            filter_nx: HqpNativeSelection {
+                selected: filter_nx.name.clone(),
+                choices: snapshot
+                    .chain
+                    .filters
+                    .iter()
+                    .map(|item| item.name.clone())
+                    .collect(),
+            },
+            shaper: HqpNativeSelection {
+                selected: shaper.name.clone(),
+                choices: snapshot
+                    .chain
+                    .shapers
+                    .iter()
+                    .map(|item| item.name.clone())
+                    .collect(),
+            },
+            rate: HqpNativeSelection {
+                selected: rate.rate.to_string(),
+                choices: snapshot
+                    .chain
+                    .rates
+                    .iter()
+                    .map(|item| item.rate.to_string())
+                    .collect(),
+            },
+        })
+    }
+
     /// Run this configured instance until cancelled.
     ///
     /// Each instance owns its retry timing independently, while the manager remains the single
@@ -2029,11 +2330,17 @@ impl HqpAdapter {
         shutdown: CancellationToken,
         phase: SharedWorkerPhase,
         recovery: SharedRecoveryState,
+        native_worker: Option<HqpNativeWorker>,
     ) {
         loop {
             let observation = tokio::select! {
                 _ = shutdown.cancelled() => break,
-                result = self.observe_and_publish_zone() => result,
+                result = async {
+                    match native_worker.as_ref() {
+                        Some(worker) => self.observe_and_publish_managed(Some(worker)).await,
+                        None => self.observe_and_publish_zone().await,
+                    }
+                } => result,
             };
 
             let delay = match observation {
@@ -2052,6 +2359,15 @@ impl HqpAdapter {
                 Err(error) => {
                     tracing::warn!("HQPlayer managed observation failed: {error}");
                     *phase.write().await = HqpWorkerPhase::Recovering;
+                    if let Some(worker) = native_worker.as_ref() {
+                        if let Err(sink_error) = worker
+                            .sink
+                            .transient_failure(&worker.instance_name, SystemTime::now())
+                            .await
+                        {
+                            tracing::warn!(%sink_error, "HQPlayer native observation sink could not retain failed observation");
+                        }
+                    }
                     let delay = recovery
                         .lock()
                         .await
@@ -4868,8 +5184,21 @@ impl HqpAdapter {
         }
     }
 
-    /// Get full pipeline status
+    /// Get the legacy pipeline payload from one coherent native observation.
     pub async fn get_pipeline_status(&self) -> Result<PipelineStatus> {
+        Ok(self.read_coherent_pipeline().await?.legacy)
+    }
+
+    /// Read the one native observation from which both the legacy pipeline payload and the
+    /// adaptive producer document are derived.
+    ///
+    /// This is deliberately the only owner of the generation-fenced gather. A second read of
+    /// `state`, cache or status after its proof would make the adaptive document a mixture of two
+    /// daemon moments even if the legacy response still looked plausible.
+    async fn read_coherent_pipeline(&self) -> Result<CoherentPipelineSnapshot> {
+        if !self.get_status().await.connected {
+            self.connect().await?;
+        }
         let _operation_guard = self.operation_lock.lock().await;
         // `State` reports settings as **list indices**, and an index means nothing apart from the list
         // it came from. So this read has one job beyond fetching: to establish that the `State` it
@@ -4911,7 +5240,19 @@ impl HqpAdapter {
         // *now* as when the lists were published; a move out and back inside that window leaves it
         // agreeing. Only a daemon-side atomic snapshot could do better, and the protocol has none.
         let mut retried = false;
-        let (state, playback_status, snapshot, vol_range) = loop {
+        let (state, playback_status, snapshot, vol_range, session) = loop {
+            // Query recovery may replace only the TCP transport and deliberately leave managed
+            // reachability false. Any first-attempt disturbance can discover that replacement —
+            // an unsettled list fill, failed probe, replaced snapshot, or the closing fence — so
+            // the one whole-read retry must complete a coherent handshake here rather than only in
+            // one of those branches.
+            if retried && !self.get_status().await.connected {
+                self.connect_with_operation_held().await.context(
+                    "HQPlayer replacement transport could not complete the coherent handshake \
+                     required before re-reading its setting lists",
+                )?;
+            }
+
             // (1) Reconnect-capable, so it goes ahead of everything the proof will cover. On the
             // first read of a connection this is always a real request.
             let (vol_range, attempt_generation) = match self.ensure_volume_range().await? {
@@ -4966,7 +5307,10 @@ impl HqpAdapter {
 
             // (3)
             let observed = self.get_state().await?;
-            let observed_status = self.get_playback_status().await.unwrap_or_default();
+            // Adaptive transport and metadata must be observed, never manufactured from
+            // `HqpStatus::default()`. A failed Status reply therefore invalidates this complete
+            // coherent reading just as an unsettled chain does.
+            let observed_status = self.get_playback_status().await?;
 
             // (4) A probe that could not run is not a probe that passed. "The cache was not
             // invalidated, so the lists are still the ones the state was read against" is true about
@@ -4998,12 +5342,13 @@ impl HqpAdapter {
             // (5) The proof hands back the values it proved. Nothing below re-reads the cache.
             match self.verified_chain_snapshot(captured, &probe).await {
                 Ok(snapshot) => {
-                    let closing_generation = self.transport_generation().await;
-                    let transport_poisoned = self
-                        .transport_poisoned
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    if transport_poisoned || closing_generation != attempt_generation {
-                        if !retried {
+                    let session = match self.coherent_session_identity(attempt_generation).await {
+                        Some(session) => session,
+                        None if !retried => {
+                            let closing_generation = self.transport_generation().await;
+                            let transport_poisoned = self
+                                .transport_poisoned
+                                .load(std::sync::atomic::Ordering::Acquire);
                             tracing::info!(
                                 "HQPlayer's native session changed or became unavailable while its \
                                  pipeline was being read (opening generation {attempt_generation}, \
@@ -5011,15 +5356,22 @@ impl HqpAdapter {
                                  {transport_poisoned}); restarting the complete read"
                             );
                             retried = true;
+                            self.connect_with_operation_held().await.context(
+                                "HQPlayer replacement transport could not complete the coherent \
+                                 handshake required before re-reading its setting lists",
+                            )?;
                             continue;
                         }
-                        return Err(anyhow!(
+                        None => {
+                            return Err(anyhow!(
                             "HQPlayer's native session changed or became unavailable while its \
-                             pipeline was being read, and again during the re-read; refusing a \
-                             result assembled from more than one producer session"
-                        ));
-                    }
-                    break (observed, observed_status, snapshot, vol_range);
+                             setting lists and pipeline state were being read, and again during \
+                             the re-read; refusing to resolve one session's chain indices through \
+                             another session's lists"
+                            ));
+                        }
+                    };
+                    break (observed, observed_status, snapshot, vol_range, session);
                 }
                 Err(reason) if !retried => {
                     tracing::info!(
@@ -5044,7 +5396,7 @@ impl HqpAdapter {
             }
         };
 
-        // The proven snapshot, and nothing else. Re-reading `self.state` here is what this shape
+        // The proven snapshot, and nothing else. Re-reading `self.state` for lists here is what this shape
         // exists to prevent: it would discard the set the proof covered in favour of whatever the
         // cache holds at this later moment. `hqplayer_pipeline_projection_lint` fails the build if it
         // creeps back.
@@ -5083,7 +5435,7 @@ impl HqpAdapter {
             _ => "Unknown",
         };
 
-        Ok(PipelineStatus {
+        let legacy = PipelineStatus {
             status: PipelineState {
                 state: state_str.to_string(),
                 // State.mode and State.active_mode are INDEX (0,1,2) - look up by ModesItem.index
@@ -5217,6 +5569,24 @@ impl HqpAdapter {
                         .collect(),
                 },
             },
+        };
+
+        Ok(CoherentPipelineSnapshot {
+            legacy,
+            state,
+            playback_status,
+            chain: ChainSnapshot {
+                modes,
+                filters,
+                shapers,
+                rates,
+            },
+            volume_range: vol_range,
+            info: session.info,
+            host: session.host,
+            instance_name: session.instance_name,
+            producer_epoch: session.producer_epoch,
+            observed_at: SystemTime::now(),
         })
     }
 
@@ -6001,17 +6371,36 @@ pub struct HqpInstanceManager {
     workers: Arc<Mutex<HashMap<String, HqpManagedWorker>>>,
     /// Serializes lifecycle and runtime instance mutations as one manager transaction.
     lifecycle_lock: Arc<Mutex<()>>,
+    /// Optional contract-free composition seam. Keeping the legacy constructor makes standalone
+    /// adapter users and compatibility harnesses exercise their unchanged public behavior.
+    native_sink: Option<Arc<dyn HqpNativeObservationSink>>,
 }
 
 impl HqpInstanceManager {
     /// Create a new instance manager
     pub fn new(bus: SharedBus) -> Self {
+        Self::new_with_optional_native_sink(bus, None)
+    }
+
+    /// Construct a manager that reports managed HQPlayer observations to a composition-root sink.
+    pub fn new_with_native_sink(
+        bus: SharedBus,
+        native_sink: Arc<dyn HqpNativeObservationSink>,
+    ) -> Self {
+        Self::new_with_optional_native_sink(bus, Some(native_sink))
+    }
+
+    fn new_with_optional_native_sink(
+        bus: SharedBus,
+        native_sink: Option<Arc<dyn HqpNativeObservationSink>>,
+    ) -> Self {
         Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
             bus,
             running: Arc::new(AtomicBool::new(false)),
             workers: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_lock: Arc::new(Mutex::new(())),
+            native_sink,
         }
     }
 
@@ -6148,6 +6537,28 @@ impl HqpInstanceManager {
         };
 
         self.stop_worker(name).await;
+        // A removed instance is unlike a temporary native outage: its producer identity is gone.
+        // Join first so no child can report a same-run observation behind this retirement.
+        if let Some(sink) = &self.native_sink {
+            if let Err(error) = sink
+                .instance_removed(name, adapter.producer_epoch().await)
+                .await
+            {
+                tracing::warn!(%error, instance = %name, "HQPlayer native observation sink could not retire removed instance; rolling removal back");
+                // Retirement and removal are one transaction. Reporting success after the adapter
+                // disappeared but its retained producer survived would leave a document that no
+                // worker can ever refresh or retire. Restore the same adapter (and its worker when
+                // this manager is live) so a caller can retry the definitive removal safely.
+                self.instances
+                    .write()
+                    .await
+                    .insert(name.to_string(), adapter.clone());
+                if self.running.load(Ordering::SeqCst) {
+                    self.start_worker(name.to_string(), adapter).await;
+                }
+                return false;
+            }
+        }
         // Removal is definitive even if the manager was not running and therefore had no worker.
         adapter.disconnect().await;
         self.save_to_config().await;
@@ -6192,6 +6603,7 @@ impl HqpInstanceManager {
         let run_adapter = adapter.clone();
         let cleanup_adapter = adapter;
         let supervisor_phase = phase.clone();
+        let native_worker = self.native_worker(&name);
         let supervisor = async move {
             supervise_worker(
                 supervisor_name,
@@ -6200,9 +6612,10 @@ impl HqpInstanceManager {
                 recovery,
                 move |child_shutdown, child_phase, child_recovery| {
                     let adapter = run_adapter.clone();
+                    let native_worker = native_worker.clone();
                     async move {
                         adapter
-                            .run_managed(child_shutdown, child_phase, child_recovery)
+                            .run_managed(child_shutdown, child_phase, child_recovery, native_worker)
                             .await;
                     }
                 },
@@ -6236,6 +6649,13 @@ impl HqpInstanceManager {
                 phase,
             },
         );
+    }
+
+    fn native_worker(&self, instance_name: &str) -> Option<HqpNativeWorker> {
+        Some(HqpNativeWorker {
+            sink: self.native_sink.clone()?,
+            instance_name: instance_name.to_string(),
+        })
     }
 
     /// Cancel and join one child before returning so it cannot republish after removal.
@@ -6273,6 +6693,9 @@ impl HqpInstanceManager {
             return Err(anyhow!("No configured HQPlayer instances"));
         }
 
+        if let Some(sink) = &self.native_sink {
+            sink.manager_started().await?;
+        }
         self.running.store(true, Ordering::SeqCst);
         for (name, adapter) in adapters {
             self.start_worker(name, adapter).await;
@@ -6301,6 +6724,11 @@ impl HqpInstanceManager {
         for (_, worker) in workers {
             if let Err(error) = worker.join.await {
                 tracing::warn!("HQPlayer child lifecycle failed to join: {error}");
+            }
+        }
+        if let Some(sink) = &self.native_sink {
+            if let Err(error) = sink.manager_stopped().await {
+                tracing::warn!(%error, "HQPlayer native observation sink could not finish manager lifecycle");
             }
         }
         self.bus.publish(BusEvent::AdapterStopped {

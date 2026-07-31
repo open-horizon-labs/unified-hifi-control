@@ -214,8 +214,23 @@ mod server {
             knob_store.clone(),
         ));
 
+        // The adaptive handle must exist before a producing adapter is constructed, but its actor
+        // must not run until the public socket is bound below. This preserves bind-before-startup
+        // while allowing HQPlayer's manager to own the handle for its whole lifecycle.
+        let producer_shutdown_token = CancellationToken::new();
+        let (adaptive_handle, producer_actor, _adaptive_view) =
+            producers::AdaptiveRuntime::build(producer_shutdown_token.clone(), 1024);
+        let hqp_adaptive_publisher = Arc::new(producers::hqplayer::HqpAdaptivePublisher::new(
+            adaptive_handle,
+        ));
+
         // HQPlayer instance manager (multi-instance support, no settings toggle)
-        let hqp_instances = Arc::new(adapters::hqplayer::HqpInstanceManager::new(bus.clone()));
+        let hqp_instances = Arc::new(
+            adapters::hqplayer::HqpInstanceManager::new_with_native_sink(
+                bus.clone(),
+                hqp_adaptive_publisher,
+            ),
+        );
         hqp_instances.load_from_config().await;
         let instance_count = hqp_instances.instance_count().await;
         if instance_count > 0 {
@@ -317,14 +332,11 @@ mod server {
         // SSE closes as soon as graceful HTTP shutdown begins. Adaptive ingress remains open
         // until producing adapters have stopped, then drains under its own non-lossy token.
         let shutdown_token = CancellationToken::new();
-        let producer_shutdown_token = CancellationToken::new();
 
         // Construct the bounded command actor before any producer can publish. The handle is
         // retained for the process lifetime and will be handed to producing adapters by #325;
         // the read-only view is consumed by #326. No adaptive payload enters the public
         // BusEvent/SSE contract.
-        let (_adaptive_handle, producer_actor, _adaptive_view) =
-            producers::AdaptiveRuntime::build(producer_shutdown_token.clone(), 1024);
         let producer_actor_task = tokio::spawn(async move {
             producer_actor.run().await;
         });

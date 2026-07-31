@@ -48,6 +48,7 @@
 pub mod admission;
 mod aggregator;
 pub mod event;
+pub mod hqplayer;
 pub mod run;
 pub mod runtime;
 

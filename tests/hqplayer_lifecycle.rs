@@ -12,13 +12,60 @@ use std::time::Duration;
 
 use mock_servers::hqplayer::corpus::VERIFIED_PROFILE;
 use mock_servers::hqplayer::model::{DaemonModel, Metadata};
-use mock_servers::hqplayer::wire::{Chunking, WirePolicy, WireServer};
+use mock_servers::hqplayer::wire::{Chunking, Disruption, WirePolicy, WireServer};
 use unified_hifi_control::adapters::hqplayer::{
-    HqpAdapter, HqpInstanceManager, HqpRecoveryConfig, HqpTimeouts, HqpWorkerPhase, HqpWorkerStatus,
+    HqpAdapter, HqpInstanceManager, HqpNativeObservation, HqpNativeObservationSink,
+    HqpRecoveryConfig, HqpTimeouts, HqpWorkerPhase, HqpWorkerStatus,
 };
 use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState, Zone};
+use unified_hifi_control::producers::hqplayer::HqpAdaptivePublisher;
+use unified_hifi_control::producers::{AdaptiveRuntime, ProducerKey, ProducerPresence};
+
+fn adaptive_manager(
+    bus: unified_hifi_control::bus::SharedBus,
+    handle: unified_hifi_control::producers::AdaptiveHandle,
+) -> HqpInstanceManager {
+    HqpInstanceManager::new_with_native_sink(bus, Arc::new(HqpAdaptivePublisher::new(handle)))
+}
+
+struct RejectRetirementSink {
+    inner: HqpAdaptivePublisher,
+}
+
+#[async_trait::async_trait]
+impl HqpNativeObservationSink for RejectRetirementSink {
+    async fn manager_started(&self) -> anyhow::Result<()> {
+        self.inner.manager_started().await
+    }
+
+    async fn observed(&self, observation: HqpNativeObservation) -> anyhow::Result<()> {
+        self.inner.observed(observation).await
+    }
+
+    async fn transient_failure(
+        &self,
+        instance_name: &str,
+        observed_at: std::time::SystemTime,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .transient_failure(instance_name, observed_at)
+            .await
+    }
+
+    async fn instance_removed(
+        &self,
+        _instance_name: &str,
+        _producer_epoch: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("injected retirement failure")
+    }
+
+    async fn manager_stopped(&self) -> anyhow::Result<()> {
+        self.inner.manager_stopped().await
+    }
+}
 
 fn isolate_config_dir() {
     static ONCE: Once = Once::new();
@@ -258,6 +305,450 @@ async fn external_changes_converge_into_the_aggregator_without_a_surface_read() 
     assert!(aggregator.get_zone("hqplayer:rig").await.is_none());
     bus.publish(BusEvent::ShuttingDown { reason: None });
     aggregator_task.await.expect("aggregator stops");
+    server.stop();
+}
+
+/// The adaptive producer and legacy zone must be projections of one managed observation. This
+/// exercises the manager path rather than calling the pure projector directly: it proves the
+/// runtime has one live HQPlayer namespace lease and that an ordinary stop leaves retained state
+/// honestly last-known while the actor remains available to drain it.
+#[tokio::test]
+async fn adaptive_managed_instance_publishes_then_stops_as_last_known() {
+    isolate_config_dir();
+    let model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    model.external_change(|s| {
+        s.playback = 2;
+        s.track = 1;
+        s.track_id = "adaptive-track".to_string();
+        s.metadata = Some(Metadata::sample());
+        s.volume_db = -23.5;
+    });
+    let server = WireServer::start(Arc::new(model), WirePolicy::default()).await;
+    let bus = create_bus();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (handle, actor, view) = AdaptiveRuntime::build(shutdown.clone(), 32);
+    let actor_task = tokio::spawn(async move { actor.run().await });
+    let manager = adaptive_manager(bus.clone(), handle);
+    let adapter = manager
+        .add_instance(
+            "rig".to_string(),
+            "127.0.0.1".to_string(),
+            Some(server.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    adapter.set_timeouts(fast_timeouts()).await;
+    adapter.set_recovery_config(fast_recovery()).await;
+    manager.start().await.expect("start adaptive lifecycle");
+
+    let mut admitted = None;
+    for _ in 0..100 {
+        let snapshots = view.snapshots();
+        if let Some(snapshot) = snapshots
+            .into_iter()
+            .find(|snapshot| snapshot.key.producer_id == "hqplayer:rig")
+        {
+            admitted = Some(snapshot);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let snapshot = admitted.expect("adaptive managed observation was admitted");
+    assert_eq!(snapshot.presence, ProducerPresence::Live);
+    assert_eq!(
+        snapshot.document.producer.epoch.0,
+        adapter.producer_epoch().await
+    );
+    assert_eq!(
+        snapshot
+            .document
+            .control(&unified_hifi_control::adaptive::ControlId::new(
+                "hqplayer.volume.level"
+            ))
+            .and_then(|control| control.observed()),
+        Some(&unified_hifi_control::adaptive::ControlValue::Decimal(
+            -23.5
+        ))
+    );
+    assert!(snapshot
+        .document
+        .lane_health(&unified_hifi_control::adaptive::TransportLane::Native)
+        .is_some());
+
+    let key = ProducerKey::of(&snapshot.document);
+    manager.stop().await;
+    assert_eq!(
+        view.snapshot(&key)
+            .expect("retained adaptive snapshot")
+            .presence,
+        ProducerPresence::LastKnown
+    );
+    shutdown.cancel();
+    actor_task.await.expect("adaptive actor drains");
+    server.stop();
+}
+
+#[tokio::test]
+async fn two_adaptive_instances_coexist_under_the_one_hqplayer_namespace_run() {
+    isolate_config_dir();
+    let first = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let second = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let bus = create_bus();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (handle, actor, view) = AdaptiveRuntime::build(shutdown.clone(), 32);
+    let actor_task = tokio::spawn(async move { actor.run().await });
+    let manager = adaptive_manager(bus, handle);
+    for (name, server) in [("first", &first), ("second", &second)] {
+        let adapter = manager
+            .add_instance(
+                name.to_string(),
+                "127.0.0.1".to_string(),
+                Some(server.port()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        adapter.set_timeouts(fast_timeouts()).await;
+        adapter.set_recovery_config(fast_recovery()).await;
+    }
+    manager.start().await.expect("start both managed instances");
+
+    for _ in 0..100 {
+        let live = view
+            .snapshots()
+            .into_iter()
+            .filter(|snapshot| snapshot.presence == ProducerPresence::Live)
+            .map(|snapshot| snapshot.key.producer_id)
+            .collect::<Vec<_>>();
+        if live.iter().any(|id| id == "hqplayer:first")
+            && live.iter().any(|id| id == "hqplayer:second")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let live = view
+        .snapshots()
+        .into_iter()
+        .filter(|snapshot| snapshot.presence == ProducerPresence::Live)
+        .map(|snapshot| snapshot.key.producer_id)
+        .collect::<Vec<_>>();
+    assert!(live.iter().any(|id| id == "hqplayer:first"));
+    assert!(live.iter().any(|id| id == "hqplayer:second"));
+
+    manager.stop().await;
+    shutdown.cancel();
+    actor_task.await.expect("actor drains");
+    first.stop();
+    second.stop();
+}
+
+#[tokio::test]
+async fn removing_one_adaptive_instance_retires_only_its_producer() {
+    isolate_config_dir();
+    let first = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let second = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let bus = create_bus();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (handle, actor, view) = AdaptiveRuntime::build(shutdown.clone(), 32);
+    let actor_task = tokio::spawn(async move { actor.run().await });
+    let manager = adaptive_manager(bus, handle);
+    for (name, server) in [("first", &first), ("second", &second)] {
+        let adapter = manager
+            .add_instance(
+                name.to_string(),
+                "127.0.0.1".to_string(),
+                Some(server.port()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        adapter.set_timeouts(fast_timeouts()).await;
+        adapter.set_recovery_config(fast_recovery()).await;
+    }
+    manager.start().await.expect("start both managed instances");
+    for _ in 0..100 {
+        if view.snapshots().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        view.snapshots().len(),
+        2,
+        "both producers admitted before removal"
+    );
+
+    assert!(manager.remove_instance("first").await, "instance removed");
+    let retained = view.snapshots();
+    assert!(
+        retained
+            .iter()
+            .all(|snapshot| snapshot.key.producer_id != "hqplayer:first"),
+        "definitive instance removal retires only its own producer"
+    );
+    assert!(
+        retained.iter().any(|snapshot| {
+            snapshot.key.producer_id == "hqplayer:second"
+                && snapshot.presence == ProducerPresence::Live
+        }),
+        "sibling producer survives another instance's retirement"
+    );
+
+    manager.stop().await;
+    shutdown.cancel();
+    actor_task.await.expect("actor drains");
+    first.stop();
+    second.stop();
+}
+
+#[tokio::test]
+async fn failed_adaptive_retirement_rolls_back_instance_removal() {
+    isolate_config_dir();
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let bus = create_bus();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (handle, actor, view) = AdaptiveRuntime::build(shutdown.clone(), 32);
+    let actor_task = tokio::spawn(async move { actor.run().await });
+    let sink = Arc::new(RejectRetirementSink {
+        inner: HqpAdaptivePublisher::new(handle),
+    });
+    let manager = HqpInstanceManager::new_with_native_sink(bus, sink);
+    let adapter = manager
+        .add_instance(
+            "rig".to_string(),
+            "127.0.0.1".to_string(),
+            Some(server.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    adapter.set_timeouts(fast_timeouts()).await;
+    adapter.set_recovery_config(fast_recovery()).await;
+    manager.start().await.expect("start managed instance");
+
+    for _ in 0..100 {
+        if view
+            .snapshots()
+            .iter()
+            .any(|snapshot| snapshot.key.producer_id == "hqplayer:rig")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        view.snapshots()
+            .iter()
+            .any(|snapshot| snapshot.key.producer_id == "hqplayer:rig"),
+        "producer admitted before removal"
+    );
+
+    assert!(
+        !manager.remove_instance("rig").await,
+        "retirement failure must make removal fail"
+    );
+    assert!(
+        manager.get("rig").await.is_some(),
+        "failed removal restores the configured instance"
+    );
+    for _ in 0..100 {
+        if manager.worker_status("rig").await.supervisor_enabled {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        manager.worker_status("rig").await.supervisor_enabled,
+        "failed removal restarts the instance worker"
+    );
+
+    manager.stop().await;
+    shutdown.cancel();
+    actor_task.await.expect("actor drains");
+    server.stop();
+}
+
+#[tokio::test]
+async fn managed_legacy_and_adaptive_projections_share_one_coherent_gather() {
+    isolate_config_dir();
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let bus = create_bus();
+    let zones = Arc::new(ZoneAggregator::new(bus.clone()));
+    let zones_task = {
+        let zones = zones.clone();
+        tokio::spawn(async move { zones.run().await })
+    };
+    tokio::task::yield_now().await;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (handle, actor, view) = AdaptiveRuntime::build(shutdown.clone(), 32);
+    let actor_task = tokio::spawn(async move { actor.run().await });
+    let manager = adaptive_manager(bus.clone(), handle);
+    let adapter = manager
+        .add_instance(
+            "rig".to_string(),
+            "127.0.0.1".to_string(),
+            Some(server.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    adapter.set_timeouts(fast_timeouts()).await;
+    let mut policy = fast_recovery();
+    policy.poll_interval = Duration::from_secs(5);
+    adapter.set_recovery_config(policy).await;
+    manager.start().await.expect("start managed instance");
+
+    for _ in 0..100 {
+        if !view.snapshots().is_empty() && zones.get_zone("hqplayer:rig").await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(view.snapshots().len(), 1, "adaptive projection admitted");
+    assert!(
+        zones.get_zone("hqplayer:rig").await.is_some(),
+        "legacy zone projected"
+    );
+    let stats = server.stats();
+    // Initial `connect` handshakes once, then the managed coherent gather reads State/Status once
+    // and probes rates around a single list fill. A second read for either legacy or adaptive
+    // projection would raise State and Status above two before the intentionally long next poll.
+    assert_eq!(stats.element_count("State"), 2);
+    assert_eq!(stats.element_count("Status"), 2);
+    assert_eq!(stats.element_count("GetRates"), 3);
+
+    manager.stop().await;
+    bus.publish(BusEvent::ShuttingDown { reason: None });
+    zones_task.await.expect("zone aggregator stops");
+    shutdown.cancel();
+    actor_task.await.expect("actor drains");
+    server.stop();
+}
+
+#[tokio::test]
+async fn adaptive_transient_failure_is_last_known_then_recovers_in_a_new_epoch() {
+    isolate_config_dir();
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let bus = create_bus();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (handle, actor, view) = AdaptiveRuntime::build(shutdown.clone(), 32);
+    let actor_task = tokio::spawn(async move { actor.run().await });
+    let manager = adaptive_manager(bus, handle);
+    let adapter = manager
+        .add_instance(
+            "rig".to_string(),
+            "127.0.0.1".to_string(),
+            Some(server.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    adapter.set_timeouts(fast_timeouts()).await;
+    let mut recovery = fast_recovery();
+    // Keep the failure visible before the reconnect retry so this assertion observes the contract
+    // state rather than scheduler timing.
+    recovery.short_retry_delay = Duration::from_millis(200);
+    recovery.restart_window = Duration::from_secs(1);
+    adapter.set_recovery_config(recovery).await;
+    manager.start().await.expect("start managed instance");
+
+    let initial = loop {
+        if let Some(snapshot) = view
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.key.producer_id == "hqplayer:rig")
+        {
+            break snapshot;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let initial_epoch = initial.document.producer.epoch;
+    let key = ProducerKey::of(&initial.document);
+    server.set_policy(WirePolicy {
+        disruption: Disruption::DropNextReplyOnce,
+        ..WirePolicy::default()
+    });
+    server.arm_disruption();
+
+    for _ in 0..100 {
+        let snapshot = view.snapshot(&key).expect("retained producer");
+        if snapshot.presence == ProducerPresence::LastKnown
+            && snapshot
+                .document
+                .lane_health(&unified_hifi_control::adaptive::TransportLane::Native)
+                .is_some_and(|lane| {
+                    lane.state == unified_hifi_control::adaptive::LaneState::Disconnected
+                })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stale = view.snapshot(&key).expect("stale snapshot");
+    assert_eq!(stale.presence, ProducerPresence::LastKnown);
+    assert!(
+        server.disruption_fired(),
+        "fault exercised a live managed observation"
+    );
+
+    for _ in 0..100 {
+        let snapshot = view.snapshot(&key).expect("recovered producer");
+        if snapshot.presence == ProducerPresence::Live
+            && snapshot.document.producer.epoch > initial_epoch
+            && snapshot
+                .document
+                .lane_health(&unified_hifi_control::adaptive::TransportLane::Native)
+                .is_some_and(|lane| {
+                    lane.state == unified_hifi_control::adaptive::LaneState::Connected
+                })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let recovered = view.snapshot(&key).expect("recovered snapshot");
+    assert_eq!(recovered.presence, ProducerPresence::Live);
+    assert!(recovered.document.producer.epoch > initial_epoch);
+
+    manager.stop().await;
+    shutdown.cancel();
+    actor_task.await.expect("actor drains");
     server.stop();
 }
 
