@@ -11,8 +11,9 @@
 //! known defect, and out of scope for #394.
 
 use crate::api::AppState;
+use crate::mcp::envelope::{Envelope, Observed, Refusal, Scope};
 use crate::mcp::routing::{LibraryRoute, ZoneTarget};
-use crate::mcp::types::{error_result, json_result, text_result, McpSearchResult};
+use crate::mcp::types::{McpPlayResult, McpSearchResult};
 use rust_mcp_sdk::{
     macros::{mcp_tool, JsonSchema},
     schema::{schema_utils::CallToolError, CallToolResult},
@@ -83,7 +84,32 @@ pub async fn handle_search(
     state: &AppState,
     args: HifiSearchTool,
 ) -> Result<CallToolResult, CallToolError> {
-    match ZoneTarget::classify_opt(args.zone_id.as_deref()).for_library() {
+    let target = ZoneTarget::classify_opt(args.zone_id.as_deref());
+    let route = target.for_library();
+
+    // A search is a read, so `ok` on success. `zone_id` is optional here, and an
+    // absent one is omitted rather than reported as null — "no zone context" and
+    // "zone context of null" are different requests.
+    let mut env = Envelope::read("hifi_search", "search")
+        .param("query", &*args.query)
+        .param_opt("zone_id", args.zone_id.as_deref());
+
+    env = match route {
+        // LMS ignores `source` entirely, so echoing it back as understood would
+        // claim the server honored something it discarded.
+        LibraryRoute::Lms => env,
+        LibraryRoute::Roon => env.param(
+            "source",
+            roon_source_name(roon_search_source(args.source.as_deref())),
+        ),
+    };
+
+    let env = match args.zone_id.as_deref() {
+        Some(zone_id) => env.scope(Scope::for_zone(state, zone_id, route.provider()).await),
+        None => env.scope(Scope::provider_only(route.provider())),
+    };
+
+    match route {
         LibraryRoute::Lms => {
             // LMS uses globalsearch, which covers every installed provider
             // (library, TIDAL, Qobuz, ...), so `source` does not apply.
@@ -100,9 +126,9 @@ pub async fn handle_search(
                             title: item.title,
                         })
                         .collect();
-                    Ok(json_result(&mcp_results))
+                    Ok(env.json_result(&mcp_results))
                 }
-                Err(e) => error_result(format!("Search error: {}", e)),
+                Err(e) => env.failed(format!("Search error: {}", e)),
             }
         }
         LibraryRoute::Roon => {
@@ -124,11 +150,25 @@ pub async fn handle_search(
                             subtitle: item.subtitle,
                         })
                         .collect();
-                    Ok(json_result(&mcp_results))
+                    Ok(env.json_result(&mcp_results))
                 }
-                Err(e) => error_result(format!("Search error: {}", e)),
+                Err(e) => env.failed(format!("Search error: {}", e)),
             }
         }
+    }
+}
+
+/// The `source` name the server resolved to, for the envelope's `params`.
+///
+/// `roon_search_source` silently falls back to Library for anything
+/// unrecognised, so reporting the resolved name is the only way a client learns
+/// that its `source: "spotify"` was quietly read as `library`.
+fn roon_source_name(source: crate::adapters::roon::SearchSource) -> &'static str {
+    use crate::adapters::roon::SearchSource;
+    match source {
+        SearchSource::Tidal => "tidal",
+        SearchSource::Qobuz => "qobuz",
+        SearchSource::Library => "library",
     }
 }
 
@@ -153,45 +193,117 @@ pub async fn handle_play(
     state: &AppState,
     args: HifiPlayTool,
 ) -> Result<CallToolResult, CallToolError> {
-    match ZoneTarget::classify(&args.zone_id).for_library() {
+    let target = ZoneTarget::classify(&args.zone_id);
+    let route = target.for_library();
+
+    match route {
         LibraryRoute::Lms => {
             use crate::adapters::lms::LmsPlayAction;
 
             // LMS ignores `source` (library only) and has no radio mode. The
             // refusal names the supported actions so the model can retry.
             if args.action.as_deref() == Some("radio") {
-                return error_result(
-                    "Radio mode not supported for LMS. Use 'play' or 'queue'.".into(),
-                );
+                return Envelope::write("hifi_play", "radio")
+                    .param("query", &*args.query)
+                    .param("zone_id", &*args.zone_id)
+                    .param("action", "radio")
+                    .scope(Scope::for_zone(state, &args.zone_id, route.provider()).await)
+                    .refused(
+                        "Radio mode not supported for LMS. Use 'play' or 'queue'.",
+                        Refusal::ProviderLimitation {
+                            operation: "radio".to_string(),
+                            alternatives: vec![
+                                "hifi_play action=play".to_string(),
+                                "hifi_play action=queue".to_string(),
+                            ],
+                            detail: "LMS's core protocol has no equivalent of Roon Radio. \
+                                     Plugin approximations exist (e.g. Don't Stop The Music) \
+                                     but UHC drives none of them."
+                                .to_string(),
+                        },
+                    );
             }
 
             let action = LmsPlayAction::parse(args.action.as_deref());
+            // `operation` is the *resolved* action, so an absent `action` reports
+            // whatever LmsPlayAction::parse defaulted to rather than nothing.
+            let env = Envelope::write("hifi_play", lms_action_name(action))
+                .param("query", &*args.query)
+                .param("zone_id", &*args.zone_id)
+                .param("action", lms_action_name(action))
+                .scope(Scope::for_zone(state, &args.zone_id, route.provider()).await);
+
             match state
                 .lms
                 .search_and_play(&args.query, &args.zone_id, action)
                 .await
             {
-                Ok(message) => Ok(text_result(message)),
-                Err(e) => error_result(format!("Play error: {}", e)),
+                Ok(message) => Ok(play_success(state, env, message).await),
+                Err(e) => env.failed(format!("Play error: {}", e)),
             }
         }
         LibraryRoute::Roon => {
             use crate::adapters::roon::PlayAction;
 
+            let source = roon_search_source(args.source.as_deref());
             let action = PlayAction::parse(args.action.as_deref().unwrap_or("play"));
+            let env = Envelope::write("hifi_play", roon_action_name(action))
+                .param("query", &*args.query)
+                .param("zone_id", &*args.zone_id)
+                .param("action", roon_action_name(action))
+                .param("source", roon_source_name(source))
+                .scope(Scope::for_zone(state, &args.zone_id, route.provider()).await);
+
             match state
                 .roon
-                .search_and_play(
-                    &args.query,
-                    &args.zone_id,
-                    roon_search_source(args.source.as_deref()),
-                    action,
-                )
+                .search_and_play(&args.query, &args.zone_id, source, action)
                 .await
             {
-                Ok(message) => Ok(text_result(message)),
-                Err(e) => error_result(format!("Play error: {}", e)),
+                Ok(message) => Ok(play_success(state, env, message).await),
+                Err(e) => env.failed(format!("Play error: {}", e)),
             }
         }
+    }
+}
+
+/// Finish a successful `hifi_play`: the adapter's message verbatim as the text,
+/// plus a zone read-back.
+///
+/// `data.message` duplicates the text on purpose, and it is the only field in
+/// this envelope that does. Without it a client reading only `structuredContent`
+/// would have no record of *which* item matched, because there is no addressable
+/// identifier for a search result until #396 lands. It is adapter-authored prose,
+/// not parsed — #396 replaces it with an opaque ref.
+async fn play_success(state: &AppState, env: Envelope, message: String) -> CallToolResult {
+    let zone_id = env
+        .scope
+        .as_ref()
+        .and_then(|s| s.zone_id.clone())
+        .unwrap_or_default();
+    let observed = Observed::from_aggregator(state, &zone_id).await;
+    env.data(&McpPlayResult {
+        message: message.clone(),
+    })
+    .observed(observed)
+    .text_result(message)
+}
+
+/// The resolved LMS play action's name, for `operation` and `params.action`.
+fn lms_action_name(action: crate::adapters::lms::LmsPlayAction) -> &'static str {
+    use crate::adapters::lms::LmsPlayAction;
+    match action {
+        LmsPlayAction::Play => "play",
+        LmsPlayAction::Queue => "queue",
+        LmsPlayAction::Insert => "insert",
+    }
+}
+
+/// The resolved Roon play action's name.
+fn roon_action_name(action: crate::adapters::roon::PlayAction) -> &'static str {
+    use crate::adapters::roon::PlayAction;
+    match action {
+        PlayAction::Play => "play",
+        PlayAction::Queue => "queue",
+        PlayAction::Radio => "radio",
     }
 }

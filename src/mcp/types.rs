@@ -14,9 +14,20 @@
 //! switch it to declaration order and reorder the keys clients receive.
 //! `tests/mcp_contract.rs::hifi_status_shape_is_pinned` asserts the ordering.
 //!
-//! This module is #395's (result envelope) primary target.
+//! # Result construction moved to [`crate::mcp::envelope`] (#395)
+//!
+//! `json_result` and `error_result` used to live here. Every tool now builds an
+//! [`Envelope`](crate::mcp::envelope::Envelope) and finishes with
+//! `Envelope::json_result` / `text_result` / `refused` / `failed`, which produce
+//! the same text *and* attach the structured payload. [`text_result`] below
+//! remains as the primitive those call.
+//!
+//! The declaration-order warning above is the reason `Envelope::json_result`
+//! renders its text from the payload struct rather than from the `serde_json::Value`
+//! it puts in `data`: a `Value::Object` is a `BTreeMap` and would serialize these
+//! structs alphabetically, changing the bytes clients receive.
 
-use rust_mcp_sdk::schema::{schema_utils::CallToolError, CallToolResult, TextContent};
+use rust_mcp_sdk::schema::{CallToolResult, TextContent};
 use serde::Serialize;
 
 // =============================================================================
@@ -56,6 +67,22 @@ pub struct McpSearchResult {
     pub subtitle: Option<String>,
 }
 
+/// `hifi_play`'s structured payload: the adapter's own message about what it
+/// matched and started.
+///
+/// A named type rather than a `json!` literal so the field inventory in
+/// `tests/mcp_contract.rs` can reach it by serialization. The success path needs a
+/// live music library, which no mock provides, so a hand-written field list would
+/// have a hole exactly where #396 is about to edit.
+///
+/// This is prose, not parsed data. It exists because until #396 mints opaque
+/// refs, the adapter's sentence is the only record of *which* item matched — so a
+/// client reading only `structuredContent` would otherwise learn nothing about it.
+#[derive(Debug, Serialize)]
+pub struct McpPlayResult {
+    pub message: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct McpHqpStatus {
     pub connected: bool,
@@ -75,25 +102,20 @@ pub struct McpPipelineStatus {
 // Result constructors
 // =============================================================================
 
-/// Plain text content.
+/// Plain text content: exactly one text block.
+///
+/// One block, always. `tests/mcp_contract.rs::result_text` treats the text a
+/// client reads as the concatenation of every text block, so a second block would
+/// change the response — which is why #395's structured payload rides
+/// `structuredContent` instead. `every_tool_result_has_exactly_one_content_block`
+/// asserts it.
+///
+/// A failure is still reported *to the model* as readable text rather than as a
+/// protocol error, so it can read the reason and retry. The `Error: ` prefix and
+/// the wording after it are contract, and
+/// `Envelope::refused`/`Envelope::failed` are the only things that add it.
 pub fn text_result(text: String) -> CallToolResult {
     CallToolResult::text_content(vec![TextContent::from(text)])
-}
-
-/// A failure reported *to the model* as readable text rather than as a protocol
-/// error, so it can read the reason and retry.
-///
-/// The `Error: ` prefix and the wording after it are contract: a model decides
-/// what to do next by reading this string. `tests/mcp_contract.rs` pins the
-/// exact text of every refusal.
-pub fn error_result(msg: String) -> Result<CallToolResult, CallToolError> {
-    Ok(text_result(format!("Error: {}", msg)))
-}
-
-/// Pretty-printed JSON content.
-pub fn json_result<T: Serialize>(data: &T) -> CallToolResult {
-    let json = serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string());
-    text_result(json)
 }
 
 /// Build the now-playing payload from an aggregator zone.

@@ -2,7 +2,7 @@
   "hifi_control/lms_unconfigured": "Error: Control error: LMS host not configured",
   "hifi_control/openhome_unknown_device": "Error: Control error: Device not found: abc",
   "hifi_control/roon_disconnected": "Error: Control error: Not connected to Roon",
-  "hifi_control/unknown_action": "Error: Control error: Device not found: abc",
+  "hifi_control/unknown_action_never_reaches_dispatch": "Error: Control error: Device not found: abc",
   "hifi_control/upnp_unknown_renderer": "Error: Control error: Renderer not found: abc",
   "hifi_control/volume_openhome": "Error: Volume control not supported for this zone type",
   "hifi_control/volume_set_without_value": "Error: volume_set requires a value (0-100)",

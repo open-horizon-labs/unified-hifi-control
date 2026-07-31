@@ -34,6 +34,8 @@
 //! unify these into one rule changes behavior; `tests/mcp_contract.rs`
 //! (`volume_routing_differs_from_transport_routing`) fails if you try.
 
+use crate::mcp::envelope::Provider;
+
 /// Which adapter a zone id refers to, by prefix alone.
 ///
 /// Classification is purely syntactic: it says nothing about whether the zone
@@ -118,6 +120,21 @@ pub enum LibraryRoute {
     Roon,
 }
 
+/// The zone-id prefixes that name an adapter, for refusals that have to say what
+/// a valid zone id looks like.
+///
+/// Derived from the same list [`ZoneTarget::classify`] matches on, so a new
+/// adapter cannot be added without this following.
+pub const ACCEPTED_ZONE_PREFIXES: &[&str] = &["roon:", "lms:", "openhome:", "upnp:"];
+
+/// The `hifi_control` actions every adapter's transport path accepts.
+///
+/// Used to answer "what does this zone support instead?" when volume is refused
+/// (#395 requires an `unsupported` result to say what *is* available). This is a
+/// routing-derived answer, not a capability matrix: #398 owns the real one and
+/// should replace this.
+pub const TRANSPORT_ACTIONS: &str = "play, pause, playpause, next, previous";
+
 impl ZoneTarget {
     /// Transport routing. `Unknown` falls through to Roon — today's behavior.
     pub fn for_transport(self) -> TransportRoute {
@@ -146,6 +163,57 @@ impl ZoneTarget {
             Self::Lms => LibraryRoute::Lms,
             // Everything else, Unknown included, goes to Roon today.
             Self::Roon | Self::OpenHome | Self::Upnp | Self::Unknown => LibraryRoute::Roon,
+        }
+    }
+
+    /// The provider name for an envelope [`Scope`](crate::mcp::envelope::Scope)
+    /// when no route was chosen — i.e. on a refusal that happened before dispatch.
+    ///
+    /// Where a route *was* chosen, ask the route instead
+    /// ([`TransportRoute::provider`] and friends), because the route is what
+    /// actually happened: `sonos:x` classifies as `Unknown` but transport still
+    /// sends it to Roon, and the envelope must report the truth rather than the
+    /// prefix.
+    pub fn provider(self) -> Provider {
+        match self {
+            Self::Lms => Provider::Lms,
+            Self::OpenHome => Provider::OpenHome,
+            Self::Upnp => Provider::Upnp,
+            Self::Roon => Provider::Roon,
+            Self::Unknown => Provider::Unknown,
+        }
+    }
+}
+
+impl TransportRoute {
+    /// The adapter this route reaches. Reports `roon` for unrecognised prefixes,
+    /// because that is where they actually go today.
+    pub fn provider(self) -> Provider {
+        match self {
+            Self::Lms => Provider::Lms,
+            Self::OpenHome => Provider::OpenHome,
+            Self::Upnp => Provider::Upnp,
+            Self::Roon => Provider::Roon,
+        }
+    }
+}
+
+impl VolumeRoute {
+    /// The adapter this route reaches, or `None` when volume is refused.
+    pub fn provider(self) -> Option<Provider> {
+        match self {
+            Self::Lms => Some(Provider::Lms),
+            Self::Roon => Some(Provider::Roon),
+            Self::Unsupported => None,
+        }
+    }
+}
+
+impl LibraryRoute {
+    pub fn provider(self) -> Provider {
+        match self {
+            Self::Lms => Provider::Lms,
+            Self::Roon => Provider::Roon,
         }
     }
 }

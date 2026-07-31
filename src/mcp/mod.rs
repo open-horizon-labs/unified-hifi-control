@@ -11,12 +11,13 @@
 //!
 //! | Module      | Responsibility                                           |
 //! |-------------|----------------------------------------------------------|
-//! | `mod.rs`    | Axum route handlers, session recovery, SDK wiring        |
-//! | [`server`]  | the `initialize` result: identity, capabilities, protocol |
-//! | [`handler`] | the `ServerHandler` impl: advertise tools, dispatch calls |
-//! | [`tools`]   | tool definitions + handlers, by family                   |
-//! | [`types`]   | response shapes and result constructors                  |
-//! | [`routing`] | zone-prefix -> adapter, in exactly one place             |
+//! | `mod.rs`     | Axum route handlers, session recovery, SDK wiring         |
+//! | [`server`]   | the `initialize` result: identity, capabilities, protocol |
+//! | [`handler`]  | the `ServerHandler` impl: advertise tools, dispatch calls |
+//! | [`tools`]    | tool definitions + handlers, by family                    |
+//! | [`types`]    | response shapes and result constructors                   |
+//! | [`envelope`] | the structured result envelope every tool fills           |
+//! | [`routing`]  | zone-prefix -> adapter, in exactly one place              |
 //!
 //! # The MCP surface is pinned by tests
 //!
@@ -29,6 +30,7 @@
 //! UPDATE_MCP_FIXTURES=1 cargo test --test mcp_contract
 //! ```
 
+pub mod envelope;
 pub mod handler;
 pub mod routing;
 pub mod server;

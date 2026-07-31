@@ -54,7 +54,7 @@ use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp;
-use unified_hifi_control::mcp::types::{McpPipelineStatus, McpSearchResult};
+use unified_hifi_control::mcp::types::{McpPipelineStatus, McpPlayResult, McpSearchResult};
 
 use mock_servers::{MockHqpServer, MockLmsServer, MockOpenHomeDevice, MockUpnpRenderer};
 
@@ -1825,6 +1825,112 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
     )),
     ("shaper", Consumed("hifi_hqplayer_set_pipeline.setting='shaper'")),
     ("rate", Consumed("hifi_hqplayer_set_pipeline.setting='rate'")),
+    // -------------------------------------------------------------------------
+    // The #395 envelope, carried on `structuredContent`.
+    //
+    // These are classified here rather than exempted because the guardrail's rule
+    // — nothing is returned that a client cannot act on — applies to the
+    // structured payload at least as much as to the text. See the extension in
+    // `no_tool_returns_an_unclassified_field`.
+    // -------------------------------------------------------------------------
+    ("schema", DisplayOnly(
+        "envelope version marker (uhc.mcp.envelope/N). A client branches on it to \
+         decide how to read the rest; it is not passed back to any tool. The bump \
+         rule lives in src/mcp/envelope.rs.",
+    )),
+    ("outcome", DisplayOnly(
+        "ok/accepted/unsupported/invalid/error. The whole point of #221: a model \
+         branches on it instead of guessing from prose. Not an input anywhere.",
+    )),
+    ("tool", DisplayOnly(
+        "echoes which tool answered, so a client correlating several calls (or #397 \
+         reading a resource with no request to pair with) does not have to track it",
+    )),
+    ("operation", DisplayOnly(
+        "the server's normalized name for what it did — `prev` reported as \
+         `previous`. Not a tool input: hifi_control.action is the write path, and \
+         this is its resolution.",
+    )),
+    ("params", DisplayOnly(
+        "wrapper for the resolved parameters. Its KEYS are always declared inputs \
+         of the tool (asserted by envelope_params_use_only_declared_tool_parameters), \
+         so everything inside it closes a loop even though the wrapper itself does not.",
+    )),
+    ("scope", DisplayOnly(
+        "wrapper for what the call acted on: provider, zone_id, zone_name",
+    )),
+    ("provider", DisplayOnly(
+        "which adapter the call was routed to. A client cannot set it — routing is \
+         derived from the zone id prefix — but it is what makes a capability refusal \
+         checkable rather than a shrug. #398 consumes this concept as data.",
+    )),
+    ("observed", DisplayOnly(
+        "wrapper for state read back after a write",
+    )),
+    ("read_from", DisplayOnly(
+        "provenance of the read-back, `aggregator` today. Named read_from rather \
+         than source so it does not collide with hifi_search.source in this table. \
+         #400 adds adapter-sourced queue reads.",
+    )),
+    ("as_of_ms", DisplayOnly(
+        "when the aggregator last updated this zone. Present so a client can judge \
+         staleness itself, because #395 forbids claiming verification the adapters \
+         cannot do — this is the honest alternative to a `verified` flag.",
+    )),
+    ("zone", DisplayOnly(
+        "wrapper holding the read-back zone; its fields are the same now-playing \
+         readout hifi_now_playing returns",
+    )),
+    ("refusal", DisplayOnly(
+        "wrapper for why a call was refused",
+    )),
+    ("reason", DisplayOnly(
+        "provider_limitation / not_implemented / invalid_parameter / unknown_target \
+         / backend_error. Each implies a different client action, which is the test \
+         for whether a distinction earns its place.",
+    )),
+    ("detail", DisplayOnly(
+        "the envelope's own sentence explaining the refusal. Deliberately NOT a \
+         copy of the frozen prose: where the prose misleads (OpenHome volume) this \
+         says the true thing.",
+    )),
+    ("alternatives", Consumed(
+        "each entry is a callable tool invocation, e.g. \"hifi_play action=queue\" \
+         (asserted by unsupported_refusals_name_the_operation_and_an_alternative)",
+    )),
+    ("tracked_by", DisplayOnly(
+        "the UHC issue that will implement a not_implemented capability. A model \
+         cannot act on it, but it is what makes \"not yet\" a claim an operator can \
+         check rather than an excuse.",
+    )),
+    ("parameter", Consumed(
+        "names the tool input the client must correct; asserted to be a parameter \
+         the tool actually declares",
+    )),
+    ("accepted", Consumed(
+        "the values the named parameter accepts — the client resends with one",
+    )),
+    ("discover_with", Consumed(
+        "names the tool that enumerates valid values, e.g. hifi_zones for zone_id",
+    )),
+    ("data", DisplayOnly(
+        "wrapper for the tool's own payload; the same JSON the human text carries. \
+         #397 projects this verbatim as resource contents.",
+    )),
+    ("message", DisplayOnly(
+        "hifi_play's adapter-authored prose, the only record of WHICH item matched, \
+         because search results have no addressable identifier until #396. Prose, \
+         not parsed — #396 replaces it with an opaque ref.",
+    )),
+    // The keys inside `params`. Every one is a tool input by construction — that
+    // is what envelope_params_use_only_declared_tool_parameters enforces — so they
+    // are all Consumed, naming the tools that take them.
+    ("action", Consumed("hifi_control.action / hifi_play.action")),
+    ("value", Consumed("hifi_control.value / hifi_hqplayer_set_pipeline.value")),
+    ("query", Consumed("hifi_search.query / hifi_play.query")),
+    ("source", Consumed("hifi_search.source / hifi_play.source")),
+    ("profile", Consumed("hifi_hqplayer_load_profile.profile")),
+    ("setting", Consumed("hifi_hqplayer_set_pipeline.setting")),
 ];
 
 /// Collect every key name reachable in a JSON value, at any depth.
@@ -1862,10 +1968,52 @@ async fn no_tool_returns_an_unclassified_field() {
 
     let mut returned = std::collections::BTreeSet::new();
     for (tool, args) in structured_calls {
-        let text = result_text(&h.app.call_tool(tool, args).await);
+        let result = h.app.call_tool(tool, args).await;
+        let text = result_text(&result);
         let parsed: Value = serde_json::from_str(&text)
             .unwrap_or_else(|e| panic!("{tool} must return JSON: {e}\n{text}"));
         collect_keys(&parsed, &mut returned);
+
+        // #395 extension: the envelope is returned data too, so the guardrail
+        // applies to it. Without this, every envelope field would be
+        // unclassified and this test would still pass — the rule would silently
+        // stop covering the newer half of the response.
+        if let Some(envelope) = result.get("structuredContent") {
+            collect_keys(envelope, &mut returned);
+        }
+    }
+
+    // Envelope shapes the four calls above cannot reach: every refusal variant's
+    // fields, every `params` key, and the write path's `observed`. Driven rather
+    // than listed, so a renamed field is caught instead of quietly reclassified.
+    for (tool, args) in [
+        // One call per Refusal variant.
+        ("hifi_now_playing", json!({ "zone_id": "roon:nope" })), // unknown_target
+        (
+            "hifi_control", // not_implemented
+            json!({ "zone_id": "openhome:abc", "action": "volume_set", "value": 1 }),
+        ),
+        (
+            "hifi_play", // provider_limitation
+            json!({ "query": "q", "zone_id": "lms:aa:bb:cc:dd:ee:ff", "action": "radio" }),
+        ),
+        (
+            "hifi_hqplayer_set_pipeline", // invalid_parameter
+            json!({ "setting": "nope", "value": "x" }),
+        ),
+        // Remaining `params` keys: query + source (Roon route), profile.
+        ("hifi_search", json!({ "query": "q" })),
+        ("hifi_hqplayer_load_profile", json!({ "profile": "p" })),
+        // A successful write, for `observed`.
+        (
+            "hifi_control",
+            json!({ "zone_id": zone_id.clone(), "action": "play" }),
+        ),
+    ] {
+        let result = h.app.call_tool(tool, args).await;
+        if let Some(envelope) = result.get("structuredContent") {
+            collect_keys(envelope, &mut returned);
+        }
     }
 
     // Two response shapes cannot be reached over the wire here: hifi_search needs
@@ -1893,6 +2041,16 @@ async fn no_tool_returns_an_unclassified_field() {
             rate: 0,
         })
         .expect("McpPipelineStatus must serialize"),
+        &mut returned,
+    );
+    // #395: hifi_play's success payload. Same reasoning — its success path needs a
+    // live music library, which no mock provides, so serialize the production type
+    // rather than trusting a comment.
+    collect_keys(
+        &serde_json::to_value(McpPlayResult {
+            message: String::new(),
+        })
+        .expect("McpPlayResult must serialize"),
         &mut returned,
     );
 
@@ -2004,10 +2162,21 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
     ("hifi_control/volume_up_defaulted", "hifi_control", || {
         json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "volume_up" })
     }),
-    // hifi_control — an action no adapter knows, passed straight through.
-    ("hifi_control/unknown_action", "hifi_control", || {
-        json!({ "zone_id": "openhome:abc", "action": "frobnicate" })
-    }),
+    // hifi_control — an action no adapter knows, passed straight through by
+    // `other => other`.
+    //
+    // NOTE the label: the OpenHome adapter resolves the device *before* matching
+    // the action, so offline this never reaches action dispatch and the text is
+    // "Device not found". Calling this case "unknown_action" would be coverage
+    // wearing a label it has not earned. What the pass-through actually does to
+    // `operation` is asserted against the LMS mock instead
+    // (`envelope_reports_normalized_actions_and_resolved_volume` and the LMS
+    // round-trip), where a device does resolve.
+    (
+        "hifi_control/unknown_action_never_reaches_dispatch",
+        "hifi_control",
+        || json!({ "zone_id": "openhome:abc", "action": "frobnicate" }),
+    ),
     // hifi_search — failure on both routes.
     ("hifi_search/roon_disconnected", "hifi_search", || {
         json!({ "query": "Eagles" })
@@ -2117,4 +2286,893 @@ async fn every_tool_result_has_exactly_one_content_block() {
             "{label}: the single content block must stay a text block"
         );
     }
+}
+
+// =============================================================================
+// 10. The envelope itself (#395)
+// =============================================================================
+//
+// The envelope rides `CallToolResult.structured_content` -> wire
+// `structuredContent`. Section 9 proves the text did not change; this section
+// proves something was actually added, and that what was added is honest.
+//
+// `EXPECTED_ENVELOPES` below is the coverage matrix. It is a table rather than a
+// pile of individual tests so that a missing outcome or an unclassified refusal
+// reason is a visible gap in one place.
+
+/// The envelope a client receives from every case in [`TOOL_TEXT_CASES`].
+///
+/// `(label, expected outcome, expected refusal reason or None)`. Keyed by the same
+/// labels as the text fixture, so the two tables describe the same calls and a
+/// case cannot be pinned for text but not for structure.
+const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
+    ("hifi_zones/empty", "ok", None),
+    (
+        "hifi_now_playing/unknown_zone",
+        "invalid",
+        Some("unknown_target"),
+    ),
+    (
+        "hifi_control/roon_disconnected",
+        "error",
+        Some("backend_error"),
+    ),
+    (
+        "hifi_control/lms_unconfigured",
+        "error",
+        Some("backend_error"),
+    ),
+    (
+        "hifi_control/openhome_unknown_device",
+        "error",
+        Some("backend_error"),
+    ),
+    (
+        "hifi_control/upnp_unknown_renderer",
+        "error",
+        Some("backend_error"),
+    ),
+    (
+        "hifi_control/volume_set_without_value",
+        "invalid",
+        Some("invalid_parameter"),
+    ),
+    // The two rows this issue exists for: one frozen string, two truths.
+    (
+        "hifi_control/volume_openhome",
+        "unsupported",
+        Some("not_implemented"),
+    ),
+    (
+        "hifi_control/volume_upnp",
+        "unsupported",
+        Some("not_implemented"),
+    ),
+    (
+        "hifi_control/volume_unknown_prefix",
+        "invalid",
+        Some("invalid_parameter"),
+    ),
+    (
+        "hifi_control/volume_up_defaulted",
+        "error",
+        Some("backend_error"),
+    ),
+    (
+        "hifi_control/unknown_action_never_reaches_dispatch",
+        "error",
+        Some("backend_error"),
+    ),
+    (
+        "hifi_search/roon_disconnected",
+        "error",
+        Some("backend_error"),
+    ),
+    (
+        "hifi_search/lms_unconfigured",
+        "error",
+        Some("backend_error"),
+    ),
+    (
+        "hifi_play/lms_radio_unsupported",
+        "unsupported",
+        Some("provider_limitation"),
+    ),
+    ("hifi_play/roon_disconnected", "error", Some("backend_error")),
+    ("hifi_status/disconnected", "ok", None),
+    ("hifi_hqplayer_status/disconnected", "ok", None),
+    ("hifi_hqplayer_profiles/empty", "ok", None),
+    (
+        "hifi_hqplayer_load_profile/disconnected",
+        "error",
+        Some("backend_error"),
+    ),
+    (
+        "hifi_hqplayer_set_pipeline/disconnected",
+        "error",
+        Some("backend_error"),
+    ),
+    (
+        "hifi_hqplayer_set_pipeline/unknown_setting",
+        "invalid",
+        Some("invalid_parameter"),
+    ),
+    (
+        "hifi_hqplayer_set_pipeline/invalid_rate",
+        "invalid",
+        Some("invalid_parameter"),
+    ),
+];
+
+/// Pull the envelope out of a `tools/call` result.
+fn envelope(result: &Value, label: &str) -> Value {
+    result
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or_else(|| panic!("{label}: every tool must attach an envelope: {result}"))
+}
+
+/// Drive every case once and hand back `(label, result)` pairs, so the tests
+/// below share one pass over the surface instead of re-driving it each time.
+async fn all_cases(app: &TestApp) -> Vec<(&'static str, Value)> {
+    let mut out = Vec::new();
+    for (label, tool, args) in TOOL_TEXT_CASES {
+        out.push((*label, app.call_tool(tool, args()).await));
+    }
+    out
+}
+
+/// Every tool, on every path, carries an envelope with the right outcome and the
+/// right refusal reason.
+///
+/// This is the acceptance criterion "one envelope type used by all tools" made
+/// checkable: 10 tools, all four refusal classes, and every case's classification
+/// stated rather than inferred.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn every_tool_returns_an_envelope_with_the_expected_outcome() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // The two tables must describe the same calls.
+    let text_labels: std::collections::BTreeSet<&str> =
+        TOOL_TEXT_CASES.iter().map(|(l, _, _)| *l).collect();
+    let env_labels: std::collections::BTreeSet<&str> =
+        EXPECTED_ENVELOPES.iter().map(|(l, _, _)| *l).collect();
+    assert_eq!(
+        text_labels, env_labels,
+        "TOOL_TEXT_CASES and EXPECTED_ENVELOPES must cover the same calls"
+    );
+
+    for (label, result) in all_cases(&app).await {
+        let env = envelope(&result, label);
+        let (_, expected_outcome, expected_reason) = EXPECTED_ENVELOPES
+            .iter()
+            .find(|(l, _, _)| *l == label)
+            .expect("labels checked above");
+
+        assert_eq!(
+            env.get("schema"),
+            Some(&json!("uhc.mcp.envelope/1")),
+            "{label}: the envelope must declare its schema"
+        );
+        assert_eq!(
+            env.get("outcome"),
+            Some(&json!(expected_outcome)),
+            "{label}: unexpected outcome in {env}"
+        );
+        assert!(
+            env.get("tool").and_then(Value::as_str).is_some(),
+            "{label}: the envelope must name the tool"
+        );
+        assert!(
+            env.get("operation").and_then(Value::as_str).is_some(),
+            "{label}: the envelope must name the operation"
+        );
+
+        match expected_reason {
+            Some(reason) => {
+                let refusal = env
+                    .get("refusal")
+                    .unwrap_or_else(|| panic!("{label}: a refused outcome needs a refusal: {env}"));
+                assert_eq!(
+                    refusal.get("reason"),
+                    Some(&json!(reason)),
+                    "{label}: unexpected refusal reason in {refusal}"
+                );
+                let detail = refusal
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("{label}: every refusal needs a detail: {refusal}"));
+                assert!(
+                    detail.len() > 20,
+                    "{label}: a refusal detail must explain itself, not restate the code: \
+                     {detail:?}"
+                );
+            }
+            None => assert!(
+                env.get("refusal").is_none(),
+                "{label}: a successful outcome must carry no refusal: {env}"
+            ),
+        }
+    }
+}
+
+/// Outcome and refusal cannot contradict each other.
+///
+/// `Refusal::outcome()` is the single mapping and `Envelope::refuse` applies it,
+/// so this is a check on the wire rather than on the type — it would catch a
+/// hand-built envelope that bypassed the builder.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn refusal_presence_matches_the_outcome_on_the_wire() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    for (label, result) in all_cases(&app).await {
+        let env = envelope(&result, label);
+        let outcome = env.get("outcome").and_then(Value::as_str).unwrap_or("");
+        let refused = matches!(outcome, "unsupported" | "invalid" | "error");
+        assert_eq!(
+            env.get("refusal").is_some(),
+            refused,
+            "{label}: outcome {outcome:?} and refusal presence disagree: {env}"
+        );
+
+        // `verified` must never appear: #395 forbids claiming verification the
+        // adapters cannot do, and the vocabulary has no way to spell it.
+        assert!(
+            matches!(outcome, "ok" | "accepted" | "unsupported" | "invalid" | "error"),
+            "{label}: unknown outcome {outcome:?}"
+        );
+    }
+}
+
+/// Every [`Refusal`] variant is exercised by at least one case.
+///
+/// Without this, a variant could exist in the type, be documented in the PR, and
+/// never actually be produced — which is the "advertised but not wired" failure
+/// AGENTS.md forbids for tools and which applies equally to a refusal vocabulary.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn every_refusal_reason_is_actually_produced() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let mut seen = std::collections::BTreeSet::new();
+    for (label, result) in all_cases(&app).await {
+        if let Some(reason) = envelope(&result, label)
+            .get("refusal")
+            .and_then(|r| r.get("reason"))
+            .and_then(Value::as_str)
+        {
+            seen.insert(reason.to_string());
+        }
+    }
+
+    for reason in [
+        "provider_limitation",
+        "not_implemented",
+        "invalid_parameter",
+        "unknown_target",
+        "backend_error",
+    ] {
+        assert!(
+            seen.contains(reason),
+            "refusal reason {reason:?} is defined but never produced; seen: {seen:?}"
+        );
+    }
+}
+
+/// `data` and the human text say the same thing.
+///
+/// **Parsed-value equality, not byte equality.** The text is rendered from the
+/// payload struct (declaration order) and `data` from `serde_json::to_value`
+/// (a `BTreeMap`, so alphabetical). Asserting strings here would fail, and
+/// "fixing" it by rendering the text from the `Value` would reorder the keys of
+/// four tools — which is exactly the change #395 promises not to make.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn envelope_data_parses_equal_to_the_text_payload() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // The tools whose human text *is* JSON.
+    let json_text_cases = [
+        "hifi_zones/empty",
+        "hifi_status/disconnected",
+        "hifi_hqplayer_status/disconnected",
+        "hifi_hqplayer_profiles/empty",
+    ];
+
+    let cases = all_cases(&app).await;
+    for label in json_text_cases {
+        let result = &cases
+            .iter()
+            .find(|(l, _)| *l == label)
+            .unwrap_or_else(|| panic!("missing case {label}"))
+            .1;
+        let text = result_text(result);
+        let from_text: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{label}: text must be JSON: {e}\n{text}"));
+        let data = envelope(result, label)
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| panic!("{label}: a JSON-text tool must set data"));
+        assert_eq!(
+            data, from_text,
+            "{label}: data and the text payload must be the same JSON value"
+        );
+    }
+
+    // And the tools whose text is prose must NOT invent a data block, except
+    // hifi_play, whose adapter message is the only record of what matched.
+    for label in [
+        "hifi_control/roon_disconnected",
+        "hifi_hqplayer_load_profile/disconnected",
+    ] {
+        let result = &cases
+            .iter()
+            .find(|(l, _)| *l == label)
+            .unwrap_or_else(|| panic!("missing case {label}"))
+            .1;
+        assert!(
+            envelope(result, label).get("data").is_none(),
+            "{label}: a prose result must not fabricate a data block"
+        );
+    }
+}
+
+/// `params` keys are always a subset of the tool's own declared input parameters.
+///
+/// This is what turns a free-form map into a checked contract: a client never
+/// meets a key it has not already seen in the tool's input schema. Values are
+/// deliberately *resolved* rather than echoed, which is asserted separately.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn envelope_params_use_only_declared_tool_parameters() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    for (label, result) in all_cases(&app).await {
+        let env = envelope(&result, label);
+        let tool = env
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{label}: envelope must name the tool"));
+        let declared: Vec<&str> = EXPECTED_TOOL_PARAMS
+            .iter()
+            .find(|(name, _)| *name == tool)
+            .map(|(_, params)| params.iter().map(|(p, _)| *p).collect())
+            .unwrap_or_else(|| panic!("{label}: {tool} is not in EXPECTED_TOOL_PARAMS"));
+
+        let params = env
+            .get("params")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("{label}: envelope must carry params: {env}"));
+        for key in params.keys() {
+            assert!(
+                declared.contains(&key.as_str()),
+                "{label}: params key {key:?} is not a declared input of {tool} \
+                 (declared: {declared:?}). The envelope must not invent parameter names."
+            );
+        }
+    }
+}
+
+/// The two lookup tables `tools/list` cannot see are now visible to a client.
+///
+/// `operation` reports the normalized action and `params.value` the resolved
+/// delta, so `prev` -> `previous` and `volume_down` with no value -> `-5.0`.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn envelope_reports_normalized_actions_and_resolved_volume() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // Alias normalization: the client said `prev`, the server did `previous`.
+    let result = app
+        .call_tool(
+            "hifi_control",
+            json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "prev" }),
+        )
+        .await;
+    let env = envelope(&result, "prev");
+    assert_eq!(
+        env.get("operation"),
+        Some(&json!("previous")),
+        "`prev` must be reported as the normalized `previous`: {env}"
+    );
+    assert_eq!(
+        env.get("params").and_then(|p| p.get("action")),
+        Some(&json!("prev")),
+        "params.action keeps the client's spelling; operation carries the resolution"
+    );
+
+    let result = app
+        .call_tool(
+            "hifi_control",
+            json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "playpause" }),
+        )
+        .await;
+    assert_eq!(
+        envelope(&result, "playpause").get("operation"),
+        Some(&json!("play_pause")),
+        "`playpause` must be reported as the backend's `play_pause`"
+    );
+
+    // The defaulted delta and the negation, neither of which a client could see
+    // before.
+    for (action, expected) in [("volume_up", 5.0), ("volume_down", -5.0)] {
+        let result = app
+            .call_tool(
+                "hifi_control",
+                json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": action }),
+            )
+            .await;
+        let env = envelope(&result, action);
+        assert_eq!(
+            env.get("operation"),
+            Some(&json!("volume_relative")),
+            "{action}: relative volume must be reported as such: {env}"
+        );
+        assert_eq!(
+            env.get("params").and_then(|p| p.get("value")),
+            Some(&json!(expected)),
+            "{action}: params.value must report the resolved delta, sign included: {env}"
+        );
+    }
+
+    // The HQPlayer alias table, same idea: `filternx` resolves to `filterNx`.
+    let result = app
+        .call_tool(
+            "hifi_hqplayer_set_pipeline",
+            json!({ "setting": "filternx", "value": "poly-sinc-gauss-long" }),
+        )
+        .await;
+    assert_eq!(
+        envelope(&result, "filternx")
+            .get("params")
+            .and_then(|p| p.get("setting")),
+        Some(&json!("filterNx")),
+        "the canonical setting name must be reported, teaching the alias table"
+    );
+}
+
+/// An `unsupported` result names the operation and says what *is* available.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn unsupported_refusals_name_the_operation_and_an_alternative() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    for (label, result) in all_cases(&app).await {
+        let env = envelope(&result, label);
+        if env.get("outcome") != Some(&json!("unsupported")) {
+            continue;
+        }
+        let refusal = env.get("refusal").expect("checked elsewhere");
+
+        assert!(
+            refusal
+                .get("operation")
+                .and_then(Value::as_str)
+                .is_some_and(|o| !o.is_empty()),
+            "{label}: an unsupported refusal must name the operation: {refusal}"
+        );
+        let alternatives = refusal
+            .get("alternatives")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("{label}: unsupported must list alternatives: {refusal}"));
+        assert!(
+            !alternatives.is_empty(),
+            "{label}: #395 requires an unsupported result to say what IS available: {refusal}"
+        );
+        for alt in alternatives {
+            let alt = alt.as_str().unwrap_or("");
+            assert!(
+                alt.starts_with("hifi_"),
+                "{label}: an alternative must be a callable tool invocation, got {alt:?}"
+            );
+        }
+
+        // The provider must be identifiable, either from the scope or from the
+        // refusal itself — an unsupported result that names no provider teaches
+        // nothing.
+        assert!(
+            env.get("scope")
+                .and_then(|s| s.get("provider"))
+                .and_then(Value::as_str)
+                .is_some_and(|p| p != "unknown"),
+            "{label}: an unsupported refusal must name the provider: {env}"
+        );
+    }
+}
+
+/// An `invalid` result names the offending parameter and its accepted values.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn invalid_refusals_name_the_parameter_and_its_accepted_values() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    for (label, result) in all_cases(&app).await {
+        let env = envelope(&result, label);
+        if env.get("outcome") != Some(&json!("invalid")) {
+            continue;
+        }
+        let refusal = env.get("refusal").expect("checked elsewhere");
+
+        let parameter = refusal
+            .get("parameter")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{label}: invalid must name the parameter: {refusal}"));
+
+        // And it must be a parameter the tool actually declares, or the client is
+        // being pointed at something it cannot set.
+        let tool = env.get("tool").and_then(Value::as_str).unwrap_or("");
+        let declared: Vec<&str> = EXPECTED_TOOL_PARAMS
+            .iter()
+            .find(|(name, _)| *name == tool)
+            .map(|(_, params)| params.iter().map(|(p, _)| *p).collect())
+            .unwrap_or_default();
+        assert!(
+            declared.contains(&parameter),
+            "{label}: refusal blames {parameter:?}, which {tool} does not declare \
+             (declared: {declared:?})"
+        );
+
+        // Either an accepted-values list, or a tool that enumerates them.
+        let has_accepted = refusal
+            .get("accepted")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty());
+        let has_discovery = refusal
+            .get("discover_with")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.starts_with("hifi_"));
+        assert!(
+            has_accepted || has_discovery,
+            "{label}: invalid must give accepted values or name a tool that lists \
+             them: {refusal}"
+        );
+    }
+}
+
+/// OpenHome and UPnP volume is a UHC gap, not a provider limitation — and the
+/// envelope says so even though the frozen prose does not.
+///
+/// Both adapters implement volume (`src/adapters/openhome.rs` and
+/// `src/adapters/upnp.rs`, action `vol_abs`/`vol_rel`) and both expose it over
+/// HTTP (`POST /openhome/control`, `POST /upnp/control`). Only the MCP volume
+/// path declines to call it. Classifying that as `provider_limitation` is exactly
+/// the mislabelling #392 rule 3 forbids, and it is what AGENTS.md's capability
+/// matrix currently implies.
+///
+/// If #398 later proves a genuine provider limit for one of these, this test is
+/// the place to change it — deliberately, with the evidence in the commit.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn openhome_and_upnp_volume_is_reported_as_a_uhc_gap_not_a_provider_limit() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    for (zone_id, provider) in [("openhome:abc", "openhome"), ("upnp:abc", "upnp")] {
+        let result = app
+            .call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "volume_set", "value": 30 }),
+            )
+            .await;
+
+        // The text is untouched.
+        assert_eq!(
+            result_text(&result),
+            "Error: Volume control not supported for this zone type",
+            "{zone_id}: the frozen prose must not change"
+        );
+
+        let env = envelope(&result, zone_id);
+        let refusal = env.get("refusal").expect("a refusal is expected");
+        assert_eq!(
+            refusal.get("reason"),
+            Some(&json!("not_implemented")),
+            "{zone_id}: the adapter implements volume, so this is UHC's gap: {refusal}"
+        );
+        assert_eq!(
+            refusal.get("tracked_by"),
+            Some(&json!("#398")),
+            "{zone_id}: 'not yet' must name the issue that makes it checkable"
+        );
+        assert_eq!(
+            env.get("scope").and_then(|s| s.get("provider")),
+            Some(&json!(provider)),
+            "{zone_id}: the scope must name the provider: {env}"
+        );
+    }
+}
+
+/// A zone id whose prefix names no adapter blames the zone id, not a provider.
+///
+/// Same frozen string as the case above, different envelope. UHC never
+/// identified a provider for `sonos:abc`, so it cannot claim one lacks volume —
+/// and telling a model "this zone does not support volume" would teach it never
+/// to retry, when the actual fix is a valid zone id.
+///
+/// This is the one place in #395 where the envelope's outcome deliberately
+/// contradicts the accompanying prose. #398 corrects the prose.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn unknown_zone_prefix_volume_blames_the_zone_id_not_the_provider() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let result = app
+        .call_tool(
+            "hifi_control",
+            json!({ "zone_id": "sonos:abc", "action": "volume_set", "value": 30 }),
+        )
+        .await;
+
+    assert_eq!(
+        result_text(&result),
+        "Error: Volume control not supported for this zone type",
+        "the frozen prose must not change"
+    );
+
+    let env = envelope(&result, "sonos");
+    assert_eq!(
+        env.get("outcome"),
+        Some(&json!("invalid")),
+        "an unidentifiable provider is the client's zone id, not a provider limit: {env}"
+    );
+    let refusal = env.get("refusal").expect("a refusal is expected");
+    assert_eq!(refusal.get("parameter"), Some(&json!("zone_id")));
+    assert_eq!(
+        refusal.get("accepted"),
+        Some(&json!(["roon:", "lms:", "openhome:", "upnp:"])),
+        "the refusal must enumerate the prefixes that name an adapter: {refusal}"
+    );
+
+    // And it must NOT claim anything about a provider.
+    assert_eq!(
+        env.get("scope").and_then(|s| s.get("provider")),
+        Some(&json!("unknown")),
+        "no provider was identified, so none may be named: {env}"
+    );
+}
+
+/// `scope.zone_name` is read back from the aggregator, never echoed, and its
+/// absence next to a present `zone_id` is how a client tells a typo from a real
+/// zone.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn scope_zone_name_is_absent_for_a_zone_the_aggregator_does_not_hold() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let result = app
+        .call_tool("hifi_now_playing", json!({ "zone_id": UNKNOWN_ROON_ZONE }))
+        .await;
+    let scope = envelope(&result, "unknown zone")
+        .get("scope")
+        .cloned()
+        .expect("a zone-scoped tool must carry a scope");
+    assert_eq!(scope.get("zone_id"), Some(&json!(UNKNOWN_ROON_ZONE)));
+    assert!(
+        scope.get("zone_name").is_none(),
+        "an unknown zone must have no name invented for it: {scope}"
+    );
+}
+
+// =============================================================================
+// 11. The envelope against a live backend (#395)
+// =============================================================================
+//
+// Everything above runs with adapters disconnected, so it covers refusals and
+// empty reads. The success path — `accepted`, plus observed state actually read
+// back from the aggregator — needs a real backend, and `MockLmsServer` is the one
+// mock a full round-trip can be driven through (see #394's notes on why Roon and
+// OpenHome/UPnP cannot be).
+
+/// A write reports `accepted`, never `ok`, and carries a read-back from the
+/// aggregator.
+///
+/// The two halves of #221 in one assertion: the model is told the command was
+/// accepted (so it stops retrying) and is shown the state (so it does not need a
+/// follow-up call), with `as_of_ms` so it can judge staleness rather than being
+/// handed a conclusion the server cannot support.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    let result = h
+        .app
+        .call_tool("hifi_control", json!({ "zone_id": zone_id, "action": "play" }))
+        .await;
+    let env = envelope(&result, "lms play");
+
+    assert_eq!(
+        env.get("outcome"),
+        Some(&json!("accepted")),
+        "a write must report accepted — nothing here confirms the effect: {env}"
+    );
+    assert!(
+        env.get("refusal").is_none(),
+        "an accepted write carries no refusal: {env}"
+    );
+
+    // Scope is resolved from the aggregator, not echoed.
+    let scope = env.get("scope").expect("zone-scoped tool needs a scope");
+    assert_eq!(scope.get("provider"), Some(&json!("lms")));
+    assert_eq!(scope.get("zone_id"), Some(&json!(zone_id)));
+    assert_eq!(
+        scope.get("zone_name"),
+        Some(&json!("Living Room")),
+        "zone_name must be read back from the aggregator, not from the request: {scope}"
+    );
+
+    let observed = env
+        .get("observed")
+        .expect("a write against a known zone must read state back");
+    assert_eq!(
+        observed.get("read_from"),
+        Some(&json!("aggregator")),
+        "AGENTS.md: the aggregator owns zone state"
+    );
+    assert!(
+        observed
+            .get("as_of_ms")
+            .and_then(Value::as_u64)
+            .is_some_and(|t| t > 0),
+        "the snapshot must carry its own timestamp so staleness is the client's \
+         call, not a claim of ours: {observed}"
+    );
+
+    // And the read-back is the same zone the text's state block describes —
+    // compared as parsed JSON, because the text keeps declaration order while
+    // `observed.zone` goes through serde_json's BTreeMap.
+    let text = result_text(&result);
+    let state_json = text
+        .split_once("Current state:\n")
+        .map(|(_, json)| json)
+        .expect("the text must still embed its state block");
+    let from_text: Value =
+        serde_json::from_str(state_json).expect("the embedded state block must be JSON");
+    assert_eq!(
+        observed.get("zone"),
+        Some(&from_text),
+        "observed.zone and the text's state block must be the same JSON value"
+    );
+    assert_eq!(from_text.get("zone_id"), Some(&json!(zone_id)));
+
+    h.stop().await;
+}
+
+/// A relative volume write reports the resolved delta and the level the
+/// aggregator holds afterwards.
+///
+/// `"Volume adjusted"` is #221's other example of prose that states nothing. The
+/// envelope turns it into: accepted, on this zone, by this delta, and here is the
+/// level now.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_volume_write_reports_the_resolved_delta_and_the_resulting_level() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    let result = h
+        .app
+        .call_tool(
+            "hifi_control",
+            json!({ "zone_id": zone_id, "action": "volume_set", "value": 55 }),
+        )
+        .await;
+
+    // Text unchanged.
+    assert_eq!(result_text(&result), "Volume set");
+
+    let env = envelope(&result, "lms volume_set");
+    assert_eq!(env.get("outcome"), Some(&json!("accepted")));
+    assert_eq!(env.get("operation"), Some(&json!("volume_absolute")));
+    assert_eq!(
+        env.get("params").and_then(|p| p.get("value")),
+        Some(&json!(55.0))
+    );
+    assert_eq!(
+        env.get("scope").and_then(|s| s.get("provider")),
+        Some(&json!("lms"))
+    );
+    assert!(
+        env.get("observed").is_some(),
+        "the volume path must read state back too, not just transport: {env}"
+    );
+
+    h.stop().await;
+}
+
+/// A fully-populated multi-tool response survives the SSE framing.
+///
+/// The envelope roughly doubles response size, and `parse_sse_json` returns only
+/// the **first** `data:` line — so a payload split across frames would be silently
+/// truncated and every assertion above would still pass on the fragment. Reasoning
+/// says JSON escapes newlines and the frame stays single-line; this drives real
+/// populated payloads through the real route and checks it.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn populated_payloads_survive_sse_framing() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    for (tool, args) in [
+        ("hifi_zones", json!({})),
+        ("hifi_now_playing", json!({ "zone_id": zone_id })),
+        ("hifi_control", json!({ "zone_id": zone_id, "action": "play" })),
+    ] {
+        let result = h.app.call_tool(tool, args).await;
+        let env = envelope(&result, tool);
+
+        // A truncated frame would fail to parse as JSON-RPC long before here, so
+        // reaching this point with a well-formed envelope is the check. Assert the
+        // last-serialized field is present too, since truncation loses the tail.
+        assert!(
+            env.get("schema").is_some() && env.get("outcome").is_some(),
+            "{tool}: envelope head missing: {env}"
+        );
+        let has_tail = env.get("data").is_some() || env.get("observed").is_some();
+        assert!(
+            has_tail,
+            "{tool}: the envelope's trailing fields are missing, which is what a \
+             truncated SSE frame would look like: {env}"
+        );
+
+        // And the text is still exactly one block at full size.
+        assert_eq!(
+            result
+                .get("content")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+            1,
+            "{tool}: still exactly one content block"
+        );
+    }
+
+    h.stop().await;
+}
+
+/// `hifi_zones` with a real zone: `data` and the text agree, and the text keeps
+/// declaration order.
+///
+/// This is the case the offline fixture cannot cover — `hifi_zones` returns `[]`
+/// with no backend, so the key-order trap is invisible there. `McpZone`'s
+/// declaration order is `zone_id, zone_name, state, volume, is_muted`, which is
+/// *not* alphabetical, so rendering the text from `serde_json::to_value` would
+/// change these bytes.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn populated_zone_payload_keeps_declaration_order_in_the_text() {
+    let h = LmsHarness::start().await;
+
+    let result = h.app.call_tool("hifi_zones", json!({})).await;
+    let text = result_text(&result);
+
+    let zone_id_at = text.find("\"zone_id\"").expect("zone_id must appear");
+    let is_muted_at = text.find("\"is_muted\"").expect("is_muted must appear");
+    assert!(
+        zone_id_at < is_muted_at,
+        "the text must keep McpZone's declaration order; alphabetical order would \
+         put is_muted first and change the bytes clients receive:\n{text}"
+    );
+
+    let from_text: Value = serde_json::from_str(&text).expect("hifi_zones text must be JSON");
+    assert_eq!(
+        envelope(&result, "hifi_zones").get("data"),
+        Some(&from_text),
+        "data must be the same JSON value as the text, key order aside"
+    );
+
+    h.stop().await;
 }
