@@ -42,7 +42,8 @@ use mock_servers::hqplayer::corpus::{
     self, LEGACY_PROFILE, SYNTHETIC_HAZARD_PROFILE, VERIFIED_PROFILE,
 };
 use mock_servers::hqplayer::model::{
-    request_attr, ActiveModeReporting, DaemonModel, DocumentStyle, LoadedChain, Metadata,
+    request_attr, ActiveModeReporting, DaemonModel, DocumentStyle, FilterFieldReporting, LoadedChain,
+    Metadata,
 };
 use mock_servers::hqplayer::tier1;
 use mock_servers::hqplayer::wire::{Chunking, Disruption, Responder, WirePolicy, WireServer};
@@ -5869,4 +5870,761 @@ async fn serve_one_canned_line(line: &str) -> u16 {
         }
     });
     port
+}
+
+// =============================================================================
+// Issue #347 — trustworthy live setters, and enumerations scoped to the LOADED chain
+//
+// #322 made these situations expressible; every client-side consequence is owned here. Each test
+// below is labelled the way #322 labelled its own: **client-red** for an expectation that fails
+// against the pre-#347 adapter, **client-pin** for a property that already holds and is pinned so it
+// cannot regress. No test asserts elapsed wall-clock time and none contacts a real daemon.
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// The `[source]` rate pin — suppressed with a stated reason, never sent
+// -----------------------------------------------------------------------------
+
+/// Under a configured `[source]` mode the daemon answers `SetRate` with `OK` and applies nothing
+/// (HQP-C-018). Retrying cannot help — what governs the rate there is a persistent config limit with
+/// no wire command — so the honest client behaviour is to **not send it** and say why.
+///
+/// Before #347 the client sent the pin and let readback arithmetic produce a failure whose message
+/// named an index, not a reason.
+///
+/// **Label: client-red.** **Provenance of the daemon behaviour: derived-upstream, tier-2-only,
+/// pending #332.**
+#[tokio::test]
+async fn a_rate_pin_under_source_is_suppressed_before_it_reaches_the_daemon() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`
+        s.playback = 2;
+    });
+    h.model.arm(|f| f.source_refuses_rate_pin = true);
+
+    let outcome = h.adapter.set_rate(705600).await;
+
+    assert_eq!(
+        h.model.request_count("SetRate"),
+        0,
+        "a write the daemon is known to ignore in this mode must not be put on the wire at all; \
+         sending it and failing on readback is a true outcome reached for no stated reason"
+    );
+    let err = outcome
+        .map(|_| ())
+        .expect_err("an unsent write must never be reported as applied");
+    let message = err.to_string();
+    assert!(
+        message.contains("[source]"),
+        "the refusal must name the configured mode that causes it, so an operator can act on it \
+         rather than reading an index comparison. Got: {message}"
+    );
+    h.stop();
+}
+
+/// The narrow case readback **cannot** catch: Auto (index 0) requested under `[source]`, where the
+/// rate is already 0. Expected 0 against observed 0 is a match, so the pre-#347 client reported
+/// success for a command that did nothing (HQP-C-019).
+///
+/// **Label: client-red.**
+#[tokio::test]
+async fn an_auto_rate_request_under_source_is_never_reported_as_applied() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+    });
+    h.model.arm(|f| f.source_refuses_rate_pin = true);
+    assert_eq!(
+        h.model.state().rate_index,
+        0,
+        "precondition: the rate must already be unpinned, which is what makes readback blind"
+    );
+
+    let outcome = h.adapter.set_rate(0).await;
+
+    assert_eq!(
+        h.model.request_count("SetRate"),
+        0,
+        "Auto is suppressed under `[source]` exactly like any other pin"
+    );
+    assert!(
+        outcome.map(|_| ()).is_err(),
+        "equality with pre-existing state is not proof that a setter applied; before #347 this \
+         reported success because it compared 0 against 0"
+    );
+    h.stop();
+}
+
+/// A rate pin in a configured PCM or SDM mode is ordinary and must still work — the suppression is
+/// **mode-conditional**, not a blanket refusal to pin rates.
+///
+/// **Label: client-pin.**
+#[tokio::test]
+async fn a_rate_pin_outside_source_is_still_sent_and_verified() {
+    let h = Harness::verified().await;
+    h.adapter.set_rate(44100).await.expect("a PCM rate pin");
+    assert_eq!(
+        h.model.state().rate_index,
+        1,
+        "the PCM list gives 44100 index 1 and the daemon must actually have moved there"
+    );
+    h.stop();
+}
+
+// -----------------------------------------------------------------------------
+// Mode writes — skipped when they are no-ops, honest about the pin when performed
+// -----------------------------------------------------------------------------
+
+/// `SetMode` clears the exact-rate pin even when the mode does not change (HQP-C-017), so writing
+/// the mode a daemon is already in destroys user state for nothing.
+///
+/// **Label: client-red.** Before #347 the client sent it unconditionally.
+#[tokio::test]
+async fn a_no_op_mode_write_is_not_sent_so_the_rate_pin_survives() {
+    let h = Harness::verified().await;
+    h.adapter.set_rate(44100).await.expect("pin a PCM rate");
+    let pinned = h.model.state();
+    assert_ne!(pinned.rate_index, 0, "precondition: the pin must be set");
+
+    // The daemon is already in PCM.
+    h.adapter
+        .set_mode("PCM")
+        .await
+        .expect("a mode that is already running is trivially satisfied");
+
+    assert_eq!(
+        h.model.request_count("SetMode"),
+        0,
+        "no `SetMode` may reach a daemon already in that mode: the write is not a no-op on the \
+         daemon, it clears the rate pin"
+    );
+    assert_eq!(
+        h.model.state().rate_index,
+        pinned.rate_index,
+        "and the user's pin must survive"
+    );
+    h.stop();
+}
+
+/// A mode write that really changes the mode is sent, and the pin it clears is reported as cleared
+/// rather than remembered.
+///
+/// **Label: client-pin** for the pipeline value — #322's `refresh_lists` already re-read it — and
+/// **client-red** for the untouched-pin half, which only holds once the no-op skip exists.
+#[tokio::test]
+async fn a_performed_mode_write_reports_the_cleared_rate_pin_honestly() {
+    let h = Harness::verified().await;
+    h.adapter.set_rate(44100).await.expect("pin a PCM rate");
+
+    h.adapter
+        .set_mode("SDM (DSD)")
+        .await
+        .expect("a real mode change");
+
+    assert_eq!(
+        h.model.request_count("SetMode"),
+        1,
+        "a mode change that is not a no-op must be sent exactly once"
+    );
+    assert_eq!(
+        h.model.state().rate_index,
+        0,
+        "the daemon clears the pin on a mode change"
+    );
+    let pipeline = h.adapter.get_pipeline_status().await.expect("pipeline");
+    assert_eq!(
+        pipeline.settings.samplerate.selected.value.as_str(),
+        "0",
+        "the client must report the rate the daemon now holds — Auto — and never the rate the user \
+         pinned before the chain reloaded"
+    );
+    assert!(
+        pipeline
+            .settings
+            .samplerate
+            .options
+            .iter()
+            .any(|o| o.value == "2822400"),
+        "and the offered rates must be the newly loaded chain's, got {:?}",
+        pipeline
+            .settings
+            .samplerate
+            .options
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect::<Vec<_>>()
+    );
+    h.stop();
+}
+
+/// The daemon names the DSD mode `"SDM (DSD)"`, so a caller asking for `"DSD"` or `"SDM"` must reach
+/// it by **semantic alias**, never by assuming a list position (HQP-C-013's device fixture is why
+/// position is unsafe).
+///
+/// **Label: client-red.** Before #347 only an exact name matched, and a bare integer was accepted
+/// instead.
+#[tokio::test]
+async fn a_mode_alias_resolves_through_the_daemons_own_name() {
+    for requested in ["DSD", "SDM", "sdm (dsd)"] {
+        let h = Harness::verified().await;
+        h.adapter
+            .set_mode(requested)
+            .await
+            .unwrap_or_else(|e| panic!("`{requested}` must resolve to the daemon's SDM entry: {e}"));
+        assert_eq!(
+            h.model.state().mode_index,
+            2,
+            "`{requested}` must reach the list index the daemon gives `SDM (DSD)`, which is 2 here \
+             and is not a position any client may assume"
+        );
+        h.stop();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Enumerations scoped to the LOADED chain
+// -----------------------------------------------------------------------------
+
+/// The headline hazard, end to end through the real client.
+///
+/// The cache is populated the ordinary way — `get_pipeline_status()`, which both
+/// `GET /hqplayer/pipeline` and the MCP status tool already call. The source then moves the loaded
+/// chain while configured `[source]` keeps `State.mode` at 0, so nothing prompts a mode-keyed cache
+/// to re-read. A name from the **previous** chain must now fail to resolve rather than being sent as
+/// a stale index that names a different filter in the chain now loaded.
+///
+/// The synthetic profile is what makes this a silent misselection instead of a loud rejection: every
+/// index resolves in both chains and always to a different name.
+///
+/// **Label: client-red.** Observed pre-fix on #347 comment 5125934210: `ok=true` while the daemon
+/// ended on a filter nobody asked for.
+#[tokio::test]
+async fn a_source_driven_chain_change_invalidates_the_cached_filter_list() {
+    let h = Harness::start(
+        SYNTHETIC_HAZARD_PROFILE,
+        WirePolicy::default(),
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`
+        s.playback = 2;
+    });
+    // The ordinary cache-populating read.
+    h.adapter
+        .get_pipeline_status()
+        .await
+        .expect("pipeline populates the list cache");
+
+    h.model.source_loads_chain(LoadedChain::Sdm);
+    let before = h.model.state();
+
+    let outcome = h.adapter.set_filter_nx("SYN-pcm-7").await;
+
+    assert!(
+        outcome.map(|_| ()).is_err(),
+        "a filter name that exists only in the chain that is no longer loaded must not resolve; \
+         before #347 it resolved from the stale cache to index 7 and selected `SYN-sdm-7`"
+    );
+    assert_eq!(
+        h.model.state().filter_nx_index,
+        before.filter_nx_index,
+        "and nothing may have been mutated on the way to that refusal"
+    );
+    h.stop();
+}
+
+/// The other half: after the same chain change, a name that **is** in the newly loaded chain
+/// resolves to *that* chain's index.
+///
+/// **Label: client-red.** Before #347 the stale cache had no `SYN-sdm-*` entry, so the resolver fell
+/// through to a fresh fetch and happened to be right — but only because the name was absent. The
+/// assertion here is on the index actually sent, which is what the previous test shows the stale
+/// path getting wrong.
+#[tokio::test]
+async fn after_a_chain_change_a_filter_resolves_against_the_newly_loaded_list() {
+    let h = Harness::start(
+        SYNTHETIC_HAZARD_PROFILE,
+        WirePolicy::default(),
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+    });
+    h.adapter.get_pipeline_status().await.expect("pipeline");
+    h.model.source_loads_chain(LoadedChain::Sdm);
+
+    h.adapter
+        .set_filter_nx("SYN-sdm-3")
+        .await
+        .expect("a name in the loaded chain must resolve");
+
+    assert_eq!(
+        request_attr(
+            &h.model.last_request("SetFilter").expect("SetFilter sent"),
+            "value"
+        )
+        .as_deref(),
+        Some("3"),
+        "the index sent must come from the chain the daemon has loaded now"
+    );
+    h.stop();
+}
+
+/// The same name occupies **different positions** in the two chains of the observed Opal corpus:
+/// `poly-sinc-gauss-long` is index 7 under PCM and index 1 under SDM. That is the evidenced form of
+/// the hazard, and it is the one a cache cannot survive.
+///
+/// **Label: client-red.**
+#[tokio::test]
+async fn a_name_present_in_both_chains_is_sent_with_the_loaded_chains_index() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+    });
+    h.adapter.get_pipeline_status().await.expect("pipeline");
+    assert_eq!(
+        corpus::index_of(
+            &corpus::document(VERIFIED_PROFILE, "filters_pcm"),
+            "FiltersItem",
+            "poly-sinc-gauss-long",
+        ),
+        Some(7),
+        "precondition: the PCM list gives this name index 7"
+    );
+
+    h.model.source_loads_chain(LoadedChain::Sdm);
+    h.adapter
+        .set_filter_nx("poly-sinc-gauss-long")
+        .await
+        .expect("the name is in both chains");
+
+    assert_eq!(
+        request_attr(
+            &h.model.last_request("SetFilter").expect("SetFilter sent"),
+            "value"
+        )
+        .as_deref(),
+        Some("1"),
+        "the SDM list gives the same name index 1; sending 7 would select a different filter, and \
+         sending 7 is what the stale cache did"
+    );
+    h.stop();
+}
+
+/// A chain change invalidates the **shaper and rate** lists as well, not only the filter list — the
+/// acceptance criterion names all three. Asserted through the read surface every client actually
+/// polls, because that is where a stale list is published as truth.
+///
+/// **Label: client-red.** Before #347 `get_pipeline_status` refreshed only when a list was *empty*,
+/// so it served the previous chain's options indefinitely.
+#[tokio::test]
+async fn a_chain_change_invalidates_the_shaper_and_rate_lists_the_pipeline_publishes() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+    });
+    let pcm = h.adapter.get_pipeline_status().await.expect("pipeline");
+    assert!(
+        pcm.settings.shaper.options.iter().any(|o| o.value == "NS9"),
+        "precondition: the PCM chain's shapers are what is cached first"
+    );
+
+    h.model.source_loads_chain(LoadedChain::Sdm);
+    let sdm = h.adapter.get_pipeline_status().await.expect("pipeline");
+
+    let shapers: Vec<&str> = sdm
+        .settings
+        .shaper
+        .options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect();
+    assert!(
+        shapers.contains(&"ASDM7") && !shapers.contains(&"NS9"),
+        "the modulators of the loaded SDM chain must replace the PCM shapers wholesale, got \
+         {shapers:?}"
+    );
+    let rates: Vec<&str> = sdm
+        .settings
+        .samplerate
+        .options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect();
+    assert!(
+        rates.contains(&"2822400") && !rates.contains(&"44100"),
+        "and so must the rates, got {rates:?}"
+    );
+    let filters: Vec<&str> = sdm
+        .settings
+        .filter1x
+        .options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect();
+    assert!(
+        filters.contains(&"sinc-Lh") && !filters.contains(&"IIR"),
+        "and the filters, got {filters:?}"
+    );
+    h.stop();
+}
+
+/// A reconnect must not inherit the previous session's enumerations. The daemon may have been
+/// reconfigured, restarted onto another profile, or simply moved chain while UHC was away.
+///
+/// **Label: client-red.** Before #347 `connect()` left the cache exactly as the dropped session had
+/// left it.
+#[tokio::test]
+async fn a_reconnect_invalidates_the_cached_enumerations() {
+    let h = Harness::start(
+        SYNTHETIC_HAZARD_PROFILE,
+        WirePolicy::default(),
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    h.model.external_change(|s| {
+        s.mode_index = 0;
+        s.playback = 2;
+    });
+    h.adapter.get_pipeline_status().await.expect("pipeline");
+
+    h.adapter.disconnect().await;
+    h.model.source_loads_chain(LoadedChain::Sdm);
+    h.adapter.connect().await.expect("reconnect");
+
+    let pipeline = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("pipeline after reconnect");
+    let filters: Vec<&str> = pipeline
+        .settings
+        .filter1x
+        .options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect();
+    assert!(
+        filters.iter().all(|f| f.starts_with("SYN-sdm-")),
+        "a reconnected session must re-read the enumerations rather than resume the previous \
+         session's, got {filters:?}"
+    );
+    h.stop();
+}
+
+// -----------------------------------------------------------------------------
+// `SetFilter` carries both sides, or refuses without mutating
+// -----------------------------------------------------------------------------
+
+/// When `State` does not report the sibling filter, the pre-#347 client substituted the legacy
+/// combined `filter` field and sent it as the sibling — a guess, and #322's audit recorded it as
+/// defect C5. A guessed sibling silently overwrites the setting the user did not touch.
+///
+/// **Label: client-red.**
+#[tokio::test]
+async fn a_filter_write_is_refused_without_mutation_when_the_sibling_is_unknowable() {
+    let h = Harness::verified().await;
+    h.model
+        .set_filter_field_reporting(FilterFieldReporting::CombinedOnly);
+    let before = h.model.state();
+
+    let outcome = h.adapter.set_filter_1x("poly-sinc-lp").await;
+
+    assert!(
+        outcome.map(|_| ()).is_err(),
+        "with the Nx sibling unknowable the write must be refused, not guessed"
+    );
+    assert_eq!(
+        h.model.request_count("SetFilter"),
+        0,
+        "and refused *before* anything reaches the daemon: `SetFilter` writes both sides, so a \
+         guessed sibling is a silent overwrite of a setting nobody asked to change"
+    );
+    assert_eq!(
+        (
+            h.model.state().filter_1x_index,
+            h.model.state().filter_nx_index
+        ),
+        (before.filter_1x_index, before.filter_nx_index),
+        "nothing may have moved"
+    );
+    h.stop();
+}
+
+/// The ordinary path: a one-sided request still puts **both** arguments on the wire, taken from the
+/// authoritative `State` rather than from the client's cache.
+///
+/// **Label: client-pin.**
+#[tokio::test]
+async fn a_one_sided_filter_write_carries_both_authoritative_arguments() {
+    let h = Harness::verified().await;
+    let before = h.model.state();
+    h.adapter
+        .set_filter_1x("poly-sinc-xtr")
+        .await
+        .expect("SetFilter");
+
+    let sent = h.model.last_request("SetFilter").expect("SetFilter sent");
+    assert_eq!(
+        (
+            request_attr(&sent, "value").as_deref(),
+            request_attr(&sent, "value1x").as_deref()
+        ),
+        (Some(before.filter_nx_index.to_string().as_str()), Some("11")),
+        "both sides go on the wire together: the requested 1x index, and the Nx index the daemon \
+         itself reports. Sent: {sent}"
+    );
+    h.stop();
+}
+
+// -----------------------------------------------------------------------------
+// Semantic names only — no raw integer identity on a control path
+// -----------------------------------------------------------------------------
+
+/// A bare integer is not a setting name. The pre-#347 resolvers parsed one and used it as a **direct
+/// list index**, so a client that had a stale number — or simply guessed — silently selected
+/// whatever now sat at that position (HQP-C-063).
+///
+/// **Label: client-red.**
+#[tokio::test]
+async fn a_numeric_string_is_never_accepted_as_a_setting_name() {
+    let h = Harness::verified().await;
+
+    assert!(
+        h.adapter.set_mode("1").await.map(|_| ()).is_err(),
+        "`1` is not a mode name"
+    );
+    assert!(
+        h.adapter.set_filter_nx("7").await.map(|_| ()).is_err(),
+        "`7` is not a filter name"
+    );
+    assert!(
+        h.adapter.set_shaper("4").await.map(|_| ()).is_err(),
+        "`4` is not a shaper name"
+    );
+    assert_eq!(
+        (
+            h.model.request_count("SetMode"),
+            h.model.request_count("SetFilter"),
+            h.model.request_count("SetShaping")
+        ),
+        (0, 0, 0),
+        "and none of them may reach the daemon as a raw index"
+    );
+    h.stop();
+}
+
+// -----------------------------------------------------------------------------
+// Matrix profiles — semantic identity, State as the authority
+// -----------------------------------------------------------------------------
+
+/// `MatrixGetProfile` is **not** the current-profile authority. #347 says so explicitly, and #341
+/// records no versioned evidence that the supported daemon implements it consistently. The observed
+/// `State.matrix_profile` field is the authority.
+///
+/// **Label: client-red.** Before #347 the client asked `MatrixGetProfile` and published its answer.
+#[tokio::test]
+async fn the_current_matrix_profile_is_read_from_state_not_matrix_get_profile() {
+    let h = Harness::verified().await;
+    h.model
+        .arm(|f| f.matrix_current_override = Some("Speakers".to_string()));
+    h.model
+        .external_change(|s| s.matrix_profile = "Rock &amp; Roll".to_string());
+
+    let current = h
+        .adapter
+        .get_matrix_profile()
+        .await
+        .expect("current profile")
+        .expect("a profile is selected");
+
+    assert_eq!(
+        (current.name.as_str(), current.index),
+        ("Rock & Roll", 2),
+        "the authority is `State.matrix_profile`, and its index comes from resolving that name \
+         against the fresh list — not from whatever `MatrixGetProfile` reports"
+    );
+    h.stop();
+}
+
+/// A matrix profile the daemon acknowledges but never applies is not success.
+///
+/// **Label: client-red.** Before #347 `set_matrix_profile` sent the name and returned `Ok` on the
+/// `result="OK"` alone, with no readback at all.
+#[tokio::test]
+async fn a_matrix_profile_accepted_but_unchanged_is_not_reported_as_applied() {
+    let h = Harness::verified().await;
+    h.model
+        .arm(|f| f.accept_but_ignore.push("MatrixSetProfile".to_string()));
+
+    let outcome = h.adapter.set_matrix_profile(1).await;
+
+    assert!(
+        h.model.request_count("MatrixSetProfile") > 0,
+        "the write must actually have been attempted: this is a daemon-side no-op"
+    );
+    assert_eq!(
+        h.model.state().matrix_profile.as_str(),
+        "Default",
+        "precondition: the daemon really did not move"
+    );
+    assert!(
+        outcome.map(|_| ()).is_err(),
+        "`result=\"OK\"` is not proof of application for the matrix family either"
+    );
+    h.stop();
+}
+
+/// A current profile the daemon's own list does not contain must not be published carrying some
+/// **other** profile's index. The pre-#347 read fell back to index 0, which is `Default` — so a UI
+/// showed `Default` selected while the daemon was on something else entirely.
+///
+/// **Label: client-red.**
+#[tokio::test]
+async fn a_current_matrix_profile_absent_from_the_fresh_list_is_not_given_another_profiles_index() {
+    let h = Harness::verified().await;
+    h.model
+        .arm(|f| f.matrix_current_override = Some("Ghost".to_string()));
+    h.model
+        .external_change(|s| s.matrix_profile = "Ghost".to_string());
+
+    let current = h.adapter.get_matrix_profile().await.expect("current");
+
+    assert!(
+        current.is_none(),
+        "a name absent from the fresh list is not a selectable identity, and index 0 belongs to \
+         `Default`; got {current:?}"
+    );
+    h.stop();
+}
+
+/// The legacy numeric request stays a **compatibility input**: it is resolved against the fresh list
+/// into a semantic name, and the name is what goes on the wire.
+///
+/// **Label: client-pin** for the wire form, **client-red** for the freshness — the pre-#347 code
+/// fetched the list but never verified the outcome.
+#[tokio::test]
+async fn a_matrix_profile_write_sends_the_semantic_name_and_verifies_the_readback() {
+    let h = Harness::verified().await;
+    h.adapter
+        .set_matrix_profile(2)
+        .await
+        .expect("a profile in the fresh list");
+
+    assert_eq!(
+        request_attr(
+            &h.model
+                .last_request("MatrixSetProfile")
+                .expect("MatrixSetProfile sent"),
+            "value"
+        )
+        .as_deref(),
+        Some("Rock &amp; Roll"),
+        "the semantic name goes on the wire, escaped as the daemon escapes it — never the number"
+    );
+    assert_eq!(
+        h.model.state().matrix_profile.as_str(),
+        "Rock &amp; Roll",
+        "and the authoritative field must actually carry it"
+    );
+    h.stop();
+}
+
+/// An externally-made profile switch is visible on the next read, and an empty
+/// `State.matrix_profile` is the default identity rather than a list position.
+///
+/// **Label: client-pin.**
+#[tokio::test]
+async fn an_external_matrix_switch_is_visible_and_an_empty_profile_is_no_selection() {
+    let h = Harness::verified().await;
+    h.model
+        .external_change(|s| s.matrix_profile = "Speakers".to_string());
+    let current = h
+        .adapter
+        .get_matrix_profile()
+        .await
+        .expect("current")
+        .expect("selected");
+    assert_eq!((current.index, current.name.as_str()), (1, "Speakers"));
+
+    h.model.external_change(|s| s.matrix_profile = String::new());
+    assert!(
+        h.adapter
+            .get_matrix_profile()
+            .await
+            .expect("current")
+            .is_none(),
+        "an empty profile field is the default/no-selection identity, not index 0"
+    );
+    h.stop();
+}
+
+/// An explicit daemon rejection of a matrix write is reported as the error it is.
+///
+/// **Label: client-pin.**
+#[tokio::test]
+async fn a_rejected_matrix_profile_write_reports_the_daemon_reason() {
+    let h = Harness::verified().await;
+    h.model.arm(|f| {
+        f.reject_next.push((
+            "MatrixSetProfile".to_string(),
+            "profile in use".to_string(),
+        ))
+    });
+
+    let err = h
+        .adapter
+        .set_matrix_profile(1)
+        .await
+        .map(|_| ())
+        .expect_err("an explicit rejection is a failure");
+    assert!(
+        err.to_string().contains("profile in use"),
+        "the daemon's own reason must survive to the caller, got: {err}"
+    );
+    h.stop();
+}
+
+// -----------------------------------------------------------------------------
+// Bounded, non-wedging failure
+// -----------------------------------------------------------------------------
+
+/// A malformed reply fails that command and leaves the connection usable, so later polling is not
+/// wedged. The oversized case is pinned by
+/// `an_unbounded_reply_is_rejected_by_an_explicit_byte_cap_and_the_next_command_still_works`; this is
+/// its malformed sibling.
+///
+/// **Label: client-pin.**
+#[tokio::test]
+async fn a_malformed_reply_does_not_wedge_later_polling() {
+    let h = Harness::with_policy(WirePolicy {
+        malformed_for_element: Some(("State".to_string(), "</Status>".to_string())),
+        ..WirePolicy::default()
+    })
+    .await;
+
+    assert!(
+        h.adapter.get_state().await.is_err(),
+        "precondition: the malformed reply must fail its own command"
+    );
+    let info = h
+        .adapter
+        .get_info()
+        .await
+        .expect("a later command must still be answered");
+    assert_eq!(
+        info.product, "Signalyst HQPlayer Embedded",
+        "and it must read the daemon's real reply rather than leftovers"
+    );
+    h.stop();
 }

@@ -152,6 +152,28 @@ pub enum ActiveModeReporting {
     ResolvesLoadedChain,
 }
 
+/// Which filter fields a `State` document carries.
+///
+/// **This is a client-contract shape, not a daemon claim.** Every capture in the corpus carries both
+/// `filter1x` and `filterNx`, and nothing here asserts that a daemon omits them. What *is* true, and
+/// what this exists to make reachable, is that UHC's own parser admits their absence —
+/// `HqpState::filter1x` and `HqpState::filter_nx` are `Option<u32>` — so the client has a branch for
+/// it and that branch decides whether a one-sided `SetFilter` **guesses** the sibling from the legacy
+/// combined `filter` field or **refuses**. #322's own audit recorded the guess as defect C5.
+///
+/// Constructed shapes and observed evidence are kept apart in this suite (see the
+/// `synthetic-chain-hazard` profile), so this is deliberately *not* reported by
+/// [`DaemonModel::armed_upstream_claims`]: that list names unqualified claims about **daemons**, and
+/// this makes no claim about any daemon at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FilterFieldReporting {
+    /// `filter`, `filter1x` and `filterNx` — what every corpus capture shows.
+    #[default]
+    Split,
+    /// The legacy combined `filter` only, so both siblings read as absent to the client.
+    CombinedOnly,
+}
+
 /// The daemon's observable state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DaemonState {
@@ -317,6 +339,8 @@ struct Inner {
     state_active_mode: ActiveModeReporting,
     /// How `Status.active_mode` reports.
     status_active_mode: ActiveModeReporting,
+    /// Which filter fields `State` carries. See [`FilterFieldReporting`].
+    filter_fields: FilterFieldReporting,
     enums: Enumerations,
     /// Every request line received, in order, so a test can assert on the value the client actually
     /// put on the wire (AC5) instead of on timing.
@@ -347,6 +371,7 @@ impl DaemonModel {
             // wants either behaviour must now say so.
             state_active_mode: ActiveModeReporting::EchoesConfiguredMode,
             status_active_mode: ActiveModeReporting::EchoesConfiguredMode,
+            filter_fields: FilterFieldReporting::default(),
             enums: Enumerations::load(profile),
             requests: Vec::new(),
         };
@@ -372,6 +397,12 @@ impl DaemonModel {
 
     pub fn set_style(&self, style: DocumentStyle) {
         self.lock().style = style;
+    }
+
+    /// Declare which filter fields `State` carries. See [`FilterFieldReporting`] — a client-contract
+    /// shape, never a claim about a daemon.
+    pub fn set_filter_field_reporting(&self, reporting: FilterFieldReporting) {
+        self.lock().filter_fields = reporting;
     }
 
     /// Declare how each renderer reports `active_mode`.
@@ -588,11 +619,21 @@ impl Inner {
             ActiveModeReporting::EchoesConfiguredMode => self.state.mode_index,
             ActiveModeReporting::ResolvesLoadedChain => self.loaded_chain_mode_index(),
         };
+        // Absent siblings are rendered by *omitting the attributes*, not by emitting empty ones: the
+        // client reads them with `parse_attr(...).and_then(parse)`, and an empty value would be an
+        // unparseable present attribute rather than an absent one. Only absence exercises the branch.
+        let siblings = match self.filter_fields {
+            FilterFieldReporting::Split => format!(
+                " filter1x=\"{}\" filterNx=\"{}\"",
+                self.state.filter_1x_index, self.state.filter_nx_index
+            ),
+            FilterFieldReporting::CombinedOnly => String::new(),
+        };
         let s = &self.state;
         let doc = format!(
             concat!(
-                "<State state=\"{state}\" mode=\"{mode}\" filter=\"{filter}\" ",
-                "filter1x=\"{f1x}\" filterNx=\"{fnx}\" shaper=\"{shaper}\" rate=\"{rate}\" ",
+                "<State state=\"{state}\" mode=\"{mode}\" filter=\"{filter}\"",
+                "{siblings} shaper=\"{shaper}\" rate=\"{rate}\" ",
                 "volume=\"{volume}\" active_mode=\"{active_mode}\" active_rate=\"{active_rate}\" ",
                 "convolution=\"{conv}\" invert=\"{invert}\" repeat=\"{repeat}\" ",
                 "random=\"{random}\" adaptive=\"{adaptive}\" filter_junk=\"{junk}\" ",
@@ -602,8 +643,7 @@ impl Inner {
             mode = s.mode_index,
             // Legacy single-filter field; observed tracking the most recently set of 1x/Nx.
             filter = s.filter_nx_index,
-            f1x = s.filter_1x_index,
-            fnx = s.filter_nx_index,
+            siblings = siblings,
             shaper = s.shaper_index,
             rate = s.rate_index,
             volume = format_db(s.volume_db),
