@@ -67,11 +67,109 @@ use crate::config::{get_config_file_path, read_config_file};
 const LMS_CONFIG_FILE: &str = "lms-config.json";
 /// Request ID for LMS JSON-RPC calls (aids debugging in LMS logs)
 const LMS_REQUEST_ID: i32 = 217;
+/// Name of the per-player LMS pref holding mute state.
+///
+/// `mixer muting ?` and `players … playerprefs:mute` read the same pref -
+/// `mixerQuery` returns `$prefs->client($client)->get("mute")` and
+/// `_addPlayersLoop` emits each requested pref by name - so the batched route
+/// cannot disagree with the per-player one. Verified against Lyrion 9.1.2.
+const LMS_MUTE_PREF: &str = "mute";
 
 /// Strip "lms:" prefix from player IDs.
 /// MCP and aggregator use prefixed IDs (e.g., "lms:00:11:22:33:44:55"), but LMS API expects bare IDs.
 fn strip_lms_prefix(id: &str) -> &str {
     id.strip_prefix("lms:").unwrap_or(id)
+}
+
+/// Read an integer that LMS may emit as either a JSON number or a JSON string.
+///
+/// LMS is not consistent about this, even within one response and even for the
+/// same field across sibling queries. Observed on a single live 9.1.2 server:
+/// `track_id` as a number, `mute` as `"0"`, `mixer volume ?` as `"42"`,
+/// `mixer muting ?` as `1`, `playlist_cur_index` as `"0"`.
+///
+/// `Value::as_i64()` alone silently yields `None` on the string form, which is
+/// how a parse bug becomes an empty result instead of an error (see #407).
+fn lms_i64(value: Option<&Value>) -> Option<i64> {
+    let value = value?;
+    value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|f| f as i64))
+        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+}
+
+/// Read an LMS 0/1 flag as a bool, tolerating number, string, `null` and absent.
+///
+/// LMS omits a player pref entirely when it was never written and returns
+/// `null` for it from the dedicated query, so "not present" and "not set" both
+/// mean false. Anything non-zero means true.
+fn lms_flag(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null) => false,
+        Some(v) => lms_i64(Some(v)).map(|n| n != 0).unwrap_or(false),
+    }
+}
+
+/// Read the entity id from a row of one of LMS's `<type>s_loop` arrays.
+///
+/// LMS keys these `<type>_id` — `album_id` in `albums_loop`, `contributor_id` in
+/// `contributors_loop`, `track_id` in `tracks_loop`. `Slim::Control::Queries`
+/// derives the loop name and the key from the same variable on adjacent lines
+/// (`"${type}s_loop"` / `"${type}_id"`), so a response that contains the loop
+/// necessarily uses that key.
+///
+/// The plain `id` fallback is deliberate belt-and-braces for any LMS version
+/// that might differ; this repo declares no minimum LMS version, so the fix must
+/// not depend on one. Reading only `id` is the #407 defect that made
+/// `search_library()` return an empty vec against every real server.
+fn loop_entity_id(row: &Value, entity: &str) -> Option<i64> {
+    lms_i64(row.get(format!("{}_id", entity)).or_else(|| row.get("id")))
+        .filter(|id| *id > 0)
+}
+
+/// What LMS actually does when a request fails, spelled out once.
+///
+/// `Slim::Web::JSONRPC::requestMethod` calls `closeHTTPSocket()` on any
+/// `$request->isStatusError()`. There is no branch that emits a JSON-RPC `error`
+/// object, so the client sees zero bytes and a closed socket - with no HTTP
+/// status line at all - for every one of: unknown command (104), bad parameters
+/// (102), unknown player id (103), bad server config (105), and Perl exceptions.
+/// Verified against live Lyrion 9.1.2; byte counts in
+/// `tests/fixtures/lms/PROVENANCE.md`.
+///
+/// Because the transport cannot tell these apart, a failure here must not be
+/// read as "this LMS does not support that command". Use `can <verb> ?` for
+/// capability questions, treating `_can: 1` as proof of presence and never
+/// `_can: 0` as proof of absence.
+const LMS_FAILURE_NOTE: &str = "LMS signals every request error this way - \
+unknown command, bad parameters, unknown player id, or bad server config are \
+indistinguishable at the transport, and it never returns a JSON-RPC error \
+object. A network fault looks the same, so do not read this as 'unsupported'.";
+
+/// Render a `slim.request` command array for an error message or log line.
+fn describe_command(player_id: Option<&str>, params: &[Value]) -> String {
+    let words: Vec<String> = params
+        .iter()
+        .map(|p| match p {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .collect();
+    format!(
+        "{} {}",
+        player_id.unwrap_or("<server>"),
+        truncate_for_log(&words.join(" "))
+    )
+}
+
+/// Keep diagnostics readable when LMS or a stray responder returns something huge.
+fn truncate_for_log(text: &str) -> String {
+    const MAX: usize = 200;
+    if text.chars().count() <= MAX {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(MAX).collect();
+    format!("{}…", head)
 }
 
 /// Saved config for persistence
@@ -293,13 +391,60 @@ impl LmsRpc {
             }
         }
 
-        let response = request.send().await?;
+        // LMS's failure signal is the *absence* of a response, so every branch
+        // below has to describe the command that provoked it or the log is
+        // useless. See describe_command / LMS_FAILURE_NOTE.
+        let command = describe_command(player_id, &params);
+
+        let response = request.send().await.map_err(|e| {
+            anyhow!(
+                "LMS closed the connection with no response for `{}`. {} \
+                 (transport: {})",
+                command,
+                LMS_FAILURE_NOTE,
+                e
+            )
+        })?;
 
         if !response.status().is_success() {
-            return Err(anyhow!("LMS request failed: {}", response.status()));
+            return Err(anyhow!(
+                "LMS request failed for `{}`: HTTP {}",
+                command,
+                response.status()
+            ));
         }
 
-        let data: Value = response.json().await?;
+        // Read bytes rather than deserialising directly: a reverse proxy can turn
+        // LMS's closed socket into a valid empty 200, and `response.json()` would
+        // report that as "EOF while parsing a value", which names neither the
+        // cause nor the command.
+        let body = response.bytes().await.map_err(|e| {
+            anyhow!(
+                "LMS closed the connection mid-response for `{}`. {} \
+                 (transport: {})",
+                command,
+                LMS_FAILURE_NOTE,
+                e
+            )
+        })?;
+
+        if body.is_empty() {
+            return Err(anyhow!(
+                "LMS returned an empty body for `{}`. {}",
+                command,
+                LMS_FAILURE_NOTE
+            ));
+        }
+
+        let data: Value = serde_json::from_slice(&body).map_err(|e| {
+            anyhow!(
+                "LMS returned a body that is not JSON for `{}`: {} (first 200 \
+                 bytes: {:?})",
+                command,
+                e,
+                String::from_utf8_lossy(&body[..body.len().min(200)])
+            )
+        })?;
 
         debug!(
             player_id = player_id.unwrap_or("<server>"),
@@ -307,13 +452,19 @@ impl LmsRpc {
             "LMS response"
         );
 
-        if let Some(error) = data.get("error") {
-            if !error.is_null() {
-                return Err(anyhow!("LMS error: {}", error));
-            }
-        }
-
-        Ok(data.get("result").cloned().unwrap_or(Value::Null))
+        // Replaces a check for a JSON-RPC `error` member, which was dead code:
+        // LMS never emits one (Slim::Web::JSONRPC::requestMethod closes the
+        // socket instead). A successful slim.request always carries `result`, so
+        // its absence means something that is not a healthy LMS answered - which
+        // also catches the hypothetical `error`-emitting responder the old check
+        // was aiming at, instead of silently handing callers Value::Null.
+        data.get("result").cloned().ok_or_else(|| {
+            anyhow!(
+                "LMS reply for `{}` has no `result` member: {}",
+                command,
+                truncate_for_log(&data.to_string())
+            )
+        })
     }
 
     async fn get_player_status(&self, player_id: &str) -> Result<LmsPlayer> {
@@ -354,6 +505,12 @@ impl LmsRpc {
             }
         }
 
+        // NOTE (#407): the artwork_track_id arm never fires, because
+        // artwork_track_id is tag `J` and the tags string above does not request
+        // it - so artwork falls through to the track's own `id`. Adding `J` is
+        // free on the wire but would change image_key values for tracks with no
+        // coverid, and image_key is client-visible, so it is left alone here and
+        // flagged for #401/#403 rather than changed inside a defect fix.
         let artwork_id = playlist_loop
             .get("coverid")
             .or_else(|| playlist_loop.get("artwork_track_id"))
@@ -365,16 +522,30 @@ impl LmsRpc {
                     .or_else(|| v.as_i64().map(|n| n.to_string()))
             });
 
+        // LMS negates the volume pref while a player is muted, so `mixer volume`
+        // arrives as e.g. -42 - and it used to be handed straight to a
+        // VolumeControl declared min: 0.0, i.e. clients were shown a negative
+        // percentage. Report the magnitude, and treat the sign as a second mute
+        // signal.
+        //
+        // The sign LAGS the mute by roughly 0.8s (mixer muting schedules a fade
+        // and only writes the negated value when it completes), so it can produce
+        // a false negative but never a false positive. That is what makes it safe
+        // to OR with the `mute` pref from `players`, which flips immediately.
+        // Timing measurements: tests/fixtures/lms/PROVENANCE.md.
+        let raw_volume = result
+            .get("mixer volume")
+            .and_then(|v| v.as_f64())
+            .or_else(|| lms_i64(result.get("mixer volume")).map(|n| n as f64))
+            .unwrap_or(0.0);
+
         Ok(LmsPlayer {
             playerid: player_id.to_string(),
             state: state.to_string(),
             mode: mode.to_string(),
-            power: result.get("power").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
-            volume: result
-                .get("mixer volume")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0)
-                .round() as i32,
+            power: lms_flag(result.get("power")),
+            volume: raw_volume.abs().round() as i32,
+            muted: raw_volume < 0.0,
             playlist_tracks: result
                 .get("playlist_tracks")
                 .and_then(|v| v.as_u64())
@@ -411,8 +582,24 @@ impl LmsRpc {
     }
 
     async fn get_players(&self) -> Result<Vec<LmsPlayer>> {
+        // `playerprefs:` asks playersQuery to include named per-player prefs in
+        // each players_loop entry, so mute state arrives inside the one `players`
+        // call this poll already makes: zero extra round-trips, whatever the poll
+        // rate or player count. The alternative - `mixer muting ?` per player per
+        // poll - would nearly double request volume at the 2s default interval.
+        //
+        // `status` cannot supply this: it carries no mute key at all. Verified
+        // against live Lyrion 9.1.2 (tests/fixtures/lms/PROVENANCE.md).
         let result = self
-            .execute(None, vec![json!("players"), json!(0), json!(100)])
+            .execute(
+                None,
+                vec![
+                    json!("players"),
+                    json!(0),
+                    json!(100),
+                    json!(format!("playerprefs:{}", LMS_MUTE_PREF)),
+                ],
+            )
             .await?;
 
         let players_loop = result
@@ -439,9 +626,16 @@ impl LmsRpc {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown")
                     .to_string(),
-                connected: p.get("connected").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
-                power: p.get("power").and_then(|v| v.as_i64()).unwrap_or(0) == 1,
+                connected: lms_flag(p.get("connected")),
+                power: lms_flag(p.get("power")),
                 ip: p.get("ip").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                // Absent means the pref was never written, i.e. not muted. Note
+                // that absence is ALSO what an LMS too old for `playerprefs:`
+                // would produce - it ignores unknown tagged params silently
+                // rather than erroring - so a `false` here is not proof of
+                // unmuted. The negative-volume signal in get_player_status()
+                // covers that case, needing no tagged parameter.
+                muted: lms_flag(p.get(LMS_MUTE_PREF)),
                 ..Default::default()
             })
             .collect())
@@ -471,6 +665,13 @@ pub struct LmsPlayer {
     pub artwork_track_id: Option<String>,
     pub coverid: Option<String>,
     pub artwork_url: Option<String>,
+    /// Whether the player is muted.
+    ///
+    /// From the per-player `mute` pref, requested via `playerprefs:mute` on the
+    /// `players` query so it costs no extra round-trip, OR-ed with a negative
+    /// `mixer volume` in `status` (LMS negates the volume while muted). `status`
+    /// itself carries no mute key.
+    pub muted: bool,
 }
 
 impl Default for LmsPlayer {
@@ -495,6 +696,7 @@ impl Default for LmsPlayer {
             artwork_track_id: None,
             coverid: None,
             artwork_url: None,
+            muted: false,
         }
     }
 }
@@ -1251,7 +1453,15 @@ impl LmsAdapter {
         })
     }
 
-    /// Fallback library-only search for older LMS versions without globalsearch
+    /// Fallback library-only search, used when globalsearch is unavailable or no
+    /// player is connected.
+    ///
+    /// LMS keys each result loop's entity id `<type>_id`, never `id`:
+    /// `albums_loop[].album_id`, `contributors_loop[].contributor_id`,
+    /// `tracks_loop[].track_id`. Reading `id` made every guard in this function
+    /// fail, so it returned an empty vec against every real server (#407).
+    /// Loops with no matches are omitted from the response entirely rather than
+    /// returned empty, so absent is normal, not an error.
     async fn search_library(&self, query: &str, limit: usize) -> Result<Vec<LmsSearchResult>> {
         let result = self
             .rpc
@@ -1268,11 +1478,11 @@ impl LmsAdapter {
 
         let mut results = Vec::new();
 
-        // Parse albums
+        // Parse albums — albums_loop[].album_id / .album
         if let Some(albums) = result.get("albums_loop").and_then(|v| v.as_array()) {
             for album in albums.iter().take(limit) {
                 if let (Some(id), Some(title)) = (
-                    album.get("id").and_then(|v| v.as_i64()),
+                    loop_entity_id(album, "album"),
                     album.get("album").and_then(|v| v.as_str()),
                 ) {
                     results.push(LmsSearchResult {
@@ -1291,11 +1501,14 @@ impl LmsAdapter {
             }
         }
 
-        // Parse artists
+        // Parse artists — contributors_loop[].contributor_id / .contributor
+        // (LMS's own type name here is "contributor", not "artist"; the published
+        // CLI reference still documents this key as artist_id, which live 9.1.2
+        // contradicts.)
         if let Some(artists) = result.get("contributors_loop").and_then(|v| v.as_array()) {
             for artist in artists.iter().take(limit.saturating_sub(results.len())) {
                 if let (Some(id), Some(name)) = (
-                    artist.get("id").and_then(|v| v.as_i64()),
+                    loop_entity_id(artist, "contributor"),
                     artist.get("contributor").and_then(|v| v.as_str()),
                 ) {
                     results.push(LmsSearchResult {
@@ -1311,11 +1524,11 @@ impl LmsAdapter {
             }
         }
 
-        // Parse tracks
+        // Parse tracks — tracks_loop[].track_id / .track
         if let Some(tracks) = result.get("tracks_loop").and_then(|v| v.as_array()) {
             for track in tracks.iter().take(limit.saturating_sub(results.len())) {
                 if let (Some(id), Some(title)) = (
-                    track.get("id").and_then(|v| v.as_i64()),
+                    loop_entity_id(track, "track"),
                     track.get("track").and_then(|v| v.as_str()),
                 ) {
                     results.push(LmsSearchResult {
@@ -1480,7 +1693,10 @@ fn lms_player_to_zone(player: &LmsPlayer) -> Zone {
             // LMS hardcodes $increment = 2.5 in Slim/Player/Client.pm:755
             // This is not queryable via CLI/JSON-RPC, so we use the constant.
             step: 2.5,
-            is_muted: false, // LMS doesn't expose mute via JSON-RPC status
+            // `status` carries no mute key, but the per-player `mute` pref does -
+            // requested via `playerprefs:mute` on the `players` query the poll
+            // already makes, so this costs no extra round-trip. See LmsPlayer.muted.
+            is_muted: player.muted,
             scale: crate::bus::VolumeScale::Percentage,
             // Use prefixed zone_id as output_id for consistent aggregator matching
             output_id: Some(zone_id),
@@ -1529,8 +1745,8 @@ async fn update_players_internal(
     let mut now_playing_updates: Vec<NowPlayingUpdate> = Vec::new();
     // State updates: (player_id, player_name, state)
     let mut state_updates: Vec<(String, String, String)> = Vec::new();
-    // VolumeChanged: (player_id, volume)
-    let mut volume_updates: Vec<(String, i32)> = Vec::new();
+    // VolumeChanged: (player_id, volume, is_muted)
+    let mut volume_updates: Vec<(String, i32, bool)> = Vec::new();
 
     // Helper to convert empty strings to None (metadata cleared)
     let to_option = |s: &str| {
@@ -1548,6 +1764,12 @@ async fn update_players_internal(
                 player.mode = status.mode;
                 player.power = status.power;
                 player.volume = status.volume;
+                // `player.muted` came from the `mute` pref on the `players` call;
+                // `status.muted` is the negated-volume signal. OR them: the pref
+                // flips immediately but needs `playerprefs:` support, the sign
+                // needs nothing but lags a mute by ~0.8s. Either alone can miss;
+                // neither produces a false positive.
+                player.muted = player.muted || status.muted;
                 player.playlist_tracks = status.playlist_tracks;
                 player.playlist_cur_index = status.playlist_cur_index;
                 player.time = status.time;
@@ -1575,7 +1797,12 @@ async fn update_players_internal(
                     || old_player.artwork_url != player.artwork_url
                     || old_player.coverid != player.coverid;
                 let state_changed = old_player.state != player.state;
-                let volume_changed = old_player.volume != player.volume;
+                // Mute counts as a volume change. Zones are served from the
+                // aggregator's event-fed cache, so a mute toggled from another
+                // controller (iPeng, Squeezer, the LMS web UI) would otherwise
+                // never reach /zones unless the volume happened to change too.
+                let volume_changed = old_player.volume != player.volume
+                    || old_player.muted != player.muted;
                 (np_changed, state_changed, volume_changed)
             } else {
                 // New player - will be handled by ZoneDiscovered
@@ -1603,7 +1830,7 @@ async fn update_players_internal(
         }
 
         if volume_changed {
-            volume_updates.push((player.playerid.clone(), player.volume));
+            volume_updates.push((player.playerid.clone(), player.volume, player.muted));
         }
 
         let mut s = state.write().await;
@@ -1637,16 +1864,19 @@ async fn update_players_internal(
         });
     }
 
-    // Emit VolumeChanged events for volume changes
-    for (player_id, volume) in volume_updates {
+    // Emit VolumeChanged events for volume or mute changes
+    for (player_id, volume, is_muted) in volume_updates {
         debug!(
-            "Polling detected volume change for {}: {}",
-            player_id, volume
+            "Polling detected volume change for {}: {} (muted: {})",
+            player_id, volume, is_muted
         );
         bus.publish(BusEvent::VolumeChanged {
             output_id: PrefixedZoneId::lms(&player_id).to_string(),
             value: volume as f32,
-            is_muted: false, // LMS doesn't expose mute via JSON-RPC
+            // Previously hard-coded false, which meant every polled volume change
+            // clobbered the correct mute state the CLI subscription had already
+            // published for the same player.
+            is_muted,
         });
     }
 
@@ -1937,28 +2167,44 @@ async fn handle_cli_event(
                     player_id, value, is_relative, absolute_volume
                 );
 
-                // Update cached state (rounded to i32 for LMS internal format)
-                {
+                // Update cached state (rounded to i32 for LMS internal format).
+                //
+                // Setting the volume clears mute server-side: mixerCommand does
+                // `$prefs->client($client)->set('mute', 0)` when the entity is
+                // 'volume' and the player is muted (Slim/Control/Commands.pm).
+                // So `false` here is LMS's behaviour, not an assumption - but it
+                // is now derived from the cache rather than hard-coded, so the
+                // model stays consistent with what the next poll will read.
+                let is_muted = {
                     let mut s = state.write().await;
                     if let Some(player) = s.players.get_mut(&player_id) {
                         player.volume = absolute_volume.round() as i32;
+                        player.muted = false;
                     }
-                }
+                    false
+                };
 
                 // Publish volume changed event with prefixed output_id
                 bus.publish(BusEvent::VolumeChanged {
                     output_id: PrefixedZoneId::lms(&player_id).to_string(),
                     value: absolute_volume,
-                    is_muted: false,
+                    is_muted,
                 });
             } else if param == "muting" {
                 let is_muted = value != 0.0;
                 debug!("Mute change for {}: {}", player_id, is_muted);
 
-                // Get current volume from cache for the event
+                // Get current volume from cache for the event, and record the mute
+                // so a ZoneDiscovered built before the next poll is already right.
                 let current_volume = {
-                    let s = state.read().await;
-                    s.players.get(&player_id).map(|p| p.volume).unwrap_or(0)
+                    let mut s = state.write().await;
+                    match s.players.get_mut(&player_id) {
+                        Some(player) => {
+                            player.muted = is_muted;
+                            player.volume
+                        }
+                        None => 0,
+                    }
                 };
 
                 // Publish volume changed event with mute state and prefixed output_id
