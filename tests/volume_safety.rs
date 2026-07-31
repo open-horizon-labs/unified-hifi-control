@@ -168,7 +168,7 @@ fn relative_step_clamped_prevents_wild_jumps() {
 // not see the defect #328 found. Two reasons, both structural rather than accidental:
 //
 //   1. It walks `src/adapters` only. The routing surface that decides what level to write lives in
-//      `src/knobs/routes.rs`.
+//      `src/knobs/routes.rs` (`dispatch_hqplayer_action`, shared with MCP's `hifi_control` since #401).
 //   2. It matches the literal `.value.unwrap_or(50.0)`. The real line read
 //      `value.and_then(|v| v.as_f64()).unwrap_or(50.0)` — same hazard, different spelling, no match.
 //
@@ -181,34 +181,40 @@ fn relative_step_clamped_prevents_wild_jumps() {
 // daemon receives nothing. This lint exists because that test can only cover the paths it calls,
 // while a future edit could add a fifth volume arm with a default and break no existing test.
 
-/// The body of `control_hqplayer`, from its signature to the sibling that follows it.
-fn control_hqplayer_body() -> String {
+/// The body of `dispatch_hqplayer_action`, from its signature to the sibling that follows it.
+///
+/// The safety-critical capability checks and volume clamp/no-default logic used to live inline in
+/// `control_hqplayer`; #401 extracted them into this transport-neutral function (shared by the HTTP
+/// knob handler and MCP's `hifi_control` tool) so the same command core backs both surfaces. The
+/// lint follows the logic to its new home rather than continuing to describe `control_hqplayer`,
+/// which is now a thin wrapper with none of these arms in its own body.
+fn dispatch_hqplayer_action_body() -> String {
     let source = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/knobs/routes.rs"),
     )
     .expect("read the routing surface");
 
     let start = source
-        .find("async fn control_hqplayer(")
-        .expect("control_hqplayer must exist: the direct HQPlayer zone routes through it");
+        .find("async fn dispatch_hqplayer_action(")
+        .expect("dispatch_hqplayer_action must exist: the direct HQPlayer zone routes through it");
     let rest = &source[start..];
     let end = rest
-        .find("\nfn require_volume_control(")
-        .expect("the function that follows control_hqplayer must still follow it");
+        .find("\nasync fn control_hqplayer(")
+        .expect("the function that follows dispatch_hqplayer_action must still follow it");
     rest[..end].to_string()
 }
 
 #[test]
 fn the_hqplayer_volume_path_never_substitutes_a_numeric_level() {
-    let body = control_hqplayer_body();
+    let body = dispatch_hqplayer_action_body();
 
     // Non-vacuity: the arms this is a claim about have to be present, or the lint passes by
     // describing a function that no longer does the thing.
     for marker in ["set_volume_db", "vol_abs", "vol_up"] {
         assert!(
             body.contains(marker),
-            "`{marker}` is gone from control_hqplayer; this lint is now vacuous and must be updated \
-             alongside whatever replaced it"
+            "`{marker}` is gone from dispatch_hqplayer_action; this lint is now vacuous and must be \
+             updated alongside whatever replaced it"
         );
     }
 
@@ -239,7 +245,7 @@ fn the_hqplayer_volume_path_never_substitutes_a_numeric_level() {
 
     assert!(
         offenders.is_empty(),
-        "\n\nSAFETY: control_hqplayer substitutes a numeric volume level.\n\n\
+        "\n\nSAFETY: dispatch_hqplayer_action substitutes a numeric volume level.\n\n\
          A level the client did not supply must be REFUSED, not invented. On a dB zone 0.0 is full \
          scale and 50.0 is above every possible maximum, and this path writes straight to a DAC.\n\n\
          Offending lines:\n{}\n\n\
@@ -251,7 +257,7 @@ fn the_hqplayer_volume_path_never_substitutes_a_numeric_level() {
 
 #[test]
 fn the_hqplayer_volume_path_clamps_to_the_zones_observed_bounds() {
-    let body = control_hqplayer_body();
+    let body = dispatch_hqplayer_action_body();
 
     // Both the absolute and the relative arm must clamp, and must clamp to values read off the
     // published zone rather than to constants. `vc` is that zone's volume control.
@@ -259,7 +265,7 @@ fn the_hqplayer_volume_path_clamps_to_the_zones_observed_bounds() {
     assert!(
         clamps.len() >= 2,
         "both the absolute and the relative volume arms must clamp; found {} clamp(s) in \
-         control_hqplayer",
+         dispatch_hqplayer_action",
         clamps.len()
     );
     for line in &clamps {
