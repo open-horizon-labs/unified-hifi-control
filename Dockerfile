@@ -17,7 +17,7 @@ RUN rustup target add wasm32-unknown-unknown
 # Install Dioxus CLI and Tailwind (with cache mount for cargo registry)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo install dioxus-cli@0.7.3
+    cargo install dioxus-cli@0.7.10 --locked
 
 # Copy manifests first (for dependency caching)
 COPY Cargo.toml Cargo.lock Dioxus.toml Makefile ./

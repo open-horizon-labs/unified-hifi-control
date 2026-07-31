@@ -203,7 +203,7 @@ WASM is built once and shared across all platform builds. The cache uses content
 - uses: actions/cache@v4
   with:
     path: ~/.cargo/bin/dx
-    key: dx-cli-0.7.3
+    key: dx-cli-0.7.10
 ```
 
 ### Embedded Assets (ADR 002)

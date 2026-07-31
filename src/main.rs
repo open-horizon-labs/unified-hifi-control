@@ -64,6 +64,73 @@ mod server {
         Redirect::to("/settings")
     }
 
+    /// Resolve the primary address other devices use to reach this host.
+    /// Connecting a UDP socket selects the default route without sending data.
+    fn is_trusted_lan_ip(ip: &std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(ip) => ip.is_private(),
+            std::net::IpAddr::V6(ip) => ip.is_unique_local(),
+        }
+    }
+
+    fn primary_non_loopback_ip() -> Option<std::net::IpAddr> {
+        let routed_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| {
+                socket.connect("192.0.2.1:80")?;
+                socket.local_addr()
+            })
+            .ok()
+            .map(|addr| addr.ip())
+            .filter(is_trusted_lan_ip);
+
+        routed_ip.or_else(|| {
+            if_addrs::get_if_addrs()
+                .ok()?
+                .into_iter()
+                .filter(|interface| !interface.is_loopback() && !interface.is_link_local())
+                .map(|interface| interface.ip())
+                .filter(is_trusted_lan_ip)
+                .min_by_key(|ip| match ip {
+                    std::net::IpAddr::V4(_) => 0,
+                    std::net::IpAddr::V6(_) => 1,
+                })
+        })
+    }
+
+    #[cfg(test)]
+    mod address_tests {
+        use super::is_trusted_lan_ip;
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        #[test]
+        fn trusted_lan_addresses_are_private_or_unique_local() {
+            assert!(is_trusted_lan_ip(&IpAddr::V4(Ipv4Addr::new(
+                192, 168, 1, 2
+            ))));
+            assert!(is_trusted_lan_ip(&IpAddr::V4(Ipv4Addr::new(
+                10, 20, 30, 40
+            ))));
+            assert!(is_trusted_lan_ip(&IpAddr::V6(Ipv6Addr::new(
+                0xfd12, 0x3456, 0x789a, 0, 0, 0, 0, 1
+            ))));
+        }
+
+        #[test]
+        fn public_and_local_only_addresses_are_not_advertised() {
+            assert!(!is_trusted_lan_ip(&IpAddr::V4(Ipv4Addr::new(
+                203, 0, 113, 10
+            ))));
+            assert!(!is_trusted_lan_ip(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+            assert!(!is_trusted_lan_ip(&IpAddr::V4(Ipv4Addr::new(
+                169, 254, 1, 2
+            ))));
+            assert!(!is_trusted_lan_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+            assert!(!is_trusted_lan_ip(&IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0x0db8, 0, 0, 0, 0, 0, 1
+            ))));
+        }
+    }
+
     pub async fn run() -> Result<()> {
         // Initialize logging
         // Priority: RUST_LOG > LOG_LEVEL (legacy) > default
@@ -120,6 +187,18 @@ mod server {
             gethostname::gethostname().to_string_lossy(),
             config.port
         );
+        let mcp_host = primary_non_loopback_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}.local",
+                    gethostname::gethostname()
+                        .to_string_lossy()
+                        .trim_end_matches(".local")
+                )
+            });
+        let mcp_endpoint = app::McpEndpoint::new(&mcp_host, config.port);
+        tracing::info!("MCP agent endpoint: {}", mcp_endpoint.url);
 
         // =========================================================================
         // Create all adapter instances (needed for API handlers regardless of state)
@@ -455,25 +534,26 @@ mod server {
         // serve_api_application() provides SSR + server functions, but no static assets
         // Our middleware injects the bootstrap scripts (from embedded index.html) into SSR HTML
         // This enables WASM hydration without requiring a public/ directory at runtime
+        let serve_config = || dioxus::server::ServeConfig::new().context(mcp_endpoint.clone());
         let router = if embedded::has_embedded_assets() {
             if let Some(bootstrap) = embedded::extract_bootstrap_snippet() {
                 tracing::info!("Using embedded SSR mode (bootstrap scripts will be injected)");
                 tracing::debug!("Bootstrap snippet:\n{}", bootstrap);
                 router
-                    .serve_api_application(dioxus::server::ServeConfig::new(), app::App)
+                    .serve_api_application(serve_config(), app::App)
                     .layer(embedded::InjectDioxusBootstrapLayer::new(bootstrap))
             } else {
                 tracing::warn!(
                     "Embedded assets found but no bootstrap scripts - falling back to SPA"
                 );
                 router
-                    .serve_api_application(dioxus::server::ServeConfig::new(), app::App)
+                    .serve_api_application(serve_config(), app::App)
                     .fallback(embedded::serve_index_html)
             }
         } else {
             tracing::info!("Using SSR mode (no embedded assets, use dx serve for development)");
             // Standard SSR mode for development
-            router.serve_dioxus_application(dioxus::server::ServeConfig::new(), app::App)
+            router.serve_dioxus_application(serve_config(), app::App)
         };
 
         // Start server with graceful shutdown
