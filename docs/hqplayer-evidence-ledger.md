@@ -108,8 +108,8 @@ were **not executed** and are recorded as gaps in that comment.
 | HQP-C-001 | `SetMode value=` carries the **list index**, not the enum ID: SDM is index 2 while its enum ID is 1 | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain · test:modes_list_distinguishes_list_index_from_enum_id · fixture:tests/fixtures/hqplayer/hqpd-6.0.4-opal/modes.xml | settled | — |
 | HQP-C-002 | Domain 1 — the **live wire** domain: `State.mode/filter/filter1x/filterNx/shaper/rate` and the **enumerated** setters (`SetMode`, `SetFilter`, `SetShaping`, `SetRate`, `SetJunkFilter`) speak a **list index** into the currently loaded enumeration. Volume is **not** in this domain — it is absolute dB (HQP-C-040). Commands evidenced elsewhere: SetShaping (HQP-C-064), SetJunkFilter (HQP-C-051) | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it · test:a_filter_name_is_not_sent_as_its_enum_id · test:a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain · test:a_rate_valid_in_one_chain_is_refused_in_the_other | settled | — |
 | HQP-C-003 | Domain 2 — the **persistent** domain: `hqplayerd.xml` and the 8088 config form store **enum IDs**, which are not list indices and must never be fed to the live lane | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-hqplayer-protocol-conformance.md` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_persistent_configuration_lane_stores_enum_ids_not_list_indices · test:feeding_a_persistent_enum_id_to_the_live_lane_is_rejected | settled | — |
-| HQP-C-004 | Domain 3 — the **client** domain **as designed**: clients exchange setting-appropriate values — semantic names for mode/filter/shaper, Hz for rate, decimal dB for volume — and the adapter owns both numeric conversions. **This is the design rule, not a description of every path today**: see HQP-C-063 | E6-documentary | `.oh/hqplayer-spec.md` layer table · direct · n/a · 2026-02-04 · n/a | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it | settled | — |
-| HQP-C-063 | Raw indices **do** cross the client boundary today, in two evidenced places: the legacy numeric route `HqpSettingRequest { name: String, value: u32 }` stringifies its number for name-based lookup (`src/api/mod.rs:825-836`), and the adapter's resolvers fall back to parsing a numeric string as a direct index (`resolve_mode_index:2081`, `resolve_filter_index:2186`, `resolve_shaper_index:2247`) | E6-documentary | `src/api/mod.rs` and `src/adapters/hqplayer.rs` at this head · direct · n/a · 2026-07-30 · n/a | none:#347 removing the raw integer-string fallback from production control paths while keeping the legacy numeric HTTP contract at the compatibility boundary | open | #347 |
+| HQP-C-004 | Domain 3 — the **client** domain: clients exchange setting-appropriate values — semantic names for mode/filter/shaper, Hz for rate, decimal dB for volume — and the adapter owns both numeric conversions. The two paths that broke this rule are gone (HQP-C-063, retired); the one frozen numeric request contract is resolved to a name at the HTTP boundary and never travels inward | E6-documentary | `.oh/hqplayer-spec.md` layer table · direct · n/a · 2026-02-04 · n/a | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it · test:a_numeric_string_is_never_accepted_as_a_setting_name | settled | — |
+| HQP-C-063 | Raw indices **did** cross the client boundary, in two evidenced places: the legacy numeric route `HqpSettingRequest { name: String, value: u32 }` stringified its number for name-based lookup (`src/api/mod.rs:825-836`), and the adapter's resolvers fell back to parsing a numeric string as a direct index (`resolve_mode_index:2081`, `resolve_filter_index:2186`, `resolve_shaper_index:2247`) | E6-documentary | `src/api/mod.rs` and `src/adapters/hqplayer.rs` at `6d688bd` · direct · n/a · 2026-07-30 · n/a | test:a_numeric_string_is_never_accepted_as_a_setting_name · test:tests/hqplayer_ledger_lint.rs::no_production_control_path_parses_a_setting_name_as_an_index | retired | #347 |
 | HQP-C-064 | **No conformance expectation drives `set_shaper`**, so the shaper setter's behaviour is L1-observed only — `shaper 24→0→24`, `result="OK"`, readback-verified on the live run — and unpinned hermetically | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | none:a conformance expectation that drives `set_shaper` and verifies the readback; the fake already applies `SetShaping` (`model.rs`), so only the expectation is missing | open | #329 |
 | HQP-C-005 | `SetMode` does **not** reset the filter or shaper selections; the fake once modelled that and no evidence supports it | E3-derived | `.oh/issue-322-…` amendment row B14 · direct · hqplayerd 6.0.4 (Opal) · 2026-07-30 · unknown | test:set_mode_does_not_reset_the_filter_and_shaper_selections | settled | — |
 | HQP-C-006 | A mode change reloads the chain, so a list index resolved before it can name a **different** setting after it | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain · test:the_same_filter_index_selects_a_different_filter_per_loaded_chain | settled | — |
@@ -133,9 +133,9 @@ were **not executed** and are recorded as gaps in that comment.
 |---|---|---|---|---|---|---|
 | HQP-C-015 | `SetRate value=` is the **list index** of the wanted rate in the current chain's list; `RatesItem` carries `rate` in Hz and **no** enum ID; `Status.active_rate` reports Hz | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:rates_list_reports_hz_and_has_no_enum_id · test:a_rate_valid_in_one_chain_is_refused_in_the_other | settled | — |
 | HQP-C-016 | Rate list index **0 is Auto** (`rate="0"`), and a mode change resets the runtime rate to it — L1 observed `rate 3 → 0` | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:tier1_requires_rate_index_zero_to_be_auto · test:a_same_mode_set_mode_still_clears_the_rate_pin | settled | — |
-| HQP-C-017 | A **same-mode** `SetMode` still reloads the chain and clears the exact-rate pin, so a no-op mode write is not a no-op | E1-upstream-verified | UHC-SALVAGE-BETA-DEV via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:a_same_mode_set_mode_still_clears_the_rate_pin | settled | — |
+| HQP-C-017 | A **same-mode** `SetMode` still reloads the chain and clears the exact-rate pin, so a no-op mode write is not a no-op | E1-upstream-verified | UHC-SALVAGE-BETA-DEV via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:a_same_mode_set_mode_still_clears_the_rate_pin · test:a_no_op_mode_write_is_not_sent_so_the_rate_pin_survives | settled | — |
 | HQP-C-018 | Under `[source]` a **non-zero** rate pin is accepted and ignored: the setter answers `OK` and the runtime rate does not move | E1-upstream-verified | UHC-SALVAGE-BETA-DEV via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:a_nonzero_rate_pin_under_source_is_accepted_and_ignored | settled | — |
-| HQP-C-019 | Under `[source]` an **Auto** (index 0) rate request is ignored and a readback **cannot tell** — comparing 0 against 0 reports success for a command that did nothing | E1-upstream-verified | UHC-SALVAGE-BETA-DEV via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:an_auto_rate_request_under_source_is_ignored_and_readback_cannot_tell | open | #347 |
+| HQP-C-019 | Under `[source]` an **Auto** (index 0) rate request is ignored and a readback **cannot tell** — comparing 0 against 0 reports success for a command that did nothing. The client therefore **suppresses** the write with a stated reason instead of verifying it | E1-upstream-verified | UHC-SALVAGE-BETA-DEV via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:an_auto_rate_request_under_source_is_ignored_and_readback_cannot_tell · test:an_auto_rate_request_under_source_is_never_reported_as_applied · test:a_rate_pin_under_source_is_suppressed_before_it_reaches_the_daemon | settled | — |
 | HQP-C-020 | The offered rate list varies wholesale **by mode** — PCM 44.1k–768k against SDM 2.8M–24.6M on L1, with no overlap | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:a_rate_valid_in_one_chain_is_refused_in_the_other | settled | — |
 | HQP-C-021 | The rate list also depends on the **selected filter**, so mode alone is insufficient to resolve a rate | E1-upstream-verified | UHC-SALVAGE-BETA-DEV §4 via #341 [comment 5126438674](https://github.com/open-horizon-labs/unified-hifi-control/issues/341#issuecomment-5126438674) (`livelane.py:33-38`) · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | none:capture GetRates before and after a SetFilter on one device and record which entries change | open | #332 |
 | HQP-C-022 | Whether `GetRates` can be **empty** at all is unsupported by any observation in the audited evidence base | E4-unverified | #341 comment 5126438674 · read-via-issue · n/a · 2026-07-30 · n/a | none:read-only GetRates capture on a daemon with no usable output configured, or upstream confirmation that an empty list is reachable | open | #332 |
@@ -147,7 +147,7 @@ were **not executed** and are recorded as gaps in that comment.
 | HQP-C-023 | `Status.active_mode` **echoes the configured mode** under `[source]`, so it cannot resolve the loaded chain | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…:1549-1552` and `model.rs:126`/`:146` at `bc9158e` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · active | test:the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics | settled | — |
 | HQP-C-024 | What `State.active_mode` reports under `[source]` — the loaded chain or the configured mode — is **unmeasured**, upstream and here | E4-unverified | `.oh/issue-322-…:1738-1740` · direct · unmeasured on any daemon · 2026-07-30 · unknown | test:the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics · #332:Resolve State.active_mode versus Status.active_mode under configured PCM/SDM and [source]/Auto with PCM and DSD sources | open | #332 |
 | HQP-C-025 | `Status` reports active settings as **display names** while `State` reports numbers, so the two are complementary rather than redundant | E3-derived | `tests/fixtures/hqplayer/hqpd-6.0.4-opal/status_playing_with_metadata.xml` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · unknown | test:status_reports_active_settings_as_display_names | settled | — |
-| HQP-C-026 | UHC's own comment at `src/adapters/hqplayer.rs:2473` calls `Status.active_mode` "unreliable" and instructs using `State`'s — a global rule the evidence does not support | E4-unverified | `src/adapters/hqplayer.rs:2473` · direct · n/a · 2026-07-30 · n/a | none:HQP-C-024 settling, after which the comment states a measured fact or is deleted | open | #347 |
+| HQP-C-026 | UHC's own comment at `src/adapters/hqplayer.rs:2473` called `Status.active_mode` "unreliable" and instructed using `State`'s — a global rule the evidence does not support | E4-unverified | `src/adapters/hqplayer.rs:2473` · direct · n/a · 2026-07-30 · n/a | test:tests/hqplayer_ledger_lint.rs::no_production_comment_settles_the_active_mode_question_by_fiat | retired | #347 |
 
 #### HQP-C-023's playback state was corrected, and the wrong value had already travelled
 
@@ -250,30 +250,34 @@ withdrawn.
 
 Each row below is an `open` or `pending-live` claim, with the acquisition plan the lint requires.
 
-### HQP-C-063 — the client boundary is not yet what HQP-C-004 describes
+### HQP-C-063 — the client boundary now is what HQP-C-004 describes · **fixed here**
 
-HQP-C-004 previously said clients *"never"* exchange list indices or enum IDs. **That is false today**, and
-an independent review caught it. Two evidenced paths:
+**Outcome first:** #347 landed both halves, and the row is `retired` — a status change, not a deletion, so
+a reader arriving from an old link sees what was true and what changed.
+
+HQP-C-004 previously said clients *"never"* exchange list indices or enum IDs. That was false at `6d688bd`,
+and an independent review caught it. Two evidenced paths:
 
 - **The legacy numeric HTTP route.** `HqpSettingRequest` carries `value: u32`, and the handler's own
-  comment reads *"Legacy endpoint - convert numeric value to string for name-based lookups"*
-  (`src/api/mod.rs:825-836`). A client that sends `3` gets `"3"` passed to `set_mode`.
+  comment read *"Legacy endpoint - convert numeric value to string for name-based lookups"*
+  (`src/api/mod.rs:825-836`). A client that sent `3` got `"3"` passed to `set_mode`.
 - **The adapter's numeric-string fallback.** `resolve_mode_index`, `resolve_filter_index` and
-  `resolve_shaper_index` each try `parse::<u32>()` and treat the result as a **direct list index** when the
-  name is not in the cached enumeration (`:2081`, `:2186`, `:2247`).
+  `resolve_shaper_index` each tried `parse::<u32>()` and treated the result as a **direct list index** when
+  the name was not in the cached enumeration (`:2081`, `:2186`, `:2247`).
 
-So HQP-C-004 is now scoped to the **design rule** and this row carries the **current fact**. #347's
-acceptance criteria own both halves precisely: *"Raw integer-string fallback is removed from production
-control paths"*, and *"Preserve the existing numeric legacy HTTP request contract … but keep that numeric
-value at the compatibility boundary and never persist or publish it as adaptive-control identity."*
+**What #347 did, and the shape of the fix.** The request contracts are frozen, so the number is *kept* —
+`HqpAdapter::legacy_index_to_name` resolves it against the enumeration the daemon is serving now and
+returns the **name**, and that is what travels inward. A position the current list does not have is an
+error at the boundary rather than an index forwarded to the wire. The resolvers no longer parse anything.
 
-**Why this row has no executable proof, deliberately.** A check that asserts the fallback still exists
-would fail the moment #347 fixed it — failing on the happy path, which is a poor tripwire. HQP-C-062's
-check is the opposite shape: it fails when a *capability is added*, which genuinely warrants a ledger
-update. The asymmetry is the reason one is executable and the other is not.
+**The proof shape changed with it, and that is the point of the earlier note.** This row previously had no
+executable proof because a check asserting the fallback *still existed* would fail on the happy path. Now
+that the fallback is gone, the tripwire can point the other way and does:
+`no_production_control_path_parses_a_setting_name_as_an_index` fails if a resolver ever parses a name back
+into an index, which is a check that only fires on a regression.
 
-**What would settle it:** #347 landing both halves, after which HQP-C-004's stronger wording becomes true
-and this row retires. Until then the ledger must not describe the intended state as the shipped one.
+**Settled by:** #347. `a_numeric_string_is_never_accepted_as_a_setting_name` drives the three semantic
+setters with `"1"`, `"7"` and `"4"` and requires all three to be refused with nothing on the wire.
 
 ### HQP-C-064 — the shaper setter has no hermetic coverage
 
@@ -313,15 +317,22 @@ fixture's `hardware` marker, then re-provenancing each fixture from the capture.
 produced 144 hardware-enumeration divergences against this corpus, which is the expected result for a
 different DAC chain and does **not** settle the excerpt positions for the Opal profile.
 
-### HQP-C-019 — Auto under `[source]` reports success for an ignored command
+### HQP-C-019 — Auto under `[source]` reported success for an ignored command · **fixed here**
 
-`verify_applied` compares the readback against the requested index; requesting Auto (0) under
-`[source]`, where the daemon ignores the pin and the rate is already 0, compares 0 against 0 and
-reports success. The setter did nothing.
+`verify_applied` compared the readback against the requested index; requesting Auto (0) under `[source]`,
+where the daemon ignores the pin and the rate is already 0, compared 0 against 0 and reported success. The
+setter did nothing.
 
-**What would settle it:** #347 introducing an `ignored` outcome distinct from `applied` and
-`rejected`, at which point this row becomes a client-behaviour claim with a test rather than an
-evidence question. The protocol half is already settled by HQP-C-018.
+**Settled by #347, and not in the way this row expected.** The plan recorded here was an `ignored` outcome
+distinct from `applied` and `rejected`. That outcome exists — `SettingOutcome::Ignored` — but it is *not*
+what fixes this case, because no readback can distinguish "ignored" from "applied" when the requested value
+equals the value already held. What fixes it is refusing to send the write at all: under a configured
+`[source]` mode the client answers `SettingOutcome::Suppressed` naming the mode, and the daemon is never
+asked. Reaching for the outcome type alone would have left the Auto case exactly as blind as before.
+
+The protocol half was already settled by HQP-C-018, and remains asserted directly against the fake, with no
+client in the path — the client no longer sends the pin, so it can no longer demonstrate a daemon ignoring
+it.
 
 ### HQP-C-021 — the rate list's dependence on the selected filter
 
@@ -353,14 +364,22 @@ first a PCM and then a DSD source, reading both fields at each step. Until then 
 chosen here, and `the_fake_does_not_settle_the_independent_state_and_status_active_mode_semantics`
 keeps the harness from choosing one either.
 
-### HQP-C-026 — UHC's own comment states the unsettled rule as settled
+### HQP-C-026 — UHC's own comment stated the unsettled rule as settled · **fixed here**
 
-`src/adapters/hqplayer.rs:2473` reads *"Use State's active_mode (INDEX) - Status's active_mode string
-is unreliable"*. That is HQP-C-024's unmeasured half asserted as fact.
+`src/adapters/hqplayer.rs:2473` read *"Use State's active_mode (INDEX) - Status's active_mode string is
+unreliable"*. That is HQP-C-024's unmeasured half asserted as fact, and #341 deliberately left it alone:
+the file was under remediation on the base branch and a comment-only edit would have conflicted for no
+behavioural gain.
 
-**What would settle it:** HQP-C-024. The comment is left in place deliberately: `src/adapters/hqplayer.rs`
-is under active remediation on the base branch this PR is stacked on, and a comment-only edit there
-would conflict for no behavioural gain. #347 owns the file and the semantics.
+**Retired by #347**, which owns the file. The comment now says what is true — that this is a reporting
+choice between one measured field and one unmeasured one, that #332 owns settling which is right, and that
+**nothing requiring correctness depends on it**: the loaded chain is resolved from the enumerations the
+daemon serves, never from either `active_mode`. HQP-C-024 stays `open` and unaffected; what is retired is
+the claim that UHC's own source asserts it settled.
+
+`no_production_comment_settles_the_active_mode_question_by_fiat` is the tripwire, the mirror of the check
+`the_reference_document_no_longer_settles_the_active_mode_question_by_fiat` already applies to the prose
+document.
 
 ### HQP-C-029 — apply-then-drop is ambiguous delivery
 

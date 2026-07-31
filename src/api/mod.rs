@@ -827,28 +827,94 @@ pub struct HqpSettingRequest {
     pub value: u32,
 }
 
+/// Apply one legacy numeric setting, resolving the number to a name at this boundary.
+///
+/// Shared by `POST /hqplayer/setting` and the numeric arm of `POST /hqp/pipeline` so there is exactly
+/// one place a list position is interpreted, and it is a place with the daemon's current enumeration
+/// in hand. `samplerate` is the exception by contract: its number is **Hz**, not a position.
+async fn hqp_apply_legacy_setting(
+    state: &AppState,
+    setting: &str,
+    value: u32,
+) -> anyhow::Result<()> {
+    use crate::adapters::hqplayer::LegacySettingFamily;
+
+    let hqp = &state.hqplayer;
+    let outcome = match setting {
+        "mode" => {
+            let name = hqp
+                .legacy_index_to_name(LegacySettingFamily::Mode, value)
+                .await?;
+            hqp.set_mode(&name).await?
+        }
+        "filter" => {
+            // Both sides to the same filter. The 1x write is verified before the Nx one is sent, so a
+            // half-applied pair is reported rather than silently left behind.
+            let name = hqp
+                .legacy_index_to_name(LegacySettingFamily::Filter, value)
+                .await?;
+            hqp.set_filter_1x(&name).await?.into_applied_result()?;
+            hqp.set_filter_nx(&name).await?
+        }
+        "filter1x" => {
+            let name = hqp
+                .legacy_index_to_name(LegacySettingFamily::Filter, value)
+                .await?;
+            hqp.set_filter_1x(&name).await?
+        }
+        "filterNx" | "filternx" => {
+            let name = hqp
+                .legacy_index_to_name(LegacySettingFamily::Filter, value)
+                .await?;
+            hqp.set_filter_nx(&name).await?
+        }
+        "shaper" | "dither" => {
+            let name = hqp
+                .legacy_index_to_name(LegacySettingFamily::Shaper, value)
+                .await?;
+            hqp.set_shaper(&name).await?
+        }
+        // By contract this number is Hz, not a list position.
+        "samplerate" | "rate" => hqp.set_rate(value).await?,
+        other => return Err(anyhow::anyhow!("Unknown setting: {}", other)),
+    };
+    outcome.into_applied_result()
+}
+
+/// Apply one setting given as a semantic name, which is the modern contract.
+async fn hqp_apply_named_setting(
+    state: &AppState,
+    setting: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let hqp = &state.hqplayer;
+    let outcome = match setting {
+        "mode" => hqp.set_mode(value).await?,
+        "filter1x" => hqp.set_filter_1x(value).await?,
+        "filterNx" | "filternx" => hqp.set_filter_nx(value).await?,
+        "shaper" | "dither" => hqp.set_shaper(value).await?,
+        "samplerate" | "rate" => {
+            let hz: u32 = value.parse().map_err(|_| {
+                anyhow::anyhow!("Invalid rate value (expected Hz like 48000, 96000): {value}")
+            })?;
+            hqp.set_rate(hz).await?
+        }
+        other => return Err(anyhow::anyhow!("Unknown setting: {}", other)),
+    };
+    outcome.into_applied_result()
+}
+
 /// POST /hqplayer/setting - Change HQPlayer pipeline setting (legacy endpoint)
+///
+/// The request contract carries `value: u32` and is frozen, so this is the **compatibility boundary**:
+/// the number is resolved into the semantic name the daemon's current enumeration gives that position,
+/// and the name is what goes inward. Nothing downstream ever sees the number, and a position the
+/// current list does not have is an error here rather than an index forwarded to the wire.
 pub async fn hqp_setting_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpSettingRequest>,
 ) -> impl IntoResponse {
-    // Legacy endpoint - convert numeric value to string for name-based lookups
-    let value_str = req.value.to_string();
-    let result = match req.name.as_str() {
-        "mode" => state.hqplayer.set_mode(&value_str).await,
-        "filter" => {
-            // Sets both 1x and Nx to the same filter - propagate first error if any
-            match state.hqplayer.set_filter_1x(&value_str).await {
-                Ok(()) => state.hqplayer.set_filter_nx(&value_str).await,
-                Err(e) => Err(e),
-            }
-        }
-        "filter1x" => state.hqplayer.set_filter_1x(&value_str).await,
-        "filterNx" | "filternx" => state.hqplayer.set_filter_nx(&value_str).await,
-        "shaper" => state.hqplayer.set_shaper(&value_str).await,
-        "samplerate" | "rate" => state.hqplayer.set_rate(req.value).await,
-        _ => Err(anyhow::anyhow!("Unknown setting: {}", req.name)),
-    };
+    let result = hqp_apply_legacy_setting(&state, &req.name, req.value).await;
 
     match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
@@ -874,28 +940,6 @@ pub async fn hqp_pipeline_update_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpPipelineRequest>,
 ) -> impl IntoResponse {
-    // Convert value to string - all settings now use name-based lookups
-    let value_str: String = match &req.value {
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => s.clone(),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Invalid value type".to_string(),
-                }),
-            )
-                .into_response()
-        }
-    };
-
-    // For samplerate, we still need the numeric Hz value
-    let rate_value: u32 = match &req.value {
-        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as u32,
-        serde_json::Value::String(s) => s.parse::<u32>().unwrap_or(0),
-        _ => 0,
-    };
-
     let valid_settings = [
         "mode",
         "samplerate",
@@ -914,14 +958,32 @@ pub async fn hqp_pipeline_update_handler(
             .into_response();
     }
 
-    let result = match req.setting.as_str() {
-        "mode" => state.hqplayer.set_mode(&value_str).await,
-        "filter1x" => state.hqplayer.set_filter_1x(&value_str).await,
-        "filterNx" | "filternx" => state.hqplayer.set_filter_nx(&value_str).await,
-        "shaper" => state.hqplayer.set_shaper(&value_str).await,
-        "samplerate" => state.hqplayer.set_rate(rate_value).await,
-        "dither" => state.hqplayer.set_shaper(&value_str).await, // dither uses same API
-        _ => Err(anyhow::anyhow!("Unknown setting: {}", req.setting)),
+    // The request contract accepts a string or a number, and the two mean different things. A string
+    // is a semantic name and travels inward unchanged. A **number** is a list position for every
+    // family except `samplerate`, whose number is Hz — so it is resolved to a name here, at the
+    // boundary, against the enumeration the daemon is serving now. Stringifying the number and
+    // letting a resolver parse it back out was the fallback HQP-C-063 records: it made a stale or
+    // guessed position select whatever now sits there.
+    let result = match &req.value {
+        serde_json::Value::Number(n) => match n.as_u64() {
+            Some(v) if v <= u64::from(u32::MAX) => {
+                hqp_apply_legacy_setting(&state, &req.setting, v as u32).await
+            }
+            _ => Err(anyhow::anyhow!(
+                "Invalid numeric value for {}: {n}",
+                req.setting
+            )),
+        },
+        serde_json::Value::String(s) => hqp_apply_named_setting(&state, &req.setting, s).await,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid value type".to_string(),
+                }),
+            )
+                .into_response()
+        }
     };
 
     match result {
@@ -1031,7 +1093,12 @@ pub async fn hqp_set_matrix_profile_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpMatrixProfileRequest>,
 ) -> impl IntoResponse {
-    match state.hqplayer.set_matrix_profile(req.profile).await {
+    match state
+        .hqplayer
+        .set_matrix_profile(req.profile)
+        .await
+        .and_then(|o| o.into_applied_result())
+    {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1828,7 +1895,11 @@ pub async fn hqp_instance_set_matrix_profile_handler(
         }
     };
 
-    match adapter.set_matrix_profile(req.value).await {
+    match adapter
+        .set_matrix_profile(req.value)
+        .await
+        .and_then(|o| o.into_applied_result())
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"ok": true, "instance": name, "value": req.value})),

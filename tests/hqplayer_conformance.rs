@@ -35,15 +35,17 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
 
-use unified_hifi_control::adapters::hqplayer::{framing, HqpAdapter, HqpTimeouts};
+use unified_hifi_control::adapters::hqplayer::{
+    framing, HqpAdapter, HqpRejected, HqpTimeouts, SettingOutcome,
+};
 use unified_hifi_control::bus::create_bus;
 
 use mock_servers::hqplayer::corpus::{
     self, LEGACY_PROFILE, SYNTHETIC_HAZARD_PROFILE, VERIFIED_PROFILE,
 };
 use mock_servers::hqplayer::model::{
-    request_attr, ActiveModeReporting, DaemonModel, DocumentStyle, FilterFieldReporting, LoadedChain,
-    Metadata,
+    request_attr, ActiveModeReporting, DaemonModel, DocumentStyle, FilterFieldReporting,
+    LoadedChain, Metadata,
 };
 use mock_servers::hqplayer::tier1;
 use mock_servers::hqplayer::wire::{Chunking, Disruption, Responder, WirePolicy, WireServer};
@@ -71,6 +73,21 @@ fn fast_timeouts() -> HqpTimeouts {
         response: Duration::from_millis(300),
         reconnect_delay: Duration::from_millis(10),
         max_attempts: 2,
+    }
+}
+
+/// `Result<SettingOutcome>` collapsed the way every advertised surface collapses it.
+///
+/// The adapter reports *which* of the five things a write turned out to be; HTTP and MCP both answer
+/// `{ok:true}` or `{error}`, so both call [`SettingOutcome::into_applied_result`]. Tests that only
+/// care whether a write landed use the same collapse, so they assert what a client would see.
+trait Applied {
+    fn applied(self) -> anyhow::Result<()>;
+}
+
+impl Applied for anyhow::Result<SettingOutcome> {
+    fn applied(self) -> anyhow::Result<()> {
+        self.and_then(SettingOutcome::into_applied_result)
     }
 }
 
@@ -300,6 +317,7 @@ async fn enumerations_are_mode_relative_and_are_refetched_after_a_mode_change() 
     h.adapter
         .set_mode("SDM (DSD)")
         .await
+        .applied()
         .expect("SetMode to SDM");
     let after = h.adapter.get_filters().await.expect("SDM filters");
     let expected = corpus::enum_entries(
@@ -632,7 +650,11 @@ async fn a_setter_accepted_but_not_applied_does_not_report_success() {
     h.model
         .arm(|f| f.accept_but_ignore.push("SetFilter".to_string()));
 
-    let result = h.adapter.set_filter_1x("IIR").await;
+    let result = h
+        .adapter
+        .set_filter_1x("IIR")
+        .await
+        .and_then(SettingOutcome::into_applied_result);
 
     assert!(
         result.is_err(),
@@ -654,6 +676,7 @@ async fn a_setter_whose_change_lands_after_a_poll_still_reports_success() {
     h.adapter
         .set_filter_1x("IIR")
         .await
+        .applied()
         .expect("a delayed-but-real change is a success");
 
     let expected = corpus::index_of(
@@ -724,9 +747,11 @@ async fn a_rejected_setter_is_reported_as_an_error_without_dropping_the_connecti
     let h = Harness::verified().await;
     let beyond_the_list = 9_999;
 
-    // Low-level: takes an index, resolves no name, so this cannot depend on name-resolution
-    // fallbacks in either direction.
-    let rejected = h.adapter.set_filter(beyond_the_list, None).await;
+    // Low-level: takes indices, resolves no name, so this cannot depend on name-resolution
+    // fallbacks in either direction. Both sides carry the same out-of-range number because
+    // `SetFilter` writes both sides on the wire and the client can no longer express a one-sided
+    // request (#347).
+    let rejected = h.adapter.set_filter(beyond_the_list, beyond_the_list).await;
     // The connection must still be usable afterwards.
     let state_after = h.adapter.get_state().await;
 
@@ -1016,11 +1041,15 @@ async fn the_junk_filter_is_read_as_a_list_index_not_a_boolean() {
 async fn a_filter_name_is_sent_as_the_index_the_observed_list_gives_it() {
     let h = Harness::verified().await;
     let filters = corpus::document(VERIFIED_PROFILE, "filters_pcm");
-    let index = corpus::index_of(&filters, "FiltersItem", "poly-sinc-lp").expect("observed index");
+    // Deliberately a filter the daemon is NOT already on. Since #347 a setter whose authoritative
+    // field already reads the requested value is `AlreadySet` and nothing goes on the wire, so
+    // requesting the current selection would assert about a request that was never sent.
+    let index = corpus::index_of(&filters, "FiltersItem", "poly-sinc-xtr").expect("observed index");
 
     h.adapter
-        .set_filter_1x("poly-sinc-lp")
+        .set_filter_1x("poly-sinc-xtr")
         .await
+        .applied()
         .expect("SetFilter");
 
     let sent = h
@@ -1045,6 +1074,7 @@ async fn a_filter_name_is_not_sent_as_its_enum_id() {
     h.adapter
         .set_filter_1x("poly-sinc-lp")
         .await
+        .applied()
         .expect("SetFilter");
 
     let sent = h
@@ -1077,6 +1107,7 @@ async fn the_same_filter_name_resolves_to_a_different_index_on_a_differently_ord
     h.adapter
         .set_filter_1x("poly-sinc-lp")
         .await
+        .applied()
         .expect("SetFilter");
 
     let sent = h
@@ -1140,7 +1171,9 @@ async fn feeding_a_persistent_enum_id_to_the_live_lane_is_rejected() {
         .parse()
         .expect("numeric");
 
-    let result = h.adapter.set_filter(stored, None).await;
+    // Both sides carry the number: `SetFilter` writes both on the wire, and since #347 the client
+    // cannot express a one-sided call at all.
+    let result = h.adapter.set_filter(stored, stored).await;
     assert!(
         result.is_err(),
         "enum ID {stored} is not a valid list index for this daemon's 12-entry list; sending a \
@@ -1459,6 +1492,7 @@ async fn a_setter_overridden_by_another_controller_fails_and_names_the_observed_
         .adapter
         .set_shaper("NS5")
         .await
+        .and_then(SettingOutcome::into_applied_result)
         .expect_err("a setting we cannot confirm is not a success, however it came to differ");
 
     assert!(
@@ -3392,32 +3426,39 @@ async fn the_fake_does_not_settle_the_independent_state_and_status_active_mode_s
 /// `SetMode` clears the single rate pin **even when the mode does not change**. Measured upstream
 /// 2026-07-28.
 ///
-/// **Label: model-fidelity.** Deliberately so: no client code reads the pin after a mode write, so
-/// there is nothing here that could fail for a client reason. #347 owns the consequence — skipping a
-/// mode write that is already running, rather than destroying the user's pin.
+/// **Label: model-fidelity**, and asserted straight through [`Responder`] with **no adapter in the
+/// path**. It drove the real client until #347, which is the issue this expectation named as the
+/// owner of the consequence — the client now refuses to send a mode it is already in, so a test that
+/// reached this daemon behaviour through `set_mode` could no longer reach it at all. The daemon-side
+/// fact is unchanged and is what this pins; the client-side consequence is
+/// `a_no_op_mode_write_is_not_sent_so_the_rate_pin_survives`.
 ///
 /// Provenance: **derived-upstream**, pending #332.
-#[tokio::test]
-async fn a_same_mode_set_mode_still_clears_the_rate_pin() {
-    let h = Harness::verified().await;
-    h.adapter.set_rate(44100).await.expect("pin a PCM rate");
-    let pinned = h.model.state();
+#[test]
+fn a_same_mode_set_mode_still_clears_the_rate_pin() {
+    let model = DaemonModel::verified();
+    // Pin a rate. Index 1 is 44100 Hz in the observed PCM list.
+    model
+        .respond("<SetRate value=\"1\"/>")
+        .expect("the fake answers SetRate");
+    let pinned = model.state();
     assert_ne!(
         pinned.rate_index, 0,
         "precondition: the pin must actually be set before a mode write can clear it"
     );
 
-    // The mode is already PCM. This write changes nothing about the mode.
-    h.adapter.set_mode("PCM").await.expect("same-mode SetMode");
+    // The mode is already PCM (index 1). This write changes nothing about the mode.
+    model
+        .respond("<SetMode value=\"1\"/>")
+        .expect("the fake answers SetMode");
 
-    let after = h.model.state();
+    let after = model.state();
     assert_eq!(
         (after.mode_index, after.rate_index, after.active_rate_hz),
         (1, 0, 0),
         "a no-op mode write still clears the pin, so a reconciliation loop that writes the mode \
          unconditionally destroys user state; got {after:?}"
     );
-    h.stop();
 }
 
 /// Records the removal of unevidenced fake behaviour.
@@ -3444,10 +3485,15 @@ async fn set_mode_does_not_reset_the_filter_and_shaper_selections() {
     h.adapter
         .set_filter_nx("poly-sinc-gauss-long")
         .await
+        .applied()
         .expect("SetFilter");
     assert_eq!(h.model.state().filter_nx_index, chosen, "precondition");
 
-    h.adapter.set_mode("PCM").await.expect("same-mode SetMode");
+    h.adapter
+        .set_mode("PCM")
+        .await
+        .applied()
+        .expect("same-mode SetMode");
 
     assert_eq!(
         h.model.state().filter_nx_index,
@@ -3808,7 +3854,7 @@ async fn feeding_the_persistent_oversampling_id_to_the_live_lane_is_rejected() {
          index range for this to be a rejection rather than a misselection"
     );
 
-    let result = h.adapter.set_filter(stored, None).await;
+    let result = h.adapter.set_filter(stored, stored).await;
     assert!(
         result.is_err(),
         "the persistent SDM domain's stored ID {stored} is not a live list index; sending it on the \
@@ -3827,27 +3873,33 @@ async fn feeding_the_persistent_oversampling_id_to_the_live_lane_is_rejected() {
 /// the rate there is a persistent config limit for which **no wire command exists**, so retrying on
 /// the live lane can never succeed.
 ///
-/// The nonzero case is caught today by accident of arithmetic: readback compares the requested index
-/// against 0 and they differ, so the client errors. That is a truthful *outcome* reached without any
-/// understanding of the cause, and it is why the message says nothing useful. #347 owns suppressing
-/// the write with an explicit reason.
-///
 /// **Provenance: derived-upstream, tier-2-only, pending #332.**
 ///
-/// **Label: client-conformance** — the client half holds today and is pinned as a regression;
-/// the mode-conditional refusal it runs against is new fake capability.
-#[tokio::test]
-async fn a_nonzero_rate_pin_under_source_is_accepted_and_ignored() {
-    let h = Harness::verified().await;
-    h.model.external_change(|s| {
+/// **Label: model-fidelity**, asserted straight through [`Responder`] with **no adapter in the path**.
+/// It drove the real client until #347 — the issue it named as the owner — which now *suppresses* the
+/// write under `[source]` rather than sending it and failing on readback arithmetic. A client that
+/// does not send the pin cannot demonstrate a daemon that ignores it, so the daemon-side fact is
+/// pinned here directly. The client-side consequence is
+/// `a_rate_pin_under_source_is_suppressed_before_it_reaches_the_daemon`.
+#[test]
+fn a_nonzero_rate_pin_under_source_is_accepted_and_ignored() {
+    let model = DaemonModel::verified();
+    model.external_change(|s| {
         s.mode_index = 0; // configured `[source]`
         s.playback = 2;
     });
-    h.model.arm(|f| f.source_refuses_rate_pin = true);
+    model.arm(|f| f.source_refuses_rate_pin = true);
 
-    let outcome = h.adapter.set_rate(705600).await;
+    // Index 9 is 705600 Hz in the observed PCM list.
+    let reply = model
+        .respond("<SetRate value=\"9\"/>")
+        .expect("the fake answers SetRate");
+    assert!(
+        reply.contains("result=\"OK\""),
+        "the daemon answers OK, which is exactly why OK is not proof; got {reply}"
+    );
 
-    let after = h.model.state();
+    let after = model.state();
     assert_eq!(
         (after.rate_index, after.active_rate_hz),
         (0, 0),
@@ -3855,24 +3907,6 @@ async fn a_nonzero_rate_pin_under_source_is_accepted_and_ignored() {
          upstream probes checked and why checking only `State.rate` produced a plausible wrong \
          answer; got {after:?}"
     );
-    assert!(
-        h.model.request_count("SetRate") > 0,
-        "the client must actually have sent the pin: this is a daemon-side refusal, not a \
-         client-side suppression. Suppression is #347's"
-    );
-    // Assert the *mechanism*, not merely that the call failed. `is_err()` alone would be satisfied
-    // by any error at all — including one for an unrelated reason — so it would pass while telling
-    // us nothing about why. The message must show readback observing the unmoved rate.
-    let err = outcome
-        .expect_err("an unapplied pin must not report success")
-        .to_string();
-    assert!(
-        err.contains("rate") && err.contains("still reads 0"),
-        "the failure must come from readback observing the rate still at 0, which is the only reason \
-         the floor holds here — it holds by arithmetic rather than by any understanding of \
-         `[source]`, and #347 owns replacing that with a stated reason. Got: {err}"
-    );
-    h.stop();
 }
 
 /// The narrower form of the same defect, and the one readback **cannot** catch.
@@ -3881,41 +3915,43 @@ async fn a_nonzero_rate_pin_under_source_is_accepted_and_ignored() {
 /// compares expected 0 against observed 0 and therefore reports **success** for a command that had no
 /// effect. Equality with pre-existing state is not proof that a setter applied.
 ///
-/// Recorded on #347 in comment 5125915480. This test asserts **only** the daemon-side facts and
-/// deliberately does not assert the client's return value: asserting success would encode a known
-/// defect as expected behaviour, and asserting failure would fail until #347 lands. #322's job is to
-/// make the case reachable, which it now is.
+/// Recorded on #347 in comment 5125915480. Asserted straight through [`Responder`] with **no adapter
+/// in the path**: the daemon answers `OK` and moves nothing, so a readback comparing 0 against 0
+/// would call it applied. That is the reason #347's client suppresses the write instead of verifying
+/// it — the client-side consequence is
+/// `an_auto_rate_request_under_source_is_never_reported_as_applied`.
 ///
 /// **Label: model-fidelity.**
-#[tokio::test]
-async fn an_auto_rate_request_under_source_is_ignored_and_readback_cannot_tell() {
-    let h = Harness::verified().await;
-    h.model.external_change(|s| {
+#[test]
+fn an_auto_rate_request_under_source_is_ignored_and_readback_cannot_tell() {
+    let model = DaemonModel::verified();
+    model.external_change(|s| {
         s.mode_index = 0;
         s.playback = 2;
     });
-    h.model.arm(|f| f.source_refuses_rate_pin = true);
-    let before = h.model.state();
+    model.arm(|f| f.source_refuses_rate_pin = true);
+    let before = model.state();
     assert_eq!(
         before.rate_index, 0,
         "precondition: the rate must already be unpinned, which is what makes the readback blind"
     );
 
     // Auto is rate 0, which the observed list carries at index 0.
-    let _ = h.adapter.set_rate(0).await;
+    let reply = model
+        .respond("<SetRate value=\"0\"/>")
+        .expect("the fake answers SetRate");
+    assert!(
+        reply.contains("result=\"OK\""),
+        "the daemon acknowledges it, got {reply}"
+    );
 
-    let after = h.model.state();
+    let after = model.state();
     assert_eq!(
         (after.rate_index, after.active_rate_hz),
         (before.rate_index, before.active_rate_hz),
         "nothing moved, which is the point: a readback comparing 0 to 0 sees a match and calls an \
          ignored command applied"
     );
-    assert!(
-        h.model.request_count("SetRate") > 0,
-        "the request reached the daemon, so this is an ignored write and not an absent one"
-    );
-    h.stop();
 }
 
 /// A DAC that cannot do DSD yields a modes list with **no SDM entry**, and the remaining entries keep
@@ -4232,7 +4268,7 @@ async fn a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain() {
     // The mode change is accepted now and applies two polls later.
     h.model
         .arm(|f| f.apply_after_polls.push(("SetMode".to_string(), 2)));
-    let _ = h.adapter.set_mode("SDM (DSD)").await;
+    let _ = h.adapter.set_mode("SDM (DSD)").await.applied();
 
     // Poll until the deferred change has landed. Each State read ticks the pending queue.
     for _ in 0..4 {
@@ -4334,21 +4370,29 @@ async fn a_rate_valid_in_one_chain_is_refused_in_the_other() {
     h.adapter
         .set_rate(pcm_only_hz)
         .await
-        .expect("a PCM rate resolves while the PCM chain is loaded");
+        .applied()
+        .expect("a PCM rate resolves and applies while the PCM chain is loaded");
 
-    // Configured `[source]` first. Only in `[source]` does the *source* decide the loaded chain, which
-    // is what this scenario needs; asking for an SDM chain while PCM is the configured mode describes a
-    // daemon that cannot exist, and a test resting on it would prove nothing about the client. The model
-    // refuses it at the setter, so the mode is set here rather than the invariant relaxed.
-    h.model.external_change(|s| s.mode_index = 0);
-    // The SDM chain is now in force, and the same Hz value has no index in it.
-    h.model.source_loads_chain(LoadedChain::Sdm);
-    let refused = h.adapter.set_rate(pcm_only_hz).await;
+    // Configure SDM through the client, which pins the loaded chain to SDM. This used to move the
+    // chain under a configured `[source]`, which since #347 short-circuits before the rate list is
+    // ever consulted — the write is suppressed for the mode, so the test would have passed without
+    // exercising rate resolution at all. A configured SDM mode reaches the same loaded chain and
+    // leaves the resolution path the thing under test.
+    h.adapter
+        .set_mode("SDM (DSD)")
+        .await
+        .applied()
+        .expect("configure SDM");
+    let refused = h.adapter.set_rate(pcm_only_hz).await.applied();
 
     assert!(
         refused.is_err(),
         "a rate absent from the loaded chain's enumeration must not resolve to some other chain's \
          index; rate resolution is relative to the list in force"
+    );
+    assert!(
+        h.model.state().rate_index == 0,
+        "and nothing may have been pinned on the way to that refusal"
     );
     h.stop();
 }
@@ -4730,9 +4774,13 @@ async fn a_reply_split_inside_a_multi_byte_character_arrives_intact() {
     // An earlier draft put it mid-string and the premise assertion below caught the arithmetic.
     let profile_name = format!("{SNOWMAN} Rock Roll");
 
+    // The vehicle is `State.matrix_profile`. It was `MatrixGetProfile` until #347 stopped treating
+    // that command as the current-profile authority, at which point the client no longer sent it on
+    // this path — and a split-read claim is only worth anything on a document the client reads. The
+    // claim itself is unchanged: a reply cut inside a multi-byte code point must reassemble exactly.
     // Premise check, before any wire is involved: one byte into the character is not a char boundary.
-    let marker = "value=\"";
-    let doc = format!("<MatrixGetProfile index=\"0\" value=\"{profile_name}\"/>");
+    let marker = "matrix_profile=\"";
+    let doc = format!("<State mode=\"1\" matrix_profile=\"{profile_name}\"/>");
     let cut = doc.find(marker).expect("marker present") + marker.len() + 1;
     assert!(
         std::str::from_utf8(&doc.as_bytes()[..cut]).is_err(),
@@ -4758,13 +4806,13 @@ async fn a_reply_split_inside_a_multi_byte_character_arrives_intact() {
 
     let current = h
         .adapter
-        .get_matrix_profile()
+        .get_state()
         .await
-        .expect("a reply split mid-character must still parse");
+        .expect("a reply split mid-character must still parse")
+        .matrix_profile;
 
     assert_eq!(
-        current.as_ref().map(|p| p.name.as_str()),
-        Some(profile_name.as_str()),
+        current, profile_name,
         "the character split across two reads must be reassembled exactly; a lossy read would show \
          replacement characters here. Got {current:?}"
     );
@@ -5912,7 +5960,7 @@ async fn a_rate_pin_under_source_is_suppressed_before_it_reaches_the_daemon() {
          sending it and failing on readback is a true outcome reached for no stated reason"
     );
     let err = outcome
-        .map(|_| ())
+        .and_then(SettingOutcome::into_applied_result)
         .expect_err("an unsent write must never be reported as applied");
     let message = err.to_string();
     assert!(
@@ -5950,7 +5998,9 @@ async fn an_auto_rate_request_under_source_is_never_reported_as_applied() {
         "Auto is suppressed under `[source]` exactly like any other pin"
     );
     assert!(
-        outcome.map(|_| ()).is_err(),
+        outcome
+            .and_then(SettingOutcome::into_applied_result)
+            .is_err(),
         "equality with pre-existing state is not proof that a setter applied; before #347 this \
          reported success because it compared 0 against 0"
     );
@@ -5964,7 +6014,11 @@ async fn an_auto_rate_request_under_source_is_never_reported_as_applied() {
 #[tokio::test]
 async fn a_rate_pin_outside_source_is_still_sent_and_verified() {
     let h = Harness::verified().await;
-    h.adapter.set_rate(44100).await.expect("a PCM rate pin");
+    h.adapter
+        .set_rate(44100)
+        .await
+        .applied()
+        .expect("a PCM rate pin");
     assert_eq!(
         h.model.state().rate_index,
         1,
@@ -5984,7 +6038,11 @@ async fn a_rate_pin_outside_source_is_still_sent_and_verified() {
 #[tokio::test]
 async fn a_no_op_mode_write_is_not_sent_so_the_rate_pin_survives() {
     let h = Harness::verified().await;
-    h.adapter.set_rate(44100).await.expect("pin a PCM rate");
+    h.adapter
+        .set_rate(44100)
+        .await
+        .applied()
+        .expect("pin a PCM rate");
     let pinned = h.model.state();
     assert_ne!(pinned.rate_index, 0, "precondition: the pin must be set");
 
@@ -5992,6 +6050,7 @@ async fn a_no_op_mode_write_is_not_sent_so_the_rate_pin_survives() {
     h.adapter
         .set_mode("PCM")
         .await
+        .applied()
         .expect("a mode that is already running is trivially satisfied");
 
     assert_eq!(
@@ -6016,11 +6075,16 @@ async fn a_no_op_mode_write_is_not_sent_so_the_rate_pin_survives() {
 #[tokio::test]
 async fn a_performed_mode_write_reports_the_cleared_rate_pin_honestly() {
     let h = Harness::verified().await;
-    h.adapter.set_rate(44100).await.expect("pin a PCM rate");
+    h.adapter
+        .set_rate(44100)
+        .await
+        .applied()
+        .expect("pin a PCM rate");
 
     h.adapter
         .set_mode("SDM (DSD)")
         .await
+        .applied()
         .expect("a real mode change");
 
     assert_eq!(
@@ -6072,7 +6136,10 @@ async fn a_mode_alias_resolves_through_the_daemons_own_name() {
         h.adapter
             .set_mode(requested)
             .await
-            .unwrap_or_else(|e| panic!("`{requested}` must resolve to the daemon's SDM entry: {e}"));
+            .applied()
+            .unwrap_or_else(|e| {
+                panic!("`{requested}` must resolve to the daemon's SDM entry: {e}")
+            });
         assert_eq!(
             h.model.state().mode_index,
             2,
@@ -6125,7 +6192,9 @@ async fn a_source_driven_chain_change_invalidates_the_cached_filter_list() {
     let outcome = h.adapter.set_filter_nx("SYN-pcm-7").await;
 
     assert!(
-        outcome.map(|_| ()).is_err(),
+        outcome
+            .and_then(SettingOutcome::into_applied_result)
+            .is_err(),
         "a filter name that exists only in the chain that is no longer loaded must not resolve; \
          before #347 it resolved from the stale cache to index 7 and selected `SYN-sdm-7`"
     );
@@ -6163,6 +6232,7 @@ async fn after_a_chain_change_a_filter_resolves_against_the_newly_loaded_list() 
     h.adapter
         .set_filter_nx("SYN-sdm-3")
         .await
+        .applied()
         .expect("a name in the loaded chain must resolve");
 
     assert_eq!(
@@ -6204,6 +6274,7 @@ async fn a_name_present_in_both_chains_is_sent_with_the_loaded_chains_index() {
     h.adapter
         .set_filter_nx("poly-sinc-gauss-long")
         .await
+        .applied()
         .expect("the name is in both chains");
 
     assert_eq!(
@@ -6341,7 +6412,9 @@ async fn a_filter_write_is_refused_without_mutation_when_the_sibling_is_unknowab
     let outcome = h.adapter.set_filter_1x("poly-sinc-lp").await;
 
     assert!(
-        outcome.map(|_| ()).is_err(),
+        outcome
+            .and_then(SettingOutcome::into_applied_result)
+            .is_err(),
         "with the Nx sibling unknowable the write must be refused, not guessed"
     );
     assert_eq!(
@@ -6372,6 +6445,7 @@ async fn a_one_sided_filter_write_carries_both_authoritative_arguments() {
     h.adapter
         .set_filter_1x("poly-sinc-xtr")
         .await
+        .applied()
         .expect("SetFilter");
 
     let sent = h.model.last_request("SetFilter").expect("SetFilter sent");
@@ -6380,7 +6454,10 @@ async fn a_one_sided_filter_write_carries_both_authoritative_arguments() {
             request_attr(&sent, "value").as_deref(),
             request_attr(&sent, "value1x").as_deref()
         ),
-        (Some(before.filter_nx_index.to_string().as_str()), Some("11")),
+        (
+            Some(before.filter_nx_index.to_string().as_str()),
+            Some("11")
+        ),
         "both sides go on the wire together: the requested 1x index, and the Nx index the daemon \
          itself reports. Sent: {sent}"
     );
@@ -6401,15 +6478,27 @@ async fn a_numeric_string_is_never_accepted_as_a_setting_name() {
     let h = Harness::verified().await;
 
     assert!(
-        h.adapter.set_mode("1").await.map(|_| ()).is_err(),
+        h.adapter
+            .set_mode("1")
+            .await
+            .and_then(SettingOutcome::into_applied_result)
+            .is_err(),
         "`1` is not a mode name"
     );
     assert!(
-        h.adapter.set_filter_nx("7").await.map(|_| ()).is_err(),
+        h.adapter
+            .set_filter_nx("7")
+            .await
+            .and_then(SettingOutcome::into_applied_result)
+            .is_err(),
         "`7` is not a filter name"
     );
     assert!(
-        h.adapter.set_shaper("4").await.map(|_| ()).is_err(),
+        h.adapter
+            .set_shaper("4")
+            .await
+            .and_then(SettingOutcome::into_applied_result)
+            .is_err(),
         "`4` is not a shaper name"
     );
     assert_eq!(
@@ -6479,7 +6568,9 @@ async fn a_matrix_profile_accepted_but_unchanged_is_not_reported_as_applied() {
         "precondition: the daemon really did not move"
     );
     assert!(
-        outcome.map(|_| ()).is_err(),
+        outcome
+            .and_then(SettingOutcome::into_applied_result)
+            .is_err(),
         "`result=\"OK\"` is not proof of application for the matrix family either"
     );
     h.stop();
@@ -6519,6 +6610,7 @@ async fn a_matrix_profile_write_sends_the_semantic_name_and_verifies_the_readbac
     h.adapter
         .set_matrix_profile(2)
         .await
+        .applied()
         .expect("a profile in the fresh list");
 
     assert_eq!(
@@ -6557,7 +6649,8 @@ async fn an_external_matrix_switch_is_visible_and_an_empty_profile_is_no_selecti
         .expect("selected");
     assert_eq!((current.index, current.name.as_str()), (1, "Speakers"));
 
-    h.model.external_change(|s| s.matrix_profile = String::new());
+    h.model
+        .external_change(|s| s.matrix_profile = String::new());
     assert!(
         h.adapter
             .get_matrix_profile()
@@ -6576,17 +6669,15 @@ async fn an_external_matrix_switch_is_visible_and_an_empty_profile_is_no_selecti
 async fn a_rejected_matrix_profile_write_reports_the_daemon_reason() {
     let h = Harness::verified().await;
     h.model.arm(|f| {
-        f.reject_next.push((
-            "MatrixSetProfile".to_string(),
-            "profile in use".to_string(),
-        ))
+        f.reject_next
+            .push(("MatrixSetProfile".to_string(), "profile in use".to_string()))
     });
 
     let err = h
         .adapter
         .set_matrix_profile(1)
         .await
-        .map(|_| ())
+        .and_then(SettingOutcome::into_applied_result)
         .expect_err("an explicit rejection is a failure");
     assert!(
         err.to_string().contains("profile in use"),
@@ -6625,6 +6716,144 @@ async fn a_malformed_reply_does_not_wedge_later_polling() {
     assert_eq!(
         info.product, "Signalyst HQPlayer Embedded",
         "and it must read the daemon's real reply rather than leftovers"
+    );
+    h.stop();
+}
+
+// -----------------------------------------------------------------------------
+// Ambiguous delivery — a lost reply is not proof the daemon did nothing
+// -----------------------------------------------------------------------------
+
+/// On HQPlayer Embedded 6.0.4 a `SetMode` was **accepted, logged and acted on** while the daemon sent
+/// no response and later dropped the connection (HQP-C-029). Reporting that as a failure is as wrong
+/// as reporting `OK` as success: the setting is there, and a client that says otherwise sends a user
+/// chasing a change that already happened.
+///
+/// The drop is element-scoped because a setter is several commands now — it reads the enumeration and
+/// `State` before it writes — so an unscoped "drop the next reply" would vanish during the read and
+/// the write would never happen.
+///
+/// **Label: client-red.** Before #347 the send's error propagated and the state was never read back.
+#[tokio::test]
+async fn a_write_whose_reply_is_lost_after_the_daemon_applied_it_is_reported_as_applied() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            apply_then_drop_reply_for_element: Some("SetShaping".to_string()),
+            ..WirePolicy::default()
+        },
+        HqpTimeouts {
+            // One attempt, so the recovery under test is the readback rather than a resend.
+            max_attempts: 1,
+            ..fast_timeouts()
+        },
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    let outcome = h
+        .adapter
+        .set_shaper("NS5")
+        .await
+        .expect("a lost reply is not a protocol error");
+
+    assert!(
+        h.server.element_drop_fired(),
+        "precondition: the reply must actually have been dropped after the daemon applied it"
+    );
+    assert_eq!(
+        h.model.state().shaper_index,
+        3,
+        "precondition: the daemon did apply it — NS5 is index 3 in the observed PCM list"
+    );
+    assert_eq!(
+        outcome,
+        SettingOutcome::Applied,
+        "the readback finds the setting in place, so the write landed however its reply was lost"
+    );
+    h.stop();
+}
+
+/// The other side of the same coin. When the write draws no usable reply **and** the state does not
+/// show it, the honest answer is neither success nor "it failed" — it is that delivery could not be
+/// established. A caller that treats that as a clean failure will retry, and a retry of a write the
+/// daemon may already hold is a different risk from a retry of one it certainly does not.
+///
+/// **Label: client-red.**
+#[tokio::test]
+async fn a_write_whose_delivery_cannot_be_established_is_reported_as_ambiguous() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            silent_for_element: Some("SetShaping".to_string()),
+            ..WirePolicy::default()
+        },
+        HqpTimeouts {
+            max_attempts: 1,
+            ..fast_timeouts()
+        },
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+    let before = h.model.state().shaper_index;
+
+    let outcome = h
+        .adapter
+        .set_shaper("NS5")
+        .await
+        .expect("ambiguity is an outcome, not a protocol error");
+
+    assert_eq!(
+        h.model.state().shaper_index,
+        before,
+        "precondition: the daemon never applied it"
+    );
+    match &outcome {
+        SettingOutcome::Ambiguous { what, reason } => {
+            assert_eq!(what, "shaper");
+            assert!(
+                reason.contains("may or may not"),
+                "the reason must say what is unknown rather than assert a failure, got: {reason}"
+            );
+        }
+        other => panic!(
+            "a write whose delivery cannot be established is neither applied nor a plain failure; \
+             got {other:?}"
+        ),
+    }
+    assert!(
+        outcome.into_applied_result().is_err(),
+        "and no advertised surface may report it as success"
+    );
+    h.stop();
+}
+
+/// An explicit rejection is **not** ambiguous delivery, and the two must not be conflated: the daemon
+/// saw the request and refused it, so there is nothing to read back and nothing to retry.
+///
+/// **Label: client-pin**, and the control for the type that separates them.
+#[tokio::test]
+async fn an_explicit_rejection_is_not_treated_as_ambiguous_delivery() {
+    let h = Harness::verified().await;
+    h.model.arm(|f| {
+        f.reject_next
+            .push(("SetShaping".to_string(), "invalid shaper".to_string()))
+    });
+
+    let err = h
+        .adapter
+        .set_shaper("NS5")
+        .await
+        .expect_err("an explicit result=Error stays an error, never an outcome");
+
+    assert!(
+        err.downcast_ref::<HqpRejected>().is_some(),
+        "the rejection must keep its type, or telling it apart from a lost reply goes back to \
+         matching on message text; got: {err}"
+    );
+    assert!(
+        err.to_string().contains("invalid shaper"),
+        "and the daemon's own reason must still reach the caller, got: {err}"
     );
     h.stop();
 }

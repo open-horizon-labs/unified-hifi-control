@@ -80,6 +80,14 @@ pub struct WirePolicy {
     pub disruption: Disruption,
     /// Requests for this element draw no reply at all, so the client must hit its response timeout.
     pub silent_for_element: Option<String>,
+    /// Apply this element to the model, then close the connection without replying — **once**.
+    ///
+    /// The element-scoped mirror of [`Disruption::ApplyThenDropReplyOnce`], which fires on whichever
+    /// request comes next. That is enough when a client operation is one command, and not enough when
+    /// it is several: since #347 a setter reads an enumeration and `State` before it writes, so the
+    /// unscoped form vanishes during the *read* and the write never happens. Naming the element puts
+    /// the drop where the claim is — after the daemon applied the write, before the reply.
+    pub apply_then_drop_reply_for_element: Option<String>,
     /// Append these raw bytes instead of a reply for this element, to model a malformed document.
     pub malformed_for_element: Option<(String, String)>,
     /// `(element, document, interval)` — on a request for that element, stream `document`
@@ -135,6 +143,7 @@ impl Default for WirePolicy {
             chunk_delay: Duration::from_millis(20),
             disruption: Disruption::None,
             silent_for_element: None,
+            apply_then_drop_reply_for_element: None,
             malformed_for_element: None,
             oversized_for_element: None,
             oversized_newline_free_for_element: None,
@@ -208,6 +217,9 @@ pub struct WireServer {
     /// One-shot budget for `oversized_for_element`, shared across connections for the same reason:
     /// a test proves the *next* command recovers, which needs the fault to stop after firing.
     oversized_left: Arc<AtomicU32>,
+    /// One-shot budget for `apply_then_drop_reply_for_element`. Element-scoped, so like the oversized
+    /// fault it is armed by being declared and cannot disturb connection setup.
+    element_drops_left: Arc<AtomicU32>,
     accept_task: JoinHandle<()>,
 }
 
@@ -229,9 +241,14 @@ impl WireServer {
                 || policy.oversized_newline_free_for_element.is_some(),
         )));
 
+        let element_drops_left = Arc::new(AtomicU32::new(u32::from(
+            policy.apply_then_drop_reply_for_element.is_some(),
+        )));
+
         let accept_stats = stats.clone();
         let accept_budget = disruptions_left.clone();
         let accept_oversized = oversized_left.clone();
+        let accept_element_drops = element_drops_left.clone();
         let accept_task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 accept_stats.connections.fetch_add(1, Ordering::SeqCst);
@@ -240,8 +257,18 @@ impl WireServer {
                 let stats = accept_stats.clone();
                 let budget = accept_budget.clone();
                 let oversized = accept_oversized.clone();
+                let element_drops = accept_element_drops.clone();
                 tokio::spawn(async move {
-                    serve_connection(stream, responder, policy, stats, budget, oversized).await;
+                    serve_connection(
+                        stream,
+                        responder,
+                        policy,
+                        stats,
+                        budget,
+                        oversized,
+                        element_drops,
+                    )
+                    .await;
                 });
             }
         });
@@ -251,8 +278,14 @@ impl WireServer {
             stats,
             disruptions_left,
             oversized_left,
+            element_drops_left,
             accept_task,
         }
+    }
+
+    /// Whether the one-shot element-scoped apply-then-drop has fired.
+    pub fn element_drop_fired(&self) -> bool {
+        self.element_drops_left.load(Ordering::SeqCst) == 0
     }
 
     /// Whether the one-shot oversized reply has been served.
@@ -345,6 +378,7 @@ async fn serve_connection(
     stats: Arc<WireStats>,
     disruptions_left: Arc<AtomicU32>,
     oversized_left: Arc<AtomicU32>,
+    element_drops_left: Arc<AtomicU32>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -493,6 +527,16 @@ async fn serve_connection(
         // The command has now been applied. Vanishing here is the ambiguous case the client cannot
         // resolve: it wrote a request and got nothing back, exactly as in `DropNextReplyOnce`, but the
         // side effect has already happened.
+        if let Some(ref element) = policy.apply_then_drop_reply_for_element {
+            if mentions(&line, element)
+                && element_drops_left
+                    .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                return;
+            }
+        }
+
         if policy.disruption == Disruption::ApplyThenDropReplyOnce
             && disruptions_left
                 .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)

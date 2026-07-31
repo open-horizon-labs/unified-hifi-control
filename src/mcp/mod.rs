@@ -589,13 +589,15 @@ impl ServerHandler for HifiMcpHandler {
             }
 
             HifiTools::HifiHqplayerSetPipelineTool(args) => {
-                // All settings now use name-based lookups - adapter handles conversion
-                // Only samplerate needs numeric parsing (Hz value)
-                let result = match args.setting.as_str() {
-                    "mode" => {
-                        // Accepts name like "PCM", "DSD", "[source]"
-                        self.state.hqplayer.set_mode(&args.value).await
-                    }
+                // Every setting is named, never numbered: the MCP contract has always been semantic,
+                // and the adapter now refuses a bare integer rather than treating it as a list
+                // position. `SettingOutcome` is what makes reporting truthful here — a write the
+                // daemon acknowledged and dropped, or one the client suppressed with a reason, is an
+                // error to this surface exactly as it is to the HTTP one.
+                let outcome = match args.setting.as_str() {
+                    // Accepts a name like "PCM", "DSD", "[source]" — the daemon's own "SDM (DSD)"
+                    // resolves from "DSD" by semantic alias.
+                    "mode" => self.state.hqplayer.set_mode(&args.value).await,
                     "filter1x" | "filter_1x" => {
                         self.state.hqplayer.set_filter_1x(&args.value).await
                     }
@@ -621,7 +623,7 @@ impl ServerHandler for HifiMcpHandler {
                     }
                 };
 
-                match result {
+                match outcome.and_then(|o| o.into_applied_result()) {
                     Ok(()) => Ok(Self::text_result(format!(
                         "Set {} to {}",
                         args.setting, args.value

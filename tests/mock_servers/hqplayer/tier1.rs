@@ -838,9 +838,12 @@ pub async fn capture(adapter: &HqpAdapter) -> anyhow::Result<Capture> {
             .collect(),
     );
 
-    // Read-only: MatrixGetProfile reports the current selection without changing it.
+    // Read-only: what `MatrixGetProfile` reports, captured as an observation. Deliberately the raw
+    // command rather than `get_matrix_profile()`, which since #347 answers from
+    // `State.matrix_profile` — diffing that field against itself would prove nothing, and settling
+    // whether the command agrees with `State` is exactly what this lane is for.
     let t = Instant::now();
-    match adapter.get_matrix_profile().await {
+    match adapter.read_matrix_get_profile().await {
         Ok(Some(p)) => {
             timed("matrix_current", t.elapsed(), &mut c);
             c.current_matrix_profile = Some((p.index, p.name));

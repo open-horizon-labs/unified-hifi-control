@@ -1942,3 +1942,201 @@ fn a_missing_proof_file_is_reported_rather_than_panicking() {
         "the real conformance suite is readable"
     );
 }
+
+// ===========================================================================================
+// Issue #347 — tripwires for the two rows it retired
+//
+// Both fire on a *regression*, which is the shape HQP-C-063's anchor argued a proof must have: a
+// check that asserts a defect still exists fails on the happy path and is worthless as a guard.
+// ===========================================================================================
+
+/// The mirror of [`the_reference_document_no_longer_settles_the_active_mode_question_by_fiat`], aimed
+/// at production source rather than prose — HQP-C-026, retired by #347.
+///
+/// `src/adapters/hqplayer.rs` told the reader that `Status.active_mode` is "unreliable" and to use
+/// `State`'s. `Status.active_mode` echoing the configured mode under `[source]` is measured
+/// (HQP-C-023); what `State.active_mode` reports there is unmeasured by anyone (HQP-C-024). Asserting
+/// the second as fact is settling an open question by comment, and a comment is where such a rule
+/// survives longest, because nothing executes it.
+///
+/// A line may still *name* the fields — the adapter has to read one of them — as long as it does not
+/// call the other unreliable without citing the open row.
+#[test]
+fn no_production_comment_settles_the_active_mode_question_by_fiat() {
+    let mut found = Vec::new();
+    for entry in walkdir::WalkDir::new(repo_root().join("src"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("rs"))
+    {
+        let Ok(body) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for (i, line) in body.lines().enumerate() {
+            let lower = line.to_ascii_lowercase();
+            let calls_it_unreliable = lower.contains("active_mode") && lower.contains("unreliable");
+            if calls_it_unreliable && !line.contains("HQP-C-024") {
+                found.push(format!(
+                    "{}:{}: {}",
+                    entry.path().display(),
+                    i + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "production source states HQP-C-024's unmeasured half as fact. `Status.active_mode` echoing \
+         under `[source]` is measured; what `State.active_mode` reports there is not, and #332 owns \
+         settling it. Cite HQP-C-024 on the line or drop the claim: {found:#?}"
+    );
+}
+
+/// No production control path may turn a setting **name** back into a list index by parsing it —
+/// HQP-C-063, retired by #347.
+///
+/// The removed fallback tried `parse::<u32>()` in `resolve_mode_index`, `resolve_filter_index` and
+/// `resolve_shaper_index` and used the result as a direct list position, so a stale or guessed number
+/// selected whatever now sat there. The legacy numeric HTTP contracts still exist and are still
+/// honoured — but the number is resolved to a name at the boundary
+/// (`HqpAdapter::legacy_index_to_name`) and what travels inward is the name.
+///
+/// Scoped to the resolver and setter bodies rather than to the whole file, because the adapter parses
+/// numbers legitimately everywhere else: every `State` attribute arrives as one. The scoping is a
+/// brace walk over the source rather than a syntax visit, so that what is searched is exactly the text
+/// a reviewer would read.
+#[test]
+fn no_production_control_path_parses_a_setting_name_as_an_index() {
+    let src = read(&repo_root().join("src/adapters/hqplayer.rs"));
+    let mut offenders = Vec::new();
+    for (name, body) in fn_bodies(&src) {
+        if !(name.starts_with("resolve_") || name.starts_with("set_")) {
+            continue;
+        }
+        if body.contains("parse::<u32>")
+            || body.contains("parse::<usize>")
+            || body.contains(".parse()")
+        {
+            offenders.push(name);
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a resolver or setter that parses a semantic name into a list index has reinstated \
+         HQP-C-063: a number arriving where a name belongs comes from another chain, another daemon, \
+         or a guess, and using it as a position silently selects a different setting. The legacy \
+         numeric contracts are served by `legacy_index_to_name` at the HTTP boundary instead. \
+         Offenders: {offenders:#?}"
+    );
+}
+
+/// `(name, body)` for every `fn` in a source file, bodies delimited by brace matching.
+///
+/// Deliberately textual. A syntax visit would need a token renderer this crate does not depend on,
+/// and the thing being guarded is a line a reviewer reads, not a shape only a parser can see.
+/// Braces inside string literals and char literals would confuse it, so both are skipped.
+fn fn_bodies(src: &str) -> Vec<(String, String)> {
+    let bytes: Vec<char> = src.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = src[i..].find("fn ") {
+        let at = i + rel;
+        // Must be a token boundary, so `async fn` counts and `my_fn ` does not.
+        let preceded_ok = at == 0
+            || !src[..at]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        i = at + 3;
+        if !preceded_ok {
+            continue;
+        }
+        let name: String = src[i..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        let Some(open_rel) = src[i..].find('{') else {
+            continue;
+        };
+        let mut j = i + open_rel;
+        // Character indices, so multi-byte source cannot desynchronise the walk.
+        let mut k = src[..j].chars().count();
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut in_char = false;
+        let start = k;
+        while k < bytes.len() {
+            let c = bytes[k];
+            let escaped = k > 0 && bytes[k - 1] == '\\';
+            match c {
+                '"' if !in_char && !escaped => in_str = !in_str,
+                '\'' if !in_str && !escaped => in_char = !in_char,
+                '{' if !in_str && !in_char => depth += 1,
+                '}' if !in_str && !in_char => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        let body: String = bytes[start..k.min(bytes.len())].iter().collect();
+        j += body.len();
+        let _ = j;
+        out.push((name, body));
+    }
+    out
+}
+
+/// Controls for [`fn_bodies`], written as the false passes it must not produce.
+///
+/// Every false pass this file has shipped was in a helper rather than in a check, so the helper is
+/// exercised directly with the shapes that would defeat it: a brace inside a string literal, a
+/// nested block, and a name that merely ends in `fn`.
+#[test]
+fn fn_bodies_finds_a_parse_in_a_resolver_and_is_not_fooled_by_braces_in_strings() {
+    let src = r#"
+        impl A {
+            fn resolve_filter_index(&self, name: &str) -> u32 {
+                if let Ok(i) = name.parse::<u32>() { return i; }
+                { let _nested = 1; }
+                0
+            }
+            fn innocent(&self) -> String {
+                // A brace inside a literal must not close the body early, or the parse above would
+                // leak into this body and the check would report the wrong function.
+                format!("{{ not a block }}")
+            }
+        }
+    "#;
+    let bodies: HashMap<String, String> = fn_bodies(src).into_iter().collect();
+
+    assert!(
+        bodies
+            .get("resolve_filter_index")
+            .is_some_and(|b| b.contains("parse::<u32>")),
+        "the resolver's own body must be found, or the check passes because it looked at nothing. \
+         Got keys {:?}",
+        bodies.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        bodies
+            .get("innocent")
+            .is_some_and(|b| !b.contains("parse::<u32>")),
+        "a body must end at its own closing brace: a brace inside a string literal is not a block, \
+         and mistaking one merges two functions and misattributes what is in them"
+    );
+    // And the exploit that motivates the token-boundary check.
+    assert!(
+        !fn_bodies("let my_fn = 1;")
+            .iter()
+            .any(|(n, _)| n == "my_fn"),
+        "`fn` must be matched as a token, not as the tail of an identifier"
+    );
+}

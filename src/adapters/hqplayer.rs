@@ -677,6 +677,137 @@ pub struct HqpState {
     pub matrix_profile: String,
 }
 
+/// What a live setting write actually did.
+///
+/// `result="OK"` is not proof of application (HQP-C-028), and equality with pre-existing state is not
+/// proof either (HQP-C-019): requesting Auto under `[source]`, where the rate is already Auto and the
+/// daemon ignores the pin, compares 0 against 0 and looks like success. So the four things a write can
+/// turn out to be are named separately rather than collapsed into `Ok`/`Err`, and the caller decides
+/// which of them counts as success on its surface.
+///
+/// An explicit `result="Error"` stays an `Err` — [`HqpAdapter::check_result`] raises it inside
+/// `send_command`, so it is a transport-level failure with the daemon's own reason attached, and it is
+/// distinguishable from every variant here by being an `Err` at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "an unexamined outcome is a setting reported as applied when it may not have been"]
+pub enum SettingOutcome {
+    /// Sent, acknowledged, and the authoritative `State` field now reads the requested value.
+    Applied,
+    /// **Nothing was sent.** The authoritative `State` field already read the requested value.
+    ///
+    /// Distinct from [`Self::Applied`] because for `SetMode` it is not an optimisation but a
+    /// correctness requirement: a same-mode `SetMode` still clears the exact-rate pin (HQP-C-017), so
+    /// writing a mode the daemon is already in destroys user state for nothing.
+    AlreadySet,
+    /// Sent and acknowledged, and the authoritative field never moved.
+    Ignored {
+        what: String,
+        requested: String,
+        observed: String,
+    },
+    /// **Never sent, and nothing mutated.** The client refused, with a stated reason.
+    Suppressed { what: String, reason: String },
+    /// The write was attempted and its outcome cannot be established — a lost reply is ambiguous
+    /// delivery, never proof of non-application (HQP-C-029).
+    Ambiguous { what: String, reason: String },
+}
+
+impl SettingOutcome {
+    /// Whether the authoritative state now carries the requested value.
+    pub fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied | Self::AlreadySet)
+    }
+
+    /// Collapse to the `Result<()>` the HTTP and MCP surfaces already answer with, so no response
+    /// contract changes: anything that is not applied becomes an error carrying the stated reason.
+    pub fn into_applied_result(self) -> Result<()> {
+        match self {
+            Self::Applied | Self::AlreadySet => Ok(()),
+            Self::Ignored {
+                what,
+                requested,
+                observed,
+            } => Err(anyhow!(
+                "HQPlayer accepted {what} but {what} still reads {observed} instead of {requested}; \
+                 refusing to report an unverified change"
+            )),
+            Self::Suppressed { what, reason } => {
+                Err(anyhow!("HQPlayer {what} was not changed: {reason}"))
+            }
+            Self::Ambiguous { what, reason } => Err(anyhow!(
+                "HQPlayer {what} may or may not have changed: {reason}"
+            )),
+        }
+    }
+}
+
+/// The daemon answered `result="Error"`: an **explicit rejection**, carrying its own reason.
+///
+/// A distinct type rather than a message, because the difference is load-bearing. A rejection is
+/// terminal — the daemon saw the request, refused it, and nothing changed — while a lost reply is
+/// *ambiguous delivery*: the daemon may have accepted, logged and acted on the request and then sent
+/// nothing (HQP-C-029). One must not be retried or read back; the other must. Telling them apart by
+/// matching on error text is how that distinction quietly stops holding.
+///
+/// `Display` is unchanged from the message this replaced, so a caller reading the string sees exactly
+/// what it saw before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HqpRejected {
+    /// The request element the daemon echoed back.
+    pub element: String,
+    /// The reason it carried as element text, when it carried one.
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Display for HqpRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.reason {
+            Some(reason) => write!(f, "HQPlayer rejected {}: {}", self.element, reason),
+            None => write!(f, "HQPlayer rejected {} (no reason given)", self.element),
+        }
+    }
+}
+
+impl std::error::Error for HqpRejected {}
+
+/// The semantic family of a mode entry, so a caller never depends on a list position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModeFamily {
+    /// Follow the source: the daemon's `[source]`.
+    Source,
+    Pcm,
+    /// Sigma-delta modulation, which the daemon names `"SDM (DSD)"` and callers ask for as `"DSD"`.
+    Sdm,
+}
+
+/// A setting family whose **legacy** HTTP request contract carries a list position rather than a name.
+///
+/// Named so the compatibility boundary is a visible, single place rather than a habit. See
+/// [`HqpAdapter::legacy_index_to_name`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacySettingFamily {
+    Mode,
+    Filter,
+    Shaper,
+}
+
+/// Which half of the filter pair a one-sided request is aimed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterSide {
+    OneX,
+    Nx,
+}
+
+impl FilterSide {
+    /// The `State` field that is authoritative for this side, named as the caller sees it.
+    fn field(self) -> &'static str {
+        match self {
+            Self::OneX => "filter1x",
+            Self::Nx => "filterNx",
+        }
+    }
+}
+
 /// HQPlayer info
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HqpInfo {
@@ -872,6 +1003,21 @@ struct HqpAdapterState {
     filters: Vec<FilterItem>,
     shapers: Vec<ListItem>,
     rates: Vec<RateItem>,
+    /// Fingerprints of the enumerations these caches were filled from.
+    ///
+    /// **This is how the loaded chain is identified.** The chain is not derived from the configured
+    /// mode — under `[source]` those are different questions (HQP-C-007) — nor from `State.active_mode`,
+    /// whose semantics under `[source]` are unmeasured (HQP-C-024) and which UHC therefore must not
+    /// read as an answer. It is derived from the only authority that is settled: the enumerations are
+    /// chain-scoped and change wholesale when the chain does (HQP-C-008, `E0-uhc-live`). So a freshly
+    /// fetched list whose fingerprint differs from the cached one **is** a chain transition, and every
+    /// other chain-scoped family is stale from that moment.
+    ///
+    /// `None` means "never observed", which is not a transition.
+    modes_fingerprint: Option<u64>,
+    filters_fingerprint: Option<u64>,
+    shapers_fingerprint: Option<u64>,
+    rates_fingerprint: Option<u64>,
     volume_range: Option<VolumeRange>,
     // Web client state for profiles
     profiles: Vec<HqpProfile>,
@@ -909,6 +1055,10 @@ impl Default for HqpAdapterState {
             filters: Vec::new(),
             shapers: Vec::new(),
             rates: Vec::new(),
+            modes_fingerprint: None,
+            filters_fingerprint: None,
+            shapers_fingerprint: None,
+            rates_fingerprint: None,
             volume_range: None,
             profiles: Vec::new(),
             hidden_fields: HashMap::new(),
@@ -1133,6 +1283,11 @@ impl HqpAdapter {
             .map_err(|_| anyhow!("Connection timeout"))?
             .map_err(|e| anyhow!("Connection failed: {}", e))?;
 
+        // A new session inherits nothing. The daemon may have restarted onto another profile, been
+        // reconfigured, or simply followed the source onto the other chain while UHC was away, and a
+        // list index cached before the drop names a different setting in every one of those cases.
+        self.invalidate_chain_cache().await;
+
         let (read_half, write_half) = stream.into_split();
         let reader = BufReader::new(read_half);
 
@@ -1193,6 +1348,8 @@ impl HqpAdapter {
             state.connected = false;
             (state.host.clone(), state.instance_name.clone())
         };
+        // Nothing observed through the old session may outlive it.
+        self.invalidate_chain_cache().await;
 
         {
             let mut conn = self.connection.lock().await;
@@ -1209,56 +1366,140 @@ impl HqpAdapter {
         }
     }
 
-    /// Refresh cached lists (modes, filters, shapers, rates)
-    /// Call this after profile changes
-    async fn refresh_lists(&self) {
-        let modes = match self.get_modes().await {
-            Ok(m) => {
-                tracing::debug!("Fetched {} modes", m.len());
-                m
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch modes: {}", e);
-                Vec::new()
-            }
-        };
-        let filters = match self.get_filters().await {
-            Ok(f) => {
-                tracing::debug!("Fetched {} filters", f.len());
-                f
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch filters: {}", e);
-                Vec::new()
-            }
-        };
-        let shapers = match self.get_shapers().await {
-            Ok(s) => {
-                tracing::debug!("Fetched {} shapers", s.len());
-                s
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch shapers: {}", e);
-                Vec::new()
-            }
-        };
-        let rates = match self.get_rates().await {
-            Ok(r) => {
-                tracing::debug!("Fetched {} rates", r.len());
-                r
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch rates: {}", e);
-                Vec::new()
-            }
-        };
-
+    /// Drop every cached chain-scoped enumeration.
+    ///
+    /// Called when the loaded chain has moved, when a mode write has reloaded it, and on connect and
+    /// disconnect — a reconnected session may be talking to a restarted daemon, a different profile,
+    /// or the same daemon after the source moved the chain while UHC was away, and a list index from
+    /// the previous session names a **different** setting in any of those cases (HQP-C-006, HQP-C-009).
+    ///
+    /// `modes` is device-scoped rather than chain-scoped, so it is dropped here only because the same
+    /// events that reload a chain can also be a different device.
+    async fn invalidate_chain_cache(&self) {
         let mut state = self.state.write().await;
-        state.modes = modes;
-        state.filters = filters;
-        state.shapers = shapers;
-        state.rates = rates;
-        tracing::debug!("Refreshed HQPlayer lists cache");
+        state.modes.clear();
+        state.filters.clear();
+        state.shapers.clear();
+        state.rates.clear();
+        state.modes_fingerprint = None;
+        state.filters_fingerprint = None;
+        state.shapers_fingerprint = None;
+        state.rates_fingerprint = None;
+        tracing::debug!("Invalidated HQPlayer chain-scoped enumeration cache");
+    }
+
+    /// Identity of an enumeration, as `(index, label)` pairs in the order the daemon served them.
+    ///
+    /// Both halves matter: a chain that offers the same names in a different order is a different
+    /// chain for every purpose a list index is used for.
+    fn fingerprint<'a>(entries: impl Iterator<Item = (u32, &'a str)>) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (index, label) in entries {
+            index.hash(&mut hasher);
+            label.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Record a freshly fetched enumeration and report whether the loaded chain moved.
+    ///
+    /// The comparison is against the **previous fingerprint of the same family**; a family never
+    /// observed before cannot be a transition. When one does move, every other chain-scoped family is
+    /// dropped rather than refetched here: the caller may not need them, and a lazy refill keeps a
+    /// control path to one enumeration fetch.
+    async fn note_enumeration(&self, family: &str, fingerprint: u64) -> bool {
+        let previous = {
+            let state = self.state.read().await;
+            match family {
+                "modes" => state.modes_fingerprint,
+                "filters" => state.filters_fingerprint,
+                "shapers" => state.shapers_fingerprint,
+                _ => state.rates_fingerprint,
+            }
+        };
+        let changed = previous.is_some_and(|p| p != fingerprint);
+        if changed {
+            tracing::info!(
+                "HQPlayer {family} enumeration changed: the loaded chain moved, dropping every \
+                 chain-scoped list"
+            );
+            self.invalidate_chain_cache().await;
+        }
+        changed
+    }
+
+    /// Fetch the modes list from the daemon and cache it, noticing a device change.
+    async fn fresh_modes(&self) -> Result<Vec<ListItem>> {
+        let modes = self.get_modes().await?;
+        let fingerprint = Self::fingerprint(modes.iter().map(|m| (m.index, m.name.as_str())));
+        self.note_enumeration("modes", fingerprint).await;
+        let mut state = self.state.write().await;
+        state.modes = modes.clone();
+        state.modes_fingerprint = Some(fingerprint);
+        Ok(modes)
+    }
+
+    /// Fetch the loaded chain's filter list from the daemon and cache it.
+    async fn fresh_filters(&self) -> Result<Vec<FilterItem>> {
+        let filters = self.get_filters().await?;
+        let fingerprint = Self::fingerprint(filters.iter().map(|f| (f.index, f.name.as_str())));
+        self.note_enumeration("filters", fingerprint).await;
+        let mut state = self.state.write().await;
+        state.filters = filters.clone();
+        state.filters_fingerprint = Some(fingerprint);
+        Ok(filters)
+    }
+
+    /// Fetch the loaded chain's shaper list from the daemon and cache it.
+    async fn fresh_shapers(&self) -> Result<Vec<ListItem>> {
+        let shapers = self.get_shapers().await?;
+        let fingerprint = Self::fingerprint(shapers.iter().map(|s| (s.index, s.name.as_str())));
+        self.note_enumeration("shapers", fingerprint).await;
+        let mut state = self.state.write().await;
+        state.shapers = shapers.clone();
+        state.shapers_fingerprint = Some(fingerprint);
+        Ok(shapers)
+    }
+
+    /// Fetch the loaded chain's rate list from the daemon and cache it.
+    ///
+    /// Also the **chain probe** used by the read path: it is the smallest chain-scoped enumeration and
+    /// the two chains' rate lists were observed disjoint (HQP-C-020, `E0-uhc-live`). The residual is
+    /// stated rather than hidden: the offered rates also depend on the selected filter (HQP-C-021), so
+    /// a filter change can move this fingerprint without the chain having moved. That direction is
+    /// harmless — it costs a refetch of lists that were about to be re-read anyway. The opposite
+    /// direction, a chain move that leaves the rate list byte-identical, is what would be missed, and
+    /// no observation suggests it is reachable.
+    async fn fresh_rates(&self) -> Result<Vec<RateItem>> {
+        let rates = self.get_rates().await?;
+        let labels: Vec<String> = rates.iter().map(|r| r.rate.to_string()).collect();
+        let fingerprint = Self::fingerprint(
+            rates
+                .iter()
+                .zip(labels.iter())
+                .map(|(r, label)| (r.index, label.as_str())),
+        );
+        self.note_enumeration("rates", fingerprint).await;
+        let mut state = self.state.write().await;
+        state.rates = rates.clone();
+        state.rates_fingerprint = Some(fingerprint);
+        Ok(rates)
+    }
+
+    /// Refresh every cached list. Used after a profile load, which can change all of them.
+    async fn refresh_lists(&self) {
+        for (family, outcome) in [
+            ("modes", self.fresh_modes().await.map(|v| v.len())),
+            ("filters", self.fresh_filters().await.map(|v| v.len())),
+            ("shapers", self.fresh_shapers().await.map(|v| v.len())),
+            ("rates", self.fresh_rates().await.map(|v| v.len())),
+        ] {
+            match outcome {
+                Ok(n) => tracing::debug!("Fetched {n} {family}"),
+                Err(e) => tracing::warn!("Failed to fetch {family}: {e}"),
+            }
+        }
     }
 
     /// Ensure connection is established, reconnecting if needed
@@ -1282,6 +1523,7 @@ impl HqpAdapter {
             state.connected = false;
             (state.host.clone(), state.instance_name.clone())
         };
+        self.invalidate_chain_cache().await;
 
         {
             let mut conn = self.connection.lock().await;
@@ -1309,10 +1551,10 @@ impl HqpAdapter {
         match Self::parse_attr(response, "result").as_deref() {
             Some("Error") => {
                 let element = framing::root_element(response).unwrap_or_else(|| "?".to_string());
-                match framing::root_text(response) {
-                    Some(reason) => Err(anyhow!("HQPlayer rejected {}: {}", element, reason)),
-                    None => Err(anyhow!("HQPlayer rejected {} (no reason given)", element)),
-                }
+                Err(anyhow!(HqpRejected {
+                    element,
+                    reason: framing::root_text(response),
+                }))
             }
             _ => Ok(()),
         }
@@ -2004,294 +2246,460 @@ impl HqpAdapter {
         }))
     }
 
-    /// Confirm a setting actually applied, by reading `State` back.
+    /// Confirm a setting actually applied, by reading the authoritative `State` field back.
     ///
-    /// Verified daemon behaviour: "a setter can return `result=\"OK\"` without the setting actually
-    /// applying. Never trust `result=\"OK\"` alone; confirm via `State` readback." A change can also
-    /// land a poll later than the acknowledgement, so this polls rather than checking once, reusing
-    /// the injected retry policy instead of introducing another knob.
+    /// Verified daemon behaviour: a setter can return `result="OK"` without the setting actually
+    /// applying, so `OK` alone is never proof (HQP-C-028). A change can also land a poll later than the
+    /// acknowledgement, so this polls rather than checking once, reusing the injected retry policy
+    /// instead of introducing another knob.
     ///
-    /// Returns an error when the setting never appears, so a caller can never be told about a change
-    /// that did not happen.
-    async fn verify_applied<F>(&self, what: &str, expected_index: u32, matches: F) -> Result<()>
+    /// Returns [`SettingOutcome::Ignored`] rather than an error when the value never appears: a write
+    /// the daemon acknowledged and dropped is a different fact from one it rejected, and a caller that
+    /// wants them collapsed asks for that with [`SettingOutcome::into_applied_result`].
+    ///
+    /// `observe` must read the field that *is* the setting. It deliberately has no fallback to a
+    /// related field: reading a sibling when the authoritative one is absent is how a readback confirms
+    /// something it never checked.
+    async fn verify_applied<T, F>(
+        &self,
+        what: &str,
+        expected: T,
+        observe: F,
+    ) -> Result<SettingOutcome>
     where
-        F: Fn(&HqpState) -> Option<u32>,
+        T: PartialEq + std::fmt::Display,
+        F: Fn(&HqpState) -> Option<T>,
     {
         let timeouts = self.timeouts().await;
-        let mut last_seen = None;
+        let mut last_seen: Option<T> = None;
 
         for attempt in 0..timeouts.max_attempts.max(1) {
             if attempt > 0 {
                 tokio::time::sleep(timeouts.reconnect_delay).await;
             }
             let state = self.get_state().await?;
-            let seen = matches(&state);
-            if seen == Some(expected_index) {
-                return Ok(());
+            let seen = observe(&state);
+            if seen.as_ref() == Some(&expected) {
+                return Ok(SettingOutcome::Applied);
             }
             last_seen = seen;
         }
 
-        Err(anyhow!(
-            "HQPlayer accepted {} but {} still reads {} instead of {}; refusing to report an \
-             unverified change",
-            what,
-            what,
-            last_seen
+        Ok(SettingOutcome::Ignored {
+            what: what.to_string(),
+            requested: expected.to_string(),
+            observed: last_seen
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "nothing".to_string()),
-            expected_index
-        ))
+        })
     }
 
-    /// Set mode by name (e.g., "PCM", "DSD", "[source]")
-    /// Resolves name to INDEX and sends to HQPlayer.
-    /// CLI confirms: `--set-mode <index>`
+    /// Write a setting and establish what it did, including when the reply never arrives.
     ///
-    /// NOTE: Mode changes affect available filters, shapers, and rates.
-    /// We refresh the cached lists after changing mode.
-    pub async fn set_mode(&self, mode_name: &str) -> Result<()> {
-        let mode_index = self.resolve_mode_index(mode_name).await?;
-        let xml = Self::build_request("SetMode", &[("value", &mode_index.to_string())]);
-        self.send_command(&xml).await?;
-        self.verify_applied("mode", mode_index, |s| Some(u32::from(s.mode)))
-            .await?;
-        // Mode change affects available filters/shapers/rates - refresh lists
-        self.refresh_lists().await;
-        Ok(())
-    }
-
-    /// Resolve mode name to INDEX, checking cache first then fetching if needed
-    /// ModesItem has: index (0,1,2), name, value (-1,0,1) - index ≠ value!
-    async fn resolve_mode_index(&self, mode_name: &str) -> Result<u32> {
-        // First try to find by name in cached modes (case-insensitive)
-        let cached_index = {
-            let state = self.state.read().await;
-            state
-                .modes
-                .iter()
-                .find(|m| m.name.eq_ignore_ascii_case(mode_name))
-                .map(|m| m.index)
-        };
-
-        if let Some(idx) = cached_index {
-            return Ok(idx);
-        }
-
-        // Not found in cache - try parsing as integer (direct index)
-        if let Ok(idx) = mode_name.parse::<u32>() {
-            return Ok(idx);
-        }
-
-        // Try refreshing mode list and searching again
-        let modes = self.get_modes().await?;
-        modes
-            .iter()
-            .find(|m| m.name.eq_ignore_ascii_case(mode_name))
-            .map(|m| m.index)
-            .ok_or_else(|| {
-                let available: Vec<_> = modes.iter().map(|m| m.name.as_str()).collect();
-                anyhow::anyhow!(
-                    "Mode '{}' not found. Available: {}",
-                    mode_name,
-                    available.join(", ")
-                )
-            })
-    }
-
-    /// Set filter (low-level) - takes INDEX values
+    /// Three outcomes come out of the send itself:
     ///
-    /// - value: sets the Nx (non-1x) filter by INDEX
-    /// - value1x: if provided, also sets the 1x filter by INDEX
+    /// * a reply — the ordinary path, and readback decides between `Applied` and `Ignored`;
+    /// * an explicit [`HqpRejected`] — terminal, propagated as the error it is, nothing changed;
+    /// * anything else (timeout, dropped connection, malformed reply) — **ambiguous delivery**. On
+    ///   HQPlayer Embedded 6.0.4 a `SetMode` was accepted, logged and acted on while the daemon sent
+    ///   no response and later dropped the connection (HQP-C-029), so treating silence as failure is
+    ///   as wrong as treating `OK` as success. The state is read back regardless: if the setting is
+    ///   there, the write landed and is reported as applied; if it is not, the outcome is
+    ///   `Ambiguous` — which is neither a success nor a claim that nothing happened.
     ///
-    /// HQPlayer CLI confirms: `--set-filter <index> [index1x]`
-    /// State returns INDEX for filter fields, so read from State and send back unchanged.
-    pub async fn set_filter(&self, value: u32, value1x: Option<u32>) -> Result<()> {
-        let value_str = value.to_string();
-        let mut attrs = vec![("value", value_str.as_str())];
-
-        let value1x_str;
-        if let Some(v1x) = value1x {
-            value1x_str = v1x.to_string();
-            attrs.push(("value1x", value1x_str.as_str()));
-        }
-
-        let xml = Self::build_request("SetFilter", &attrs);
-        tracing::debug!(
-            "SetFilter: value={} (Nx), value1x={:?} (1x) | XML: {}",
-            value,
-            value1x,
-            xml.trim()
-        );
-        self.send_command(&xml).await?;
-        Ok(())
-    }
-
-    /// Set only the 1x filter, preserving current Nx filter index
-    /// Accepts filter name (e.g., "poly-sinc-lp") or index as string
-    pub async fn set_filter_1x(&self, filter_name: &str) -> Result<()> {
-        let filter_index = self.resolve_filter_index(filter_name).await?;
-        let state = self.get_state().await?;
-        // State returns INDEX for filters
-        let current_nx_index = state.filter_nx.unwrap_or(state.filter);
-        tracing::debug!(
-            "set_filter_1x: name='{}' resolved_index={}, state.filter_nx={:?}, state.filter={}, using current_nx={}",
-            filter_name, filter_index, state.filter_nx, state.filter, current_nx_index
-        );
-        self.set_filter(current_nx_index, Some(filter_index))
-            .await?;
-        self.verify_applied("filter1x", filter_index, |s| s.filter1x.or(Some(s.filter)))
-            .await
-    }
-
-    /// Set only the Nx filter, preserving current 1x filter index
-    /// Accepts filter name (e.g., "poly-sinc-lp") or index as string
-    pub async fn set_filter_nx(&self, filter_name: &str) -> Result<()> {
-        let filter_index = self.resolve_filter_index(filter_name).await?;
-        // State returns INDEX for filters
-        let state = self.get_state().await?;
-        let current_1x_index = state.filter1x.unwrap_or(state.filter);
-        tracing::debug!(
-            "set_filter_nx: name='{}' resolved_index={}, state.filter1x={:?}, state.filter={}, using current_1x={}",
-            filter_name, filter_index, state.filter1x, state.filter, current_1x_index
-        );
-        self.set_filter(filter_index, Some(current_1x_index))
-            .await?;
-        self.verify_applied("filterNx", filter_index, |s| s.filter_nx.or(Some(s.filter)))
-            .await
-    }
-
-    /// Resolve filter name to INDEX, checking cache first then fetching if needed
-    async fn resolve_filter_index(&self, filter_name: &str) -> Result<u32> {
-        // First try to find by name in cached filters
-        let cached_result = {
-            let state = self.state.read().await;
-            state
-                .filters
-                .iter()
-                .find(|f| f.name == filter_name)
-                .map(|f| (f.index, f.value))
-        };
-
-        if let Some((idx, val)) = cached_result {
-            tracing::debug!(
-                "resolve_filter_index: '{}' -> index={}, value={} (from cache)",
-                filter_name,
-                idx,
-                val
-            );
-            return Ok(idx);
-        }
-
-        // Not found in cache - try parsing as integer (direct index)
-        if let Ok(idx) = filter_name.parse::<u32>() {
-            tracing::debug!(
-                "resolve_filter_index: '{}' parsed as direct index={}",
-                filter_name,
-                idx
-            );
-            return Ok(idx);
-        }
-
-        // Try refreshing filter list and searching again
-        let filters = self.get_filters().await?;
-        let result = filters
-            .iter()
-            .find(|f| f.name == filter_name)
-            .map(|f| (f.index, f.value));
-
-        match result {
-            Some((idx, val)) => {
-                tracing::debug!(
-                    "resolve_filter_index: '{}' -> index={}, value={} (after refresh)",
-                    filter_name,
-                    idx,
-                    val
+    /// The readback reconnects on its own (`get_state` goes through `ensure_connected`), so this is
+    /// also the recovery path, not just the reporting one.
+    ///
+    /// Only absolute writes reach here. A relative one-shot is never retried after its write is
+    /// attempted (HQP-C-030), and `send_command` enforces that separately.
+    async fn write_setting<T, F>(
+        &self,
+        xml: &str,
+        what: &str,
+        expected: T,
+        observe: F,
+    ) -> Result<SettingOutcome>
+    where
+        T: PartialEq + std::fmt::Display + Clone,
+        F: Fn(&HqpState) -> Option<T>,
+    {
+        match self.send_command(xml).await {
+            Ok(_) => self.verify_applied(what, expected, observe).await,
+            Err(e) if e.downcast_ref::<HqpRejected>().is_some() => Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    "HQPlayer {what} write got no usable reply ({e}); reading the state back, \
+                     because a lost reply is not proof the daemon did not apply it"
                 );
-                Ok(idx)
+                match self.verify_applied(what, expected, observe).await {
+                    Ok(SettingOutcome::Applied) => Ok(SettingOutcome::Applied),
+                    _ => Ok(SettingOutcome::Ambiguous {
+                        what: what.to_string(),
+                        reason: format!(
+                            "the write was attempted but drew no usable reply ({e}), and the \
+                             daemon's state does not show it; it may or may not have been applied"
+                        ),
+                    }),
+                }
             }
-            None => Err(anyhow::anyhow!(
-                "Filter '{}' not found in available filters",
-                filter_name
+        }
+    }
+
+    /// The semantic family a mode name belongs to, matched by prefix and alias rather than position.
+    ///
+    /// Positions are unsafe: a DAC without DSD capability yields a modes list with **no** SDM entry and
+    /// the survivors keep their own indices, so a caller assuming index 2 is SDM finds something on one
+    /// device and the wrong thing on another (HQP-C-013). Names are not exact either — the daemon
+    /// reports `"SDM (DSD)"`, so equality against `"SDM"` or `"DSD"` fails on the device that has it.
+    ///
+    /// `None` means "no family recognised", which includes every string of digits. That is deliberate:
+    /// a bare integer is not a mode name, and treating one as a list index is what HQP-C-063 records.
+    fn mode_family(name: &str) -> Option<ModeFamily> {
+        let trimmed = name.trim().to_ascii_lowercase();
+        let bare = trimmed.trim_start_matches('[').trim_end_matches(']');
+        if bare == "source" {
+            return Some(ModeFamily::Source);
+        }
+        if trimmed.starts_with("pcm") {
+            return Some(ModeFamily::Pcm);
+        }
+        if trimmed.starts_with("sdm") || trimmed.starts_with("dsd") {
+            return Some(ModeFamily::Sdm);
+        }
+        None
+    }
+
+    /// Resolve a mode name against the list the daemon is serving **now**.
+    ///
+    /// Exact match first, then semantic family. A family match must be unambiguous: if a daemon ever
+    /// offered two SDM entries, picking one of them silently would be the positional assumption this
+    /// exists to remove, so it is refused instead.
+    fn resolve_mode(modes: &[ListItem], requested: &str) -> Result<u32> {
+        if let Some(exact) = modes
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(requested))
+        {
+            return Ok(exact.index);
+        }
+        let available = || {
+            modes
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let wanted = Self::mode_family(requested).ok_or_else(|| {
+            anyhow!(
+                "Mode '{}' is not a mode this daemon offers. Available: {}",
+                requested,
+                available()
+            )
+        })?;
+        let mut matches = modes
+            .iter()
+            .filter(|m| Self::mode_family(&m.name) == Some(wanted));
+        match (matches.next(), matches.next()) {
+            (Some(only), None) => Ok(only.index),
+            (Some(_), Some(_)) => Err(anyhow!(
+                "Mode '{}' matches more than one entry this daemon offers, so no single one can be \
+                 chosen without guessing. Available: {}",
+                requested,
+                available()
+            )),
+            _ => Err(anyhow!(
+                "Mode '{}' is not offered by this daemon. Available: {}",
+                requested,
+                available()
             )),
         }
     }
 
-    /// Set shaper - sends INDEX to HQPlayer
-    /// Accepts shaper name (e.g., "ASDM7") or index as string
-    /// HQPlayer CLI confirms: `--set-shaping <index>`
-    pub async fn set_shaper(&self, shaper_name: &str) -> Result<()> {
-        let shaper_index = self.resolve_shaper_index(shaper_name).await?;
-        let xml = Self::build_request("SetShaping", &[("value", &shaper_index.to_string())]);
-        self.send_command(&xml).await?;
-        self.verify_applied("shaper", shaper_index, |s| Some(s.shaper))
-            .await
+    /// Set mode by semantic name — `"PCM"`, `"DSD"`, `"[source]"`, or the daemon's own `"SDM (DSD)"`.
+    ///
+    /// Resolved against the list the daemon serves now and sent as that list's **index** (HQP-C-001).
+    ///
+    /// A mode the daemon is already in is **not written**. `SetMode` clears the exact-rate pin even
+    /// when the mode does not change (HQP-C-017), so an unconditional write destroys a user's pinned
+    /// rate for nothing. When a write is performed the chain reloads, so every chain-scoped list is
+    /// dropped and the pin the daemon just cleared is re-read rather than remembered.
+    pub async fn set_mode(&self, mode_name: &str) -> Result<SettingOutcome> {
+        let modes = self.fresh_modes().await?;
+        let mode_index = Self::resolve_mode(&modes, mode_name)?;
+
+        let state = self.get_state().await?;
+        if u32::from(state.mode) == mode_index {
+            tracing::debug!(
+                "HQPlayer is already in mode {mode_index}; not writing it, because SetMode clears \
+                 the rate pin even when the mode does not change"
+            );
+            return Ok(SettingOutcome::AlreadySet);
+        }
+
+        let xml = Self::build_request("SetMode", &[("value", &mode_index.to_string())]);
+        let outcome = self
+            .write_setting(&xml, "mode", mode_index, |s| Some(u32::from(s.mode)))
+            .await?;
+        // A mode change reloads the chain whatever the readback said, so nothing cached about it
+        // survives. This is also what makes the cleared pin honest: there is no remembered rate to
+        // report, only the one the daemon now holds.
+        self.invalidate_chain_cache().await;
+        Ok(outcome)
     }
 
-    /// Resolve shaper name to INDEX, checking cache first then fetching if needed
-    async fn resolve_shaper_index(&self, shaper_name: &str) -> Result<u32> {
-        // First try to find by name in cached shapers
-        let cached_index = {
-            let state = self.state.read().await;
-            state
-                .shapers
-                .iter()
-                .find(|s| s.name == shaper_name)
-                .map(|s| s.index)
+    /// Send `SetFilter` with **both** arguments.
+    ///
+    /// The daemon's `SetFilter` writes both sides: `value` alone sets 1x and Nx together, and
+    /// `value1x` splits them. There is therefore no such thing as a one-sided write on the wire — a
+    /// caller that omits the sibling is overwriting it with whatever it passed as `value`. Taking both
+    /// indices is what makes that impossible to express, rather than merely discouraged.
+    ///
+    /// **Indices in, and no readback.** This is the raw form: it resolves no name and confirms
+    /// nothing, so it is not a control path. Every advertised surface goes through
+    /// [`Self::set_filter_1x`] or [`Self::set_filter_nx`], which resolve a semantic name against the
+    /// loaded chain's list and verify the result.
+    /// The request both sides of the pair travel in, built in one place so they cannot drift.
+    fn filter_request(value_nx: u32, value1x: u32) -> String {
+        let nx = value_nx.to_string();
+        let one_x = value1x.to_string();
+        Self::build_request("SetFilter", &[("value", &nx), ("value1x", &one_x)])
+    }
+
+    pub async fn set_filter(&self, value_nx: u32, value1x: u32) -> Result<()> {
+        tracing::debug!("SetFilter: value={value_nx} (Nx), value1x={value1x} (1x)");
+        self.send_command(&Self::filter_request(value_nx, value1x))
+            .await?;
+        Ok(())
+    }
+
+    /// Set only the 1x filter, preserving the Nx filter the daemon reports.
+    pub async fn set_filter_1x(&self, filter_name: &str) -> Result<SettingOutcome> {
+        self.set_filter_side(FilterSide::OneX, filter_name).await
+    }
+
+    /// Set only the Nx filter, preserving the 1x filter the daemon reports.
+    pub async fn set_filter_nx(&self, filter_name: &str) -> Result<SettingOutcome> {
+        self.set_filter_side(FilterSide::Nx, filter_name).await
+    }
+
+    /// One side of the filter pair, carrying the authoritative other side with it.
+    ///
+    /// The sibling comes from `State`'s own `filter1x`/`filterNx` and from nowhere else. The previous
+    /// implementation substituted the legacy combined `filter` field when a sibling was absent, which
+    /// is a **guess**: `filter` tracks the most recently set of the two, so the guess silently
+    /// overwrote the setting the caller did not touch. When the sibling cannot be established the
+    /// write is refused with a reason and nothing is sent.
+    async fn set_filter_side(&self, side: FilterSide, filter_name: &str) -> Result<SettingOutcome> {
+        let filters = self.fresh_filters().await?;
+        let index = Self::resolve_filter(&filters, filter_name)?;
+        let what = side.field();
+
+        let state = self.get_state().await?;
+        let (Some(current_1x), Some(current_nx)) = (state.filter1x, state.filter_nx) else {
+            return Ok(SettingOutcome::Suppressed {
+                what: what.to_string(),
+                reason: "the daemon's State does not report both filter1x and filterNx, and \
+                         SetFilter writes both sides at once; sending it would overwrite the sibling \
+                         with a guess"
+                    .to_string(),
+            });
         };
 
-        if let Some(idx) = cached_index {
-            return Ok(idx);
+        let current = match side {
+            FilterSide::OneX => current_1x,
+            FilterSide::Nx => current_nx,
+        };
+        if current == index {
+            return Ok(SettingOutcome::AlreadySet);
         }
 
-        // Not found in cache - try parsing as integer (direct index)
-        if let Ok(idx) = shaper_name.parse::<u32>() {
-            return Ok(idx);
-        }
+        let (send_nx, send_1x) = match side {
+            FilterSide::OneX => (current_nx, index),
+            FilterSide::Nx => (index, current_1x),
+        };
+        tracing::debug!("SetFilter: value={send_nx} (Nx), value1x={send_1x} (1x)");
+        let xml = Self::filter_request(send_nx, send_1x);
+        self.write_setting(&xml, what, index, |s| match side {
+            FilterSide::OneX => s.filter1x,
+            FilterSide::Nx => s.filter_nx,
+        })
+        .await
+    }
 
-        // Try refreshing shaper list and searching again
-        let shapers = self.get_shapers().await?;
-        shapers
+    /// Resolve a filter name against the list the daemon is serving **now**.
+    ///
+    /// No numeric fallback. A list index that arrives as a name is not a name — it is a number from
+    /// some other chain, some other daemon, or a guess, and accepting it is how a stale index silently
+    /// selects a different filter (HQP-C-009, HQP-C-063).
+    fn resolve_filter(filters: &[FilterItem], requested: &str) -> Result<u32> {
+        filters
             .iter()
-            .find(|s| s.name == shaper_name)
-            .map(|s| s.index)
+            .find(|f| f.name == requested)
+            .or_else(|| {
+                filters
+                    .iter()
+                    .find(|f| f.name.eq_ignore_ascii_case(requested))
+            })
+            .map(|f| f.index)
             .ok_or_else(|| {
-                anyhow::anyhow!("Shaper '{}' not found in available shapers", shaper_name)
+                anyhow!(
+                    "Filter '{}' is not in the list this daemon is serving for the chain it has \
+                     loaded",
+                    requested
+                )
             })
     }
 
-    /// Set sample rate
-    /// The value parameter is the actual rate (e.g., 48000), but HQPlayer's SetRate
-    /// command expects the index from the rates list, so we look it up.
-    pub async fn set_rate(&self, rate_value: u32) -> Result<()> {
-        // Look up the index for this rate value from cached rates
-        let index = {
-            let state = self.state.read().await;
-            state
-                .rates
-                .iter()
-                .find(|r| r.rate == rate_value)
-                .map(|r| r.index)
-        };
-
-        let index = match index {
-            Some(idx) => idx,
-            None => {
-                // Rate not found in cached list - maybe cache is stale, try refreshing
-                let rates = self.get_rates().await?;
-                rates
+    /// Resolve a shaper name against the list the daemon is serving **now**. No numeric fallback,
+    /// for the same reason as [`Self::resolve_filter`].
+    fn resolve_shaper(shapers: &[ListItem], requested: &str) -> Result<u32> {
+        shapers
+            .iter()
+            .find(|s| s.name == requested)
+            .or_else(|| {
+                shapers
                     .iter()
-                    .find(|r| r.rate == rate_value)
-                    .map(|r| r.index)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Rate {} not found in available rates", rate_value)
-                    })?
-            }
-        };
+                    .find(|s| s.name.eq_ignore_ascii_case(requested))
+            })
+            .map(|s| s.index)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Shaper '{}' is not in the list this daemon is serving for the chain it has \
+                     loaded",
+                    requested
+                )
+            })
+    }
+
+    /// Set the shaper (the modulator, under an SDM chain) by semantic name.
+    pub async fn set_shaper(&self, shaper_name: &str) -> Result<SettingOutcome> {
+        let shapers = self.fresh_shapers().await?;
+        let shaper_index = Self::resolve_shaper(&shapers, shaper_name)?;
+
+        if self.get_state().await?.shaper == shaper_index {
+            return Ok(SettingOutcome::AlreadySet);
+        }
+
+        let xml = Self::build_request("SetShaping", &[("value", &shaper_index.to_string())]);
+        self.write_setting(&xml, "shaper", shaper_index, |s| Some(s.shaper))
+            .await
+    }
+
+    /// Whether the daemon's **configured** mode is the source-following one.
+    ///
+    /// Read from the modes list the daemon is serving now, by semantic family — never from a list
+    /// position, and never from `State.active_mode`, whose meaning under `[source]` is unmeasured
+    /// (HQP-C-024). Returns the daemon's own name for the mode so a refusal can quote it.
+    fn configured_source_mode(modes: &[ListItem], state: &HqpState) -> Option<String> {
+        modes
+            .iter()
+            .find(|m| m.index == u32::from(state.mode))
+            .filter(|m| Self::mode_family(&m.name) == Some(ModeFamily::Source))
+            .map(|m| m.name.clone())
+    }
+
+    /// Pin the sample rate, in Hz.
+    ///
+    /// The Hz value is resolved to the **list index** the loaded chain gives it (HQP-C-015), against a
+    /// list fetched now rather than a cached one — the offered rates change wholesale with the chain
+    /// (HQP-C-020).
+    ///
+    /// Under a configured `[source]` mode the write is **suppressed and never sent**. The daemon
+    /// answers `OK` there and applies nothing (HQP-C-018); what governs the rate in that mode is a
+    /// persistent configuration limit for which no wire command exists, so no retry can succeed. The
+    /// Auto case is why suppression rather than readback is the answer: requesting index 0 when the
+    /// rate is already 0 compares 0 against 0, so a readback reports success for a command that did
+    /// nothing (HQP-C-019).
+    pub async fn set_rate(&self, rate_value: u32) -> Result<SettingOutcome> {
+        let modes = self.fresh_modes().await?;
+        let state = self.get_state().await?;
+        if let Some(mode_name) = Self::configured_source_mode(&modes, &state) {
+            return Ok(SettingOutcome::Suppressed {
+                what: "rate".to_string(),
+                reason: format!(
+                    "the configured mode is '{mode_name}', in which the daemon acknowledges a rate \
+                     pin and applies nothing — the rate is governed by persistent configuration \
+                     there, so the write was not sent"
+                ),
+            });
+        }
+
+        let rates = self.fresh_rates().await?;
+        let index = rates
+            .iter()
+            .find(|r| r.rate == rate_value)
+            .map(|r| r.index)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Rate {} is not offered for the chain this daemon has loaded",
+                    rate_value
+                )
+            })?;
+
+        if state.rate == index {
+            return Ok(SettingOutcome::AlreadySet);
+        }
 
         let xml = Self::build_request("SetRate", &[("value", &index.to_string())]);
-        self.send_command(&xml).await?;
-        self.verify_applied("rate", index, |s| Some(s.rate)).await
+        self.write_setting(&xml, "rate", index, |s| Some(s.rate))
+            .await
+    }
+
+    /// Turn a legacy numeric setting value into the semantic name it denotes **right now**.
+    ///
+    /// `POST /hqplayer/setting` carries `value: u32` and `POST /hqp/pipeline` accepts a JSON number,
+    /// and both request contracts are frozen. So the number is kept — at this boundary, and only
+    /// here. It is resolved against the enumeration the daemon is serving for the chain it has
+    /// loaded, and what continues inward is the **name**.
+    ///
+    /// That is the whole of HQP-C-063's fix. The number never becomes an identity: it is not cached,
+    /// not published, and not passed to a setter. A position that the current list does not have is
+    /// an error rather than something forwarded and hoped about — which is what the removed
+    /// `parse::<u32>()` fallback did, and why a stale number could select a different setting.
+    pub async fn legacy_index_to_name(
+        &self,
+        family: LegacySettingFamily,
+        index: u32,
+    ) -> Result<String> {
+        let (name, count) = match family {
+            LegacySettingFamily::Mode => {
+                let modes = self.fresh_modes().await?;
+                (
+                    modes
+                        .iter()
+                        .find(|m| m.index == index)
+                        .map(|m| m.name.clone()),
+                    modes.len(),
+                )
+            }
+            LegacySettingFamily::Filter => {
+                let filters = self.fresh_filters().await?;
+                (
+                    filters
+                        .iter()
+                        .find(|f| f.index == index)
+                        .map(|f| f.name.clone()),
+                    filters.len(),
+                )
+            }
+            LegacySettingFamily::Shaper => {
+                let shapers = self.fresh_shapers().await?;
+                (
+                    shapers
+                        .iter()
+                        .find(|s| s.index == index)
+                        .map(|s| s.name.clone()),
+                    shapers.len(),
+                )
+            }
+        };
+        name.ok_or_else(|| {
+            anyhow!(
+                "{:?} position {} is not in the {}-entry list this daemon is serving now",
+                family,
+                index,
+                count
+            )
+        })
     }
 
     /// Set volume in whole dB.
@@ -2402,8 +2810,20 @@ impl HqpAdapter {
         let state = self.get_state().await?;
         let playback_status = self.get_playback_status().await.unwrap_or_default();
 
-        // Lazy-load lists if not cached (first request after connect)
-        // Check ALL lists - if any are empty, we need to refresh
+        // Chain probe. The lists this view publishes are scoped to the chain the daemon has *loaded*,
+        // and under `[source]` that chain moves without `State.mode` moving at all (HQP-C-007) — so
+        // "refresh when a list is empty" served the previous chain's options indefinitely, and a UI
+        // offering PCM filters over a loaded DSD chain is a lie a user acts on.
+        //
+        // The rate list is the probe because it is the smallest chain-scoped enumeration and the two
+        // chains' rate lists were observed disjoint (HQP-C-020). Its fingerprint changing drops every
+        // chain-scoped cache, which the lazy fill below then repopulates. A probe failure is not fatal
+        // to a read: the caller still gets `State` and `Status`.
+        if let Err(e) = self.fresh_rates().await {
+            tracing::warn!("HQPlayer chain probe failed, serving cached enumerations: {e}");
+        }
+
+        // Lazy-fill whatever the probe left empty — on the first read after connect, that is all of it.
         let needs_lists = {
             let cached = self.state.read().await;
             cached.modes.is_empty()
@@ -2472,8 +2892,17 @@ impl HqpAdapter {
                 state: state_str.to_string(),
                 // State.mode and State.active_mode are INDEX (0,1,2) - look up by ModesItem.index
                 mode: get_mode_by_index(state.mode),
-                // Use State's active_mode (INDEX) - Status's active_mode string is unreliable
-                // (shows "[source]" even when actually outputting DSD)
+                // `State.active_mode`, resolved through the modes list. This is a **reporting choice
+                // between two fields whose semantics are not both measured**, not a statement that one
+                // is right: `Status.active_mode` is measured to echo the configured mode under
+                // `[source]` (HQP-C-023), and what `State.active_mode` reports there has never been
+                // measured by anyone (HQP-C-024). An earlier comment here called the `Status` field
+                // "unreliable" and instructed always using this one, which asserted the unmeasured half
+                // as fact; #332 owns settling it.
+                //
+                // Nothing that has to be *correct* depends on this field. The loaded chain — which
+                // decides every enumeration below — is resolved from the enumerations the daemon
+                // serves, never from either `active_mode`.
                 active_mode: get_mode_by_index(state.active_mode),
                 active_filter: playback_status.active_filter.clone(),
                 active_shaper: playback_status.active_shaper.clone(),
@@ -3019,13 +3448,50 @@ impl HqpAdapter {
         }))
     }
 
-    /// Get current matrix profile
+    /// The matrix profile the daemon currently has selected.
+    ///
+    /// The authority is the observed **`State.matrix_profile`** field, not `MatrixGetProfile`: #341
+    /// records no versioned evidence that the supported daemon implements that command consistently,
+    /// and #347 says explicitly not to treat it as the current-profile authority until it does.
+    ///
+    /// The `index` is *derived* by resolving that name against the list the daemon is serving now — it
+    /// is a position in a list, so it is only meaningful alongside the list it came from and is never
+    /// stored. A name the fresh list does not contain yields `None` rather than a profile carrying
+    /// some other entry's index: nothing in the list is selected, and reporting index 0 would name
+    /// whatever sits first, which on the observed corpus is `Default`.
     pub async fn get_matrix_profile(&self) -> Result<Option<MatrixProfile>> {
+        let current = self.get_state().await?.matrix_profile;
+        if current.is_empty() {
+            // No selection. The empty field is the default identity and is not list position 0.
+            return Ok(None);
+        }
+        let profiles = self.get_matrix_profiles().await?;
+        let resolved = profiles.into_iter().find(|p| p.name == current);
+        if resolved.is_none() {
+            tracing::warn!(
+                "HQPlayer reports matrix profile {current:?}, which its own MatrixListProfiles does \
+                 not contain; reporting no selection rather than another profile's index"
+            );
+        }
+        Ok(resolved)
+    }
+
+    /// Ask the daemon what `MatrixGetProfile` reports.
+    ///
+    /// **This is an observation, not the authority.** [`Self::get_matrix_profile`] reads
+    /// `State.matrix_profile`, because #341 records no versioned evidence that the supported daemon
+    /// implements `MatrixGetProfile` consistently and #347 forbids assuming it does. This method
+    /// exists so the tier-1 read-only capture lane can *watch* what the command says and diff it
+    /// against `State` — which is how that question gets settled by evidence instead of by assumption.
+    ///
+    /// No control path calls it, and
+    /// `no_production_code_treats_matrix_get_profile_as_the_current_selection` keeps it that way.
+    pub async fn read_matrix_get_profile(&self) -> Result<Option<MatrixProfile>> {
         let xml = Self::build_request("MatrixGetProfile", &[]);
         let response = self.send_command(&xml).await?;
 
-        // HQPlayer returns current profile - try both 'value' (as per Node.js reference)
-        // and 'name' attribute for compatibility
+        // Both `value` (the Node.js reference's reading) and `name` are accepted, because which one
+        // the daemon uses is part of what this lane is capturing.
         let index = Self::parse_attr_u32(&response, "index");
         let name =
             Self::parse_attr(&response, "value").or_else(|| Self::parse_attr(&response, "name"));
@@ -3036,19 +3502,40 @@ impl HqpAdapter {
         }
     }
 
-    /// Set matrix profile by index - converts index to name for HQPlayer
-    /// HQPlayer's MatrixSetProfile expects profile NAME, not index
-    pub async fn set_matrix_profile(&self, profile_index: u32) -> Result<()> {
-        // Get the list of profiles and find the name for this index
+    /// Select a matrix profile by its position in the daemon's current list.
+    ///
+    /// **This is the compatibility boundary and nothing else.** The legacy HTTP routes carry a
+    /// number, so the number is accepted here, resolved against the list the daemon is serving now,
+    /// and immediately turned into the semantic name that goes on the wire. The number is never
+    /// stored, never published as identity, and never reaches the daemon.
+    pub async fn set_matrix_profile(&self, profile_index: u32) -> Result<SettingOutcome> {
         let profiles = self.get_matrix_profiles().await?;
-        let profile = profiles
+        let name = profiles
             .iter()
             .find(|p| p.index == profile_index)
-            .ok_or_else(|| anyhow::anyhow!("Matrix profile index {} not found", profile_index))?;
+            .map(|p| p.name.clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "Matrix profile {} is not a position in the list this daemon is serving now",
+                    profile_index
+                )
+            })?;
+        self.set_matrix_profile_named(&name).await
+    }
 
-        let xml = Self::build_request("MatrixSetProfile", &[("value", &profile.name)]);
-        self.send_command(&xml).await?;
-        Ok(())
+    /// Select a matrix profile by name, verifying against the authoritative `State` field.
+    ///
+    /// `MatrixSetProfile` takes the name, and like every other setter its `result="OK"` is not proof
+    /// of application (HQP-C-028) — so the write is confirmed by reading `State.matrix_profile` back.
+    pub async fn set_matrix_profile_named(&self, name: &str) -> Result<SettingOutcome> {
+        if self.get_state().await?.matrix_profile == name {
+            return Ok(SettingOutcome::AlreadySet);
+        }
+        let xml = Self::build_request("MatrixSetProfile", &[("value", name)]);
+        self.write_setting(&xml, "matrix profile", name.to_string(), |s| {
+            Some(s.matrix_profile.clone())
+        })
+        .await
     }
 
     /// Get name of this instance (if set)
