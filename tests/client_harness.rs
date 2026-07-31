@@ -1315,3 +1315,108 @@ mod integration {
         println!("iOS: Got HQPlayer profiles");
     }
 }
+
+// =============================================================================
+// The two HQPlayer setting routes accept different name sets, and share an applier (#347)
+//
+// `POST /hqplayer/setting` and the numeric arm of `POST /hqp/pipeline` were made to share one
+// applier so a list position is interpreted in exactly one place. The applier has to accept
+// `dither`, because /hqp/pipeline always has — and /hqplayer/setting never has. Sharing the code
+// therefore silently added an accepted name to a frozen request contract. Found in self-review of
+// the diff rather than by a test, which is why these exist: the fix that followed had none.
+//
+// Asserted on the **response body**, not only the status, because both the widening and the fix
+// answer 4xx/5xx here — an unconfigured adapter fails too. Only the message says which path ran.
+// =============================================================================
+
+#[cfg(test)]
+mod hqplayer_setting_route_contract {
+    use super::*;
+
+    /// `dither` is not a name this route has ever accepted, and it must still be refused **by the
+    /// route**, before anything reaches the adapter.
+    #[tokio::test]
+    async fn the_legacy_setting_route_still_refuses_a_name_it_never_accepted() {
+        let app = create_test_app().await;
+        let (status, body) = post_json(
+            &app,
+            "/hqplayer/setting",
+            &json!({ "name": "dither", "value": 3 }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unknown setting name is a bad request, as it always was. Body: {body}"
+        );
+        let json = assert_json("POST /hqplayer/setting (unknown name)", &body);
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("Unknown setting: dither"),
+            "the exact message this route already answered with — a different one means the name \
+             was accepted and something downstream refused it instead, which is the widening. \
+             Body: {body}"
+        );
+    }
+
+    /// The control for the check above: the gate must refuse only what the route never accepted.
+    /// `shaper` **is** one of its names, so it must get past the gate and fail downstream on the
+    /// unconfigured adapter instead.
+    #[tokio::test]
+    async fn the_legacy_setting_route_still_accepts_the_names_it_always_had() {
+        let app = create_test_app().await;
+        for name in ["mode", "filter", "filter1x", "filterNx", "shaper", "rate"] {
+            let (_, body) = post_json(
+                &app,
+                "/hqplayer/setting",
+                &json!({ "name": name, "value": 1 }),
+            )
+            .await;
+            assert!(
+                !body.contains("Unknown setting"),
+                "`{name}` is one of this route's own names and must reach the adapter; refusing it \
+                 would be the gate over-reaching. Body: {body}"
+            );
+        }
+    }
+
+    /// And the other side of the shared applier: `/hqp/pipeline` keeps accepting `dither`, so the
+    /// fix narrowed one route rather than both.
+    #[tokio::test]
+    async fn the_pipeline_route_still_accepts_dither() {
+        let app = create_test_app().await;
+        let (_, body) = post_json(
+            &app,
+            "/hqp/pipeline",
+            &json!({ "setting": "dither", "value": "NS9" }),
+        )
+        .await;
+
+        assert!(
+            !body.contains("Invalid setting"),
+            "`dither` is one of /hqp/pipeline's valid settings and must stay one — this route's \
+             own gate rejects with `Invalid setting`. Body: {body}"
+        );
+    }
+
+    /// `/hqp/pipeline`'s own gate is unchanged too: a setting it never accepted is still refused
+    /// with its own wording, which is a different message from the other route's.
+    #[tokio::test]
+    async fn the_pipeline_route_still_refuses_a_setting_it_never_accepted() {
+        let app = create_test_app().await;
+        let (status, body) = post_json(
+            &app,
+            "/hqp/pipeline",
+            &json!({ "setting": "convolution", "value": "on" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("Invalid setting"),
+            "each route keeps its own rejection wording; sharing an applier must not merge them. \
+             Body: {body}"
+        );
+    }
+}
