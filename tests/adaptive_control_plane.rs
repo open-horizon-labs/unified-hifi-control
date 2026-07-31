@@ -26,11 +26,11 @@ use unified_hifi_control::producers::control_plane::{
 };
 use unified_hifi_control::producers::surface::{
     admit_for_surface, project, project_with, timing_key, ChoiceProjection, Mutability,
-    ProjectionNotice, RenderedProjection, SurfaceProfile, SurfaceProjection, VerifiedSeries,
-    OMITTED_BUDGET_EXHAUSTED, OMITTED_CONTAINER_DROPPED, SURFACE_PROJECTION_SCHEMA,
-    TIMING_HELD_UNTIL_CHAIN_LOADED, TIMING_LIVE_IMMEDIATE, TIMING_PERSISTENT_ONLY,
-    TIMING_RESTART_REQUIRED, TIMING_UNKNOWN, TIMING_VERIFIED_PENDING, WITHHELD_PER_CHOICE_REASON,
-    WITHHELD_RISK_EXCEEDS_SURFACE, WITHHELD_UNRENDERABLE_KIND,
+    ProjectionNotice, RenderedProjection, SurfaceProfile, VerifiedSeries, OMITTED_BUDGET_EXHAUSTED,
+    OMITTED_CONTAINER_DROPPED, SURFACE_PROJECTION_SCHEMA, TIMING_HELD_UNTIL_CHAIN_LOADED,
+    TIMING_LIVE_IMMEDIATE, TIMING_PERSISTENT_ONLY, TIMING_RESTART_REQUIRED, TIMING_UNKNOWN,
+    TIMING_VERIFIED_PENDING, WITHHELD_PER_CHOICE_REASON, WITHHELD_RISK_EXCEEDS_SURFACE,
+    WITHHELD_UNDESCRIBABLE_APPLY, WITHHELD_UNRENDERABLE_KIND,
 };
 use unified_hifi_control::producers::{
     AdaptiveRuntime, ProducerKey, ProducerPresence, ProducerSnapshot,
@@ -77,14 +77,7 @@ fn snapshot(document: ProducerDocument) -> ProducerSnapshot {
 }
 
 fn rendered(document: ProducerDocument, profile: &SurfaceProfile) -> RenderedProjection {
-    let snapshot = snapshot(document);
-    match project(&snapshot, profile) {
-        SurfaceProjection::Rendered(rendered) => *rendered,
-        SurfaceProjection::Fallback(fallback) => panic!(
-            "expected a rendered projection for {}, got a fallback: {:?}",
-            profile.surface_id, fallback.refusal
-        ),
-    }
+    project(&snapshot(document), profile)
 }
 
 fn rendered_with(
@@ -92,13 +85,7 @@ fn rendered_with(
     profile: &SurfaceProfile,
     verified: &VerifiedSeries,
 ) -> RenderedProjection {
-    let snapshot = snapshot(document);
-    match project_with(&snapshot, profile, verified) {
-        SurfaceProjection::Rendered(rendered) => *rendered,
-        SurfaceProjection::Fallback(fallback) => {
-            panic!("expected a rendered projection, got {:?}", fallback.refusal)
-        }
-    }
+    project_with(&snapshot(document), profile, verified)
 }
 
 /// The release series this build has verified, supplied the way the composition root supplies it.
@@ -306,6 +293,7 @@ fn the_only_prose_keys_this_layer_originates_are_its_own_declared_ones() {
         WITHHELD_UNRENDERABLE_KIND,
         WITHHELD_PER_CHOICE_REASON,
         WITHHELD_RISK_EXCEEDS_SURFACE,
+        WITHHELD_UNDESCRIBABLE_APPLY,
     ];
     let omitted_keys = [OMITTED_BUDGET_EXHAUSTED, OMITTED_CONTAINER_DROPPED];
 
@@ -337,6 +325,83 @@ fn the_only_prose_keys_this_layer_originates_are_its_own_declared_ones() {
     assert!(
         withheld + view.omitted.len() > 0,
         "the fixture must actually exercise this"
+    );
+}
+
+#[test]
+fn an_apply_effect_this_build_cannot_describe_is_not_advertised_as_invokable() {
+    let mut document = pipeline();
+    if let Some(apply) = control_mut(&mut document, "hqplayer.pipeline.mode")
+        .apply
+        .as_mut()
+    {
+        apply.effect = ApplyEffect::Unrecognized("audible_next_tuesday".to_string());
+    }
+    let view = rendered(document, &web());
+    let mode = view.control("hqplayer.pipeline.mode").expect("projected");
+
+    match &mode.mutability {
+        Mutability::WithheldFromSurface { reason } => assert_eq!(
+            reason.display_text_key.as_deref(),
+            Some(WITHHELD_UNDESCRIBABLE_APPLY),
+            "an effect this build cannot name must not be offered; `timing_key` would fall back to \
+             an admission rather than a description"
+        ),
+        other => panic!("expected the undescribable effect to be withheld, got {other:?}"),
+    }
+    assert!(
+        mode.observed.is_some(),
+        "and the control keeps rendering, because the value is still readable"
+    );
+}
+
+#[test]
+fn a_bounded_surface_discloses_staged_edits_it_cannot_show() {
+    // `filter_1x` carries a grounded `desired` lane and `chain.sdm.filter` a grounded `held` one.
+    // A six-control knob receives neither, and must still be able to say edits are waiting.
+    let view = rendered(pipeline(), &device(6));
+    let waiting: Vec<&str> = view
+        .staged_elsewhere
+        .iter()
+        .map(ControlId::as_str)
+        .collect();
+
+    assert!(
+        waiting.contains(&"hqplayer.pipeline.filter_1x")
+            && waiting.contains(&"hqplayer.chain.sdm.filter"),
+        "a surface showing a subset must disclose intent it is hiding: {waiting:?}"
+    );
+    assert!(
+        !waiting.contains(&"hqplayer.volume.level"),
+        "a control the surface *did* receive is not elsewhere"
+    );
+
+    let unbounded = rendered(pipeline(), &web());
+    assert!(
+        unbounded.staged_elsewhere.is_empty(),
+        "nothing is elsewhere when everything is here: {:?}",
+        unbounded.staged_elsewhere
+    );
+}
+
+#[test]
+fn mcp_keeps_the_capability_the_shipped_tool_already_has() {
+    // `hifi_hqplayer_set_pipeline` lets an assistant change mode today, and mode is
+    // `playback_interruption`. A stricter default ceiling would look like a projection detail while
+    // silently removing a shipped capability.
+    let view = rendered(pipeline(), &mcp());
+    assert!(
+        view.control("hqplayer.pipeline.mode")
+            .expect("projected")
+            .is_mutable_here(),
+        "MCP must still be able to drive the pipeline mode"
+    );
+    assert!(
+        !view
+            .control("hqplayer.settings.legacy_dither")
+            .expect("projected")
+            .is_mutable_here(),
+        "and must still not be offered an operation that destroys retained configuration"
     );
 }
 
@@ -719,8 +784,7 @@ fn a_verified_product_version_raises_no_untested_notice() {
 fn a_last_known_producer_says_so_rather_than_looking_current() {
     let mut snapshot = snapshot(pipeline());
     snapshot.presence = ProducerPresence::LastKnown;
-    let projection = project(&snapshot, &web());
-    let view = projection.rendered().expect("last-known still renders");
+    let view = project(&snapshot, &web());
 
     assert_eq!(view.presence, ProducerPresence::LastKnown);
     assert!(
@@ -1440,10 +1504,9 @@ async fn a_projection_and_a_command_agree_about_the_position_to_fence_on() {
     let service = service.with_executor(executor.clone());
     let key = ProducerKey::of(&pipeline());
 
-    let projection = service
+    let view = service
         .project(&key, &web())
         .expect("the producer is admitted");
-    let view = projection.rendered().expect("rendered");
 
     service
         .submit(command_for(&key, view.position))

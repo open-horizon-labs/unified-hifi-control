@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use crate::adaptive::{ApplyLane, ControlId, ControlValue, OperationRecord, RevisionRef};
 use crate::bus::events::PrefixedZoneId;
 
-use super::surface::{project_with, SurfaceProfile, SurfaceProjection, VerifiedSeries};
+use super::surface::{project_with, RenderedProjection, SurfaceProfile, VerifiedSeries};
 use super::{AdaptiveView, ProducerKey, ProducerSnapshot};
 
 /// Why a zone id did not resolve to a producer.
@@ -229,7 +229,7 @@ impl ControlPlaneService {
         &self,
         key: &ProducerKey,
         profile: &SurfaceProfile,
-    ) -> Option<SurfaceProjection> {
+    ) -> Option<RenderedProjection> {
         self.view
             .snapshot(key)
             .map(|snapshot| project_with(&snapshot, profile, &self.verified))

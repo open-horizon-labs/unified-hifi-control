@@ -68,6 +68,8 @@ pub const WITHHELD_UNRENDERABLE_KIND: &str = "surface.withheld.unrenderable_kind
 pub const WITHHELD_PER_CHOICE_REASON: &str = "surface.withheld.per_choice_reason";
 /// Catalog key for a control whose risk class exceeds what this surface may offer.
 pub const WITHHELD_RISK_EXCEEDS_SURFACE: &str = "surface.withheld.risk_exceeds_surface";
+/// Catalog key for a control whose apply semantics this build cannot describe.
+pub const WITHHELD_UNDESCRIBABLE_APPLY: &str = "surface.withheld.undescribable_apply";
 /// Catalog key for a control dropped because the surface's control budget was exhausted.
 pub const OMITTED_BUDGET_EXHAUSTED: &str = "surface.omitted.budget_exhausted";
 /// Catalog key for a control dropped because the container it belongs to was dropped.
@@ -146,13 +148,19 @@ impl SurfaceProfile {
         }
     }
 
-    /// An AI tool client: every primitive is expressible as data, but nothing confirms at invoke
-    /// time, so a destructive operation is not advertised as invokable.
+    /// An AI tool client: every primitive is expressible as data, and nothing confirms at invoke
+    /// time.
+    ///
+    /// The ceiling is `Disruptive` rather than `Caution` deliberately. `hifi_hqplayer_set_pipeline`
+    /// already lets an assistant change mode today, and mode is `playback_interruption`; a stricter
+    /// default would look like a projection detail while silently removing a shipped capability the
+    /// moment MCP adopted this profile. `Destructive` stays out: losing retained configuration is
+    /// not recoverable by re-issuing the opposite command.
     pub fn mcp() -> Self {
         Self {
             surface_id: "mcp".to_string(),
             capabilities: SurfaceCapabilities {
-                max_risk: RiskClass::Caution,
+                max_risk: RiskClass::Disruptive,
                 ..SurfaceCapabilities::unrestricted()
             },
             budget: SurfaceBudget::default(),
@@ -255,33 +263,6 @@ pub struct FallbackProjection {
     pub declared_schema: Option<String>,
     /// Why the document was not admitted.
     pub refusal: Refusal,
-}
-
-/// What a surface receives.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SurfaceProjection {
-    /// The document was admitted and projected.
-    Rendered(Box<RenderedProjection>),
-    /// The document could not be admitted at this schema generation.
-    Fallback(FallbackProjection),
-}
-
-impl SurfaceProjection {
-    /// The rendered projection, if this is one.
-    pub fn rendered(&self) -> Option<&RenderedProjection> {
-        match self {
-            Self::Rendered(rendered) => Some(rendered),
-            Self::Fallback(_) => None,
-        }
-    }
-
-    /// The surface this projection was produced for.
-    pub fn surface_id(&self) -> &str {
-        match self {
-            Self::Rendered(rendered) => &rendered.surface_id,
-            Self::Fallback(fallback) => &fallback.surface_id,
-        }
-    }
 }
 
 /// Producer identity, as a surface needs it.
@@ -627,6 +608,11 @@ pub struct RenderedProjection {
     pub controls: Vec<ProjectedControl>,
     /// Controls this surface did not receive, and why.
     pub omitted: Vec<OmittedControl>,
+    /// Controls with unapplied intent that this surface did not receive.
+    ///
+    /// Disclosure, not an instruction: a bounded surface must be able to say that edits are waiting
+    /// where the user cannot see them, without applying, discarding or blocking on them.
+    pub staged_elsewhere: Vec<ControlId>,
     /// What the surface must tell the user about the projection as a whole.
     pub notices: Vec<ProjectionNotice>,
 }
@@ -691,7 +677,7 @@ fn legible_string(raw: &serde_json::Value, path: &[&str]) -> Option<String> {
 // =============================================================================
 
 /// Project one admitted snapshot for one surface, with no opinion about backend releases.
-pub fn project(snapshot: &ProducerSnapshot, profile: &SurfaceProfile) -> SurfaceProjection {
+pub fn project(snapshot: &ProducerSnapshot, profile: &SurfaceProfile) -> RenderedProjection {
     project_with(snapshot, profile, &VerifiedSeries::default())
 }
 
@@ -700,7 +686,7 @@ pub fn project_with(
     snapshot: &ProducerSnapshot,
     profile: &SurfaceProfile,
     verified: &VerifiedSeries,
-) -> SurfaceProjection {
+) -> RenderedProjection {
     let document = snapshot.document.as_ref();
     let mut notices = document_notices(snapshot, document, verified);
 
@@ -708,12 +694,14 @@ pub fn project_with(
     let ranked = rank_controls(document, profile);
     let (kept, omitted) = apply_budget(document, ranked, profile, &mut notices);
 
+    let staged_elsewhere = staged_outside(document, &kept);
+
     let controls: Vec<ProjectedControl> = kept
         .iter()
         .map(|control| project_control(control, document, profile, &invalidation, &mut notices))
         .collect();
 
-    SurfaceProjection::Rendered(Box::new(RenderedProjection {
+    RenderedProjection {
         schema: SURFACE_PROJECTION_SCHEMA,
         surface_id: profile.surface_id.clone(),
         producer: projected_producer(document),
@@ -723,8 +711,41 @@ pub fn project_with(
         groups: project_groups(document, profile),
         controls,
         omitted,
+        staged_elsewhere,
         notices,
-    }))
+    }
+}
+
+/// Controls holding unapplied intent that this surface did not receive.
+///
+/// A surface that shows a subset must still be able to say "there are edits waiting somewhere you
+/// cannot see" — the alternative is a user who applies what is in front of them and silently ships
+/// changes they forgot about, or who cannot find the change the system says is pending. Disclosure
+/// only: this is not an instruction to apply, discard, or block on them.
+fn staged_outside(document: &ProducerDocument, kept: &[&Control]) -> Vec<ControlId> {
+    let present: BTreeSet<&ControlId> = kept.iter().map(|control| &control.id).collect();
+    let mut waiting: BTreeSet<ControlId> = document
+        .controls
+        .iter()
+        .filter(|control| !present.contains(&control.id))
+        .filter(|control| {
+            [ValueLane::Desired, ValueLane::Held].iter().any(|lane| {
+                control
+                    .lane(lane)
+                    .and_then(LaneValue::grounded_value)
+                    .is_some()
+            })
+        })
+        .map(|control| control.id.clone())
+        .collect();
+    for change_set in &document.change_sets {
+        for entry in &change_set.entries {
+            if !present.contains(&entry.control) {
+                waiting.insert(entry.control.clone());
+            }
+        }
+    }
+    waiting.into_iter().collect()
 }
 
 fn projected_producer(document: &ProducerDocument) -> ProjectedProducer {
@@ -1183,10 +1204,34 @@ fn project_mutability(control: &Control, profile: &SurfaceProfile) -> Mutability
         return withheld(WITHHELD_RISK_EXCEEDS_SURFACE, apply.risk.as_str());
     }
 
+    // A newer minor can add an apply lane, effect or disruption this build has never heard of. The
+    // value still round-trips and the control still renders — but "where does this write go", "when
+    // does it become true" and "what will I hear" are the three things every surface tells the user
+    // before it offers a write, and an unrecognized member answers none of them. Offering it anyway
+    // is how a tool description stops being true; `timing_key` would fall back to
+    // [`TIMING_UNKNOWN`], which is an admission, not a description.
+    if let Some(unknown) = undescribable(apply) {
+        return withheld(WITHHELD_UNDESCRIBABLE_APPLY, unknown);
+    }
+
     Mutability::Mutable {
         apply: Box::new(apply.clone()),
         description: describe(apply),
     }
+}
+
+/// The first apply-semantics member this build does not recognize, if any.
+fn undescribable(apply: &ApplySemantics) -> Option<&str> {
+    if !apply.lane.is_recognized() {
+        return Some(apply.lane.as_str());
+    }
+    if !apply.effect.is_recognized() {
+        return Some(apply.effect.as_str());
+    }
+    if !apply.disruption.is_recognized() {
+        return Some(apply.disruption.as_str());
+    }
+    None
 }
 
 fn withheld(display_text_key: &str, detail: &str) -> Mutability {
