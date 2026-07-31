@@ -21,7 +21,7 @@ Use GitHub for all task tracking:
 **Purpose:** Propose implementations for review
 - Link to the issue being addressed: `Fixes #123`
 - Describe what changed and how to test
-- Request review from coderabbit and superego
+- Request review from coderabbit
 
 ### Merging PRs
 **TEST BEFORE MERGING.** Do not merge PRs without testing.
@@ -46,15 +46,7 @@ Use GitHub for all task tracking:
 
 ## Code Review
 
-This project uses two complementary review tools:
-
-### superego (Metacognitive Advisor)
-**When to use:** Before commits, when choosing between approaches, when uncertain
-**Protocol:**
-- Mode: `pull` (reviews on request, not automatically)
-- Use `sg review` at decision points during development
-- Post superego reviews to PRs for visibility
-- Handle findings: P1-P3 fix immediately, P4 can discard with reason
+This project uses CodeRabbit for automated pull-request review:
 
 ### coderabbit (Automated Code Review)
 **When to use:** Automatically runs on all PRs
@@ -62,13 +54,6 @@ This project uses two complementary review tools:
 - Reviews code style, potential bugs, and best practices
 - Address feedback before merging
 - Use `@coderabbit` in PR comments to ask questions
-
-### wm (Working Memory)
-**When to use:** Automatic - captures learnings from sessions
-**Protocol:**
-- Runs automatically via hooks
-- Extracts tacit knowledge from completed work
-- No manual intervention needed
 
 ---
 
