@@ -99,7 +99,15 @@ else
     fi
 fi
 
-python3 -S -m json.tool "${SYNOLOGY_DIR}/conf/privilege" >/dev/null || fail "conf/privilege is invalid JSON"
+privilege_file="${SYNOLOGY_DIR}/conf/privilege"
+python3 -S -m json.tool "$privilege_file" >/dev/null || fail "conf/privilege is invalid JSON"
+postuninst_run_as=$(python3 -S -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    privilege = json.load(source)
+print(next((entry.get("run-as", "") for entry in privilege.get("ctrl-script", []) if entry.get("action") == "postuninst"), ""))
+' "$privilege_file")
+[[ "$postuninst_run_as" == root ]] || fail "postuninst must run as root so it can remove the package @appdata directory"
 python3 -S -m json.tool "${SYNOLOGY_DIR}/conf/resource" >/dev/null || fail "conf/resource is invalid JSON"
 assert_contains "${SYNOLOGY_DIR}/conf/resource" '"port-config"' "conf/resource must register the package firewall protocol file"
 

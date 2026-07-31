@@ -2,7 +2,39 @@
 # Post-uninstallation script
 # Runs after package files are removed
 
-# DSM removes the package-owned FHS directories after this hook. Persistent
-# user data is intentionally left to the package framework.
+PACKAGE_NAME="unified-hifi-control"
+
+# DSM deliberately preserves SYNOPKG_PKGVAR across package removal. Resolve
+# its /var/packages symlink so the backing @appdata directory is removed on a
+# true uninstall, while retaining it when this hook runs during an upgrade.
+if [ "${SYNOPKG_PKG_STATUS:-}" = "UNINSTALL" ] && [ -n "${SYNOPKG_PKGVAR:-}" ]; then
+    PACKAGE_VAR=$(readlink -f "$SYNOPKG_PKGVAR")
+    PACKAGE_VOLUME=${SYNOPKG_PKGDEST_VOL:-}
+    VOLUME_NUMBER=${PACKAGE_VOLUME#/volume}
+
+    case "$PACKAGE_VOLUME" in
+        /volume*)
+            ;;
+        *)
+            echo "Refusing to remove package data for unexpected volume: $PACKAGE_VOLUME" >&2
+            exit 1
+            ;;
+    esac
+
+    case "$VOLUME_NUMBER" in
+        ""|0*|*[!0-9]*)
+            echo "Refusing to remove package data for unexpected volume: $PACKAGE_VOLUME" >&2
+            exit 1
+            ;;
+    esac
+
+    EXPECTED_PACKAGE_VAR="${PACKAGE_VOLUME}/@appdata/${PACKAGE_NAME}"
+    if [ "$PACKAGE_VAR" != "$EXPECTED_PACKAGE_VAR" ]; then
+        echo "Refusing to remove unexpected package data path: $PACKAGE_VAR" >&2
+        exit 1
+    fi
+
+    rm -rf -- "$PACKAGE_VAR"
+fi
 
 exit 0
