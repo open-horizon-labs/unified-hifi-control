@@ -30,8 +30,7 @@ fn package_metadata_matches_packaged_files() {
     );
     assert!(
         !PKGBUILD.lines().any(|line| {
-            line.trim_start().starts_with('"')
-                && line.contains("${_pkgname}.install")
+            line.trim_start().starts_with('"') && line.contains("${_pkgname}.install")
         }),
         ".install files are handled by makepkg and must not be sources"
     );
@@ -62,9 +61,7 @@ fn package_metadata_matches_packaged_files() {
 #[test]
 fn service_uses_systemd_managed_writable_state() {
     assert!(SERVICE.contains("StateDirectory=unified-hifi-control"));
-    assert!(
-        SERVICE.contains("Environment=CONFIG_DIR=/var/lib/unified-hifi-control")
-    );
+    assert!(SERVICE.contains("Environment=CONFIG_DIR=/var/lib/unified-hifi-control"));
     assert!(!SERVICE.contains("Environment=DATA_DIR="));
     assert!(!SERVICE.contains("Environment=CONFIG_DIR=/etc/"));
     assert!(!SERVICE.contains("ConfigurationDirectory="));
