@@ -1529,12 +1529,18 @@ impl HqpAdapter {
     /// *movement*, and with nothing cached there is no movement to report. This one is about
     /// *presence*, and it has to be asked again after the reads — a reconnect between the two
     /// empties the cache behind the answer.
+    ///
+    /// A missing `rates_fingerprint` counts as incomplete too. Current writers update it in lockstep
+    /// with `rates`, so this is defensive invariant enforcement rather than a separately reachable
+    /// state today. It is what the lists were filled *from*: without it there is nothing for
+    /// [`Self::chain_still_matches_cache`] to compare against and the lists would be unanchored.
     async fn chain_lists_incomplete(&self) -> bool {
         let cached = self.state.read().await;
         cached.modes.is_empty()
             || cached.filters.is_empty()
             || cached.shapers.is_empty()
             || cached.rates.is_empty()
+            || cached.rates_fingerprint.is_none()
     }
 
     /// Whether the daemon's chain still matches the one the cache was filled from, **publishing

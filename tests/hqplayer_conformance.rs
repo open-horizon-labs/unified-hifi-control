@@ -7305,12 +7305,7 @@ async fn a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles
     let web = FakeConfigWeb::start(CONFIG_PAGE_RAW_LANE, PROFILE_PAGE_SEMANTIC_LANE).await;
     let h = Harness::start(
         VERIFIED_PROFILE,
-        WirePolicy {
-            // Declared, not yet live: the cache below has to fill successfully first, or the test
-            // would be about a daemon that never worked rather than one that stopped.
-            silent_for_element_when_armed: Some("GetShapers".to_string()),
-            ..WirePolicy::default()
-        },
+        WirePolicy::default(),
         HqpTimeouts {
             max_attempts: 1,
             ..fast_timeouts()
@@ -7349,8 +7344,21 @@ async fn a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles
         "precondition: the pre-load shapers are cached, got {stale:?}"
     );
 
-    // The profile load succeeds; the refresh that follows it cannot complete.
-    h.server.arm_element_silence();
+    // The profile load succeeds; the refresh that follows it cannot complete. Armed only now, after
+    // the cache above filled successfully — otherwise the test would be about a daemon that never
+    // worked rather than one that stopped.
+    h.model.arm(|f| {
+        // One rejection breaks the eager post-load refresh; two more cover the read path's bounded
+        // retry. On the broken implementation only the first is consumed because the stale cache
+        // makes the read skip both fills. On the fixed implementation the cache is empty, so the
+        // read must either establish fresh lists or fail explicitly rather than publish the old ones.
+        for _ in 0..3 {
+            f.reject_next.push((
+                "GetShapers".to_string(),
+                "post-profile refresh refused".to_string(),
+            ));
+        }
+    });
     h.adapter
         .load_profile("raw-a")
         .await
@@ -7402,6 +7410,13 @@ async fn a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles
 /// `isolate_config_dir` exists to protect a real user's config, not to test persistence.
 ///
 /// The adapter keeps its credentials in memory throughout, which is what the caller actually needs.
+///
+/// Two callers of this helper running at once would defeat it: `UHC_CONFIG_DIR` is one process-wide
+/// variable, so the second one's restore writes back whichever value it happened to read — the
+/// *other* caller's scratch path, already deleted — and every later `HqpAdapter::new` reads from a
+/// directory that no longer exists. The lock below makes the redirect-and-restore one indivisible
+/// step. It is async because the `configure` it wraps is, and holding a `std::sync::Mutex` across an
+/// await would block the runtime worker rather than yield it.
 async fn configure_without_persisting(
     adapter: &HqpAdapter,
     host: &str,
@@ -7410,6 +7425,13 @@ async fn configure_without_persisting(
     user: &str,
     password: &str,
 ) {
+    static CONFIG_DIR_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    let _guard = CONFIG_DIR_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
     let previous = std::env::var("UHC_CONFIG_DIR").expect("the suite isolates the config dir");
     let scratch = std::path::Path::new(&previous).join(format!(
         "no-persist-{}-{:?}",
