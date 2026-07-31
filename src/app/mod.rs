@@ -18,9 +18,67 @@ use settings_context::use_settings_provider;
 use sse::use_sse_provider;
 use theme::use_theme_provider;
 
+/// MCP connection details injected by the server during SSR.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpEndpoint {
+    pub url: String,
+}
+
+impl McpEndpoint {
+    pub fn new(host: &str, port: u16) -> Self {
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+
+        Self {
+            url: format!("http://{host}:{port}/mcp"),
+        }
+    }
+
+    pub fn agent_config(&self) -> String {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {
+                "unified-hifi-control": {
+                    "type": "http",
+                    "url": self.url,
+                }
+            }
+        }))
+        .unwrap_or_default()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn from_document() -> Option<Self> {
+        const META_SELECTOR: &str = "meta[name=\"uhc-mcp-endpoint\"]";
+
+        let document = web_sys::window()?.document()?;
+        let element = document.query_selector(META_SELECTOR).ok()??;
+        let url = element.get_attribute("content")?;
+        Some(Self { url })
+    }
+}
+
+impl Default for McpEndpoint {
+    fn default() -> Self {
+        Self::new("your-bridge-host", 8088)
+    }
+}
+
 /// Root app component with routing
 #[component]
 pub fn App() -> Element {
+    // SSR injects a reachable LAN endpoint. During hydration, read the same
+    // value from the rendered document so client and server markup agree.
+    #[cfg(target_arch = "wasm32")]
+    let mcp_endpoint = try_consume_context::<McpEndpoint>()
+        .or_else(McpEndpoint::from_document)
+        .unwrap_or_default();
+    #[cfg(not(target_arch = "wasm32"))]
+    let mcp_endpoint = try_consume_context::<McpEndpoint>().unwrap_or_default();
+    use_context_provider(|| mcp_endpoint.clone());
+
     // Initialize SSE context at app root (single EventSource for all pages)
     use_sse_provider();
 
@@ -31,6 +89,10 @@ pub fn App() -> Element {
     use_settings_provider();
 
     rsx! {
+        document::Meta {
+            name: "uhc-mcp-endpoint",
+            content: "{mcp_endpoint.url}"
+        }
         Router::<Route> {}
     }
 }
@@ -48,4 +110,34 @@ pub enum Route {
     Knobs {},
     #[route("/settings")]
     Settings {},
+}
+
+#[cfg(test)]
+mod tests {
+    use super::McpEndpoint;
+
+    #[test]
+    fn mcp_endpoint_uses_reachable_ipv4_address_in_agent_config() {
+        let endpoint = McpEndpoint::new("192.168.1.24", 8088);
+
+        assert_eq!(endpoint.url, "http://192.168.1.24:8088/mcp");
+        assert_eq!(
+            endpoint.agent_config(),
+            r#"{
+  "mcpServers": {
+    "unified-hifi-control": {
+      "type": "http",
+      "url": "http://192.168.1.24:8088/mcp"
+    }
+  }
+}"#
+        );
+    }
+
+    #[test]
+    fn mcp_endpoint_brackets_ipv6_addresses() {
+        let endpoint = McpEndpoint::new("fd00::24", 9000);
+
+        assert_eq!(endpoint.url, "http://[fd00::24]:9000/mcp");
+    }
 }

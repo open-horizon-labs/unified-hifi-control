@@ -64,6 +64,33 @@ mod server {
         Redirect::to("/settings")
     }
 
+    /// Resolve the primary address other devices use to reach this host.
+    /// Connecting a UDP socket selects the default route without sending data.
+    fn primary_non_loopback_ip() -> Option<std::net::IpAddr> {
+        let routed_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| {
+                socket.connect("192.0.2.1:80")?;
+                socket.local_addr()
+            })
+            .ok()
+            .map(|addr| addr.ip())
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+
+        routed_ip.or_else(|| {
+            if_addrs::get_if_addrs()
+                .ok()?
+                .into_iter()
+                .filter(|interface| !interface.is_loopback() && !interface.is_link_local())
+                .map(|interface| interface.ip())
+                .min_by_key(|ip| match ip {
+                    std::net::IpAddr::V4(ip) if ip.is_private() => 0,
+                    std::net::IpAddr::V4(_) => 1,
+                    std::net::IpAddr::V6(ip) if ip.is_unique_local() => 2,
+                    std::net::IpAddr::V6(_) => 3,
+                })
+        })
+    }
+
     pub async fn run() -> Result<()> {
         // Initialize logging
         // Priority: RUST_LOG > LOG_LEVEL (legacy) > default
@@ -120,6 +147,18 @@ mod server {
             gethostname::gethostname().to_string_lossy(),
             config.port
         );
+        let mcp_host = primary_non_loopback_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| {
+                format!(
+                    "{}.local",
+                    gethostname::gethostname()
+                        .to_string_lossy()
+                        .trim_end_matches(".local")
+                )
+            });
+        let mcp_endpoint = app::McpEndpoint::new(&mcp_host, config.port);
+        tracing::info!("MCP agent endpoint: {}", mcp_endpoint.url);
 
         // =========================================================================
         // Create all adapter instances (needed for API handlers regardless of state)
@@ -455,25 +494,26 @@ mod server {
         // serve_api_application() provides SSR + server functions, but no static assets
         // Our middleware injects the bootstrap scripts (from embedded index.html) into SSR HTML
         // This enables WASM hydration without requiring a public/ directory at runtime
+        let serve_config = || dioxus::server::ServeConfig::new().context(mcp_endpoint.clone());
         let router = if embedded::has_embedded_assets() {
             if let Some(bootstrap) = embedded::extract_bootstrap_snippet() {
                 tracing::info!("Using embedded SSR mode (bootstrap scripts will be injected)");
                 tracing::debug!("Bootstrap snippet:\n{}", bootstrap);
                 router
-                    .serve_api_application(dioxus::server::ServeConfig::new(), app::App)
+                    .serve_api_application(serve_config(), app::App)
                     .layer(embedded::InjectDioxusBootstrapLayer::new(bootstrap))
             } else {
                 tracing::warn!(
                     "Embedded assets found but no bootstrap scripts - falling back to SPA"
                 );
                 router
-                    .serve_api_application(dioxus::server::ServeConfig::new(), app::App)
+                    .serve_api_application(serve_config(), app::App)
                     .fallback(embedded::serve_index_html)
             }
         } else {
             tracing::info!("Using SSR mode (no embedded assets, use dx serve for development)");
             // Standard SSR mode for development
-            router.serve_dioxus_application(dioxus::server::ServeConfig::new(), app::App)
+            router.serve_dioxus_application(serve_config(), app::App)
         };
 
         // Start server with graceful shutdown

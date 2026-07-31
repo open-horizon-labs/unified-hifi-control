@@ -9,6 +9,7 @@ use crate::app::components::Layout;
 use crate::app::settings_context::use_settings;
 use crate::app::sse::use_sse;
 use crate::app::theme::{use_theme, Theme};
+use crate::app::McpEndpoint;
 
 /// OpenHome status response
 #[derive(Clone, Debug, Default, serde::Deserialize, PartialEq)]
@@ -28,6 +29,8 @@ pub fn Settings() -> Element {
     let sse = use_sse();
     let theme_ctx = use_theme();
     let settings_ctx = use_settings();
+    let mcp_endpoint = use_context::<McpEndpoint>();
+    let agent_config = mcp_endpoint.agent_config();
 
     // Adapter toggle signals
     let mut roon_enabled = use_signal(|| true);
@@ -141,6 +144,69 @@ pub fn Settings() -> Element {
 
             h1 { class: "text-2xl font-bold mb-6", "Settings" }
 
+            // MCP discovery and agent onboarding
+            section { class: "mb-8", aria_labelledby: "mcp-server-heading",
+                div { class: "card overflow-hidden",
+                    div { class: "px-5 py-5 sm:px-6 sm:py-6 border-b border-default flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between",
+                        div { class: "max-w-3xl",
+                            h2 {
+                                id: "mcp-server-heading",
+                                class: "text-xl font-semibold",
+                                "You have an MCP server"
+                            }
+                            p { class: "mt-2 text-secondary max-w-2xl",
+                                "MCP (Model Context Protocol) is how compatible AI agents connect to your hi-fi tools. It is already running with Unified Hi-Fi Control—there is nothing else to install."
+                            }
+                        }
+                        span { class: "badge badge-secondary gap-2 self-start shrink-0",
+                            span {
+                                class: "block size-2 rounded-full bg-emerald-500",
+                                aria_hidden: "true"
+                            }
+                            "Available now"
+                        }
+                    }
+
+                    div { class: "grid lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]",
+                        div { class: "min-w-0 px-5 py-5 sm:px-6 sm:py-6 lg:border-r border-default",
+                            h3 { class: "font-semibold", "Your MCP address" }
+                            p { class: "mt-2 text-sm text-secondary max-w-prose",
+                                "This URL uses this device's network address—not localhost—so an agent on another device can reach it."
+                            }
+                            div { class: "mt-4",
+                                p { class: "text-xs font-medium text-muted", "MCP URL" }
+                                code {
+                                    class: "mt-2 block w-full min-w-0 overflow-x-auto rounded-md bg-hover px-3 py-3 text-sm select-all",
+                                    "{mcp_endpoint.url}"
+                                }
+                            }
+                            p { class: "mt-4 text-xs text-muted max-w-prose",
+                                "Keep Unified Hi-Fi Control running, and only connect agents you trust. Connected agents can control playback on your system."
+                            }
+                        }
+
+                        div { class: "min-w-0 px-5 py-5 sm:px-6 sm:py-6 bg-[var(--surface-base)]",
+                            h3 { class: "font-semibold", "Set up an agent" }
+                            ol { class: "mt-3 space-y-4 list-decimal pl-5 text-sm text-secondary",
+                                li {
+                                    p { "Open your agent's MCP settings and add this JSON." }
+                                    pre {
+                                        class: "mt-3 w-full min-w-0 overflow-x-auto rounded-md bg-hover p-4 text-xs leading-relaxed text-primary",
+                                        aria_label: "MCP server configuration",
+                                        code { "{agent_config}" }
+                                    }
+                                }
+                                li { "Restart or reload the agent so it discovers the new server." }
+                                li { "Ask the agent to list your hi-fi zones to confirm the connection." }
+                            }
+                            p { class: "mt-4 text-xs text-muted",
+                                "If your agent uses a different configuration format, give it the MCP URL shown here."
+                            }
+                        }
+                    }
+                }
+            }
+
             // Features section (adapters + page visibility)
             section { class: "mb-8",
                 div { class: "mb-4",
@@ -148,7 +214,7 @@ pub fn Settings() -> Element {
                     p { class: "text-muted text-sm", "Zone sources and page visibility" }
                 }
 
-                div { class: "card p-6",
+                div { class: "card overflow-x-auto p-4 sm:p-6",
                     table { class: "w-full", id: "features-table",
                         thead {
                             tr { class: "border-b border-default",
@@ -161,14 +227,16 @@ pub fn Settings() -> Element {
                             // Roon (adapter only, no dedicated page)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "checkbox",
-                                        aria_label: "Enable Roon",
-                                        checked: roon_enabled(),
-                                        onchange: move |_| {
-                                            roon_enabled.toggle();
-                                            save_settings();
+                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "checkbox",
+                                            aria_label: "Enable Roon",
+                                            checked: roon_enabled(),
+                                            onchange: move |_| {
+                                                roon_enabled.toggle();
+                                                save_settings();
+                                            }
                                         }
                                     }
                                 }
@@ -196,14 +264,16 @@ pub fn Settings() -> Element {
                             // OpenHome (adapter only, no dedicated page)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "checkbox",
-                                        aria_label: "Enable OpenHome",
-                                        checked: openhome_enabled(),
-                                        onchange: move |_| {
-                                            openhome_enabled.toggle();
-                                            save_settings();
+                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "checkbox",
+                                            aria_label: "Enable OpenHome",
+                                            checked: openhome_enabled(),
+                                            onchange: move |_| {
+                                                openhome_enabled.toggle();
+                                                save_settings();
+                                            }
                                         }
                                     }
                                 }
@@ -227,14 +297,16 @@ pub fn Settings() -> Element {
                             // UPnP/DLNA
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "checkbox",
-                                        aria_label: "Enable UPnP/DLNA",
-                                        checked: upnp_enabled(),
-                                        onchange: move |_| {
-                                            upnp_enabled.toggle();
-                                            save_settings();
+                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "checkbox",
+                                            aria_label: "Enable UPnP/DLNA",
+                                            checked: upnp_enabled(),
+                                            onchange: move |_| {
+                                                upnp_enabled.toggle();
+                                                save_settings();
+                                            }
                                         }
                                     }
                                 }
@@ -258,14 +330,16 @@ pub fn Settings() -> Element {
                             // LMS (adapter + page)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "checkbox",
-                                        aria_label: "Enable LMS",
-                                        checked: lms_enabled(),
-                                        onchange: move |_| {
-                                            lms_enabled.toggle();
-                                            save_settings();
+                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "checkbox",
+                                            aria_label: "Enable LMS",
+                                            checked: lms_enabled(),
+                                            onchange: move |_| {
+                                                lms_enabled.toggle();
+                                                save_settings();
+                                            }
                                         }
                                     }
                                 }
@@ -293,14 +367,16 @@ pub fn Settings() -> Element {
                             // HQPlayer (adapter + page)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "checkbox",
-                                        aria_label: "Enable HQPlayer",
-                                        checked: hqplayer_enabled(),
-                                        onchange: move |_| {
-                                            hqplayer_enabled.toggle();
-                                            save_settings();
+                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "checkbox",
+                                            aria_label: "Enable HQPlayer",
+                                            checked: hqplayer_enabled(),
+                                            onchange: move |_| {
+                                                hqplayer_enabled.toggle();
+                                                save_settings();
+                                            }
                                         }
                                     }
                                 }
@@ -324,14 +400,16 @@ pub fn Settings() -> Element {
                             // Knobs (page only, no adapter)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    input {
-                                        r#type: "checkbox",
-                                        class: "checkbox",
-                                        aria_label: "Show Knobs page",
-                                        checked: !hide_knobs(),
-                                        onchange: move |_| {
-                                            hide_knobs.toggle();
-                                            save_settings();
+                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "checkbox",
+                                            aria_label: "Show Knobs page",
+                                            checked: !hide_knobs(),
+                                            onchange: move |_| {
+                                                hide_knobs.toggle();
+                                                save_settings();
+                                            }
                                         }
                                     }
                                 }
