@@ -251,6 +251,30 @@ impl TestApp {
         Self { router }
     }
 
+    /// Issue a bare GET or DELETE to `/mcp`, as MCP clients do to open the SSE
+    /// stream and to tear a session down.
+    async fn request(
+        &self,
+        method: Method,
+        session_id: Option<&str>,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri("/mcp")
+            .header(header::ACCEPT, "application/json, text/event-stream");
+        if let Some(sid) = session_id {
+            builder = builder.header(MCP_SESSION_ID_HEADER, sid);
+        }
+        let response = self
+            .router
+            .clone()
+            .oneshot(builder.body(Body::empty()).expect("build request"))
+            .await
+            .expect("mcp route must respond");
+
+        (response.status(), response.headers().clone())
+    }
+
     /// POST a JSON-RPC message to `/mcp` and return `(response headers, parsed result)`.
     ///
     /// `enable_json_response` is false in `create_mcp_extension`, so responses
@@ -400,8 +424,26 @@ fn result_text(result: &Value) -> String {
 // 1. tools/list snapshot
 // =============================================================================
 
-/// The `tools/list` wire payload — names, descriptions, input schemas, and
-/// annotation hints — must match the committed fixture byte for byte.
+/// Each tool's contract — description, input schema, annotation hints — pinned
+/// against the committed fixture.
+///
+/// # Why the fixture is keyed by tool name rather than being the raw array
+///
+/// Epic #392 is additive-only, so the guardrail has to distinguish two things
+/// that a positional array conflates:
+///
+/// - a tool was **added** — permitted, and should read as a purely additive diff
+/// - an existing tool's description or schema **changed** — forbidden, and should
+///   read as a loud modification
+///
+/// Keyed by name, adding a tool adds one key and leaves every existing key byte
+/// identical. As an array, appending a tool is also additive, but #399 and #400
+/// land in parallel by the epic's own plan and each appends one — so whichever
+/// merges second would face a conflict plus a mandatory regeneration, which is
+/// exactly how reflexive `UPDATE_MCP_FIXTURES=1` becomes a habit.
+///
+/// Advertised **order** is pinned separately, in
+/// [`tools_list_order_is_pinned`], so order and content fail independently.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn tools_list_matches_fixture() {
@@ -422,7 +464,62 @@ async fn tools_list_matches_fixture() {
         tool_names(tools)
     );
 
-    assert_matches_fixture("mcp_tools.json", result.get("tools").expect("tools"));
+    let mut by_name = serde_json::Map::new();
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .expect("every tool must have a name")
+            .to_string();
+        // The name is the key, so drop it from the value: otherwise renaming a
+        // tool would show up as one added key and one removed key with identical
+        // bodies, which reads as additive when it is not.
+        let mut body = tool.clone();
+        body.as_object_mut().expect("tool must be an object").remove("name");
+        assert!(
+            by_name.insert(name.clone(), body).is_none(),
+            "duplicate tool name in tools/list: {name}"
+        );
+    }
+
+    assert_matches_fixture("mcp_tools.json", &Value::Object(by_name));
+}
+
+/// The order `tools/list` advertises, pinned separately from tool content.
+///
+/// Order is part of the wire payload and models do weight earlier tools, so it is
+/// worth pinning — but a reordering and a description change are different bugs
+/// and should not fail the same assertion.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn tools_list_order_is_pinned() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let result = app.list_tools().await;
+    let tools = result
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("tools array");
+
+    assert_eq!(
+        tool_names(tools),
+        vec![
+            "hifi_zones",
+            "hifi_now_playing",
+            "hifi_control",
+            "hifi_search",
+            "hifi_play",
+            "hifi_status",
+            "hifi_hqplayer_status",
+            "hifi_hqplayer_profiles",
+            "hifi_hqplayer_load_profile",
+            "hifi_hqplayer_set_pipeline",
+        ],
+        "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
+         APPEND new tools rather than inserting, so this assertion grows by one \
+         line instead of shifting."
+    );
 }
 
 fn tool_names(tools: &[Value]) -> Vec<String> {
@@ -513,7 +610,9 @@ async fn initialize_result_matches_fixture() {
 fn declared_protocol_version_and_capabilities_are_pinned() {
     let details = mcp::server_details();
 
-    let declared: String = details.protocol_version.into();
+    // `protocol_version` is already a String on InitializeResult; bound here so
+    // the assertion reads against production's value rather than a literal.
+    let declared: String = details.protocol_version;
     assert_eq!(
         declared, SERVER_PROTOCOL_VERSION,
         "the declared protocol version changed. The wire snapshot cannot catch a \
@@ -720,6 +819,123 @@ async fn every_tool_has_a_nonempty_description() {
             "{name}: tool description must be non-empty"
         );
     }
+}
+
+// =============================================================================
+// 3b. Transport layer: session recovery, GET, DELETE
+// =============================================================================
+//
+// Everything above POSTs with a valid session. That leaves three of the four
+// public functions in src/mcp/mod.rs unexercised — including
+// `auto_recover_session`, which is the most intricate code in the module and was
+// moved verbatim by the split. It exists because real clients hold stale sessions
+// across a server restart, so it is load-bearing rather than glue.
+
+/// A POST carrying a session id the server has never heard of must still
+/// succeed: `auto_recover_session` transparently mints a new session and rewrites
+/// the request headers, so the client's request goes through instead of failing.
+///
+/// Without this test the split could have broken stale-session recovery and every
+/// other test in this file would still pass.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn a_stale_session_id_is_transparently_recovered() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // Never initialized; this id exists nowhere in the session store.
+    let (_, response) = app
+        .post(
+            Some("stale-session-from-a-previous-server-process"),
+            json!({ "jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {} }),
+        )
+        .await;
+
+    let response = response.expect("a stale session must still get a JSON-RPC response");
+    assert!(
+        response.get("error").is_none(),
+        "stale session recovery must not surface an error to the client: {response}"
+    );
+    let tools = response
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("recovered request must return the tool list, got: {response}")
+        });
+    assert_eq!(
+        tools.len(),
+        10,
+        "the recovered session must serve the same tool list as a fresh one"
+    );
+}
+
+/// GET opens the server-to-client SSE stream; DELETE tears a session down. Both
+/// are wired in `src/main.rs` and neither had any coverage. Smoked here so a
+/// mis-wired route surfaces as a test failure rather than as a client that
+/// silently cannot receive notifications.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn get_and_delete_are_wired_and_session_aware() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    let (session_id, _) = app.initialize().await;
+
+    // GET without a session is rejected rather than opening a stream.
+    let (status, _) = app.request(Method::GET, None).await;
+    assert!(
+        status.is_client_error(),
+        "GET without a session must be refused, got {status}"
+    );
+
+    // DELETE without a session likewise.
+    let (status, _) = app.request(Method::DELETE, None).await;
+    assert!(
+        status.is_client_error(),
+        "DELETE without a session must be refused, got {status}"
+    );
+
+    // DELETE with a live session terminates it.
+    let (status, _) = app.request(Method::DELETE, Some(&session_id)).await;
+    assert!(
+        status.is_success(),
+        "DELETE with a valid session must succeed, got {status}"
+    );
+
+    // An unknown session id is refused, and GET and DELETE refuse it
+    // *differently*. Unlike POST, neither has an auto-recovery path.
+    //
+    // GET answering 500 rather than 404 is arguably wrong — a stale SSE
+    // reconnect is a client-side condition, not a server fault — but it is
+    // today's behavior, and #394 records rather than corrects. Recorded here so
+    // that if a later issue fixes it, the change is visible instead of incidental.
+    let (status, _) = app
+        .request(Method::DELETE, Some("never-initialized-session"))
+        .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::NOT_FOUND,
+        "DELETE with an unknown session returns 404 today"
+    );
+
+    let (status, _) = app
+        .request(Method::GET, Some("never-initialized-session"))
+        .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "GET with an unknown session returns 500 today (see the note above: \
+         recorded, not endorsed)"
+    );
+
+    // The methods really are routed: axum answers an unrouted method with 405,
+    // and PATCH is the control case.
+    let (status, _) = app.request(Method::PATCH, Some(&session_id)).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::METHOD_NOT_ALLOWED,
+        "PATCH is not wired, so 405 here is what proves the GET/DELETE statuses \
+         above came from the handlers rather than from axum's router"
+    );
 }
 
 // =============================================================================
@@ -1263,7 +1479,13 @@ impl LmsHarness {
 
         let app = TestApp::with_state(state.clone());
 
-        // Wait for the player to propagate: adapter connect -> ZoneDiscovered -> aggregator.
+        // Wait for the player to propagate: adapter connect -> ZoneDiscovered ->
+        // aggregator.
+        //
+        // Budget is 100 x 100ms = 10s, against a local mock that normally responds
+        // in well under a second. Generous on purpose, but it is a wall-clock
+        // budget: if this ever flakes on a loaded machine, the propagation path is
+        // the thing to instrument, not the loop count to raise.
         let zone_id = format!("lms:{}", Self::PLAYER_ID);
         let mut found = false;
         for _ in 0..100 {
@@ -1690,6 +1912,12 @@ async fn no_tool_returns_an_unclassified_field() {
     );
 
     // Every display-only justification must actually say something.
+    //
+    // This measures length, not content, and a proxy can be gamed by padding. It
+    // is kept because it does real work — it caught "Roon core label" (exactly 15
+    // characters) and forced the reasons to be rewritten into something a reader
+    // can act on. If you are here because this failed, the fix is a better reason,
+    // not a longer one.
     for (field, role) in FIELD_ROLES {
         if let DisplayOnly(reason) = role {
             assert!(
