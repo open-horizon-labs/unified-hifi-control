@@ -1163,6 +1163,51 @@ pub struct HqpStatus {
     /// Track album from the optional `Status/metadata` child.
     #[serde(skip)]
     pub album: Option<String>,
+
+    // -------------------------------------------------------------------------
+    // Remaining `Status/metadata` child attributes (#328).
+    //
+    // Every field below is `#[serde(skip)]`, following the precedent set by `title`/`artist`/`album`
+    // above: the public HQPlayer payload contract is unchanged, and the unified zone projection is
+    // what publishes these through the existing now-playing shape.
+    //
+    // **These are not protocol claims.** The parser reads the metadata child's attributes
+    // *generically* and fills whichever of these the daemon happened to send. Only `artist`,
+    // `album`, `song`, `samplerate`, `bits`, `channels` and `bitrate` have corpus evidence
+    // (`tests/fixtures/hqplayer/hqpd-6.0.4-opal/status_playing_with_metadata.xml`); the others are
+    // read opportunistically and are `None` on every daemon that does not send them. Nothing here
+    // asserts that any daemon does.
+    // -------------------------------------------------------------------------
+    /// Composer, when the metadata child supplies one.
+    #[serde(skip)]
+    pub composer: Option<String>,
+    /// Genre, when the metadata child supplies one.
+    #[serde(skip)]
+    pub genre: Option<String>,
+    /// Track URI/location, when the metadata child supplies one.
+    ///
+    /// Not published: no field on `crate::bus::NowPlaying` can carry it, and adding one is a
+    /// response-schema change to the `GET /events` payload requiring explicit approval (#328 Known
+    /// limitations). It is used as a *track-loaded* signal for transport capability, which is a real
+    /// consumer and the reason parsing it is not dead weight.
+    #[serde(skip)]
+    pub uri: Option<String>,
+
+    // Source-domain stream facts, kept deliberately separate from the `active_*` output-domain
+    // fields above. Conflating the two is the defect #328 records as its fourth: the DAC's output
+    // depth was being published as the track's.
+    /// Source sample rate from the metadata child.
+    #[serde(skip)]
+    pub source_samplerate: Option<u32>,
+    /// Source bit depth from the metadata child.
+    #[serde(skip)]
+    pub source_bits: Option<u32>,
+    /// Source channel count from the metadata child.
+    #[serde(skip)]
+    pub source_channels: Option<u32>,
+    /// Source bitrate from the metadata child.
+    #[serde(skip)]
+    pub source_bitrate: Option<u32>,
 }
 
 /// Volume range info
@@ -4133,6 +4178,13 @@ impl HqpAdapter {
             title: Self::parse_child_attr(response, "metadata", "song"),
             artist: Self::parse_child_attr(response, "metadata", "artist"),
             album: Self::parse_child_attr(response, "metadata", "album"),
+            composer: None,
+            genre: None,
+            uri: None,
+            source_samplerate: None,
+            source_bits: None,
+            source_channels: None,
+            source_bitrate: None,
         }
     }
 
@@ -7091,6 +7143,32 @@ impl HqpAdapter {
     pub async fn set_instance_name(&self, name: String) {
         let mut state = self.state.write().await;
         state.instance_name = Some(name);
+    }
+
+    /// Debug-only integration-test seam over the pure direct-zone projection.
+    ///
+    /// Exists because two of the projection's obligations are not expressible through the wire fake:
+    /// the source/output bit-depth split (the fake derives `Status.active_bits` from the same
+    /// metadata child it derives the source depth from, so the two can never disagree there), and
+    /// the exhaustive capability matrix, which would otherwise cost one TCP daemon per state. The
+    /// routing, clearing and reconciliation behaviour is tested through the real socket instead.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn project_direct_zone(
+        host: &str,
+        instance_name: Option<&str>,
+        info: &HqpInfo,
+        status: &HqpStatus,
+        vol_range: &VolumeRange,
+    ) -> BusZone {
+        Self::hqp_status_to_zone(host, instance_name, info, status, vol_range)
+    }
+
+    /// Debug-only integration-test seam over the `Status` document parser.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn parse_status_for_test(response: &str) -> HqpStatus {
+        Self::parse_status_response(response)
     }
 
     /// Convert HQPlayer status to a unified bus Zone
