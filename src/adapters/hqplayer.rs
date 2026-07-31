@@ -876,7 +876,12 @@ pub struct VolumeRange {
 }
 
 /// Mode/Filter/Shaper item
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` because a freshly fetched family is compared against the cached one *whole*, not
+/// only through its fingerprint. The fingerprint covers `(index, name)` — the pair a list index is
+/// resolved through — so two lists agreeing on it can still differ in the fields it does not cover,
+/// and a publisher that skipped the write on a fingerprint match alone would drop those silently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListItem {
     pub index: u32,
     pub name: String,
@@ -884,14 +889,14 @@ pub struct ListItem {
 }
 
 /// Rate item
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateItem {
     pub index: u32,
     pub rate: u32,
 }
 
 /// Filter item with arg
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterItem {
     pub index: u32,
     pub name: String,
@@ -1009,24 +1014,162 @@ pub struct MatrixProfile {
 /// (HQP-C-020) — and it is the wrong *identity*, because a profile load can replace filters and
 /// shapers while leaving rates byte-identical. A read that captured only the rates would accept such
 /// a replacement as the set it started from.
+///
+/// And a generation alongside them, because four fingerprints are still not enough. They describe
+/// *what* is cached, and a clear-then-refill can arrive back at the same four — the same daemon
+/// reloading the same configuration — while the event that emptied the cache has changed the
+/// session, the profile or the loaded chain, and therefore changed `State`. Contents alone cannot
+/// distinguish "untouched" from "torn down and rebuilt identically"; only a counter of fillings can,
+/// and that distinction is what a read holding a pre-clear identity and a post-clear `State` needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChainIdentity {
     modes: u64,
     filters: u64,
     shapers: u64,
     rates: u64,
+    generation: u64,
 }
 
-/// The four cached chain-scoped families, taken together, at one instant.
+/// The four chain-scoped families, taken together, as one value.
 ///
 /// Returned by [`HqpAdapter::verified_chain_snapshot`] so that what a read *verified* and what it
-/// *publishes* are the same values rather than two reads of the same cache.
+/// *publishes* are the same values rather than two reads of the same cache, and accepted by
+/// [`HqpAdapter::publish_chain_snapshot`] so that a gathered set is offered to the cache as one
+/// thing rather than four assignments that could each be judged separately.
 #[derive(Debug, Clone)]
 struct ChainSnapshot {
     modes: Vec<ListItem>,
     filters: Vec<FilterItem>,
     shapers: Vec<ListItem>,
     rates: Vec<RateItem>,
+}
+
+/// **One** freshly fetched chain-scoped family, on its way into the cache.
+///
+/// The counterpart of [`ChainSnapshot`] for the single-family path, and one value rather than a
+/// `(family_name, list, fingerprint)` triple for a specific reason: those three had drifted apart.
+/// The removed `note_enumeration` took a `&str` to decide *which* previous fingerprint to compare,
+/// while its caller separately assigned the list and separately assigned a fingerprint it had
+/// computed itself — three spellings of "which family is this" that nothing made agree, passed
+/// across two different lock acquisitions. Here the family, the contents and the fingerprint are one
+/// value, the fingerprint is derived from the contents rather than accepted alongside them (the
+/// invariant [`HqpAdapter::chain_identity_of`] rests on), and the whole decision happens under one
+/// lock in [`HqpAdapter::publish_fresh_family`].
+#[derive(Debug, Clone)]
+enum FreshFamily {
+    Modes(Vec<ListItem>),
+    Filters(Vec<FilterItem>),
+    Shapers(Vec<ListItem>),
+    Rates(Vec<RateItem>),
+}
+
+impl FreshFamily {
+    /// The daemon's name for this family, for the line a transition logs.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Modes(_) => "modes",
+            Self::Filters(_) => "filters",
+            Self::Shapers(_) => "shapers",
+            Self::Rates(_) => "rates",
+        }
+    }
+
+    /// The identity of these contents, derived from them and from nothing else.
+    fn fingerprint(&self) -> u64 {
+        match self {
+            Self::Modes(items) | Self::Shapers(items) => {
+                HqpAdapter::fingerprint(items.iter().map(|i| (i.index, i.name.as_str())))
+            }
+            Self::Filters(items) => {
+                HqpAdapter::fingerprint(items.iter().map(|i| (i.index, i.name.as_str())))
+            }
+            Self::Rates(items) => HqpAdapter::rates_fingerprint(items),
+        }
+    }
+
+    /// The fingerprint the cache currently holds for *this* family, or `None` if it holds none —
+    /// which is what a family never fetched and a family just cleared both look like.
+    fn cached_fingerprint(&self, state: &HqpAdapterState) -> Option<u64> {
+        match self {
+            Self::Modes(_) => state.modes_fingerprint,
+            Self::Filters(_) => state.filters_fingerprint,
+            Self::Shapers(_) => state.shapers_fingerprint,
+            Self::Rates(_) => state.rates_fingerprint,
+        }
+    }
+
+    /// Whether these contents are, element for element, what the cache already holds.
+    ///
+    /// Asked in addition to the fingerprint rather than instead of it. The fingerprint answers "does
+    /// this list resolve indices the same way"; this answers "is writing it a no-op", and only the
+    /// second licenses skipping the write.
+    fn matches_cache(&self, state: &HqpAdapterState) -> bool {
+        match self {
+            Self::Modes(items) => *items == state.modes,
+            Self::Filters(items) => *items == state.filters,
+            Self::Shapers(items) => *items == state.shapers,
+            Self::Rates(items) => *items == state.rates,
+        }
+    }
+
+    /// Whether this reply resolves every position exactly as the cached winner does.
+    ///
+    /// Narrower than [`Self::matches_cache`]: a setter only needs the `(index, semantic value)`
+    /// mapping to be current. If a complete refresh overtook this fetch but published that exact
+    /// mapping, the reply is safe to resolve through even if non-routing metadata differs. The
+    /// winner remains authoritative and is never rewritten by this check.
+    fn resolves_like_cache(&self, state: &HqpAdapterState) -> bool {
+        match self {
+            Self::Modes(items) => items
+                .iter()
+                .map(|item| (item.index, item.name.as_str()))
+                .eq(state
+                    .modes
+                    .iter()
+                    .map(|item| (item.index, item.name.as_str()))),
+            Self::Filters(items) => items
+                .iter()
+                .map(|item| (item.index, item.name.as_str()))
+                .eq(state
+                    .filters
+                    .iter()
+                    .map(|item| (item.index, item.name.as_str()))),
+            Self::Shapers(items) => items
+                .iter()
+                .map(|item| (item.index, item.name.as_str()))
+                .eq(state
+                    .shapers
+                    .iter()
+                    .map(|item| (item.index, item.name.as_str()))),
+            Self::Rates(items) => items
+                .iter()
+                .map(|item| (item.index, item.rate))
+                .eq(state.rates.iter().map(|item| (item.index, item.rate))),
+        }
+    }
+
+    /// Install these contents **and** the fingerprint derived from them, together, so that no path
+    /// can leave a family anchored to an identity it was not filled from.
+    fn install(self, state: &mut HqpAdapterState, fingerprint: u64) {
+        match self {
+            Self::Modes(items) => {
+                state.modes = items;
+                state.modes_fingerprint = Some(fingerprint);
+            }
+            Self::Filters(items) => {
+                state.filters = items;
+                state.filters_fingerprint = Some(fingerprint);
+            }
+            Self::Shapers(items) => {
+                state.shapers = items;
+                state.shapers_fingerprint = Some(fingerprint);
+            }
+            Self::Rates(items) => {
+                state.rates = items;
+                state.rates_fingerprint = Some(fingerprint);
+            }
+        }
+    }
 }
 
 /// Why a read could not join the `State` it observed to the lists it holds.
@@ -1094,6 +1237,14 @@ struct HqpAdapterState {
     filters_fingerprint: Option<u64>,
     shapers_fingerprint: Option<u64>,
     rates_fingerprint: Option<u64>,
+    /// How many times the chain-scoped cache has been cleared or filled, ever.
+    ///
+    /// Fingerprints say *what* is cached; this says *which filling of it* that is. The two are not
+    /// the same question, and the difference is what a writer holding a set gathered off-lock needs:
+    /// an invalidate-and-refill can land byte-identical fingerprints from a different profile load,
+    /// session or poll, and nothing in the contents distinguishes that from the cache never having
+    /// been touched. Monotonic, bumped on every clear and every publication, and never reset.
+    chain_generation: u64,
     volume_range: Option<VolumeRange>,
     // Web client state for profiles
     profiles: Vec<HqpProfile>,
@@ -1135,6 +1286,7 @@ impl Default for HqpAdapterState {
             filters_fingerprint: None,
             shapers_fingerprint: None,
             rates_fingerprint: None,
+            chain_generation: 0,
             volume_range: None,
             profiles: Vec::new(),
             hidden_fields: HashMap::new(),
@@ -1267,18 +1419,12 @@ impl HqpAdapter {
                 // Clear ALL instance-specific cached data when switching hosts
                 state.info = None;
                 state.last_state = None;
-                state.modes.clear();
-                state.filters.clear();
-                state.shapers.clear();
-                state.rates.clear();
-                // The fingerprints go with the lists they describe. Left behind, they would be one
-                // daemon's enumeration identity used to judge whether *another* daemon's chain had
-                // moved — a comparison with no meaning, and the presence check downstream would be
-                // the only thing left standing between that and a published answer.
-                state.modes_fingerprint = None;
-                state.filters_fingerprint = None;
-                state.shapers_fingerprint = None;
-                state.rates_fingerprint = None;
+                // Through the common helper rather than by hand. The lists, the fingerprints that
+                // anchor them and the generation that dates them are one fact in three parts — a
+                // second spelling of the clearing is how one of the three gets left behind, and a
+                // fingerprint left behind is one daemon's enumeration identity used to judge whether
+                // *another* daemon's chain had moved.
+                Self::clear_chain_cache(&mut state);
                 state.volume_range = None;
                 state.profiles.clear();
                 state.hidden_fields.clear();
@@ -1468,7 +1614,14 @@ impl HqpAdapter {
     ///
     /// Split out because [`Self::verified_chain_snapshot`] must decide *and* act inside one lock: a
     /// proof that dropped the lock to call [`Self::invalidate_chain_cache`] would be judging one
-    /// cache and clearing whatever happened to be there a moment later.
+    /// cache and clearing whatever happened to be there a moment later. Every clearing in the
+    /// adapter goes through here, including `configure`'s, so that the generation bump cannot be
+    /// forgotten at one of them.
+    ///
+    /// The bump is unconditional, including when there was nothing to clear. "The cache was already
+    /// empty" is not the same as "nothing happened to it": a gather in flight was reading a daemon
+    /// that has since been reconnected or reconfigured, and declining to publish is the cheap,
+    /// retryable outcome while publishing a set from before the event is the expensive one.
     fn clear_chain_cache(state: &mut HqpAdapterState) {
         state.modes.clear();
         state.filters.clear();
@@ -1478,7 +1631,23 @@ impl HqpAdapter {
         state.filters_fingerprint = None;
         state.shapers_fingerprint = None;
         state.rates_fingerprint = None;
+        Self::bump_chain_generation(state);
         tracing::debug!("Invalidated HQPlayer chain-scoped enumeration cache");
+    }
+
+    /// Record that the chain-scoped cache is no longer the filling it was.
+    ///
+    /// Wrapping rather than saturating: a token is compared only across one bounded gather/read, so
+    /// an ABA collision would require 2^64 cache events during that operation. Saturating would be
+    /// strictly worse — after reaching `MAX`, every later clear/publication would remain `MAX` and
+    /// become invisible to every in-flight guard.
+    fn bump_chain_generation(state: &mut HqpAdapterState) {
+        state.chain_generation = state.chain_generation.wrapping_add(1);
+    }
+
+    /// The current chain-cache generation, for a caller about to gather off-lock.
+    async fn chain_generation(&self) -> u64 {
+        self.state.read().await.chain_generation
     }
 
     /// Identity of an enumeration, as `(index, label)` pairs in the order the daemon served them.
@@ -1495,63 +1664,117 @@ impl HqpAdapter {
         hasher.finish()
     }
 
-    /// Record a freshly fetched enumeration and report whether the loaded chain moved.
+    /// Offer **one** freshly fetched family to the cache — or refuse it, and tell the caller so.
     ///
-    /// The comparison is against the **previous fingerprint of the same family**; a family never
-    /// observed before cannot be a transition. When one does move, every other chain-scoped family is
-    /// dropped rather than refetched here: the caller may not need them, and a lazy refill keeps a
-    /// control path to one enumeration fetch.
-    async fn note_enumeration(&self, family: &str, fingerprint: u64) -> bool {
-        let previous = {
-            let state = self.state.read().await;
-            match family {
-                "modes" => state.modes_fingerprint,
-                "filters" => state.filters_fingerprint,
-                "shapers" => state.shapers_fingerprint,
-                _ => state.rates_fingerprint,
+    /// The single-family counterpart of [`Self::publish_chain_snapshot`], and the same three
+    /// decisions taken in the same place: is this fetch still current, did the family move, and what
+    /// gets written. `since` is the generation the fetch was issued against, captured before the
+    /// request went out, so the window this covers is the whole round trip.
+    ///
+    /// **Under one write lock, and that is the substance of it rather than a detail of it.** These
+    /// decisions used to be three separate lock acquisitions — a read to fetch the previous
+    /// fingerprint, an `invalidate_chain_cache` if it had moved, a write to assign — and between any
+    /// two of them a profile load, a reconnect or another poll's refresh could publish a complete
+    /// set. Two distinct outcomes followed. If the replacement landed before the fingerprint read,
+    /// the comparison found the *winner's* fingerprint, disagreed with it, and dropped the winner to
+    /// install one family: a partial cache. If it landed between the read and the write, nothing
+    /// disagreed with anything and the write simply overwrote one family of the winner's set,
+    /// leaving three families from the new profile beside one from the old — **complete, coherent to
+    /// every presence check, and agreeing with a rate probe whenever the two profiles offer the same
+    /// rates, which is ordinary** (HQP-C-021). Held under one lock, neither interleaving exists;
+    /// checked against `since`, neither outcome is reachable even so.
+    ///
+    /// **An overtaken fetch is an `Err`, not a quiet `Ok`.** The list does not merely fail to reach
+    /// the cache — it must not reach the *caller* either. Every `fresh_*` hands its list back to a
+    /// setter that resolves a name against it and sends the resulting **position** to the daemon
+    /// (HQP-C-001). A position in a list the daemon has stopped serving names a different setting,
+    /// which is this issue. So the loser reports its loss, the caller gets an error it can retry,
+    /// and — the same asymmetry [`Self::verified_chain_snapshot`] applies to `Replaced` — the winner
+    /// is not touched.
+    ///
+    /// **A family that reads the same is not a cache event.** No clearing, no change, no bump: the
+    /// generation is what in-flight gathers and reads compare against, so bumping it for a
+    /// confirmation would invalidate their work and manufacture the very race it exists to detect —
+    /// and the ordinary outcome of a setter's refetch is exactly the list already cached. Contents
+    /// are compared whole rather than by fingerprint alone, because the fingerprint covers
+    /// `(index, name)` and a write can be a no-op only if *nothing* in the family differs. A family
+    /// with no previous fingerprint is a family being filled, never a confirmation.
+    ///
+    /// The fingerprint is derived from the contents here, never accepted from the caller, for the
+    /// reason [`Self::publish_chain_snapshot`] derives its four.
+    async fn publish_fresh_family(&self, fresh: FreshFamily, since: u64) -> Result<()> {
+        let fingerprint = fresh.fingerprint();
+        let mut state = self.state.write().await;
+
+        if state.chain_generation != since {
+            // A full refresh can win while this single-family request is in flight. The generation
+            // says the fetch may no longer be trusted *by default*, but when the winner is anchored
+            // to the same routing fingerprint and the complete semantic mapping agrees element for
+            // element, resolving through the reply selects exactly what resolving through the
+            // winner would select. Accept the reply without publishing it or changing the winner's
+            // generation. Any changed mapping remains a hard error below.
+            if fresh.cached_fingerprint(&state) == Some(fingerprint)
+                && fresh.resolves_like_cache(&state)
+            {
+                return Ok(());
             }
-        };
-        let changed = previous.is_some_and(|p| p != fingerprint);
-        if changed {
-            tracing::info!(
-                "HQPlayer {family} enumeration changed: the loaded chain moved, dropping every \
-                 chain-scoped list"
-            );
-            self.invalidate_chain_cache().await;
+            return Err(anyhow!(
+                "HQPlayer's {} list was read against a set of lists that has since been cleared or \
+                 replaced, so the positions in it are no longer this daemon's; refusing to cache it \
+                 or to resolve a setting through it",
+                fresh.label()
+            ));
         }
-        changed
+
+        let previous = fresh.cached_fingerprint(&state);
+
+        // The daemon confirmed what is already there. Nothing happened to the cache, so nothing is
+        // recorded as having happened to it.
+        if previous == Some(fingerprint) && fresh.matches_cache(&state) {
+            return Ok(());
+        }
+
+        // This family moved, so every other chain-scoped list is the previous chain's and goes.
+        // Refetching them here would put a second round trip on a control path; the next read
+        // refills lazily.
+        if previous.is_some_and(|p| p != fingerprint) {
+            tracing::info!(
+                "HQPlayer {} enumeration changed: the loaded chain moved, dropping every \
+                 chain-scoped list",
+                fresh.label()
+            );
+            Self::clear_chain_cache(&mut state);
+        }
+
+        fresh.install(&mut state, fingerprint);
+        Self::bump_chain_generation(&mut state);
+        Ok(())
     }
 
     /// Fetch the modes list from the daemon and cache it, noticing a device change.
     async fn fresh_modes(&self) -> Result<Vec<ListItem>> {
+        let since = self.chain_generation().await;
         let modes = self.get_modes().await?;
-        let fingerprint = Self::fingerprint(modes.iter().map(|m| (m.index, m.name.as_str())));
-        self.note_enumeration("modes", fingerprint).await;
-        let mut state = self.state.write().await;
-        state.modes = modes.clone();
-        state.modes_fingerprint = Some(fingerprint);
+        self.publish_fresh_family(FreshFamily::Modes(modes.clone()), since)
+            .await?;
         Ok(modes)
     }
 
     /// Fetch the loaded chain's filter list from the daemon and cache it.
     async fn fresh_filters(&self) -> Result<Vec<FilterItem>> {
+        let since = self.chain_generation().await;
         let filters = self.get_filters().await?;
-        let fingerprint = Self::fingerprint(filters.iter().map(|f| (f.index, f.name.as_str())));
-        self.note_enumeration("filters", fingerprint).await;
-        let mut state = self.state.write().await;
-        state.filters = filters.clone();
-        state.filters_fingerprint = Some(fingerprint);
+        self.publish_fresh_family(FreshFamily::Filters(filters.clone()), since)
+            .await?;
         Ok(filters)
     }
 
     /// Fetch the loaded chain's shaper list from the daemon and cache it.
     async fn fresh_shapers(&self) -> Result<Vec<ListItem>> {
+        let since = self.chain_generation().await;
         let shapers = self.get_shapers().await?;
-        let fingerprint = Self::fingerprint(shapers.iter().map(|s| (s.index, s.name.as_str())));
-        self.note_enumeration("shapers", fingerprint).await;
-        let mut state = self.state.write().await;
-        state.shapers = shapers.clone();
-        state.shapers_fingerprint = Some(fingerprint);
+        self.publish_fresh_family(FreshFamily::Shapers(shapers.clone()), since)
+            .await?;
         Ok(shapers)
     }
 
@@ -1567,18 +1790,10 @@ impl HqpAdapter {
     /// direction, a chain move that leaves the rate list byte-identical, is what would be missed, and
     /// no observation suggests it is reachable.
     async fn fresh_rates(&self) -> Result<Vec<RateItem>> {
+        let since = self.chain_generation().await;
         let rates = self.get_rates().await?;
-        let labels: Vec<String> = rates.iter().map(|r| r.rate.to_string()).collect();
-        let fingerprint = Self::fingerprint(
-            rates
-                .iter()
-                .zip(labels.iter())
-                .map(|(r, label)| (r.index, label.as_str())),
-        );
-        self.note_enumeration("rates", fingerprint).await;
-        let mut state = self.state.write().await;
-        state.rates = rates.clone();
-        state.rates_fingerprint = Some(fingerprint);
+        self.publish_fresh_family(FreshFamily::Rates(rates.clone()), since)
+            .await?;
         Ok(rates)
     }
 
@@ -1602,6 +1817,12 @@ impl HqpAdapter {
     /// `a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles_lists_in_place`
     /// covers), and that replacement is invisible to a rates comparison.
     ///
+    /// And the generation, because even four fingerprints describe only the contents. An
+    /// invalidate-and-refill that lands byte-identical lists is still a *different filling*, and the
+    /// event behind it — a reconnect, a profile load, a mode write — is one that moves `State`. A
+    /// read holding the pre-clear identity and the post-clear `State` must not have those two
+    /// compare equal.
+    ///
     /// `None` means the set is **not** a set: a family is empty, or a family is present without the
     /// fingerprint it was filled from, which would leave it unanchored. Presence and identity are the
     /// same question asked once here, because a partial cache has no identity to compare — which is
@@ -1619,6 +1840,7 @@ impl HqpAdapter {
             filters: state.filters_fingerprint?,
             shapers: state.shapers_fingerprint?,
             rates: state.rates_fingerprint?,
+            generation: state.chain_generation,
         })
     }
 
@@ -1643,7 +1865,10 @@ impl HqpAdapter {
     ///   drop; the caller refills.
     /// * **Replaced** — the set is coherent and complete but is not the one this read captured. The
     ///   cache is not known to be wrong; it is simply newer than this read, and dropping it would
-    ///   punish whoever published it for winning a race. This read fails; the cache stands.
+    ///   punish whoever published it for winning a race. This read fails; the cache stands. A refill
+    ///   whose four fingerprints happen to match is `Replaced` too, on the generation: the lists
+    ///   reading the same does not make the `State` observed after the clearing event belong to the
+    ///   set observed before it.
     /// * **Moved** — after establishing that the current cache is still the captured set, the
     ///   daemon's live rate list contradicts it. That is the daemon disagreeing with the cache, so
     ///   the cache is wrong and goes.
@@ -1748,13 +1973,28 @@ impl HqpAdapter {
     /// transition", not "the four replies came from one instant", which nothing short of an atomic
     /// daemon-side snapshot could establish.
     ///
+    /// **And the bracket does not make this writer safe to publish, which is the other guard.** Both
+    /// probes agreeing says the *daemon's chain* held still; it says nothing about the *cache*, which
+    /// this writer has not been holding a lock on for the whole gather. An invalidation and a
+    /// complete refill from a new profile can land in that window, and if the two profiles' rate
+    /// lists agree — ordinary, since the offered rates follow the filter (HQP-C-021) — the bracket is
+    /// satisfied by a set that is now the previous profile's. So the generation is captured before
+    /// the first reply is requested and re-checked under the publication lock: see
+    /// [`Self::publish_chain_snapshot`], which is where the set is actually installed or dropped.
+    ///
     /// **Returns whether a complete, coherent snapshot was published.** The caller has to be able to
-    /// tell: a refresh that publishes nothing leaves the cache exactly as it found it, and when the
-    /// caller *needed* that fill — a first read after connect, or one after an invalidation — what it
-    /// is left holding is nothing at all. Swallowing that turned "I could not read this" into "this
-    /// daemon offers no filters", which is the ambiguity every other guard here exists to refuse.
+    /// tell: a refresh that publishes nothing leaves the cache as it *is* — usually exactly as this
+    /// refresh found it, and, when an overtaking writer is what stopped it, holding that writer's
+    /// newer set instead. Either way, when the caller *needed* the fill — a first read after connect,
+    /// or one after an invalidation — it may be left holding nothing at all. Swallowing that turned
+    /// "I could not read this" into "this daemon offers no filters", which is the ambiguity every
+    /// other guard here exists to refuse.
     #[must_use = "a refresh that did not settle leaves the cache empty, which is not the same as a daemon with no settings"]
     async fn refresh_lists(&self) -> bool {
+        // Captured before the first reply is asked for, so the window this covers is the whole
+        // gather rather than the part of it after some later moment.
+        let since = self.chain_generation().await;
+
         let gathered = async {
             // Opening probe. The rate list is the bracket for the same reason it is the read path's
             // chain probe: smallest chain-scoped enumeration, and the two chains' rate lists were
@@ -1790,10 +2030,6 @@ impl HqpAdapter {
             return false;
         }
 
-        let modes_fp = Self::fingerprint(modes.iter().map(|m| (m.index, m.name.as_str())));
-        let filters_fp = Self::fingerprint(filters.iter().map(|f| (f.index, f.name.as_str())));
-        let shapers_fp = Self::fingerprint(shapers.iter().map(|s| (s.index, s.name.as_str())));
-
         tracing::debug!(
             "Refreshed HQPlayer lists: {} modes, {} filters, {} shapers, {} rates",
             modes.len(),
@@ -1802,15 +2038,66 @@ impl HqpAdapter {
             rates.len()
         );
 
+        self.publish_chain_snapshot(
+            ChainSnapshot {
+                modes,
+                filters,
+                shapers,
+                rates,
+            },
+            since,
+        )
+        .await
+    }
+
+    /// Install a gathered set as the chain-scoped cache, **unless the cache moved on while it was
+    /// being gathered**. Reports whether it was published.
+    ///
+    /// `since` is the generation the gather started from. A publication is a claim about the daemon
+    /// as it was during the gather, and the gather happens off this lock: by the time the writer
+    /// arrives here, an invalidation and a complete refill from a new profile can already have
+    /// landed. Publishing anyway replaces a current set with one read before the change — and does
+    /// so *invisibly*, because both sets are complete and self-consistent, and the four-family
+    /// identity cannot tell "cached from the old profile" from "cached now" when the profiles happen
+    /// to agree. A later read then captures the overwritten cache, probes rates that never moved,
+    /// and reports the old profile's names for the new profile's `State`, with every guard passing.
+    ///
+    /// So the loser reports its loss and the winner is untouched. This is deliberately the *same*
+    /// asymmetry [`Self::verified_chain_snapshot`] applies to `Replaced`: whoever is holding the
+    /// older observation yields, and a cache that is not known to be wrong is not dropped.
+    ///
+    /// Fingerprints are derived here from the contents being installed rather than accepted from the
+    /// caller, because "every family is fingerprinted from what is in it" is the invariant the whole
+    /// identity comparison rests on, and a caller that computed one of the four from something else
+    /// would break it silently.
+    #[must_use = "an unpublished gather leaves the cache as it found it, and the caller wanted it filled"]
+    async fn publish_chain_snapshot(&self, gathered: ChainSnapshot, since: u64) -> bool {
         let mut state = self.state.write().await;
-        state.modes = modes;
-        state.filters = filters;
-        state.shapers = shapers;
-        state.rates = rates;
-        state.modes_fingerprint = Some(modes_fp);
-        state.filters_fingerprint = Some(filters_fp);
-        state.shapers_fingerprint = Some(shapers_fp);
-        state.rates_fingerprint = Some(rates_fp);
+
+        if state.chain_generation != since {
+            tracing::warn!(
+                "HQPlayer's setting lists were replaced while this refresh was reading them; \
+                 keeping the newer set rather than overwriting it with one read from before the \
+                 change"
+            );
+            return false;
+        }
+
+        state.modes_fingerprint = Some(Self::fingerprint(
+            gathered.modes.iter().map(|m| (m.index, m.name.as_str())),
+        ));
+        state.filters_fingerprint = Some(Self::fingerprint(
+            gathered.filters.iter().map(|f| (f.index, f.name.as_str())),
+        ));
+        state.shapers_fingerprint = Some(Self::fingerprint(
+            gathered.shapers.iter().map(|s| (s.index, s.name.as_str())),
+        ));
+        state.rates_fingerprint = Some(Self::rates_fingerprint(&gathered.rates));
+        state.modes = gathered.modes;
+        state.filters = gathered.filters;
+        state.shapers = gathered.shapers;
+        state.rates = gathered.rates;
+        Self::bump_chain_generation(&mut state);
         true
     }
 
@@ -3232,7 +3519,21 @@ impl HqpAdapter {
             // that does not settle is the read's failure, not a quieter version of success: with no
             // cache there is nothing to publish but four empty lists.
             let mut captured = self.chain_identity().await;
-            if captured.is_none() && self.refresh_lists().await {
+            if captured.is_none() {
+                // The re-read is unconditional, and the refresh's verdict is a log line rather than
+                // a gate. `refresh_lists` returns `false` for two situations that have nothing in
+                // common: it could not gather a set, or it *was overtaken* — a profile load, a
+                // reconnect's refill or another poll's refresh published a complete set while this
+                // one was reading, and the loser declined to overwrite it. In the second the cache
+                // ends up filled, by the winner, which is the whole point of yielding to it. Reading
+                // the cache only on `true` would throw that winner away, spend the retry, and report
+                // "no coherent set" about a daemon whose lists were sitting complete in the cache.
+                if !self.refresh_lists().await {
+                    tracing::debug!(
+                        "HQPlayer's list refresh published nothing; reading the cache anyway, \
+                         since a refresh that lost a race leaves the winner's set in place"
+                    );
+                }
                 captured = self.chain_identity().await;
             }
             let Some(captured) = captured else {
@@ -4907,6 +5208,40 @@ mod chain_identity_tests {
         }
     }
 
+    /// A generation token only has to distinguish cache events that can overlap one in-flight
+    /// gather/read. Saturating at `u64::MAX` would make the very next clear or publication invisible
+    /// forever: `MAX -> MAX`. Wrapping keeps every adjacent event distinct; an ABA collision would
+    /// require 2^64 cache mutations during that one bounded operation.
+    #[test]
+    fn the_generation_counter_never_stalls_at_the_integer_ceiling() {
+        let mut state = HqpAdapterState {
+            chain_generation: u64::MAX,
+            ..HqpAdapterState::default()
+        };
+
+        HqpAdapter::bump_chain_generation(&mut state);
+        assert_eq!(
+            state.chain_generation, 0,
+            "the event after MAX must still produce a distinct token; saturation would make it \
+             invisible to every in-flight publication"
+        );
+        HqpAdapter::bump_chain_generation(&mut state);
+        assert_eq!(
+            state.chain_generation, 1,
+            "and the counter must continue advancing after the wrap"
+        );
+    }
+
+    /// The four families of a cache, as the value a gather hands to the publisher.
+    fn gathered(cache: &HqpAdapterState) -> ChainSnapshot {
+        ChainSnapshot {
+            modes: cache.modes.clone(),
+            filters: cache.filters.clone(),
+            shapers: cache.shapers.clone(),
+            rates: cache.rates.clone(),
+        }
+    }
+
     /// An adapter whose cache is a given complete set, and nothing else. No socket, no config: these
     /// tests are about the proof, and the proof is a decision about memory.
     async fn adapter_with_cache(cache: HqpAdapterState) -> HqpAdapter {
@@ -5095,6 +5430,517 @@ mod chain_identity_tests {
             adapter.chain_identity().await,
             Some(captured),
             "proving a read must not disturb the cache it proved"
+        );
+    }
+
+    /// **The write-side twin of `a_cache_replaced_mid_read_fails_this_read_and_is_left_in_place`,
+    /// and the one the read-side guard cannot cover.** `refresh_lists` gathers five replies off the
+    /// state lock and only then takes it. Everything the read path does to avoid overwriting a
+    /// winner happens on the *read* side; the refresh writer, having taken no position on what it
+    /// was replacing, used to assign all four families unconditionally.
+    ///
+    /// So: a profile load lands while the gather is in flight, invalidating the cache and refilling
+    /// it from the new profile. The gather's closing `GetRates` then returns — the rate list is
+    /// unchanged across the two profiles (HQP-C-021 makes that ordinary), so the bracket agrees with
+    /// itself and the old writer publishes the *previous* profile's filters and shapers over the
+    /// new profile's. Nothing downstream can detect it: a later read captures that cache, probes,
+    /// finds the rates agreeing, and reports the old profile's filter name for a `State` produced by
+    /// the new one. Confidently, which is the part that matters.
+    ///
+    /// Only the generation can refuse this. The four fingerprints cannot: the winner is complete,
+    /// self-consistent and — on the rates — identical.
+    ///
+    /// **Label: client-red.** Found by CodeRabbit at `9b1fdfe`.
+    #[tokio::test]
+    async fn a_gather_overtaken_by_a_newer_profile_publishes_nothing_and_leaves_the_winner() {
+        let old_profile = pcm_cache();
+        let unchanged_rates = old_profile.rates.clone();
+        let old_modes = old_profile.modes.clone();
+        // What the five replies will amount to, gathered off the state lock.
+        let stale_gather = gathered(&old_profile);
+        let adapter = adapter_with_cache(old_profile).await;
+
+        // The gather begins: this is the cache its replies were asked on behalf of.
+        let since = adapter.chain_generation().await;
+
+        // Mid-gather: a profile load drops the cache and republishes it from the new profile. Same
+        // rates — a profile can move the filters and shapers while leaving the rate list alone.
+        adapter.invalidate_chain_cache().await;
+        let winner = cache_of(
+            old_modes,
+            vec![filter(0, "closed-form"), filter(1, "gauss-long")],
+            vec![mode(0, "ASDM7"), mode(1, "ASDM5")],
+            unchanged_rates,
+        );
+        assert!(
+            adapter
+                .publish_chain_snapshot(gathered(&winner), adapter.chain_generation().await)
+                .await,
+            "precondition: the newer profile's set publishes, since nothing overtook it"
+        );
+        let winner_id = adapter
+            .chain_identity()
+            .await
+            .expect("the winner is the cache now");
+
+        // And only now does the old gather reach the lock.
+        let published = adapter.publish_chain_snapshot(stale_gather, since).await;
+
+        assert!(
+            !published,
+            "the cache this gather set out to fill has been filled by someone newer; publishing \
+             over it would replace a current set with one read before the profile changed"
+        );
+        assert_eq!(
+            adapter.chain_identity().await,
+            Some(winner_id),
+            "and the winner is left exactly as it was — an overtaken writer reports its loss to its \
+             caller, it does not take the cache down with it"
+        );
+        assert_eq!(
+            adapter
+                .state
+                .read()
+                .await
+                .filters
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["closed-form", "gauss-long"],
+            "which is to say: the new profile's filters, not the ones this gather was holding"
+        );
+    }
+
+    /// The other half of the same rule, and the half a refill-shaped test cannot reach: an
+    /// invalidation with **nothing** published after it must stop an overtaken gather too.
+    ///
+    /// That is the reconnect, not the profile load. `connect`, `disconnect` and `mark_disconnected`
+    /// all drop the cache and leave it empty, and a gather straddling one of them read some of its
+    /// five replies through a session that has since ended — through a daemon that may have
+    /// restarted, been reconfigured, or followed the source onto the other chain while UHC was away.
+    /// Publishing that set fills an emptied cache with exactly the lists the emptying was for.
+    ///
+    /// Written because the mutation check found it: deleting the bump from `clear_chain_cache` left
+    /// the two races above still passing, since in both of them the *refill's* bump does the work.
+    /// Only a clearing with no refill isolates the clearing's own bump.
+    #[tokio::test]
+    async fn an_invalidation_with_no_refill_stops_an_overtaken_gather_as_well() {
+        let cache = pcm_cache();
+        let stale_gather = gathered(&cache);
+        let adapter = adapter_with_cache(cache).await;
+        let since = adapter.chain_generation().await;
+
+        // Mid-gather the session dropped. Nothing refills it — a reconnect leaves the cache empty
+        // and the next read fills it.
+        adapter.invalidate_chain_cache().await;
+
+        let published = adapter.publish_chain_snapshot(stale_gather, since).await;
+
+        assert!(
+            !published,
+            "these lists were read through a session that has ended; an empty cache is not an \
+             invitation to fill it with them"
+        );
+        assert!(
+            adapter.chain_identity().await.is_none(),
+            "and the cache stays empty, so the next read refills it from the daemon it is actually \
+             talking to"
+        );
+    }
+
+    /// The generation is part of the **identity**, not just a publication guard, and this is why.
+    ///
+    /// A profile load, a reconnect or a mode write clears the cache and refills it. That refill can
+    /// come back byte-identical in all four families — the same daemon reloading the same
+    /// configuration is the ordinary case, not a contrived one — while `State` is emphatically not
+    /// the same: the session, the profile and the loaded chain behind it all changed, which is the
+    /// event that made the cache be dropped in the first place.
+    ///
+    /// A read that captured the pre-clear cache and then observed `State` therefore holds a `State`
+    /// from after the event and an identity from before it. On fingerprints alone those two caches
+    /// compare equal and the read passes, joining that `State`'s indices to lists it never saw
+    /// filled. The generation is the only thing in the identity that separates "untouched" from
+    /// "torn down and rebuilt to look the same".
+    #[tokio::test]
+    async fn a_byte_identical_refill_is_still_a_replacement_for_a_read_that_captured_the_old_cache()
+    {
+        let cache = pcm_cache();
+        let probe = cache.rates.clone();
+        let refill = gathered(&cache);
+        let adapter = adapter_with_cache(cache).await;
+        let captured = adapter.chain_identity().await.expect("a complete cache");
+
+        // Torn down and rebuilt from the same four lists.
+        adapter.invalidate_chain_cache().await;
+        assert!(
+            adapter
+                .publish_chain_snapshot(refill, adapter.chain_generation().await)
+                .await,
+            "precondition: the refill publishes"
+        );
+
+        let outcome = adapter.verified_chain_snapshot(captured, &probe).await;
+
+        assert_eq!(
+            outcome.err(),
+            Some(ChainProofFailure::Replaced),
+            "the lists read the same, and they are still not the filling this read captured; the \
+             `State` it holds was reported after the event that emptied that one"
+        );
+        assert!(
+            adapter.chain_identity().await.is_some(),
+            "the refill is the current cache and is not known to be wrong; this read retries, the \
+             cache stands"
+        );
+    }
+
+    /// The four families of a cache, each as the value a **single-family** fetch would hand the
+    /// publisher — which is what a setter's `fresh_*` does, as opposed to `refresh_lists`' whole set.
+    fn each_family(cache: &HqpAdapterState) -> Vec<FreshFamily> {
+        vec![
+            FreshFamily::Modes(cache.modes.clone()),
+            FreshFamily::Filters(cache.filters.clone()),
+            FreshFamily::Shapers(cache.shapers.clone()),
+            FreshFamily::Rates(cache.rates.clone()),
+        ]
+    }
+
+    /// **The single-family twin of
+    /// `a_gather_overtaken_by_a_newer_profile_publishes_nothing_and_leaves_the_winner`, and the one
+    /// with a wire consequence.** `refresh_lists` publishes a whole set and returns a `bool`;
+    /// `fresh_filters` publishes *one* family and hands the list **back to a setter**, which resolves
+    /// a filter name to a position in it and sends that position to the daemon.
+    ///
+    /// So: a setter's `GetFilters` goes out against the loaded profile. While the reply is in flight
+    /// a profile load clears the cache and refills it completely from the new profile — same rate
+    /// list, which is ordinary, since a profile can move the filters and shapers and leave the
+    /// offered rates alone (HQP-C-021). The reply then arrives holding the *previous* profile's
+    /// filters.
+    ///
+    /// Two things must not happen, and both did. The cache must not be disturbed: the winner is
+    /// complete, current, and not known to be wrong. And the list must not be returned to the setter,
+    /// because the index it resolves a name to is a position in a list the daemon is no longer
+    /// serving — HQP-C-001's misselection, arriving through the write path.
+    ///
+    /// The damage the old shape could do had two shapes, depending on where the profile load landed
+    /// inside the publisher. Landing before the previous-fingerprint read, it left a *partial* cache:
+    /// the fingerprints disagreed, so every family was dropped and only this one refilled. Landing
+    /// *between* that read and the write — two separate lock acquisitions, which is what made the
+    /// window — it left a **complete mixed** cache: three families from the new profile and one from
+    /// the old, with nothing missing for a later read to notice and a rate probe that agrees. One
+    /// guard closes both, and closes the second by construction: the comparison and the write happen
+    /// under one lock, and the generation captured before the request decides whether either runs.
+    ///
+    /// **Label: client-red.**
+    #[tokio::test]
+    async fn a_stale_filter_fetch_overtaken_by_a_complete_winner_is_refused_and_leaves_it_alone() {
+        let old_profile = pcm_cache();
+        let unchanged_rates = old_profile.rates.clone();
+        let old_modes = old_profile.modes.clone();
+        // What `GetFilters` returned, off the state lock: the profile that was loaded at the time.
+        let stale_filters = FreshFamily::Filters(old_profile.filters.clone());
+        let adapter = adapter_with_cache(old_profile).await;
+
+        // The request goes out. This is the cache it was asked on behalf of.
+        let since = adapter.chain_generation().await;
+
+        // Mid-flight: a profile load drops the cache and republishes it complete from the new
+        // profile, leaving the rate list untouched.
+        adapter.invalidate_chain_cache().await;
+        let winner = cache_of(
+            old_modes,
+            vec![filter(0, "closed-form"), filter(1, "gauss-long")],
+            vec![mode(0, "ASDM7"), mode(1, "ASDM5")],
+            unchanged_rates,
+        );
+        assert!(
+            adapter
+                .publish_chain_snapshot(gathered(&winner), adapter.chain_generation().await)
+                .await,
+            "precondition: the newer profile's set publishes, since nothing overtook it"
+        );
+        let winner_id = adapter
+            .chain_identity()
+            .await
+            .expect("the winner is the cache now");
+
+        // And only now does the overtaken reply reach the lock.
+        let outcome = adapter.publish_fresh_family(stale_filters, since).await;
+
+        assert!(
+            outcome.is_err(),
+            "this list was read against a cache that has since been replaced; publishing it is one \
+             fault and handing it back to the setter that will resolve an index through it is the \
+             other, so the fetch fails and the caller re-reads"
+        );
+        assert_eq!(
+            adapter.chain_identity().await,
+            Some(winner_id),
+            "and the winner is left exactly as it was — identity and all. An overtaken fetch \
+             reports its loss to its caller; it does not clear the cache, refill one family of it, \
+             or leave three families from one profile beside a fourth from another"
+        );
+        assert_eq!(
+            adapter
+                .state
+                .read()
+                .await
+                .filters
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["closed-form", "gauss-long"],
+            "which is to say: the new profile's filters, not the ones this fetch was holding"
+        );
+    }
+
+    /// A concurrent full refresh can outrun a single-family fetch without changing the mapping the
+    /// setter is about to use. This is the ordinary empty-cache race after connect or a mode change:
+    /// the poll fills all four families while the user's `GetFilters` is in flight. Refusing that
+    /// reply merely because the generation advanced turns a safe click into a 500; accepting it is
+    /// safe only when the winner resolves every index to the same semantic name.
+    #[tokio::test]
+    async fn an_overtaken_fresh_family_that_resolves_like_the_winner_is_still_usable() {
+        let winner = pcm_cache();
+        let same_filters = FreshFamily::Filters(winner.filters.clone());
+        let adapter = adapter_with_cache(HqpAdapterState::default()).await;
+
+        // The setter's request starts against the empty cache.
+        let since = adapter.chain_generation().await;
+
+        // A pipeline poll wins the race and fills a complete, coherent cache from the same daemon
+        // and chain before the setter's reply reaches the publisher.
+        assert!(
+            adapter
+                .publish_chain_snapshot(gathered(&winner), since)
+                .await,
+            "precondition: the full refresh wins and publishes"
+        );
+        let winner_id = adapter
+            .chain_identity()
+            .await
+            .expect("the winner published all four families");
+
+        adapter
+            .publish_fresh_family(same_filters, since)
+            .await
+            .expect(
+                "the generation moved, but the winner maps every filter index to the same name; \
+                 the setter can safely resolve through the reply rather than returning a 500",
+            );
+
+        assert_eq!(
+            adapter.chain_identity().await,
+            Some(winner_id),
+            "accepting an equivalent reply must not rewrite or re-date the complete winner"
+        );
+    }
+
+    /// The full-snapshot publisher's generation bump is the fence that stops a single-family fetch
+    /// issued against an empty cache from clearing a newer complete winner. Unlike the profile-load
+    /// races above, there is no preceding invalidation bump here: deleting the publication bump is
+    /// therefore sufficient to make the stale writer pass its guard and reduce the cache to one
+    /// family.
+    #[tokio::test]
+    async fn a_full_snapshot_fill_fences_an_older_fresh_family_with_a_different_mapping() {
+        let winner = pcm_cache();
+        let stale_modes = FreshFamily::Modes(vec![mode(0, "[source]"), mode(1, "SDM (DSD)")]);
+        let adapter = adapter_with_cache(HqpAdapterState::default()).await;
+        let since = adapter.chain_generation().await;
+
+        assert!(
+            adapter
+                .publish_chain_snapshot(gathered(&winner), since)
+                .await,
+            "precondition: a full refresh fills the empty cache"
+        );
+        let winner_id = adapter
+            .chain_identity()
+            .await
+            .expect("the full refresh published a complete winner");
+
+        assert!(
+            adapter
+                .publish_fresh_family(stale_modes, since)
+                .await
+                .is_err(),
+            "the full publication must advance the generation so an older, different mapping is \
+             refused"
+        );
+        assert_eq!(
+            adapter.chain_identity().await,
+            Some(winner_id),
+            "the stale family must not clear the complete winner and leave a partial cache"
+        );
+    }
+
+    /// The same rule for **every** family, because the guard is one shared piece of code and a
+    /// per-family spelling of it is how three of the four keep it and the fourth quietly does not.
+    ///
+    /// The cache event here is a bare invalidation with nothing published after it — the reconnect
+    /// rather than the profile load. `connect`, `disconnect` and `mark_disconnected` all clear and
+    /// leave the cache empty, and a fetch straddling one of them was answered by a session that has
+    /// ended. An empty cache is not an invitation to refill one family of it with a list read
+    /// through a daemon that may since have restarted, been reconfigured, or followed the source
+    /// onto the other chain.
+    #[tokio::test]
+    async fn every_family_refuses_a_fetch_the_cache_has_outrun() {
+        for fresh in each_family(&pcm_cache()) {
+            let family = fresh.label();
+            let adapter = adapter_with_cache(pcm_cache()).await;
+            let since = adapter.chain_generation().await;
+
+            // Mid-fetch the session dropped.
+            adapter.invalidate_chain_cache().await;
+
+            let outcome = adapter.publish_fresh_family(fresh, since).await;
+
+            assert!(
+                outcome.is_err(),
+                "the {family} list was fetched against a cache that has since been cleared; it \
+                 must reach neither the cache nor the setter that asked for it"
+            );
+            assert!(
+                adapter.chain_identity().await.is_none(),
+                "and the clearing stands: the {family} fetch did not refill the cache behind the \
+                 back of the event that emptied it"
+            );
+        }
+    }
+
+    /// **A refetch that changes nothing is not a cache event, and treating it as one is not merely
+    /// wasteful — it is wrong.** The generation is what an in-flight gather and an in-flight read
+    /// compare against, so bumping it invalidates *their* work: a `refresh_lists` or a `fresh_*`
+    /// that started a moment earlier is now told the cache moved, drops what it read and returns a
+    /// failure, and `get_pipeline_status` spends its one retry on it.
+    ///
+    /// Every setter begins with a `fresh_*`, and the overwhelmingly common outcome of one is the
+    /// list the cache already holds — the chain has not moved between two clicks. So the old
+    /// unconditional bump made the *ordinary* case manufacture the very race the generation exists
+    /// to detect. Byte-identical contents with no clearing in between is not a new filling of the
+    /// cache; it is the same filling, confirmed.
+    #[tokio::test]
+    async fn a_fresh_family_identical_to_the_cached_one_is_not_a_new_filling_of_the_cache() {
+        let cache = pcm_cache();
+        let same_filters = FreshFamily::Filters(cache.filters.clone());
+        let adapter = adapter_with_cache(cache).await;
+        let before = adapter
+            .chain_identity()
+            .await
+            .expect("a complete cache has identity");
+
+        adapter
+            .publish_fresh_family(same_filters, adapter.chain_generation().await)
+            .await
+            .expect("nothing overtook this fetch and the daemon served what was already cached");
+
+        assert_eq!(
+            adapter.chain_identity().await,
+            Some(before),
+            "the daemon confirmed the list the cache was already holding; nothing was cleared and \
+             nothing was replaced, so no reader or writer in flight has been given a reason to \
+             throw away what it read"
+        );
+    }
+
+    /// The no-op path requires whole-family equality, not merely equality of the routing
+    /// fingerprint. Filter flags are not currently projected to clients, but they are part of the
+    /// daemon's enumeration and the cache must not silently discard a fresh value just because its
+    /// `(index, name)` mapping stayed put.
+    #[tokio::test]
+    async fn changed_family_metadata_is_published_even_when_the_mapping_fingerprint_is_unchanged() {
+        let cache = pcm_cache();
+        let mut changed_filters = cache.filters.clone();
+        changed_filters[0].value = 7;
+        changed_filters[0].arg = 9;
+        let adapter = adapter_with_cache(cache).await;
+        let before = adapter.chain_generation().await;
+
+        adapter
+            .publish_fresh_family(FreshFamily::Filters(changed_filters.clone()), before)
+            .await
+            .expect("nothing overtook the fetch; only non-routing metadata changed");
+
+        let state = adapter.state.read().await;
+        assert_eq!(
+            state.filters, changed_filters,
+            "a fingerprint match must not turn changed family contents into a no-op"
+        );
+        assert_ne!(
+            state.chain_generation, before,
+            "publishing changed contents must fence readers that captured the earlier filling"
+        );
+        assert!(
+            HqpAdapter::chain_identity_of(&state).is_some(),
+            "the routing mapping did not move, so the other three families remain a coherent set"
+        );
+    }
+
+    /// The other half of that rule, and the half that keeps it from being "never bump". A family
+    /// whose fingerprint moved *is* a different chain: the other three families' indices belong to
+    /// the chain that just went away, so they go with it, and the generation has to say so loudly
+    /// enough that anything holding the previous set stops trusting it.
+    #[tokio::test]
+    async fn a_fresh_family_that_moved_clears_the_rest_and_advances_the_generation() {
+        let adapter = adapter_with_cache(pcm_cache()).await;
+        let before = adapter.chain_generation().await;
+        let moved = FreshFamily::Filters(vec![filter(0, "closed-form"), filter(1, "gauss-long")]);
+
+        adapter
+            .publish_fresh_family(moved, before)
+            .await
+            .expect("nothing overtook this fetch; the daemon simply served a different list");
+
+        assert_ne!(
+            adapter.chain_generation().await,
+            before,
+            "the loaded chain moved under this cache, which is exactly the event an in-flight \
+             gather or read must be told about"
+        );
+        assert!(
+            adapter.chain_identity().await.is_none(),
+            "and the other three families went with it: their indices name settings in the chain \
+             that is no longer loaded, so the next read refills rather than mixing them with this \
+             one"
+        );
+        assert_eq!(
+            adapter
+                .state
+                .read()
+                .await
+                .filters
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["closed-form", "gauss-long"],
+            "the family that was actually fetched is published, not dropped along with the rest — \
+             the caller asked for it and is about to resolve a name against it"
+        );
+    }
+
+    /// The no-op short-circuit is conditioned on there being a **previous fingerprint** to match,
+    /// not on the contents alone. A family the cache does not hold is a family being filled, and a
+    /// filling is a cache event however familiar the list looks: the clearing that emptied it was
+    /// one, and whatever was in flight across it has to see both.
+    #[tokio::test]
+    async fn refilling_a_cleared_family_advances_the_generation_even_with_the_same_list() {
+        let cache = pcm_cache();
+        let same_filters = FreshFamily::Filters(cache.filters.clone());
+        let adapter = adapter_with_cache(cache).await;
+
+        adapter.invalidate_chain_cache().await;
+        let after_clear = adapter.chain_generation().await;
+
+        adapter
+            .publish_fresh_family(same_filters, after_clear)
+            .await
+            .expect("the fetch was issued after the clearing, so nothing has outrun it");
+
+        assert_ne!(
+            adapter.chain_generation().await,
+            after_clear,
+            "an empty family becoming a filled one is a filling, and the list reading the same as \
+             the one cleared a moment ago does not make it the same filling"
         );
     }
 }
