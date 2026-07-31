@@ -1813,6 +1813,20 @@ struct HqpAdapterState {
     /// been touched. Monotonic, bumped on every clear and every publication, and never reset.
     chain_generation: u64,
     volume_range: Option<VolumeRange>,
+    /// The last volume capability this endpoint was ever *observed* to have (#328).
+    ///
+    /// Distinct from `volume_range` above, and the distinction is the point. That one is
+    /// session-scoped and is cleared on every disconnect, because a session's values must not
+    /// outlive it. This one is **endpoint**-scoped: it answers "what did this daemon last tell us it
+    /// can do", which a dropped TCP reply is not evidence against.
+    ///
+    /// It exists because the transient-failure path used to answer with `VolumeRange::default()`,
+    /// whose `enabled` is `false`, and the zone projection maps `!enabled` to no volume control at
+    /// all. One lost `VolumeRange` reply therefore told every client that a working −60…0 dB zone
+    /// had become a fixed-volume device — a capability lie, and on a knob it removes the control the
+    /// user is turning. Cleared when the endpoint is reconfigured, since a different daemon's
+    /// capability is not this one's.
+    last_observed_volume_range: Option<VolumeRange>,
     // Web client state for profiles
     profiles: Vec<HqpProfile>,
     hidden_fields: HashMap<String, String>,
@@ -1860,6 +1874,7 @@ impl Default for HqpAdapterState {
             rates_fingerprint: None,
             chain_generation: 0,
             volume_range: None,
+            last_observed_volume_range: None,
             profiles: Vec::new(),
             hidden_fields: HashMap::new(),
             config_title: None,
@@ -1922,6 +1937,37 @@ impl HqpAdapter {
         };
         guard.take()
     }
+
+    /// Record an observed volume capability, keeping both scopes in step.
+    ///
+    /// `volume_range` is session-scoped and dies with the session; `last_observed_volume_range` is
+    /// endpoint-scoped and survives a reconnect so a dropped reply cannot be mistaken for a
+    /// fixed-volume daemon (#328). They are one fact in two lifetimes, and the reason this is a
+    /// helper rather than two assignments is that the first version of the #328 fix set only the
+    /// session-scoped one at three of its four sites: the fourth was `ensure_volume_range`'s
+    /// cache-hit early return, which is the path a healthy producer takes on *every poll after the
+    /// first*. The endpoint-scoped value was therefore still `None` at the moment the fault arrived,
+    /// and the retention it was added for never fired.
+    fn remember_volume_capability(state: &mut HqpAdapterState, range: &VolumeRange) {
+        state.volume_range = Some(range.clone());
+        state.last_observed_volume_range = Some(range.clone());
+    }
+
+    /// Comparison tolerance for a dB level that arrived as a double through two independent reads.
+    ///
+    /// Used only to decide whether the level is *at* the range floor, which is what mute is on this
+    /// protocol. An exact `==` on two separately-parsed doubles is the wrong test, and a wide
+    /// tolerance would report a genuinely low level as muted; 0.05 dB is far below the smallest step
+    /// any observed daemon offers and far above double-formatting noise.
+    const VOLUME_READBACK_TOLERANCE_DB: f64 = 0.05;
+
+    /// Floor for the volume step published to clients.
+    ///
+    /// The verified live sample sends no `step` attribute, so a step often has to be chosen rather
+    /// than read. Whatever is chosen must be *usable*: a published step of zero reaches a knob as a
+    /// control that visibly does nothing, and the user's conclusion is that the zone is broken.
+    /// 0.5 dB is the finest step any observed daemon reports, so it cannot overshoot a real one.
+    const MIN_PUBLISHED_VOLUME_STEP_DB: f64 = 0.5;
 
     pub fn new(bus: SharedBus) -> Self {
         #[allow(clippy::expect_used)] // HTTP client creation only fails if TLS setup fails
@@ -2063,6 +2109,9 @@ impl HqpAdapter {
                 // *another* daemon's chain had moved.
                 Self::clear_chain_cache(&mut state);
                 state.volume_range = None;
+                // Endpoint-scoped: a different daemon's volume capability is not this one's, so the
+                // retained last-observed value must not survive an endpoint change (#328).
+                state.last_observed_volume_range = None;
             }
             if persistent_changed {
                 // Hidden fields and profile values belong to one web endpoint and credential
@@ -2403,7 +2452,28 @@ impl HqpAdapter {
                             self.establish_transport_locked().await?;
                             (info, state, status) = self.read_required_handshake_fields().await?;
                         }
-                        VolumeRange::default()
+
+                        // Retain the capability this **endpoint** was last observed to have rather
+                        // than synthesising a disabled one (#328). `VolumeRange::default()` here has
+                        // `enabled: false`, which the direct-zone projection maps to no volume
+                        // control at all — so a daemon that stops answering one optional query was
+                        // reported to every client as having become a fixed-volume device, and a
+                        // knob lost the control the user was turning.
+                        //
+                        // This is the *handshake* copy of the same fallback in
+                        // `ensure_volume_range`, and it is the one that actually fires under a lost
+                        // reply: the timeout discards the socket, the reconnect above re-runs the
+                        // handshake, and the handshake — not the poll — is where the substitution
+                        // happened. Fixing only the poll's copy left the defect fully intact.
+                        //
+                        // An explicit `result="Error"` is still terminal (the arm above), because
+                        // there the daemon authoritatively answered.
+                        self.state
+                            .read()
+                            .await
+                            .last_observed_volume_range
+                            .clone()
+                            .unwrap_or_default()
                     }
                 },
             };
@@ -2434,7 +2504,7 @@ impl HqpAdapter {
             let mut state = self.state.write().await;
             state.info = Some(info.clone());
             state.last_state = Some(observed_state);
-            state.volume_range = Some(volume_range.clone());
+            Self::remember_volume_capability(&mut state, &volume_range);
             state.producer_epoch = state.producer_epoch.wrapping_add(1);
             // This is deliberately last: no observer may see reachable until the session has a
             // coherent initial snapshot ready to publish.
@@ -2523,7 +2593,7 @@ impl HqpAdapter {
                 ));
             }
             state.last_state = Some(snapshot.state.clone());
-            state.volume_range = Some(snapshot.volume_range.clone());
+            Self::remember_volume_capability(&mut state, &snapshot.volume_range);
         }
 
         let zone = Self::hqp_status_to_zone(
@@ -2584,7 +2654,7 @@ impl HqpAdapter {
                 return Ok(());
             }
             state.last_state = Some(observed_state);
-            state.volume_range = Some(volume_range.clone());
+            Self::remember_volume_capability(&mut state, &volume_range);
             (
                 state
                     .host
@@ -3279,12 +3349,13 @@ impl HqpAdapter {
     /// query rather than merely omitting the optional capability.
     async fn ensure_volume_range(&self) -> Result<PipelineVolumeRange> {
         {
-            let state = self.state.read().await;
+            let mut state = self.state.write().await;
             if let Some(range) = state.volume_range.clone() {
-                return Ok(PipelineVolumeRange::Observed {
-                    range,
-                    generation: state.transport_generation,
-                });
+                // The steady-state path: a healthy producer answers from cache on every poll after
+                // the first, so this is where the endpoint-scoped capability is kept alive.
+                let generation = state.transport_generation;
+                state.last_observed_volume_range = Some(range.clone());
+                return Ok(PipelineVolumeRange::Observed { range, generation });
             }
         }
         match self.get_volume_range_with_generation().await {
@@ -3292,14 +3363,34 @@ impl HqpAdapter {
                 let mut state = self.state.write().await;
                 // Do not date a value from the previous socket as if the replacement served it.
                 if state.transport_generation == generation {
-                    state.volume_range = Some(range.clone());
+                    Self::remember_volume_capability(&mut state, &range);
+                } else {
+                    // The value came from a socket this session replaced, so it must not be dated as
+                    // the current session's. It is still what this *endpoint* last reported it can
+                    // do, which is the only claim the endpoint-scoped field makes.
+                    state.last_observed_volume_range = Some(range.clone());
                 }
                 Ok(PipelineVolumeRange::Observed { range, generation })
             }
             Err(error) if error.downcast_ref::<HqpRejected>().is_some() => Err(error),
             Err(e) => {
-                tracing::debug!("HQPlayer volume range unavailable ({e}); reporting fixed volume");
-                Ok(PipelineVolumeRange::FixedFallback(VolumeRange::default()))
+                // A lost reply is not evidence that the daemon became fixed-volume, so the last
+                // capability it was observed to have is retained rather than replaced by a synthetic
+                // disabled one. Only a daemon that has *never* answered is reported as fixed —
+                // there, claiming a capability would be the opposite fabrication.
+                let retained = self
+                    .state
+                    .read()
+                    .await
+                    .last_observed_volume_range
+                    .clone()
+                    .unwrap_or_default();
+                tracing::debug!(
+                    "HQPlayer volume range unavailable ({e}); retaining last observed capability \
+                     (enabled={})",
+                    retained.enabled
+                );
+                Ok(PipelineVolumeRange::FixedFallback(retained))
             }
         }
     }
@@ -4150,15 +4241,85 @@ impl HqpAdapter {
         Ok(Self::parse_state_response(&response))
     }
 
-    /// Read an attribute from a child element without letting child attributes override the root.
-    fn parse_child_attr(response: &str, child: &str, attr: &str) -> Option<String> {
-        let marker = format!("<{child}");
-        let start = response.find(&marker)?;
-        Self::parse_attr(&response[start..], attr)
+    /// Every attribute of the `Status/metadata` child, keyed by name (#328).
+    ///
+    /// **Deliberately generic, and that is the whole design.** A per-attribute parser has to name
+    /// the attributes it expects, and naming one is a claim that a daemon sends it. The corpus
+    /// evidences exactly seven — `artist`, `album`, `song`, `samplerate`, `bits`, `channels`,
+    /// `bitrate` (`tests/fixtures/hqplayer/hqpd-6.0.4-opal/status_playing_with_metadata.xml`) — and
+    /// `.oh/hqplayer-evidence-ledger.md` exists because unevidenced protocol claims in this client
+    /// have repeatedly turned out to be wrong. Reading whatever the child carries makes no claim at
+    /// all: an attribute is published when it arrives and absent otherwise.
+    ///
+    /// Scoped to the child's own open tag, so a malformed or unterminated child costs the metadata
+    /// and nothing else — the root's `state`, `position`, `length` and `volume` are parsed from the
+    /// root tag by separate calls and are unaffected. That property is load-bearing: the `metadata`
+    /// child is the one part of a `Status` document this client has observed malformed in the wild
+    /// (see the framing note at the top of this file), and a status poll that lost the playback
+    /// state because a title was unreadable would be the worse failure by far.
+    fn parse_metadata_child(response: &str) -> HashMap<String, String> {
+        let mut attrs = HashMap::new();
+        let Some(start) = response.find("<metadata") else {
+            return attrs;
+        };
+        let rest = &response[start..];
+        // The child is self-closing in every observed document, but bound the scan at whichever
+        // terminator arrives first so a child missing its `/>` cannot swallow the closing `</Status>`
+        // and start reporting root attributes as source metadata.
+        let end = rest
+            .find("/>")
+            .or_else(|| rest.find('>'))
+            .unwrap_or(rest.len());
+        let scope = &rest[..end];
+
+        // Walk ` name="value"` pairs. An unterminated value ends the walk rather than the document:
+        // whatever was already collected stands, and the malformed tail is dropped.
+        let mut cursor = match scope.find(char::is_whitespace) {
+            Some(offset) => &scope[offset..],
+            None => return attrs,
+        };
+        while let Some(eq) = cursor.find('=') {
+            let name = cursor[..eq].trim();
+            let after_eq = cursor[eq + 1..].trim_start();
+            let Some(quoted) = after_eq.strip_prefix('"') else {
+                break;
+            };
+            // No closing quote: the child was cut mid-value. Stop, keeping what came before.
+            let Some(close) = quoted.find('"') else { break };
+            if !name.is_empty() && !name.contains(char::is_whitespace) {
+                attrs.insert(
+                    name.to_ascii_lowercase(),
+                    framing::decode_entities(&quoted[..close]),
+                );
+            }
+            cursor = &quoted[close + 1..];
+        }
+        attrs
+    }
+
+    /// Typed source-domain reading of one metadata attribute.
+    ///
+    /// A value the daemon sends but this client cannot parse becomes `None`, never `0`. Zero is a
+    /// meaningful sample rate and bit depth in exactly no context, and `#347`'s whole class of bug
+    /// was a parse failure defaulting to a plausible-looking number.
+    fn metadata_u32(attrs: &HashMap<String, String>, key: &str) -> Option<u32> {
+        attrs
+            .get(key)
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0)
+    }
+
+    /// Non-empty text reading of one metadata attribute. An empty attribute is absent, not `""`.
+    fn metadata_text(attrs: &HashMap<String, String>, key: &str) -> Option<String> {
+        attrs
+            .get(key)
+            .map(|raw| raw.trim().to_string())
+            .filter(|value| !value.is_empty())
     }
 
     /// Parse the complete playback status, including its optional metadata child.
     fn parse_status_response(response: &str) -> HqpStatus {
+        let meta = Self::parse_metadata_child(response);
         HqpStatus {
             state: Self::parse_attr_u32(response, "state") as u8,
             track: Self::parse_attr_u32(response, "track"),
@@ -4175,16 +4336,20 @@ impl HqpAdapter {
             active_channels: Self::parse_attr_u32(response, "active_channels"),
             samplerate: Self::parse_attr_u32(response, "samplerate"),
             bitrate: Self::parse_attr_u32(response, "bitrate"),
-            title: Self::parse_child_attr(response, "metadata", "song"),
-            artist: Self::parse_child_attr(response, "metadata", "artist"),
-            album: Self::parse_child_attr(response, "metadata", "album"),
-            composer: None,
-            genre: None,
-            uri: None,
-            source_samplerate: None,
-            source_bits: None,
-            source_channels: None,
-            source_bitrate: None,
+            title: Self::metadata_text(&meta, "song"),
+            artist: Self::metadata_text(&meta, "artist"),
+            album: Self::metadata_text(&meta, "album"),
+            composer: Self::metadata_text(&meta, "composer"),
+            genre: Self::metadata_text(&meta, "genre"),
+            // `location` is the spelling UPnP/DIDL uses for the same idea; both are read because
+            // neither is evidenced for HQPlayer and reading a key the daemon never sends costs
+            // nothing, while guessing the wrong single spelling costs the field.
+            uri: Self::metadata_text(&meta, "uri")
+                .or_else(|| Self::metadata_text(&meta, "location")),
+            source_samplerate: Self::metadata_u32(&meta, "samplerate"),
+            source_bits: Self::metadata_u32(&meta, "bits"),
+            source_channels: Self::metadata_u32(&meta, "channels"),
+            source_bitrate: Self::metadata_u32(&meta, "bitrate"),
         }
     }
 
@@ -7196,13 +7361,35 @@ impl HqpAdapter {
         };
 
         let volume_control = if vol_range.enabled {
+            // The step the daemon actually sent, and only if it is usable. The verified live sample
+            // sends **no** `step` attribute at all, so `step_db` is routinely `None`; the integer
+            // sibling is already `.max(1)` at parse time. A zero or negative step would reach a knob
+            // as "turning me changes nothing", which is why this cannot be a bare `unwrap_or`.
+            let step = vol_range
+                .step_db
+                .filter(|db| *db > 0.0)
+                .unwrap_or(f64::from(vol_range.step))
+                .max(Self::MIN_PUBLISHED_VOLUME_STEP_DB);
+
+            // Clamped into the observed range before publication. An out-of-range level is a
+            // disagreement between two daemon reads (`Status.volume` and `VolumeRange`), and a client
+            // that draws a slider from these three numbers must not be handed a value outside its
+            // own track.
+            let value = status.volume_db.clamp(vol_range.min_db, vol_range.max_db);
+
             Some(BusVolumeControl {
                 // Exact dB, not the rounded payload projection.
-                value: status.volume_db as f32,
+                value: value as f32,
                 min: vol_range.min_db as f32,
                 max: vol_range.max_db as f32,
-                step: vol_range.step_db.unwrap_or(f64::from(vol_range.step)) as f32,
-                is_muted: false, // HQPlayer doesn't report mute separately
+                step: step as f32,
+                // Mute *is* observable, contrary to the comment this replaces. `VolumeMute` was
+                // verified live (#322, HQPlayer Embedded 6.0.2) to be an absolute, idempotent move
+                // to the range floor with no mute flag anywhere on the wire. So "muted" means the
+                // level is sitting at the floor, and that is a fact about the observation rather
+                // than a flag being invented. The tolerance is there because the floor arrives as a
+                // double through two independent reads.
+                is_muted: value <= vol_range.min_db + Self::VOLUME_READBACK_TOLERANCE_DB,
                 scale: VolumeScale::Decibel,
                 output_id: Some(zone_id.clone()),
             })
@@ -7210,25 +7397,53 @@ impl HqpAdapter {
             None
         };
 
-        // Build now_playing if we have track info
-        let has_metadata =
-            status.title.is_some() || status.artist.is_some() || status.album.is_some();
-        let now_playing = if !status.track_id.is_empty() || status.length > 0 || has_metadata {
+        // Is a track loaded? Every signal here is one the daemon supplied; none is inferred from
+        // another. `uri` participates because a location is a track identity even when the daemon
+        // sends no `song`/`track_id` — which is the one published use it has (see its field comment).
+        let has_metadata = status.title.is_some()
+            || status.artist.is_some()
+            || status.album.is_some()
+            || status.uri.is_some();
+        let track_loaded = !status.track_id.is_empty() || status.length > 0 || has_metadata;
+
+        let now_playing = if track_loaded {
             Some(BusNowPlaying {
                 title: status.title.clone().unwrap_or_default(),
                 artist: status.artist.clone().unwrap_or_default(),
                 album: status.album.clone().unwrap_or_default(),
+                // Album art is explicitly unavailable rather than promised. Native `LibraryPicture`
+                // needs binary framing on a connection this client treats as XML-only, plus caps,
+                // authentication and cache policy — none of which #328 establishes.
                 image_key: None,
                 seek_position: Some(status.position as f64),
                 duration: Some(status.length as f64),
                 metadata: Some(TrackMetadata {
-                    format: Some(status.active_mode.clone()),
-                    sample_rate: Some(status.samplerate),
-                    bit_depth: Some(status.active_bits as u8),
-                    bitrate: Some(status.bitrate),
-                    genre: None,
-                    composer: None,
-                    track_number: Some(status.track),
+                    // `TrackMetadata` is the **source** domain: it hangs off `NowPlaying` and
+                    // describes the track. HQPlayer's `active_*` attributes are the **output**
+                    // domain — what the DAC is being fed after upsampling and modulation — and
+                    // publishing them here is what made a 24-bit track read as 32-bit.
+                    //
+                    // `format` stays `None` on purpose. The daemon supplies no source container or
+                    // codec, and `active_mode` is not one: it is the output mode, and under
+                    // source-following it reads back the literal string `[source]`. Publishing it as
+                    // the track's format fabricates source metadata the daemon never sent.
+                    format: None,
+                    sample_rate: status.source_samplerate.or({
+                        // The root `samplerate` attribute is the source rate in every corpus
+                        // document (the child agrees with it), so it is a legitimate fallback —
+                        // unlike `active_rate`, which is the output rate and is never substituted.
+                        (status.samplerate > 0).then_some(status.samplerate)
+                    }),
+                    // No fallback to `active_bits`. There is no source-depth substitute for an
+                    // output depth: inferring one is exactly the "cannot fabricate PCM depth"
+                    // hazard, so an unsupplied source depth is absent.
+                    bit_depth: status.source_bits.and_then(|bits| u8::try_from(bits).ok()),
+                    bitrate: status
+                        .source_bitrate
+                        .or((status.bitrate > 0).then_some(status.bitrate)),
+                    genre: status.genre.clone(),
+                    composer: status.composer.clone(),
+                    track_number: (status.track > 0).then_some(status.track),
                     disc_number: None,
                 }),
             })
@@ -7249,12 +7464,23 @@ impl HqpAdapter {
             now_playing,
             source: "hqplayer".to_string(),
             is_controllable: true,
-            is_seekable: true,
+            // Every flag below is derived from the observation. They used to be hard-coded `true`,
+            // which made a stopped, empty zone advertise seek and skip — and the program session's
+            // hard constraint is that "unsupported operations are never advertised".
+            //
+            // A duration is what makes a position meaningful, so a live stream (`length == 0`) is
+            // playing and not seekable.
+            is_seekable: status.length > 0,
             last_updated,
+            // Play stays offered whenever the daemon is not already playing: HQPlayer can resume a
+            // loaded playlist the client cannot see, so refusing play on a stopped zone would deny
+            // a legitimate action rather than avoid an impossible one.
             is_play_allowed: state != PlaybackState::Playing,
             is_pause_allowed: state == PlaybackState::Playing,
-            is_next_allowed: true,
-            is_previous_allowed: true,
+            // Skip needs something to skip from. With nothing loaded these are the flags that had a
+            // knob drawing enabled buttons for a daemon that would answer `result="Error"`.
+            is_next_allowed: track_loaded,
+            is_previous_allowed: track_loaded,
         }
     }
 }
@@ -7859,6 +8085,19 @@ impl HqpZoneLinkService {
 
     /// Link a zone to an HQP instance
     pub async fn link_zone(&self, zone_id: String, instance_name: String) -> Result<()> {
+        // A direct HQPlayer zone is already an HQPlayer control path, so it cannot also be a
+        // DSP-*enrichment* target: linking one gives a client two routes to one daemon with no rule
+        // for which wins, which is the ambiguity #328's acceptance criteria forbid. Refused here
+        // rather than filtered at read time, so the ambiguous state is never storable in the first
+        // place — a link persisted to disk outlives whichever surface filtered it out.
+        if zone_id.starts_with("hqplayer:") {
+            return Err(anyhow!(
+                "{} is a direct HQPlayer zone and already controls its instance; DSP enrichment \
+                 links are for zones from another backend",
+                zone_id
+            ));
+        }
+
         // Verify instance exists
         if self.instances.get(&instance_name).await.is_none() {
             return Err(anyhow!("Unknown HQP instance: {}", instance_name));

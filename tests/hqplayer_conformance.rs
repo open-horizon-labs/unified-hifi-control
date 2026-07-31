@@ -8384,15 +8384,75 @@ async fn a_lost_volume_range_reply_does_not_publish_the_cache_its_reconnect_empt
     h.stop();
 }
 
-/// A daemon may serve its complete setting universe while never answering `VolumeRange`. The
+/// A daemon may serve its complete setting universe while **never** answering `VolumeRange`. The
 /// pipeline contract treats that missing, non-chain-scoped capability as fixed volume; reconnecting
 /// after its timeout must not make the transport-generation fence reject an otherwise coherent
 /// settings read.
 ///
 /// **Label: client-red.** CodeRabbit found that the fallback was dated to the failed transport, so
 /// the replacement transport deterministically made both pipeline attempts fail.
+///
+/// **Amended by #328, and the amendment is a scenario fix rather than a weakening.** This test's
+/// setup used `connected_then_policy`, which connects successfully *first* and only then silences
+/// `VolumeRange` — so it was never exercising its own stated premise. It observed a working
+/// −60…0 dB control and then asserted that losing one reply about it proves the daemon became a
+/// fixed-volume device. #328 rejects that inference (see the retention test below); the
+/// never-answered premise this docstring actually describes is unaffected and is what is pinned
+/// here, using a policy that is silent from the very first request.
 #[tokio::test]
-async fn an_unresponsive_volume_range_still_yields_a_fixed_volume_pipeline() {
+async fn a_never_answered_volume_range_still_yields_a_fixed_volume_pipeline() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            silent_for_element: Some("VolumeRange".to_string()),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter
+        .connect()
+        .await
+        .expect("missing VolumeRange remains an optional fixed-volume capability");
+    h.adapter.disconnect().await;
+
+    let pipeline = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("missing VolumeRange degrades to a fixed-volume pipeline");
+
+    assert!(
+        pipeline.volume.is_fixed,
+        "with no volume capability ever observed, the fallback must advertise fixed volume rather \
+         than invent variable-volume bounds"
+    );
+    assert_eq!(
+        published_families(&pipeline).len(),
+        4,
+        "the non-chain-scoped fallback must not discard coherent setting families"
+    );
+    h.stop();
+}
+
+/// Once a volume capability **has** been observed on an endpoint, losing a later `VolumeRange` reply
+/// must not downgrade the pipeline to fixed volume (#328).
+///
+/// This is the scenario the test above used to run, with the opposite expectation. The reasoning
+/// changed because the old assertion conflated two different facts: *"this daemon has no volume
+/// control"* and *"one query about the volume control went unanswered"*. Only the first is a
+/// capability claim; the second is a transport event, and answering it with `enabled: false` made
+/// the direct-zone projection drop `volume_control` entirely — so a knob lost the control the user
+/// was turning because a reply was dropped.
+///
+/// The retained bounds are **observed**, never synthesised, which is what the original assertion's
+/// stated concern ("rather than invent variable-volume bounds") was actually protecting against.
+/// An explicit `result="Error"` is still terminal and is covered separately: there the daemon
+/// authoritatively answered.
+///
+/// **Label: client-red.** Verified failing against the pre-#328 tree.
+#[tokio::test]
+async fn an_observed_volume_capability_survives_a_later_unanswered_volume_range() {
     let h = Harness::connected_then_policy(
         WirePolicy {
             silent_for_element: Some("VolumeRange".to_string()),
@@ -8407,16 +8467,19 @@ async fn an_unresponsive_volume_range_still_yields_a_fixed_volume_pipeline() {
         .adapter
         .get_pipeline_status()
         .await
-        .expect("missing VolumeRange degrades to a fixed-volume pipeline");
+        .expect("a lost optional reply must not fail the whole pipeline read");
 
     assert!(
-        pipeline.volume.is_fixed,
-        "the fallback must advertise fixed volume rather than invent variable-volume bounds"
+        !pipeline.volume.is_fixed,
+        "the -60..0 dB capability was observed on this endpoint; a dropped reply is a transport \
+         event, not evidence the daemon became fixed-volume"
     );
+    assert_eq!(pipeline.volume.min, -60);
+    assert_eq!(pipeline.volume.max, 0);
     assert_eq!(
         published_families(&pipeline).len(),
         4,
-        "the non-chain-scoped fallback must not discard coherent setting families"
+        "retaining the capability must still not discard coherent setting families"
     );
     h.stop();
 }

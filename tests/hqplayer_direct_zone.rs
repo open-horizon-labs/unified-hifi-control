@@ -62,7 +62,19 @@ fn isolate_config_dir() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let dir = std::env::temp_dir().join(format!("uhc-hqp-direct-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create isolated direct-zone config dir");
+        let subdir = dir.join("unified-hifi");
+        std::fs::create_dir_all(&subdir).expect("create isolated direct-zone config dir");
+
+        // The HQPlayer adapter defaults to **off**, and a zone whose adapter is disabled is a 404 by
+        // design. Every test here is about a user who has turned it on, so the setting is written
+        // rather than assumed — and writing it is also what makes the adapter-filter test meaningful:
+        // with the toggle off, a filter bug and a correct filter are indistinguishable.
+        std::fs::write(
+            subdir.join("app-settings.json"),
+            r#"{"adapters":{"roon":true,"upnp":false,"openhome":false,"lms":false,"hqplayer":true}}"#,
+        )
+        .expect("write isolated app settings");
+
         std::env::set_var("UHC_CONFIG_DIR", dir);
     });
 }
@@ -292,7 +304,9 @@ async fn transport_reaches_the_selected_hqplayer_instance_and_not_roon() {
     rig.zone_when(|z| z.state == PlaybackState::Playing).await;
 
     let before = model.request_count("Pause");
-    let (status, body) = rig.post_control(json!({"zone_id":"hqplayer:rig","action":"pause"})).await;
+    let (status, body) = rig
+        .post_control(json!({"zone_id":"hqplayer:rig","action":"pause"}))
+        .await;
 
     assert_eq!(
         status,
@@ -488,16 +502,16 @@ async fn a_stopped_empty_zone_advertises_no_seek_next_or_previous() {
     rig.attach(&server).await;
     let zone = rig.zone_when(|z| z.state == PlaybackState::Stopped).await;
 
-    assert!(!zone.is_seekable, "nothing is loaded, so nothing is seekable");
+    assert!(
+        !zone.is_seekable,
+        "nothing is loaded, so nothing is seekable"
+    );
     assert!(
         !zone.is_next_allowed,
         "no loaded track means no next to skip to"
     );
     assert!(!zone.is_previous_allowed);
-    assert!(
-        !zone.is_pause_allowed,
-        "a stopped zone cannot be paused"
-    );
+    assert!(!zone.is_pause_allowed, "a stopped zone cannot be paused");
 
     let (status, body) = rig
         .get_json("/knob/now_playing?zone_id=hqplayer%3Arig")
@@ -528,7 +542,9 @@ async fn a_loaded_playing_zone_advertises_the_transport_it_really_has() {
     assert!(!zone.is_play_allowed, "already playing");
     assert!(zone.is_controllable);
 
-    let np = zone.now_playing.expect("a loaded track publishes now_playing");
+    let np = zone
+        .now_playing
+        .expect("a loaded track publishes now_playing");
     assert_eq!(np.duration, Some(215.0));
     assert_eq!(np.seek_position, Some(42.0));
 

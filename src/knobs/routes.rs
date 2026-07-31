@@ -133,8 +133,16 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
         .map(|l| (l.zone_id, l.instance))
         .collect();
 
-    // Helper to create DspInfo if zone is linked to HQPlayer
+    // Helper to create DspInfo if zone is linked to HQPlayer.
+    //
+    // A direct `hqplayer:` zone never gets one. It already *is* an HQPlayer control path, so a `dsp`
+    // block pointing at an instance would give the client two routes to one daemon with no rule for
+    // which wins (#328). `HqpZoneLinkService::link_zone` refuses such a link at the source, and this
+    // is the second half of that guard: links persisted by an older build must not resurface here.
     let get_dsp = |zone_id: &str| -> Option<DspInfo> {
+        if zone_id.starts_with("hqplayer:") {
+            return None;
+        }
         hqp_links.get(zone_id).map(|instance| DspInfo {
             r#type: "hqplayer".to_string(),
             instance: Some(instance.clone()),
@@ -162,7 +170,11 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
                 adapters.openhome
             } else if z.zone_id.starts_with("upnp:") {
                 adapters.upnp
-            } else if z.zone_id.starts_with("hqp:") {
+            } else if z.zone_id.starts_with("hqplayer:") {
+                // `hqplayer:` is the prefix `PrefixedZoneId::hqplayer` emits and the only one
+                // HQPlayer zones ever carry. This tested `hqp:` until #328, so it never matched, and
+                // HQPlayer zones fell into the include-by-default arm below — the adapter toggle in
+                // settings silently did nothing for them.
                 adapters.hqplayer
             } else {
                 true // Unknown prefix, include by default
@@ -542,9 +554,43 @@ pub async fn knob_control_handler(
         // UPnP zone control
         let udn = req.zone_id.trim_start_matches("upnp:");
         return control_upnp(&state, udn, &req.action).await;
+    } else if req.zone_id.starts_with("hqplayer:") {
+        // Direct HQPlayer instance control (#328). Before this arm existed, a `hqplayer:` zone id
+        // fell through to the Roon branch below and every HQPlayer command was executed against
+        // Roon with the prefix stripped.
+        let instance = req.zone_id.trim_start_matches("hqplayer:");
+        return control_hqplayer(
+            &state,
+            &req.zone_id,
+            instance,
+            &req.action,
+            req.value.as_ref(),
+        )
+        .await;
     }
 
-    // Roon zone (or legacy zone_id without prefix)
+    // Roon zone, or a legacy zone_id with no prefix at all.
+    //
+    // A *prefixed* id that reached here names a backend this server does not route, and offering it
+    // to Roon is how a command for one zone silently became a command for another (or for none).
+    // Only the legacy unprefixed shape — which the Node.js server and older knob firmware still
+    // send — may mean Roon implicitly.
+    if !req.zone_id.starts_with("roon:") && req.zone_id.contains(':') {
+        let prefix = req
+            .zone_id
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Unsupported zone source: {}", prefix),
+                "error_code": "UNSUPPORTED_ZONE_SOURCE",
+            })),
+        ));
+    }
+
     let roon_zone_id = if req.zone_id.starts_with("roon:") {
         req.zone_id.trim_start_matches("roon:").to_string()
     } else {
@@ -552,6 +598,204 @@ pub async fn knob_control_handler(
     };
 
     control_roon(&state, &roon_zone_id, &req.action, req.value.as_ref()).await
+}
+
+/// Control a direct HQPlayer instance (#328).
+///
+/// **Every refusal below is checked against the zone the aggregator published**, not against a fresh
+/// adapter read. That is deliberate and it is the invariant that keeps this function honest: the
+/// capability flag a client was handed in `GET /knob/now_playing` is literally the flag its command
+/// is judged by, so "advertised" and "permitted" cannot drift apart. It is also required — a surface
+/// may not query an adapter for state (`docs/ARCHITECTURE.md`, `tests/architecture_lint.rs`).
+///
+/// The cost is that the flags can be up to one poll interval (2 s by default) stale. That bound is
+/// accepted and recorded in `.oh/hqplayer-direct-zone.md`; closing it would need either a
+/// forbidden adapter state read on the command path or daemon-side compare-and-set, which the
+/// protocol does not offer.
+async fn control_hqplayer(
+    state: &AppState,
+    zone_id: &str,
+    instance: &str,
+    action: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let bad_request = |message: String, code: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": message, "error_code": code})),
+        )
+    };
+
+    // Resolve the instance explicitly. A missing instance is a 404 rather than a fallback: the
+    // client named a specific daemon, and quietly using a different one is the failure mode this
+    // whole function exists to remove.
+    let Some(adapter) = state.hqp_instances.get(instance).await else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("Unknown HQPlayer instance: {}", instance),
+                "error_code": "ZONE_NOT_FOUND",
+            })),
+        ));
+    };
+
+    // The aggregator is the only state source consulted here.
+    let zone = state.aggregator.get_zone(zone_id).await;
+
+    let result = match action {
+        "play" => adapter.play().await,
+        "pause" => adapter.pause().await,
+        "stop" => adapter.stop().await,
+        "next" | "previous" | "prev" => {
+            let allowed = zone
+                .as_ref()
+                .map(|z| {
+                    if action == "next" {
+                        z.is_next_allowed
+                    } else {
+                        z.is_previous_allowed
+                    }
+                })
+                .unwrap_or(false);
+            if !allowed {
+                return Err(bad_request(
+                    format!("{} is not available in the zone's current state", action),
+                    "ACTION_NOT_ALLOWED",
+                ));
+            }
+            if action == "next" {
+                adapter.next().await
+            } else {
+                adapter.previous().await
+            }
+        }
+        "play_pause" | "playpause" => {
+            // Resolved from the published state rather than sent as a toggle, because HQPlayer has
+            // no toggle command: `Pause` pauses and `Play` plays. With no published state there is
+            // nothing to resolve against, and guessing would be a coin flip on an audible action.
+            match zone.as_ref().map(|z| z.state) {
+                Some(crate::bus::PlaybackState::Playing) => adapter.pause().await,
+                Some(_) => adapter.play().await,
+                None => {
+                    return Err(bad_request(
+                        "play_pause needs a known playback state; none has been observed yet"
+                            .to_string(),
+                        "STATE_UNKNOWN",
+                    ))
+                }
+            }
+        }
+        "seek" => {
+            if !zone.as_ref().map(|z| z.is_seekable).unwrap_or(false) {
+                return Err(bad_request(
+                    "this zone is not seekable in its current state".to_string(),
+                    "ACTION_NOT_ALLOWED",
+                ));
+            }
+            // No default position. A seek with no usable target is a client bug, and inventing 0
+            // would restart the track.
+            let Some(position) = value.and_then(|v| v.as_f64()) else {
+                return Err(bad_request(
+                    "seek requires a numeric position in seconds".to_string(),
+                    "INVALID_VALUE",
+                ));
+            };
+            if !position.is_finite() || position < 0.0 {
+                return Err(bad_request(
+                    "seek position must be a non-negative number of seconds".to_string(),
+                    "INVALID_VALUE",
+                ));
+            }
+            // Clamped to the observed duration so a slider released past the end lands on the end
+            // rather than drawing `result="Error"` from the daemon. Kept as an `Option` with no
+            // numeric default: an absent duration means "nothing observed to clamp against", which
+            // is a different fact from "the track is zero seconds long", and collapsing the two
+            // through `unwrap_or(0.0)` is the shape `tests/volume_safety.rs` refuses on this path.
+            let ceiling = zone
+                .as_ref()
+                .and_then(|z| z.now_playing.as_ref())
+                .and_then(|np| np.duration)
+                .filter(|d| *d > 0.0);
+            let target = match ceiling {
+                Some(duration) => position.min(duration),
+                None => position,
+            };
+            adapter.seek(target.round().max(0.0) as u32).await
+        }
+        "vol_up" | "volume_up" | "vol_down" | "volume_down" => {
+            let vc = require_volume_control(zone.as_ref())?;
+            let down = action.contains("down");
+            // The step the client asked for, else the step this zone published. Both are decimal dB.
+            let step = value
+                .and_then(|v| v.as_f64())
+                .map(|v| v.abs())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(f64::from(vc.step));
+            let delta = if down { -step } else { step };
+            // Relative movement is applied as an absolute write computed from the last observed
+            // level. HQPlayer's own `VolumeUp`/`VolumeDown` would avoid the staleness window but use
+            // the daemon's step — which the verified live sample does not even send — and would
+            // ignore the user's configured `volume_step_override`.
+            let target = (f64::from(vc.value) + delta).clamp(f64::from(vc.min), f64::from(vc.max));
+            adapter.set_volume_db(target).await
+        }
+        "vol_abs" | "volume" => {
+            let vc = require_volume_control(zone.as_ref())?;
+            // SAFETY: no numeric default, in either direction. `unwrap_or(50.0)` on a dB zone means
+            // +50 dB, which is above every possible maximum; `unwrap_or(0.0)` means full scale. A
+            // level nobody supplied is a refusal, never a number.
+            let Some(requested) = value.and_then(|v| v.as_f64()).filter(|v| v.is_finite()) else {
+                return Err(bad_request(
+                    "an absolute volume requires a finite numeric level in dB".to_string(),
+                    "INVALID_VALUE",
+                ));
+            };
+            adapter
+                .set_volume_db(requested.clamp(f64::from(vc.min), f64::from(vc.max)))
+                .await
+        }
+        "mute" => {
+            require_volume_control(zone.as_ref())?;
+            // `VolumeMute` is a verified absolute, idempotent move to the range floor (#322, live
+            // 6.0.2). There is no daemon-side unmute and UHC stores no pre-mute level, so no
+            // toggle is advertised — an "unmute" whose result is not observable as unmute would be
+            // exactly the kind of claim this issue exists to remove.
+            adapter.volume_mute().await
+        }
+        _ => {
+            return Err(bad_request(
+                format!("Unknown action: {}", action),
+                "UNKNOWN_ACTION",
+            ))
+        }
+    };
+
+    match result {
+        Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )),
+    }
+}
+
+/// The zone's published volume control, or a refusal.
+///
+/// A zone with no volume control is a zone whose daemon answers `Volume` with a bare
+/// `result="Error"`. Sending one anyway is a request with no safe interpretation on a
+/// hardware-attenuated setup, so it is refused before it reaches the wire.
+fn require_volume_control(
+    zone: Option<&crate::bus::Zone>,
+) -> Result<crate::bus::VolumeControl, (StatusCode, Json<serde_json::Value>)> {
+    zone.and_then(|z| z.volume_control.clone()).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "this zone has no volume control",
+                "error_code": "VOLUME_NOT_AVAILABLE",
+            })),
+        )
+    })
 }
 
 /// Control Roon zone
