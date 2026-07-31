@@ -19,9 +19,9 @@ field.
 **Key constraint:** no public API route/request/response contract changes, no live appliance, and the
 #322 executable corpus — not current Rust behaviour — is the protocol authority.
 
-**Success:** every supported live setter reports `applied`, `already-set`, `ignored`, `suppressed` or
-`ambiguous` from an authoritative `State` readback; enumerations are scoped to the loaded chain and
-invalidated when it moves; no raw integer reaches a control path.
+**Success:** every supported *enumerated* live setter reports `applied`, `already-set`, `ignored`,
+`suppressed` or `ambiguous` from an authoritative `State` readback; enumerations are scoped to the
+loaded chain and invalidated when it moves; no raw integer reaches a control path.
 
 ## Solution Space
 
@@ -71,13 +71,26 @@ compatibility boundary, never publish or persist it as identity.
   a cache that can name a different filter than the user picked.
 - No PCM/SDM label for the loaded chain. `shaper_label` keeps its existing configured-mode heuristic;
   changing a response *value* has no acceptance criterion and would be an unbudgeted risk.
-- `Ambiguous` is reachable only after a write was attempted and its reply lost — the client then does
-  a bounded readback rather than assuming failure (HQP-C-029).
+- `Ambiguous` is reachable after a write was attempted and its reply lost — the client then does a
+  bounded readback rather than assuming failure (HQP-C-029) — and also when the authoritative field is
+  absent, where nothing can be established either way.
+- **Volume is outside the outcome vocabulary and stays `Result<()>`.** Result-checked, never
+  readback-verified: adaptive volume moves the level on its own, so a readback would manufacture
+  failures, and volume is absolute dB rather than a list index (HQP-C-040). Documented on
+  `SettingOutcome` rather than silently implied, so nothing claims "every setter".
+- The refresh bracket detects a chain that **ended** somewhere other than where it started. A change
+  out and back inside one window would leave both probes agreeing. Nothing observed suggests that is
+  reachable, and the guard is described as "did not straddle a visible transition" rather than as a
+  same-instant snapshot, which nothing short of a daemon-side atomic read could give.
 
 ## Execute
 
-Status: complete. See the PR body for RED/GREEN evidence.
+**Status: in progress at the time of writing.** Two commits exist on
+`fix/issue-347-hqplayer-trustworthy-setters` (RED, then GREEN); nothing is pushed and no PR exists.
+An independent execute audit then raised nine items, addressed as forward work before any further
+commit. RED/GREEN evidence goes in the PR body once it is opened.
 
 ## Review / Dissent
 
-Recorded as PR comments 1–6.
+Not yet performed. The six report comments are written and posted after the PR exists, re-anchored to
+the final head.

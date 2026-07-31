@@ -2002,25 +2002,33 @@ fn no_production_comment_settles_the_active_mode_question_by_fiat() {
 /// honoured — but the number is resolved to a name at the boundary
 /// (`HqpAdapter::legacy_index_to_name`) and what travels inward is the name.
 ///
-/// Scoped to the resolver and setter bodies rather than to the whole file, because the adapter parses
-/// numbers legitimately everywhere else: every `State` attribute arrives as one. The scoping is a
-/// brace walk over the source rather than a syntax visit, so that what is searched is exactly the text
-/// a reviewer would read.
+/// Decided by **parsing** the adapter, not by scanning its text. An earlier revision of this check
+/// hand-rolled a brace matcher to carve function bodies out of the source, which is the helper shape
+/// this file has been burned by before: comments, raw strings and — fatally — the apostrophe in a
+/// lifetime such as `&'a str` all desynchronise a character walk, and every one of those failures is
+/// silent and in the *permissive* direction. `syn` already parses this file for two other checks, and
+/// a visitor that finds `.parse()` calls inside a named function has none of those failure modes,
+/// because comments and literals are not expressions.
+///
+/// Scoped to the resolvers and setters rather than the whole file, because the adapter parses numbers
+/// legitimately everywhere else: every `State` attribute arrives as one.
 #[test]
 fn no_production_control_path_parses_a_setting_name_as_an_index() {
     let src = read(&repo_root().join("src/adapters/hqplayer.rs"));
-    let mut offenders = Vec::new();
-    for (name, body) in fn_bodies(&src) {
-        if !(name.starts_with("resolve_") || name.starts_with("set_")) {
-            continue;
-        }
-        if body.contains("parse::<u32>")
-            || body.contains("parse::<usize>")
-            || body.contains(".parse()")
-        {
-            offenders.push(name);
-        }
-    }
+    let file = syn::parse_file(&src).expect("the adapter parses");
+    let scanned = control_fn_names(&file);
+    assert!(
+        scanned.len() >= 5,
+        "the scope collapsed to {} function(s), which would make this check pass by looking at \
+         almost nothing — the adapter has a resolver per family and a setter per setting: {scanned:?}",
+        scanned.len()
+    );
+
+    let offenders: Vec<String> = control_fn_names(&file)
+        .into_iter()
+        .filter(|name| !parse_calls_in(&file, name).is_empty())
+        .collect();
+
     assert!(
         offenders.is_empty(),
         "a resolver or setter that parses a semantic name into a list index has reinstated \
@@ -2031,112 +2039,141 @@ fn no_production_control_path_parses_a_setting_name_as_an_index() {
     );
 }
 
-/// `(name, body)` for every `fn` in a source file, bodies delimited by brace matching.
-///
-/// Deliberately textual. A syntax visit would need a token renderer this crate does not depend on,
-/// and the thing being guarded is a line a reviewer reads, not a shape only a parser can see.
-/// Braces inside string literals and char literals would confuse it, so both are skipped.
-fn fn_bodies(src: &str) -> Vec<(String, String)> {
-    let bytes: Vec<char> = src.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while let Some(rel) = src[i..].find("fn ") {
-        let at = i + rel;
-        // Must be a token boundary, so `async fn` counts and `my_fn ` does not.
-        let preceded_ok = at == 0
-            || !src[..at]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        i = at + 3;
-        if !preceded_ok {
-            continue;
-        }
-        let name: String = src[i..]
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if name.is_empty() {
-            continue;
-        }
-        let Some(open_rel) = src[i..].find('{') else {
-            continue;
-        };
-        let mut j = i + open_rel;
-        // Character indices, so multi-byte source cannot desynchronise the walk.
-        let mut k = src[..j].chars().count();
-        let mut depth = 0i32;
-        let mut in_str = false;
-        let mut in_char = false;
-        let start = k;
-        while k < bytes.len() {
-            let c = bytes[k];
-            let escaped = k > 0 && bytes[k - 1] == '\\';
-            match c {
-                '"' if !in_char && !escaped => in_str = !in_str,
-                '\'' if !in_str && !escaped => in_char = !in_char,
-                '{' if !in_str && !in_char => depth += 1,
-                '}' if !in_str && !in_char => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
+/// Names of every function that resolves or writes a setting.
+fn control_fn_names(file: &syn::File) -> Vec<String> {
+    struct Names(Vec<String>);
+    impl<'ast> syn::visit::Visit<'ast> for Names {
+        fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+            let name = f.sig.ident.to_string();
+            if name.starts_with("resolve_") || name.starts_with("set_") {
+                self.0.push(name);
             }
-            k += 1;
+            syn::visit::visit_impl_item_fn(self, f);
         }
-        let body: String = bytes[start..k.min(bytes.len())].iter().collect();
-        j += body.len();
-        let _ = j;
-        out.push((name, body));
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            let name = f.sig.ident.to_string();
+            if name.starts_with("resolve_") || name.starts_with("set_") {
+                self.0.push(name);
+            }
+            syn::visit::visit_item_fn(self, f);
+        }
     }
-    out
+    let mut names = Names(Vec::new());
+    syn::visit::Visit::visit_file(&mut names, file);
+    names.0
 }
 
-/// Controls for [`fn_bodies`], written as the false passes it must not produce.
+/// Every `.parse(...)` **call expression** inside the named function, reported as its receiver text
+/// where one can be named.
 ///
-/// Every false pass this file has shipped was in a helper rather than in a check, so the helper is
-/// exercised directly with the shapes that would defeat it: a brace inside a string literal, a
-/// nested block, and a name that merely ends in `fn`.
+/// A call expression, deliberately: a `parse` inside a comment or a string literal is not one, so the
+/// whole class of false positives a text scan has to defend against does not arise. `visit_expr_call`
+/// covers the free-function form (`str::parse(x)`) and `visit_expr_method_call` the method form.
+fn parse_calls_in(file: &syn::File, target: &str) -> Vec<String> {
+    struct Finder<'a> {
+        target: &'a str,
+        in_target: bool,
+        hits: Vec<String>,
+    }
+    impl<'a> Finder<'a> {
+        fn scan_body(&mut self, name: &str, block: &syn::Block) {
+            if name != self.target {
+                return;
+            }
+            let was = self.in_target;
+            self.in_target = true;
+            syn::visit::visit_block(self, block);
+            self.in_target = was;
+        }
+    }
+    impl<'ast, 'a> syn::visit::Visit<'ast> for Finder<'a> {
+        fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+            let name = f.sig.ident.to_string();
+            self.scan_body(&name, &f.block);
+            syn::visit::visit_impl_item_fn(self, f);
+        }
+        fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+            let name = f.sig.ident.to_string();
+            self.scan_body(&name, &f.block);
+            syn::visit::visit_item_fn(self, f);
+        }
+        fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+            if self.in_target && call.method == "parse" {
+                self.hits.push(format!("{}.parse(..)", "<receiver>"));
+            }
+            syn::visit::visit_expr_method_call(self, call);
+        }
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if self.in_target {
+                if let syn::Expr::Path(p) = &*call.func {
+                    if p.path
+                        .segments
+                        .last()
+                        .is_some_and(|s| s.ident == "parse" || s.ident == "from_str")
+                    {
+                        self.hits.push("parse(..)".to_string());
+                    }
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let mut finder = Finder {
+        target,
+        in_target: false,
+        hits: Vec::new(),
+    };
+    syn::visit::Visit::visit_file(&mut finder, file);
+    finder.hits
+}
+
+/// Controls for the two helpers above, written as the false passes they must not produce.
+///
+/// Every false pass this file has shipped was in a helper rather than in a check, so both are driven
+/// directly with the shapes that defeat a text scan: a `parse` inside a comment, inside a plain string
+/// literal, inside a **raw** string literal, and a lifetime apostrophe in the signature — which is
+/// what broke the brace-matching predecessor this replaced.
 #[test]
-fn fn_bodies_finds_a_parse_in_a_resolver_and_is_not_fooled_by_braces_in_strings() {
-    let src = r#"
+fn the_parse_finder_reads_expressions_and_not_comments_literals_or_lifetimes() {
+    let file = syn::parse_file(
+        r##"
         impl A {
-            fn resolve_filter_index(&self, name: &str) -> u32 {
+            fn resolve_filter_index<'a>(&self, name: &'a str) -> u32 {
                 if let Ok(i) = name.parse::<u32>() { return i; }
-                { let _nested = 1; }
                 0
             }
-            fn innocent(&self) -> String {
-                // A brace inside a literal must not close the body early, or the parse above would
-                // leak into this body and the check would report the wrong function.
-                format!("{{ not a block }}")
+            fn resolve_mode_index<'a>(&self, name: &'a str) -> u32 {
+                // name.parse::<u32>() would be wrong here, and a comment is not code
+                let _doc = "call name.parse::<u32>() to get an index";
+                let _raw = r#"name.parse::<u32>()"#;
+                let _lifetime_bearing: &'a str = name;
+                0
             }
+            fn unrelated_helper(&self, s: &str) -> u32 { s.parse().unwrap_or(0) }
         }
-    "#;
-    let bodies: HashMap<String, String> = fn_bodies(src).into_iter().collect();
+    "##,
+    )
+    .expect("the control source parses");
 
     assert!(
-        bodies
-            .get("resolve_filter_index")
-            .is_some_and(|b| b.contains("parse::<u32>")),
-        "the resolver's own body must be found, or the check passes because it looked at nothing. \
-         Got keys {:?}",
-        bodies.keys().collect::<Vec<_>>()
+        !parse_calls_in(&file, "resolve_filter_index").is_empty(),
+        "a real `.parse()` call inside the target must be found, or the check looks at nothing"
     );
     assert!(
-        bodies
-            .get("innocent")
-            .is_some_and(|b| !b.contains("parse::<u32>")),
-        "a body must end at its own closing brace: a brace inside a string literal is not a block, \
-         and mistaking one merges two functions and misattributes what is in them"
+        parse_calls_in(&file, "resolve_mode_index").is_empty(),
+        "a `parse` in a comment, a string literal or a raw string literal is not a call — and the \
+         lifetime apostrophes here are exactly what desynchronised the character walk this replaced"
     );
-    // And the exploit that motivates the token-boundary check.
+
+    let names = control_fn_names(&file);
     assert!(
-        !fn_bodies("let my_fn = 1;")
-            .iter()
-            .any(|(n, _)| n == "my_fn"),
-        "`fn` must be matched as a token, not as the tail of an identifier"
+        names.contains(&"resolve_filter_index".to_string())
+            && names.contains(&"resolve_mode_index".to_string()),
+        "both resolvers must be in scope, got {names:?}"
+    );
+    assert!(
+        !names.contains(&"unrelated_helper".to_string()),
+        "a helper that is neither a resolver nor a setter is out of scope; it may parse numbers \
+         legitimately, and widening the scope to it would make the check noise"
     );
 }

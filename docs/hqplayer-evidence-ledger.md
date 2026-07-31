@@ -110,7 +110,7 @@ were **not executed** and are recorded as gaps in that comment.
 | HQP-C-003 | Domain 2 — the **persistent** domain: `hqplayerd.xml` and the 8088 config form store **enum IDs**, which are not list indices and must never be fed to the live lane | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-hqplayer-protocol-conformance.md` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_persistent_configuration_lane_stores_enum_ids_not_list_indices · test:feeding_a_persistent_enum_id_to_the_live_lane_is_rejected | settled | — |
 | HQP-C-004 | Domain 3 — the **client** domain: clients exchange setting-appropriate values — semantic names for mode/filter/shaper, Hz for rate, decimal dB for volume — and the adapter owns both numeric conversions. The two paths that broke this rule are gone (HQP-C-063, retired); the one frozen numeric request contract is resolved to a name at the HTTP boundary and never travels inward | E6-documentary | `.oh/hqplayer-spec.md` layer table · direct · n/a · 2026-02-04 · n/a | test:a_filter_name_is_sent_as_the_index_the_observed_list_gives_it · test:a_numeric_string_is_never_accepted_as_a_setting_name | settled | — |
 | HQP-C-063 | Raw indices **did** cross the client boundary, in two evidenced places: the legacy numeric route `HqpSettingRequest { name: String, value: u32 }` stringified its number for name-based lookup (`src/api/mod.rs:825-836`), and the adapter's resolvers fell back to parsing a numeric string as a direct index (`resolve_mode_index:2081`, `resolve_filter_index:2186`, `resolve_shaper_index:2247`) | E6-documentary | `src/api/mod.rs` and `src/adapters/hqplayer.rs` at `6d688bd` · direct · n/a · 2026-07-30 · n/a | test:a_numeric_string_is_never_accepted_as_a_setting_name · test:tests/hqplayer_ledger_lint.rs::no_production_control_path_parses_a_setting_name_as_an_index | retired | #347 |
-| HQP-C-064 | **No conformance expectation drives `set_shaper`**, so the shaper setter's behaviour is L1-observed only — `shaper 24→0→24`, `result="OK"`, readback-verified on the live run — and unpinned hermetically | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | none:a conformance expectation that drives `set_shaper` and verifies the readback; the fake already applies `SetShaping` (`model.rs`), so only the expectation is missing | open | #329 |
+| HQP-C-064 | The shaper setter was L1-observed only — `shaper 24→0→24`, `result="OK"`, readback-verified on the live run — with **no conformance expectation driving `set_shaper`**. It is now driven hermetically, including the readback and the three delivery outcomes | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:a_write_whose_reply_is_lost_after_the_daemon_applied_it_is_reported_as_applied · test:a_write_whose_delivery_cannot_be_established_is_reported_as_ambiguous · test:an_explicit_rejection_is_not_treated_as_ambiguous_delivery | settled | — |
 | HQP-C-005 | `SetMode` does **not** reset the filter or shaper selections; the fake once modelled that and no evidence supports it | E3-derived | `.oh/issue-322-…` amendment row B14 · direct · hqplayerd 6.0.4 (Opal) · 2026-07-30 · unknown | test:set_mode_does_not_reset_the_filter_and_shaper_selections | settled | — |
 | HQP-C-006 | A mode change reloads the chain, so a list index resolved before it can name a **different** setting after it | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:a_delayed_set_mode_still_clamps_indices_into_the_loaded_chain · test:the_same_filter_index_selects_a_different_filter_per_loaded_chain | settled | — |
 | HQP-C-007 | Under configured `[source]` the **loaded chain** can move between PCM and SDM while `State.mode` stays 0 | E1-upstream-verified | UHC-SALVAGE-BETA-DEV via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_loaded_chain_moves_under_source_while_the_configured_mode_stays_source | settled | — |
@@ -279,21 +279,26 @@ into an index, which is a check that only fires on a regression.
 **Settled by:** #347. `a_numeric_string_is_never_accepted_as_a_setting_name` drives the three semantic
 setters with `"1"`, `"7"` and `"4"` and requires all three to be refused with nothing on the wire.
 
-### HQP-C-064 — the shaper setter has no hermetic coverage
+### HQP-C-064 — the shaper setter had no hermetic coverage · **closed here**
 
-Found by **check 34**, which this PR added in response to CodeRabbit's HQP-C-051 finding: every `Set*`
+Found by **check 34**, which #341 added in response to CodeRabbit's HQP-C-051 finding: every `Set*`
 command a claim names must be exercised by one of that claim's own cited proofs. Running it flagged
 `SetShaping` in HQP-C-002, and the reason turned out to be a genuine gap rather than a citation slip —
-**no test in `tests/hqplayer_conformance.rs` calls `adapter.set_shaper`.** Verified directly: `set_mode`
-and `set_rate` are each driven by four expectations; `set_shaper` by none.
+**no test in `tests/hqplayer_conformance.rs` called `adapter.set_shaper`.** Verified directly at the
+time: `set_mode` and `set_rate` were each driven by four expectations; `set_shaper` by none.
 
-So the shaper setter's behaviour rests entirely on L1: `shaper 24→0→24`, `result="OK"`, readback-verified
-against a real daemon. That is good evidence and it is **not** a regression pin — a client change could
-break `set_shaper` today and this suite would stay green.
+So the shaper setter's behaviour rested entirely on L1: `shaper 24→0→24`, `result="OK"`,
+readback-verified against a real daemon. Good evidence, and **not** a regression pin — a client change
+could have broken `set_shaper` and the suite would have stayed green.
 
-**What would settle it:** a conformance expectation that drives `set_shaper` and verifies the readback. The
-fake already applies `SetShaping`, so only the expectation is missing, which makes this a coverage gap
-rather than a capability gap — the same shape as HQP-C-051.
+**Settled by #347**, which drives `set_shaper` through all three delivery outcomes hermetically: a
+reply lost *after* the daemon applied the write (reported applied, because the readback finds it), a
+write whose delivery cannot be established (reported ambiguous, neither success nor a claim that
+nothing happened), and an explicit `result="Error"` (terminal, keeping the daemon's own reason). The
+readback is the thing under test in all three, which is what the gap was.
+
+Row retained rather than deleted, because the *reason* it existed — a claim naming a command none of
+its proofs sent — is the class the check was built to find, and the row is the record of it.
 
 ### HQP-C-011 — does `GetFilters` renumber a name's enum ID between chains?
 

@@ -341,6 +341,8 @@ struct Inner {
     status_active_mode: ActiveModeReporting,
     /// Which filter fields `State` carries. See [`FilterFieldReporting`].
     filter_fields: FilterFieldReporting,
+    /// `(element, chain)` — move the loaded chain once, right after that element is answered.
+    chain_switch_after: Option<(String, LoadedChain)>,
     enums: Enumerations,
     /// Every request line received, in order, so a test can assert on the value the client actually
     /// put on the wire (AC5) instead of on timing.
@@ -372,6 +374,7 @@ impl DaemonModel {
             state_active_mode: ActiveModeReporting::EchoesConfiguredMode,
             status_active_mode: ActiveModeReporting::EchoesConfiguredMode,
             filter_fields: FilterFieldReporting::default(),
+            chain_switch_after: None,
             enums: Enumerations::load(profile),
             requests: Vec::new(),
         };
@@ -437,6 +440,28 @@ impl DaemonModel {
         );
         inner.state.loaded_chain = chain;
         inner.clamp_to_loaded_chain();
+    }
+
+    /// Move the loaded chain **while the client is mid-conversation**: once, immediately after the
+    /// named element has been answered.
+    ///
+    /// [`Self::source_loads_chain`] moves the chain between client calls, which is enough for a
+    /// client that reads one list. It is not enough for one that reads several and publishes them as
+    /// a set: four replies read one after another are four moments, and a source change landing
+    /// between two of them yields a set that mixes the chains. Only a change *inside* the window can
+    /// express that, so the trigger is the request rather than the test's own timeline.
+    ///
+    /// **Provenance: derived-upstream, tier-2-only** — the same source-following observation as
+    /// [`LoadedChain`]. That a change can land between two requests needs no separate evidence: it
+    /// follows from the chain being able to move at all while the client is connected.
+    pub fn switch_chain_after_request(&self, element: &str, chain: LoadedChain) {
+        let mut inner = self.lock();
+        assert_eq!(
+            inner.state.mode_index, 0,
+            "switch_chain_after_request requires configured [source] mode, for the same reason \
+             source_loads_chain does: in PCM or SDM the configured mode *is* the chain"
+        );
+        inner.chain_switch_after = Some((element.to_string(), chain));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1137,6 +1162,17 @@ impl Responder for DaemonModel {
             // Verified: even an unknown element gets an echoed error, connection intact.
             other => inner.error(other, "Unknown command"),
         };
+
+        // A source-driven chain change landing *inside* a client's multi-request conversation. Applied
+        // after the reply is built, so this request still sees the chain it asked about and every
+        // later one sees the new chain — which is exactly how a change between two requests looks.
+        let due = matches!(inner.chain_switch_after, Some((ref el, _)) if *el == element);
+        if due {
+            if let Some((_, chain)) = inner.chain_switch_after.take() {
+                inner.state.loaded_chain = chain;
+                inner.clamp_to_loaded_chain();
+            }
+        }
 
         Some(reply)
     }

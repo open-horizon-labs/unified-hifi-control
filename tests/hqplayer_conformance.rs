@@ -6857,3 +6857,222 @@ async fn an_explicit_rejection_is_not_treated_as_ambiguous_delivery() {
     );
     h.stop();
 }
+
+// -----------------------------------------------------------------------------
+// A published enumeration set is coherent, or it is not published
+// -----------------------------------------------------------------------------
+
+/// Which chain-scoped families the pipeline view actually offers options for.
+///
+/// The unit of publication is the **set**: a view carrying one family and not the others has still
+/// been handed to a caller as this daemon's settings, so "some but not all" is the shape both checks
+/// below forbid.
+fn published_families(
+    pipeline: &unified_hifi_control::adapters::hqplayer::PipelineStatus,
+) -> Vec<&'static str> {
+    [
+        ("mode", !pipeline.settings.mode.options.is_empty()),
+        ("filter1x", !pipeline.settings.filter1x.options.is_empty()),
+        ("shaper", !pipeline.settings.shaper.options.is_empty()),
+        (
+            "samplerate",
+            !pipeline.settings.samplerate.options.is_empty(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, full)| *full)
+    .map(|(name, _)| name)
+    .collect()
+}
+
+/// Four lists read one after another are four moments, not one. A source change landing between two
+/// of them yields a set that mixes the chains — SDM filters offered next to PCM shapers — and
+/// publishing that under one lock is no better than publishing it in pieces: it has still been
+/// handed over as a single view of a single daemon.
+///
+/// The change is triggered by a request rather than by the test's own timeline, because that is the
+/// only way to land it *inside* the window.
+///
+/// **Label: client-red.** Before the bracket, the refresh published modes and SDM filters from before
+/// the change and PCM shapers and rates from after it.
+#[tokio::test]
+async fn a_chain_change_during_a_list_refresh_publishes_nothing_rather_than_a_mixed_set() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`
+        s.playback = 2;
+    });
+    // Fill the cache from the PCM chain the ordinary way.
+    h.adapter.get_pipeline_status().await.expect("pipeline");
+
+    // The chain moves to SDM, which the next poll's probe will notice and act on...
+    h.model.source_loads_chain(LoadedChain::Sdm);
+    // ...and then moves back, mid-refresh, right after the filter list has been served. So the
+    // refresh sees SDM filters and PCM shapers.
+    h.model
+        .switch_chain_after_request("GetFilters", LoadedChain::Pcm);
+
+    let straddled = h.adapter.get_pipeline_status().await.expect("pipeline");
+
+    let filters: Vec<&str> = straddled
+        .settings
+        .filter1x
+        .options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect();
+    let shapers: Vec<&str> = straddled
+        .settings
+        .shaper
+        .options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect();
+    assert!(
+        !(filters.contains(&"sinc-Lh") && shapers.contains(&"NS9")),
+        "a set straddling the change must not be published: these are the SDM chain's filters beside \
+         the PCM chain's shapers, offered together as one daemon's settings. filters={filters:?} \
+         shapers={shapers:?}"
+    );
+    // ...and it must not have passed by *partial* publication either. Refusing the straddling set has
+    // to mean publishing none of it: a view carrying one family and not the other three is still
+    // handed to a caller as this daemon's settings, and a check that only forbade the mixed pair
+    // would be satisfied by a family having been blanked on the way past.
+    let populated = published_families(&straddled);
+    assert!(
+        populated.is_empty() || populated.len() == 4,
+        "a refused refresh must publish nothing, not a part. Published: {populated:?}"
+    );
+
+    // And the client recovers: the daemon is settled on PCM now, so the next poll publishes a
+    // coherent PCM set rather than staying blank.
+    let settled = h.adapter.get_pipeline_status().await.expect("pipeline");
+    let filters: Vec<&str> = settled
+        .settings
+        .filter1x
+        .options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect();
+    let shapers: Vec<&str> = settled
+        .settings
+        .shaper
+        .options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect();
+    assert!(
+        filters.contains(&"IIR") && shapers.contains(&"NS9"),
+        "refusing to publish a straddling set must not wedge the view: once the chain settles, the \
+         next read publishes it. filters={filters:?} shapers={shapers:?}"
+    );
+    h.stop();
+}
+
+/// One family failing must not publish the other three. A refresh is a set or it is nothing: leaving
+/// a caller with fresh filters beside an empty shaper list tells it the daemon offers no modulators,
+/// which is a different and worse falsehood than "not read yet".
+///
+/// **Label: client-red.** The previous refresh assigned an empty vector per failed family and
+/// published the rest.
+#[tokio::test]
+async fn a_single_failed_family_publishes_no_part_of_the_refresh() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            silent_for_element: Some("GetShapers".to_string()),
+            ..WirePolicy::default()
+        },
+        HqpTimeouts {
+            max_attempts: 1,
+            ..fast_timeouts()
+        },
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    let pipeline = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("a failed family must not fail the whole read");
+
+    let populated = published_families(&pipeline);
+
+    assert!(
+        populated.is_empty(),
+        "the shaper fetch failed, so no part of that refresh may be published — a partially filled \
+         cache is offered to callers as a complete one. Published anyway: {populated:?}"
+    );
+    h.stop();
+}
+
+/// The legacy `filter` setting means *both sides*, and it must reach the daemon as **one**
+/// `SetFilter`. Two one-sided writes can half-apply — the first lands, the second is rejected,
+/// ignored or lost — leaving the daemon on a pair nobody asked for.
+///
+/// **Label: client-red.** The first form of this route wrote 1x and then Nx.
+#[tokio::test]
+async fn the_legacy_both_sides_filter_write_is_a_single_command() {
+    let h = Harness::verified().await;
+    let before = h.model.state();
+    assert_eq!(
+        (before.filter_1x_index, before.filter_nx_index),
+        (6, 6),
+        "precondition: the observed corpus starts both sides on index 6"
+    );
+
+    h.adapter
+        .set_filter_pair("poly-sinc-xtr")
+        .await
+        .applied()
+        .expect("both sides to one filter");
+
+    assert_eq!(
+        h.model.request_count("SetFilter"),
+        1,
+        "both sides go in one request, so the pair cannot half-apply on the wire"
+    );
+    let sent = h.model.last_request("SetFilter").expect("SetFilter sent");
+    assert_eq!(
+        (
+            request_attr(&sent, "value").as_deref(),
+            request_attr(&sent, "value1x").as_deref()
+        ),
+        (Some("11"), Some("11")),
+        "and it carries the same index on both sides. Sent: {sent}"
+    );
+    let after = h.model.state();
+    assert_eq!(
+        (after.filter_1x_index, after.filter_nx_index),
+        (11, 11),
+        "the daemon must end with both sides on the requested filter"
+    );
+    h.stop();
+}
+
+/// A both-sides write the daemon acknowledges and drops is not success, and the failure names both
+/// sides rather than half of them.
+///
+/// **Label: client-pin** for the refusal, **client-red** for the pair being one verified unit.
+#[tokio::test]
+async fn a_both_sides_filter_write_that_is_ignored_reports_both_sides() {
+    let h = Harness::verified().await;
+    h.model
+        .arm(|f| f.accept_but_ignore.push("SetFilter".to_string()));
+
+    let err = h
+        .adapter
+        .set_filter_pair("poly-sinc-xtr")
+        .await
+        .applied()
+        .expect_err("an acknowledged-but-dropped pair is not applied");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("1x=11,Nx=11") && message.contains("1x=6,Nx=6"),
+        "the error must name the pair asked for and the pair observed, so a half-applied write and \
+         an ignored one are distinguishable. Got: {message}"
+    );
+    h.stop();
+}

@@ -848,13 +848,13 @@ async fn hqp_apply_legacy_setting(
             hqp.set_mode(&name).await?
         }
         "filter" => {
-            // Both sides to the same filter. The 1x write is verified before the Nx one is sent, so a
-            // half-applied pair is reported rather than silently left behind.
+            // Both sides to the same filter, in **one** `SetFilter`. Two one-sided writes could
+            // half-apply — the first lands, the second is rejected or lost — leaving the daemon on a
+            // pair nobody asked for; a single request carrying both indices cannot.
             let name = hqp
                 .legacy_index_to_name(LegacySettingFamily::Filter, value)
                 .await?;
-            hqp.set_filter_1x(&name).await?.into_applied_result()?;
-            hqp.set_filter_nx(&name).await?
+            hqp.set_filter_pair(&name).await?
         }
         "filter1x" => {
             let name = hqp
