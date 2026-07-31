@@ -1,0 +1,57 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "search",
+      "0",
+      5,
+      "term:Aurora"
+    ]
+  ],
+  "result": {
+    "albums_count": 2,
+    "albums_loop": [
+      {
+        "album": "Northern Ember",
+        "album_id": 2
+      },
+      {
+        "album": "Ember Light",
+        "album_id": 1
+      }
+    ],
+    "contributors_count": 1,
+    "contributors_loop": [
+      {
+        "contributor": "Aurora Borealis Trio",
+        "contributor_id": 2
+      }
+    ],
+    "count": 8,
+    "tracks_count": 5,
+    "tracks_loop": [
+      {
+        "track": "Aurora Interlude",
+        "track_id": 5
+      },
+      {
+        "track": "Ember Rising",
+        "track_id": 1
+      },
+      {
+        "track": "Slow Ember",
+        "track_id": 2
+      },
+      {
+        "track": "Borealis Waltz",
+        "track_id": 3
+      },
+      {
+        "track": "Ember Dawn",
+        "track_id": 4
+      }
+    ]
+  }
+}

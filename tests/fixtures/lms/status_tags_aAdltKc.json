@@ -1,0 +1,25 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "02:00:00:00:00:01",
+    [
+      "status",
+      "-",
+      1,
+      "tags:aAdltKc"
+    ]
+  ],
+  "result": {
+    "mode": "stop",
+    "player_connected": 1,
+    "player_ip": "172.17.0.1:60364",
+    "player_name": "Kitchen",
+    "playlist mode": "off",
+    "playlist repeat": 0,
+    "playlist shuffle": 0,
+    "playlist_tracks": 0,
+    "randomplay": 0,
+    "seq_no": 0
+  }
+}
