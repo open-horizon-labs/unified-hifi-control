@@ -1941,3 +1941,180 @@ async fn no_tool_returns_an_unclassified_field() {
 
     h.stop().await;
 }
+
+// =============================================================================
+// 9. The human-readable text of all 10 tools, pinned byte for byte (#395)
+// =============================================================================
+//
+// Issue #395 adds a structured result envelope to every tool. Its hard
+// constraint is that the envelope is *added* and the existing text is never
+// substituted, so this section pins the text before any envelope code exists.
+//
+// The fixture below is generated at commit 06821cb — the tip of #394, with no
+// envelope in the tree. `git log --follow tests/fixtures/mcp_tool_text.json`
+// should therefore show exactly one commit, made before the envelope landed. A
+// later commit touching it means the additive contract broke and the fixture was
+// regenerated to hide it.
+//
+// Cases are chosen to be deterministic with every adapter disconnected: no
+// hosts, ports, timestamps or discovery results appear in any expected string.
+// LMS success text is pinned separately, against the mock server.
+
+/// Every tool, with the calls whose text is deterministic offline.
+///
+/// Read as a coverage matrix: all 10 tools appear, and between them all four
+/// refusal classes #395 must distinguish (provider cannot / not yet implemented
+/// in UHC / this failed / your input was invalid) are represented.
+const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
+    // hifi_zones — empty read.
+    ("hifi_zones/empty", "hifi_zones", || json!({})),
+    // hifi_now_playing — the zone id names nothing.
+    ("hifi_now_playing/unknown_zone", "hifi_now_playing", || {
+        json!({ "zone_id": UNKNOWN_ROON_ZONE })
+    }),
+    // hifi_control — backend failure, all four routing targets.
+    ("hifi_control/roon_disconnected", "hifi_control", || {
+        json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "play" })
+    }),
+    ("hifi_control/lms_unconfigured", "hifi_control", || {
+        json!({ "zone_id": "lms:aa:bb:cc:dd:ee:ff", "action": "play" })
+    }),
+    ("hifi_control/openhome_unknown_device", "hifi_control", || {
+        json!({ "zone_id": "openhome:abc", "action": "play" })
+    }),
+    ("hifi_control/upnp_unknown_renderer", "hifi_control", || {
+        json!({ "zone_id": "upnp:abc", "action": "play" })
+    }),
+    // hifi_control — volume_set with no value.
+    ("hifi_control/volume_set_without_value", "hifi_control", || {
+        json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "volume_set" })
+    }),
+    // hifi_control — volume refused for zone types the MCP volume path skips.
+    ("hifi_control/volume_openhome", "hifi_control", || {
+        json!({ "zone_id": "openhome:abc", "action": "volume_set", "value": 30 })
+    }),
+    ("hifi_control/volume_upnp", "hifi_control", || {
+        json!({ "zone_id": "upnp:abc", "action": "volume_set", "value": 30 })
+    }),
+    // hifi_control — volume refused for a prefix that names no adapter at all.
+    ("hifi_control/volume_unknown_prefix", "hifi_control", || {
+        json!({ "zone_id": "sonos:abc", "action": "volume_set", "value": 30 })
+    }),
+    // hifi_control — relative volume, defaulted delta, reaching the Roon path.
+    ("hifi_control/volume_up_defaulted", "hifi_control", || {
+        json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "volume_up" })
+    }),
+    // hifi_control — an action no adapter knows, passed straight through.
+    ("hifi_control/unknown_action", "hifi_control", || {
+        json!({ "zone_id": "openhome:abc", "action": "frobnicate" })
+    }),
+    // hifi_search — failure on both routes.
+    ("hifi_search/roon_disconnected", "hifi_search", || {
+        json!({ "query": "Eagles" })
+    }),
+    ("hifi_search/lms_unconfigured", "hifi_search", || {
+        json!({ "query": "Eagles", "zone_id": "lms:aa:bb:cc:dd:ee:ff" })
+    }),
+    // hifi_play — LMS has no radio mode.
+    ("hifi_play/lms_radio_unsupported", "hifi_play", || {
+        json!({ "query": "Kind of Blue", "zone_id": "lms:aa:bb:cc:dd:ee:ff", "action": "radio" })
+    }),
+    ("hifi_play/roon_disconnected", "hifi_play", || {
+        json!({ "query": "Eagles", "zone_id": UNKNOWN_ROON_ZONE })
+    }),
+    // hifi_status — deterministic read.
+    ("hifi_status/disconnected", "hifi_status", || json!({})),
+    // The four HQPlayer tools.
+    (
+        "hifi_hqplayer_status/disconnected",
+        "hifi_hqplayer_status",
+        || json!({}),
+    ),
+    ("hifi_hqplayer_profiles/empty", "hifi_hqplayer_profiles", || {
+        json!({})
+    }),
+    (
+        "hifi_hqplayer_load_profile/disconnected",
+        "hifi_hqplayer_load_profile",
+        || json!({ "profile": "4x-Sinc-L" }),
+    ),
+    (
+        "hifi_hqplayer_set_pipeline/disconnected",
+        "hifi_hqplayer_set_pipeline",
+        || json!({ "setting": "mode", "value": "PCM" }),
+    ),
+    // hifi_hqplayer_set_pipeline — two distinct offending parameters.
+    (
+        "hifi_hqplayer_set_pipeline/unknown_setting",
+        "hifi_hqplayer_set_pipeline",
+        || json!({ "setting": "oversampling", "value": "8x" }),
+    ),
+    (
+        "hifi_hqplayer_set_pipeline/invalid_rate",
+        "hifi_hqplayer_set_pipeline",
+        || json!({ "setting": "samplerate", "value": "not-a-number" }),
+    ),
+];
+
+/// The exact text every tool returns, pinned against a fixture generated before
+/// the envelope existed.
+///
+/// This is #395's central guarantee. A diff here means the envelope replaced
+/// text rather than accompanying it — which is the bug, not a stale fixture.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn tool_text_is_byte_identical_to_the_pre_envelope_fixture() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let mut captured = serde_json::Map::new();
+    for (label, tool, args) in TOOL_TEXT_CASES {
+        let result = app.call_tool(tool, args()).await;
+        captured.insert(label.to_string(), json!(result_text(&result)));
+    }
+
+    // Every tool must appear, or the fixture is a partial guarantee dressed up
+    // as a total one.
+    let covered: std::collections::BTreeSet<&str> =
+        TOOL_TEXT_CASES.iter().map(|(_, tool, _)| *tool).collect();
+    assert_eq!(
+        covered.len(),
+        10,
+        "all 10 tools must have their text pinned; covered: {covered:?}"
+    );
+
+    assert_matches_fixture("mcp_tool_text.json", &Value::Object(captured));
+}
+
+/// Exactly one content block per tool result.
+///
+/// `result_text` in this file concatenates every text block with `\n`, so a
+/// second block would change the text a client reads while every `starts_with`
+/// assertion above stayed green. #395 chose `structuredContent` over a second
+/// JSON text block precisely to avoid that; this asserts the choice rather than
+/// trusting it.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn every_tool_result_has_exactly_one_content_block() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    for (label, tool, args) in TOOL_TEXT_CASES {
+        let result = app.call_tool(tool, args()).await;
+        let content = result
+            .get("content")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("{label}: result must carry a content array: {result}"));
+        assert_eq!(
+            content.len(),
+            1,
+            "{label}: exactly one content block, or the human-readable text changes; \
+             got {content:?}"
+        );
+        assert_eq!(
+            content[0].get("type"),
+            Some(&json!("text")),
+            "{label}: the single content block must stay a text block"
+        );
+    }
+}
