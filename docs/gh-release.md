@@ -188,7 +188,7 @@ WASM is built once and shared across all platform builds. The cache uses content
 **sccache** caches individual compilation units (`.o` files). Used with rust-cache for native builds:
 
 ```yaml
-- uses: mozilla-actions/sccache-action@v0.0.9
+- uses: mozilla-actions/sccache-action@v0.0.11
 - run: cargo build --release
   env:
     SCCACHE_GHA_ENABLED: "true"
