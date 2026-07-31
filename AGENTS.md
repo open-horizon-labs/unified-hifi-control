@@ -186,14 +186,23 @@ MCP (Model Context Protocol) enables AI assistants (Claude, ChatGPT, BoltAI, etc
 
 ### Current Capabilities
 
-| Feature | Roon | LMS | OpenHome | UPnP |
-|---------|------|-----|----------|------|
-| Discovery (zones) | ✅ | ✅ | ✅ | ✅ |
-| Transport (play/pause/next) | ✅ | ✅ | ✅ | ✅ |
-| Volume control | ✅ | ✅ | ❌ | ❌ |
-| Search | ✅ | ✅ | ❌ | ❌ |
-| Play by query | ✅ | ✅ | ❌ | ❌ |
-| Queue building | ✅ | ✅ | ❌ | ❌ |
+| Feature | Roon | LMS | OpenHome | UPnP | HQPlayer (direct) |
+|---------|------|-----|----------|------|--------------------|
+| Discovery (zones) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Transport (play/pause/next/previous) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Stop, seek, mute | ❌ | ❌ | ❌ | ❌ | ✅ |
+| Volume control | ✅ (0-100) | ✅ (0-100) | ❌ | ❌ | ✅ (decimal dB) |
+| Search | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Play by query | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Queue building | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Pipeline/profile management | ❌ | ❌ | ❌ | ❌ | ✅ (default instance only, via `hifi_hqplayer_*`) |
+
+A direct HQPlayer zone (`zone_id` starting `hqplayer:`) is a normal zone through `hifi_zones`,
+`hifi_now_playing`, and `hifi_control` — routed through the same `ZoneAggregator`/instance-manager
+path as every other backend, never a Roon fallback. Its volume unit is decimal dB, not the 0-100
+scale Roon/LMS use. The `hifi_hqplayer_*` tools are separate: they manage HQPlayer's own pipeline
+and profile configuration (not zone playback) and always target the single default configured
+instance — none of them takes a `zone_id`.
 
 ### Tool Design Principles
 
@@ -211,16 +220,16 @@ MCP (Model Context Protocol) enables AI assistants (Claude, ChatGPT, BoltAI, etc
 
 | Tool | Purpose |
 |------|---------|
-| `hifi_zones` | List all playback zones |
-| `hifi_now_playing` | Get current track info |
-| `hifi_control` | Play, pause, next, previous, volume |
+| `hifi_zones` | List all playback zones, including direct HQPlayer zones |
+| `hifi_now_playing` | Get current track info for any zone |
+| `hifi_control` | Play, pause, next, previous, volume for every zone; stop, seek, mute additionally for direct HQPlayer zones |
 | `hifi_search` | Search library/TIDAL/Qobuz (Roon, LMS) |
 | `hifi_play` | Search and play/queue/radio (Roon, LMS) |
 | `hifi_status` | Bridge connection status |
-| `hifi_hqplayer_status` | HQPlayer pipeline status |
-| `hifi_hqplayer_profiles` | List HQPlayer configs |
-| `hifi_hqplayer_load_profile` | Load HQPlayer config |
-| `hifi_hqplayer_set_pipeline` | Change HQPlayer setting |
+| `hifi_hqplayer_status` | HQPlayer pipeline status (default instance) |
+| `hifi_hqplayer_profiles` | List HQPlayer configs (default instance) |
+| `hifi_hqplayer_load_profile` | Load HQPlayer config (default instance) |
+| `hifi_hqplayer_set_pipeline` | Change HQPlayer setting (default instance) |
 
 ---
 
