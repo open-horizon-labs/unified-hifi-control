@@ -37,11 +37,10 @@ Use GitHub for all task tracking:
 - Auto-merge in a "merge party" without explicit approval for each PR
 
 ### Git Workflow
-**DO NOT force push (`git push --force` or `git push -f`)**
-- This project uses squash merges, so commit history cleanup is unnecessary
-- Force pushing breaks checkouts for anyone tracking the branch
-- Force pushing loses SHA references (builds, comments, reviews)
-- Just push new commits - they all get squashed on merge anyway
+- Rebasing an owned feature branch is allowed when it keeps a stacked PR current or makes its dependency history clearer.
+- Publish rewritten history with `git push --force-with-lease`, never plain `--force`/`-f`, so an unseen remote update is not overwritten.
+- Do not rewrite `master`, `v3`, release branches, or another contributor's branch.
+- Before rewriting a branch, check for active worktrees/collaborators and record the new exact head in affected PR reports.
 
 ---
 
