@@ -11,7 +11,7 @@ use roon_api::{
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
     transport::{self, volume, Control, Transport, Zone as RoonZone},
-    CoreEvent, Info, Parsed, RoonApi, Services, Svc,
+    CoreEvent, Info, Parsed, RoonApi, RoonApiError, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -402,22 +402,86 @@ struct RoonState {
 impl RoonState {
     /// Route a Core browse/load rejection to the exact request waiting on it.
     ///
-    /// TODO(#405): not implemented yet - this reproduces the pre-#405 behavior
-    /// (the rejection is dropped and no waiter is resolved) so the correlation
-    /// tests fail against it.
+    /// Correlation is by `req_id`, cross-checked against the session key:
+    ///
+    /// - `req_id` is authoritative. The fork hands back the same request id
+    ///   that `Browse::browse`/`Browse::load` returned when the request was
+    ///   submitted (fork `src/browse.rs:126-154`, read back off the wire at
+    ///   `:157`), and `Moo` allocates request ids from one monotonic
+    ///   per-connection counter (fork `src/moo.rs:124-135`). So a `req_id`
+    ///   names exactly one submitted request, and `pending_browses` and
+    ///   `pending_loads` cannot both hold it. That is strictly better than the
+    ///   session-key scan the success arms are forced into: a session key is
+    ///   shared by every request in a browse session (`search()` reuses one
+    ///   across six requests, and `/roon/browse` lets a caller supply its own),
+    ///   so scanning for it cannot say *which* request was refused - nor even
+    ///   whether it was a browse or a load.
+    ///
+    /// - The session key is checked because that counter restarts at 0 on every
+    ///   reconnect (fork `src/moo.rs:92`): a rejection arriving on a fresh
+    ///   connection can carry a request id that an older, not-yet-timed-out
+    ///   entry still occupies. On a mismatch the waiter is left alone and falls
+    ///   back to `BROWSE_TIMEOUT` - the pre-#405 behavior - because resolving
+    ///   the wrong caller is worse than resolving them late.
+    ///
+    /// Resolution is exactly-once: every path removes the entry before sending,
+    /// so a repeated rejection finds nothing and a waiter can never be resolved
+    /// twice. A `KeyMismatch` leaves the entry for the caller's own timeout to
+    /// clean up, so no path strands one.
     fn route_browse_rejection(
         &mut self,
-        _req_id: usize,
-        _session_key: Option<&str>,
-        _kind: RoonBrowseErrorKind,
+        req_id: usize,
+        session_key: Option<&str>,
+        kind: RoonBrowseErrorKind,
     ) -> ErrorRouting {
+        if let Some((pending_key, _)) = self.pending_browses.get(&req_id) {
+            if pending_key.as_deref() != session_key {
+                return ErrorRouting::KeyMismatch;
+            }
+            if let Some((_, sender)) = self.pending_browses.remove(&req_id) {
+                return if deliver_browse_rejection(sender, kind, session_key) {
+                    ErrorRouting::Browse
+                } else {
+                    ErrorRouting::ReceiverGone
+                };
+            }
+        }
+
+        if let Some((pending_key, _)) = self.pending_loads.get(&req_id) {
+            if pending_key.as_deref() != session_key {
+                return ErrorRouting::KeyMismatch;
+            }
+            if let Some((_, sender)) = self.pending_loads.remove(&req_id) {
+                return if deliver_browse_rejection(sender, kind, session_key) {
+                    ErrorRouting::Load
+                } else {
+                    ErrorRouting::ReceiverGone
+                };
+            }
+        }
+
         ErrorRouting::NoWaiter
     }
 
     /// Route a Core image rejection to the request waiting on it.
     ///
-    /// TODO(#405): not implemented yet - see `route_browse_rejection`.
-    fn route_image_rejection(&mut self, _req_id: usize, _image_key: &str) -> ErrorRouting {
+    /// Same rule as [`RoonState::route_browse_rejection`], with the image key
+    /// standing in for the session key. `get_image` reads `None` as "Image not
+    /// found", so the caller gets an answer instead of a 10s timeout.
+    fn route_image_rejection(&mut self, req_id: usize, image_key: &str) -> ErrorRouting {
+        if let Some((pending_key, _)) = self.pending_images.get(&req_id) {
+            if pending_key != image_key {
+                return ErrorRouting::KeyMismatch;
+            }
+            if let Some((_, sender)) = self.pending_images.remove(&req_id) {
+                return if sender.send(None).is_ok() {
+                    ErrorRouting::Image
+                } else {
+                    ErrorRouting::ReceiverGone
+                };
+            }
+        }
+
         ErrorRouting::NoWaiter
     }
 }
@@ -2081,6 +2145,66 @@ async fn run_roon_loop(
                                         session_key
                                     );
                                 }
+                            }
+                        }
+                    }
+                    // Issue #405: the Core answered with a rejection rather than
+                    // a result. Route it to the request that is waiting on it -
+                    // dropping it here is what made a stale item key look like
+                    // an unreachable Core, ten seconds late.
+                    Parsed::Error(err) => {
+                        let routing = {
+                            let mut s = state_for_events.write().await;
+                            match &err {
+                                RoonApiError::BrowseInvalidItemKey((req_id, session_key)) => s
+                                    .route_browse_rejection(
+                                        *req_id,
+                                        session_key.as_deref(),
+                                        RoonBrowseErrorKind::InvalidItemKey,
+                                    ),
+                                RoonApiError::BrowseInvalidLevels((req_id, session_key)) => s
+                                    .route_browse_rejection(
+                                        *req_id,
+                                        session_key.as_deref(),
+                                        RoonBrowseErrorKind::InvalidLevels,
+                                    ),
+                                RoonApiError::BrowseZoneNotFound((req_id, session_key)) => s
+                                    .route_browse_rejection(
+                                        *req_id,
+                                        session_key.as_deref(),
+                                        RoonBrowseErrorKind::ZoneNotFound,
+                                    ),
+                                RoonApiError::BrowseUnexpectedError((req_id, session_key)) => s
+                                    .route_browse_rejection(
+                                        *req_id,
+                                        session_key.as_deref(),
+                                        RoonBrowseErrorKind::UnexpectedError,
+                                    ),
+                                RoonApiError::ImageNotFound((req_id, image_key))
+                                | RoonApiError::ImageUnexpectedError((req_id, image_key)) => {
+                                    s.route_image_rejection(*req_id, image_key)
+                                }
+                            }
+                        };
+
+                        match routing {
+                            ErrorRouting::NoWaiter => tracing::debug!(
+                                "Roon reported an error with nothing waiting on it \
+                                 (already resolved or timed out): {}",
+                                err
+                            ),
+                            ErrorRouting::KeyMismatch => tracing::warn!(
+                                "Roon error not routed - a pending request holds that \
+                                 request id under a different session/image key, so it \
+                                 was left for its own timeout: {}",
+                                err
+                            ),
+                            ErrorRouting::ReceiverGone => tracing::debug!(
+                                "Roon error arrived after its caller gave up: {}",
+                                err
+                            ),
+                            ErrorRouting::Browse | ErrorRouting::Load | ErrorRouting::Image => {
+                                tracing::debug!("Roon error routed to its {:?} request: {}", routing, err)
                             }
                         }
                     }

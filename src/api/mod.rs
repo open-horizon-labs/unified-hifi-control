@@ -511,6 +511,33 @@ pub async fn roon_play_handler(
     }
 }
 
+/// Turn a Roon browse/load failure into an HTTP response, keeping the failure
+/// classes apart (issue #405).
+///
+/// A reference the Core refused is a client-fixable condition that now arrives
+/// immediately, so it answers 404 with the Core's own explanation and the
+/// recovery instruction. Everything else - a timed-out or unreachable Core, a
+/// Core-side fault - keeps the 500 it has always had. Browse-not-connected is
+/// still checked before the request is issued and still answers 503.
+fn roon_browse_failure(err: &anyhow::Error, prefix: &str) -> axum::response::Response {
+    use crate::adapters::roon::{RoonBrowseError, RoonBrowseErrorKind};
+
+    let status = match RoonBrowseError::from_error(err).map(|rejection| rejection.kind) {
+        Some(RoonBrowseErrorKind::InvalidItemKey) | Some(RoonBrowseErrorKind::ZoneNotFound) => {
+            StatusCode::NOT_FOUND
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    let error = if prefix.is_empty() {
+        err.to_string()
+    } else {
+        format!("{}: {}", prefix, err)
+    };
+
+    (status, Json(ErrorResponse { error })).into_response()
+}
+
 /// Play item request body
 #[derive(Deserialize)]
 pub struct PlayItemRequest {
@@ -549,13 +576,7 @@ pub async fn roon_play_item_handler(
             Json(serde_json::json!({ "message": message })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => roon_browse_failure(&e, ""),
     }
 }
 
@@ -646,15 +667,7 @@ pub async fn roon_browse_handler(
     // Browse to the level
     let browse_result = match state.roon.browse(opts).await {
         Ok(result) => result,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response()
-        }
+        Err(e) => return roon_browse_failure(&e, ""),
     };
 
     // Load items at this level
@@ -686,15 +699,7 @@ pub async fn roon_browse_handler(
                         }
                     })
                     .collect(),
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("Browse load error: {}", e),
-                        }),
-                    )
-                        .into_response();
-                }
+                Err(e) => return roon_browse_failure(&e, "Browse load error"),
             }
         } else {
             vec![]
