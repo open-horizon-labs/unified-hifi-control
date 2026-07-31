@@ -10,6 +10,11 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 mkdir -p "${TEST_ROOT}/target" "${TEST_ROOT}/scripts" "${TEST_ROOT}/var" "${TEST_ROOT}/home"
 cp "${ROOT_DIR}"/build/synology/scripts/* "${TEST_ROOT}/scripts/"
 
+# DSM exposes persistent package data through /var/packages/<name>/var, which
+# points to a volume's @appdata directory.
+rmdir "${TEST_ROOT}/var"
+ln -s /volume1/@appdata/unified-hifi-control "${TEST_ROOT}/var"
+
 cat > "${TEST_ROOT}/target/unified-hifi-control" <<'DAEMON'
 #!/bin/sh
 
@@ -30,7 +35,9 @@ docker run --rm \
     "$IMAGE" \
     bash -euo pipefail -c '
         useradd --system --home-dir /var/packages/unified-hifi-control/home unified-hifi-control
+        mkdir -p /volume1/@appdata/unified-hifi-control/firmware
         chown -R unified-hifi-control:unified-hifi-control /var/packages/unified-hifi-control
+        chown -R unified-hifi-control:unified-hifi-control /volume1/@appdata/unified-hifi-control
 
         run_as_package() {
             su -s /bin/sh unified-hifi-control -c "$1"
@@ -44,7 +51,11 @@ docker run --rm \
         run_as_package "/var/packages/unified-hifi-control/scripts/postinst"
         run_as_package "/var/packages/unified-hifi-control/scripts/preupgrade"
         run_as_package "/var/packages/unified-hifi-control/scripts/preuninst"
-        run_as_package "/var/packages/unified-hifi-control/scripts/postuninst"
+        printf "preserve during upgrade\n" > /var/packages/unified-hifi-control/var/firmware/version.json
+        SYNOPKG_PKG_STATUS=UPGRADE \
+            SYNOPKG_PKGVAR=/var/packages/unified-hifi-control/var \
+            /var/packages/unified-hifi-control/scripts/postuninst
+        test -f /volume1/@appdata/unified-hifi-control/firmware/version.json
         run_as_package "/var/packages/unified-hifi-control/scripts/preinst"
         run_as_package "/var/packages/unified-hifi-control/scripts/postinst"
         run_as_package "/var/packages/unified-hifi-control/scripts/postupgrade"
@@ -74,7 +85,10 @@ docker run --rm \
         rm /var/packages/unified-hifi-control/var/unified-hifi-control.pid
 
         run_as_package "/var/packages/unified-hifi-control/scripts/preuninst"
-        run_as_package "/var/packages/unified-hifi-control/scripts/postuninst"
+        SYNOPKG_PKG_STATUS=UNINSTALL \
+            SYNOPKG_PKGVAR=/var/packages/unified-hifi-control/var \
+            /var/packages/unified-hifi-control/scripts/postuninst
+        test ! -e /volume1/@appdata/unified-hifi-control
 
         # Restore bind-mount ownership so the host-side cleanup trap works on
         # Linux runners where container UID ownership is preserved.

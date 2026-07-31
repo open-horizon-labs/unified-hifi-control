@@ -1,5 +1,11 @@
 {
   "defaults": {
     "run-as": "package"
-  }
+  },
+  "ctrl-script": [
+    {
+      "action": "postuninst",
+      "run-as": "root"
+    }
+  ]
 }
