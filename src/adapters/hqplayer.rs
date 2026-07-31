@@ -1002,7 +1002,68 @@ pub struct MatrixProfile {
     pub name: String,
 }
 
-/// Internal adapter state
+/// The identity of a complete set of cached chain-scoped enumerations.
+///
+/// Four fingerprints rather than one. The rate list alone is the right *probe* for a chain move —
+/// smallest chain-scoped enumeration, and the two chains' rate lists were observed disjoint
+/// (HQP-C-020) — and it is the wrong *identity*, because a profile load can replace filters and
+/// shapers while leaving rates byte-identical. A read that captured only the rates would accept such
+/// a replacement as the set it started from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChainIdentity {
+    modes: u64,
+    filters: u64,
+    shapers: u64,
+    rates: u64,
+}
+
+/// The four cached chain-scoped families, taken together, at one instant.
+///
+/// Returned by [`HqpAdapter::verified_chain_snapshot`] so that what a read *verified* and what it
+/// *publishes* are the same values rather than two reads of the same cache.
+#[derive(Debug, Clone)]
+struct ChainSnapshot {
+    modes: Vec<ListItem>,
+    filters: Vec<FilterItem>,
+    shapers: Vec<ListItem>,
+    rates: Vec<RateItem>,
+}
+
+/// Why a read could not join the `State` it observed to the lists it holds.
+///
+/// Named cases rather than a bare `bool`, because they do not mean the same thing: only `Moved` is
+/// the daemon contradicting the cache, and only that one justifies dropping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainProofFailure {
+    /// A family went missing mid-read — a reconnect, most likely.
+    Partial,
+    /// The daemon's live rate list is not the one the cached lists were read from.
+    Moved,
+    /// A complete, coherent, *different* set is in the cache: it was replaced mid-read.
+    Replaced,
+}
+
+impl std::fmt::Display for ChainProofFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::Partial => {
+                "its setting lists were dropped while its state was being read, most likely by a \
+                 reconnect"
+            }
+            Self::Moved => {
+                "its loaded chain moved while its state was being read, so the rate list it serves \
+                 now is not the one those lists came from"
+            }
+            Self::Replaced => {
+                "its setting lists were replaced while its state was being read, so that state's \
+                 indices belong to a set this read never verified"
+            }
+        };
+        f.write_str(reason)
+    }
+}
+
+/// Internal adapter state.
 #[allow(dead_code)]
 struct HqpAdapterState {
     instance_name: Option<String>,
@@ -1400,6 +1461,15 @@ impl HqpAdapter {
     /// events that reload a chain can also be a different device.
     async fn invalidate_chain_cache(&self) {
         let mut state = self.state.write().await;
+        Self::clear_chain_cache(&mut state);
+    }
+
+    /// The clearing itself, on a lock the caller already holds.
+    ///
+    /// Split out because [`Self::verified_chain_snapshot`] must decide *and* act inside one lock: a
+    /// proof that dropped the lock to call [`Self::invalidate_chain_cache`] would be judging one
+    /// cache and clearing whatever happened to be there a moment later.
+    fn clear_chain_cache(state: &mut HqpAdapterState) {
         state.modes.clear();
         state.filters.clear();
         state.shapers.clear();
@@ -1487,8 +1557,10 @@ impl HqpAdapter {
 
     /// Fetch the loaded chain's rate list from the daemon and cache it.
     ///
-    /// Also the **chain probe** used by the read path: it is the smallest chain-scoped enumeration and
-    /// the two chains' rate lists were observed disjoint (HQP-C-020, `E0-uhc-live`). The residual is
+    /// The rate list is also what the read path and [`Self::refresh_lists`] **probe** with — through
+    /// a bare [`Self::get_rates`] rather than through here, since a probe must publish nothing — for
+    /// the reason this list is the chosen one: it is the smallest chain-scoped enumeration and the
+    /// two chains' rate lists were observed disjoint (HQP-C-020, `E0-uhc-live`). The residual is
     /// stated rather than hidden: the offered rates also depend on the selected filter (HQP-C-021), so
     /// a filter change can move this fingerprint without the chain having moved. That direction is
     /// harmless — it costs a refetch of lists that were about to be re-read anyway. The opposite
@@ -1522,50 +1594,130 @@ impl HqpAdapter {
         )
     }
 
-    /// Whether any chain-scoped family is missing from the cache.
+    /// The identity of the **whole** cached chain-scoped set, as one comparable value.
     ///
-    /// Separate from [`Self::chain_still_matches_cache`] because they answer different questions and
-    /// conflating them is how an empty cache passed for an unchanged one: that check is about
-    /// *movement*, and with nothing cached there is no movement to report. This one is about
-    /// *presence*, and it has to be asked again after the reads — a reconnect between the two
-    /// empties the cache behind the answer.
+    /// All four fingerprints, not the rate list alone. A rates-only identity answers "did the chain
+    /// move" and cannot answer "is this the same set I looked at a moment ago": a profile load can
+    /// replace the filters and shapers while leaving the rates untouched (which is exactly the case
+    /// `a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles_lists_in_place`
+    /// covers), and that replacement is invisible to a rates comparison.
     ///
-    /// A missing `rates_fingerprint` counts as incomplete too. Current writers update it in lockstep
-    /// with `rates`, so this is defensive invariant enforcement rather than a separately reachable
-    /// state today. It is what the lists were filled *from*: without it there is nothing for
-    /// [`Self::chain_still_matches_cache`] to compare against and the lists would be unanchored.
-    async fn chain_lists_incomplete(&self) -> bool {
-        let cached = self.state.read().await;
-        cached.modes.is_empty()
-            || cached.filters.is_empty()
-            || cached.shapers.is_empty()
-            || cached.rates.is_empty()
-            || cached.rates_fingerprint.is_none()
+    /// `None` means the set is **not** a set: a family is empty, or a family is present without the
+    /// fingerprint it was filled from, which would leave it unanchored. Presence and identity are the
+    /// same question asked once here, because a partial cache has no identity to compare — which is
+    /// what let an emptied cache pass for an unchanged one when the two were asked separately.
+    fn chain_identity_of(state: &HqpAdapterState) -> Option<ChainIdentity> {
+        if state.modes.is_empty()
+            || state.filters.is_empty()
+            || state.shapers.is_empty()
+            || state.rates.is_empty()
+        {
+            return None;
+        }
+        Some(ChainIdentity {
+            modes: state.modes_fingerprint?,
+            filters: state.filters_fingerprint?,
+            shapers: state.shapers_fingerprint?,
+            rates: state.rates_fingerprint?,
+        })
     }
 
-    /// Whether the daemon's chain still matches the one the cache was filled from, **publishing
-    /// nothing either way**. Drops the cache when it does not.
+    /// [`Self::chain_identity_of`] against the live cache.
+    async fn chain_identity(&self) -> Option<ChainIdentity> {
+        Self::chain_identity_of(&*self.state.read().await)
+    }
+
+    /// **The read path's proof, and the thing it proves is a value, not a verdict.**
     ///
-    /// The read path's check. Deliberately not [`Self::fresh_rates`], which caches what it fetched:
-    /// caching here would publish one family on its own, so a poll that detected a transition would
-    /// leave a caller holding the new chain's rates beside no filters and no shapers — a partial view,
-    /// offered as a whole one. Detection and publication are separate jobs, and [`Self::refresh_lists`]
-    /// owns the second.
+    /// A check that returns `bool` and leaves its caller to fetch the data again has proved nothing
+    /// about what the caller then publishes: the cache it re-reads is a *later* cache, and a
+    /// concurrent profile load, reconnect, `fresh_*` publication or [`Self::refresh_lists`] can have
+    /// replaced it in between with one that is complete, self-consistent, and describes a different
+    /// configuration entirely. Re-checking presence does not help — a complete replacement is present.
+    /// So verification and extraction happen under **one** lock, and what comes back is the exact set
+    /// that was verified.
     ///
-    /// Nothing cached yet reads as a match: there is no previous observation for the daemon to
-    /// contradict, and the caller's own lazy fill is what settles it.
-    async fn chain_still_matches_cache(&self) -> Result<bool> {
-        let fingerprint = Self::rates_fingerprint(&self.get_rates().await?);
-        let previous = self.state.read().await.rates_fingerprint;
-        if previous.is_some_and(|p| p != fingerprint) {
+    /// Three ways it can fail, and the difference between them decides whether the cache is dropped:
+    ///
+    /// * **Partial** — a family went missing, which is what a reconnect leaves behind. Nothing to
+    ///   drop; the caller refills.
+    /// * **Replaced** — the set is coherent and complete but is not the one this read captured. The
+    ///   cache is not known to be wrong; it is simply newer than this read, and dropping it would
+    ///   punish whoever published it for winning a race. This read fails; the cache stands.
+    /// * **Moved** — after establishing that the current cache is still the captured set, the
+    ///   daemon's live rate list contradicts it. That is the daemon disagreeing with the cache, so
+    ///   the cache is wrong and goes.
+    ///
+    /// Classification order matters because the probe was fetched before this lock was acquired. A
+    /// newer complete cache can arrive after the probe; that is `Replaced`, even if its rates differ
+    /// from the old probe, and it must survive. Only when `current == captured` does the probe describe
+    /// the same read generation and have authority to invalidate that cache as `Moved`.
+    ///
+    /// Residual, unchanged and unclosable from here: the probe establishes that the daemon's rate list
+    /// now matches the one these lists were read from. A move out and back inside the window leaves it
+    /// agreeing. Only a daemon-side atomic snapshot could do better, and the protocol has none.
+    async fn verified_chain_snapshot(
+        &self,
+        captured: ChainIdentity,
+        probe: &[RateItem],
+    ) -> std::result::Result<ChainSnapshot, ChainProofFailure> {
+        let probe_fingerprint = Self::rates_fingerprint(probe);
+        let mut state = self.state.write().await;
+
+        let Some(current) = Self::chain_identity_of(&state) else {
+            return Err(ChainProofFailure::Partial);
+        };
+
+        // The probe predates this lock. If another complete set won the race, it is newer than the
+        // probe and must not be invalidated merely because the old observation differs from it.
+        if current != captured {
+            return Err(ChainProofFailure::Replaced);
+        }
+
+        if current.rates != probe_fingerprint {
             tracing::info!(
                 "HQPlayer rate enumeration changed: the loaded chain moved, dropping every \
                  chain-scoped list"
             );
-            self.invalidate_chain_cache().await;
-            return Ok(false);
+            Self::clear_chain_cache(&mut state);
+            return Err(ChainProofFailure::Moved);
         }
-        Ok(true)
+
+        Ok(ChainSnapshot {
+            modes: state.modes.clone(),
+            filters: state.filters.clone(),
+            shapers: state.shapers.clone(),
+            rates: state.rates.clone(),
+        })
+    }
+
+    /// Fetch the volume range if it is not cached yet, and report what the cache holds afterwards.
+    ///
+    /// **Reconnect-capable, and therefore not something the read may do after proving coherence.** A
+    /// lost reply here takes `send_command` through `mark_disconnected` and `connect`, and both
+    /// invalidate every chain-scoped list because a session's indices must not outlive it. Done
+    /// before the proof, that is merely a fill the read then has to do; done after it, it empties the
+    /// cache the proof was about and the read publishes four empty lists as this daemon's settings.
+    ///
+    /// A failure is not the read's failure. The range is not chain-scoped and nothing joins it to a
+    /// list index; a daemon that will not answer `VolumeRange` still has settings worth reporting, and
+    /// the default renders as a fixed-volume device rather than as a wrong one.
+    async fn ensure_volume_range(&self) -> VolumeRange {
+        let cached = { self.state.read().await.volume_range.clone() };
+        if let Some(range) = cached {
+            return range;
+        }
+        match self.get_volume_range().await {
+            Ok(range) => {
+                let mut state = self.state.write().await;
+                state.volume_range = Some(range.clone());
+                range
+            }
+            Err(e) => {
+                tracing::debug!("HQPlayer volume range unavailable ({e}); reporting fixed volume");
+                VolumeRange::default()
+            }
+        }
     }
 
     /// Refresh every cached list, publishing **one coherent snapshot or none at all**.
@@ -3029,36 +3181,61 @@ impl HqpAdapter {
     /// Get full pipeline status
     pub async fn get_pipeline_status(&self) -> Result<PipelineStatus> {
         // `State` reports settings as **list indices**, and an index means nothing apart from the list
-        // it came from. So the lists are settled first and `State` is read after them, then the chain
-        // is checked once more: if it moved while `State` was being read, the index and the list
-        // describe different chains and neither answer is the daemon's.
+        // it came from. So this read has one job beyond fetching: to establish that the `State` it
+        // publishes and the lists it resolves that state through describe **the same loaded chain**,
+        // and to publish exactly the values that establishment covered.
         //
-        // Reading `State` first — as this did — is the same misselection this issue exists to end,
-        // arriving through the read path and needing no write at all: under `[source]` the chain moves
-        // without `State.mode` moving (HQP-C-007), so a pre-transition index was resolved against
-        // post-transition lists.
+        // Reading `State` first — as this once did — is the same misselection this issue exists to
+        // end, arriving through the read path and needing no write at all: under `[source]` the chain
+        // moves without `State.mode` moving (HQP-C-007), so a pre-transition index was resolved
+        // against post-transition lists.
         //
-        // The rate list is the check because it is the smallest chain-scoped enumeration and the two
-        // chains' rate lists were observed disjoint (HQP-C-020). One retry, not a loop: a daemon whose
-        // chain is flapping would otherwise hold this open, and after the retry the lists and `State`
-        // are at least read in the right order.
+        // The order below is the whole design, and each step is where it is for a reason:
         //
-        // **Residual, and it cannot be closed from here.** The check confirms the chain is the same
+        // 1. **The volume range first**, because fetching it can reconnect, and a reconnect empties
+        //    every chain-scoped list. Anything reconnect-capable has to happen before coherence is
+        //    established, never after it — a proof followed by a reconnect is a proof about a cache
+        //    that no longer exists. It used to run last, between the check and the publication, which
+        //    made four empty lists the *deterministic* answer to a lost `VolumeRange` reply on the
+        //    first read of a connection.
+        // 2. **Fill if needed and capture the identity** of all four families — fingerprints, not
+        //    contents — before reading `State`. Four and not just the rates: a profile load can
+        //    replace filters and shapers while leaving the rate list untouched, and a rates-only
+        //    identity cannot see it. A required fill that does not settle is the read's failure, not
+        //    a quieter version of success.
+        // 3. **`State` and `Status`.**
+        // 4. **Probe the daemon's rate list**, which is the chain-movement check: smallest
+        //    chain-scoped enumeration, and the two chains' were observed disjoint (HQP-C-020).
+        // 5. **Prove and take the snapshot under one lock**, and project from *that* — never from a
+        //    later read of the cache. A verdict plus a re-read is two moments, and a concurrent
+        //    profile load, reconnect, `fresh_*` publication or refresh can replace the cache between
+        //    them with a complete, coherent, entirely different set. Presence cannot distinguish that
+        //    case; identity can.
+        //
+        // One retry for the whole read, not per step: a daemon whose chain is flapping would
+        // otherwise hold this open. A first unsettled arm explicitly continues; a proven snapshot
+        // breaks; an exhausted arm returns an error. There is no third attempt or fall-through read.
+        //
+        // **Residual, and it cannot be closed from here.** The probe confirms the chain is the same
         // *now* as when the lists were published; a move out and back inside that window leaves it
         // agreeing. Only a daemon-side atomic snapshot could do better, and the protocol has none.
-        // Every arm below is terminal — it breaks with a settled pair or returns — so there is no
-        // state to carry out of the loop and no "what if it fell through" case to answer for. An
-        // earlier shape carried an `Option` and re-read `State` if it were somehow `None`, which was
-        // unreachable and would have cost a round trip to discover that.
         let mut retried = false;
-        let (state, playback_status) = loop {
-            // Lazy-fill whatever is missing — on the first read after connect, that is all of it.
-            let needs_lists = self.chain_lists_incomplete().await;
-            // A *required* fill that does not settle is the read's failure, not a quieter version of
-            // success. With nothing cached there is no previous fingerprint for the chain check to
-            // contradict, so it correctly answers "unchanged" — it is a check about movement — and
-            // the fill is then the only thing between a caller and four empty lists.
-            if needs_lists && !self.refresh_lists().await {
+        let (state, playback_status, snapshot, vol_range) = loop {
+            // (1) Reconnect-capable, so it goes ahead of everything the proof will cover. On the
+            // first read of a connection this is always a real request.
+            let vol_range = self.ensure_volume_range().await;
+
+            // (2) asks one question: *is there a complete set, and what is its identity*. Lazy-fill
+            // only if there is not — on the first read after connect
+            // that is all of it — and then ask again rather than assuming the fill settled, since a
+            // reconnect can empty the cache between publishing it and looking at it. A required fill
+            // that does not settle is the read's failure, not a quieter version of success: with no
+            // cache there is nothing to publish but four empty lists.
+            let mut captured = self.chain_identity().await;
+            if captured.is_none() && self.refresh_lists().await {
+                captured = self.chain_identity().await;
+            }
+            let Some(captured) = captured else {
                 if !retried {
                     tracing::info!(
                         "HQPlayer's setting lists did not settle; re-reading once before giving up"
@@ -3070,69 +3247,28 @@ impl HqpAdapter {
                     "HQPlayer's setting lists could not be read as one coherent set; refusing to \
                      report a pipeline with no settings in it, which is not what this daemon offers"
                 ));
-            }
+            };
 
+            // (3)
             let observed = self.get_state().await?;
             let observed_status = self.get_playback_status().await.unwrap_or_default();
 
-            match self.chain_still_matches_cache().await {
-                // The chain has not moved — but "has not moved" is not "is there". The fill decision
-                // above was made before these reads, and a reconnect during them empties the cache
-                // behind it: `mark_disconnected` and `connect` both invalidate, because a session's
-                // list indices must not outlive it. The check then waves the read through *correctly*,
-                // since with no previous fingerprint there is no movement to report — it is a check
-                // about change, not about presence. So presence is checked here, where it is known.
-                Ok(true) if self.chain_lists_incomplete().await => {
-                    if !retried {
-                        tracing::info!(
-                            "HQPlayer's setting lists were dropped while its state was being read, \
-                             most likely by a reconnect; re-reading"
-                        );
-                        retried = true;
-                        continue;
-                    }
-                    return Err(anyhow!(
-                        "HQPlayer's setting lists could not be read as one coherent set; refusing to \
-                         report a pipeline with no settings in it, which is not what this daemon \
-                         offers"
-                    ));
-                }
-                Ok(true) => break (observed, observed_status),
-                Ok(false) if !retried => {
-                    tracing::info!(
-                        "HQPlayer's loaded chain moved while its state was being read; re-reading \
-                         rather than resolving one chain's indices against another's lists"
-                    );
-                    retried = true;
-                }
-                // The retry moved too. There is nothing coherent to publish and no third attempt:
-                // the lists in hand came from the chain before *this* move, and noticing the move
-                // dropped them, so what is left is a state read against nothing. Answering `Ok`
-                // here hands back empty option lists and selections that resolve to nothing,
-                // presented as this daemon's settings — a caller cannot tell that from a daemon
-                // that genuinely offers no filters. The route has always had an error arm; this is
-                // what it is for.
-                Ok(false) => {
-                    return Err(anyhow!(
-                        "HQPlayer's loaded chain moved while its settings were being read, and \
-                         again during the re-read; refusing to report settings that belong to no \
-                         single chain"
-                    ))
-                }
-                // A check that could not run is not a check that passed. "The cache was not
-                // invalidated, so the lists are still the ones the state was read against" is true
-                // about the *cache* and answers nothing about the *daemon*: whether it still has
-                // that chain loaded is exactly what the failed request was asked. An explicit
-                // `result="Error"` here is terminal in `send_command` — no retry, no disconnect, no
-                // invalidation — so the cache survives looking entirely usable, and a view projected
-                // through it is indistinguishable from a verified one. A `warn!` does not make it
-                // one. Same bound as every other unsettled read here: one re-read, then say so.
+            // (4) A probe that could not run is not a probe that passed. "The cache was not
+            // invalidated, so the lists are still the ones the state was read against" is true about
+            // the *cache* and answers nothing about the *daemon*: whether it still has that chain
+            // loaded is exactly what the failed request was asked. An explicit `result="Error"` is
+            // terminal in `send_command` — no retry, no disconnect, no invalidation — so the cache
+            // survives looking entirely usable, and a view projected through it is indistinguishable
+            // from a verified one. A `warn!` does not make it one.
+            let probe = match self.get_rates().await {
+                Ok(probe) => probe,
                 Err(e) if !retried => {
                     tracing::info!(
                         "HQPlayer's chain check could not be run ({e}); re-reading rather than \
                          resolving its indices against lists nothing has confirmed they belong to"
                     );
                     retried = true;
+                    continue;
                 }
                 Err(e) => {
                     return Err(anyhow!(
@@ -3142,32 +3278,44 @@ impl HqpAdapter {
                          resolved through"
                     ))
                 }
+            };
+
+            // (5) The proof hands back the values it proved. Nothing below re-reads the cache.
+            match self.verified_chain_snapshot(captured, &probe).await {
+                Ok(snapshot) => break (observed, observed_status, snapshot, vol_range),
+                Err(reason) if !retried => {
+                    tracing::info!(
+                        "HQPlayer's settings did not hold still while they were being read \
+                         ({reason}); re-reading rather than publishing a state and a set of lists \
+                         that were never shown to belong together"
+                    );
+                    retried = true;
+                }
+                // The retry did not settle either. There is nothing coherent to publish and no third
+                // attempt. Answering `Ok` here hands back empty or unrelated option lists and
+                // selections that resolve to nothing, presented as this daemon's settings — a caller
+                // cannot tell that from a daemon that genuinely offers no filters. The route has
+                // always had an error arm; this is what it is for.
+                Err(reason) => {
+                    return Err(anyhow!(
+                        "HQPlayer's settings could not be read as one coherent set — {reason}, and \
+                         again during the re-read; refusing to report a loaded chain's indices \
+                         resolved through setting lists that belong to another"
+                    ))
+                }
             }
         };
 
-        // Lazy-load volume range if not cached
-        let needs_vol_range = {
-            let cached = self.state.read().await;
-            cached.volume_range.is_none()
-        };
-        if needs_vol_range {
-            if let Ok(vr) = self.get_volume_range().await {
-                let mut cached = self.state.write().await;
-                cached.volume_range = Some(vr);
-            }
-        }
-
-        // Use cached data
-        let (modes, filters, shapers, rates, vol_range) = {
-            let cached = self.state.read().await;
-            (
-                cached.modes.clone(),
-                cached.filters.clone(),
-                cached.shapers.clone(),
-                cached.rates.clone(),
-                cached.volume_range.clone().unwrap_or_default(),
-            )
-        };
+        // The proven snapshot, and nothing else. Re-reading `self.state` here is what this shape
+        // exists to prevent: it would discard the set the proof covered in favour of whatever the
+        // cache holds at this later moment. `hqplayer_pipeline_projection_lint` fails the build if it
+        // creeps back.
+        let ChainSnapshot {
+            modes,
+            filters,
+            shapers,
+            rates,
+        } = snapshot;
 
         // State returns INDEX for filters and shapers (not value!)
         // See hqp-control help: --set-filter <index> [index1x]
@@ -4578,5 +4726,375 @@ mod parse_attr_scope_tests {
         let truncated = "<State song='a>b state=\"1\"";
         assert_eq!(framing::root_open_tag(truncated), None);
         assert_eq!(HqpAdapter::parse_attr(truncated, "state"), None);
+    }
+}
+
+/// The identity-and-snapshot rule the pipeline read rests on (issue #347, Opus dissent at `b7a7a1a`).
+///
+/// These reach past the adapter's public surface deliberately. The rule is about **which cache** a
+/// verified state is joined to, and the window it closes is between two moments inside one function:
+/// no sequence of public calls can place a second actor in that window without a production hook, and
+/// a test-only hook would be testing the hook. What *can* be pinned honestly is the primitive — that
+/// the proof answers about the cache it hands back, that four fingerprints and not one decide whether
+/// a set is the same set, and that only the daemon contradicting the cache is grounds for dropping it.
+///
+/// The structural half of the same rule — that the projection never re-reads what the proof returned —
+/// is `tests/hqplayer_pipeline_projection_lint.rs`, which is red at `b7a7a1a`.
+#[cfg(test)]
+// The crate denies `expect` because a panic in production is not an error report. In a test a panic
+// *is* the report, and an `expect` whose message states the precondition it is asserting is clearer
+// than a `match` that fabricates a fallback the test would then silently pass against.
+#[allow(clippy::expect_used)]
+mod chain_identity_tests {
+    use super::*;
+
+    fn mode(index: u32, name: &str) -> ListItem {
+        ListItem {
+            index,
+            name: name.to_string(),
+            value: 0,
+        }
+    }
+
+    fn filter(index: u32, name: &str) -> FilterItem {
+        FilterItem {
+            index,
+            name: name.to_string(),
+            value: 0,
+            arg: 0,
+        }
+    }
+
+    fn rate(index: u32, rate: u32) -> RateItem {
+        RateItem { index, rate }
+    }
+
+    /// A complete, self-consistent cache: every family filled and fingerprinted from its contents,
+    /// which is the invariant every writer in the adapter maintains.
+    fn cache_of(
+        modes: Vec<ListItem>,
+        filters: Vec<FilterItem>,
+        shapers: Vec<ListItem>,
+        rates: Vec<RateItem>,
+    ) -> HqpAdapterState {
+        HqpAdapterState {
+            modes_fingerprint: Some(HqpAdapter::fingerprint(
+                modes.iter().map(|m| (m.index, m.name.as_str())),
+            )),
+            filters_fingerprint: Some(HqpAdapter::fingerprint(
+                filters.iter().map(|f| (f.index, f.name.as_str())),
+            )),
+            shapers_fingerprint: Some(HqpAdapter::fingerprint(
+                shapers.iter().map(|s| (s.index, s.name.as_str())),
+            )),
+            rates_fingerprint: Some(HqpAdapter::rates_fingerprint(&rates)),
+            modes,
+            filters,
+            shapers,
+            rates,
+            ..HqpAdapterState::default()
+        }
+    }
+
+    fn pcm_cache() -> HqpAdapterState {
+        cache_of(
+            vec![mode(0, "[source]"), mode(1, "PCM")],
+            vec![filter(0, "sinc-M"), filter(1, "poly-sinc-xtr")],
+            vec![mode(0, "NS9"), mode(1, "NS5")],
+            vec![rate(0, 44100), rate(1, 48000)],
+        )
+    }
+
+    /// **The rule the rate list alone cannot express.** A profile load can replace the filters and the
+    /// shapers while leaving the rate list byte-identical — that is not hypothetical, it is what
+    /// `a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles_lists_in_place`
+    /// exercises end to end — and a read that captured only the rates would accept the replacement as
+    /// the set it started from and join its `State`'s filter index to another profile's filter list.
+    #[test]
+    fn a_replaced_filter_list_is_a_different_set_even_when_the_rates_did_not_move() {
+        let before = pcm_cache();
+        let after = cache_of(
+            before.modes.clone(),
+            // A different profile's filters, at the same positions.
+            vec![filter(0, "closed-form"), filter(1, "gauss-long")],
+            before.shapers.clone(),
+            before.rates.clone(),
+        );
+
+        let before_id =
+            HqpAdapter::chain_identity_of(&before).expect("a complete set has identity");
+        let after_id = HqpAdapter::chain_identity_of(&after).expect("a complete set has identity");
+
+        assert_eq!(
+            before_id.rates, after_id.rates,
+            "precondition: the rate list is untouched, so a rates-only identity sees no change at all"
+        );
+        assert_ne!(
+            before_id, after_id,
+            "but the set is not the same set, and the identity a read captures has to say so"
+        );
+    }
+
+    /// The same rule for the other two families, so the identity cannot be narrowed to "rates and
+    /// filters" either.
+    #[test]
+    fn a_replaced_shaper_or_mode_list_is_also_a_different_set() {
+        let before = pcm_cache();
+        let shapers_moved = cache_of(
+            before.modes.clone(),
+            before.filters.clone(),
+            vec![mode(0, "ASDM7"), mode(1, "ASDM5")],
+            before.rates.clone(),
+        );
+        let modes_moved = cache_of(
+            vec![mode(0, "[source]"), mode(1, "SDM")],
+            before.filters.clone(),
+            before.shapers.clone(),
+            before.rates.clone(),
+        );
+
+        let before_id = HqpAdapter::chain_identity_of(&before).expect("identity");
+        assert_ne!(
+            before_id,
+            HqpAdapter::chain_identity_of(&shapers_moved).expect("identity"),
+            "the shaper list decides what a shaper index names"
+        );
+        assert_ne!(
+            before_id,
+            HqpAdapter::chain_identity_of(&modes_moved).expect("identity"),
+            "and the mode list decides what a mode index names"
+        );
+    }
+
+    /// Presence is not a separate question asked separately — that separation is how an emptied cache
+    /// passed for an unchanged one. A set that is missing a family has no identity to compare, so the
+    /// proof cannot pass it whatever else is true.
+    #[test]
+    fn a_cache_missing_any_family_has_no_identity() {
+        for drop_one in 0..4 {
+            let mut state = pcm_cache();
+            match drop_one {
+                0 => state.modes.clear(),
+                1 => state.filters.clear(),
+                2 => state.shapers.clear(),
+                _ => state.rates.clear(),
+            }
+            assert!(
+                HqpAdapter::chain_identity_of(&state).is_none(),
+                "family {drop_one} is empty, so this is not a set"
+            );
+        }
+    }
+
+    /// A family present without the fingerprint it was filled from is unanchored: there is nothing to
+    /// compare it against, so it cannot take part in an identity. Current writers keep the two in
+    /// lockstep, which makes this defensive rather than presently reachable — and it is the invariant
+    /// that keeps it that way.
+    #[test]
+    fn a_family_without_the_fingerprint_it_was_filled_from_has_no_identity() {
+        for drop_one in 0..4 {
+            let mut state = pcm_cache();
+            match drop_one {
+                0 => state.modes_fingerprint = None,
+                1 => state.filters_fingerprint = None,
+                2 => state.shapers_fingerprint = None,
+                _ => state.rates_fingerprint = None,
+            }
+            assert!(
+                HqpAdapter::chain_identity_of(&state).is_none(),
+                "fingerprint {drop_one} is missing, so that family is unanchored"
+            );
+        }
+    }
+
+    /// An adapter whose cache is a given complete set, and nothing else. No socket, no config: these
+    /// tests are about the proof, and the proof is a decision about memory.
+    async fn adapter_with_cache(cache: HqpAdapterState) -> HqpAdapter {
+        let adapter = HqpAdapter::new(crate::bus::create_bus());
+        let mut state = adapter.state.write().await;
+        state.modes = cache.modes;
+        state.filters = cache.filters;
+        state.shapers = cache.shapers;
+        state.rates = cache.rates;
+        state.modes_fingerprint = cache.modes_fingerprint;
+        state.filters_fingerprint = cache.filters_fingerprint;
+        state.shapers_fingerprint = cache.shapers_fingerprint;
+        state.rates_fingerprint = cache.rates_fingerprint;
+        drop(state);
+        adapter
+    }
+
+    /// The proof's whole point: it returns **the set it verified**, so what a caller publishes and
+    /// what was proved coherent are the same values rather than two reads of the same cache.
+    #[tokio::test]
+    async fn the_proof_hands_back_the_exact_set_it_verified() {
+        let cache = pcm_cache();
+        let expected = cache.filters.clone();
+        let probe = cache.rates.clone();
+        let adapter = adapter_with_cache(cache).await;
+        let captured = adapter.chain_identity().await.expect("a complete cache");
+
+        let snapshot = adapter
+            .verified_chain_snapshot(captured, &probe)
+            .await
+            .expect("an unchanged cache and an agreeing probe are a verified read");
+
+        assert_eq!(
+            snapshot
+                .filters
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            expected.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            "the returned snapshot is what the caller projects; it must be the verified contents"
+        );
+        assert_eq!(snapshot.modes.len(), 2);
+        assert_eq!(snapshot.shapers.len(), 2);
+        assert_eq!(snapshot.rates.len(), 2);
+    }
+
+    /// **The race the dissent names.** A complete, coherent, *different* cache is in place by the time
+    /// the proof runs — a profile load, a reconnect's refill or another poll's refresh got there
+    /// first. Presence says yes; the rate probe says yes, because this replacement did not touch the
+    /// rates. Only the captured identity can refuse it, and refuse it it must: the `State` this read
+    /// holds was reported against the *other* set.
+    ///
+    /// And the new cache stays. It is not known to be wrong — it is merely newer than this read, and
+    /// dropping it would make one read's bad luck into everyone's refetch.
+    #[tokio::test]
+    async fn a_cache_replaced_mid_read_fails_this_read_and_is_left_in_place() {
+        let before = pcm_cache();
+        let probe = before.rates.clone();
+        let adapter = adapter_with_cache(before).await;
+        let captured = adapter.chain_identity().await.expect("a complete cache");
+
+        // The replacement: a complete set from another profile, same rate list.
+        let replacement = cache_of(
+            vec![mode(0, "[source]"), mode(1, "PCM")],
+            vec![filter(0, "closed-form"), filter(1, "gauss-long")],
+            vec![mode(0, "NS9"), mode(1, "NS5")],
+            probe.clone(),
+        );
+        {
+            let mut state = adapter.state.write().await;
+            state.filters = replacement.filters.clone();
+            state.filters_fingerprint = replacement.filters_fingerprint;
+        }
+
+        let outcome = adapter.verified_chain_snapshot(captured, &probe).await;
+
+        assert_eq!(
+            outcome.err(),
+            Some(ChainProofFailure::Replaced),
+            "a complete replacement is present and unmoved, and it is still not the set this read \
+             captured; publishing its lists against the captured state's indices is the \
+             misselection this issue exists to end"
+        );
+        let state = adapter.state.read().await;
+        assert_eq!(
+            state
+                .filters
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["closed-form", "gauss-long"],
+            "and the newer set stands: this read failed, the cache did not"
+        );
+    }
+
+    /// The probe is an observation taken **before** the proof acquires the cache lock. If another
+    /// reader publishes a complete newer set after that observation, the probe can disagree with
+    /// the cache simply because it describes the set this read started from. That is `Replaced`, not
+    /// evidence that the newer cache is stale, even when the replacement also has different rates.
+    ///
+    /// Classification order is therefore correctness, not presentation: compare the current
+    /// four-family identity with the captured identity first. Only when they are the same set may a
+    /// disagreeing live probe invalidate it.
+    #[tokio::test]
+    async fn an_old_probe_never_clears_a_newer_complete_cache_with_different_rates() {
+        let before = pcm_cache();
+        let old_probe = before.rates.clone();
+        let adapter = adapter_with_cache(before).await;
+        let captured = adapter.chain_identity().await.expect("a complete cache");
+
+        let replacement = cache_of(
+            vec![mode(0, "[source]"), mode(2, "SDM")],
+            vec![filter(0, "poly-sinc-gauss-hires-lp"), filter(1, "sinc-L")],
+            vec![mode(0, "ASDM7"), mode(1, "ASDM5")],
+            vec![rate(0, 2_822_400), rate(1, 5_644_800)],
+        );
+        let replacement_id =
+            HqpAdapter::chain_identity_of(&replacement).expect("the replacement is complete");
+        {
+            let mut state = adapter.state.write().await;
+            state.modes = replacement.modes;
+            state.filters = replacement.filters;
+            state.shapers = replacement.shapers;
+            state.rates = replacement.rates;
+            state.modes_fingerprint = replacement.modes_fingerprint;
+            state.filters_fingerprint = replacement.filters_fingerprint;
+            state.shapers_fingerprint = replacement.shapers_fingerprint;
+            state.rates_fingerprint = replacement.rates_fingerprint;
+        }
+
+        let outcome = adapter.verified_chain_snapshot(captured, &old_probe).await;
+
+        assert_eq!(
+            outcome.err(),
+            Some(ChainProofFailure::Replaced),
+            "the old probe and newer cache belong to different read generations; this read must be \
+             retried without accusing the newer set of contradicting the daemon"
+        );
+        assert_eq!(
+            adapter.chain_identity().await,
+            Some(replacement_id),
+            "a probe taken before the replacement is not grounds to erase the complete cache that \
+             replaced it"
+        );
+    }
+
+    /// The one failure that *is* grounds for dropping the cache: the daemon's live rate list
+    /// contradicts the rates currently cached. That is the daemon disagreeing with the cache, so the
+    /// cache is wrong — and the next read must refill rather than compare against it again.
+    #[tokio::test]
+    async fn a_probe_that_contradicts_the_cached_rates_drops_the_cache() {
+        let cache = pcm_cache();
+        let adapter = adapter_with_cache(cache).await;
+        let captured = adapter.chain_identity().await.expect("a complete cache");
+        // The other chain's rates (HQP-C-020: the two were observed disjoint).
+        let probe = vec![rate(0, 2822400), rate(1, 5644800)];
+
+        let outcome = adapter.verified_chain_snapshot(captured, &probe).await;
+
+        assert_eq!(
+            outcome.err(),
+            Some(ChainProofFailure::Moved),
+            "the daemon is serving a rate list these lists were not read from"
+        );
+        assert!(
+            adapter.chain_identity().await.is_none(),
+            "a cache the daemon contradicts must not survive to be compared against again"
+        );
+    }
+
+    /// The mirror of the case above, and the one that keeps the rule from degrading into "any
+    /// difference drops the cache": an unchanged set with an agreeing probe leaves everything alone.
+    #[tokio::test]
+    async fn a_verified_read_changes_nothing() {
+        let cache = pcm_cache();
+        let probe = cache.rates.clone();
+        let adapter = adapter_with_cache(cache).await;
+        let captured = adapter.chain_identity().await.expect("a complete cache");
+
+        adapter
+            .verified_chain_snapshot(captured, &probe)
+            .await
+            .expect("verified");
+
+        assert_eq!(
+            adapter.chain_identity().await,
+            Some(captured),
+            "proving a read must not disturb the cache it proved"
+        );
     }
 }

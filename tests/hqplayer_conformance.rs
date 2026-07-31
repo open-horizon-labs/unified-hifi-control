@@ -7643,3 +7643,71 @@ async fn a_final_chain_check_that_runs_on_the_retry_publishes_the_verified_read(
     );
     h.stop();
 }
+
+/// **The proof is not the end of the read.** Everything the read does *after* proving coherence is
+/// still able to destroy it, and the lazy `VolumeRange` fill is exactly that: a network request,
+/// issued once the chain check has already passed, on the way to the projection.
+///
+/// A lost reply to it is not exotic. `send_command` calls `mark_disconnected`, which invalidates
+/// every chain-scoped list because a session's indices must not outlive it, then reconnects — and
+/// `connect` invalidates again for the same reason. The read then clones four empty vectors and
+/// hands them back as `Ok`, having proved a coherence that no longer describes anything it is
+/// publishing.
+///
+/// This is reachable on the **first** read of a connection, which is the only read that has to fetch
+/// the volume range at all: nothing is cached, so the request is always made. No chain movement, no
+/// profile load, no concurrency — one dropped reply.
+///
+/// The assertion is deliberately two-sided. Recovering and publishing a complete set is a fine
+/// answer, and so is refusing; what is forbidden is the third thing, an `Ok` carrying none of the
+/// daemon's settings, which a caller cannot tell from a daemon that offers none.
+///
+/// **Label: client-red.** Found by CodeRabbit at `b7a7a1a`. Before this, the read published four
+/// empty families.
+#[tokio::test]
+async fn a_lost_volume_range_reply_does_not_publish_the_cache_its_reconnect_emptied() {
+    // Element-scoped and one-shot: the daemon applies the request, then vanishes without replying,
+    // once. Scoping it to `VolumeRange` keeps it clear of connection setup and of the list fill, so
+    // the only thing it can disturb is the lazy volume-range fetch itself.
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            apply_then_drop_reply_for_element: Some("VolumeRange".to_string()),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    // The first read after connect: nothing is cached, so this read both fills the lists and fetches
+    // the volume range.
+    let outcome = h.adapter.get_pipeline_status().await;
+
+    assert!(
+        h.server.element_drop_fired(),
+        "precondition: the read must actually have lost a `VolumeRange` reply, otherwise this test \
+         proves nothing about what follows one"
+    );
+
+    match outcome {
+        Err(e) => assert!(
+            e.to_string().contains("lists") || e.to_string().contains("chain"),
+            "refusing is a legitimate answer, but it must name what could not be established. Got: \
+             {e}"
+        ),
+        Ok(published) => {
+            let families = published_families(&published);
+            assert_eq!(
+                families.len(),
+                4,
+                "a read may recover and publish a complete set, but a proof of coherence taken \
+                 before a reconnect says nothing about the cache that reconnect emptied. Published \
+                 {families:?}, with filter1x selected as {:?} out of {} options",
+                published.settings.filter1x.selected.value,
+                published.settings.filter1x.options.len()
+            );
+        }
+    }
+    h.stop();
+}
