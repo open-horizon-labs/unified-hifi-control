@@ -1947,6 +1947,18 @@ impl HqpAdapter {
         self.connect_with_operation_held().await
     }
 
+    /// Read the fields that make a direct-zone session authoritative.
+    ///
+    /// Volume capability is deliberately excluded: some daemons never answer `VolumeRange`, and
+    /// that optional absence degrades to fixed volume. Identity, State and Status cannot degrade
+    /// without inventing a producer observation.
+    async fn read_required_handshake_fields(&self) -> Result<(HqpInfo, HqpState, HqpStatus)> {
+        let info = self.get_info_inner().await?;
+        let state = self.get_state_inner().await?;
+        let status = self.get_playback_status_inner().await?;
+        Ok((info, state, status))
+    }
+
     /// Complete a coherent managed handshake while the caller already owns `operation_lock`.
     ///
     /// The coherent pipeline reader uses this only after command recovery replaced the native
@@ -1954,6 +1966,21 @@ impl HqpAdapter {
     /// on the operation lease; skipping the handshake would leave a transport-usable but
     /// unpublished session with no identity or producer epoch.
     async fn connect_with_operation_held(&self) -> Result<()> {
+        self.connect_with_operation_held_using(None).await
+    }
+
+    /// Complete a managed handshake on the caller's current transport, optionally carrying an
+    /// already-established volume capability into it.
+    ///
+    /// The coherent pipeline reader asks `VolumeRange` before proving any chain-scoped facts. When
+    /// that query itself established a replacement transport, repeating it in the handshake would
+    /// either turn an optional timeout into a connection failure or consume a one-shot rejection
+    /// before the pipeline read can report it. The hint is therefore accepted only by this private
+    /// path and is dated to the transport on which the rest of the handshake is performed.
+    async fn connect_with_operation_held_using(
+        &self,
+        volume_hint: Option<(VolumeRange, u64)>,
+    ) -> Result<()> {
         let _conversation_guard = self.conversation_lock.lock().await;
         let _connect_guard = self.connect_lock.lock().await;
         self.reconcile_cancelled_transport().await;
@@ -1964,7 +1991,16 @@ impl HqpAdapter {
             return Ok(());
         }
 
-        self.establish_transport_locked().await?;
+        let transport_poisoned = self
+            .transport_poisoned
+            .load(std::sync::atomic::Ordering::Acquire);
+        if !has_connection || transport_poisoned {
+            self.establish_transport_locked().await?;
+        }
+        let handshake_generation = self.transport_generation().await;
+        let volume_hint = volume_hint
+            .filter(|(_, observed_generation)| *observed_generation == handshake_generation)
+            .map(|(range, _)| range);
         let host = self
             .state
             .read()
@@ -1978,10 +2014,40 @@ impl HqpAdapter {
         // with Default: doing so publishes a stopped, empty, fixed-volume zone that the daemon never
         // reported and leaves `connected=true` after a partial handshake.
         let handshake = async {
-            let info = self.get_info_inner().await?;
-            let state = self.get_state_inner().await?;
-            let status = self.get_playback_status_inner().await?;
-            let volume_range = self.get_volume_range_inner().await?;
+            let (mut info, mut state, mut status) = self.read_required_handshake_fields().await?;
+            let volume_range = match volume_hint {
+                Some(range) => range,
+                None => match self.get_volume_range_inner().await {
+                    Ok(range) => range,
+                    Err(error) if error.downcast_ref::<HqpRejected>().is_some() => {
+                        return Err(error)
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "HQPlayer volume range unavailable during handshake ({error}); reporting fixed volume"
+                        );
+
+                        // A timeout or malformed frame can consume/drop the in-flight socket. The
+                        // identity, State and Status already read from that session cannot be paired
+                        // with later pipeline lists from a replacement. Re-establish and re-read
+                        // every required field before publishing the fixed-volume fallback.
+                        let transport_missing = self.connection.lock().await.is_none();
+                        let transport_poisoned = self
+                            .transport_poisoned
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        if transport_missing || transport_poisoned {
+                            // `send_command_inner` has no async error wrapper: cancellation safety
+                            // deliberately leaves poison set when its in-flight guard drops. Run
+                            // the normal cleanup before installing a replacement, so the new socket
+                            // cannot inherit the failed conversation's poison bit.
+                            self.reconcile_cancelled_transport().await;
+                            self.establish_transport_locked().await?;
+                            (info, state, status) = self.read_required_handshake_fields().await?;
+                        }
+                        VolumeRange::default()
+                    }
+                },
+            };
             Ok::<_, anyhow::Error>((info, state, status, volume_range))
         }
         .await;
@@ -3616,6 +3682,7 @@ impl HqpAdapter {
     async fn get_volume_range_inner(&self) -> Result<VolumeRange> {
         let xml = Self::build_request("VolumeRange", &[]);
         let response = self.send_command_inner(&xml).await?;
+        Self::check_result(&response)?;
         Self::require_root_attrs(
             &response,
             "VolumeRange",
@@ -5196,9 +5263,6 @@ impl HqpAdapter {
     /// `state`, cache or status after its proof would make the adaptive document a mixture of two
     /// daemon moments even if the legacy response still looked plausible.
     async fn read_coherent_pipeline(&self) -> Result<CoherentPipelineSnapshot> {
-        if !self.get_status().await.connected {
-            self.connect().await?;
-        }
         let _operation_guard = self.operation_lock.lock().await;
         // `State` reports settings as **list indices**, and an index means nothing apart from the list
         // it came from. So this read has one job beyond fetching: to establish that the `State` it
@@ -5255,7 +5319,7 @@ impl HqpAdapter {
 
             // (1) Reconnect-capable, so it goes ahead of everything the proof will cover. On the
             // first read of a connection this is always a real request.
-            let (vol_range, attempt_generation) = match self.ensure_volume_range().await? {
+            let (vol_range, mut attempt_generation) = match self.ensure_volume_range().await? {
                 PipelineVolumeRange::Observed { range, generation } => (range, generation),
                 PipelineVolumeRange::FixedFallback(range) => {
                     // A timeout/lost reply discarded the old socket. Establish the replacement
@@ -5266,6 +5330,24 @@ impl HqpAdapter {
                     (range, self.transport_generation().await)
                 }
             };
+
+            // A query may establish a usable native transport without declaring the managed
+            // session reachable. Complete that handshake on the same socket and carry the range
+            // just established above, rather than issuing `VolumeRange` twice. This preserves the
+            // optional fixed-volume fallback and leaves explicit daemon rejection terminal at the
+            // first query.
+            if !self.get_status().await.connected {
+                self.connect_with_operation_held_using(Some((
+                    vol_range.clone(),
+                    attempt_generation,
+                )))
+                .await
+                .context(
+                    "HQPlayer transport could not complete the coherent handshake required \
+                         before reading its setting lists",
+                )?;
+                attempt_generation = self.transport_generation().await;
+            }
 
             // (2) asks one question: *is there a complete set, and what is its identity*. Lazy-fill
             // only if there is not — on the first read after connect

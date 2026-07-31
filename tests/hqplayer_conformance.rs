@@ -7764,6 +7764,47 @@ async fn an_unresponsive_volume_range_still_yields_a_fixed_volume_pipeline() {
     h.stop();
 }
 
+/// The direct lifecycle handshake uses the non-retrying command primitive. If its optional
+/// `VolumeRange` request times out, dropping that in-flight conversation poisons the old socket.
+/// The fixed-volume fallback must reconcile that poison before publishing the replacement session,
+/// or `connect()` returns success for a producer that `get_status()` immediately calls disconnected.
+#[tokio::test]
+async fn a_direct_connect_volume_fallback_publishes_a_healthy_replacement_session() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            silent_for_element: Some("VolumeRange".to_string()),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+
+    h.adapter
+        .connect()
+        .await
+        .expect("missing VolumeRange remains an optional fixed-volume capability");
+    let connections_after_connect = h.server.stats().connections();
+    let status = h.adapter.get_status().await;
+    assert!(
+        status.connected && status.info.is_some(),
+        "the replacement session published by connect must not retain the failed socket's poison"
+    );
+
+    let pipeline = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("the healthy replacement session remains usable");
+    assert!(pipeline.volume.is_fixed);
+    assert_eq!(
+        h.server.stats().connections(),
+        connections_after_connect,
+        "the next read must not tear down a replacement session merely because stale poison survived"
+    );
+    h.stop();
+}
+
 #[tokio::test]
 async fn an_explicit_volume_range_rejection_is_terminal_not_a_fallback() {
     let h = Harness::verified().await;
