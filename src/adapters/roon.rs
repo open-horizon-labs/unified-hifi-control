@@ -428,16 +428,23 @@ impl RoonState {
     /// so a repeated rejection finds nothing and a waiter can never be resolved
     /// twice. A `KeyMismatch` leaves the entry for the caller's own timeout to
     /// clean up, so no path strands one.
+    ///
+    /// Both maps are searched for an entry where *both* the request id and the
+    /// session key match before any mismatch is reported. A mismatched entry in
+    /// one map must not hide a matching entry in the other - that too is only
+    /// reachable through a reconnect id collision, but reporting a mismatch
+    /// early would cost a legitimate waiter its prompt answer.
     fn route_browse_rejection(
         &mut self,
         req_id: usize,
         session_key: Option<&str>,
         kind: RoonBrowseErrorKind,
     ) -> ErrorRouting {
-        if let Some((pending_key, _)) = self.pending_browses.get(&req_id) {
-            if pending_key.as_deref() != session_key {
-                return ErrorRouting::KeyMismatch;
-            }
+        let browse_matches = matches!(
+            self.pending_browses.get(&req_id),
+            Some((pending_key, _)) if pending_key.as_deref() == session_key
+        );
+        if browse_matches {
             if let Some((_, sender)) = self.pending_browses.remove(&req_id) {
                 return if deliver_browse_rejection(sender, kind, session_key) {
                     ErrorRouting::Browse
@@ -447,10 +454,11 @@ impl RoonState {
             }
         }
 
-        if let Some((pending_key, _)) = self.pending_loads.get(&req_id) {
-            if pending_key.as_deref() != session_key {
-                return ErrorRouting::KeyMismatch;
-            }
+        let load_matches = matches!(
+            self.pending_loads.get(&req_id),
+            Some((pending_key, _)) if pending_key.as_deref() == session_key
+        );
+        if load_matches {
             if let Some((_, sender)) = self.pending_loads.remove(&req_id) {
                 return if deliver_browse_rejection(sender, kind, session_key) {
                     ErrorRouting::Load
@@ -458,6 +466,10 @@ impl RoonState {
                     ErrorRouting::ReceiverGone
                 };
             }
+        }
+
+        if self.pending_browses.contains_key(&req_id) || self.pending_loads.contains_key(&req_id) {
+            return ErrorRouting::KeyMismatch;
         }
 
         ErrorRouting::NoWaiter
@@ -2515,6 +2527,29 @@ mod tests {
             state.pending_browses.contains_key(&7),
             "the waiter must stay in the map so its own timeout still cleans up"
         );
+    }
+
+    #[test]
+    fn a_mismatched_entry_in_one_map_does_not_hide_a_match_in_the_other() {
+        // Only reachable through a reconnect id collision: a stale browse from
+        // the old connection holds req_id 8, and the new connection issues a
+        // load that also gets req_id 8. Reporting the browse's key mismatch
+        // early would cost the load its prompt answer for no safety gain.
+        let mut state = RoonState::default();
+        let mut stale_browse = pending_browse(&mut state, 8, "browse_old");
+        let mut live_load = pending_load(&mut state, 8, "load_new");
+
+        let routing =
+            state.route_browse_rejection(8, Some("load_new"), RoonBrowseErrorKind::InvalidItemKey);
+
+        assert_eq!(routing, ErrorRouting::Load);
+        assert_eq!(
+            rejection_kind(&mut live_load),
+            RoonBrowseErrorKind::InvalidItemKey
+        );
+        assert_still_waiting(&mut stale_browse, "the stale browse");
+        assert!(state.pending_browses.contains_key(&8));
+        assert!(!state.pending_loads.contains_key(&8));
     }
 
     #[test]
