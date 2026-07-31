@@ -580,6 +580,9 @@ jobs:
           mkdir -p dist/bin
           cp target/x86_64-unknown-linux-musl/release/unified-hifi-control dist/bin/unified-hifi-linux-x64
 
+      - name: Verify ELF hardening
+        run: scripts/check-elf-hardening.sh dist/bin/unified-hifi-linux-x64
+
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
@@ -810,6 +813,9 @@ jobs:
         run: |
           mkdir -p dist/bin
           cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
+
+      - name: Verify ELF hardening
+        run: scripts/check-elf-hardening.sh dist/bin/${{ matrix.output }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
