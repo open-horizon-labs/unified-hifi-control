@@ -6912,37 +6912,36 @@ async fn a_chain_change_during_a_list_refresh_publishes_nothing_rather_than_a_mi
     h.model
         .switch_chain_after_request("GetFilters", LoadedChain::Pcm);
 
-    let straddled = h.adapter.get_pipeline_status().await.expect("pipeline");
-
-    let filters: Vec<&str> = straddled
-        .settings
-        .filter1x
-        .options
-        .iter()
-        .map(|o| o.value.as_str())
-        .collect();
-    let shapers: Vec<&str> = straddled
-        .settings
-        .shaper
-        .options
-        .iter()
-        .map(|o| o.value.as_str())
-        .collect();
-    assert!(
-        !(filters.contains(&"sinc-Lh") && shapers.contains(&"NS9")),
-        "a set straddling the change must not be published: these are the SDM chain's filters beside \
-         the PCM chain's shapers, offered together as one daemon's settings. filters={filters:?} \
-         shapers={shapers:?}"
-    );
-    // ...and it must not have passed by *partial* publication either. Refusing the straddling set has
-    // to mean publishing none of it: a view carrying one family and not the other three is still
-    // handed to a caller as this daemon's settings, and a check that only forbade the mixed pair
-    // would be satisfied by a family having been blanked on the way past.
-    let populated = published_families(&straddled);
-    assert!(
-        populated.is_empty() || populated.len() == 4,
-        "a refused refresh must publish nothing, not a part. Published: {populated:?}"
-    );
+    match h.adapter.get_pipeline_status().await {
+        // Refusing the straddling set means publishing none of it — and since this read needed that
+        // set, it has nothing left to answer with. A view carrying one family and not the other
+        // three, or all four empty, is still handed to a caller as this daemon's settings.
+        Err(e) => assert!(
+            e.to_string().contains("lists") || e.to_string().contains("chain"),
+            "the failure must name what could not be settled. Got: {e}"
+        ),
+        Ok(straddled) => {
+            let filters: Vec<&str> = straddled
+                .settings
+                .filter1x
+                .options
+                .iter()
+                .map(|o| o.value.as_str())
+                .collect();
+            let shapers: Vec<&str> = straddled
+                .settings
+                .shaper
+                .options
+                .iter()
+                .map(|o| o.value.as_str())
+                .collect();
+            panic!(
+                "a read whose only enumeration set straddled a chain change must not be reported as \
+                 a successful one. filters={filters:?} shapers={shapers:?} families={:?}",
+                published_families(&straddled)
+            );
+        }
+    }
 
     // And the client recovers: the daemon is settled on PCM now, so the next poll publishes a
     // coherent PCM set rather than staying blank.
@@ -6969,14 +6968,19 @@ async fn a_chain_change_during_a_list_refresh_publishes_nothing_rather_than_a_mi
     h.stop();
 }
 
-/// One family failing must not publish the other three. A refresh is a set or it is nothing: leaving
-/// a caller with fresh filters beside an empty shaper list tells it the daemon offers no modulators,
-/// which is a different and worse falsehood than "not read yet".
+/// One family failing must not publish the other three, **and must not be reported as a successful
+/// read either**. A refresh is a set or it is nothing: leaving a caller with fresh filters beside an
+/// empty shaper list tells it the daemon offers no modulators, and answering `Ok` with *all four*
+/// empty tells it the daemon offers nothing at all. Both are falsehoods a caller acts on; "not read
+/// yet" is not something a `PipelineStatus` can express.
 ///
-/// **Label: client-red.** The previous refresh assigned an empty vector per failed family and
-/// published the rest.
+/// This test previously asserted `Ok` with nothing published, which pinned the second falsehood as
+/// expected behaviour — the same ambiguity the bounded-retry fix rejects, reached through the lazy
+/// fill instead. CodeRabbit found it.
+///
+/// **Label: client-red.**
 #[tokio::test]
-async fn a_single_failed_family_publishes_no_part_of_the_refresh() {
+async fn a_single_failed_family_fails_the_read_rather_than_publishing_an_empty_one() {
     let h = Harness::start(
         VERIFIED_PROFILE,
         WirePolicy {
@@ -6991,18 +6995,57 @@ async fn a_single_failed_family_publishes_no_part_of_the_refresh() {
     .await;
     h.adapter.connect().await.expect("connect");
 
-    let pipeline = h
-        .adapter
-        .get_pipeline_status()
-        .await
-        .expect("a failed family must not fail the whole read");
+    match h.adapter.get_pipeline_status().await {
+        Err(e) => assert!(
+            e.to_string().contains("lists"),
+            "the failure must say the setting lists could not be read, rather than surfacing as \
+             some unrelated error. Got: {e}"
+        ),
+        Ok(published) => {
+            let families = published_families(&published);
+            panic!(
+                "a fill that never settled must not be reported as a successful read. It published \
+                 {families:?}, with {} filter options and {} shaper options — a caller cannot tell \
+                 that from a daemon that genuinely offers neither",
+                published.settings.filter1x.options.len(),
+                published.settings.shaper.options.len()
+            );
+        }
+    }
+    h.stop();
+}
 
-    let populated = published_families(&pipeline);
+/// The same hole reached through the **first** read after connect, where there is no cache at all.
+///
+/// With nothing cached there is no previous fingerprint, so the chain check has nothing to
+/// contradict and answers "unchanged" — correctly, since it is a check about *movement*. That makes
+/// the required lazy fill the only thing standing between a caller and an empty answer, so its
+/// failure has to be the read's failure.
+///
+/// **Label: client-red.**
+#[tokio::test]
+async fn a_first_read_whose_required_fill_never_settles_is_not_reported_as_success() {
+    let h = Harness::start(
+        VERIFIED_PROFILE,
+        WirePolicy {
+            silent_for_element: Some("GetFilters".to_string()),
+            ..WirePolicy::default()
+        },
+        HqpTimeouts {
+            max_attempts: 1,
+            ..fast_timeouts()
+        },
+    )
+    .await;
+    h.adapter.connect().await.expect("connect");
+
+    let outcome = h.adapter.get_pipeline_status().await;
 
     assert!(
-        populated.is_empty(),
-        "the shaper fetch failed, so no part of that refresh may be published — a partially filled \
-         cache is offered to callers as a complete one. Published anyway: {populated:?}"
+        outcome.is_err(),
+        "the very first read has no cache to fall back on, so a fill that did not settle leaves \
+         nothing to publish; it published {:?} instead",
+        outcome.map(|p| published_families(&p))
     );
     h.stop();
 }

@@ -1566,7 +1566,14 @@ impl HqpAdapter {
     /// cycle — and the honest description of this guard is "the set did not straddle a visible
     /// transition", not "the four replies came from one instant", which nothing short of an atomic
     /// daemon-side snapshot could establish.
-    async fn refresh_lists(&self) {
+    ///
+    /// **Returns whether a complete, coherent snapshot was published.** The caller has to be able to
+    /// tell: a refresh that publishes nothing leaves the cache exactly as it found it, and when the
+    /// caller *needed* that fill — a first read after connect, or one after an invalidation — what it
+    /// is left holding is nothing at all. Swallowing that turned "I could not read this" into "this
+    /// daemon offers no filters", which is the ambiguity every other guard here exists to refuse.
+    #[must_use = "a refresh that did not settle leaves the cache empty, which is not the same as a daemon with no settings"]
+    async fn refresh_lists(&self) -> bool {
         let gathered = async {
             // Opening probe. The rate list is the bracket for the same reason it is the read path's
             // chain probe: smallest chain-scoped enumeration, and the two chains' rate lists were
@@ -1589,7 +1596,7 @@ impl HqpAdapter {
                     "HQPlayer list refresh incomplete ({e}); publishing nothing rather than a cache \
                      mixing one chain's entries with another's"
                 );
-                return;
+                return false;
             }
         };
 
@@ -1599,7 +1606,7 @@ impl HqpAdapter {
                 "HQPlayer's loaded chain moved while its lists were being read; publishing nothing \
                  rather than a set that straddles the change"
             );
-            return;
+            return false;
         }
 
         let modes_fp = Self::fingerprint(modes.iter().map(|m| (m.index, m.name.as_str())));
@@ -1623,6 +1630,7 @@ impl HqpAdapter {
         state.filters_fingerprint = Some(filters_fp);
         state.shapers_fingerprint = Some(shapers_fp);
         state.rates_fingerprint = Some(rates_fp);
+        true
     }
 
     /// Ensure connection is established, reconnecting if needed
@@ -3009,9 +3017,12 @@ impl HqpAdapter {
         // **Residual, and it cannot be closed from here.** The check confirms the chain is the same
         // *now* as when the lists were published; a move out and back inside that window leaves it
         // agreeing. Only a daemon-side atomic snapshot could do better, and the protocol has none.
-        let mut state = None;
-        let mut playback_status = HqpStatus::default();
-        for attempt in 0..2 {
+        // Every arm below is terminal — it breaks with a settled pair or returns — so there is no
+        // state to carry out of the loop and no "what if it fell through" case to answer for. An
+        // earlier shape carried an `Option` and re-read `State` if it were somehow `None`, which was
+        // unreachable and would have cost a round trip to discover that.
+        let mut retried = false;
+        let (state, playback_status) = loop {
             // Lazy-fill whatever is missing — on the first read after connect, that is all of it.
             let needs_lists = {
                 let cached = self.state.read().await;
@@ -3020,24 +3031,35 @@ impl HqpAdapter {
                     || cached.shapers.is_empty()
                     || cached.rates.is_empty()
             };
-            if needs_lists {
-                self.refresh_lists().await;
+            // A *required* fill that does not settle is the read's failure, not a quieter version of
+            // success. With nothing cached there is no previous fingerprint for the chain check to
+            // contradict, so it correctly answers "unchanged" — it is a check about movement — and
+            // the fill is then the only thing between a caller and four empty lists.
+            if needs_lists && !self.refresh_lists().await {
+                if !retried {
+                    tracing::info!(
+                        "HQPlayer's setting lists did not settle; re-reading once before giving up"
+                    );
+                    retried = true;
+                    continue;
+                }
+                return Err(anyhow!(
+                    "HQPlayer's setting lists could not be read as one coherent set; refusing to \
+                     report a pipeline with no settings in it, which is not what this daemon offers"
+                ));
             }
 
             let observed = self.get_state().await?;
-            playback_status = self.get_playback_status().await.unwrap_or_default();
+            let observed_status = self.get_playback_status().await.unwrap_or_default();
 
-            // A check failure is not fatal to a read: the caller still gets `State` and `Status`.
             match self.chain_still_matches_cache().await {
-                Ok(true) => {
-                    state = Some(observed);
-                    break;
-                }
-                Ok(false) if attempt == 0 => {
+                Ok(true) => break (observed, observed_status),
+                Ok(false) if !retried => {
                     tracing::info!(
                         "HQPlayer's loaded chain moved while its state was being read; re-reading \
                          rather than resolving one chain's indices against another's lists"
                     );
+                    retried = true;
                 }
                 // The retry moved too. There is nothing coherent to publish and no third attempt:
                 // the lists in hand came from the chain before *this* move, and noticing the move
@@ -3047,28 +3069,20 @@ impl HqpAdapter {
                 // that genuinely offers no filters. The route has always had an error arm; this is
                 // what it is for.
                 Ok(false) => {
-                    let _ = observed;
                     return Err(anyhow!(
                         "HQPlayer's loaded chain moved while its settings were being read, and \
                          again during the re-read; refusing to report settings that belong to no \
                          single chain"
-                    ));
+                    ))
                 }
+                // A check that could not run is not a check that failed: the cache was not
+                // invalidated, so the lists are still the ones the state was read against. The
+                // caller gets the read, and the log says the guarantee was weaker this time.
                 Err(e) => {
                     tracing::warn!("HQPlayer chain check failed, serving cached enumerations: {e}");
-                    state = Some(observed);
+                    break (observed, observed_status);
                 }
             }
-            if state.is_some() {
-                break;
-            }
-        }
-        let state = match state {
-            Some(state) => state,
-            // Unreachable in practice: the loop only leaves this `None` by exhausting both attempts
-            // without setting it, and the second attempt always sets it. Read it once more rather
-            // than unwrap, so a future edit to the loop cannot turn a logic slip into a panic.
-            None => self.get_state().await?,
         };
 
         // Lazy-load volume range if not cached
@@ -3635,8 +3649,16 @@ impl HqpAdapter {
                     if response.status().is_client_error() || response.status().is_server_error() {
                         return Err(anyhow!("Profile load failed: {}", response.status()));
                     }
-                    // Refresh cached lists after profile change
-                    self.refresh_lists().await;
+                    // Refresh cached lists after profile change. A refresh that does not settle
+                    // leaves the cache empty rather than stale, and the next pipeline read is what
+                    // reports that — the profile load itself succeeded and saying otherwise would
+                    // be a different lie.
+                    if !self.refresh_lists().await {
+                        tracing::warn!(
+                            "HQPlayer profile loaded, but its setting lists did not settle; the \
+                             next read will refill them"
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -3647,8 +3669,13 @@ impl HqpAdapter {
             return Err(anyhow!("Profile load failed: {}", response.status()));
         }
 
-        // Refresh cached lists after profile change
-        self.refresh_lists().await;
+        // Refresh cached lists after profile change; see the note on the retry path above.
+        if !self.refresh_lists().await {
+            tracing::warn!(
+                "HQPlayer profile loaded, but its setting lists did not settle; the next read will \
+                 refill them"
+            );
+        }
         Ok(())
     }
 
