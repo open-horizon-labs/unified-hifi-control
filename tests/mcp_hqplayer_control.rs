@@ -520,6 +520,69 @@ async fn mcp_volume_set_routes_to_the_hqplayer_instance_and_clamps_to_the_observ
     server.stop();
 }
 
+/// **Client expectation.** `volume_up`/`volume_down` on a direct HQPlayer zone move relative to the
+/// last observed level via the same `hqplayer:` arm `volume_set` uses — not the old `set_volume`
+/// helper, which never had a `hqplayer:` branch for any of the three volume actions.
+#[tokio::test]
+async fn mcp_volume_up_and_down_route_to_the_hqplayer_instance() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|z| z.volume_control.is_some()).await;
+
+    let up = rig
+        .call_tool(
+            "hifi_control",
+            json!({"zone_id": "hqplayer:rig", "action": "volume_up"}),
+        )
+        .await;
+    assert!(
+        !text_of(&up).starts_with("Error"),
+        "volume_up must succeed via MCP"
+    );
+    let after_up: f64 = request_attr(
+        &model
+            .last_request("Volume")
+            .expect("a Volume write from volume_up"),
+        "value",
+    )
+    .expect("numeric value")
+    .parse()
+    .expect("value parses as a number");
+    assert!(
+        after_up > -23.5,
+        "volume_up must move the level up from -23.5 dB, got {after_up}"
+    );
+
+    let down = rig
+        .call_tool(
+            "hifi_control",
+            json!({"zone_id": "hqplayer:rig", "action": "volume_down"}),
+        )
+        .await;
+    assert!(
+        !text_of(&down).starts_with("Error"),
+        "volume_down must succeed via MCP"
+    );
+    let after_down: f64 = request_attr(
+        &model
+            .last_request("Volume")
+            .expect("a Volume write from volume_down"),
+        "value",
+    )
+    .expect("numeric value")
+    .parse()
+    .expect("value parses as a number");
+    assert!(
+        after_down < after_up,
+        "volume_down must move the level down from {after_up} dB, got {after_down}"
+    );
+
+    rig.shutdown().await;
+    server.stop();
+}
+
 /// **Client expectation, and the safety-critical one.** A volume command through MCP with no
 /// usable level is refused — never turned into a number, and never sent to the daemon. Mirrors
 /// `tests/hqplayer_direct_zone.rs::a_missing_or_unparseable_level_is_refused_never_defaulted` for
