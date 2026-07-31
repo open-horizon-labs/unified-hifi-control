@@ -33,9 +33,15 @@ that interval resolves the operation as `Ignored` with `NotAttempted`; it must n
 `Applied`/`Confirmed`. Once the executor-begun fence is installed, `Pending` means the attempt is
 unknown: matching or conflicting observations may update producer state but cannot resolve that
 operation. Receipt evidence is the only source of attempted-write truth, and admitting typed
-completion clears the fence atomically with its operation transition. Manager stop refuses to drop
-the run while a fence remains. Instance removal may arrive after the manager has finished the
-native call but before the command actor publishes that receipt, so it records retirement intent
+completion clears the fence atomically with its operation transition. The exact fenced receipt
+remains admissible as audit evidence if a newer producer epoch is observed after dispatch begins:
+the full opaque lease, correlation, generation, pending operation, and live fence must still match.
+This narrow exception does not restore native authority, and the same stale receipt is rejected
+after its one-shot fence is consumed. Manager stop refuses to drop the run while a fence remains,
+and manager start is rejected while that stopping run still owns an in-flight or deferred receipt;
+start may be retried only after terminal admission releases the prior run. Instance removal may
+arrive after the manager has finished the native call but before the command actor publishes that
+receipt, so it records retirement intent
 and blocks new work while retaining the coordinator. Retirement occurs only after the receipt's
 terminal operation is admitted; the compact retired coordinator then preserves exact correlation
 truth for a late duplicate callback.

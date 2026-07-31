@@ -1479,6 +1479,12 @@ impl HqpPublisherCoordinator {
     }
 
     fn manager_started(&mut self) -> Result<(), HqpCoordinatorRefusal> {
+        if self.run.is_some() && self.stop_requested {
+            // A receipt/deferred terminal publication still owns the old run. Reporting success
+            // here would let the manager launch new workers which that old completion can later
+            // make last-known. The caller may retry once quiescence drops the prior run.
+            return Err(HqpCoordinatorRefusal::LeaseStillCurrent);
+        }
         if self.run.is_none() {
             self.run = Some(self.handle.begin_run("hqplayer"));
             self.stop_requested = false;
@@ -2103,6 +2109,28 @@ impl HqpPublisherCoordinator {
         Ok(())
     }
 
+    /// Validate the narrow exception for a receipt whose exact executor-begun lease crossed a
+    /// producer epoch observation. The correlation's full opaque lease equality prevents a stale
+    /// or fabricated generation from borrowing another operation's fence.
+    fn is_exact_fenced_pending(&self, lease: &HqpCommandLease) -> bool {
+        let Some(instance_name) = lease.producer_id.strip_prefix("hqplayer:") else {
+            return false;
+        };
+        let Some(state) = self.instances.get(instance_name) else {
+            return false;
+        };
+        state.dispatch_in_progress.contains(&lease.generation)
+            && state
+                .correlations
+                .get(&lease.correlation_id)
+                .is_some_and(|correlation| correlation.lease == *lease)
+            && state.ledger.iter().any(|operation| {
+                operation.id == lease.operation_id
+                    && operation.generation == Some(lease.generation)
+                    && operation.outcome == CommandOutcome::Pending
+            })
+    }
+
     /// Return already-published terminal truth for a late actor callback. In particular, instance
     /// retirement removes the document from the public view, but must not make a completion retry
     /// look like a fresh lease or make the accepted operation's audit disappear.
@@ -2131,7 +2159,7 @@ impl HqpPublisherCoordinator {
         lease: &HqpCommandLease,
         completion: HqpCommandCompletion,
     ) -> Result<OperationRecord, HqpCoordinatorRefusal> {
-        if self.validate(lease).is_err() {
+        if self.validate(lease).is_err() && !self.is_exact_fenced_pending(lease) {
             return self
                 .retained_terminal_operation(lease)
                 .ok_or(HqpCoordinatorRefusal::StaleLease);
@@ -3904,8 +3932,15 @@ mod tests {
             .begin_dispatch(reservation.lease())
             .await
             .expect("final lease check fences the begun executor");
+        let mut restarted = sample();
+        restarted.producer_epoch = 8;
+        restarted.execution_target.producer_epoch = 8;
         publisher
-            .instance_removed("main", 7)
+            .observed(restarted)
+            .await
+            .expect("new epoch may be observed while exact old-session receipt is pending");
+        publisher
+            .instance_removed("main", 8)
             .await
             .expect("removal waits for the actor's receipt completion");
         assert!(
@@ -4012,6 +4047,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_start_is_rejected_until_stopping_run_admits_deferred_receipt() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let reservation = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("initial"),
+                "restart-before-old-receipt",
+                "PCM",
+            ))
+            .await
+            .expect("reserve");
+        publisher
+            .begin_dispatch(reservation.lease())
+            .await
+            .expect("executor begun fence");
+        assert!(publisher.manager_stopped().await.is_err());
+        assert!(
+            publisher.manager_started().await.is_err(),
+            "new workers cannot start while the old fenced receipt owns the run"
+        );
+
+        for _ in 0..5 {
+            publisher.refuse_next_publication().await;
+        }
+        assert!(matches!(
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Indeterminate,
+                        WriteAttempt::Attempted,
+                        Timestamp::new("2026-07-31T00:00:01Z"),
+                        Some(RecoveryState::AwaitingReadback),
+                        None,
+                    ),
+                )
+                .await,
+            Err(HqpCoordinatorRefusal::PublicationFailed(_))
+        ));
+        assert!(
+            publisher.manager_started().await.is_err(),
+            "deferred terminal admission still owns the stopping run"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if publisher.manager_started().await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restart succeeds only after old receipt admission ends the prior run");
+        assert_eq!(
+            view.snapshot(&key)
+                .expect("receipt audit")
+                .document
+                .operations[0]
+                .outcome,
+            CommandOutcome::Indeterminate
+        );
+
+        publisher.manager_stopped().await.expect("new run stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
     async fn coordinator_retries_one_terminal_publication_failure_without_stranding_conflict() {
         let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
         let key = crate::producers::ProducerKey {
@@ -4073,6 +4181,17 @@ mod tests {
             ))
             .await
             .expect("reserve");
+        publisher
+            .begin_dispatch(reservation.lease())
+            .await
+            .expect("executor begun before epoch advance");
+        let mut restarted = sample();
+        restarted.producer_epoch = 8;
+        restarted.execution_target.producer_epoch = 8;
+        publisher
+            .observed(restarted)
+            .await
+            .expect("new epoch observation preserves exact fence");
         for _ in 0..3 {
             publisher.refuse_next_publication().await;
         }
@@ -4469,6 +4588,89 @@ mod tests {
         assert_eq!(operation.history.len(), 1);
         assert_eq!(operation.history[0].from, CommandOutcome::Pending);
         assert_eq!(operation.history[0].to, CommandOutcome::Rejected);
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn newer_epoch_after_executor_begins_still_admits_exact_old_session_receipt() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let reservation = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("epoch-7 snapshot"),
+                "epoch-advance-during-executor",
+                "PCM",
+            ))
+            .await
+            .expect("epoch-7 reservation");
+        publisher
+            .begin_dispatch(reservation.lease())
+            .await
+            .expect("epoch-7 executor fence");
+
+        let mut restarted = sample();
+        restarted.producer_epoch = 8;
+        restarted.execution_target.producer_epoch = 8;
+        restarted.mode_is_source = false;
+        restarted.mode.selected = "PCM".to_string();
+        publisher
+            .observed(restarted)
+            .await
+            .expect("new epoch observation is admitted without resolving fenced operation");
+        let advanced = view.snapshot(&key).expect("epoch-8 snapshot");
+        assert_eq!(advanced.document.producer.epoch, ProducerEpoch(8));
+        assert_eq!(
+            advanced.document.operations[0].outcome,
+            CommandOutcome::Pending
+        );
+
+        publisher
+            .complete(
+                reservation.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Indeterminate,
+                    WriteAttempt::Attempted,
+                    Timestamp::new("2026-07-31T00:00:01Z"),
+                    Some(RecoveryState::AwaitingReadback),
+                    None,
+                ),
+            )
+            .await
+            .expect("exact fenced epoch-7 receipt remains admissible as epoch-8 audit");
+        let audited = view.snapshot(&key).expect("receipt audit");
+        assert_eq!(audited.document.producer.epoch, ProducerEpoch(8));
+        assert_eq!(
+            audited.document.operations[0].outcome,
+            CommandOutcome::Indeterminate
+        );
+        assert_eq!(
+            audited.document.operations[0].write_attempt,
+            WriteAttempt::Attempted
+        );
+
+        assert_eq!(
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Applied,
+                        WriteAttempt::Confirmed,
+                        Timestamp::new("2026-07-31T00:00:02Z"),
+                        Some(RecoveryState::NotRequired),
+                        None,
+                    ),
+                )
+                .await,
+            Err(HqpCoordinatorRefusal::StaleLease),
+            "once the exact fence is consumed, an old-epoch completion is stale again"
+        );
 
         publisher.manager_stopped().await.expect("manager stops");
         shutdown.cancel();

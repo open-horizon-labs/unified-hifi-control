@@ -214,6 +214,17 @@ pub struct HqpImmediateCommandActor {
     executor: Arc<dyn HqpNativeSettingExecutor>,
 }
 
+fn send_submit_reply(
+    reply: oneshot::Sender<Result<HqpCommandAcknowledgement, HqpCommandServiceRefusal>>,
+    response: Result<HqpCommandAcknowledgement, HqpCommandServiceRefusal>,
+) {
+    if reply.send(response).is_err() {
+        // The actor owns an accepted reservation independently of caller lifetime. A dropped
+        // acknowledgement receiver is observable cancellation, not permission to abandon work.
+        tracing::debug!("HQPlayer command submitter disconnected before acknowledgement");
+    }
+}
+
 impl HqpImmediateCommandActor {
     /// Build a bounded service. Capacity must be non-zero (the same requirement as Tokio's
     /// bounded channel).
@@ -266,7 +277,11 @@ impl HqpImmediateCommandActor {
                         }
                     }
                     for waiter in shutdown_replies {
-                        let _ = waiter.send(());
+                        if waiter.send(()).is_err() {
+                            tracing::debug!(
+                                "HQPlayer command shutdown waiter disconnected before drain"
+                            );
+                        }
                     }
                     return;
                 }
@@ -280,43 +295,49 @@ impl HqpImmediateCommandActor {
         reply: oneshot::Sender<Result<HqpCommandAcknowledgement, HqpCommandServiceRefusal>>,
     ) {
         if let Err(refusal) = validate_correlation_id(&request.correlation_id) {
-            let _ = reply.send(Err(HqpCommandServiceRefusal::Preflight(refusal)));
+            send_submit_reply(reply, Err(HqpCommandServiceRefusal::Preflight(refusal)));
             return;
         }
         match self.coordinator.lookup_correlation(&request).await {
             Ok(Some(reservation)) => {
-                let _ = reply.send(Ok(HqpCommandAcknowledgement {
-                    operation: reservation.operation().clone(),
-                    duplicate: true,
-                }));
+                send_submit_reply(
+                    reply,
+                    Ok(HqpCommandAcknowledgement {
+                        operation: reservation.operation().clone(),
+                        duplicate: true,
+                    }),
+                );
                 return;
             }
             Ok(None) => {}
             Err(refusal) => {
-                let _ = reply.send(Err(HqpCommandServiceRefusal::Coordinator(refusal)));
+                send_submit_reply(reply, Err(HqpCommandServiceRefusal::Coordinator(refusal)));
                 return;
             }
         }
         let Some(snapshot) = self.view.snapshot(&request.key) else {
-            let _ = reply.send(Err(HqpCommandServiceRefusal::ProducerUnknown));
+            send_submit_reply(reply, Err(HqpCommandServiceRefusal::ProducerUnknown));
             return;
         };
         let validated = match preflight(&snapshot, &request) {
             Ok(validated) => validated,
             Err(refusal) => {
-                let _ = reply.send(Err(HqpCommandServiceRefusal::Preflight(refusal)));
+                send_submit_reply(reply, Err(HqpCommandServiceRefusal::Preflight(refusal)));
                 return;
             }
         };
         if instance_name(&validated).is_none() {
-            let _ = reply.send(Err(HqpCommandServiceRefusal::InvalidProducerIdentity));
+            send_submit_reply(
+                reply,
+                Err(HqpCommandServiceRefusal::InvalidProducerIdentity),
+            );
             return;
         }
         let setting = native_setting(&validated);
         let reservation = match self.coordinator.reserve(validated).await {
             Ok(reservation) => reservation,
             Err(refusal) => {
-                let _ = reply.send(Err(HqpCommandServiceRefusal::Coordinator(refusal)));
+                send_submit_reply(reply, Err(HqpCommandServiceRefusal::Coordinator(refusal)));
                 return;
             }
         };
@@ -329,7 +350,7 @@ impl HqpImmediateCommandActor {
         };
         // The accepted job no longer depends on this send succeeding. A disconnected submitter
         // drops only its acknowledgement receiver, never the actor-owned reservation.
-        let _ = reply.send(Ok(acknowledgement));
+        send_submit_reply(reply, Ok(acknowledgement));
         if duplicate {
             return;
         }
