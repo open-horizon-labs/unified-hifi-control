@@ -181,35 +181,78 @@ fn code_only(text: &str) -> String {
     out
 }
 
-/// The `#[cfg(...)]` attributes written in `text`, each as its own readable string.
+fn meta_can_apply_cfg(meta: &syn::Meta) -> bool {
+    if meta.path().is_ident("cfg") {
+        return true;
+    }
+    let syn::Meta::List(list) = meta else {
+        return false;
+    };
+    if !list.path.is_ident("cfg_attr") {
+        return false;
+    }
+    list.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+        .is_ok_and(|arguments| arguments.iter().skip(1).any(meta_can_apply_cfg))
+}
+
+/// The attributes that directly or conditionally apply `cfg`, in readable spelling.
 ///
-/// Extracted rather than matched whole-line because a gate can share a line with the item it
-/// gates, and because `#[cfg_attr(...)]` must not match — it cannot exclude a module.
-fn cfg_attributes_in(text: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("#[cfg(") {
-        let tail = &rest[start..];
-        match tail.find(")]") {
-            Some(end) => {
-                found.push(tail[..end + 2].to_string());
-                rest = &tail[end + 2..];
+/// `syn` owns tokenization here. A textual scanner is not sufficient because raw strings,
+/// comments, and nested token trees may all contain delimiter-like text.
+fn cfg_attributes(attributes: &[syn::Attribute]) -> Vec<String> {
+    attributes
+        .iter()
+        .filter_map(|attribute| {
+            if !meta_can_apply_cfg(&attribute.meta) {
+                return None;
             }
-            None => {
-                // Unterminated on this line. Record what is here rather than dropping a gate.
-                found.push(tail.trim().to_string());
-                break;
+            match &attribute.meta {
+                syn::Meta::List(list) if list.path.is_ident("cfg") => {
+                    Some(format!("#[cfg({})]", list.tokens))
+                }
+                syn::Meta::List(list) if list.path.is_ident("cfg_attr") => {
+                    Some(format!("#[cfg_attr({})]", list.tokens))
+                }
+                _ => Some(format!("#[{}]", attribute.path().segments[0].ident)),
+            }
+        })
+        .collect()
+}
+
+fn find_adaptive_declaration(
+    items: &[syn::Item],
+    enclosing_gates: &[String],
+) -> Option<Vec<String>> {
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+
+        if module.ident == "adaptive"
+            && matches!(module.vis, syn::Visibility::Public(_))
+            && module.content.is_none()
+        {
+            let mut gates = cfg_attributes(&module.attrs);
+            gates.extend(enclosing_gates.iter().cloned());
+            return Some(gates);
+        }
+
+        if let Some((_, nested_items)) = &module.content {
+            let mut nested_gates = enclosing_gates.to_vec();
+            nested_gates.extend(cfg_attributes(&module.attrs));
+            if let Some(gates) = find_adaptive_declaration(nested_items, &nested_gates) {
+                return Some(gates);
             }
         }
     }
-    found
+    None
 }
 
 /// Every `#[cfg(...)]` attribute that applies to `pub mod adaptive;` in `source`.
 ///
 /// `None` means the declaration is absent. An empty vector means it is present and ungated.
 ///
-/// Three things this has to get right, each of which hid a real gate at some point:
+/// Four things this has to get right, each of which hid a real gate at some point:
 ///
 /// 1. **The declaration line, not the first textual occurrence.** `str::find` would match a
 ///    doc comment above the real site and then assert about the wrong line.
@@ -220,50 +263,12 @@ fn cfg_attributes_in(text: &str) -> Vec<String> {
 /// 3. **Attribute stacks.** A `#[cfg(...)]` need not be the attribute nearest the
 ///    declaration — Rust allows any number in any order, so
 ///    `#[cfg(feature = "server")]` / `#[allow(dead_code)]` / `pub mod adaptive;` is gated.
-///    Pending gates therefore *accumulate* across consecutive attribute lines.
-///
-/// The accumulation has to stop somewhere, or every ungated `pub mod` below the server block
-/// in `src/lib.rs` would be reported as gated. It stops at the next item or block: whatever
-/// consumes the attributes owns them, and they do not carry forward.
+/// 4. **Rust token boundaries.** Multiline attributes and raw strings can contain `)]`
+///    without closing an attribute. Parsing the syntax tree keeps those tokens attached to
+///    the item Rust itself attaches them to.
 fn adaptive_declaration_gates(source: &str) -> Option<Vec<String>> {
-    let mut enclosing: Vec<Vec<String>> = Vec::new();
-    let mut pending: Vec<String> = Vec::new();
-    let mut gates: Option<Vec<String>> = None;
-
-    for line in code_only(source).lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // The declaration consumes any pending attributes, plus every enclosing frame.
-        if let Some(prefix) = trimmed.strip_suffix(ADAPTIVE_DECLARATION) {
-            let mut found = cfg_attributes_in(prefix);
-            found.append(&mut pending);
-            found.extend(enclosing.iter().flatten().cloned());
-            gates = Some(found);
-            continue;
-        }
-        // A block opener consumes them instead, and holds them until it closes.
-        if trimmed.ends_with('{') {
-            let mut frame = cfg_attributes_in(trimmed);
-            frame.append(&mut pending);
-            enclosing.push(frame);
-            continue;
-        }
-        if trimmed == "}" {
-            enclosing.pop();
-            continue;
-        }
-        // An attribute adds to the stack without disturbing what is already there. `#![…]`
-        // crate attributes land here too and contribute nothing, which is correct.
-        if trimmed.starts_with('#') {
-            pending.extend(cfg_attributes_in(trimmed));
-            continue;
-        }
-        // Any other item consumed the attributes above it. They are not ours.
-        pending.clear();
-    }
-    gates
+    let file = syn::parse_file(source).ok()?;
+    find_adaptive_declaration(&file.items, &cfg_attributes(&file.attrs))
 }
 
 #[test]
@@ -392,6 +397,56 @@ fn stacked_attributes_do_not_hide_a_cfg_gate_on_the_declaration() {
             "#[cfg(feature = \"server\")]".to_string(),
             "#[cfg(feature = \"web\")]".to_string(),
         ])
+    );
+
+    // Formatting a compound cfg across lines must not discard the gate while the
+    // attribute is still incomplete.
+    let multiline = "#[cfg(all(\n\
+                     feature = \"server\",\n\
+                     not(target_arch = \"wasm32\")\n\
+                 ))]\n\
+                 pub mod adaptive;\n";
+    let multiline_gates =
+        adaptive_declaration_gates(multiline).expect("the declaration must be found");
+    assert_eq!(
+        forbidden_gates_in(&multiline_gates.join(" ")),
+        vec!["feature = \"server\""],
+        "a multiline cfg attribute must remain attached to the declaration"
+    );
+
+    // A raw string may legally contain delimiter-like text. A textual delimiter counter
+    // must not let that content detach an earlier cfg attribute from the declaration.
+    let raw_string = r####"
+        #[cfg(feature = "server")]
+        #[doc = concat!(
+            r##"contains " )] still raw"##,
+            "shared"
+        )]
+        pub mod adaptive;
+    "####;
+    let raw_string_gates =
+        adaptive_declaration_gates(raw_string).expect("the declaration must be found");
+    assert_eq!(
+        forbidden_gates_in(&raw_string_gates.join(" ")),
+        vec!["feature = \"server\""],
+        "raw-string content must not terminate a stacked attribute"
+    );
+
+    // `cfg_attr` can apply a real `cfg` and exclude the module on one target.
+    let conditional = "#[cfg_attr(not(feature = \"server\"), cfg(any()))]\npub mod adaptive;\n";
+    let conditional_gates =
+        adaptive_declaration_gates(conditional).expect("the declaration must be found");
+    assert!(
+        !conditional_gates.is_empty(),
+        "a cfg_attr capable of applying cfg must be treated as a gate"
+    );
+
+    // An inner crate attribute gates every item even though it is not attached to ItemMod.
+    let crate_gated = "#![cfg(feature = \"server\")]\npub mod adaptive;\n";
+    assert_eq!(
+        adaptive_declaration_gates(crate_gated),
+        Some(vec!["#[cfg(feature = \"server\")]".to_string()]),
+        "a crate-level cfg must be inherited by the declaration"
     );
 
     // The other half of the property: an attribute stack that belongs to a *different* item

@@ -137,12 +137,12 @@ second consumer crate actually exists.
 **Updated:** 2026-07-30
 **Status:** complete
 
-Landed in three commits plus a cleanup commit:
+The initial execution landed in four commits (after the `cd436e0` solution-space record):
 
 - `43d674b` domain model (`src/adaptive/`, 8 modules, shared not server-gated)
 - `67e83bb` untrack `.oh/.cache` artifacts a `git add -A` had swept in
 - `9449152` six canonical fixtures, 79 contract tests, dependency lint
-- docs: normative spec, ADR 003, ARCHITECTURE.md pointer
+- `40e22a8` normative spec, ADR 003, ARCHITECTURE.md pointer
 
 All five solution-review actions and all five solution-dissent actions landed as tests or
 normative spec text rather than prose:
@@ -161,14 +161,18 @@ normative spec text rather than prose:
 | expected-ungrounded lanes per producer family | spec section 2 |
 
 **Drift check:** none. No routes touched, `tests/fixtures/api_routes.txt` unchanged,
-`api-change-approved` never applied, no user-owned file modified. 390 tests pass.
+`api-change-approved` never applied, no user-owned file modified. At `40e22a8`, the initial
+execution gate passed 390 tests.
 
 ### Remediation of CodeRabbit review (2026-07-30)
 
 Thirteen findings: five actionable threads, eight review-body nitpicks. Twelve accepted,
-one rejected with evidence. 407 tests pass (was 397); the ten new tests were written and
-seen failing before the fixes, and the three lint fixes were verified against probes that
-demonstrated each blind spot on the pre-remediation code.
+one rejected with evidence. The intervening C2 coherence follow-up in `a5cae03` brought the
+pre-remediation branch to 397 tests; remediation then passed 407 tests. Those ten added
+tests were written and seen failing before the fixes, and the three lint fixes were verified
+against probes that demonstrated each blind spot on the pre-remediation code. The later
+stacked-attribute regression in `d6da952` added the 408th test; the multiline-attribute
+review fix extends that same test rather than changing the test count.
 
 Three of the accepted findings changed the contract, so the specification and ADR 003 moved
 with them rather than after them:
