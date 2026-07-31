@@ -3174,7 +3174,7 @@ impl HqpAdapter {
                 SettingOutcome::Suppressed { .. } => return Ok(outcome),
             }
 
-            let state = match self.get_state().await {
+            let mut state = match self.get_state().await {
                 Ok(state) => state,
                 Err(e) => {
                     unsettled = Some(format!(
@@ -3192,6 +3192,23 @@ impl HqpAdapter {
                             reason: format!(
                                 "a {what} write may have reached the wire, but the configured mode \
                                  could not be resolved during final proof ({error})"
+                            ),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+                // GetModes carries capabilities, not the configured selection. Re-read State after
+                // that reconnect-capable request so a controller changing mode immediately after
+                // the earlier proof reply cannot leave us proving rate through stale mode/rate
+                // fields. The remaining post-State race is the protocol's non-atomic boundary.
+                state = match self.get_state().await {
+                    Ok(state) => state,
+                    Err(error) if attempted_write => {
+                        return Ok(SettingOutcome::Ambiguous {
+                            what: what.to_string(),
+                            reason: format!(
+                                "a {what} write may have reached the wire, but State could not be \
+                                 re-read after the final modes fetch ({error})"
                             ),
                         });
                     }

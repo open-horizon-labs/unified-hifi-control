@@ -8657,3 +8657,43 @@ async fn a_rate_write_that_enters_source_after_the_decision_is_not_applied() {
     }
     h.stop();
 }
+
+/// Fetching `GetModes` after the final proof `State` does not make that earlier state current: the
+/// available modes list is device-scoped and does not carry the configured selection. A controller
+/// can select `[source]` immediately after the proof reply while the rate list stays on PCM.
+///
+/// **Label: client-red.** Found by CodeRabbit at `5f0e2b9`.
+#[tokio::test]
+async fn a_rate_proof_rechecks_state_after_fetching_modes() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.rate_index = 1;
+        s.active_rate_hz = 44_100;
+    });
+    // Decision State, write readback State, then proof State. The first two transitions are no-ops;
+    // the third lands `[source]` immediately after the stale proof reply.
+    h.model.switch_mode_after_request("State", 1);
+    h.model.switch_mode_after_request("State", 1);
+    h.model.switch_mode_after_request("State", 0);
+
+    let outcome = h
+        .adapter
+        .set_rate(0)
+        .await
+        .expect("a raced final proof is an outcome");
+
+    assert_eq!(h.model.request_count("SetRate"), 1);
+    assert_eq!(h.model.state().mode_index, 0);
+    match outcome {
+        SettingOutcome::Ambiguous { what, reason } => {
+            assert_eq!(what, "rate");
+            assert!(
+                reason.contains("[source]") && reason.contains("wire"),
+                "the post-modes State must expose the final source mode and prior write; got: \
+                 {reason}"
+            );
+        }
+        other => panic!("a stale pre-modes State cannot prove the Auto pin: {other:?}"),
+    }
+    h.stop();
+}
