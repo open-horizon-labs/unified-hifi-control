@@ -595,6 +595,89 @@ async fn failed_adaptive_retirement_rolls_back_instance_removal() {
 }
 
 #[tokio::test]
+async fn accepted_adaptive_retirement_retry_does_not_restore_the_removed_instance() {
+    isolate_config_dir();
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let bus = create_bus();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let (handle, actor, view) = AdaptiveRuntime::build(shutdown.clone(), 32);
+    let actor_task = tokio::spawn(async move { actor.run().await });
+    let publisher = Arc::new(HqpAdaptivePublisher::new(handle));
+    let manager = HqpInstanceManager::new_with_native_sink(bus, publisher.clone());
+    let adapter = manager
+        .add_instance(
+            "rig".to_string(),
+            "127.0.0.1".to_string(),
+            Some(server.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    adapter.set_timeouts(fast_timeouts()).await;
+    adapter.set_recovery_config(fast_recovery()).await;
+    manager.start().await.expect("start managed instance");
+
+    for _ in 0..100 {
+        if view
+            .snapshots()
+            .iter()
+            .any(|snapshot| snapshot.key.producer_id == "hqplayer:rig")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        view.snapshots()
+            .iter()
+            .any(|snapshot| snapshot.key.producer_id == "hqplayer:rig"),
+        "producer admitted before removal"
+    );
+
+    publisher
+        .debug_refuse_next_retirement()
+        .await
+        .expect("inject one retryable retirement refusal");
+    assert!(
+        manager.remove_instance("rig").await,
+        "coordinator-owned retirement retry is a committed removal"
+    );
+    assert!(
+        manager.get("rig").await.is_none(),
+        "committed removal never restores the adapter"
+    );
+    assert!(
+        !manager.worker_status("rig").await.supervisor_enabled,
+        "committed removal never restarts the worker"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if view
+                .snapshots()
+                .iter()
+                .all(|snapshot| snapshot.key.producer_id != "hqplayer:rig")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("coordinator retry eventually retires the producer");
+
+    manager.stop().await;
+    shutdown.cancel();
+    actor_task.await.expect("actor drains");
+    server.stop();
+}
+
+#[tokio::test]
 async fn managed_legacy_and_adaptive_projections_share_one_coherent_gather() {
     isolate_config_dir();
     let server = WireServer::start(

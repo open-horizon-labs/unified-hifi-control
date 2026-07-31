@@ -1229,6 +1229,10 @@ enum HqpCoordinatorCommand {
     RefuseNextPublication {
         reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
     },
+    #[cfg(any(test, debug_assertions))]
+    RefuseNextRetirement {
+        reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
+    },
 }
 
 struct HqpPublisherCoordinator {
@@ -1239,6 +1243,8 @@ struct HqpPublisherCoordinator {
     retired_instance_order: VecDeque<String>,
     #[cfg(test)]
     refused_publications: usize,
+    #[cfg(any(test, debug_assertions))]
+    refused_retirements: usize,
     stop_requested: bool,
 }
 
@@ -1352,6 +1358,14 @@ impl HqpPublisherCoordinator {
             self.instances.insert(instance_name, state);
             return Err(error);
         }
+        #[cfg(any(test, debug_assertions))]
+        if self.refused_retirements > 0 {
+            self.refused_retirements -= 1;
+            self.instances.insert(instance_name, state);
+            return Err(HqpCoordinatorRefusal::RetirementFailed(
+                "injected retirement refusal".to_string(),
+            ));
+        }
         if let Some(run) = self.run.as_ref() {
             let producer_id = format!("hqplayer:{instance_name}");
             let retirement = self
@@ -1390,6 +1404,7 @@ impl HqpPublisherCoordinator {
         at: Timestamp,
     ) -> Result<(), HqpCoordinatorRefusal> {
         let mut candidate_ledger = state.ledger.clone();
+        let mut expiration_frontier = HashSet::new();
         let mut changed = false;
         for operation in &mut candidate_ledger {
             if operation.outcome == CommandOutcome::Pending
@@ -1414,6 +1429,7 @@ impl HqpPublisherCoordinator {
                     }),
                 )
                 .map_err(|_| HqpCoordinatorRefusal::IllegalTransition)?;
+            expiration_frontier.insert(operation.id.clone());
             changed = true;
         }
         if !changed {
@@ -1422,11 +1438,15 @@ impl HqpPublisherCoordinator {
 
         let mut correlation_tombstones = state.correlation_tombstones.clone();
         let mut correlation_tombstone_order = state.correlation_tombstone_order.clone();
-        prune_terminal_history(
+        if expiration_frontier.len() > MAX_TERMINAL_OPERATIONS {
+            return Err(HqpCoordinatorRefusal::UnresolvedRetentionFull);
+        }
+        prune_terminal_history_preserving(
             &mut candidate_ledger,
             &state.correlations,
             &mut correlation_tombstones,
             &mut correlation_tombstone_order,
+            &expiration_frontier,
         );
         let mut candidate_document = state
             .tracker
@@ -1545,6 +1565,11 @@ impl HqpPublisherCoordinator {
                 #[cfg(test)]
                 HqpCoordinatorCommand::RefuseNextPublication { reply } => {
                     self.refused_publications += 1;
+                    let _ = reply.send(Ok(()));
+                }
+                #[cfg(any(test, debug_assertions))]
+                HqpCoordinatorCommand::RefuseNextRetirement { reply } => {
+                    self.refused_retirements += 1;
                     let _ = reply.send(Ok(()));
                 }
                     }
@@ -1947,8 +1972,24 @@ impl HqpPublisherCoordinator {
             self.instances.insert(instance_name, state);
             return Ok(());
         }
-        self.retire_admitted_instance(instance_name, state, epoch)
+        match self
+            .retire_admitted_instance(instance_name.clone(), state, epoch)
             .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // `retire_admitted_instance` records retirement intent before any fallible
+                // publication/retire operation and reinserts the exact state on failure. From
+                // here the coordinator owns durable retry; reporting an error would make the
+                // manager restore a worker which this accepted retirement will later hide.
+                tracing::warn!(
+                    ?error,
+                    instance = %instance_name,
+                    "HQPlayer retirement committed for coordinator-owned retry"
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn reserve(
@@ -2631,6 +2672,25 @@ fn prune_terminal_history(
     tombstones: &mut HashMap<String, HqpCommandFingerprint>,
     tombstone_order: &mut VecDeque<String>,
 ) {
+    prune_terminal_history_preserving(
+        ledger,
+        correlations,
+        tombstones,
+        tombstone_order,
+        &HashSet::new(),
+    );
+}
+
+/// Bound terminal history while preserving records created by the current serialization frontier.
+/// Retirement uses this to guarantee that newly explicit `Expired` truth is admitted at least
+/// once; older terminal audit is the first candidate for compaction instead.
+fn prune_terminal_history_preserving(
+    ledger: &mut Vec<OperationRecord>,
+    correlations: &HashMap<String, HqpCorrelationReservation>,
+    tombstones: &mut HashMap<String, HqpCommandFingerprint>,
+    tombstone_order: &mut VecDeque<String>,
+    protected: &HashSet<OperationId>,
+) {
     let terminal_count = ledger
         .iter()
         .filter(|operation| !operation_is_unresolved(operation))
@@ -2640,7 +2700,10 @@ fn prune_terminal_history(
         return;
     }
     ledger.retain(|operation| {
-        if terminal_to_drop > 0 && !operation_is_unresolved(operation) {
+        if terminal_to_drop > 0
+            && !operation_is_unresolved(operation)
+            && !protected.contains(&operation.id)
+        {
             terminal_to_drop -= 1;
             if let Some(reservation) = correlations.get(&operation.correlation_id) {
                 retain_correlation_tombstone(
@@ -2655,6 +2718,10 @@ fn prune_terminal_history(
             true
         }
     });
+    debug_assert_eq!(
+        terminal_to_drop, 0,
+        "the bounded unresolved cap must leave enough unprotected terminal history to compact"
+    );
 }
 
 fn retain_correlation_tombstone(
@@ -2720,6 +2787,8 @@ impl HqpAdaptivePublisher {
                 retired_instance_order: VecDeque::new(),
                 #[cfg(test)]
                 refused_publications: 0,
+                #[cfg(any(test, debug_assertions))]
+                refused_retirements: 0,
                 stop_requested: false,
             }
             .run(receiver),
@@ -2791,6 +2860,15 @@ impl HqpAdaptivePublisher {
         self.request(|reply| HqpCoordinatorCommand::RefuseNextPublication { reply })
             .await
             .expect("test coordinator accepts publication fault");
+    }
+
+    /// Debug-only conformance seam for proving committed retirement retry semantics.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn debug_refuse_next_retirement(&self) -> anyhow::Result<()> {
+        self.request(|reply| HqpCoordinatorCommand::RefuseNextRetirement { reply })
+            .await
+            .map_err(|error| anyhow!("HQPlayer retirement fault injection failed: {error:?}"))
     }
 
     pub(crate) async fn complete(
@@ -4173,10 +4251,13 @@ mod tests {
         for _ in 0..9 {
             publisher.refuse_next_publication().await;
         }
-        assert!(publisher.instance_removed("main", 7).await.is_err());
+        assert!(
+            publisher.instance_removed("main", 7).await.is_ok(),
+            "accepted retirement owns publication retry instead of inviting manager rollback"
+        );
         let still_visible = view
             .snapshot(&key)
-            .expect("failed expiration publication cannot retire the producer");
+            .expect("committed expiration remains visible until its publication succeeds");
         assert_eq!(
             still_visible.document.operations[0].outcome,
             CommandOutcome::Indeterminate
@@ -5035,6 +5116,97 @@ mod tests {
             .expect("retirement expiration transition");
         assert_eq!(expiration.from, CommandOutcome::Indeterminate);
         assert_eq!(expiration.to, CommandOutcome::Expired);
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn retirement_pruning_preserves_the_expiration_frontier_over_newer_terminal_history() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let initial = view.snapshot(&key).expect("initial snapshot");
+        let ambiguous_request = crate::producers::hqplayer_command::HqpImmediateCommandRequest {
+            key: key.clone(),
+            expected: initial.document.position(),
+            control: ControlId::new(CONTROL_PIPELINE_MODE),
+            requested: ControlValue::choice(choice_id(CONTROL_PIPELINE_MODE, "PCM")),
+            lane: ApplyLane::Immediate,
+            correlation_id: "old-ambiguous-before-full-terminal-history".to_string(),
+        };
+        let ambiguous = publisher
+            .reserve(
+                crate::producers::hqplayer_command::preflight(&initial, &ambiguous_request)
+                    .expect("ambiguous request preflight"),
+            )
+            .await
+            .expect("ambiguous request reserves");
+        publisher
+            .complete(
+                ambiguous.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Indeterminate,
+                    WriteAttempt::Attempted,
+                    Timestamp::new("2026-07-31T00:03:00Z"),
+                    Some(RecoveryState::AwaitingReadback),
+                    None,
+                ),
+            )
+            .await
+            .expect("ambiguous receipt admits");
+
+        for index in 0..MAX_TERMINAL_OPERATIONS {
+            let reservation = publisher
+                .reserve(validated_mode_command(
+                    &view.snapshot(&key).expect("terminal iteration snapshot"),
+                    &format!("newer-terminal-{index}"),
+                    "PCM",
+                ))
+                .await
+                .expect("newer terminal request reserves");
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Applied,
+                        WriteAttempt::Confirmed,
+                        Timestamp::new(format!("2026-07-31T00:04:{index:02}Z")),
+                        Some(RecoveryState::NotRequired),
+                        None,
+                    ),
+                )
+                .await
+                .expect("newer terminal request completes");
+        }
+
+        publisher
+            .instance_removed("main", 7)
+            .await
+            .expect("retirement commits");
+        assert!(view.snapshot(&key).is_none(), "producer retired");
+        let retained = publisher
+            .lookup_correlation(&ambiguous_request)
+            .await
+            .expect("retired correlation lookup")
+            .expect("freshly expired frontier survives retirement pruning");
+        assert_eq!(retained.operation().outcome, CommandOutcome::Expired);
+        assert_eq!(retained.operation().write_attempt, WriteAttempt::Attempted);
+        assert_eq!(
+            retained.operation().recovery,
+            Some(RecoveryState::ReplanRequired)
+        );
+        let reason = retained
+            .operation()
+            .reason
+            .as_ref()
+            .expect("expired reason");
+        assert_eq!(reason.code, ReasonCode::Expired);
+        assert_eq!(reason.scope, ReasonScope::Producer);
 
         publisher.manager_stopped().await.expect("manager stops");
         shutdown.cancel();

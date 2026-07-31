@@ -49,8 +49,13 @@ retirement transitions every non-Pending outcome that still awaits convergence t
 `ReasonCode::Expired` and `ReplanRequired`, and admits that terminal document before hiding the
 producer. Publication failure retains the live coordinator and immutable deferred candidate for
 retry, so retirement cannot overtake the audit frontier. The bounded compact retired coordinator
-then preserves exact correlation truth for late duplicate callbacks; global identity eviction can
-discard only history already made terminal at retirement.
+then preserves exact correlation truth for late duplicate callbacks. Retirement-specific pruning
+protects every operation made `Expired` by this frontier and compacts pre-existing terminal history
+first; global identity eviction can therefore discard only history already made terminal and
+admitted at retirement. Once retirement intent is recorded, coordinator retries are part of the
+committed removal transaction: the observation sink reports success so the instance manager cannot
+restore a worker that the coordinator is still committed to retire. A refusal before retirement
+intent is accepted remains an error and permits manager rollback.
 
 `CommandOutcome::Pending` is an explicit non-terminal state. It is not evidence of producer state, sets `awaits_convergence`, and may transition to Applied, Ignored, Rejected, Superseded, Disconnected, TimedOut, Indeterminate, or a future recognized terminal outcome. No terminal outcome can regress to Pending.
 
