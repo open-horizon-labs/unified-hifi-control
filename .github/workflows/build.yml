@@ -507,7 +507,7 @@ jobs:
           find target/dx -name "*.wasm" -o -name "*.js" | head -5
 
       - name: Upload WASM assets
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: wasm-assets
           # Only upload release web assets, not entire target/dx/ (avoids 30MB+ bloat)
@@ -550,7 +550,7 @@ jobs:
         run: cargo install cargo-zigbuild --locked
 
       - name: Download WASM assets
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: wasm-assets
           path: target/dx/unified-hifi-control/release/web/
@@ -581,7 +581,7 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/unified-hifi-control dist/bin/unified-hifi-linux-x64
 
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binary-x86_64-unknown-linux-musl
           path: dist/bin/
@@ -594,7 +594,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binary-x86_64-unknown-linux-musl
           path: dist/
@@ -775,7 +775,7 @@ jobs:
         run: cargo install cargo-zigbuild --locked
 
       - name: Download WASM assets
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: wasm-assets
           path: target/dx/unified-hifi-control/release/web/
@@ -812,7 +812,7 @@ jobs:
           cp target/${{ matrix.target }}/release/unified-hifi-control dist/bin/${{ matrix.output }}
 
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.target }}
           path: dist/bin/
@@ -840,7 +840,7 @@ jobs:
           shared-key: macos-x64
 
       - name: Download WASM assets
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: wasm-assets
           path: target/dx/unified-hifi-control/release/web/
@@ -868,7 +868,7 @@ jobs:
           cargo build --release --target x86_64-apple-darwin
 
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binary-macos-x64
           path: target/x86_64-apple-darwin/release/unified-hifi-control
@@ -896,7 +896,7 @@ jobs:
           shared-key: macos-arm64
 
       - name: Download WASM assets
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: wasm-assets
           path: target/dx/unified-hifi-control/release/web/
@@ -924,7 +924,7 @@ jobs:
           cargo build --release --target aarch64-apple-darwin
 
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binary-macos-arm64
           path: target/aarch64-apple-darwin/release/unified-hifi-control
@@ -941,13 +941,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Download x86_64 binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binary-macos-x64
           path: x64/
 
       - name: Download arm64 binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binary-macos-arm64
           path: arm64/
@@ -962,7 +962,7 @@ jobs:
           file dist/bin/unified-hifi-macos-universal
 
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binary-macos-universal
           path: dist/bin/
@@ -988,7 +988,7 @@ jobs:
           shared-key: windows
 
       - name: Download WASM assets
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: wasm-assets
           path: target/dx/unified-hifi-control/release/web/
@@ -1027,7 +1027,7 @@ jobs:
           cp target/release/unified-hifi-control.exe dist/bin/unified-hifi-win64.exe
 
       - name: Upload binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: binary-windows
           path: dist/bin/
@@ -1049,13 +1049,13 @@ jobs:
 
       # Download all available binaries
       - name: Download Linux x64 binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binary-x86_64-unknown-linux-musl
           path: binaries/
 
       - name: Download Linux ARM64 binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         if: needs.build-linux-arm.result == 'success'
         continue-on-error: true
         with:
@@ -1063,7 +1063,7 @@ jobs:
           path: binaries/
 
       - name: Download Linux ARMv7 binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         if: needs.build-linux-arm.result == 'success'
         continue-on-error: true
         with:
@@ -1071,7 +1071,7 @@ jobs:
           path: binaries/
 
       - name: Download macOS binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         if: needs.build-macos-universal.result == 'success'
         continue-on-error: true
         with:
@@ -1079,7 +1079,7 @@ jobs:
           path: binaries/
 
       - name: Download Windows binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         if: needs.build-windows.result == 'success'
         continue-on-error: true
         with:
@@ -1152,7 +1152,7 @@ jobs:
           rm -rf repack
 
       - name: Upload LMS plugin
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: lms-plugin
           path: dist/lms-unified-hifi-control-*.zip
@@ -1195,7 +1195,7 @@ jobs:
           fi
 
       - name: Download Linux binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binary-${{ matrix.target }}
           path: build/synology/package/
@@ -1230,7 +1230,7 @@ jobs:
             package.tgz scripts conf
 
       - name: Upload Synology package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: synology-${{ matrix.cpu_arch }}
           path: dist/installers/*.spk
@@ -1246,7 +1246,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download Linux binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binary-x86_64-unknown-linux-musl
           path: dist/bin/
@@ -1279,7 +1279,7 @@ jobs:
           mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ needs.plan.outputs.version }}_x86_64.qpkg
 
       - name: Upload QNAP package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: qnap-x86_64
           path: dist/installers/*.qpkg
@@ -1298,7 +1298,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download Linux binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binary-aarch64-unknown-linux-musl
           path: dist/bin/
@@ -1331,7 +1331,7 @@ jobs:
           mv qnap-build/*.qpkg dist/installers/unified-hifi-control_${{ needs.plan.outputs.version }}_arm_64.qpkg
 
       - name: Upload QNAP package
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: qnap-arm_64
           path: dist/installers/*.qpkg
@@ -1350,7 +1350,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download Linux binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binary-x86_64-unknown-linux-musl
           path: binaries/
@@ -1365,14 +1365,14 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: muness/unified-hifi-control
           tags: |
@@ -1420,7 +1420,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download Linux binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binary-${{ matrix.target }}
           path: dist/
@@ -1434,7 +1434,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1457,7 +1457,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: docker-digest-${{ matrix.target }}
           path: /tmp/digests/*
@@ -1470,7 +1470,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: docker-digest-*
           path: /tmp/digests
@@ -1480,14 +1480,14 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: |
             muness/unified-hifi-control
@@ -1526,7 +1526,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download Linux binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: binary-*-linux-*
           path: dist/bin/
@@ -1596,7 +1596,7 @@ jobs:
             build/linux/unified-hifi-control.service=/etc/systemd/system/unified-hifi-control.service
 
       - name: Upload Linux packages
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: linux-packages
           path: |
@@ -1618,7 +1618,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: artifacts/
 
@@ -1817,7 +1817,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: artifacts/
         continue-on-error: true
