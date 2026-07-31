@@ -87,7 +87,7 @@ docker run --rm \
 
         run_as_package "/var/packages/unified-hifi-control/scripts/preuninst"
 
-        # A lookalike @appdata path outside DSM's selected package volume must
+        # A lookalike @appdata path outside the DSM-selected package volume must
         # never be removed by the root-running uninstall hook.
         mkdir -p /tmp/@appdata/unified-hifi-control
         printf "preserve unexpected path\n" > /tmp/@appdata/unified-hifi-control/sentinel
