@@ -422,7 +422,18 @@ impl RoonState {
     ///   connection can carry a request id that an older, not-yet-timed-out
     ///   entry still occupies. On a mismatch the waiter is left alone and falls
     ///   back to `BROWSE_TIMEOUT` - the pre-#405 behavior - because resolving
-    ///   the wrong caller is worse than resolving them late.
+    ///   the wrong caller is worse than resolving them late. Do not remove this
+    ///   check as redundant: `req_id` uniqueness is per-connection only, and
+    ///   nothing near this code says so.
+    ///
+    /// The pair is not a unique key, and this narrows the reconnect window
+    /// rather than closing it. Session keys are not unique either - a caller
+    /// that reuses one across a reconnect (`/roon/browse` accepts a
+    /// caller-supplied `session_key`) can produce a stale entry and a fresh
+    /// request that agree on both. Both callers get an error either way, and
+    /// neither is ever told a wrong *success*; today both simply time out. If a
+    /// long-lived browse tree is ever built on one session key (#399), stamp the
+    /// pending entries with a connection generation instead.
     ///
     /// Resolution is exactly-once: every path removes the entry before sending,
     /// so a repeated rejection finds nothing and a waiter can never be resolved
@@ -480,6 +491,12 @@ impl RoonState {
     /// Same rule as [`RoonState::route_browse_rejection`], with the image key
     /// standing in for the session key. `get_image` reads `None` as "Image not
     /// found", so the caller gets an answer instead of a 10s timeout.
+    ///
+    /// Accepted lossiness: `pending_images` senders carry `Option<ImageData>`,
+    /// so `ImageNotFound` and `ImageUnexpectedError` both arrive at the caller
+    /// as "Image not found". The distinction survives only in the log line the
+    /// event loop writes. Widening `ImageRequest` to a `Result` would carry it
+    /// through, and is not worth the churn for cover art.
     fn route_image_rejection(&mut self, req_id: usize, image_key: &str) -> ErrorRouting {
         if let Some((pending_key, _)) = self.pending_images.get(&req_id) {
             if pending_key != image_key {
@@ -2114,6 +2131,13 @@ async fn run_roon_loop(
                             }
                         }
                     }
+                    // Note the asymmetry with the Parsed::Error arm below: this
+                    // one has to scan by session key because
+                    // `Parsed::BrowseResult` carries no req_id, so it cannot say
+                    // *which* request in a session answered. The error arm is
+                    // given the req_id and correlates exactly. Do not assume the
+                    // two correlate the same way; closing this gap needs a
+                    // change to the pinned fork.
                     Parsed::BrowseResult(result, session_key) => {
                         tracing::debug!(
                             "Roon BrowseResult action={:?}, session_key={:?}",
@@ -2164,6 +2188,11 @@ async fn run_roon_loop(
                     // a result. Route it to the request that is waiting on it -
                     // dropping it here is what made a stale item key look like
                     // an unreachable Core, ten seconds late.
+                    //
+                    // Matched exhaustively on purpose: no wildcard, so a fork
+                    // bump that adds a variant fails to compile here instead of
+                    // silently resuming the swallow this arm exists to end. If
+                    // you are here because of that error, route the new variant.
                     Parsed::Error(err) => {
                         let routing = {
                             let mut s = state_for_events.write().await;
@@ -2483,9 +2512,10 @@ mod tests {
 
     #[test]
     fn load_rejection_resolves_the_load_not_a_browse_sharing_its_session() {
-        // A browse and a load in the same browse session, both pending. A
-        // session-key scan would resolve whichever the map yielded first; the
-        // req_id in the rejection says exactly which one the Core refused.
+        // The positive invariant: the refused request is identified by req_id,
+        // so a sibling sharing its session key in the *other* map is untouched.
+        // (Correlating by session key instead could not even tell a browse from
+        // a load here - it would have to pick a map to scan first.)
         let mut state = RoonState::default();
         let mut browse = pending_browse(&mut state, 20, "play_item_1");
         let mut load = pending_load(&mut state, 21, "play_item_1");
