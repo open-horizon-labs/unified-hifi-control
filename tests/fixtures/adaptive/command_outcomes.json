@@ -76,6 +76,19 @@
   },
   "operations": [
     {
+      "id": "op-pending-9000",
+      "correlation_id": "corr-9000",
+      "request": {
+        "control": "hqplayer.pipeline.mode",
+        "requested": { "type": "choice", "value": "hqplayer.pipeline.mode.engine.50434d" },
+        "lane": "immediate",
+        "base": { "epoch": 7, "control_plane": 12, "state": 4211 }
+      },
+      "write_attempt": "not_attempted",
+      "outcome": "pending",
+      "recovery": "awaiting_readback"
+    },
+    {
       "id": "op-provisional-9001",
       "correlation_id": "corr-9001",
       "change_set": "cs-web-3f9a",

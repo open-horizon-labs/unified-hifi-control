@@ -763,6 +763,104 @@ impl SettingOutcome {
     }
 }
 
+#[cfg(test)]
+mod native_setting_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_keeps_attempt_acknowledgement_and_readback_as_independent_evidence() {
+        let rejected = HqpRejected {
+            element: "SetRate".to_string(),
+            reason: Some("unsupported".to_string()),
+        };
+
+        let no_attempt = NativeSettingReceipt::NotAttempted {
+            reason: "already selected".to_string(),
+            readback: NativeSettingReadback::Noop,
+        };
+        assert!(matches!(
+            no_attempt,
+            NativeSettingReceipt::NotAttempted { .. }
+        ));
+        assert!(matches!(
+            NativeSettingReceipt::DaemonRejected(rejected),
+            NativeSettingReceipt::DaemonRejected(HqpRejected { .. })
+        ));
+        assert!(matches!(
+            NativeSettingReceipt::DaemonAcknowledged {
+                readback: NativeSettingReadback::Verified
+            },
+            NativeSettingReceipt::DaemonAcknowledged { .. }
+        ));
+        let possible_attempt = NativeSettingReceipt::PossibleAttempt {
+            reason: "reply lost".to_string(),
+            readback: NativeSettingReadback::Unavailable {
+                reason: "State unavailable".to_string(),
+            },
+        };
+        assert!(matches!(
+            possible_attempt,
+            NativeSettingReceipt::PossibleAttempt { .. }
+        ));
+        let divergent = NativeSettingReadback::Divergent {
+            requested: "PCM".to_string(),
+            observed: "SDM (DSD)".to_string(),
+        };
+        assert!(matches!(divergent, NativeSettingReadback::Divergent { .. }));
+    }
+
+    #[test]
+    fn receipt_collapses_only_at_the_legacy_setting_outcome_boundary() {
+        assert_eq!(
+            NativeSettingReceipt::NotAttempted {
+                reason: "already selected".to_string(),
+                readback: NativeSettingReadback::Noop,
+            }
+            .into_setting_outcome("mode")
+            .expect("no-op collapse"),
+            SettingOutcome::AlreadySet
+        );
+
+        assert_eq!(
+            NativeSettingReceipt::DaemonAcknowledged {
+                readback: NativeSettingReadback::Divergent {
+                    requested: "NS5".to_string(),
+                    observed: "NS9".to_string(),
+                },
+            }
+            .into_setting_outcome("shaper")
+            .expect("acknowledged divergence collapse"),
+            SettingOutcome::Ignored {
+                what: "shaper".to_string(),
+                requested: "NS5".to_string(),
+                observed: "NS9".to_string(),
+            }
+        );
+
+        assert!(matches!(
+            NativeSettingReceipt::PossibleAttempt {
+                reason: "reply lost".to_string(),
+                readback: NativeSettingReadback::Unavailable {
+                    reason: "State unavailable".to_string(),
+                },
+            }
+            .into_setting_outcome("rate"),
+            Ok(SettingOutcome::Ambiguous { .. })
+        ));
+
+        let rejection = NativeSettingReceipt::DaemonRejected(HqpRejected {
+            element: "SetFilter".to_string(),
+            reason: Some("unsupported".to_string()),
+        })
+        .into_setting_outcome("filter")
+        .expect_err("explicit daemon rejection must remain an error");
+        assert!(
+            rejection.downcast_ref::<HqpRejected>().is_some(),
+            "the collapse must retain the typed rejection rather than parse its display text"
+        );
+    }
+}
+
 /// The daemon answered `result="Error"`: an **explicit rejection**, carrying its own reason.
 ///
 /// A distinct type rather than a message, because the difference is load-bearing. A rejection is
@@ -791,6 +889,132 @@ impl std::fmt::Display for HqpRejected {
 }
 
 impl std::error::Error for HqpRejected {}
+
+/// Authoritative readback evidence for one native setting operation.
+///
+/// This intentionally names protocol facts, not adaptive command outcomes.  The adapter knows
+/// whether its same-session `State` observation matched; the producer layer decides what that
+/// means for a correlated operation later.  Keeping it here means that layer never has to recover
+/// an attempt boundary by inspecting an `anyhow` display string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeSettingReadback {
+    /// `State` read the requested semantic value after the operation.
+    Verified,
+    /// The preflight/readback proof established that no write was needed.
+    Noop,
+    /// `State` was available but held a different value.
+    Divergent { requested: String, observed: String },
+    /// The native session could not provide an authoritative readback.
+    Unavailable { reason: String },
+}
+
+/// Native evidence retained by the five semantic pipeline setters.
+///
+/// This is deliberately contract-free: it does not mention adaptive controls, operation IDs, or
+/// user-facing status.  It distinguishes the facts the wire can establish: no send, a reply that
+/// explicitly rejected or acknowledged the request, and a request that may have left the process
+/// but never supplied usable acknowledgement.  The accompanying [`NativeSettingReadback`] remains
+/// separate so a caller never mistakes `result="OK"` for proof of application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeSettingReceipt {
+    /// No request was attempted.  A no-op can still have a verified readback.
+    NotAttempted {
+        reason: String,
+        readback: NativeSettingReadback,
+    },
+    /// The daemon explicitly refused this request.  This is not inferred from a string.
+    DaemonRejected(HqpRejected),
+    /// The daemon explicitly returned `result="OK"`; readback determines whether it applied.
+    DaemonAcknowledged { readback: NativeSettingReadback },
+    /// A request may have been written, but acknowledgement was unavailable or non-explicit.
+    PossibleAttempt {
+        reason: String,
+        readback: NativeSettingReadback,
+    },
+}
+
+/// Semantic setting commands whose native evidence is available to the producer layer.
+///
+/// Values remain semantic names/Hz values; native list positions never cross this adapter boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Wired by the producer command service in the next #329 slice.
+pub(crate) enum HqpNativeSetting<'a> {
+    Mode(&'a str),
+    Filter1x(&'a str),
+    FilterNx(&'a str),
+    Shaper(&'a str),
+    Rate(u32),
+}
+
+impl NativeSettingReceipt {
+    /// Preserve the pre-existing adapter surface while the immediate-command service is introduced.
+    ///
+    /// Public setters still return `Result<SettingOutcome>`; this is the one intentional collapse
+    /// point.  In particular, an explicit daemon rejection stays the existing typed `Err`, while a
+    /// non-acknowledged delivery stays ambiguous even if a later implementation supplies a
+    /// non-matching readback.
+    fn into_setting_outcome(self, what: &str) -> Result<SettingOutcome> {
+        match self {
+            Self::NotAttempted {
+                reason: _,
+                readback: NativeSettingReadback::Noop,
+            } => Ok(SettingOutcome::AlreadySet),
+            Self::NotAttempted { reason, readback } => Ok(SettingOutcome::Ambiguous {
+                what: what.to_string(),
+                reason: format!(
+                    "the write was not attempted ({reason}); native readback was {readback:?}"
+                ),
+            }),
+            Self::DaemonRejected(rejected) => Err(anyhow!(rejected)),
+            Self::DaemonAcknowledged {
+                readback: NativeSettingReadback::Verified,
+            } => Ok(SettingOutcome::Applied),
+            Self::DaemonAcknowledged {
+                readback: NativeSettingReadback::Noop,
+            } => Ok(SettingOutcome::AlreadySet),
+            Self::DaemonAcknowledged {
+                readback:
+                    NativeSettingReadback::Divergent {
+                        requested,
+                        observed,
+                    },
+            } => Ok(SettingOutcome::Ignored {
+                what: what.to_string(),
+                requested,
+                observed,
+            }),
+            Self::DaemonAcknowledged {
+                readback: NativeSettingReadback::Unavailable { reason },
+            } => Ok(SettingOutcome::Ambiguous {
+                what: what.to_string(),
+                reason,
+            }),
+            Self::PossibleAttempt {
+                readback: NativeSettingReadback::Verified,
+                ..
+            } => Ok(SettingOutcome::Applied),
+            Self::PossibleAttempt { reason, readback } => Ok(SettingOutcome::Ambiguous {
+                what: what.to_string(),
+                reason: format!(
+                    "the write may or may not have been applied: {reason}; native readback was \
+                     {readback:?}, so delivery cannot be established"
+                ),
+            }),
+        }
+    }
+}
+
+/// The evidence available immediately after one setter request crosses the native transport.
+///
+/// Kept private because only the adapter can turn a framing/transport event into these facts; the
+/// receipt above is the seam intentionally available to the next internal execution layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NativeSettingDelivery {
+    NotAttempted { reason: String },
+    DaemonRejected(HqpRejected),
+    DaemonAcknowledged,
+    PossibleAttempt { reason: String },
+}
 
 /// A semantic operation was about to continue on a different native transport.
 ///
@@ -3161,6 +3385,67 @@ impl HqpAdapter {
         }
     }
 
+    /// Send one semantic-setting request without erasing whether bytes entered the write path.
+    ///
+    /// `send_command_on_transport` predates the receipt seam and must retain its `Result<String>`
+    /// contract for non-setting callers.  This sibling keeps the exact same session fencing and
+    /// serialisation, but returns typed delivery evidence instead of adding prose context to an
+    /// `anyhow::Error` and making a later caller parse it back out.
+    async fn send_setting_on_transport(
+        &self,
+        xml: &str,
+        expected_generation: u64,
+    ) -> Result<NativeSettingDelivery> {
+        let _conversation_guard = self.conversation_lock.lock().await;
+        self.reconcile_cancelled_transport().await;
+        let actual_generation = self.transport_generation().await;
+        let has_connection = self.connection.lock().await.is_some();
+        if !has_connection || actual_generation != expected_generation {
+            return Err(HqpSessionChanged {
+                expected: expected_generation,
+                actual: actual_generation,
+            }
+            .into());
+        }
+
+        let mut request_attempted = false;
+        match self
+            .send_command_inner_tracking(xml, &mut request_attempted)
+            .await
+        {
+            Ok(response) => match Self::parse_attr(&response, "result").as_deref() {
+                Some("Error") => Ok(NativeSettingDelivery::DaemonRejected(HqpRejected {
+                    element: framing::root_element(&response).unwrap_or_else(|| "?".to_string()),
+                    reason: framing::root_text(&response),
+                })),
+                Some("OK") => Ok(NativeSettingDelivery::DaemonAcknowledged),
+                // Existing setters accepted a missing `result` and relied on State verification.
+                // Keep that observable behaviour, but do not call it an acknowledgement the daemon
+                // did not actually make.
+                _ => Ok(NativeSettingDelivery::PossibleAttempt {
+                    reason: "the daemon replied without an explicit result=\"OK\" acknowledgement"
+                        .to_string(),
+                }),
+            },
+            Err(error) => {
+                self.mark_disconnected().await;
+                if request_attempted {
+                    Ok(NativeSettingDelivery::PossibleAttempt {
+                        reason: format!(
+                            "the request entered the native write path but drew no usable reply ({error})"
+                        ),
+                    })
+                } else {
+                    Ok(NativeSettingDelivery::NotAttempted {
+                        reason: format!(
+                            "the native transport failed before the request entered its write path ({error})"
+                        ),
+                    })
+                }
+            }
+        }
+    }
+
     /// Retry one command while the caller owns the instance conversation lease.
     async fn send_command_serialized(&self, xml: &str) -> Result<String> {
         let timeouts = self.timeouts().await;
@@ -4550,7 +4835,7 @@ impl HqpAdapter {
         what: &str,
         expected: T,
         observe: F,
-    ) -> Result<SettingOutcome>
+    ) -> Result<NativeSettingReadback>
     where
         T: PartialEq + std::fmt::Display,
         F: Fn(&HqpState) -> Option<T>,
@@ -4565,7 +4850,7 @@ impl HqpAdapter {
             let state = self.get_state_on_transport(expected_generation).await?;
             let seen = observe(&state);
             if seen.as_ref() == Some(&expected) {
-                return Ok(SettingOutcome::Applied);
+                return Ok(NativeSettingReadback::Verified);
             }
             if seen.is_some() {
                 last_seen = seen;
@@ -4573,22 +4858,82 @@ impl HqpAdapter {
         }
 
         match last_seen {
-            Some(observed) => Ok(SettingOutcome::Ignored {
-                what: what.to_string(),
+            Some(observed) => Ok(NativeSettingReadback::Divergent {
                 requested: expected.to_string(),
                 observed: observed.to_string(),
             }),
-            None => Ok(SettingOutcome::Ambiguous {
-                what: what.to_string(),
+            None => Ok(NativeSettingReadback::Unavailable {
                 reason: format!(
                     "the daemon does not report {what}, so whether it now holds {expected} cannot \
-                     be established from its State"
+                    be established from its State"
                 ),
             }),
         }
     }
 
     /// Write and verify on the exact transport whose enumeration supplied the wire position.
+    ///
+    /// This is the native receipt seam.  It is intentionally private to the adapter until the
+    /// producer executor is ready to accept semantic (never index-bearing) commands, but public
+    /// setter behaviour below is only a collapse of this value.
+    async fn write_setting_receipt_on_transport<T, F>(
+        &self,
+        expected_generation: u64,
+        xml: &str,
+        what: &str,
+        expected: T,
+        observe: F,
+    ) -> Result<NativeSettingReceipt>
+    where
+        T: PartialEq + std::fmt::Display,
+        F: Fn(&HqpState) -> Option<T>,
+    {
+        let receipt = match self
+            .send_setting_on_transport(xml, expected_generation)
+            .await?
+        {
+            NativeSettingDelivery::NotAttempted { reason } => NativeSettingReceipt::NotAttempted {
+                reason,
+                readback: NativeSettingReadback::Unavailable {
+                    reason:
+                        "no authoritative State readback was made because no request entered the \
+                             native write path"
+                            .to_string(),
+                },
+            },
+            NativeSettingDelivery::DaemonRejected(rejected) => {
+                NativeSettingReceipt::DaemonRejected(rejected)
+            }
+            NativeSettingDelivery::DaemonAcknowledged => {
+                let readback = self
+                    .verify_applied_on_transport(expected_generation, what, expected, observe)
+                    .await
+                    .unwrap_or_else(|error| NativeSettingReadback::Unavailable {
+                        reason: format!(
+                            "the write was acknowledged on native session generation \
+                             {expected_generation}, but same-session verification failed ({error})"
+                        ),
+                    });
+                NativeSettingReceipt::DaemonAcknowledged { readback }
+            }
+            NativeSettingDelivery::PossibleAttempt { reason } => {
+                let readback = self
+                    .verify_applied_on_transport(expected_generation, what, expected, observe)
+                    .await
+                    .unwrap_or_else(|error| NativeSettingReadback::Unavailable {
+                        reason: format!(
+                            "a write may have reached native session generation {expected_generation}, \
+                             but same-session verification failed ({error})"
+                        ),
+                    });
+                NativeSettingReceipt::PossibleAttempt { reason, readback }
+            }
+        };
+
+        Ok(receipt)
+    }
+
+    /// Preserve the long-standing public setter contract while callers gain a typed native seam.
     async fn write_setting_on_transport<T, F>(
         &self,
         expected_generation: u64,
@@ -4598,37 +4943,12 @@ impl HqpAdapter {
         observe: F,
     ) -> Result<SettingOutcome>
     where
-        T: PartialEq + std::fmt::Display + Clone,
+        T: PartialEq + std::fmt::Display,
         F: Fn(&HqpState) -> Option<T>,
     {
-        match self
-            .send_command_on_transport(xml, expected_generation)
-            .await
-        {
-            Ok(_) => match self
-                .verify_applied_on_transport(expected_generation, what, expected, observe)
-                .await
-            {
-                Ok(outcome) => Ok(outcome),
-                Err(error) => Ok(SettingOutcome::Ambiguous {
-                    what: what.to_string(),
-                    reason: format!(
-                        "the write was attempted on native session generation \
-                         {expected_generation}, but same-session verification failed ({error})"
-                    ),
-                }),
-            },
-            Err(error) if error.downcast_ref::<HqpRejected>().is_some() => Err(error),
-            Err(error) if error.downcast_ref::<HqpSessionChanged>().is_some() => Err(error),
-            Err(error) => Ok(SettingOutcome::Ambiguous {
-                what: what.to_string(),
-                reason: format!(
-                    "the write was attempted on native session generation {expected_generation} \
-                     but drew no usable reply ({error}); it may or may not have been applied, and \
-                     verification was not moved to a replacement session"
-                ),
-            }),
-        }
+        self.write_setting_receipt_on_transport(expected_generation, xml, what, expected, observe)
+            .await?
+            .into_setting_outcome(what)
     }
 
     /// The semantic family a mode name belongs to, matched by prefix and alias rather than position.
@@ -4732,7 +5052,14 @@ impl HqpAdapter {
                         "HQPlayer is already in mode {mode_index}; not writing it, because SetMode \
                          clears the rate pin even when the mode does not change"
                     );
-                    return Ok(SettingOutcome::AlreadySet);
+                    return NativeSettingReceipt::NotAttempted {
+                        reason:
+                            "State already held the requested mode; SetMode was not sent because \
+                                 it clears an exact-rate pin even when unchanged"
+                                .to_string(),
+                        readback: NativeSettingReadback::Noop,
+                    }
+                    .into_setting_outcome("mode");
                 }
 
                 let xml = Self::build_request("SetMode", &[("value", &mode_index.to_string())]);
@@ -4835,7 +5162,11 @@ impl HqpAdapter {
             |index, generation| async move {
                 let state = self.get_state_on_transport(generation).await?;
                 if state.filter1x == Some(index) && state.filter_nx == Some(index) {
-                    return Ok(SettingOutcome::AlreadySet);
+                    return NativeSettingReceipt::NotAttempted {
+                        reason: "State already held the requested filter pair".to_string(),
+                        readback: NativeSettingReadback::Noop,
+                    }
+                    .into_setting_outcome("filter");
                 }
 
                 // Both sides are the setting here, so both are verified. Rendered as one value
@@ -4901,7 +5232,11 @@ impl HqpAdapter {
                     FilterSide::Nx => current_nx,
                 };
                 if current == index {
-                    return Ok(SettingOutcome::AlreadySet);
+                    return NativeSettingReceipt::NotAttempted {
+                        reason: format!("State already held the requested {what} filter"),
+                        readback: NativeSettingReadback::Noop,
+                    }
+                    .into_setting_outcome(what);
                 }
 
                 let (send_nx, send_1x) = match side {
@@ -4978,7 +5313,11 @@ impl HqpAdapter {
             || self.fresh_shapers_with_generation(),
             |shaper_index, generation| async move {
                 if self.get_state_on_transport(generation).await?.shaper == shaper_index {
-                    return Ok(SettingOutcome::AlreadySet);
+                    return NativeSettingReceipt::NotAttempted {
+                        reason: "State already held the requested shaper".to_string(),
+                        readback: NativeSettingReadback::Noop,
+                    }
+                    .into_setting_outcome("shaper");
                 }
 
                 let xml =
@@ -5040,7 +5379,11 @@ impl HqpAdapter {
                     });
                 }
                 if state.rate == index {
-                    return Ok(SettingOutcome::AlreadySet);
+                    return NativeSettingReceipt::NotAttempted {
+                        reason: "State already held the requested rate pin".to_string(),
+                        readback: NativeSettingReadback::Noop,
+                    }
+                    .into_setting_outcome("rate");
                 }
 
                 let xml = Self::build_request("SetRate", &[("value", &index.to_string())]);
@@ -5051,6 +5394,99 @@ impl HqpAdapter {
             },
         )
         .await
+    }
+
+    /// Execute one semantic pipeline command and retain typed native evidence for its caller.
+    ///
+    /// This is the producer-facing seam for the five #329 controls.  It deliberately accepts no
+    /// native index and imports no producer/adaptive vocabulary.  The mature public setters remain
+    /// intact for existing routes; this method converts their already-typed outcome/error boundary
+    /// without classifying `anyhow` display text.  Where that legacy boundary has already collapsed
+    /// an explicit acknowledgement into `Applied`/`Ignored`, this method reports the conservative
+    /// `PossibleAttempt` evidence rather than inventing an acknowledgement.  The lower native write
+    /// seam retains explicit acknowledgement/rejection for the subsequent full receipt migration.
+    #[allow(dead_code)] // Internal producer seam; no public route owns it yet.
+    pub(crate) async fn execute_native_setting(
+        &self,
+        setting: HqpNativeSetting<'_>,
+    ) -> Result<NativeSettingReceipt> {
+        let (what, result) = match setting {
+            HqpNativeSetting::Mode(value) => ("mode", self.set_mode(value).await),
+            HqpNativeSetting::Filter1x(value) => ("filter1x", self.set_filter_1x(value).await),
+            HqpNativeSetting::FilterNx(value) => ("filterNx", self.set_filter_nx(value).await),
+            HqpNativeSetting::Shaper(value) => ("shaper", self.set_shaper(value).await),
+            HqpNativeSetting::Rate(value) => ("rate", self.set_rate(value).await),
+        };
+        Self::receipt_from_legacy_setting_result(what, result)
+    }
+
+    /// Convert the frozen `Result<SettingOutcome>` API without trying to recover facts from error
+    /// prose.  The conservative possible-attempt cases are intentional: `SettingOutcome::Applied`
+    /// proves readback but no longer carries whether the reply said `result="OK"`.
+    fn receipt_from_legacy_setting_result(
+        what: &str,
+        result: Result<SettingOutcome>,
+    ) -> Result<NativeSettingReceipt> {
+        match result {
+            Ok(SettingOutcome::AlreadySet) => Ok(NativeSettingReceipt::NotAttempted {
+                reason: "the semantic setter proved the requested value was already selected"
+                    .to_string(),
+                readback: NativeSettingReadback::Noop,
+            }),
+            Ok(SettingOutcome::Suppressed { reason, .. }) => {
+                Ok(NativeSettingReceipt::NotAttempted {
+                    reason,
+                    readback: NativeSettingReadback::Unavailable {
+                        reason: "the semantic setter suppressed the write before an authoritative \
+                                 post-write readback"
+                            .to_string(),
+                    },
+                })
+            }
+            Ok(SettingOutcome::Applied) => Ok(NativeSettingReceipt::PossibleAttempt {
+                reason:
+                    "the legacy semantic result proves matching same-session readback but does \
+                         not retain the daemon acknowledgement bit"
+                        .to_string(),
+                readback: NativeSettingReadback::Verified,
+            }),
+            Ok(SettingOutcome::Ignored {
+                requested,
+                observed,
+                ..
+            }) => Ok(NativeSettingReceipt::PossibleAttempt {
+                reason: "the legacy semantic result proves a divergent same-session readback but \
+                         does not retain the daemon acknowledgement bit"
+                    .to_string(),
+                readback: NativeSettingReadback::Divergent {
+                    requested,
+                    observed,
+                },
+            }),
+            Ok(SettingOutcome::Ambiguous { reason, .. }) => {
+                Ok(NativeSettingReceipt::PossibleAttempt {
+                    reason,
+                    readback: NativeSettingReadback::Unavailable {
+                        reason: format!(
+                            "the legacy {what} setter reported ambiguous delivery without an \
+                             authoritative receipt"
+                        ),
+                    },
+                })
+            }
+            Err(error) => match error.downcast::<HqpRejected>() {
+                Ok(rejected) => Ok(NativeSettingReceipt::DaemonRejected(rejected)),
+                Err(error) => Ok(NativeSettingReceipt::NotAttempted {
+                    reason: error.to_string(),
+                    readback: NativeSettingReadback::Unavailable {
+                        reason: format!(
+                            "the semantic {what} setter ended before it could return native \
+                             delivery evidence"
+                        ),
+                    },
+                }),
+            },
+        }
     }
 
     /// Turn a legacy numeric setting value into the semantic name it denotes **right now**.

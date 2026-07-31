@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::change_set::ChangeSetId;
 use super::control::{ApplyLane, ControlId, Reason};
 use super::document::{Extensions, RevisionRef};
-use super::value::Timestamp;
+use super::value::{ControlValue, Timestamp};
 use super::vocab::semantic_enum;
 
 /// A stable operation identifier.
@@ -57,6 +57,12 @@ semantic_enum! {
 semantic_enum! {
     /// What became of an operation.
     pub enum CommandOutcome {
+        /// The command was accepted for execution, but no authoritative producer
+        /// convergence has been observed yet.
+        ///
+        /// This is deliberately not evidence that the producer received or applied the
+        /// command. A consumer must await a later outcome or observed revision.
+        Pending => "pending",
         /// The requested effect is observed on the producer.
         Applied => "applied",
         /// The producer accepted the write and nothing changed, because the value was
@@ -111,14 +117,14 @@ impl CommandOutcome {
 
     /// Whether this outcome is evidence about the producer's observed state.
     ///
-    /// False for [`CommandOutcome::Indeterminate`], [`CommandOutcome::TimedOut`] and
-    /// [`CommandOutcome::Compensating`]: those describe what happened to the *operation*,
-    /// not what is true of the producer. A consumer that treats them as state evidence
-    /// will display a value the engine never adopted.
+    /// False for [`CommandOutcome::Pending`], [`CommandOutcome::Indeterminate`],
+    /// [`CommandOutcome::TimedOut`] and [`CommandOutcome::Compensating`]: those describe
+    /// what happened to the *operation*, not what is true of the producer. A consumer
+    /// that treats them as state evidence will display a value the engine never adopted.
     pub fn is_state_evidence(&self) -> bool {
         !matches!(
             self,
-            Self::Indeterminate | Self::TimedOut | Self::Compensating
+            Self::Pending | Self::Indeterminate | Self::TimedOut | Self::Compensating
         )
     }
 
@@ -126,7 +132,8 @@ impl CommandOutcome {
     pub fn awaits_convergence(&self) -> bool {
         matches!(
             self,
-            Self::Indeterminate
+            Self::Pending
+                | Self::Indeterminate
                 | Self::TimedOut
                 | Self::Compensating
                 | Self::PartiallyApplied
@@ -154,8 +161,25 @@ impl CommandOutcome {
             return false;
         }
         // Nothing may regress into an unresolved state.
-        !matches!(next, Self::Indeterminate | Self::TimedOut)
+        !matches!(next, Self::Pending | Self::Indeterminate | Self::TimedOut)
     }
+}
+
+/// The exact semantic request admitted for one operation.
+///
+/// Kept on the operation rather than inferred from later state: once a choice set or revision
+/// advances, the producer still owes consumers an auditable record of what was requested and the
+/// base against which it passed preflight.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperationRequest {
+    /// The control addressed by the request.
+    pub control: ControlId,
+    /// The semantic value requested; native indices never cross this boundary.
+    pub requested: ControlValue,
+    /// The lane selected by the admitted control descriptor.
+    pub lane: ApplyLane,
+    /// The exact producer revision against which the request was admitted.
+    pub base: RevisionRef,
 }
 
 /// A rejected attempt to record a transition.
@@ -233,6 +257,9 @@ pub struct OperationRecord {
     /// Correlation id shared with the request that started it, so every surface can
     /// follow the same operation without inventing its own tracking.
     pub correlation_id: String,
+    /// The admitted semantic request, when this record represents a direct control operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<OperationRequest>,
     /// The change set this operation executed, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_set: Option<ChangeSetId>,

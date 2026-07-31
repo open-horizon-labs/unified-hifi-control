@@ -58,8 +58,8 @@ pub use change_set::{
     RetireOutcome, StageOutcome, Staleness, Surface,
 };
 pub use command::{
-    CommandOutcome, OperationId, OperationRecord, OutcomeTransition, PlanStep, RecoveryState,
-    TransitionRejected, WriteAttempt,
+    CommandOutcome, OperationId, OperationRecord, OperationRequest, OutcomeTransition, PlanStep,
+    RecoveryState, TransitionRejected, WriteAttempt,
 };
 pub use constraint::{
     Constraint, ConstraintEffect, Evaluation, Expr, ExprLimit, Permission, ValueLookup, Visibility,

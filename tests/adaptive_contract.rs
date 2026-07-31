@@ -1369,6 +1369,75 @@ mod outcomes {
     }
 
     #[test]
+    fn pending_is_unresolved_and_resolves_without_becoming_state_evidence() {
+        let pending = CommandOutcome::Pending;
+
+        assert!(!pending.is_terminal());
+        assert!(
+            !pending.is_state_evidence(),
+            "pending reports only that the operation has not yet converged"
+        );
+        assert!(pending.awaits_convergence());
+        assert_eq!(
+            serde_json::to_value(&pending).expect("pending serializes"),
+            serde_json::json!("pending"),
+            "pending has its own wire value rather than collapsing into another outcome"
+        );
+        assert_eq!(
+            serde_json::from_value::<CommandOutcome>(serde_json::json!("pending"))
+                .expect("pending deserializes"),
+            pending
+        );
+
+        for resolution in [
+            CommandOutcome::Applied,
+            CommandOutcome::Rejected,
+            CommandOutcome::Divergent,
+            CommandOutcome::Unrecognized("later_terminal_outcome".to_string()),
+        ] {
+            assert!(
+                pending.may_transition_to(&resolution),
+                "pending may resolve to {resolution}"
+            );
+        }
+
+        for terminal in [
+            CommandOutcome::Applied,
+            CommandOutcome::Ignored,
+            CommandOutcome::Rejected,
+            CommandOutcome::Superseded,
+            CommandOutcome::Compensated,
+            CommandOutcome::Expired,
+        ] {
+            assert!(
+                !terminal.may_transition_to(&pending),
+                "a terminal {terminal} cannot regress to pending"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_records_the_exact_semantic_request_and_base_revision() {
+        let record = operation("op-pending-9000");
+        let request = record.request.expect("pending command request is explicit");
+
+        assert_eq!(request.control.as_str(), "hqplayer.pipeline.mode");
+        assert_eq!(
+            request.requested,
+            unified_hifi_control::adaptive::ControlValue::choice(
+                "hqplayer.pipeline.mode.engine.50434d"
+            )
+        );
+        assert_eq!(
+            request.lane,
+            unified_hifi_control::adaptive::ApplyLane::Immediate
+        );
+        assert_eq!(request.base.epoch.0, 7);
+        assert_eq!(request.base.control_plane.0, 12);
+        assert_eq!(request.base.state.0, 4211);
+    }
+
+    #[test]
     fn consumers_never_infer_state_from_whether_a_call_returned() {
         // The two facts are tracked separately, and only some combinations are
         // evidence of state.
