@@ -252,6 +252,22 @@ Deliberately **not** touched: `tests/fixtures/api_routes.txt`, `src/api/mod.rs`,
 9. **Mode-switch qualification during playback (issue's beta/dev criterion) is not addressed.**
    It is a #347/#375 setter concern, not a direct-zone projection concern, and nothing here
    changes it.
+10. **`is_muted` has a known false positive at the range floor, and it is inherent to the protocol.**
+    A user who deliberately turns the level down to `min_db` is reported as muted, because
+    `VolumeMute` *is* "set the level to `min_db`" and there is no mute flag to distinguish the two —
+    the two situations produce byte-identical observations. Reporting mute anyway is the better trade
+    (at the floor both readings agree no sound is coming out, and the alternative makes the mute
+    button's effect invisible), but it is a real mislabel for anyone who uses the bottom of the range.
+    Raised by the dissent pass; only a protocol-level mute flag could close it.
+11. **The root-`samplerate`-is-the-source-rate fallback rests on one agreeing sample.** The single
+    corpus `Status` document carries root `samplerate="44100"`, child `samplerate="44100"`,
+    `active_rate="352800"`. Agreement cannot distinguish *"the root is the source rate"* from *"the
+    root happens to equal it on this material"*, and no document shows them diverging. Kept, because
+    it is daemon-supplied data rather than an invention and dropping it loses a fact the daemon sent —
+    but if the root actually follows the output rate, this publishes an output rate as the track's,
+    which is a relocated instance of the defect this issue fixes. **Falsifiable cheaply:** play
+    upsampled material and compare root against child `samplerate`. Left to #332's live qualification;
+    the fallback must be deleted if the check goes the other way.
 
 ---
 

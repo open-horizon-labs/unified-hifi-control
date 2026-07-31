@@ -7413,6 +7413,14 @@ impl HqpAdapter {
                 // level is sitting at the floor, and that is a fact about the observation rather
                 // than a flag being invented. The tolerance is there because the floor arrives as a
                 // double through two independent reads.
+                //
+                // **Known false positive, inherent to the protocol rather than to this code.** A user
+                // who deliberately turns the level down to the floor is reported as muted, because
+                // "muted" and "turned all the way down" produce byte-identical observations — there
+                // is no mute flag to disambiguate them. The alternative is to never report mute,
+                // which makes the mute button's effect invisible and is the worse trade: at the floor
+                // both readings agree that no sound is coming out. Recorded in
+                // `.oh/hqplayer-direct-zone.md` rather than papered over.
                 is_muted: value <= vol_range.min_db + Self::VOLUME_READBACK_TOLERANCE_DB,
                 scale: VolumeScale::Decibel,
                 output_id: Some(zone_id.clone()),
@@ -7453,9 +7461,29 @@ impl HqpAdapter {
                     // the track's format fabricates source metadata the daemon never sent.
                     format: None,
                     sample_rate: status.source_samplerate.or({
-                        // The root `samplerate` attribute is the source rate in every corpus
-                        // document (the child agrees with it), so it is a legitimate fallback —
-                        // unlike `active_rate`, which is the output rate and is never substituted.
+                        // Fallback to the root `samplerate` attribute, and the strength of this is
+                        // worth stating exactly rather than generously.
+                        //
+                        // **What is evidenced:** the one corpus `Status` document carries root
+                        // `samplerate="44100"`, child `samplerate="44100"` and
+                        // `active_rate="352800"`. So the root tracks the *child* and not the output
+                        // rate in that sample.
+                        //
+                        // **What is not:** the root and the child *agree* there, which cannot
+                        // distinguish "the root is the source rate" from "the root happens to equal
+                        // the source rate on this material". One agreeing sample is not proof of
+                        // identity, and no corpus document shows them diverging.
+                        //
+                        // Kept anyway, because this is HQPlayer-supplied data rather than an
+                        // invention, and the alternative — publishing no rate when the child omits
+                        // one — loses a fact the daemon did send. `active_rate` is never substituted,
+                        // which is the substitution that would actually misattribute the domain.
+                        //
+                        // Falsifiable, and the check is cheap: play upsampled material and compare
+                        // root `samplerate` against child `samplerate`. If the root follows the
+                        // output, this fallback is publishing an output rate as the track's and must
+                        // be deleted. Recorded in `.oh/hqplayer-direct-zone.md` and left to #332's
+                        // live qualification.
                         (status.samplerate > 0).then_some(status.samplerate)
                     }),
                     // No fallback to `active_bits`. There is no source-depth substitute for an
