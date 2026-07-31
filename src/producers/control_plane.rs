@@ -6,28 +6,32 @@
 //!    state. There is no fallthrough arm. #328 records what a fallthrough costs: `hqplayer:Living
 //!    Room` reached the Roon adapter with its prefix stripped, where it either failed or matched an
 //!    unrelated Roon zone.
-//! 2. **Projection.** [`super::surface::project`] over the snapshot the aggregator serves, for the
-//!    profile the surface declared.
+//! 2. **Projection.** [`super::surface::project_with`] over the snapshot the aggregator serves, for
+//!    the profile the surface declared.
 //! 3. **Submission.** A surface-neutral semantic command, executed by the registered executor for
-//!    the routed producer's family — HQPlayer's being #329's bounded actor, reached through #375's
-//!    single control-to-operation registry. A family with no executor is refused, never defaulted.
+//!    the routed producer's family. A family with no executor is refused, never defaulted.
 //!
 //! ## Why the surface never sees the internals
 //!
-//! [`SemanticRefusal`] is a public, surface-neutral vocabulary. The HQPlayer preflight has
-//! twenty-odd typed refusals naming lanes, chains and rate spellings; a browser and an MCP client
-//! need to know *what to do next*, and the answer is one of ten things. The mapping is an
-//! exhaustive `match`, so a new internal refusal cannot silently become an existing surface verdict.
+//! [`SemanticRefusal`] is a public, surface-neutral vocabulary. HQPlayer's preflight has twenty-odd
+//! typed refusals naming lanes, chains and rate spellings; a browser and an MCP client need to know
+//! *what to do next*, and the answer is one of ten things. The mapping is an exhaustive `match` in
+//! the executor, so a new internal refusal cannot silently become an existing surface verdict.
+//!
+//! ## What this module does not know
+//!
+//! Any producer family. `hqplayer` appears nowhere here; the HQPlayer executor is registered by the
+//! composition root and lives beside the HQPlayer command service.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::adaptive::{ApplyLane, ControlId, ControlValue, RevisionRef};
+use crate::adaptive::{ApplyLane, ControlId, ControlValue, OperationRecord, RevisionRef};
 use crate::bus::events::PrefixedZoneId;
 
-use super::surface::{project, SurfaceProfile, SurfaceProjection};
+use super::surface::{project_with, SurfaceProfile, SurfaceProjection, VerifiedSeries};
 use super::{AdaptiveView, ProducerKey, ProducerSnapshot};
 
 /// Why a zone id did not resolve to a producer.
@@ -81,18 +85,18 @@ pub enum SemanticRefusal {
     /// The control has no verified semantic operation yet, so no truthful receipt is possible.
     NoVerifiedOperation,
     /// The coordinator would not reserve the operation: a conflicting correlation, a superseding
-    /// operation, or a closed producer.
+    /// operation, a busy producer, or one that is shutting down.
     NotReserved,
 }
 
 /// Why a command did not reach an executor, or was not admitted by one.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandRefusal {
-    /// The zone did not resolve.
+    /// The zone or producer did not resolve.
     Route(RouteRefusal),
     /// The routed producer's family has no registered semantic executor.
     ///
-    /// The alternative — trying the executor we happen to have — is the #328 defect with a
+    /// The alternative — trying the executor we happen to have — is the #328 fallthrough with a
     /// different prefix.
     NoExecutorForProducer {
         /// The family that has none.
@@ -118,6 +122,9 @@ pub struct SemanticCommand {
     /// The apply lane the descriptor declared.
     pub lane: ApplyLane,
     /// Idempotency correlation, shared by every surface following this operation.
+    ///
+    /// One physical gesture is one correlation, so a duplicated tap — the iPad Safari
+    /// compatibility-click case recorded on #331 — is one operation rather than two audible writes.
     pub correlation_id: String,
     /// Which surface submitted it.
     pub surface_id: String,
@@ -127,7 +134,7 @@ pub struct SemanticCommand {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandAcceptance {
     /// The operation the producer will report against.
-    pub operation: crate::adaptive::OperationRecord,
+    pub operation: OperationRecord,
     /// True when this correlation matched an operation already reserved: a retry, not a new write.
     pub duplicate: bool,
 }
@@ -147,6 +154,7 @@ pub trait SemanticCommandExecutor: Send + Sync {
 pub struct ControlPlaneService {
     view: AdaptiveView,
     executors: BTreeMap<String, Arc<dyn SemanticCommandExecutor>>,
+    verified: VerifiedSeries,
 }
 
 impl ControlPlaneService {
@@ -155,6 +163,7 @@ impl ControlPlaneService {
         Self {
             view,
             executors: BTreeMap::new(),
+            verified: VerifiedSeries::default(),
         }
     }
 
@@ -165,23 +174,49 @@ impl ControlPlaneService {
         self
     }
 
+    /// Declare which backend release series this build has verified.
+    pub fn with_verified_series(mut self, verified: VerifiedSeries) -> Self {
+        self.verified = verified;
+        self
+    }
+
     /// Every producer the aggregator currently holds.
     pub fn producers(&self) -> Vec<ProducerKey> {
-        // RED stub.
-        Vec::new()
+        self.view
+            .snapshots()
+            .into_iter()
+            .map(|snapshot| snapshot.key)
+            .collect()
     }
 
     /// Resolve a prefixed zone id to the producer bound to it.
+    ///
+    /// Reads admitted state only, and has no default arm. Both properties matter: an adapter cannot
+    /// be consulted, and an id that matches nothing produces a refusal rather than whichever
+    /// producer happened to be first.
     pub fn route(&self, zone_id: &str) -> Result<ProducerKey, RouteRefusal> {
-        // RED stub: the naive first-match a fallthrough would have written.
-        let _ = zone_id;
-        self.view
-            .snapshots()
-            .first()
-            .map(|snapshot| snapshot.key.clone())
-            .ok_or_else(|| RouteRefusal::UnknownProducer {
+        if PrefixedZoneId::parse(zone_id).is_none() {
+            return Err(RouteRefusal::UnknownZonePrefix {
                 zone_id: zone_id.to_string(),
-            })
+            });
+        }
+        let mut candidates: Vec<ProducerKey> = self
+            .view
+            .snapshots()
+            .into_iter()
+            .filter(|snapshot| snapshot.key.zone_id.as_deref() == Some(zone_id))
+            .map(|snapshot| snapshot.key)
+            .collect();
+        match candidates.len() {
+            0 => Err(RouteRefusal::UnknownProducer {
+                zone_id: zone_id.to_string(),
+            }),
+            1 => Ok(candidates.remove(0)),
+            _ => Err(RouteRefusal::AmbiguousProducer {
+                zone_id: zone_id.to_string(),
+                candidates,
+            }),
+        }
     }
 
     /// The aggregator's snapshot for one producer.
@@ -190,24 +225,37 @@ impl ControlPlaneService {
     }
 
     /// Project one producer for one surface.
-    pub fn project(&self, key: &ProducerKey, profile: &SurfaceProfile) -> Option<SurfaceProjection> {
+    pub fn project(
+        &self,
+        key: &ProducerKey,
+        profile: &SurfaceProfile,
+    ) -> Option<SurfaceProjection> {
         self.view
             .snapshot(key)
-            .map(|snapshot| project(&snapshot, profile))
+            .map(|snapshot| project_with(&snapshot, profile, &self.verified))
     }
 
-    /// Submit one semantic command through the executor that owns the routed producer's family.
+    /// Submit one semantic command through the executor that owns the addressed producer's family.
+    ///
+    /// The family is read from the *admitted document*, never from the caller's request, so a
+    /// surface cannot name a family to choose an executor.
     pub async fn submit(
         &self,
         command: SemanticCommand,
     ) -> Result<CommandAcceptance, CommandRefusal> {
-        // RED stub.
-        let _ = &command;
-        Err(CommandRefusal::ServiceClosed)
+        let Some(snapshot) = self.view.snapshot(&command.key) else {
+            return Err(CommandRefusal::Route(RouteRefusal::UnknownProducer {
+                zone_id: command
+                    .key
+                    .zone_id
+                    .clone()
+                    .unwrap_or_else(|| command.key.producer_id.clone()),
+            }));
+        };
+        let producer_type = snapshot.document.producer.producer_type.clone();
+        let Some(executor) = self.executors.get(&producer_type) else {
+            return Err(CommandRefusal::NoExecutorForProducer { producer_type });
+        };
+        executor.submit(command).await
     }
-}
-
-#[allow(dead_code)]
-fn stub_unused(zone_id: &str) -> Option<PrefixedZoneId> {
-    PrefixedZoneId::parse(zone_id)
 }

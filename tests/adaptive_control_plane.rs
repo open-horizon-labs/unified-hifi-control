@@ -17,20 +17,20 @@ use async_trait::async_trait;
 use unified_hifi_control::adaptive::{
     admit_document_str, ApplyEffect, ApplyLane, Authority, AvailabilityState, ChoiceSet,
     CommandOutcome, ControlId, ControlKind, ControlValue, DocumentRevisions, OperationId,
-    OperationRecord, OperationRequest, ProducerDocument, ProducerEpoch, Reason, ReasonCode,
-    RevisionRef, RiskClass, SourceClass, TargetRole, WriteAttempt, CONSUMER_SCHEMA_VERSION,
+    OperationRecord, OperationRequest, ProducerDocument, ProducerEpoch, ReasonCode, RevisionRef,
+    RiskClass, SourceClass, TargetRole, WriteAttempt, CONSUMER_SCHEMA_VERSION,
 };
 use unified_hifi_control::producers::control_plane::{
     CommandAcceptance, CommandRefusal, ControlPlaneService, RouteRefusal, SemanticCommand,
     SemanticCommandExecutor,
 };
 use unified_hifi_control::producers::surface::{
-    project, project_raw, timing_key, ChoiceProjection, Mutability, ProjectionNotice,
-    RenderedProjection, SurfaceProfile, SurfaceProjection, OMITTED_BUDGET_EXHAUSTED,
-    OMITTED_CONTAINER_DROPPED, SURFACE_PROJECTION_SCHEMA, TIMING_HELD_UNTIL_CHAIN_LOADED,
-    TIMING_LIVE_IMMEDIATE, TIMING_PERSISTENT_ONLY, TIMING_RESTART_REQUIRED, TIMING_UNKNOWN,
-    TIMING_VERIFIED_PENDING, WITHHELD_PER_CHOICE_REASON, WITHHELD_RISK_EXCEEDS_SURFACE,
-    WITHHELD_UNRENDERABLE_KIND,
+    admit_for_surface, project, project_with, timing_key, ChoiceProjection, Mutability,
+    ProjectionNotice, RenderedProjection, SurfaceProfile, SurfaceProjection, VerifiedSeries,
+    OMITTED_BUDGET_EXHAUSTED, OMITTED_CONTAINER_DROPPED, SURFACE_PROJECTION_SCHEMA,
+    TIMING_HELD_UNTIL_CHAIN_LOADED, TIMING_LIVE_IMMEDIATE, TIMING_PERSISTENT_ONLY,
+    TIMING_RESTART_REQUIRED, TIMING_UNKNOWN, TIMING_VERIFIED_PENDING, WITHHELD_PER_CHOICE_REASON,
+    WITHHELD_RISK_EXCEEDS_SURFACE, WITHHELD_UNRENDERABLE_KIND,
 };
 use unified_hifi_control::producers::{
     AdaptiveRuntime, ProducerKey, ProducerPresence, ProducerSnapshot,
@@ -85,6 +85,32 @@ fn rendered(document: ProducerDocument, profile: &SurfaceProfile) -> RenderedPro
             profile.surface_id, fallback.refusal
         ),
     }
+}
+
+fn rendered_with(
+    document: ProducerDocument,
+    profile: &SurfaceProfile,
+    verified: &VerifiedSeries,
+) -> RenderedProjection {
+    let snapshot = snapshot(document);
+    match project_with(&snapshot, profile, verified) {
+        SurfaceProjection::Rendered(rendered) => *rendered,
+        SurfaceProjection::Fallback(fallback) => {
+            panic!("expected a rendered projection, got {:?}", fallback.refusal)
+        }
+    }
+}
+
+/// The release series this build has verified, supplied the way the composition root supplies it.
+///
+/// The projector holds no engine knowledge; the HQPlayer entry is the HQPlayer producer's own.
+fn verified_series() -> VerifiedSeries {
+    VerifiedSeries::default().with(
+        "hqplayer",
+        unified_hifi_control::producers::hqplayer::HQP_VERIFIED_PRODUCT_SERIES
+            .iter()
+            .copied(),
+    )
 }
 
 fn web() -> SurfaceProfile {
@@ -196,7 +222,10 @@ fn the_observed_lane_never_carries_staged_or_held_intent() {
     let filter = view
         .control("hqplayer.pipeline.filter_1x")
         .expect("filter_1x is projected");
-    let observed = filter.observed.as_ref().expect("filter_1x has an observed lane");
+    let observed = filter
+        .observed
+        .as_ref()
+        .expect("filter_1x has an observed lane");
     assert_eq!(
         observed.grounded_value(),
         Some(&ControlValue::Choice("poly-sinc-gauss-long".to_string())),
@@ -263,7 +292,9 @@ fn availability_reasons_survive_projection_on_every_surface() {
 #[test]
 fn constraints_that_name_a_control_are_projected_onto_it() {
     let view = rendered(pipeline(), &web());
-    let rate = view.control("hqplayer.pipeline.rate.exact").expect("projected");
+    let rate = view
+        .control("hqplayer.pipeline.rate.exact")
+        .expect("projected");
     let ids: Vec<&str> = rate
         .constraints
         .iter()
@@ -353,7 +384,13 @@ fn a_surface_that_offers_less_never_offers_something_different() {
             }
 
             match (&control.mutability, &reference.mutability) {
-                (Mutability::Mutable { description, .. }, Mutability::Mutable { description: reference_description, .. }) => {
+                (
+                    Mutability::Mutable { description, .. },
+                    Mutability::Mutable {
+                        description: reference_description,
+                        ..
+                    },
+                ) => {
                     assert_eq!(
                         description, reference_description,
                         "{} on {}: the cost of writing is the producer's, not the surface's",
@@ -418,7 +455,9 @@ fn a_surface_limitation_is_never_reported_as_the_producers_verdict() {
 #[test]
 fn an_unrenderable_primitive_is_withheld_rather_than_flattened() {
     let view = rendered(pipeline(), &device(64));
-    let composite = view.control("hqplayer.matrix.channel_map").expect("projected");
+    let composite = view
+        .control("hqplayer.matrix.channel_map")
+        .expect("projected");
     assert_eq!(composite.kind, ControlKind::Composite);
     match &composite.mutability {
         Mutability::WithheldFromSurface { reason } => {
@@ -434,7 +473,9 @@ fn an_unrenderable_primitive_is_withheld_rather_than_flattened() {
 #[test]
 fn an_operation_riskier_than_the_surface_may_offer_is_withheld_with_that_reason() {
     let view = rendered(pipeline(), &mcp());
-    let dither = view.control("hqplayer.settings.legacy_dither").expect("projected");
+    let dither = view
+        .control("hqplayer.settings.legacy_dither")
+        .expect("projected");
     assert_eq!(
         dither.availability.state,
         AvailabilityState::Deprecated,
@@ -476,7 +517,9 @@ fn the_producers_own_block_outranks_a_surface_limitation() {
     // `chain.sdm.filter` is unavailable *and* would be withheld from a device. The user must be
     // told the chain is not loaded, not that their knob is too small.
     let view = rendered(pipeline(), &device(64));
-    let sdm = view.control("hqplayer.chain.sdm.filter").expect("projected");
+    let sdm = view
+        .control("hqplayer.chain.sdm.filter")
+        .expect("projected");
     match &sdm.mutability {
         Mutability::Blocked { reasons } => assert_eq!(reasons[0].code, ReasonCode::ChainNotLoaded),
         other => panic!("the producer's reason must win, got {other:?}"),
@@ -490,8 +533,8 @@ fn the_producers_own_block_outranks_a_surface_limitation() {
 #[test]
 fn an_unsupported_major_degrades_to_an_informative_fallback() {
     let raw = raw_fixture("unsupported_major");
-    match project_raw(&raw, &web()) {
-        SurfaceProjection::Fallback(fallback) => {
+    match admit_for_surface(&raw, &web()) {
+        Err(fallback) => {
             assert_eq!(fallback.surface_id, "web");
             assert_eq!(fallback.declared_schema.as_deref(), Some("2.0"));
             assert!(
@@ -508,19 +551,16 @@ fn an_unsupported_major_degrades_to_an_informative_fallback() {
                  the producer it cannot render"
             );
         }
-        SurfaceProjection::Rendered(_) => {
-            panic!("a v2 document must never be partially rendered by a v1 consumer")
-        }
+        Ok(_) => panic!("a v2 document must never be partially rendered by a v1 consumer"),
     }
 }
 
 #[test]
 fn a_newer_minor_renders_and_says_that_it_did_not_understand_everything() {
     let raw = raw_fixture("forward_compatible_additions");
-    let projection = project_raw(&raw, &web());
-    let view = projection
-        .rendered()
-        .expect("a newer minor of the same major must render");
+    let document =
+        admit_for_surface(&raw, &web()).expect("a newer minor of the same major is admissible");
+    let view = rendered(document, &web());
 
     assert!(
         view.notices.iter().any(|notice| matches!(
@@ -563,7 +603,7 @@ fn a_newer_minor_renders_and_says_that_it_did_not_understand_everything() {
 fn an_untested_product_version_notices_without_disabling_discovered_controls() {
     let mut document = pipeline();
     document.producer.product_version = Some("7.0.0-beta".to_string());
-    let view = rendered(document, &web());
+    let view = rendered_with(document, &web(), &verified_series());
 
     assert!(
         view.notices.iter().any(|notice| matches!(
@@ -584,7 +624,7 @@ fn an_untested_product_version_notices_without_disabling_discovered_controls() {
 
 #[test]
 fn a_verified_product_version_raises_no_untested_notice() {
-    let view = rendered(pipeline(), &web());
+    let view = rendered_with(pipeline(), &web(), &verified_series());
     assert!(
         !view
             .notices
@@ -668,7 +708,9 @@ fn a_settled_write_does_not_hold_its_dependents_in_reloading() {
         CommandOutcome::Applied,
     )];
     let view = rendered(document, &web());
-    let filter = view.control("hqplayer.pipeline.filter_1x").expect("projected");
+    let filter = view
+        .control("hqplayer.pipeline.filter_1x")
+        .expect("projected");
     assert!(
         matches!(filter.choices, ChoiceProjection::Enumerated { .. }),
         "once the outcome is state evidence the enumeration published beside it is current"
@@ -680,7 +722,11 @@ fn an_unreadable_enumeration_is_not_the_same_as_an_empty_one() {
     let mut unreadable = pipeline();
     control_mut(&mut unreadable, "hqplayer.pipeline.mode").choices = None;
     let view = rendered(unreadable, &web());
-    match &view.control("hqplayer.pipeline.mode").expect("projected").choices {
+    match &view
+        .control("hqplayer.pipeline.mode")
+        .expect("projected")
+        .choices
+    {
         ChoiceProjection::Unknown { reason } => {
             assert_eq!(reason.code, ReasonCode::Unobservable)
         }
@@ -695,7 +741,11 @@ fn an_unreadable_enumeration_is_not_the_same_as_an_empty_one() {
         choices: Vec::new(),
     });
     let view = rendered(empty, &web());
-    match &view.control("hqplayer.pipeline.mode").expect("projected").choices {
+    match &view
+        .control("hqplayer.pipeline.mode")
+        .expect("projected")
+        .choices
+    {
         ChoiceProjection::Enumerated { choices, .. } => assert!(
             choices.is_empty(),
             "a successful read of an empty collection is a fact, and a different fact"
@@ -712,7 +762,11 @@ fn an_unreadable_enumeration_is_not_the_same_as_an_empty_one() {
 fn busy_state_is_scoped_per_operation_and_per_control() {
     let mut document = pipeline();
     document.operations = vec![
-        operation("op-mode-1", "hqplayer.pipeline.mode", CommandOutcome::Pending),
+        operation(
+            "op-mode-1",
+            "hqplayer.pipeline.mode",
+            CommandOutcome::Pending,
+        ),
         operation("op-vol-2", "hqplayer.volume.level", CommandOutcome::Applied),
     ];
     let view = rendered(document, &web());
@@ -788,12 +842,7 @@ fn every_control_in_one_projection_comes_from_one_document() {
     let expected: BTreeMap<String, Option<ControlValue>> = document
         .controls
         .iter()
-        .map(|control| {
-            (
-                control.id.to_string(),
-                control.observed().cloned(),
-            )
-        })
+        .map(|control| (control.id.to_string(), control.observed().cloned()))
         .collect();
     let view = rendered(document, &web());
 
@@ -896,7 +945,9 @@ fn narrowing_an_option_list_never_hides_the_current_selection() {
     });
 
     let view = rendered(document, &device(64));
-    let filter = view.control("hqplayer.pipeline.filter_1x").expect("projected");
+    let filter = view
+        .control("hqplayer.pipeline.filter_1x")
+        .expect("projected");
     let offered = filter.offered_choice_ids();
     assert!(
         offered.contains(&"poly-sinc-gauss-long"),
@@ -1054,7 +1105,9 @@ fn a_provisional_acknowledgement_is_never_described_as_proof() {
 #[test]
 fn coupled_controls_are_advertised_as_one_plan() {
     let view = rendered(pipeline(), &web());
-    let enabled = view.control("hqplayer.volume.fixed.enabled").expect("projected");
+    let enabled = view
+        .control("hqplayer.volume.fixed.enabled")
+        .expect("projected");
     match &enabled.mutability {
         Mutability::Mutable { description, .. } => {
             assert_eq!(
@@ -1111,10 +1164,7 @@ async fn service_with(
         .await
         .expect("the actor drains once its channel closes")
         .expect("the actor task must not panic");
-    (
-        ControlPlaneService::new(view),
-        runs.into_values().collect(),
-    )
+    (ControlPlaneService::new(view), runs.into_values().collect())
 }
 
 fn hqplayer_zone_document(zone: &str) -> ProducerDocument {
@@ -1137,7 +1187,9 @@ async fn an_unknown_hqplayer_identity_is_refused_rather_than_routed_anywhere_els
         other => panic!("an unknown HQPlayer identity must refuse, got {other:?}"),
     }
     assert!(
-        service.route("roon:1601bb42ed14351b99c2926214f6cbb80724").is_ok(),
+        service
+            .route("roon:1601bb42ed14351b99c2926214f6cbb80724")
+            .is_ok(),
         "the producer that does exist still routes"
     );
 }

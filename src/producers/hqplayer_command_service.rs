@@ -18,6 +18,9 @@ use crate::adaptive::{
     WriteAttempt,
 };
 
+use super::control_plane::{
+    CommandAcceptance, CommandRefusal, SemanticCommand, SemanticCommandExecutor, SemanticRefusal,
+};
 use super::hqplayer::{
     HqpAdaptivePublisher, HqpCommandCompletion, HqpCommandLease, HqpCommandReservation,
     HqpCoordinatorRefusal, HqpSemanticOperation,
@@ -42,9 +45,7 @@ pub(crate) enum HqpCommandServiceRefusal {
     InvalidProducerIdentity,
     Preflight(HqpPreflightRefusal),
     Coordinator(HqpCoordinatorRefusal),
-    // #329 intentionally adds no public consumer. #331 will construct this refusal when its
-    // adaptive surface submits after shutdown.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The actor closed before accepting the message. Reached by `HqpSemanticExecutor` (#331).
     ServiceClosed,
 }
 
@@ -143,9 +144,7 @@ impl HqpNativeSettingExecutor for HqpInstanceManager {
 }
 
 enum HqpCommandActorMessage {
-    // The first public consumer lands in #331; keeping the variant in the production actor now is
-    // what lets that issue remain a thin projection instead of redesigning accepted-job lifetime.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // The public consumer landed in #331: `HqpSemanticExecutor` below is the only sender.
     Submit {
         request: Box<HqpImmediateCommandRequest>,
         reply: oneshot::Sender<Result<HqpCommandAcknowledgement, HqpCommandServiceRefusal>>,
@@ -163,7 +162,6 @@ pub struct HqpImmediateCommandHandle {
 }
 
 impl HqpImmediateCommandHandle {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn submit(
         &self,
         request: HqpImmediateCommandRequest,
@@ -627,6 +625,126 @@ fn now() -> Timestamp {
     Timestamp::new(chrono::Utc::now().to_rfc3339())
 }
 
+// =============================================================================
+// #331: the surface-facing executor
+// =============================================================================
+
+/// The HQPlayer implementation of the control plane's producer-neutral executor (#331).
+///
+/// It exists so `ControlPlaneService` never names a producer family, and so the twenty-two typed
+/// refusals this module can produce are translated once, here, into the ten a surface can act on.
+/// The translation is an exhaustive `match`: a refusal added later fails to compile rather than
+/// silently inheriting an existing surface verdict.
+pub struct HqpSemanticExecutor {
+    commands: HqpImmediateCommandHandle,
+}
+
+impl HqpSemanticExecutor {
+    /// The `producer_type` this executor owns, as published by the HQPlayer producer document.
+    pub const PRODUCER_TYPE: &'static str = "hqplayer";
+
+    /// Wrap the bounded immediate-command actor's ingress.
+    pub fn new(commands: HqpImmediateCommandHandle) -> Self {
+        Self { commands }
+    }
+}
+
+#[async_trait]
+impl SemanticCommandExecutor for HqpSemanticExecutor {
+    fn producer_type(&self) -> &str {
+        Self::PRODUCER_TYPE
+    }
+
+    async fn submit(&self, command: SemanticCommand) -> Result<CommandAcceptance, CommandRefusal> {
+        let request = HqpImmediateCommandRequest {
+            key: command.key,
+            expected: command.expected,
+            control: command.control,
+            requested: command.requested,
+            lane: command.lane,
+            correlation_id: command.correlation_id,
+        };
+        match self.commands.submit(request).await {
+            Ok(acknowledgement) => Ok(CommandAcceptance {
+                operation: acknowledgement.operation,
+                duplicate: acknowledgement.duplicate,
+            }),
+            Err(refusal) => Err(surface_refusal(refusal)),
+        }
+    }
+}
+
+fn surface_refusal(refusal: HqpCommandServiceRefusal) -> CommandRefusal {
+    match refusal {
+        HqpCommandServiceRefusal::ServiceClosed => CommandRefusal::ServiceClosed,
+        HqpCommandServiceRefusal::ProducerUnknown
+        | HqpCommandServiceRefusal::InvalidProducerIdentity => {
+            CommandRefusal::Refused(SemanticRefusal::ProducerMismatch)
+        }
+        HqpCommandServiceRefusal::Preflight(preflight) => {
+            CommandRefusal::Refused(semantic_preflight(preflight))
+        }
+        HqpCommandServiceRefusal::Coordinator(coordinator) => match coordinator {
+            HqpCoordinatorRefusal::Preflight(preflight) => {
+                CommandRefusal::Refused(semantic_preflight(preflight))
+            }
+            HqpCoordinatorRefusal::CoordinatorClosed
+            | HqpCoordinatorRefusal::LifecycleNotRunning => CommandRefusal::ServiceClosed,
+            HqpCoordinatorRefusal::ProducerUnknown => {
+                CommandRefusal::Refused(SemanticRefusal::ProducerMismatch)
+            }
+            HqpCoordinatorRefusal::InvalidCorrelation => {
+                CommandRefusal::Refused(SemanticRefusal::CorrelationUnusable)
+            }
+            // Everything remaining is one fact for a surface: nothing was written, and the reason
+            // is contention or bookkeeping rather than the request. A surface re-reads and retries.
+            HqpCoordinatorRefusal::CorrelationConflict
+            | HqpCoordinatorRefusal::ConflictBusy
+            | HqpCoordinatorRefusal::UnresolvedRetentionFull
+            | HqpCoordinatorRefusal::StaleLease
+            | HqpCoordinatorRefusal::LeaseStillCurrent
+            | HqpCoordinatorRefusal::IllegalTransition
+            | HqpCoordinatorRefusal::RevisionFailed(_)
+            | HqpCoordinatorRefusal::PublicationFailed(_)
+            | HqpCoordinatorRefusal::RetirementFailed(_) => {
+                CommandRefusal::Refused(SemanticRefusal::NotReserved)
+            }
+        },
+    }
+}
+
+fn semantic_preflight(refusal: HqpPreflightRefusal) -> SemanticRefusal {
+    match refusal {
+        HqpPreflightRefusal::CorrelationIdEmpty
+        | HqpPreflightRefusal::CorrelationIdTooLong { .. } => SemanticRefusal::CorrelationUnusable,
+        HqpPreflightRefusal::ProducerMismatch => SemanticRefusal::ProducerMismatch,
+        HqpPreflightRefusal::RevisionMismatch { expected, actual } => {
+            SemanticRefusal::PositionStale { expected, actual }
+        }
+        HqpPreflightRefusal::ProducerNotLive | HqpPreflightRefusal::ProducerStale => {
+            SemanticRefusal::ProducerNotWritable
+        }
+        HqpPreflightRefusal::NativeLaneMissing
+        | HqpPreflightRefusal::NativeLaneUnavailable
+        | HqpPreflightRefusal::NativeLaneStale => SemanticRefusal::LaneUnusable,
+        HqpPreflightRefusal::ControlUnknown
+        | HqpPreflightRefusal::ControlUnavailable
+        | HqpPreflightRefusal::ControlReadOnly => SemanticRefusal::ControlNotWritable,
+        HqpPreflightRefusal::WrongApplyLane
+        | HqpPreflightRefusal::NonImmediateRequest
+        | HqpPreflightRefusal::WrongControlKind
+        | HqpPreflightRefusal::WrongValueKind => SemanticRefusal::RequestMismatch,
+        HqpPreflightRefusal::UnknownChoice
+        | HqpPreflightRefusal::ChoiceUnavailable
+        | HqpPreflightRefusal::ChoiceMissingEngineName
+        | HqpPreflightRefusal::InvalidRateEngineName => SemanticRefusal::ValueNotSelectable,
+        // #375 registered these descriptors; #347 owes them a verified receipt. Advertising them as
+        // invokable before that is how a tool description stops being true.
+        HqpPreflightRefusal::DeferredToIssue328 { .. }
+        | HqpPreflightRefusal::UnsupportedControl => SemanticRefusal::NoVerifiedOperation,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
@@ -885,6 +1003,118 @@ mod tests {
             HqpImmediateCommandActor::build_with(view, coordinator, executor, capacity);
         let task = tokio::spawn(actor.run());
         (handle, task)
+    }
+
+    // =========================================================================
+    // #331: the surface-facing executor
+    // =========================================================================
+
+    /// The `ServiceClosed` case #329 predicted for this issue, now reachable.
+    ///
+    /// It matters because a surface must be able to distinguish "the request was wrong" from "the
+    /// server is going away": the first is worth showing the user, the second is worth retrying.
+    #[tokio::test]
+    async fn a_command_submitted_after_shutdown_is_service_closed_rather_than_a_refusal() {
+        let live = snapshot();
+        let key = live.key.clone();
+        let expected = live.document.position();
+        let (handle, task) = build_test_service(
+            live,
+            Arc::new(FakeCoordinator::default()),
+            Arc::new(FakeExecutor::new(Arc::new(StdMutex::new(Vec::new())))),
+            4,
+        );
+        handle.shutdown().await.expect("the actor drains");
+        task.await.expect("the actor task ends");
+
+        let executor = HqpSemanticExecutor::new(handle);
+        assert_eq!(executor.producer_type(), "hqplayer");
+        let refused = executor
+            .submit(SemanticCommand {
+                key,
+                expected,
+                control: ControlId::new(MODE),
+                requested: ControlValue::Choice(MODE_CHOICE.to_string()),
+                lane: ApplyLane::Immediate,
+                correlation_id: "corr-after-shutdown".to_string(),
+                surface_id: "web".to_string(),
+            })
+            .await
+            .expect_err("a closed actor accepts nothing");
+        assert_eq!(refused, CommandRefusal::ServiceClosed);
+    }
+
+    /// Every internal refusal has to land on exactly one surface verdict, and the collapse must not
+    /// erase the distinction a surface acts on. Revision staleness in particular must survive:
+    /// "re-read and retry" is a different instruction from "your request was wrong".
+    #[test]
+    fn internal_refusals_collapse_onto_surface_verdicts_without_losing_what_to_do_next() {
+        assert_eq!(
+            surface_refusal(HqpCommandServiceRefusal::Preflight(
+                HqpPreflightRefusal::RevisionMismatch {
+                    expected: stale_position(),
+                    actual: current_position(),
+                }
+            )),
+            CommandRefusal::Refused(SemanticRefusal::PositionStale {
+                expected: stale_position(),
+                actual: current_position(),
+            })
+        );
+        assert_eq!(
+            surface_refusal(HqpCommandServiceRefusal::Preflight(
+                HqpPreflightRefusal::UnknownChoice
+            )),
+            CommandRefusal::Refused(SemanticRefusal::ValueNotSelectable)
+        );
+        assert_eq!(
+            surface_refusal(HqpCommandServiceRefusal::Preflight(
+                HqpPreflightRefusal::ControlReadOnly
+            )),
+            CommandRefusal::Refused(SemanticRefusal::ControlNotWritable)
+        );
+        assert_eq!(
+            surface_refusal(HqpCommandServiceRefusal::Preflight(
+                HqpPreflightRefusal::UnsupportedControl
+            )),
+            CommandRefusal::Refused(SemanticRefusal::NoVerifiedOperation)
+        );
+        assert_eq!(
+            surface_refusal(HqpCommandServiceRefusal::Coordinator(
+                HqpCoordinatorRefusal::CoordinatorClosed
+            )),
+            CommandRefusal::ServiceClosed,
+            "a closing coordinator is a retry, not a rejected request"
+        );
+        assert_eq!(
+            surface_refusal(HqpCommandServiceRefusal::Coordinator(
+                HqpCoordinatorRefusal::ConflictBusy
+            )),
+            CommandRefusal::Refused(SemanticRefusal::NotReserved)
+        );
+        assert_eq!(
+            surface_refusal(HqpCommandServiceRefusal::Coordinator(
+                HqpCoordinatorRefusal::Preflight(HqpPreflightRefusal::ProducerNotLive)
+            )),
+            CommandRefusal::Refused(SemanticRefusal::ProducerNotWritable),
+            "a preflight refusal repeated by the coordinator must read the same to a surface"
+        );
+    }
+
+    fn stale_position() -> RevisionRef {
+        RevisionRef {
+            epoch: ProducerEpoch(7),
+            control_plane: crate::adaptive::Revision(3),
+            state: crate::adaptive::Revision(8),
+        }
+    }
+
+    fn current_position() -> RevisionRef {
+        RevisionRef {
+            epoch: ProducerEpoch(7),
+            control_plane: crate::adaptive::Revision(3),
+            state: crate::adaptive::Revision(9),
+        }
     }
 
     #[test]
