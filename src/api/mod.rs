@@ -914,6 +914,30 @@ pub async fn hqp_setting_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpSettingRequest>,
 ) -> impl IntoResponse {
+    // This endpoint's accepted names, exactly as it has always accepted them. The numeric applier
+    // below is shared with `POST /hqp/pipeline`, which additionally accepts `dither` — sharing the
+    // applier must not quietly widen *this* route, so the gate is here and the error text is the one
+    // it already answered with.
+    const ACCEPTED: [&str; 8] = [
+        "mode",
+        "filter",
+        "filter1x",
+        "filterNx",
+        "filternx",
+        "shaper",
+        "samplerate",
+        "rate",
+    ];
+    if !ACCEPTED.contains(&req.name.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Unknown setting: {}", req.name),
+            }),
+        )
+            .into_response();
+    }
+
     let result = hqp_apply_legacy_setting(&state, &req.name, req.value).await;
 
     match result {
