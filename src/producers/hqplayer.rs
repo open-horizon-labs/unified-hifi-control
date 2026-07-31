@@ -1335,11 +1335,23 @@ impl HqpPublisherCoordinator {
     async fn retire_admitted_instance(
         &mut self,
         instance_name: String,
-        state: HqpInstanceCoordinator,
+        mut state: HqpInstanceCoordinator,
         producer_epoch: ProducerEpoch,
     ) -> Result<(), HqpCoordinatorRefusal> {
         debug_assert!(!has_pending_operations(&state));
         debug_assert!(state.dispatch_in_progress.is_empty());
+        // Retirement is definitive: no later producer observation can converge an ambiguous
+        // receipt. Make that boundary visible and admitted before the compact retired map can
+        // retain or eventually evict the audit. Keeping the retirement request on publication
+        // failure lets the deferred retry resume here without retiring early.
+        state.retirement_requested = Some(producer_epoch);
+        if let Err(error) = self
+            .expire_unresolved_before_retirement(&mut state, contract_timestamp(SystemTime::now()))
+            .await
+        {
+            self.instances.insert(instance_name, state);
+            return Err(error);
+        }
         if let Some(run) = self.run.as_ref() {
             let producer_id = format!("hqplayer:{instance_name}");
             let retirement = self
@@ -1370,6 +1382,74 @@ impl HqpPublisherCoordinator {
             },
         );
         Ok(())
+    }
+
+    async fn expire_unresolved_before_retirement(
+        &mut self,
+        state: &mut HqpInstanceCoordinator,
+        at: Timestamp,
+    ) -> Result<(), HqpCoordinatorRefusal> {
+        let mut candidate_ledger = state.ledger.clone();
+        let mut changed = false;
+        for operation in &mut candidate_ledger {
+            if operation.outcome == CommandOutcome::Pending
+                || !operation.outcome.awaits_convergence()
+            {
+                continue;
+            }
+            operation.recovery = Some(RecoveryState::ReplanRequired);
+            operation
+                .transition(
+                    CommandOutcome::Expired,
+                    at.clone(),
+                    None,
+                    Some(Reason {
+                        code: ReasonCode::Expired,
+                        scope: ReasonScope::Producer,
+                        display_text_key: None,
+                        detail: Some(
+                            "HQPlayer instance retired before authoritative convergence"
+                                .to_string(),
+                        ),
+                    }),
+                )
+                .map_err(|_| HqpCoordinatorRefusal::IllegalTransition)?;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+
+        let mut correlation_tombstones = state.correlation_tombstones.clone();
+        let mut correlation_tombstone_order = state.correlation_tombstone_order.clone();
+        prune_terminal_history(
+            &mut candidate_ledger,
+            &state.correlations,
+            &mut correlation_tombstones,
+            &mut correlation_tombstone_order,
+        );
+        let mut candidate_document = state
+            .tracker
+            .last_document
+            .clone()
+            .ok_or(HqpCoordinatorRefusal::ProducerUnknown)?;
+        candidate_document.operations = candidate_ledger.clone();
+        let mut candidate_tracker = state.tracker.clone();
+        candidate_tracker
+            .materialize(candidate_document)
+            .map_err(|error| HqpCoordinatorRefusal::RevisionFailed(format!("{error:?}")))?;
+        self.publish_deferred(
+            state,
+            HqpDeferredCommit {
+                tracker: candidate_tracker,
+                ledger: candidate_ledger,
+                active_pipeline: state.active_pipeline,
+                dispatch_in_progress: state.dispatch_in_progress.clone(),
+                correlation_tombstones,
+                correlation_tombstone_order,
+            },
+        )
+        .await
     }
 
     async fn publish_deferred(
@@ -3980,8 +4060,12 @@ mod tests {
             )
             .await
             .expect("late duplicate preserves the attempted receipt audit");
-        assert_eq!(duplicate.outcome, CommandOutcome::Indeterminate);
+        assert_eq!(duplicate.outcome, CommandOutcome::Expired);
         assert_eq!(duplicate.write_attempt, WriteAttempt::Attempted);
+        assert_eq!(duplicate.recovery, Some(RecoveryState::ReplanRequired));
+        let reason = duplicate.reason.as_ref().expect("retirement reason");
+        assert_eq!(reason.code, ReasonCode::Expired);
+        assert_eq!(reason.scope, ReasonScope::Producer);
 
         shutdown.cancel();
         actor_task.await.expect("actor joins");
@@ -4042,6 +4126,92 @@ mod tests {
             WriteAttempt::Attempted
         );
 
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn retirement_waits_for_expiration_publication_before_hiding_the_instance() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let request = crate::producers::hqplayer_command::HqpImmediateCommandRequest {
+            key: key.clone(),
+            expected: view.snapshot(&key).expect("initial").document.position(),
+            control: ControlId::new(CONTROL_PIPELINE_MODE),
+            requested: ControlValue::choice(choice_id(CONTROL_PIPELINE_MODE, "PCM")),
+            lane: ApplyLane::Immediate,
+            correlation_id: "retirement-expiration-publication".to_string(),
+        };
+        let reservation = publisher
+            .reserve(
+                crate::producers::hqplayer_command::preflight(
+                    &view.snapshot(&key).expect("preflight snapshot"),
+                    &request,
+                )
+                .expect("request preflight"),
+            )
+            .await
+            .expect("reserve");
+        publisher
+            .complete(
+                reservation.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Indeterminate,
+                    WriteAttempt::Attempted,
+                    Timestamp::new("2026-07-31T00:00:01Z"),
+                    Some(RecoveryState::AwaitingReadback),
+                    None,
+                ),
+            )
+            .await
+            .expect("ambiguous receipt audit admits");
+
+        for _ in 0..9 {
+            publisher.refuse_next_publication().await;
+        }
+        assert!(publisher.instance_removed("main", 7).await.is_err());
+        let still_visible = view
+            .snapshot(&key)
+            .expect("failed expiration publication cannot retire the producer");
+        assert_eq!(
+            still_visible.document.operations[0].outcome,
+            CommandOutcome::Indeterminate
+        );
+
+        let expired = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(found) = publisher
+                    .lookup_correlation(&request)
+                    .await
+                    .expect("correlation lookup remains available")
+                {
+                    if found.operation().outcome == CommandOutcome::Expired {
+                        break found;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deferred expiration publishes and retirement completes");
+        assert_eq!(expired.operation().write_attempt, WriteAttempt::Attempted);
+        assert_eq!(
+            expired.operation().recovery,
+            Some(RecoveryState::ReplanRequired)
+        );
+        let reason = expired.operation().reason.as_ref().expect("expired reason");
+        assert_eq!(reason.code, ReasonCode::Expired);
+        assert_eq!(reason.scope, ReasonScope::Producer);
+        assert!(
+            view.snapshot(&key).is_none(),
+            "producer becomes hidden only after expiration was admitted"
+        );
+
+        publisher.manager_stopped().await.expect("manager stops");
         shutdown.cancel();
         actor_task.await.expect("actor joins");
     }
@@ -4796,10 +4966,10 @@ mod tests {
                 .complete(
                     reservation.lease(),
                     HqpCommandCompletion::new(
-                        CommandOutcome::Applied,
-                        WriteAttempt::Confirmed,
+                        CommandOutcome::Indeterminate,
+                        WriteAttempt::Attempted,
                         Timestamp::new(format!("2026-07-31T00:02:{:02}Z", index % 60)),
-                        Some(RecoveryState::NotRequired),
+                        Some(RecoveryState::AwaitingReadback),
                         None,
                     ),
                 )
@@ -4809,6 +4979,34 @@ mod tests {
                 .instance_removed(&instance_name, 7)
                 .await
                 .expect("completed instance retires");
+
+            if index == MAX_RETIRED_INSTANCES - 1 {
+                let oldest_before_eviction = publisher
+                    .lookup_correlation(oldest_request.as_ref().expect("oldest request"))
+                    .await
+                    .expect("oldest retained lookup")
+                    .expect("oldest is retained until the next distinct retirement");
+                assert_eq!(
+                    oldest_before_eviction.operation().outcome,
+                    CommandOutcome::Expired,
+                    "retirement makes unresolved convergence explicitly terminal before eviction"
+                );
+                assert_eq!(
+                    oldest_before_eviction.operation().write_attempt,
+                    WriteAttempt::Attempted
+                );
+                assert_eq!(
+                    oldest_before_eviction.operation().recovery,
+                    Some(RecoveryState::ReplanRequired)
+                );
+                let reason = oldest_before_eviction
+                    .operation()
+                    .reason
+                    .as_ref()
+                    .expect("expiration reason");
+                assert_eq!(reason.code, ReasonCode::Expired);
+                assert_eq!(reason.scope, ReasonScope::Producer);
+            }
         }
 
         assert!(
@@ -4817,16 +5015,26 @@ mod tests {
                 .await
                 .expect("expired retired lookup is not an error")
                 .is_none(),
-            "the oldest distinct retired identity is evicted at the global bound"
+            "the oldest distinct retired identity is evicted only after its audit is terminal"
         );
-        assert!(
-            publisher
-                .lookup_correlation(newest_request.as_ref().expect("newest request"))
-                .await
-                .expect("newest retired lookup")
-                .is_some(),
-            "the newest retired identity keeps exact duplicate truth"
+        let newest = publisher
+            .lookup_correlation(newest_request.as_ref().expect("newest request"))
+            .await
+            .expect("newest retired lookup")
+            .expect("newest retired identity keeps exact duplicate truth");
+        assert_eq!(newest.operation().outcome, CommandOutcome::Expired);
+        assert_eq!(newest.operation().write_attempt, WriteAttempt::Attempted);
+        assert_eq!(
+            newest.operation().recovery,
+            Some(RecoveryState::ReplanRequired)
         );
+        let expiration = newest
+            .operation()
+            .history
+            .last()
+            .expect("retirement expiration transition");
+        assert_eq!(expiration.from, CommandOutcome::Indeterminate);
+        assert_eq!(expiration.to, CommandOutcome::Expired);
 
         publisher.manager_stopped().await.expect("manager stops");
         shutdown.cancel();

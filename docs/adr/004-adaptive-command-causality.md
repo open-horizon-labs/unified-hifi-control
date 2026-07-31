@@ -42,9 +42,15 @@ and manager start is rejected while that stopping run still owns an in-flight or
 start may be retried only after terminal admission releases the prior run. Instance removal may
 arrive after the manager has finished the native call but before the command actor publishes that
 receipt, so it records retirement intent
-and blocks new work while retaining the coordinator. Retirement occurs only after the receipt's
-terminal operation is admitted; the compact retired coordinator then preserves exact correlation
-truth for a late duplicate callback.
+and blocks new work while retaining the coordinator. Retirement begins only after the typed
+receipt transition is admitted and no `Pending` operation or dispatch fence remains. Definitive
+retirement transitions every non-Pending outcome that still awaits convergence to explicit
+`Expired` audit truth with producer-scoped
+`ReasonCode::Expired` and `ReplanRequired`, and admits that terminal document before hiding the
+producer. Publication failure retains the live coordinator and immutable deferred candidate for
+retry, so retirement cannot overtake the audit frontier. The bounded compact retired coordinator
+then preserves exact correlation truth for late duplicate callbacks; global identity eviction can
+discard only history already made terminal at retirement.
 
 `CommandOutcome::Pending` is an explicit non-terminal state. It is not evidence of producer state, sets `awaits_convergence`, and may transition to Applied, Ignored, Rejected, Superseded, Disconnected, TimedOut, Indeterminate, or a future recognized terminal outcome. No terminal outcome can regress to Pending.
 
