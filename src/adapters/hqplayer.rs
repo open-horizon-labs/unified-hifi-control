@@ -20,6 +20,9 @@
 //! - Enumerations are mode-relative: a mode change swaps the filter/shaper/rate lists wholesale.
 //! - `result="OK"` is not proof a setting applied. See `verify_applied`.
 
+mod lifecycle;
+pub use lifecycle::{HqpRecoveryConfig, HqpWorkerPhase, HqpWorkerStatus};
+
 use anyhow::{anyhow, Result};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Writer;
@@ -45,6 +48,7 @@ use crate::bus::{
     VolumeControl as BusVolumeControl, VolumeScale, Zone as BusZone,
 };
 use crate::config::{get_config_file_path, read_config_file};
+use lifecycle::{supervise_worker, RecoveryState, SharedRecoveryState, SharedWorkerPhase};
 
 const HQP_CONFIG_FILE: &str = "hqp-config.json";
 
@@ -1432,6 +1436,8 @@ struct HqpAdapterState {
     cookies: HashMap<String, String>,
     /// Injectable timeout/retry policy. Defaults to the shipped constants.
     timeouts: HqpTimeouts,
+    /// Long-lived producer recovery policy. Separate from per-command retry semantics.
+    recovery_config: HqpRecoveryConfig,
 }
 
 /// Digest authentication state
@@ -1475,6 +1481,7 @@ impl Default for HqpAdapterState {
             digest_auth: None,
             cookies: HashMap::new(),
             timeouts: HqpTimeouts::default(),
+            recovery_config: HqpRecoveryConfig::default(),
         }
     }
 }
@@ -1713,6 +1720,18 @@ impl HqpAdapter {
     /// serialized payload.
     pub async fn set_timeouts(&self, timeouts: HqpTimeouts) {
         self.state.write().await.timeouts = timeouts;
+    }
+
+    async fn recovery_config(&self) -> HqpRecoveryConfig {
+        self.state.read().await.recovery_config
+    }
+
+    /// Override the managed producer recovery policy.
+    ///
+    /// This is an internal conformance seam, not a serialized setting or public control-plane
+    /// contract. Production uses the supported-version-qualified default.
+    pub async fn set_recovery_config(&self, config: HqpRecoveryConfig) {
+        self.state.write().await.recovery_config = config;
     }
 
     /// Check if configured
@@ -2005,9 +2024,12 @@ impl HqpAdapter {
     /// Each instance owns its retry timing independently, while the manager remains the single
     /// adapter-wide lifecycle/ACK visible to the coordinator. Poll futures are cancellation-safe:
     /// cancellation drops the in-flight request and immediately closes the session before return.
-    async fn run_managed(&self, shutdown: CancellationToken) {
-        const POLL_INTERVAL: Duration = Duration::from_secs(2);
-
+    async fn run_managed(
+        &self,
+        shutdown: CancellationToken,
+        phase: SharedWorkerPhase,
+        recovery: SharedRecoveryState,
+    ) {
         loop {
             let observation = tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -2015,15 +2037,31 @@ impl HqpAdapter {
             };
 
             let delay = match observation {
-                Ok(()) => POLL_INTERVAL,
+                Ok(()) => {
+                    *phase.write().await = HqpWorkerPhase::Healthy;
+                    let mut recovery = recovery.lock().await;
+                    if recovery.on_coherent_success(tokio::time::Instant::now()) {
+                        tracing::info!(
+                            "HQPlayer managed observation remained coherent for {:?}; \
+                             retry debt reset",
+                            recovery.config().stable_threshold
+                        );
+                    }
+                    recovery.config().poll_interval
+                }
                 Err(error) => {
                     tracing::warn!("HQPlayer managed observation failed: {error}");
+                    *phase.write().await = HqpWorkerPhase::Recovering;
+                    let delay = recovery
+                        .lock()
+                        .await
+                        .on_failure(tokio::time::Instant::now());
                     // A handshake failure already leaves a clean disconnected session. A failure
                     // after reachability normally passes through send_command/mark_disconnected;
                     // this closes any remaining partially-used socket without publishing a false
                     // disconnect edge for a session that never became reachable.
                     self.disconnect().await;
-                    self.timeouts().await.reconnect_delay
+                    delay
                 }
             };
 
@@ -5953,6 +5991,7 @@ pub struct HqpInstanceInfo {
 struct HqpManagedWorker {
     shutdown: CancellationToken,
     join: tokio::task::JoinHandle<()>,
+    phase: SharedWorkerPhase,
 }
 
 pub struct HqpInstanceManager {
@@ -6139,13 +6178,42 @@ impl HqpInstanceManager {
             return;
         }
 
-        // Build the child future before taking the worker-map lock. The future is inert until
-        // spawned; keeping its await expression outside the map-guard scope also makes the actual
-        // invariant obvious to the AST lock lint.
+        // Build the supervisor before taking the worker-map lock. The future is inert until
+        // spawned; keeping its await expressions outside the map-guard scope also makes the actual
+        // invariant obvious to the AST lock lint. Retry debt belongs to the supervisor and is
+        // therefore preserved across replaceable observer children.
         let shutdown = CancellationToken::new();
-        let child_shutdown = shutdown.clone();
-        let child = async move {
-            adapter.run_managed(child_shutdown).await;
+        let supervisor_shutdown = shutdown.clone();
+        let phase = Arc::new(RwLock::new(HqpWorkerPhase::Recovering));
+        let recovery = Arc::new(Mutex::new(RecoveryState::new(
+            adapter.recovery_config().await,
+        )));
+        let supervisor_name = name.clone();
+        let run_adapter = adapter.clone();
+        let cleanup_adapter = adapter;
+        let supervisor_phase = phase.clone();
+        let supervisor = async move {
+            supervise_worker(
+                supervisor_name,
+                supervisor_shutdown,
+                supervisor_phase,
+                recovery,
+                move |child_shutdown, child_phase, child_recovery| {
+                    let adapter = run_adapter.clone();
+                    async move {
+                        adapter
+                            .run_managed(child_shutdown, child_phase, child_recovery)
+                            .await;
+                    }
+                },
+                move || {
+                    let adapter = cleanup_adapter.clone();
+                    async move {
+                        adapter.disconnect().await;
+                    }
+                },
+            )
+            .await;
         };
 
         let mut workers = self.workers.lock().await;
@@ -6159,8 +6227,15 @@ impl HqpInstanceManager {
             return;
         }
 
-        let join = tokio::spawn(child);
-        workers.insert(name, HqpManagedWorker { shutdown, join });
+        let join = tokio::spawn(supervisor);
+        workers.insert(
+            name,
+            HqpManagedWorker {
+                shutdown,
+                join,
+                phase,
+            },
+        );
     }
 
     /// Cancel and join one child before returning so it cannot republish after removal.
@@ -6237,6 +6312,25 @@ impl HqpInstanceManager {
     pub async fn instance_count(&self) -> usize {
         let instances = self.instances.read().await;
         instances.len()
+    }
+
+    /// Internal supervisor/child status without changing any serialized status payload.
+    pub async fn worker_status(&self, name: &str) -> HqpWorkerStatus {
+        let phase = self
+            .workers
+            .lock()
+            .await
+            .get(name)
+            .map(|worker| worker.phase.clone());
+        let supervisor_enabled = self.running.load(Ordering::SeqCst) && phase.is_some();
+        let phase = match phase {
+            Some(phase) => *phase.read().await,
+            None => HqpWorkerPhase::Stopped,
+        };
+        HqpWorkerStatus {
+            supervisor_enabled,
+            phase,
+        }
     }
 }
 

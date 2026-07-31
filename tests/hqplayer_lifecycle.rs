@@ -13,7 +13,9 @@ use std::time::Duration;
 use mock_servers::hqplayer::corpus::VERIFIED_PROFILE;
 use mock_servers::hqplayer::model::{DaemonModel, Metadata};
 use mock_servers::hqplayer::wire::{Chunking, WirePolicy, WireServer};
-use unified_hifi_control::adapters::hqplayer::{HqpAdapter, HqpInstanceManager, HqpTimeouts};
+use unified_hifi_control::adapters::hqplayer::{
+    HqpAdapter, HqpInstanceManager, HqpRecoveryConfig, HqpTimeouts, HqpWorkerPhase, HqpWorkerStatus,
+};
 use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState, Zone};
@@ -33,6 +35,17 @@ fn fast_timeouts() -> HqpTimeouts {
         response: Duration::from_millis(500),
         reconnect_delay: Duration::from_millis(10),
         max_attempts: 1,
+    }
+}
+
+fn fast_recovery() -> HqpRecoveryConfig {
+    HqpRecoveryConfig {
+        poll_interval: Duration::from_millis(10),
+        short_retry_delay: Duration::from_millis(10),
+        restart_window: Duration::from_millis(40),
+        backoff_initial: Duration::from_millis(20),
+        backoff_cap: Duration::from_millis(40),
+        stable_threshold: Duration::from_millis(20),
     }
 }
 
@@ -459,6 +472,7 @@ async fn unavailable_startup_and_daemon_restart_recover_without_stale_state() {
         )
         .await;
     adapter.set_timeouts(fast_timeouts()).await;
+    adapter.set_recovery_config(fast_recovery()).await;
     manager
         .start()
         .await
@@ -466,6 +480,14 @@ async fn unavailable_startup_and_daemon_restart_recover_without_stale_state() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!adapter.get_status().await.connected);
     assert!(aggregator.get_zone("hqplayer:rig").await.is_none());
+    assert_eq!(
+        manager.worker_status("rig").await,
+        HqpWorkerStatus {
+            supervisor_enabled: true,
+            phase: HqpWorkerPhase::Recovering,
+        },
+        "enabled supervisor and recovering child are distinct from a healthy producer"
+    );
 
     let first_model = DaemonModel::with_profile(VERIFIED_PROFILE);
     first_model.external_change(|s| {
@@ -484,6 +506,10 @@ async fn unavailable_startup_and_daemon_restart_recover_without_stale_state() {
     })
     .await;
     assert_eq!(first_zone.state, PlaybackState::Playing);
+    assert_eq!(
+        manager.worker_status("rig").await.phase,
+        HqpWorkerPhase::Healthy
+    );
     let first_epoch = adapter.producer_epoch().await;
 
     first_server.shutdown().await;
@@ -534,6 +560,13 @@ async fn unavailable_startup_and_daemon_restart_recover_without_stale_state() {
     );
 
     manager.stop().await;
+    assert_eq!(
+        manager.worker_status("rig").await,
+        HqpWorkerStatus {
+            supervisor_enabled: false,
+            phase: HqpWorkerPhase::Stopped,
+        }
+    );
     bus.publish(BusEvent::ShuttingDown { reason: None });
     aggregator_task.await.expect("aggregator stops");
     second_server.stop();
