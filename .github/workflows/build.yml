@@ -389,7 +389,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -832,7 +832,7 @@ jobs:
           targets: x86_64-apple-darwin
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -888,7 +888,7 @@ jobs:
           targets: aarch64-apple-darwin
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -980,7 +980,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
