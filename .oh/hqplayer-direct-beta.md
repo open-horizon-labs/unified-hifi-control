@@ -172,7 +172,7 @@ inputs-read section names from `.oh/adaptive-interaction-plane.md`.
 
 ## Execute
 
-**Status:** in progress · **Updated:** 2026-07-31
+**Status:** complete (draft PR open, not merged) · **Updated:** 2026-07-31
 
 Red-first throughout: `tests/mcp_hqplayer_control.rs` drives the real `/mcp` HTTP surface with
 `rust-mcp-sdk`'s own client runtime (dev-dependency, streamable-http transport) against a bound
@@ -180,26 +180,69 @@ ephemeral port — the same "test from the client's expectation" discipline AGEN
 the MCP client itself standing in for the AI-assistant client this surface exists to serve, the same
 role the ESP32/iOS harness plays for the knob/web surfaces.
 
-Filled in as the gates run; full transcript in the Execute-checkpoint PR comment.
+Implementation: extracted `control_hqplayer`'s body in `src/knobs/routes.rs` into transport-neutral
+`dispatch_hqplayer_action` (`Result<(), HqpDispatchError>`); `control_hqplayer` became a thin wrapper
+converting that back to its existing `(StatusCode, Json)` shape. `src/mcp/mod.rs`'s
+`HifiControlTool` arm now calls the same function for `hqplayer:` zone ids before falling into its
+existing Roon/LMS/OpenHome/UPnP dispatch. Tool descriptions and the server `instructions` string
+updated to state HQPlayer's zone support, its dB volume unit, and the `hifi_hqplayer_*`
+default-instance-only scope.
 
 | Gate | Command | Result |
 |------|---------|--------|
-| RED, targeted | `cargo test --test mcp_hqplayer_control` | _pending_ |
-| GREEN, targeted | `cargo test --test mcp_hqplayer_control` | _pending_ |
-| Direct-zone regression | `cargo test --test hqplayer_direct_zone` | _pending_ |
-| Whole suite | `cargo test --all-features` | _pending_ |
-| Clippy | `cargo clippy --all-targets --all-features -- -D warnings` | _pending_ |
-| Format | `cargo fmt --all --check` | _pending_ |
-| API contract | `cargo test --test api_contract` | _pending_ |
-| Architecture/adaptive lints | `cargo test --test architecture_lint --test adaptive_dependency_lint --test adaptive_publication_lint` | _pending_ |
-| Release UI | `dx build --release --platform web --features web` | _pending_ |
-| Live rig | see Ship section | _pending_ |
+| RED, targeted | `cargo test --test mcp_hqplayer_control` @ `f7542f9` | **32 passed, 5 failed** — the routing/volume/action gaps the audit found, nothing else |
+| GREEN, targeted | `cargo test --test mcp_hqplayer_control` | **38 passed, 0 failed** (8 behavioral + mock-server infra tests) |
+| Direct-zone regression | `cargo test --test hqplayer_direct_zone` | **56 passed, 0 failed** — unchanged, confirms the extraction is behavior-preserving |
+| Volume-safety source lint | `cargo test --test volume_safety` | Initially failed (scanned the now-empty `control_hqplayer` body) — non-vacuity assertion caught it; updated to scan `dispatch_hqplayer_action`; **16 passed** |
+| Whole suite | `cargo test --all-features` | **1287+ passed, 0 failed, 33 targets** |
+| Clippy (lib) | `cargo clippy --lib --all-features -- -D warnings` | **clean** |
+| Clippy (all targets) | `cargo clippy --all-targets --all-features` | **395 pre-existing errors** (#338 backlog); **0** in any touched file |
+| Format | `cargo fmt --all --check` | **clean** |
+| API contract | `cargo test --test api_contract` | **2 passed**; `api_routes.txt` byte-identical |
+| Architecture/adaptive lints | `architecture_lint` / `adaptive_dependency_lint` / `adaptive_publication_lint` | **9 / 7 / 57 passed** |
+| Release UI | `dx build --release --platform web --features web` | **client + server build completed successfully** |
+| Live rig | see Ship section | pending |
 
 ---
 
 ## Review
 
-_Pending — filled in after Execute is green._
+**Status:** complete · **Updated:** 2026-07-31
+
+Read the whole diff against the base branch looking for what falsification would find, not just
+re-confirming the design. One real gap found and closed; nothing else survived scrutiny.
+
+1. **Coverage gap: `volume_up`/`volume_down` were never exercised through MCP.** The Execute
+   checkpoint's tests proved `volume_set` reaches the HQPlayer instance but not the other two verbs
+   that shared the same broken `set_volume` helper before the fix (and the same
+   `dispatch_hqplayer_action` arm after it). Closed by
+   `mcp_volume_up_and_down_route_to_the_hqplayer_instance`, which asserts the daemon received two
+   distinct `Volume` writes moving in opposite directions from the last observed level.
+
+Checked and **not** found to be defects:
+
+* **MCP zone-level tools (`hifi_zones`/`hifi_now_playing`/`hifi_control`) do not honor the
+  `adapters.hqplayer` (or any other adapter) settings toggle**, unlike the knob surface's
+  `get_all_zones_internal`. Read `src/adapters/hqplayer.rs` and `HqpInstanceManager` for any
+  toggle-awareness: none exists below the knob-routes filtering layer, and MCP's `hifi_zones` calls
+  `state.aggregator.get_zones()` directly, bypassing that filter — for every backend, not only
+  HQPlayer. Pre-existing behavior, not introduced or worsened by this branch; recorded as a known
+  limitation rather than fixed, since closing it is an MCP-wide settings-filtering change well
+  outside "focused HQPlayer compatibility fix."
+* **Error-message duplication between the HTTP and MCP surfaces on `Backend` errors.** MCP's
+  `Self::error_result` already prefixes `"Error: "`; the non-HQPlayer arm additionally prefixes
+  `"Control error: "` before calling it, so its errors read `"Error: Control error: …"` while the new
+  HQPlayer arm reads plain `"Error: …"`. Cosmetic only — the HQPlayer form is arguably cleaner — and
+  not part of any tested contract.
+* **Three near-identical `McpNowPlaying`-building blocks now exist in `src/mcp/mod.rs`** (the
+  `hifi_now_playing` tool, the pre-existing non-HQPlayer control success path, and the new HQPlayer
+  arm). A `fn mcp_now_playing(zone) -> McpNowPlaying` helper would remove the duplication, but two of
+  the three copies predate this branch and extracting only for the new one is inconsistent scope
+  creep for a "focused" fix. Recorded as a follow-up, not made.
+* **`trim_start_matches("hqplayer:")` on an instance name containing a colon** — same non-finding
+  #328's own review recorded for the knob path: it would strip a repeated literal prefix, but an
+  instance named `hqplayer:x` is not a reachable configuration, and the behavior is identical to the
+  code this branch reused, not new.
 
 ---
 
