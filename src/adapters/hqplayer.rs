@@ -3119,12 +3119,28 @@ impl HqpAdapter {
                          single chain"
                     ))
                 }
-                // A check that could not run is not a check that failed: the cache was not
-                // invalidated, so the lists are still the ones the state was read against. The
-                // caller gets the read, and the log says the guarantee was weaker this time.
+                // A check that could not run is not a check that passed. "The cache was not
+                // invalidated, so the lists are still the ones the state was read against" is true
+                // about the *cache* and answers nothing about the *daemon*: whether it still has
+                // that chain loaded is exactly what the failed request was asked. An explicit
+                // `result="Error"` here is terminal in `send_command` — no retry, no disconnect, no
+                // invalidation — so the cache survives looking entirely usable, and a view projected
+                // through it is indistinguishable from a verified one. A `warn!` does not make it
+                // one. Same bound as every other unsettled read here: one re-read, then say so.
+                Err(e) if !retried => {
+                    tracing::info!(
+                        "HQPlayer's chain check could not be run ({e}); re-reading rather than \
+                         resolving its indices against lists nothing has confirmed they belong to"
+                    );
+                    retried = true;
+                }
                 Err(e) => {
-                    tracing::warn!("HQPlayer chain check failed, serving cached enumerations: {e}");
-                    break (observed, observed_status);
+                    return Err(anyhow!(
+                        "HQPlayer's loaded chain could not be verified while its settings were \
+                         being read, and again during the re-read ({e}); refusing to report \
+                         settings whose indices were never checked against the lists they are \
+                         resolved through"
+                    ))
                 }
             }
         };

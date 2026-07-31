@@ -7511,3 +7511,135 @@ async fn a_reconnect_during_the_reads_does_not_publish_the_cache_it_emptied() {
     }
     h.stop();
 }
+
+/// A chain check that **could not run** is not a chain check that passed.
+///
+/// The final `GetRates` is the whole basis for joining `State`'s indices to the cached enumerations:
+/// it is what establishes that the list a selection is resolved through belongs to the chain the
+/// daemon had loaded when it reported that selection. An explicit `result="Error"` on it is terminal
+/// in `send_command` — it does not retry, does not disconnect and does not invalidate — so the cache
+/// survives intact and looks entirely usable. That is precisely what makes swallowing it dangerous:
+/// the published view is indistinguishable from a verified one, and a caller has no way to see that
+/// the join was never checked.
+///
+/// The earlier reading was "the cache was not invalidated, so the lists are still the ones the state
+/// was read against". That is true about the *cache* and says nothing about the *daemon*: the lists
+/// are unchanged locally, while whether the daemon still has that chain loaded is exactly the
+/// question the failed request was asked. A `warn!` is not a substitute for an answer.
+///
+/// So it takes the same shape as every other unsettled read here — one bounded retry, then an error.
+///
+/// **Label: client-red.** Found by CodeRabbit at `619dee4`. Before this, a rejected final `GetRates`
+/// was logged and the state was projected through the cached lists anyway.
+#[tokio::test]
+async fn a_final_chain_check_that_cannot_run_twice_is_reported_rather_than_published() {
+    let h = Harness::verified().await;
+    let before = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("the cache fills while the daemon is healthy");
+    assert_eq!(
+        published_families(&before).len(),
+        4,
+        "precondition: a complete cache, so the read below skips its fill and the only `GetRates` \
+         left in it is the chain check"
+    );
+    let rates_before = h.model.request_count("GetRates");
+
+    // Two rejections: the first catches the read's chain check, the second catches the retry's. The
+    // daemon stays up throughout — an explicit rejection is not a transport failure — so nothing
+    // invalidates and the cache remains fully populated and inviting.
+    h.model.arm(|f| {
+        for _ in 0..2 {
+            f.reject_next
+                .push(("GetRates".to_string(), "chain check refused".to_string()));
+        }
+    });
+
+    let outcome = h.adapter.get_pipeline_status().await;
+
+    match outcome {
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("chain"),
+                "the failure must say what could not be established — that the loaded chain could \
+                 not be verified — rather than surfacing as some unrelated read error. Got: \
+                 {message}"
+            );
+            assert_eq!(
+                h.model.request_count("GetRates") - rates_before,
+                2,
+                "the bound is one retry, not zero and not a loop: a first unverifiable check is \
+                 re-read once before the read gives up"
+            );
+        }
+        Ok(published) => {
+            let families = published_families(&published);
+            panic!(
+                "a read whose chain check never ran must not be published as a verified one. It \
+                 published {families:?}, with filter1x selected as {:?} out of {} options — \
+                 indices joined to lists nothing confirmed belong to the same chain",
+                published.settings.filter1x.selected.value,
+                published.settings.filter1x.options.len()
+            );
+        }
+    }
+    h.stop();
+}
+
+/// The bound is a **retry**, not a second way to fail. A single unverifiable chain check followed by
+/// one that runs and passes leaves the read with exactly what it needs — a state and a set of lists
+/// confirmed to describe the same loaded chain — and that read is published.
+///
+/// This is the other half of the check above, and it is what keeps the fix from degrading into
+/// "any failed request fails the read": the request count is asserted, so a read that published
+/// without a *successful* check cannot pass by publishing the same four families the swallowing
+/// version did.
+///
+/// **Label: client-red.** Before this, the retry did not exist: the first rejection was logged and
+/// the cached lists were published unverified, so coherence was never established at all.
+#[tokio::test]
+async fn a_final_chain_check_that_runs_on_the_retry_publishes_the_verified_read() {
+    let h = Harness::verified().await;
+    let before = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("the cache fills while the daemon is healthy");
+    assert_eq!(
+        published_families(&before).len(),
+        4,
+        "precondition: a complete cache, so the read below skips its fill"
+    );
+    let rates_before = h.model.request_count("GetRates");
+
+    h.model.arm(|f| {
+        f.reject_next
+            .push(("GetRates".to_string(), "chain check refused".to_string()))
+    });
+
+    let published = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("a check that runs on the retry and passes is a verified read");
+
+    assert_eq!(
+        h.model.request_count("GetRates") - rates_before,
+        2,
+        "the publication must rest on a check that actually ran: one rejected, one answered. A \
+         single request would mean the rejection was swallowed and nothing was verified"
+    );
+    assert_eq!(
+        published_families(&published).len(),
+        4,
+        "a verified read publishes the complete set"
+    );
+    assert_eq!(
+        published.settings.filter1x.selected.value, before.settings.filter1x.selected.value,
+        "and the daemon did not move, so the verified selection is the one it held all along"
+    );
+    h.stop();
+}
