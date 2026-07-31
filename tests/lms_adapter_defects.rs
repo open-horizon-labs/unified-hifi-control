@@ -520,6 +520,37 @@ async fn lms_failure_missing_result_member_is_reported() {
     handle.abort();
 }
 
+/// An unreachable server and a rejected request are different problems and must
+/// not share a message: one is configuration, the other is LMS refusing the
+/// command with no detail about why.
+#[tokio::test]
+#[serial_test::serial(lms_config)]
+async fn unreachable_server_is_not_reported_as_a_rejected_request() {
+    clear_lms_config();
+    let (bus, _rx) = test_bus();
+    // Port 1 on loopback: privileged and unused, so this is a connect refusal
+    // rather than an accepted-then-closed socket.
+    let adapter = LmsAdapter::new(bus);
+    adapter
+        .configure("127.0.0.1".to_string(), Some(1), None, None)
+        .await;
+
+    let err = match adapter.get_players().await {
+        Ok(_) => panic!("an unreachable port must not look like success"),
+        Err(e) => format!("{e:#}"),
+    };
+    let lowered = err.to_lowercase();
+    assert!(
+        lowered.contains("cannot reach"),
+        "an unreachable server must be reported as unreachable, got: {err}"
+    );
+    assert!(
+        !lowered.contains("closed the connection"),
+        "an unreachable server must not be described as LMS closing the \
+         connection - that is a different diagnosis: {err}"
+    );
+}
+
 /// The dead check being replaced must not be replaced by *another* dead check:
 /// a well-formed LMS reply still has to succeed.
 #[tokio::test]

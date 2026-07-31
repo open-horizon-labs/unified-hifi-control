@@ -146,6 +146,38 @@ unknown command, bad parameters, unknown player id, or bad server config are \
 indistinguishable at the transport, and it never returns a JSON-RPC error \
 object. A network fault looks the same, so do not read this as 'unsupported'.";
 
+/// Turn a `reqwest` transport failure into a message that says which of LMS's
+/// failure modes it actually is.
+///
+/// Worth distinguishing, because they call for different responses: an
+/// unreachable server is a configuration or network problem, whereas a socket
+/// closed *after* the request was accepted is LMS rejecting the request, and the
+/// operator needs to know that "rejected" carries no detail about why.
+fn describe_send_failure(command: &str, error: &reqwest::Error) -> anyhow::Error {
+    if error.is_connect() {
+        return anyhow!(
+            "cannot reach LMS to run `{}`: {}. Check the configured host and port.",
+            command,
+            error
+        );
+    }
+    if error.is_timeout() {
+        return anyhow!(
+            "LMS did not answer `{}` before the request timed out: {}. LMS can \
+             also hang rather than close on some bad-parameter requests, which \
+             looks identical to a slow server.",
+            command,
+            error
+        );
+    }
+    anyhow!(
+        "LMS closed the connection without answering `{}`. {} (transport: {})",
+        command,
+        LMS_FAILURE_NOTE,
+        error
+    )
+}
+
 /// Render a `slim.request` command array for an error message or log line.
 fn describe_command(player_id: Option<&str>, params: &[Value]) -> String {
     let words: Vec<String> = params
@@ -396,15 +428,10 @@ impl LmsRpc {
         // useless. See describe_command / LMS_FAILURE_NOTE.
         let command = describe_command(player_id, &params);
 
-        let response = request.send().await.map_err(|e| {
-            anyhow!(
-                "LMS closed the connection with no response for `{}`. {} \
-                 (transport: {})",
-                command,
-                LMS_FAILURE_NOTE,
-                e
-            )
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| describe_send_failure(&command, &e))?;
 
         if !response.status().is_success() {
             return Err(anyhow!(
@@ -418,15 +445,10 @@ impl LmsRpc {
         // LMS's closed socket into a valid empty 200, and `response.json()` would
         // report that as "EOF while parsing a value", which names neither the
         // cause nor the command.
-        let body = response.bytes().await.map_err(|e| {
-            anyhow!(
-                "LMS closed the connection mid-response for `{}`. {} \
-                 (transport: {})",
-                command,
-                LMS_FAILURE_NOTE,
-                e
-            )
-        })?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| describe_send_failure(&command, &e))?;
 
         if body.is_empty() {
             return Err(anyhow!(
@@ -2420,10 +2442,22 @@ impl AdapterLogic for LmsAdapter {
             AdapterCommand::VolumeAbsolute(v) => self.control(player_id, "vol_abs", Some(v)).await,
             AdapterCommand::VolumeRelative(v) => self.control(player_id, "vol_rel", Some(v)).await,
             AdapterCommand::Mute(_) => {
-                // LMS doesn't have direct mute support via JSON-RPC
+                // LMS *does* support mute control - `mixer muting <0|1>`, verified
+                // against live Lyrion 9.1.2 - and this adapter now reports mute
+                // state. Only the control path is unimplemented, and exposing it
+                // is player-feature work (#403), out of scope for #407.
+                //
+                // The previous message said "Mute not supported by LMS adapter",
+                // which blamed the provider for a UHC gap. Per #392: report
+                // "not yet implemented in UHC" and "not supported by this
+                // provider" as distinct states, never collapse them.
                 return Ok(AdapterCommandResponse {
                     success: false,
-                    error: Some("Mute not supported by LMS adapter".to_string()),
+                    error: Some(
+                        "Mute control is not yet implemented in UHC for LMS. LMS \
+                         itself supports it via `mixer muting <0|1>`; see #403."
+                            .to_string(),
+                    ),
                 });
             }
         };
