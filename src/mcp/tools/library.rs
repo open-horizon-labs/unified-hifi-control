@@ -19,8 +19,16 @@ use rust_mcp_sdk::{
 };
 use serde::{Deserialize, Serialize};
 
-/// How many results to request from a backend.
-const SEARCH_LIMIT: usize = 10;
+/// How many results to request from LMS.
+///
+/// Kept separate from [`ROON_SEARCH_LIMIT`] even though both are 10 today. They
+/// were two independent literals before #394, and a refactor mandated to change
+/// no behavior should not quietly couple them: the two backends page and rank
+/// differently, so a future tuning of one is not a decision about the other.
+const LMS_SEARCH_LIMIT: usize = 10;
+
+/// How many results to request from Roon.
+const ROON_SEARCH_LIMIT: usize = 10;
 
 /// Search for music
 #[mcp_tool(
@@ -81,11 +89,7 @@ pub async fn handle_search(
             // (library, TIDAL, Qobuz, ...), so `source` does not apply.
             match state
                 .lms
-                .search(
-                    &args.query,
-                    args.zone_id.as_deref(),
-                    Some(SEARCH_LIMIT),
-                )
+                .search(&args.query, args.zone_id.as_deref(), Some(LMS_SEARCH_LIMIT))
                 .await
             {
                 Ok(results) => {
@@ -107,7 +111,7 @@ pub async fn handle_search(
                 .search(
                     &args.query,
                     args.zone_id.as_deref(),
-                    Some(SEARCH_LIMIT),
+                    Some(ROON_SEARCH_LIMIT),
                     roon_search_source(args.source.as_deref()),
                 )
                 .await

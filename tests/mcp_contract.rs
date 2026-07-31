@@ -54,6 +54,7 @@ use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp;
+use unified_hifi_control::mcp::types::{McpPipelineStatus, McpSearchResult};
 
 use mock_servers::{MockHqpServer, MockLmsServer, MockOpenHomeDevice, MockUpnpRenderer};
 
@@ -495,6 +496,51 @@ async fn initialize_result_matches_fixture() {
         .expect("serverInfo.version") = json!("<CARGO_PKG_VERSION>");
 
     assert_matches_fixture("mcp_initialize.json", &result);
+}
+
+/// The wire snapshot above cannot see a *raised* declared protocol version,
+/// because the SDK negotiates down to whatever the client asked for: declare
+/// `2026-06-18`, have the client ask for `2025-11-25`, and the result still says
+/// `2025-11-25`. Lowering it is caught (the request becomes an outright error);
+/// raising it is not.
+///
+/// So the declared value is also asserted directly off `server_details()` — the
+/// reason that function was extracted from `create_mcp_extension`. This reads
+/// production's own value instead of restating it, and it is what makes
+/// `SERVER_PROTOCOL_VERSION` above a checked mirror rather than a second source
+/// of truth.
+#[test]
+fn declared_protocol_version_and_capabilities_are_pinned() {
+    let details = mcp::server_details();
+
+    let declared: String = details.protocol_version.into();
+    assert_eq!(
+        declared, SERVER_PROTOCOL_VERSION,
+        "the declared protocol version changed. The wire snapshot cannot catch a \
+         raised version, so this assertion is the one that matters — update \
+         SERVER_PROTOCOL_VERSION only when the change is intended."
+    );
+
+    // Capabilities gate request dispatch in the SDK, so the declared set decides
+    // which methods are reachable at all. #397 adds `resources`; #394 must not.
+    assert!(
+        details.capabilities.tools.is_some(),
+        "tools capability must be declared"
+    );
+    assert!(
+        details.capabilities.resources.is_none(),
+        "#394 must not declare a resources capability — that is #397's work"
+    );
+    assert!(
+        details.capabilities.prompts.is_none(),
+        "no prompts capability is declared today"
+    );
+    assert!(
+        details.capabilities.logging.is_none(),
+        "no logging capability is declared today"
+    );
+
+    assert_eq!(details.server_info.version, env!("CARGO_PKG_VERSION"));
 }
 
 /// Older clients must still get a session: the SDK negotiates down to the
@@ -1172,6 +1218,7 @@ async fn search_and_play_routing_is_pinned() {
 struct LmsHarness {
     app: TestApp,
     mock: MockLmsServer,
+    lms: Arc<LmsAdapter>,
     player_id: &'static str,
     _settings: SettingsFixture,
     _aggregator: tokio::task::JoinHandle<()>,
@@ -1231,13 +1278,18 @@ impl LmsHarness {
         Self {
             app,
             mock,
+            lms,
             player_id: Self::PLAYER_ID,
             _settings: settings,
             _aggregator: aggregator_task,
         }
     }
 
+    /// Stop the adapter before dropping the fixture. Without this its polling
+    /// task outlives the test and can write `lms-config.json` into a `TempDir`
+    /// that `SettingsFixture` has already removed.
     async fn stop(self) {
+        self.lms.stop().await;
         self._aggregator.abort();
         self.mock.stop().await;
     }
@@ -1594,16 +1646,33 @@ async fn no_tool_returns_an_unclassified_field() {
         collect_keys(&parsed, &mut returned);
     }
 
-    // `hifi_search`'s result fields are unreachable without a live music library,
-    // so they are listed explicitly. Keep in sync with `McpSearchResult`.
-    for field in ["title", "subtitle"] {
-        returned.insert(field.to_string());
-    }
-    // `McpPipelineStatus` only serializes when HQPlayer is connected with a live
-    // pipeline. Keep in sync with that struct.
-    for field in ["state", "filter", "shaper", "rate"] {
-        returned.insert(field.to_string());
-    }
+    // Two response shapes cannot be reached over the wire here: hifi_search needs
+    // a live music library, and McpPipelineStatus only serializes when HQPlayer is
+    // connected with a running pipeline.
+    //
+    // Their fields are collected by serializing the production types rather than
+    // by listing names in a comment. A hand-written list would have a hole exactly
+    // where it matters most: renaming McpSearchResult::subtitle would leave
+    // `subtitle` classified and the new name unnoticed — and McpSearchResult is
+    // the struct #396 exists to change.
+    collect_keys(
+        &serde_json::to_value(McpSearchResult {
+            title: String::new(),
+            subtitle: None,
+        })
+        .expect("McpSearchResult must serialize"),
+        &mut returned,
+    );
+    collect_keys(
+        &serde_json::to_value(McpPipelineStatus {
+            state: String::new(),
+            filter: String::new(),
+            shaper: String::new(),
+            rate: 0,
+        })
+        .expect("McpPipelineStatus must serialize"),
+        &mut returned,
+    );
 
     let unclassified: Vec<&String> = returned
         .iter()
