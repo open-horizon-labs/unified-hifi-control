@@ -50,8 +50,8 @@ const GROUP_PIPELINE: &str = "pipeline";
 ///
 /// This is intentionally a semantic, adapter-facing vocabulary rather than a wire vocabulary:
 /// callers carry names and decimal values, and [`crate::adapters::hqplayer::HqpAdapter`] resolves
-/// them against the daemon's current state before it writes. Issue #331 will add the checked
-/// dispatch path; this registry prevents its public command surface from inventing a second mapping.
+/// them against the daemon's current state before it writes. Issue #329 adds the checked internal
+/// dispatch path; #331's public consumers must reuse it instead of inventing a second mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum HqpSemanticOperation {
     /// [`crate::adapters::hqplayer::HqpAdapter::play`].
@@ -86,8 +86,8 @@ pub(crate) struct HqpControlOperation {
 }
 
 // This is deliberately one registry, not a second set of string matches in every consumer. The
-// producer validates every dynamically mutable control against it before publication, and #331 can
-// use the same mapping after it has preflighted a client command.
+// producer validates every dynamically mutable control against it before publication, and #329's
+// command service uses the same mapping after it has preflighted a client command.
 const HQP_SEMANTIC_OPERATION_REGISTRY: [HqpControlOperation; 11] = [
     HqpControlOperation {
         control_id: CONTROL_TRANSPORT_PLAY,
