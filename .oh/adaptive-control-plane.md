@@ -207,10 +207,35 @@ knob, which is the acceptance criterion the issue actually turns on.
 
 ### TDD evidence — RED before GREEN
 
-`tests/adaptive_control_plane.rs` was written first, against a deliberately naive stub
-(`src/producers/surface.rs` returning an empty projection and `control_plane.rs` routing by
-first-match). The RED transcript is recorded in the Execute PR comment and reproduced in
-"Verification" below.
+`tests/adaptive_control_plane.rs` was written first, against a deliberately naive stub:
+`surface.rs` returned an empty projection and `control_plane.rs::route` returned the *first*
+admitted snapshot — the fallthrough this issue exists to remove, written down so a test could kill
+it.
+
+```
+$ cargo test --all-features --test adaptive_control_plane
+test result: FAILED. 8 passed; 31 failed; 0 ignored
+```
+
+Two of the RED failures are the ones worth citing, because they are the issue's hard constraints
+failing exactly as predicted:
+
+```
+two_producers_claiming_one_zone_refuse_rather_than_pick
+  picking one silently is how a command lands on the wrong role:
+  Ok(ProducerKey { producer_id: "hqplayer:living-room", role: Playback, ... })
+
+a_producer_family_with_no_executor_is_refused_not_defaulted
+  expected a refusal naming the family, got Err(ServiceClosed)
+```
+
+Of the 8 that passed at RED, 6 passed vacuously over an empty control list (`no_two_surfaces_…`,
+`a_surface_that_offers_less_…`, `every_control_in_one_projection_…`,
+`a_verified_product_version_…`, `an_older_projection_…`, `routing_reads_only_admitted_state`) and 2
+were genuine (`a_projection_carries_exactly_one_producer_position`,
+`every_apply_effect_has_its_own_timing_key`). All 6 became non-vacuous at GREEN.
+
+GREEN: **44 passed, 0 failed**, plus 2 new unit tests in the HQPlayer command service.
 
 ### What landed
 
@@ -227,6 +252,28 @@ first-match). The RED transcript is recorded in the Execute PR comment and repro
 | Version fallback | An unsupported major yields `SurfaceProjection::Fallback` carrying the legible identity and the refusal. An untested *product* version yields a notice and keeps every discovered control. A newer minor yields `UnknownAdditions` and renders. |
 | `ControlPlaneService::route()` | Resolves a prefixed zone id to a `ProducerKey` from admitted state only. An unknown `hqplayer:` identity returns `RouteRefusal::UnknownProducer`; it can never resolve to another family's key. |
 | `ControlPlaneService::submit()` | Surface-neutral semantic command → routed producer → #375's registry → #329's actor. A producer family with no registered executor is refused, not defaulted. |
+
+### What the review pass changed
+
+Three defects in my own first cut, all of the same shape — a decision that looked deterministic and
+was not, or a field that promised something it did not deliver:
+
+| Finding | Fix |
+|---|---|
+| Two outstanding writes invalidating one enumeration picked whichever came first in `operations`, a `Vec` order the producer never promised | `Invalidation::of` sorts by operation id first — the same reasoning #324 used when it refused to keep "the first" C2 claimant |
+| `narrow()` ended with a `truncate` that could never fire, so the retention rule read as if it had a bound it did not | rewritten as membership-then-position over a `BTreeSet`; the budget is deliberately exceeded when a control holds more selections than the surface asked for, and that is now stated |
+| `SurfaceCapabilities::reason_text` was declared, documented, and read by nothing | removed. A capability that changes no projection is a promise to a future reader that this layer honours something it does not |
+
+### What the dissent pass changed
+
+Four more, and the first two are the ones that would have shipped a false claim:
+
+| Finding | Fix |
+|---|---|
+| `every_operation_mcp_may_invoke_is_fully_described_without_guessing` asserted `timing_key != unknown`, but nothing enforced it: an `ApplyEffect` from a newer minor would be advertised as invokable with `apply.timing.unknown` — a tool description that is an admission rather than a description | unrecognized `lane`/`effect`/`disruption` now withhold mutation under `WITHHELD_UNDESCRIBABLE_APPLY`, with a test |
+| `SurfaceProjection` had a `Fallback` arm nothing could construct: an admitted snapshot cannot carry an unsupported major, because `admit_document` refused it upstream. An enum modelling a union that only exists on a wire nobody has approved yet | removed. `project` returns `RenderedProjection`; `admit_for_surface` returns the fallback as its error. The proposed HTTP contract below describes the union honestly, without an in-tree type that lies about being reachable |
+| `SurfaceProfile::mcp()` capped risk at `Caution`, which would have silently removed a capability `hifi_hqplayer_set_pipeline` ships today (mode is `playback_interruption`) the moment MCP adopted the profile | ceiling raised to `Disruptive`, `Destructive` still excluded, and the decision is pinned by `mcp_keeps_the_capability_the_shipped_tool_already_has` |
+| A bounded surface could not disclose staged edits it was not shown, which is exactly the case the issue's immediate-tuning criterion names | `RenderedProjection::staged_elsewhere`, disclosure only — it never applies, discards or blocks |
 
 ### Drift check
 
@@ -278,6 +325,9 @@ request type. Notes that matter for the approval decision:
 
 1. **No surface consumes this yet.** Web rendering, MCP discovery/execution and device manifests all
    require the contract above. The layer is complete and tested; the last hop is an approval.
+   Concretely: `ControlPlaneService` is constructed by nothing in `src/main.rs`, because the only
+   place it could be held is `AppState`, which lives in `src/api/` and may not name
+   `crate::producers`.
 2. **ESP32 manifests are doubly blocked.** Beyond the API freeze, #326 (matcher-to-manifest
    composition) does not exist on this branch. The `device` profile and its bounded, priority-ordered
    projection are delivered and tested, but there is no manifest composer to feed.
@@ -291,14 +341,44 @@ request type. Notes that matter for the approval decision:
 5. **Continuous-control interaction rules are not implemented.** Transient drag state, coalesced
    pointer intent and latest-wins settlement are surface-side behaviours; the projector supplies the
    range, step, unit and reset provenance they need, and #342/#329 own the interaction itself.
-6. **`SurfaceProjection` is not itself version-negotiated across processes.** It carries a `schema`
-   field and a compatibility rule, but with no out-of-process consumer the rule has never been
-   exercised against a real mismatch.
+6. **`RenderedProjection` is not itself version-negotiated across processes.** It carries a `schema`
+   field, but with no out-of-process consumer the compatibility rule has never been exercised
+   against a real mismatch.
 7. **No live validation.** Hermetic fixtures only, as instructed. #375 already records that the
    6.0.2 rig is in an About-only Trial state that prevents native/config observation.
+8. **The routing rule is a second router, not the one in the live path.** #328 already fixed the
+   `hqplayer:`-falls-through-to-Roon defect in `src/knobs/routes.rs`. `ControlPlaneService::route`
+   governs the *producer-addressed* path a future surface would use, so the acceptance criterion
+   "no route defaults unknown HQPlayer identity to Roon" is now satisfied twice rather than once
+   here.
+9. **Projection tests construct `ProducerSnapshot` directly.** Its fields are `pub`, so the pure
+   projection tests exercise only the contract-layer `admit_document`, not #324's admission gate.
+   The routing and command tests do go through the real gate. The gap is narrow — canonical fixtures
+   pass both — but `snapshot.repairs` has no coverage from a demotion the aggregator actually
+   performed, so `ProjectionNotice::IntentRepaired` is reachable in code and unproven end to end.
 
 ---
 
 ## Verification
 
-Recorded at the exact head in the Execute PR comment.
+**Updated:** 2026-07-31 · exact head recorded in the Execute PR comment.
+
+| Gate | Result |
+|---|---|
+| `cargo test --all-features --test adaptive_control_plane` | 44 passed, 0 failed |
+| `cargo test --all-features --lib producers::hqplayer_command_service` | 16 passed, 0 failed (2 new) |
+| `cargo test --all-features --test adaptive_publication_lint` | 57 passed — the surface boundary holds |
+| `cargo test --all-features --test architecture_lint` | 9 passed |
+| `cargo test --all-features --test api_contract` | 2 passed; route fixture unchanged |
+| `cargo test --all-features --test adaptive_dependency_lint` / `aggregator_lint` | 7 / 2 passed |
+| `cargo test --all-features --no-fail-fast` (whole suite) | **1296 passed, 0 failed, 13 ignored** (environment-gated) |
+| `cargo fmt --all -- --check` | clean |
+| `cargo clippy --lib --all-features -- -D warnings` | clean |
+| `cargo check --release --all-features` | clean |
+| `dx build --release --platform web --features web` | recorded in the Execute comment |
+
+**Drift, verified rather than asserted.** Against the base `212f555` the only files touched are
+`.oh/adaptive-control-plane.md`, `src/producers/{surface,control_plane,mod,hqplayer,hqplayer_command_service}.rs`
+and `tests/adaptive_control_plane.rs`. `src/api/`, `src/mcp/`, `src/app/`, `src/knobs/`, `src/mqtt/`
+and `src/main.rs` are untouched. `tests/fixtures/api_routes.txt` is byte-identical to `origin/v3`.
+`src/main.rs` carries 88 `.route(` lines on the base and 88 here. No label applied to the PR.
