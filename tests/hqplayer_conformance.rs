@@ -130,8 +130,14 @@ impl Harness {
 
     /// Connected, with a wire policy of the test's choosing.
     async fn with_policy(policy: WirePolicy) -> Self {
-        let h = Self::start(VERIFIED_PROFILE, policy, fast_timeouts()).await;
+        Self::connected_then_policy(policy, fast_timeouts()).await
+    }
+
+    /// Complete the coherent initial snapshot before arming a command-level wire fault.
+    async fn connected_then_policy(policy: WirePolicy, timeouts: HqpTimeouts) -> Self {
+        let h = Self::start(VERIFIED_PROFILE, WirePolicy::default(), timeouts).await;
         h.adapter.connect().await.expect("connect to fake daemon");
+        h.server.set_policy(policy);
         h
     }
 
@@ -474,11 +480,13 @@ async fn a_silent_daemon_is_retried_exactly_the_configured_number_of_times() {
         ..WirePolicy::default()
     })
     .await;
+    let state_requests_before_command = h.server.stats().element_count("State");
     let _ = h.adapter.get_state().await;
     assert_eq!(
-        h.server.stats().element_count("State"),
+        h.server.stats().element_count("State") - state_requests_before_command,
         fast_timeouts().max_attempts,
-        "the retry budget is asserted by counting the State requests the daemon saw, never by timing"
+        "the retry budget is asserted by counting only the command's State requests, excluding the \
+         coherent initial snapshot and never relying on timing"
     );
     h.stop();
 }
@@ -4569,8 +4577,7 @@ async fn a_burst_larger_than_the_skip_ceiling_is_reported_rather_than_drained_fo
     // Comfortably past the 256 ceiling, delivered ahead of the reply in one write so the whole burst
     // lands in the buffer and the drain loop has to deal with all of it without reading again.
     let burst = vec![PUSH_STATUS_FRAME; 400].join("\n");
-    let h = Harness::start(
-        VERIFIED_PROFILE,
+    let h = Harness::connected_then_policy(
         WirePolicy {
             coalesce_leading_for_element: Some(("State".to_string(), burst)),
             ..WirePolicy::default()
@@ -4582,7 +4589,6 @@ async fn a_burst_larger_than_the_skip_ceiling_is_reported_rather_than_drained_fo
         },
     )
     .await;
-    h.adapter.connect().await.expect("connect");
 
     let err = h
         .adapter
@@ -5160,8 +5166,7 @@ async fn a_follower_burst_past_the_ceiling_is_refused_like_a_leading_burst() {
          it; {} bytes",
         follower.len()
     );
-    let h = Harness::start(
-        VERIFIED_PROFILE,
+    let h = Harness::connected_then_policy(
         WirePolicy {
             coalesce_extra_for_element: Some(("State".to_string(), follower)),
             ..WirePolicy::default()
@@ -5169,7 +5174,6 @@ async fn a_follower_burst_past_the_ceiling_is_refused_like_a_leading_burst() {
         fast_timeouts(),
     )
     .await;
-    h.adapter.connect().await.expect("connect");
 
     let outcome = h.adapter.get_state().await;
 
@@ -7670,8 +7674,7 @@ async fn a_lost_volume_range_reply_does_not_publish_the_cache_its_reconnect_empt
     // Element-scoped and one-shot: the daemon applies the request, then vanishes without replying,
     // once. Scoping it to `VolumeRange` keeps it clear of connection setup and of the list fill, so
     // the only thing it can disturb is the lazy volume-range fetch itself.
-    let h = Harness::start(
-        VERIFIED_PROFILE,
+    let h = Harness::connected_then_policy(
         WirePolicy {
             apply_then_drop_reply_for_element: Some("VolumeRange".to_string()),
             ..WirePolicy::default()
@@ -7679,10 +7682,11 @@ async fn a_lost_volume_range_reply_does_not_publish_the_cache_its_reconnect_empt
         fast_timeouts(),
     )
     .await;
-    h.adapter.connect().await.expect("connect");
 
-    // The first read after connect: nothing is cached, so this read both fills the lists and fetches
-    // the volume range.
+    // The lifecycle handshake now establishes the initial range. Exercise the same lost-reply
+    // recovery boundary explicitly, then ask the projection to prove that any cache invalidated by
+    // the reconnect is either refilled coherently or refused.
+    let _ = h.adapter.get_volume_range().await;
     let outcome = h.adapter.get_pipeline_status().await;
 
     assert!(

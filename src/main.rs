@@ -10,9 +10,6 @@ mod server {
         mdns,
     };
 
-    // Import Startable trait for adapter lifecycle methods
-    use adapters::Startable;
-
     // Import load_app_settings for checking adapter enabled state
     use api::load_app_settings;
 
@@ -252,17 +249,6 @@ mod server {
             }
         }
 
-        // Auto-connect HQPlayer if configured (establishes TCP connection at startup)
-        if hqplayer.is_configured().await {
-            match hqplayer.get_pipeline_status().await {
-                Ok(_) => tracing::info!("HQPlayer auto-connected at startup"),
-                Err(e) => tracing::warn!(
-                    "HQPlayer auto-connect failed (will retry on page access): {}",
-                    e
-                ),
-            }
-        }
-
         // HQP zone link service
         let hqp_zone_links = Arc::new(adapters::hqplayer::HqpZoneLinkService::new(
             hqp_instances.clone(),
@@ -296,10 +282,27 @@ mod server {
         // Start enabled adapters (single codepath using coordinator)
         // =========================================================================
 
+        // Subscribe the authoritative aggregator before any producer can publish its initial
+        // discovery snapshot. The bus is broadcast-only and does not replay messages to subscribers
+        // created after adapter startup.
+        let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
+        let (aggregator_ready_tx, aggregator_ready_rx) = tokio::sync::oneshot::channel();
+        let aggregator_for_spawn = zone_aggregator.clone();
+        tokio::spawn(async move {
+            aggregator_for_spawn
+                .run_with_ready(aggregator_ready_tx)
+                .await;
+        });
+        aggregator_ready_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("ZoneAggregator stopped before subscribing to the bus"))?;
+        tracing::info!("ZoneAggregator started");
+
         // Build list of startable adapters
         // Note: lms_cli shares config with lms - both start when LMS is configured
         let startable_adapters: Vec<Arc<dyn adapters::Startable>> = vec![
             roon.clone(),
+            hqp_instances.clone(),
             lms.clone(),
             lms_cli.clone(),
             openhome.clone(),
@@ -309,17 +312,6 @@ mod server {
         // Single loop to start all enabled adapters
         coord.start_all_enabled(&startable_adapters).await;
 
-        // Initialize ZoneAggregator for unified zone state
-        let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
-        let aggregator_for_spawn = zone_aggregator.clone();
-        tokio::spawn(async move {
-            aggregator_for_spawn.run().await;
-        });
-        tracing::info!("ZoneAggregator started");
-
-        // Clone Roon adapter for shutdown access (cheap - just Arc clones)
-        let roon_for_shutdown = roon.clone();
-
         // Create shutdown token for graceful SSE termination (fixes #73)
         let shutdown_token = CancellationToken::new();
 
@@ -327,7 +319,7 @@ mod server {
         let state = api::AppState::new(
             roon,
             hqplayer,
-            hqp_instances,
+            hqp_instances.clone(),
             hqp_zone_links,
             lms.clone(),
             openhome.clone(),
@@ -634,14 +626,14 @@ mod server {
         // Give listeners a moment to react to ShuttingDown
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Stop adapters
-        roon_for_shutdown.stop().await;
+        // Stop every coordinator-owned Startable and wait for its children. Individual stop methods
+        // are idempotent, so adapters that already reacted to ShuttingDown remain safe here.
+        coord
+            .stop_all(state_for_shutdown.startable_adapters.as_ref())
+            .await;
         if let Some(ref fw) = firmware_service {
             fw.stop();
         }
-        lms.stop().await;
-        openhome.stop().await;
-        upnp.stop().await;
         tracing::info!("Shutdown complete");
 
         Ok(())

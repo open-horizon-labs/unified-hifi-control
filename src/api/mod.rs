@@ -1540,6 +1540,20 @@ pub async fn hqp_configure_handler(
     // Save to instance manager for persistence
     state.hqp_instances.save_to_config().await;
 
+    // An enabled fresh installation may have skipped the HQPlayer lifecycle at process startup
+    // because no endpoint existed yet. Start the idempotent manager after configuration rather than
+    // requiring a process restart, while still honoring the adapter's explicit enabled setting.
+    if state.coordinator.is_enabled("hqplayer").await {
+        match state.hqp_instances.start().await {
+            Ok(()) => state.coordinator.set_running("hqplayer", true).await,
+            Err(error) => {
+                tracing::warn!(
+                    "HQPlayer managed lifecycle could not start after configuration: {error}"
+                )
+            }
+        }
+    }
+
     // Test connection by attempting to get pipeline status (this establishes connection)
     let connected = match state.hqplayer.get_pipeline_status().await {
         Ok(_) => true,
@@ -1750,6 +1764,15 @@ pub async fn hqp_add_instance_handler(
             req.password,
         )
         .await;
+
+    if state.coordinator.is_enabled("hqplayer").await {
+        match state.hqp_instances.start().await {
+            Ok(()) => state.coordinator.set_running("hqplayer", true).await,
+            Err(error) => tracing::warn!(
+                "HQPlayer managed lifecycle could not start after adding an instance: {error}"
+            ),
+        }
+    }
 
     (
         StatusCode::OK,
@@ -2257,11 +2280,14 @@ pub async fn api_settings_post_handler(
                 if adapter.can_start().await {
                     if let Err(e) = adapter.start().await {
                         tracing::warn!("Failed to start adapter {}: {}", name, e);
+                    } else {
+                        coord.set_running(name, true).await;
                     }
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
                 adapter.stop().await;
+                coord.set_running(name, false).await;
             }
         }
     }

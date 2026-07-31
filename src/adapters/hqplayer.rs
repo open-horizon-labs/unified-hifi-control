@@ -30,13 +30,16 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
+use crate::adapters::Startable;
 use crate::bus::{
     BusEvent, NowPlaying as BusNowPlaying, PlaybackState, PrefixedZoneId, SharedBus, TrackMetadata,
     VolumeControl as BusVolumeControl, VolumeScale, Zone as BusZone,
@@ -854,6 +857,18 @@ pub struct HqpStatus {
     pub active_channels: u32,
     pub samplerate: u32,
     pub bitrate: u32,
+    /// Track title from the optional `Status/metadata` child.
+    ///
+    /// Kept internal until the public HQPlayer payload contract is explicitly revised; the unified
+    /// zone projection can still publish it through the existing now-playing shape.
+    #[serde(skip)]
+    pub title: Option<String>,
+    /// Track artist from the optional `Status/metadata` child.
+    #[serde(skip)]
+    pub artist: Option<String>,
+    /// Track album from the optional `Status/metadata` child.
+    #[serde(skip)]
+    pub album: Option<String>,
 }
 
 /// Volume range info
@@ -1269,6 +1284,12 @@ struct HqpAdapterState {
     web_username: Option<String>,
     web_password: Option<String>,
     connected: bool,
+    /// Monotonic identity of the last connection that completed a coherent handshake.
+    ///
+    /// A fast reconnect may pass through `connected=false` between two consumer observations, so
+    /// correctness cannot depend on sampling that transient edge. This advances only when the new
+    /// socket has produced the complete initial direct-zone snapshot.
+    producer_epoch: u64,
     info: Option<HqpInfo>,
     last_state: Option<HqpState>,
     modes: Vec<ListItem>,
@@ -1329,6 +1350,7 @@ impl Default for HqpAdapterState {
             web_username: None,
             web_password: None,
             connected: false,
+            producer_epoch: 0,
             info: None,
             last_state: None,
             modes: Vec::new(),
@@ -1355,6 +1377,15 @@ impl Default for HqpAdapterState {
 pub struct HqpAdapter {
     state: Arc<RwLock<HqpAdapterState>>,
     connection: Arc<Mutex<Option<HqpConnection>>>,
+    /// Serializes socket establishment. The command mutex serializes an existing connection, but
+    /// without this two concurrent first requests can both observe `None` and install two sessions.
+    connect_lock: Arc<Mutex<()>>,
+    /// Linearizes one instance's native conversations with connection, disconnect and configure.
+    ///
+    /// The socket mutex protects request/reply framing, but not the identity surrounding it: without
+    /// this lease `configure` can publish a new host while an old-host response is still in flight,
+    /// and a poll can combine State/Status/VolumeRange around a local command.
+    conversation_lock: Arc<Mutex<()>>,
     http_client: Client,
     bus: SharedBus,
     /// Unsolicited documents skipped while awaiting command replies. Diagnostics for tier-1 live
@@ -1373,6 +1404,8 @@ impl HqpAdapter {
         let adapter = Self {
             state: Arc::new(RwLock::new(HqpAdapterState::default())),
             connection: Arc::new(Mutex::new(None)),
+            connect_lock: Arc::new(Mutex::new(())),
+            conversation_lock: Arc::new(Mutex::new(())),
             http_client,
             bus,
             unsolicited_skipped: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1446,11 +1479,19 @@ impl HqpAdapter {
         web_username: Option<String>,
         web_password: Option<String>,
     ) {
-        let changed = {
+        let _conversation_guard = self.conversation_lock.lock().await;
+        let (changed, old_reachable) = {
             let mut state = self.state.write().await;
             let port = port.unwrap_or(DEFAULT_PORT);
 
             let changed = state.host.as_ref() != Some(&host) || state.port != port;
+            let old_reachable = changed.then(|| {
+                (
+                    state.connected,
+                    state.host.clone(),
+                    state.instance_name.clone(),
+                )
+            });
             state.host = Some(host);
             state.port = port;
             state.web_port = web_port.unwrap_or(DEFAULT_WEB_PORT);
@@ -1483,12 +1524,19 @@ impl HqpAdapter {
                 state.hidden_fields.clear();
                 state.config_title = None;
             }
-            changed
+            (changed, old_reachable)
         };
 
         if changed {
             let mut conn = self.connection.lock().await;
             *conn = None;
+        }
+
+        if let Some((true, Some(old_host), instance_name)) = old_reachable {
+            let zone_id = PrefixedZoneId::hqplayer(instance_name.as_deref().unwrap_or(&old_host));
+            self.bus.publish(BusEvent::ZoneRemoved { zone_id });
+            self.bus
+                .publish(BusEvent::HqpDisconnected { host: old_host });
         }
 
         // Persist to disk
@@ -1548,8 +1596,25 @@ impl HqpAdapter {
         }
     }
 
-    /// Connect to HQPlayer
-    pub async fn connect(&self) -> Result<()> {
+    /// Identity of the most recent session that completed the coherent handshake.
+    ///
+    /// Internal lifecycle provenance seam for producer snapshots and conformance tests. It is not
+    /// serialized by any existing HTTP, SSE or MCP payload.
+    pub async fn producer_epoch(&self) -> u64 {
+        self.state.read().await.producer_epoch
+    }
+
+    /// Establish only the serialized native transport.
+    ///
+    /// The managed producer's reachability contract is deliberately stronger than this: it becomes
+    /// connected only after [`Self::connect`] has assembled a coherent zone snapshot. Command retry
+    /// must nevertheless be able to rebuild a socket without making an unrelated query depend on
+    /// every projection field being readable. The caller holds `connect_lock`.
+    async fn establish_transport_locked(&self) -> Result<()> {
+        if self.connection.lock().await.is_some() {
+            return Ok(());
+        }
+
         let (host, port) = {
             let state = self.state.read().await;
             let host = state
@@ -1566,35 +1631,81 @@ impl HqpAdapter {
             .map_err(|_| anyhow!("Connection timeout"))?
             .map_err(|e| anyhow!("Connection failed: {}", e))?;
 
-        // A new session inherits nothing. The daemon may have restarted onto another profile, been
-        // reconfigured, or simply followed the source onto the other chain while UHC was away, and a
-        // list index cached before the drop names a different setting in every one of those cases.
+        // A new native session inherits nothing. It is transport-usable immediately, but it is not
+        // yet a publishable producer session and therefore does not advance `producer_epoch` or set
+        // `connected`.
         self.invalidate_chain_cache().await;
-
         let (read_half, write_half) = stream.into_split();
         let reader = BufReader::new(read_half);
+        *self.connection.lock().await = Some(HqpConnection {
+            stream: reader,
+            write_half,
+            carry: Vec::new(),
+        });
+        Ok(())
+    }
 
-        {
-            let mut conn = self.connection.lock().await;
-            *conn = Some(HqpConnection {
-                stream: reader,
-                write_half,
-                carry: Vec::new(),
-            });
+    /// Connect to HQPlayer
+    pub async fn connect(&self) -> Result<()> {
+        let _conversation_guard = self.conversation_lock.lock().await;
+        let _connect_guard = self.connect_lock.lock().await;
+
+        // A second caller may have completed the session while this caller waited for the guard.
+        let has_connection = self.connection.lock().await.is_some();
+        if has_connection && self.state.read().await.connected {
+            return Ok(());
         }
 
-        {
-            let mut state = self.state.write().await;
-            state.connected = true;
-        }
+        self.establish_transport_locked().await?;
+        let host = self
+            .state
+            .read()
+            .await
+            .host
+            .clone()
+            .ok_or_else(|| anyhow!("HQPlayer host not configured"))?;
 
-        // Minimal on-connect: just GetInfo + Status to verify connection
-        let info = self.get_info_inner().await?;
-        let status = self.get_playback_status_inner().await.unwrap_or_default();
+        // Reachability starts only after every field required to build a truthful direct-zone
+        // snapshot has been read on this session. In particular, Status failure cannot be replaced
+        // with Default: doing so publishes a stopped, empty, fixed-volume zone that the daemon never
+        // reported and leaves `connected=true` after a partial handshake.
+        let handshake = async {
+            let info = self.get_info_inner().await?;
+            let state = self.get_state_inner().await?;
+            let status = self.get_playback_status_inner().await?;
+            let volume_range = self.get_volume_range_inner().await?;
+            Ok::<_, anyhow::Error>((info, state, status, volume_range))
+        }
+        .await;
+
+        let (info, observed_state, status, volume_range) = match handshake {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                {
+                    let mut conn = self.connection.lock().await;
+                    *conn = None;
+                }
+                {
+                    let mut state = self.state.write().await;
+                    state.connected = false;
+                    state.info = None;
+                    state.last_state = None;
+                    state.volume_range = None;
+                    Self::clear_chain_cache(&mut state);
+                }
+                return Err(error.context("HQPlayer coherent initial snapshot failed"));
+            }
+        };
 
         {
             let mut state = self.state.write().await;
             state.info = Some(info.clone());
+            state.last_state = Some(observed_state);
+            state.volume_range = Some(volume_range.clone());
+            state.producer_epoch = state.producer_epoch.wrapping_add(1);
+            // This is deliberately last: no observer may see reachable until the session has a
+            // coherent initial snapshot ready to publish.
+            state.connected = true;
         }
 
         tracing::info!("HQPlayer connected: {} v{}", info.name, info.version);
@@ -1613,7 +1724,7 @@ impl HqpAdapter {
             instance_name.as_deref(),
             &info,
             &status,
-            &VolumeRange::default(),
+            &volume_range,
         );
         self.bus.publish(BusEvent::ZoneDiscovered { zone });
 
@@ -1626,20 +1737,30 @@ impl HqpAdapter {
 
     /// Disconnect
     pub async fn disconnect(&self) {
-        let (host, instance_name) = {
+        let _conversation_guard = self.conversation_lock.lock().await;
+        let (was_connected, host, instance_name) = {
             let mut state = self.state.write().await;
+            let was_connected = state.connected;
             state.connected = false;
-            (state.host.clone(), state.instance_name.clone())
+            state.info = None;
+            state.last_state = None;
+            state.volume_range = None;
+            Self::clear_chain_cache(&mut state);
+            (
+                was_connected,
+                state.host.clone(),
+                state.instance_name.clone(),
+            )
         };
-        // Nothing observed through the old session may outlive it.
-        self.invalidate_chain_cache().await;
-
         {
             let mut conn = self.connection.lock().await;
             *conn = None;
         }
 
-        if let Some(ref h) = host {
+        if was_connected {
+            let Some(ref h) = host else {
+                return;
+            };
             // Emit ZoneRemoved for this HQPlayer instance
             let zone_id = PrefixedZoneId::hqplayer(instance_name.as_deref().unwrap_or(h));
             self.bus.publish(BusEvent::ZoneRemoved { zone_id });
@@ -1647,6 +1768,111 @@ impl HqpAdapter {
             self.bus
                 .publish(BusEvent::HqpDisconnected { host: h.clone() });
         }
+    }
+
+    /// Observe and publish one complete direct-zone snapshot.
+    ///
+    /// `ZoneDiscovered` is intentionally an upsert in the aggregator. Publishing the whole zone is
+    /// what lets a definitive server clear remove now-playing metadata or volume capability; the
+    /// narrower delta events cannot express either transition.
+    async fn observe_and_publish_zone(&self) -> Result<()> {
+        if !self.get_status().await.connected {
+            self.connect().await?;
+            return Ok(());
+        }
+
+        let _conversation_guard = self.conversation_lock.lock().await;
+        let epoch = self.producer_epoch().await;
+        let observed_state = self.get_state_inner().await?;
+        let status = self.get_playback_status_inner().await?;
+        // Re-read the range rather than treating it as process-lifetime configuration. A restarted
+        // daemon or an external configuration change can alter fixed/adaptive/range policy.
+        let volume_range = self.get_volume_range_inner().await?;
+
+        let (host, instance_name, info) = {
+            let mut state = self.state.write().await;
+            if state.producer_epoch != epoch {
+                // One of the reconnect-capable reads established a new session and `connect()`
+                // already published that session's coherent initial zone. Never combine a State
+                // from before that edge with Status/VolumeRange from after it.
+                return Ok(());
+            }
+            state.last_state = Some(observed_state);
+            state.volume_range = Some(volume_range.clone());
+            (
+                state
+                    .host
+                    .clone()
+                    .ok_or_else(|| anyhow!("HQPlayer host not configured"))?,
+                state.instance_name.clone(),
+                state
+                    .info
+                    .clone()
+                    .ok_or_else(|| anyhow!("HQPlayer session has no coherent identity"))?,
+            )
+        };
+
+        let zone = Self::hqp_status_to_zone(
+            &host,
+            instance_name.as_deref(),
+            &info,
+            &status,
+            &volume_range,
+        );
+        self.bus.publish(BusEvent::ZoneDiscovered { zone });
+        self.bus.publish(BusEvent::HqpStateChanged {
+            host: host.clone(),
+            state: match status.state {
+                0 => "stopped",
+                1 => "paused",
+                2 => "playing",
+                _ => "unknown",
+            }
+            .to_string(),
+        });
+        self.bus.publish(BusEvent::HqpPipelineChanged {
+            host,
+            filter: (!status.active_filter.is_empty()).then_some(status.active_filter),
+            shaper: (!status.active_shaper.is_empty()).then_some(status.active_shaper),
+            rate: (status.active_rate != 0).then_some(status.active_rate.to_string()),
+        });
+        Ok(())
+    }
+
+    /// Run this configured instance until cancelled.
+    ///
+    /// Each instance owns its retry timing independently, while the manager remains the single
+    /// adapter-wide lifecycle/ACK visible to the coordinator. Poll futures are cancellation-safe:
+    /// cancellation drops the in-flight request and immediately closes the session before return.
+    async fn run_managed(&self, shutdown: CancellationToken) {
+        const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+        loop {
+            let observation = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                result = self.observe_and_publish_zone() => result,
+            };
+
+            let delay = match observation {
+                Ok(()) => POLL_INTERVAL,
+                Err(error) => {
+                    tracing::warn!("HQPlayer managed observation failed: {error}");
+                    // A handshake failure already leaves a clean disconnected session. A failure
+                    // after reachability normally passes through send_command/mark_disconnected;
+                    // this closes any remaining partially-used socket without publishing a false
+                    // disconnect edge for a session that never became reachable.
+                    self.disconnect().await;
+                    self.timeouts().await.reconnect_delay
+                }
+            };
+
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+
+        self.disconnect().await;
     }
 
     /// Drop every cached chain-scoped enumeration.
@@ -2171,6 +2397,12 @@ impl HqpAdapter {
 
     /// Ensure connection is established, reconnecting if needed
     pub async fn ensure_connected(&self) -> Result<()> {
+        let _conversation_guard = self.conversation_lock.lock().await;
+        self.ensure_transport().await
+    }
+
+    /// Ensure a native socket exists. The caller owns the conversation lease.
+    async fn ensure_transport(&self) -> Result<()> {
         // Check if already connected
         {
             let conn = self.connection.lock().await;
@@ -2179,29 +2411,43 @@ impl HqpAdapter {
             }
         }
 
-        // Not connected, try to connect
-        self.connect().await
+        // Command recovery needs only a serialized transport. Managed reachability remains false
+        // until `connect()` completes and publishes its coherent initial snapshot.
+        let _connect_guard = self.connect_lock.lock().await;
+        self.establish_transport_locked().await
     }
 
     /// Mark connection as broken (called on communication errors)
     async fn mark_disconnected(&self) {
-        let (host, instance_name) = {
+        let (was_connected, host, instance_name) = {
             let mut state = self.state.write().await;
+            let was_connected = state.connected;
             state.connected = false;
-            (state.host.clone(), state.instance_name.clone())
+            state.info = None;
+            state.last_state = None;
+            state.volume_range = None;
+            Self::clear_chain_cache(&mut state);
+            (
+                was_connected,
+                state.host.clone(),
+                state.instance_name.clone(),
+            )
         };
-        self.invalidate_chain_cache().await;
-
         {
             let mut conn = self.connection.lock().await;
             *conn = None;
         }
 
-        if let Some(ref h) = host {
+        if was_connected {
+            let Some(ref h) = host else {
+                return;
+            };
             tracing::warn!("HQPlayer connection lost to {}", h);
             // Emit ZoneRemoved for this HQPlayer instance
             let zone_id = PrefixedZoneId::hqplayer(instance_name.as_deref().unwrap_or(h));
             self.bus.publish(BusEvent::ZoneRemoved { zone_id });
+            self.bus
+                .publish(BusEvent::HqpDisconnected { host: h.clone() });
         }
     }
 
@@ -2229,6 +2475,12 @@ impl HqpAdapter {
 
     /// Send command and get response with auto-reconnection
     async fn send_command(&self, xml: &str) -> Result<String> {
+        let _conversation_guard = self.conversation_lock.lock().await;
+        self.send_command_serialized(xml).await
+    }
+
+    /// Retry one command while the caller owns the instance conversation lease.
+    async fn send_command_serialized(&self, xml: &str) -> Result<String> {
         let timeouts = self.timeouts().await;
         let mut last_error = None;
         // Relative and toggling commands carry a side effect that is not the same applied twice.
@@ -2238,7 +2490,7 @@ impl HqpAdapter {
 
         for attempt in 0..timeouts.max_attempts {
             // Ensure we're connected
-            if let Err(e) = self.ensure_connected().await {
+            if let Err(e) = self.ensure_transport().await {
                 last_error = Some(e);
                 if attempt + 1 < timeouts.max_attempts {
                     tracing::debug!(
@@ -2592,10 +2844,62 @@ impl HqpAdapter {
     // Inner methods (used during connect, no auto-reconnect to avoid recursion)
     // =========================================================================
 
+    /// Require the minimum authoritative root shape needed for a publishable session snapshot.
+    ///
+    /// The normal parsers remain tolerant for version-specific optional fields. The handshake is a
+    /// different boundary: silently defaulting a missing required field would turn `<Status/>` into
+    /// a fabricated stopped, zero-volume zone and call it reachable.
+    fn require_root_attrs(response: &str, element: &str, attrs: &[&str]) -> Result<()> {
+        let actual = framing::root_element(response);
+        if actual.as_deref() != Some(element) {
+            return Err(anyhow!(
+                "Expected {element} handshake document, received {:?}",
+                actual
+            ));
+        }
+        let missing: Vec<&str> = attrs
+            .iter()
+            .copied()
+            .filter(|attr| Self::parse_attr(response, attr).is_none())
+            .collect();
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "Incomplete {element} handshake document; missing root attribute(s): {}",
+                missing.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_numeric_root_attrs(response: &str, element: &str, attrs: &[&str]) -> Result<()> {
+        Self::require_root_attrs(response, element, attrs)?;
+        let invalid: Vec<&str> = attrs
+            .iter()
+            .copied()
+            .filter(|attr| {
+                Self::parse_attr(response, attr)
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .is_none()
+            })
+            .collect();
+        if !invalid.is_empty() {
+            return Err(anyhow!(
+                "Invalid {element} handshake numeric attribute(s): {}",
+                invalid.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
     /// Get HQPlayer info (no reconnection)
     async fn get_info_inner(&self) -> Result<HqpInfo> {
         let xml = Self::build_request("GetInfo", &[]);
         let response = self.send_command_inner(&xml).await?;
+        Self::require_root_attrs(
+            &response,
+            "GetInfo",
+            &["name", "product", "version", "platform", "engine"],
+        )?;
 
         Ok(HqpInfo {
             name: Self::parse_attr(&response, "name").unwrap_or_default(),
@@ -2606,28 +2910,90 @@ impl HqpAdapter {
         })
     }
 
+    /// Parse the authoritative `State` document.
+    fn parse_state_response(response: &str) -> HqpState {
+        HqpState {
+            state: Self::parse_attr_u32(response, "state") as u8,
+            mode: Self::parse_attr_u32(response, "mode") as u8,
+            filter: Self::parse_attr_u32(response, "filter"),
+            filter1x: Self::parse_attr(response, "filter1x").and_then(|s| s.parse().ok()),
+            filter_nx: Self::parse_attr(response, "filterNx").and_then(|s| s.parse().ok()),
+            shaper: Self::parse_attr_u32(response, "shaper"),
+            rate: Self::parse_attr_u32(response, "rate"),
+            volume: Self::parse_attr_i32(response, "volume"),
+            volume_db: Self::parse_attr_f64(response, "volume").unwrap_or_default(),
+            filter_junk: Self::parse_attr_u32(response, "filter_junk"),
+            active_mode: Self::parse_attr_u32(response, "active_mode") as u8,
+            active_rate: Self::parse_attr_u32(response, "active_rate"),
+            invert: Self::parse_attr_bool(response, "invert"),
+            convolution: Self::parse_attr_bool(response, "convolution"),
+            repeat: Self::parse_attr_u32(response, "repeat") as u8,
+            random: Self::parse_attr_bool(response, "random"),
+            adaptive: Self::parse_attr_bool(response, "adaptive"),
+            filter_20k: Self::parse_attr_bool(response, "filter_20k"),
+            matrix_profile: Self::parse_attr(response, "matrix_profile").unwrap_or_default(),
+        }
+    }
+
+    /// Get current state without reconnecting. Used only while establishing a new session.
+    async fn get_state_inner(&self) -> Result<HqpState> {
+        let xml = Self::build_request("State", &[]);
+        let response = self.send_command_inner(&xml).await?;
+        Self::require_numeric_root_attrs(&response, "State", &["state", "mode", "volume"])?;
+        Ok(Self::parse_state_response(&response))
+    }
+
+    /// Read an attribute from a child element without letting child attributes override the root.
+    fn parse_child_attr(response: &str, child: &str, attr: &str) -> Option<String> {
+        let marker = format!("<{child}");
+        let start = response.find(&marker)?;
+        Self::parse_attr(&response[start..], attr)
+    }
+
+    /// Parse the complete playback status, including its optional metadata child.
+    fn parse_status_response(response: &str) -> HqpStatus {
+        HqpStatus {
+            state: Self::parse_attr_u32(response, "state") as u8,
+            track: Self::parse_attr_u32(response, "track"),
+            track_id: Self::parse_attr(response, "track_id").unwrap_or_default(),
+            position: Self::parse_attr_u32(response, "position"),
+            length: Self::parse_attr_u32(response, "length"),
+            volume: Self::parse_attr_i32(response, "volume"),
+            volume_db: Self::parse_attr_f64(response, "volume").unwrap_or_default(),
+            active_mode: Self::parse_attr(response, "active_mode").unwrap_or_default(),
+            active_filter: Self::parse_attr(response, "active_filter").unwrap_or_default(),
+            active_shaper: Self::parse_attr(response, "active_shaper").unwrap_or_default(),
+            active_rate: Self::parse_attr_u32(response, "active_rate"),
+            active_bits: Self::parse_attr_u32(response, "active_bits"),
+            active_channels: Self::parse_attr_u32(response, "active_channels"),
+            samplerate: Self::parse_attr_u32(response, "samplerate"),
+            bitrate: Self::parse_attr_u32(response, "bitrate"),
+            title: Self::parse_child_attr(response, "metadata", "song"),
+            artist: Self::parse_child_attr(response, "metadata", "artist"),
+            album: Self::parse_child_attr(response, "metadata", "album"),
+        }
+    }
+
     /// Get playback status (no reconnection)
     async fn get_playback_status_inner(&self) -> Result<HqpStatus> {
         let xml = Self::build_request("Status", &[("subscribe", "0")]);
         let response = self.send_command_inner(&xml).await?;
+        Self::require_numeric_root_attrs(&response, "Status", &["state", "volume"])?;
 
-        Ok(HqpStatus {
-            state: Self::parse_attr_u32(&response, "state") as u8,
-            track: Self::parse_attr_u32(&response, "track"),
-            track_id: Self::parse_attr(&response, "track_id").unwrap_or_default(),
-            position: Self::parse_attr_u32(&response, "position"),
-            length: Self::parse_attr_u32(&response, "length"),
-            volume: Self::parse_attr_i32(&response, "volume"),
-            volume_db: Self::parse_attr_f64(&response, "volume").unwrap_or_default(),
-            active_mode: Self::parse_attr(&response, "active_mode").unwrap_or_default(),
-            active_filter: Self::parse_attr(&response, "active_filter").unwrap_or_default(),
-            active_shaper: Self::parse_attr(&response, "active_shaper").unwrap_or_default(),
-            active_rate: Self::parse_attr_u32(&response, "active_rate"),
-            active_bits: Self::parse_attr_u32(&response, "active_bits"),
-            active_channels: Self::parse_attr_u32(&response, "active_channels"),
-            samplerate: Self::parse_attr_u32(&response, "samplerate"),
-            bitrate: Self::parse_attr_u32(&response, "bitrate"),
-        })
+        Ok(Self::parse_status_response(&response))
+    }
+
+    /// Get the volume capability without reconnecting. Used only during the coherent handshake.
+    async fn get_volume_range_inner(&self) -> Result<VolumeRange> {
+        let xml = Self::build_request("VolumeRange", &[]);
+        let response = self.send_command_inner(&xml).await?;
+        Self::require_root_attrs(
+            &response,
+            "VolumeRange",
+            &["min", "max", "enabled", "adaptive"],
+        )?;
+        Self::require_numeric_root_attrs(&response, "VolumeRange", &["min", "max"])?;
+        Ok(Self::parse_volume_range_response(&response))
     }
 
     /// Build XML request
@@ -2734,69 +3100,34 @@ impl HqpAdapter {
     pub async fn get_state(&self) -> Result<HqpState> {
         let xml = Self::build_request("State", &[]);
         let response = self.send_command(&xml).await?;
-
-        Ok(HqpState {
-            state: Self::parse_attr_u32(&response, "state") as u8,
-            mode: Self::parse_attr_u32(&response, "mode") as u8,
-            filter: Self::parse_attr_u32(&response, "filter"),
-            filter1x: Self::parse_attr(&response, "filter1x").and_then(|s| s.parse().ok()),
-            filter_nx: Self::parse_attr(&response, "filterNx").and_then(|s| s.parse().ok()),
-            shaper: Self::parse_attr_u32(&response, "shaper"),
-            rate: Self::parse_attr_u32(&response, "rate"),
-            volume: Self::parse_attr_i32(&response, "volume"),
-            volume_db: Self::parse_attr_f64(&response, "volume").unwrap_or_default(),
-            filter_junk: Self::parse_attr_u32(&response, "filter_junk"),
-            active_mode: Self::parse_attr_u32(&response, "active_mode") as u8,
-            active_rate: Self::parse_attr_u32(&response, "active_rate"),
-            invert: Self::parse_attr_bool(&response, "invert"),
-            convolution: Self::parse_attr_bool(&response, "convolution"),
-            repeat: Self::parse_attr_u32(&response, "repeat") as u8,
-            random: Self::parse_attr_bool(&response, "random"),
-            adaptive: Self::parse_attr_bool(&response, "adaptive"),
-            filter_20k: Self::parse_attr_bool(&response, "filter_20k"),
-            matrix_profile: Self::parse_attr(&response, "matrix_profile").unwrap_or_default(),
-        })
+        Ok(Self::parse_state_response(&response))
     }
 
     /// Get playback status
     pub async fn get_playback_status(&self) -> Result<HqpStatus> {
         let xml = Self::build_request("Status", &[("subscribe", "0")]);
         let response = self.send_command(&xml).await?;
+        Ok(Self::parse_status_response(&response))
+    }
 
-        Ok(HqpStatus {
-            state: Self::parse_attr_u32(&response, "state") as u8,
-            track: Self::parse_attr_u32(&response, "track"),
-            track_id: Self::parse_attr(&response, "track_id").unwrap_or_default(),
-            position: Self::parse_attr_u32(&response, "position"),
-            length: Self::parse_attr_u32(&response, "length"),
-            volume: Self::parse_attr_i32(&response, "volume"),
-            volume_db: Self::parse_attr_f64(&response, "volume").unwrap_or_default(),
-            active_mode: Self::parse_attr(&response, "active_mode").unwrap_or_default(),
-            active_filter: Self::parse_attr(&response, "active_filter").unwrap_or_default(),
-            active_shaper: Self::parse_attr(&response, "active_shaper").unwrap_or_default(),
-            active_rate: Self::parse_attr_u32(&response, "active_rate"),
-            active_bits: Self::parse_attr_u32(&response, "active_bits"),
-            active_channels: Self::parse_attr_u32(&response, "active_channels"),
-            samplerate: Self::parse_attr_u32(&response, "samplerate"),
-            bitrate: Self::parse_attr_u32(&response, "bitrate"),
-        })
+    fn parse_volume_range_response(response: &str) -> VolumeRange {
+        VolumeRange {
+            min: Self::parse_attr_i32(response, "min"),
+            max: Self::parse_attr_i32(response, "max"),
+            step: Self::parse_attr_i32(response, "step").max(1),
+            enabled: Self::parse_attr_bool(response, "enabled"),
+            adaptive: Self::parse_attr_bool(response, "adaptive"),
+            min_db: Self::parse_attr_f64(response, "min").unwrap_or_default(),
+            max_db: Self::parse_attr_f64(response, "max").unwrap_or_default(),
+            step_db: Self::parse_attr_f64(response, "step"),
+        }
     }
 
     /// Get volume range
     pub async fn get_volume_range(&self) -> Result<VolumeRange> {
         let xml = Self::build_request("VolumeRange", &[]);
         let response = self.send_command(&xml).await?;
-
-        Ok(VolumeRange {
-            min: Self::parse_attr_i32(&response, "min"),
-            max: Self::parse_attr_i32(&response, "max"),
-            step: Self::parse_attr_i32(&response, "step").max(1),
-            enabled: Self::parse_attr_bool(&response, "enabled"),
-            adaptive: Self::parse_attr_bool(&response, "adaptive"),
-            min_db: Self::parse_attr_f64(&response, "min").unwrap_or_default(),
-            max_db: Self::parse_attr_f64(&response, "max").unwrap_or_default(),
-            step_db: Self::parse_attr_f64(&response, "step"),
-        })
+        Ok(Self::parse_volume_range_response(&response))
     }
 
     /// Parse multi-item response
@@ -4928,11 +5259,13 @@ impl HqpAdapter {
         };
 
         // Build now_playing if we have track info
-        let now_playing = if !status.track_id.is_empty() || status.length > 0 {
+        let has_metadata =
+            status.title.is_some() || status.artist.is_some() || status.album.is_some();
+        let now_playing = if !status.track_id.is_empty() || status.length > 0 || has_metadata {
             Some(BusNowPlaying {
-                title: String::new(), // HQPlayer status doesn't include title
-                artist: String::new(),
-                album: String::new(),
+                title: status.title.clone().unwrap_or_default(),
+                artist: status.artist.clone().unwrap_or_default(),
+                album: status.album.clone().unwrap_or_default(),
                 image_key: None,
                 seek_position: Some(status.position as f64),
                 duration: Some(status.length as f64),
@@ -4989,9 +5322,18 @@ pub struct HqpInstanceInfo {
 }
 
 /// Manager for multiple HQPlayer instances
+struct HqpManagedWorker {
+    shutdown: CancellationToken,
+    join: tokio::task::JoinHandle<()>,
+}
+
 pub struct HqpInstanceManager {
     instances: Arc<RwLock<HashMap<String, Arc<HqpAdapter>>>>,
     bus: SharedBus,
+    running: Arc<AtomicBool>,
+    workers: Arc<Mutex<HashMap<String, HqpManagedWorker>>>,
+    /// Serializes lifecycle and runtime instance mutations as one manager transaction.
+    lifecycle_lock: Arc<Mutex<()>>,
 }
 
 impl HqpInstanceManager {
@@ -5000,6 +5342,9 @@ impl HqpInstanceManager {
         Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
             bus,
+            running: Arc::new(AtomicBool::new(false)),
+            workers: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -5056,20 +5401,13 @@ impl HqpInstanceManager {
 
     /// Get or create an instance by name
     pub async fn get_or_create(&self, name: &str) -> Arc<HqpAdapter> {
-        {
-            let instances = self.instances.read().await;
-            if let Some(adapter) = instances.get(name) {
-                return adapter.clone();
-            }
-        }
-
-        // Create new instance
+        // Prepare outside the map lock, then use the entry as the atomic winner. Two callers may
+        // prepare candidates, but they can no longer return different adapters for the same name.
         let adapter = Arc::new(HqpAdapter::new(self.bus.clone()));
         adapter.set_instance_name(name.to_string()).await;
 
         let mut instances = self.instances.write().await;
-        instances.insert(name.to_string(), adapter.clone());
-        adapter
+        instances.entry(name.to_string()).or_insert(adapter).clone()
     }
 
     /// Get an instance by name (if it exists)
@@ -5120,23 +5458,33 @@ impl HqpInstanceManager {
         username: Option<String>,
         password: Option<String>,
     ) -> Arc<HqpAdapter> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
         let adapter = self.get_or_create(&name).await;
         adapter
             .configure(host, port, web_port, username, password)
             .await;
         self.save_to_config().await;
+        if self.running.load(Ordering::SeqCst) {
+            self.start_worker(name, adapter.clone()).await;
+        }
         adapter
     }
 
     /// Remove an instance by name
     pub async fn remove_instance(&self, name: &str) -> bool {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
         let mut instances = self.instances.write().await;
-        let removed = instances.remove(name).is_some();
-        if removed {
-            drop(instances);
-            self.save_to_config().await;
-        }
-        removed
+        let removed = instances.remove(name);
+        drop(instances);
+        let Some(adapter) = removed else {
+            return false;
+        };
+
+        self.stop_worker(name).await;
+        // Removal is definitive even if the manager was not running and therefore had no worker.
+        adapter.disconnect().await;
+        self.save_to_config().await;
+        true
     }
 
     /// Check if any instance is configured
@@ -5145,10 +5493,141 @@ impl HqpInstanceManager {
         !instances.is_empty()
     }
 
+    /// Whether at least one child has a native endpoint and can enter the managed lifecycle.
+    async fn has_configured_instances(&self) -> bool {
+        let adapters: Vec<Arc<HqpAdapter>> =
+            self.instances.read().await.values().cloned().collect();
+        for adapter in adapters {
+            if adapter.is_configured().await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Start exactly one child observer for a configured runtime instance.
+    async fn start_worker(&self, name: String, adapter: Arc<HqpAdapter>) {
+        if !adapter.is_configured().await {
+            return;
+        }
+
+        // Build the child future before taking the worker-map lock. The future is inert until
+        // spawned; keeping its await expression outside the map-guard scope also makes the actual
+        // invariant obvious to the AST lock lint.
+        let shutdown = CancellationToken::new();
+        let child_shutdown = shutdown.clone();
+        let child = async move {
+            adapter.run_managed(child_shutdown).await;
+        };
+
+        let mut workers = self.workers.lock().await;
+        // Recheck while holding the worker-set lock. A concurrent stop may have flipped `running`
+        // after `add_instance` decided this call was needed; spawning after stop drained the map
+        // would otherwise create an orphan observer.
+        if !self.running.load(Ordering::SeqCst) {
+            return;
+        }
+        if workers.contains_key(&name) {
+            return;
+        }
+
+        let join = tokio::spawn(child);
+        workers.insert(name, HqpManagedWorker { shutdown, join });
+    }
+
+    /// Cancel and join one child before returning so it cannot republish after removal.
+    async fn stop_worker(&self, name: &str) {
+        let worker = self.workers.lock().await.remove(name);
+        if let Some(worker) = worker {
+            worker.shutdown.cancel();
+            if let Err(error) = worker.join.await {
+                tracing::warn!("HQPlayer child lifecycle failed to join: {error}");
+            }
+        }
+    }
+
+    async fn start_internal(&self) -> Result<()> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        if self.running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let candidates: Vec<(String, Arc<HqpAdapter>)> = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|(name, adapter)| (name.clone(), adapter.clone()))
+            .collect();
+        let mut adapters = Vec::new();
+        for (name, adapter) in candidates {
+            if adapter.is_configured().await {
+                adapters.push((name, adapter));
+            }
+        }
+
+        if adapters.is_empty() {
+            return Err(anyhow!("No configured HQPlayer instances"));
+        }
+
+        self.running.store(true, Ordering::SeqCst);
+        for (name, adapter) in adapters {
+            self.start_worker(name, adapter).await;
+        }
+
+        Ok(())
+    }
+
+    async fn stop_internal(&self) {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        if !self.running.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.bus.publish(BusEvent::AdapterStopping {
+            adapter: "hqplayer".to_string(),
+            reason: Some("HQPlayer lifecycle stopped".to_string()),
+        });
+
+        let workers = {
+            let mut workers = self.workers.lock().await;
+            std::mem::take(&mut *workers)
+        };
+        for worker in workers.values() {
+            worker.shutdown.cancel();
+        }
+        for (_, worker) in workers {
+            if let Err(error) = worker.join.await {
+                tracing::warn!("HQPlayer child lifecycle failed to join: {error}");
+            }
+        }
+        self.bus.publish(BusEvent::AdapterStopped {
+            adapter: "hqplayer".to_string(),
+        });
+    }
+
     /// Get instance count
     pub async fn instance_count(&self) -> usize {
         let instances = self.instances.read().await;
         instances.len()
+    }
+}
+
+#[async_trait::async_trait]
+impl Startable for HqpInstanceManager {
+    fn name(&self) -> &'static str {
+        "hqplayer"
+    }
+
+    async fn start(&self) -> Result<()> {
+        self.start_internal().await
+    }
+
+    async fn stop(&self) {
+        self.stop_internal().await;
+    }
+
+    async fn can_start(&self) -> bool {
+        self.has_configured_instances().await
     }
 }
 

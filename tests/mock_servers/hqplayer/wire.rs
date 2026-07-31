@@ -18,12 +18,13 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// How one reply document is split across TCP writes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -211,6 +212,7 @@ where
 pub struct WireServer {
     addr: SocketAddr,
     stats: Arc<WireStats>,
+    policy: Arc<RwLock<WirePolicy>>,
     /// One-shot disruption budget shared across connections, so `DropNextReplyOnce` fires once for
     /// the whole server rather than once per connection.
     disruptions_left: Arc<AtomicU32>,
@@ -220,15 +222,23 @@ pub struct WireServer {
     /// One-shot budget for `apply_then_drop_reply_for_element`. Element-scoped, so like the oversized
     /// fault it is armed by being declared and cannot disturb connection setup.
     element_drops_left: Arc<AtomicU32>,
+    shutdown: CancellationToken,
     accept_task: JoinHandle<()>,
 }
 
 impl WireServer {
     /// Bind an ephemeral loopback port and start serving.
     pub async fn start(responder: Arc<dyn Responder>, policy: WirePolicy) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
+        Self::start_on(SocketAddr::from(([127, 0, 0, 1], 0)), responder, policy).await
+    }
+
+    /// Bind a specific loopback address so lifecycle tests can restart the daemon in place.
+    pub async fn start_on(
+        bind_addr: SocketAddr,
+        responder: Arc<dyn Responder>,
+        policy: WirePolicy,
+    ) -> Self {
+        let listener = TcpListener::bind(bind_addr).await.expect("bind loopback");
         let addr = listener.local_addr().expect("local_addr");
         let stats = Arc::new(WireStats::default());
         // Disruptions start unarmed so connection setup is never the thing under test; a test
@@ -244,41 +254,61 @@ impl WireServer {
         let element_drops_left = Arc::new(AtomicU32::new(u32::from(
             policy.apply_then_drop_reply_for_element.is_some(),
         )));
+        let policy = Arc::new(RwLock::new(policy));
 
         let accept_stats = stats.clone();
+        let accept_policy = policy.clone();
         let accept_budget = disruptions_left.clone();
         let accept_oversized = oversized_left.clone();
         let accept_element_drops = element_drops_left.clone();
+        let shutdown = CancellationToken::new();
+        let accept_shutdown = shutdown.clone();
         let accept_task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let accepted = tokio::select! {
+                    _ = accept_shutdown.cancelled() => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((stream, _)) = accepted else {
+                    break;
+                };
                 accept_stats.connections.fetch_add(1, Ordering::SeqCst);
                 let responder = responder.clone();
-                let policy = policy.clone();
+                let policy = accept_policy.clone();
                 let stats = accept_stats.clone();
                 let budget = accept_budget.clone();
                 let oversized = accept_oversized.clone();
                 let element_drops = accept_element_drops.clone();
-                tokio::spawn(async move {
-                    serve_connection(
-                        stream,
-                        responder,
-                        policy,
-                        stats,
-                        budget,
-                        oversized,
-                        element_drops,
-                    )
-                    .await;
+                let connection_shutdown = accept_shutdown.clone();
+                connections.spawn(async move {
+                    tokio::select! {
+                        _ = connection_shutdown.cancelled() => {}
+                        _ = serve_connection(
+                            stream,
+                            responder,
+                            policy,
+                            stats,
+                            budget,
+                            oversized,
+                            element_drops,
+                        ) => {}
+                    }
                 });
             }
+
+            accept_shutdown.cancel();
+            while connections.join_next().await.is_some() {}
         });
 
         Self {
             addr,
             stats,
+            policy,
             disruptions_left,
             oversized_left,
             element_drops_left,
+            shutdown,
             accept_task,
         }
     }
@@ -306,6 +336,25 @@ impl WireServer {
         self.stats.clone()
     }
 
+    /// Replace the active wire policy without replacing the TCP session.
+    ///
+    /// This lets a conformance test establish the adapter's required coherent initial snapshot and
+    /// then arm the fault whose recovery behavior it actually intends to exercise.
+    pub fn set_policy(&self, policy: WirePolicy) {
+        self.oversized_left.store(
+            u32::from(
+                policy.oversized_for_element.is_some()
+                    || policy.oversized_newline_free_for_element.is_some(),
+            ),
+            Ordering::SeqCst,
+        );
+        self.element_drops_left.store(
+            u32::from(policy.apply_then_drop_reply_for_element.is_some()),
+            Ordering::SeqCst,
+        );
+        *self.policy.write().expect("wire policy lock poisoned") = policy;
+    }
+
     /// Arm the policy's one-shot disruption. Call after connecting, so setup is never disrupted.
     pub fn arm_disruption(&self) {
         self.disruptions_left.store(1, Ordering::SeqCst);
@@ -317,7 +366,14 @@ impl WireServer {
     }
 
     pub fn stop(self) {
+        self.shutdown.cancel();
         self.accept_task.abort();
+    }
+
+    /// Stop accepting, close every accepted connection and wait until the address is reusable.
+    pub async fn shutdown(self) {
+        self.shutdown.cancel();
+        let _ = self.accept_task.await;
     }
 }
 
@@ -374,7 +430,7 @@ fn mentions(line: &str, element: &str) -> bool {
 async fn serve_connection(
     stream: TcpStream,
     responder: Arc<dyn Responder>,
-    policy: WirePolicy,
+    policy: Arc<RwLock<WirePolicy>>,
     stats: Arc<WireStats>,
     disruptions_left: Arc<AtomicU32>,
     oversized_left: Arc<AtomicU32>,
@@ -398,6 +454,7 @@ async fn serve_connection(
         }
         stats.requests.fetch_add(1, Ordering::SeqCst);
         stats.record(&line);
+        let policy = policy.read().expect("wire policy lock poisoned").clone();
 
         if policy.disruption == Disruption::DropNextReplyOnce
             && disruptions_left

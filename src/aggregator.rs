@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, info};
 
 use crate::bus::{BusEvent, NowPlaying, SharedBus, Zone};
@@ -28,7 +28,24 @@ impl ZoneAggregator {
     /// Start the aggregator's event processing loop
     /// Should be spawned as a task
     pub async fn run(&self) {
+        self.run_inner(None).await;
+    }
+
+    /// Start the event loop and acknowledge after the broadcast subscription exists.
+    ///
+    /// The bus does not replay. Merely spawning `run()` before producers is insufficient because the
+    /// spawned future may not be polled until after an adapter publishes its initial snapshot.
+    pub async fn run_with_ready(&self, ready: oneshot::Sender<()>) {
+        self.run_inner(Some(ready)).await;
+    }
+
+    async fn run_inner(&self, ready: Option<oneshot::Sender<()>>) {
         let mut rx = self.bus.subscribe();
+        if let Some(ready) = ready {
+            if ready.send(()).is_err() {
+                debug!("ZoneAggregator readiness receiver was dropped before startup completed");
+            }
+        }
 
         info!("ZoneAggregator started");
 

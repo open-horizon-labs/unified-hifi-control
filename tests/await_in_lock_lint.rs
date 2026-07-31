@@ -237,6 +237,29 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "conn_guard",
         "Protocol requires exclusive connection access",
     ),
+    // One native instance is a serialized conversation. This lease deliberately spans connect,
+    // command/retry, multi-document observation and configure so host/session identity cannot
+    // change around an in-flight response and local commands cannot split a published snapshot.
+    (
+        "adapters/hqplayer.rs",
+        "_conversation_guard",
+        "HQPlayer instance conversations must be linearized",
+    ),
+    // Socket establishment is itself one operation. Releasing this lease during TcpStream::connect
+    // lets concurrent first callers install different sessions; every call acquires it only after
+    // the conversation lease, giving the pair one documented lock order.
+    (
+        "adapters/hqplayer.rs",
+        "_connect_guard",
+        "HQPlayer socket establishment must be single-flight",
+    ),
+    // The manager changes its instance and worker maps together and joins removed children before
+    // releasing the transaction. This prevents same-name add/remove and start/stop races.
+    (
+        "adapters/hqplayer.rs",
+        "_lifecycle_guard",
+        "HQPlayer manager lifecycle mutations must be serialized",
+    ),
 ];
 
 fn is_allowed(file: &str, guard: &str) -> bool {

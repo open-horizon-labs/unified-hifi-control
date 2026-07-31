@@ -20,7 +20,7 @@ use std::sync::Arc;
 /// All available adapters in the system.
 /// This is the single source of truth for what adapters exist.
 /// Note: "lms-cli" is a companion to "lms" and shares its enabled state.
-pub const AVAILABLE_ADAPTERS: &[&str] = &["roon", "lms", "lms-cli", "openhome", "upnp"];
+pub const AVAILABLE_ADAPTERS: &[&str] = &["roon", "lms", "lms-cli", "openhome", "upnp", "hqplayer"];
 
 /// Registered adapter with its spawn function
 struct RegisteredAdapter {
@@ -31,6 +31,8 @@ struct RegisteredAdapter {
     enabled: bool,
     /// Running task handle (if started)
     handle: Option<JoinHandle<()>>,
+    /// Startable adapters own their child tasks internally rather than exposing a JoinHandle here.
+    direct_running: bool,
     /// Cancellation token for this adapter
     cancel: CancellationToken,
 }
@@ -79,6 +81,7 @@ impl AdapterCoordinator {
                 "lms-cli" => settings.lms,
                 "openhome" => settings.openhome,
                 "upnp" => settings.upnp,
+                "hqplayer" => settings.hqplayer,
                 _ => false,
             };
             self.register(name, enabled).await;
@@ -104,7 +107,12 @@ impl AdapterCoordinator {
                 continue;
             }
             match adapter.start().await {
-                Ok(()) => info!("Started adapter: {}", name),
+                Ok(()) => {
+                    if let Some(registered) = self.adapters.write().await.get_mut(name) {
+                        registered.direct_running = true;
+                    }
+                    info!("Started adapter: {}", name);
+                }
                 Err(e) => warn!("Failed to start adapter {}: {}", name, e),
             }
         }
@@ -114,6 +122,9 @@ impl AdapterCoordinator {
     pub async fn stop_all(&self, adapters: &[Arc<dyn Startable>]) {
         for adapter in adapters {
             adapter.stop().await;
+            if let Some(registered) = self.adapters.write().await.get_mut(adapter.name()) {
+                registered.direct_running = false;
+            }
             debug!("Stopped adapter: {}", adapter.name());
         }
     }
@@ -127,6 +138,7 @@ impl AdapterCoordinator {
                 prefix: prefix.to_string(),
                 enabled,
                 handle: None,
+                direct_running: false,
                 cancel: self.shutdown.child_token(),
             },
         );
@@ -175,6 +187,13 @@ impl AdapterCoordinator {
         }
     }
 
+    /// Record lifecycle state for Startable adapters that own their worker tasks internally.
+    pub async fn set_running(&self, prefix: &str, running: bool) {
+        if let Some(adapter) = self.adapters.write().await.get_mut(prefix) {
+            adapter.direct_running = running;
+        }
+    }
+
     /// Check if an adapter is enabled
     pub async fn is_enabled(&self, prefix: &str) -> bool {
         let adapters = self.adapters.read().await;
@@ -186,7 +205,7 @@ impl AdapterCoordinator {
         let adapters = self.adapters.read().await;
         adapters
             .get(prefix)
-            .map(|a| a.handle.is_some())
+            .map(|a| a.handle.is_some() || a.direct_running)
             .unwrap_or(false)
     }
 
@@ -353,7 +372,7 @@ impl AdapterCoordinator {
                     AdapterStatus {
                         prefix: prefix.clone(),
                         enabled: adapter.enabled,
-                        running: adapter.handle.is_some(),
+                        running: adapter.handle.is_some() || adapter.direct_running,
                     },
                 )
             })
@@ -376,6 +395,26 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    struct DirectStartable {
+        started: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Startable for DirectStartable {
+        fn name(&self) -> &'static str {
+            "direct"
+        }
+
+        async fn start(&self) -> Result<()> {
+            self.started.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn stop(&self) {
+            self.started.store(false, Ordering::SeqCst);
+        }
+    }
+
     #[tokio::test]
     async fn test_register_and_check_enabled() {
         let bus = create_bus();
@@ -386,6 +425,55 @@ mod tests {
 
         coord.register("disabled", false).await;
         assert!(!coord.is_enabled("disabled").await);
+    }
+
+    /// Issue #162: the public settings model has carried an `hqplayer` enable switch while the
+    /// lifecycle registry silently omitted it. A configured producer therefore could not enter the
+    /// coordinator-owned start/stop path at all.
+    ///
+    /// **Label: client-red.** The settings surface already promises this toggle controls the adapter.
+    #[tokio::test]
+    async fn hqplayer_setting_registers_the_managed_adapter() {
+        let bus = create_bus();
+        let coord = AdapterCoordinator::new(bus);
+        let settings = AdapterSettings {
+            hqplayer: true,
+            ..Default::default()
+        };
+
+        coord.register_from_settings(&settings).await;
+
+        assert!(
+            coord
+                .registered_adapters()
+                .await
+                .iter()
+                .any(|a| a == "hqplayer"),
+            "HQPlayer must be a coordinator-owned lifecycle, not an opportunistic page read"
+        );
+        assert!(coord.is_enabled("hqplayer").await);
+    }
+
+    #[tokio::test]
+    async fn direct_startable_lifecycle_is_reported_as_running() {
+        let bus = create_bus();
+        let coord = AdapterCoordinator::new(bus);
+        coord.register("direct", true).await;
+
+        let adapter = Arc::new(DirectStartable {
+            started: AtomicBool::new(false),
+        });
+        let adapters: Vec<Arc<dyn Startable>> = vec![adapter.clone()];
+
+        coord.start_all_enabled(&adapters).await;
+        assert!(adapter.started.load(Ordering::SeqCst));
+        assert!(coord.is_running("direct").await);
+        assert!(coord.adapter_status().await["direct"].running);
+
+        coord.stop_all(&adapters).await;
+        assert!(!adapter.started.load(Ordering::SeqCst));
+        assert!(!coord.is_running("direct").await);
+        assert!(!coord.adapter_status().await["direct"].running);
     }
 
     #[tokio::test]
