@@ -5,13 +5,15 @@
 # Enable: add to your shell profile: export RUSTC_WRAPPER=sccache
 
 # Keep the statically linked Linux release artifacts position-independent and
-# fully RELRO-hardened. These target-specific flags do not affect host tools,
-# build scripts, WASM, macOS, or Windows builds.
+# fully RELRO-hardened. Zig 0.13 ignores rustc's combined `-static-pie` option,
+# so pass `-pie` explicitly alongside the musl target's existing static mode.
+# These target-specific flags do not affect host tools, build scripts, WASM,
+# macOS, or Windows builds.
 [target.x86_64-unknown-linux-musl]
-rustflags = ["-C", "relocation-model=pic", "-C", "relro-level=full"]
+rustflags = ["-C", "relocation-model=pic", "-C", "relro-level=full", "-C", "link-arg=-pie"]
 
 [target.aarch64-unknown-linux-musl]
-rustflags = ["-C", "relocation-model=pic", "-C", "relro-level=full"]
+rustflags = ["-C", "relocation-model=pic", "-C", "relro-level=full", "-C", "link-arg=-pie"]
 
 [target.armv7-unknown-linux-musleabihf]
-rustflags = ["-C", "relocation-model=pic", "-C", "relro-level=full"]
+rustflags = ["-C", "relocation-model=pic", "-C", "relro-level=full", "-C", "link-arg=-pie"]

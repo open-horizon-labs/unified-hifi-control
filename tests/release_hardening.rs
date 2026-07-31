@@ -32,6 +32,10 @@ fn musl_release_targets_enable_pie_and_full_relro() {
             section.contains("relro-level=full"),
             "{target} must enable full RELRO"
         );
+        assert!(
+            section.contains("link-arg=-pie"),
+            "{target} must explicitly select PIE with the Zig linker"
+        );
     }
 }
 
