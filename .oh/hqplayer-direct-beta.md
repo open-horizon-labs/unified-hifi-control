@@ -335,6 +335,92 @@ live verification needs either this rig's daemon-side fault fixed, or a differen
 
 ## Ship / Beta A (#350)
 
-_Pending. Will record: source SHA, included issues/PRs, toolchain, target, build date, checksum;
-live-rig checklist with hardware-dependent rows explicitly labeled pending until run; rollback path;
-artifact channel._
+**Status:** artifact built and smoke-tested; **not published** — awaiting explicit maintainer
+approval per #350's own hard constraint · **Updated:** 2026-07-31
+
+### Provenance
+
+| Field | Value |
+|-------|-------|
+| Source SHA | `96b5eb6698085612dd8792688bfb4c4068827dd5` (this branch, `feat/issue-401-hqplayer-mcp-beta-validation`) |
+| Base SHA | `212f5551da3b2f83d6c433734b2613816c6ff6d0` (`feat/issue-328-direct-hqplayer-zone`, PR #391) |
+| Included issues/PRs | #401 (this), stacked on #328/PR #391, stacked on #329/PR #382. All three still **draft, unmerged** — this artifact is not a release build off `v3`. |
+| Toolchain | rustc 1.97.1 (rustup `stable-aarch64-apple-darwin`, 2026-07-14), Dioxus CLI 0.7.10 (57d6794) |
+| Build command | `make css && dx build --release --platform web --features web` |
+| Target | `aarch64-apple-darwin` (arm64 macOS) — the only target built this session; no cross-compiled Linux/musl artifact was produced |
+| Build date | 2026-07-31 |
+| Artifact | `target/dx/unified-hifi-control/release/web/server` (14 MB Mach-O 64-bit executable, plus its sibling `public/` directory of static/WASM assets — both are required; the binary alone will panic looking for `public/wasm/`, per README) |
+| SHA-256 | `ab01c789c90045638885f523ab6372d307c7d607ee7f52ecb5f3da2786c93b15` |
+| Config/schema version | Unchanged from `v3` — `AppSettings`/`app-settings.json` shape is untouched by this branch |
+
+### Smoke test (no live hardware, no LAN activity)
+
+Run with all four network-facing adapters (`roon`, `upnp`, `openhome`, `lms`) and `hqplayer`
+disabled via an isolated `UHC_CONFIG_DIR`, specifically so the default-enabled Roon extension
+discovery does not touch the real network during this check — the task's "do not scan the LAN"
+constraint applies to this smoke test exactly as it does to live-rig validation.
+
+| Check | Result |
+|-------|--------|
+| Process starts, binds port 8088, stays alive | ✅ |
+| `GET /` (SSR/web hydration shell) | ✅ HTTP 200 |
+| `GET /status` | ✅ valid JSON, all adapters correctly report disconnected |
+| `GET /zones` (existing non-HQPlayer path, API contract) | ✅ HTTP 200, `{"zones":[]}` — correct with everything disabled |
+| `POST /mcp` initialize without required `Accept` headers | ✅ correctly rejected with a JSON-RPC error, not a crash |
+
+One earlier run this session (before the artifact above was rebuilt) hit a startup panic —
+`Invalid route "/favicon.ico": Insertion failed due to conflict with previously registered route`
+— when `has_embedded_assets()` evaluated false and the server fell back to
+`serve_dioxus_application`'s own asset-route registration, colliding with the explicit
+`/favicon.ico` route in `main.rs`. Rebuilding cleanly (after touching `src/embedded.rs` to rule out
+stale incremental-compilation state, which briefly surfaced a different, unrelated `rust-embed`
+`.iter()` compile error that also did not reproduce on a clean rebuild) made it disappear, and the
+artifact above — built fresh, smoke-tested three times — starts cleanly every time. **Recorded as a
+suspected build-environment/incremental-compilation fragility in the general Dioxus embedded-assets
+pipeline** (`src/embedded.rs`, `main.rs`'s asset routes), **not reproduced on a clean build, not
+touched by any commit on this branch** (this branch never edits `src/embedded.rs` or `main.rs`), and
+out of scope to chase further here — flagged for whoever next touches the embedded-assets pipeline,
+not fixed.
+
+### Live-rig checklist (#350's required focused checklist)
+
+Every row is hardware-dependent and is labeled **pending**, not passed, per #350's explicit
+constraint. See "Live-rig validation attempt" above for why: the rig's daemon crashes on the first
+non-mutating `GetInfo` request, so nothing below could be attempted.
+
+| Row | Status |
+|-----|--------|
+| Metadata (title/artist/album/etc. from a real playing track) | pending — rig `GetInfo` fault |
+| Transport (play/pause/next/previous) | pending — rig `GetInfo` fault |
+| Seek | pending — rig `GetInfo` fault |
+| Decimal volume (set, up/down, clamp) | pending — rig `GetInfo` fault |
+| External-controller convergence (another client changes state, UHC observes it) | pending — rig `GetInfo` fault |
+| Reconnect (daemon restart/network drop recovery) | pending — rig `GetInfo` fault |
+| Linked-DSP coexistence | pending — rig `GetInfo` fault |
+
+### Install / run (Beta A test build — not a stable-channel release)
+
+This is a source-built test artifact for reviewers/testers with a Rust+Dioxus toolchain, not a
+packaged release; #350's "distinct beta channel" and "installable" artifact requirements are for the
+*next* step (an actual tagged pre-release build) once this PR merges and a maintainer approves
+publishing one. Until then:
+
+1. **Back up existing configuration**, if testing on a machine with a real UHC install:
+   `cp -r "$UHC_CONFIG_DIR" "$UHC_CONFIG_DIR.bak"` (default config dir per `src/config`;
+   override with `UHC_CONFIG_DIR` to test in complete isolation instead, as the smoke test above
+   does — recommended for anyone who has a working stable install already).
+2. **Build:** `git checkout feat/issue-401-hqplayer-mcp-beta-validation && make css && dx build
+   --release --platform web --features web`.
+3. **Run:** `cd target/dx/unified-hifi-control/release/web && PORT=8088 UHC_CONFIG_DIR=/path/to/test-config ./server`.
+4. **Exercise:** enable the HQPlayer adapter and point an instance at the tester's HQPlayer 6.0.2
+   Embedded host through the existing web UI/config exactly as today; drive it from the web UI, a
+   knob, or an MCP client (Claude, etc.) via `http://<host>:8088/mcp`.
+5. **Log capture:** the process logs to stdout/stderr (`tracing`); redirect to a file
+   (`... ./server > uhc-beta.log 2>&1`) for issue reports. No credentials are ever logged by this
+   path — the HQPlayer native protocol this branch touches is unauthenticated.
+6. **Roll back:** stop the test binary; if a real config dir was used (not isolated), restore the
+   backup from step 1; resume the tester's existing stable install/binary. Nothing this branch does
+   is persisted outside the config dir it was pointed at.
+
+**Explicit maintainer approval is required, and has not been requested or given, before any artifact
+from this branch is published to any channel — beta or otherwise.**
