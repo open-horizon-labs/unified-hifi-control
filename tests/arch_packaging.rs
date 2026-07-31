@@ -6,12 +6,40 @@ const INSTALL: &str = include_str!("../build/arch/unified-hifi-control.install")
 const ARCH_DOCS: &str = include_str!("../docs/arch-linux.md");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/build.yml");
 
+fn checksum_values(name: &str) -> Vec<&str> {
+    let declaration = format!("{name}=(");
+    let start = PKGBUILD
+        .find(&declaration)
+        .unwrap_or_else(|| panic!("PKGBUILD is missing {name}"));
+    let array = PKGBUILD[start + declaration.len()..]
+        .split_once(')')
+        .unwrap_or_else(|| panic!("PKGBUILD has an unterminated {name}"))
+        .0;
+
+    array.split('\'').skip(1).step_by(2).collect()
+}
+
 #[test]
 fn sources_are_immutable_and_verified() {
-    assert!(
-        !PKGBUILD.contains("'SKIP'"),
-        "Arch package sources must have fixed integrity checks"
-    );
+    for (name, expected_count) in [
+        ("sha256sums", 2),
+        ("sha256sums_x86_64", 1),
+        ("sha256sums_aarch64", 1),
+        ("sha256sums_armv7h", 1),
+    ] {
+        let values = checksum_values(name);
+        assert_eq!(
+            values.len(),
+            expected_count,
+            "{name} must contain {expected_count} checksum(s)"
+        );
+        assert!(
+            values
+                .iter()
+                .all(|value| value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())),
+            "{name} must contain only SHA-256 digests"
+        );
+    }
     assert!(
         PKGBUILD.contains("v${pkgver}/LICENSE"),
         "the upstream license must be pinned to the packaged release"
