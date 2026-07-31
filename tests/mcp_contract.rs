@@ -29,6 +29,8 @@
 //! Regenerate only when the change to the MCP surface is intended and approved.
 //! A fixture diff on an "additive only" PR is a bug report, not a chore.
 
+mod mock_servers;
+
 use axum::{
     body::Body,
     http::{header, Method, Request},
@@ -52,6 +54,8 @@ use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp;
+
+use mock_servers::{MockHqpServer, MockLmsServer, MockOpenHomeDevice, MockUpnpRenderer};
 
 // =============================================================================
 // Fixture plumbing
@@ -191,7 +195,13 @@ struct TestApp {
 }
 
 async fn build_state(lms: Option<Arc<LmsAdapter>>) -> AppState {
-    let bus = create_bus();
+    build_state_with_bus(create_bus(), lms).await
+}
+
+async fn build_state_with_bus(
+    bus: unified_hifi_control::bus::SharedBus,
+    lms: Option<Arc<LmsAdapter>>,
+) -> AppState {
     let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
     let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
     let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
@@ -664,4 +674,973 @@ async fn every_tool_has_a_nonempty_description() {
             "{name}: tool description must be non-empty"
         );
     }
+}
+
+// =============================================================================
+// 4. Capabilities gate: what the server refuses today
+// =============================================================================
+
+/// `create_mcp_extension` declares only `tools`, and rust-mcp-sdk 0.8.3 gates
+/// request dispatch on the *declared* capability before any handler runs
+/// (`ServerCapabilities::can_handle_request`, which rejects all five resource
+/// methods when `resources.is_none()`). So the resource methods are not merely
+/// unimplemented — they return a concrete JSON-RPC error, and that error is part
+/// of today's surface.
+///
+/// Pinned here so #397 shows up as a visible diff (refusal -> success) rather
+/// than as a silent change from one behavior to another. The SDK gate keys only
+/// on the *presence* of `resources`; it never inspects `subscribe` or
+/// `listChanged`.
+///
+/// This test records current behavior. It does not endorse it, and #394 must not
+/// declare a `resources` capability — that is #397's work.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn resource_methods_are_refused_while_only_tools_is_declared() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    let (session_id, init) = app.initialize().await;
+
+    // Precondition: the declared capability set contains tools and not resources.
+    assert!(
+        init.pointer("/capabilities/tools").is_some(),
+        "tools capability must be declared: {init}"
+    );
+    assert!(
+        init.pointer("/capabilities/resources").is_none(),
+        "#394 must not declare a resources capability — that is #397's work: {init}"
+    );
+
+    for (id, method, params) in [
+        (10, "resources/list", json!({})),
+        (11, "resources/read", json!({ "uri": "hifi://zones" })),
+        (12, "resources/templates/list", json!({})),
+    ] {
+        let (_, response) = app
+            .post(
+                Some(&session_id),
+                json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+            )
+            .await;
+        let response =
+            response.unwrap_or_else(|| panic!("{method} must return a JSON-RPC response"));
+
+        let error = response
+            .get("error")
+            .unwrap_or_else(|| panic!("{method} must be refused today, got: {response}"));
+        assert_eq!(
+            error.get("code").and_then(Value::as_i64),
+            Some(-32603),
+            "{method}: expected the capability gate's internal-error code, got {error}"
+        );
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            message.contains("does not support resources"),
+            "{method}: the refusal must name the missing capability, got {message:?}"
+        );
+    }
+}
+
+// =============================================================================
+// 5. Every dispatch arm, and the lookup tables tools/list cannot see
+// =============================================================================
+//
+// `handle_call_tool_request` is one match with ten arms and three pure lookup
+// tables inside it. None of that is visible in tools/list: inverting the sign of
+// `volume_down`, or dropping the `filternx` alias, would leave every snapshot in
+// this file green. So each arm is reached and its observable output pinned.
+//
+// Adapters are disconnected here on purpose. Error text is contract too: an MCP
+// client reads these strings and decides what to do next, and they are exactly
+// what a careless move of a match arm garbles.
+
+/// A zone id no adapter knows, but which routes to Roon by today's rules.
+const UNKNOWN_ROON_ZONE: &str = "roon:does-not-exist";
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_zones_returns_an_empty_array_with_no_zones() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let text = result_text(&app.call_tool("hifi_zones", json!({})).await);
+    assert_eq!(text, "[]", "hifi_zones must return a JSON array");
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_now_playing_reports_unknown_zones_by_id() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let text = result_text(
+        &app.call_tool("hifi_now_playing", json!({ "zone_id": UNKNOWN_ROON_ZONE }))
+            .await,
+    );
+    assert_eq!(
+        text,
+        format!("Error: Zone not found: {UNKNOWN_ROON_ZONE}"),
+        "the refusal must name the zone so a client can correct itself"
+    );
+}
+
+/// `hifi_status` is one of only two tools whose full payload is deterministic
+/// with no backend, so its shape is pinned exactly.
+///
+/// It is built with a `serde_json::json!` literal rather than a struct. That is
+/// deliberate: `serde_json` without `preserve_order` serializes maps as
+/// `BTreeMap` (alphabetical), while a struct serializes in declaration order.
+/// Converting this response to a typed struct would reorder the keys in the text
+/// a client receives, so the ordering is asserted as well as the content.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_status_shape_is_pinned() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let text = result_text(&app.call_tool("hifi_status", json!({})).await);
+    let parsed: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("hifi_status must return JSON: {e}\n{text}"));
+
+    assert_eq!(
+        parsed,
+        json!({
+            "roon": { "connected": false, "core_name": null },
+            "hqplayer": { "connected": false, "host": null }
+        }),
+        "hifi_status payload drifted"
+    );
+    assert!(
+        text.find("\"hqplayer\"").unwrap_or(usize::MAX) < text.find("\"roon\"").unwrap_or(0),
+        "hifi_status keys must stay alphabetical (BTreeMap order); a typed struct \
+         would reorder them and change the text clients receive:\n{text}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_hqplayer_status_shape_is_pinned() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let text = result_text(&app.call_tool("hifi_hqplayer_status", json!({})).await);
+    let parsed: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("hifi_hqplayer_status must return JSON: {e}\n{text}"));
+
+    assert_eq!(
+        parsed,
+        json!({ "connected": false, "host": null, "pipeline": null }),
+        "hifi_hqplayer_status payload drifted"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_hqplayer_profiles_returns_an_array() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let text = result_text(&app.call_tool("hifi_hqplayer_profiles", json!({})).await);
+    assert_eq!(text, "[]", "hifi_hqplayer_profiles must return a JSON array");
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_hqplayer_load_profile_reports_failure_prefix() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let text = result_text(
+        &app.call_tool("hifi_hqplayer_load_profile", json!({ "profile": "4x-Sinc-L" }))
+            .await,
+    );
+    assert!(
+        text.starts_with("Error: Failed to load profile: "),
+        "unexpected load_profile failure text: {text:?}"
+    );
+}
+
+/// The HQPlayer setting alias table (`filter1x|filter_1x`,
+/// `filterNx|filter_nx|filternx`, `shaper|dither`, `rate|samplerate`, `mode`) is
+/// a pure lookup inside one match arm, invisible to `tools/list`. Dropping an
+/// alias while moving the arm turns a documented input into "Unknown setting" —
+/// the AGENTS.md "no broken tools" failure, with a green snapshot suite. Every
+/// alias is therefore checked individually.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hqplayer_set_pipeline_alias_table_is_pinned() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // Recognised aliases reach the adapter, which is disconnected, so they fail
+    // with the per-setting failure prefix rather than "Unknown setting".
+    for setting in [
+        "mode",
+        "filter1x",
+        "filter_1x",
+        "filterNx",
+        "filter_nx",
+        "filternx",
+        "shaper",
+        "dither",
+    ] {
+        let text = result_text(
+            &app.call_tool(
+                "hifi_hqplayer_set_pipeline",
+                json!({ "setting": setting, "value": "poly-sinc-gauss-long" }),
+            )
+            .await,
+        );
+        assert!(
+            text.starts_with(&format!("Error: Failed to set {setting}: ")),
+            "alias {setting:?} must be recognised and reach the adapter, got {text:?}"
+        );
+    }
+
+    // `rate` and `samplerate` are the only settings that parse their value.
+    for setting in ["rate", "samplerate"] {
+        let text = result_text(
+            &app.call_tool(
+                "hifi_hqplayer_set_pipeline",
+                json!({ "setting": setting, "value": "96000" }),
+            )
+            .await,
+        );
+        assert!(
+            text.starts_with(&format!("Error: Failed to set {setting}: ")),
+            "alias {setting:?} must be recognised, got {text:?}"
+        );
+
+        let text = result_text(
+            &app.call_tool(
+                "hifi_hqplayer_set_pipeline",
+                json!({ "setting": setting, "value": "not-a-number" }),
+            )
+            .await,
+        );
+        assert_eq!(
+            text, "Error: Invalid rate value (expected Hz like 48000, 96000)",
+            "{setting:?} must reject a non-numeric rate before reaching the adapter"
+        );
+    }
+
+    // Anything else is refused, and the refusal lists the valid settings.
+    let text = result_text(
+        &app.call_tool(
+            "hifi_hqplayer_set_pipeline",
+            json!({ "setting": "oversampling", "value": "8x" }),
+        )
+        .await,
+    );
+    assert_eq!(
+        text,
+        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither",
+        "the refusal must enumerate the valid settings"
+    );
+}
+
+/// `hifi_control`'s volume handling: the required-value rule for `volume_set`,
+/// the defaulted delta for `volume_up`/`volume_down`, and the fact that volume
+/// uses a different routing rule from transport. The exact backend command each
+/// action produces is pinned by the LMS mock round-trip below.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_control_volume_argument_handling_is_pinned() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // volume_set with no value is refused before any routing happens.
+    let text = result_text(
+        &app.call_tool(
+            "hifi_control",
+            json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "volume_set" }),
+        )
+        .await,
+    );
+    assert_eq!(
+        text, "Error: volume_set requires a value (0-100)",
+        "volume_set without a value must be refused with its documented range"
+    );
+
+    // volume_up / volume_down do not require a value; they default the delta and
+    // reach the volume path (Roon here), not the transport path.
+    for action in ["volume_up", "volume_down"] {
+        let text = result_text(
+            &app.call_tool(
+                "hifi_control",
+                json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": action }),
+            )
+            .await,
+        );
+        assert_eq!(
+            text, "Error: Volume error: Not connected to Roon",
+            "{action} must default its delta and reach the Roon volume path"
+        );
+    }
+}
+
+/// `hifi_play` refuses `action='radio'` for LMS before touching the network. The
+/// exact wording is contract: the model is expected to read it and retry with a
+/// supported action.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_play_refuses_radio_for_lms() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let text = result_text(
+        &app.call_tool(
+            "hifi_play",
+            json!({
+                "query": "Kind of Blue",
+                "zone_id": "lms:aa:bb:cc:dd:ee:ff",
+                "action": "radio"
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        text, "Error: Radio mode not supported for LMS. Use 'play' or 'queue'.",
+        "the refusal must name the supported actions"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_search_and_hifi_play_report_errors_with_their_own_prefixes() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let text = result_text(&app.call_tool("hifi_search", json!({ "query": "Eagles" })).await);
+    assert_eq!(
+        text, "Error: Search error: Browse service not available - not connected to Roon",
+        "hifi_search must prefix failures with 'Search error'"
+    );
+
+    let text = result_text(
+        &app.call_tool(
+            "hifi_play",
+            json!({ "query": "Eagles", "zone_id": UNKNOWN_ROON_ZONE }),
+        )
+        .await,
+    );
+    assert_eq!(
+        text, "Error: Play error: Browse service not available - not connected to Roon",
+        "hifi_play must prefix failures with 'Play error'"
+    );
+}
+
+// =============================================================================
+// 6. Zone-prefix routing
+// =============================================================================
+//
+// Each adapter refuses an unknown id with its own distinctive wording, so the
+// error text identifies which adapter a call actually reached. That makes routing
+// observable end to end, without mocks and without reading the source.
+
+/// Transport routing: `lms:` / `openhome:` / `upnp:` go to their adapters and
+/// EVERYTHING ELSE goes to Roon — including bare ids and unrecognised prefixes.
+///
+/// The Roon default is a known defect (#398). #394 freezes it rather than fixing
+/// it, so a green run here means "unchanged", never "correct".
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn transport_routing_including_the_roon_default_is_pinned() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let cases: &[(&str, &str, &str)] = &[
+        ("lms:aa:bb:cc:dd:ee:ff", "not configured", "explicit lms:"),
+        ("openhome:abc", "Device not found: abc", "explicit openhome:"),
+        ("upnp:abc", "Renderer not found: abc", "explicit upnp:"),
+        ("roon:abc", "Not connected to Roon", "explicit roon:"),
+        // Today's defaults. Both belong to #398, not #394.
+        ("1601a5d4bare", "Not connected to Roon", "bare id -> Roon"),
+        ("sonos:abc", "Not connected to Roon", "unknown prefix -> Roon"),
+    ];
+
+    for (zone_id, expected_fragment, label) in cases {
+        let text = result_text(
+            &app.call_tool("hifi_control", json!({ "zone_id": zone_id, "action": "play" }))
+                .await,
+        );
+        assert!(
+            text.contains(expected_fragment),
+            "{label} ({zone_id}): expected the error to contain {expected_fragment:?}, \
+             which identifies the adapter reached; got {text:?}"
+        );
+    }
+}
+
+/// Volume routing is a *different* rule from transport routing, and the
+/// difference is load-bearing: `sonos:abc` is refused for volume but routed to
+/// Roon for transport. Unifying these into one predicate would change behavior.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn volume_routing_differs_from_transport_routing() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let volume_supported: &[(&str, &str)] = &[
+        ("lms:aa:bb:cc:dd:ee:ff", "not configured"),
+        ("roon:abc", "Not connected to Roon"),
+        ("1601a5d4bare", "Not connected to Roon"),
+    ];
+    for (zone_id, expected_fragment) in volume_supported {
+        let text = result_text(
+            &app.call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "volume_set", "value": 30 }),
+            )
+            .await,
+        );
+        assert!(
+            text.contains(expected_fragment),
+            "{zone_id}: volume must reach an adapter; got {text:?}"
+        );
+    }
+
+    for zone_id in ["openhome:abc", "upnp:abc", "sonos:abc"] {
+        let text = result_text(
+            &app.call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "volume_set", "value": 30 }),
+            )
+            .await,
+        );
+        assert_eq!(
+            text, "Error: Volume control not supported for this zone type",
+            "{zone_id}: volume must be refused, not silently routed"
+        );
+    }
+}
+
+/// Search and play route on `lms:` only; everything else, including an absent
+/// `zone_id`, goes to Roon.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn search_and_play_routing_is_pinned() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // Roon's browse-backed paths word their refusal differently from transport's,
+    // so match case-insensitively on the part that names the adapter.
+    let roon = "not connected to roon";
+
+    // hifi_search's zone_id is optional. Absent -> Roon.
+    let text = result_text(&app.call_tool("hifi_search", json!({ "query": "q" })).await);
+    assert!(
+        text.to_lowercase().contains(roon),
+        "an absent zone_id must route search to Roon; got {text:?}"
+    );
+
+    for (zone_id, expected_fragment) in [
+        ("lms:aa:bb:cc:dd:ee:ff", "not configured"),
+        ("openhome:abc", roon),
+        ("upnp:abc", roon),
+        ("sonos:abc", roon),
+    ] {
+        let text = result_text(
+            &app.call_tool("hifi_search", json!({ "query": "q", "zone_id": zone_id }))
+                .await,
+        );
+        assert!(
+            text.to_lowercase().contains(expected_fragment),
+            "search {zone_id}: expected {expected_fragment:?}, got {text:?}"
+        );
+
+        let text = result_text(
+            &app.call_tool("hifi_play", json!({ "query": "q", "zone_id": zone_id }))
+                .await,
+        );
+        assert!(
+            text.to_lowercase().contains(expected_fragment),
+            "play {zone_id}: expected {expected_fragment:?}, got {text:?}"
+        );
+    }
+}
+
+// =============================================================================
+// 7. Round-trips against tests/mock_servers/
+// =============================================================================
+
+/// A `TestApp` wired to a live mock LMS server, with the aggregator running so
+/// discovered players actually reach `hifi_zones`.
+struct LmsHarness {
+    app: TestApp,
+    mock: MockLmsServer,
+    player_id: &'static str,
+    _settings: SettingsFixture,
+    _aggregator: tokio::task::JoinHandle<()>,
+}
+
+impl LmsHarness {
+    const PLAYER_ID: &'static str = "aa:bb:cc:dd:ee:ff";
+
+    fn zone_id(&self) -> String {
+        format!("lms:{}", self.player_id)
+    }
+
+    /// `SettingsFixture` points `UHC_CONFIG_DIR` at a fresh temp dir, so
+    /// `LmsAdapter::configure`'s on-disk config is isolated per test too.
+    async fn start() -> Self {
+        let settings = SettingsFixture::with_hqplayer(true);
+
+        let mock = MockLmsServer::start().await;
+        mock.add_player(Self::PLAYER_ID, "Living Room").await;
+        mock.set_mode(Self::PLAYER_ID, "pause").await;
+        mock.set_volume(Self::PLAYER_ID, 42).await;
+        mock.set_now_playing(Self::PLAYER_ID, "So What", "Miles Davis", "Kind of Blue")
+            .await;
+
+        let bus = create_bus();
+        let lms = Arc::new(LmsAdapter::new(bus.clone()));
+        lms.configure(
+            mock.addr().ip().to_string(),
+            Some(mock.addr().port()),
+            None,
+            None,
+        )
+        .await;
+
+        let state = build_state_with_bus(bus, Some(lms.clone())).await;
+
+        // The aggregator only learns about zones by consuming bus events.
+        let aggregator = state.aggregator.clone();
+        let aggregator_task = tokio::spawn(async move { aggregator.run().await });
+
+        lms.start().await.expect("LMS adapter must start");
+
+        let app = TestApp::with_state(state.clone());
+
+        // Wait for the player to propagate: adapter connect -> ZoneDiscovered -> aggregator.
+        let zone_id = format!("lms:{}", Self::PLAYER_ID);
+        let mut found = false;
+        for _ in 0..100 {
+            if state.aggregator.get_zone(&zone_id).await.is_some() {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(found, "LMS player never reached the aggregator as {zone_id}");
+
+        Self {
+            app,
+            mock,
+            player_id: Self::PLAYER_ID,
+            _settings: settings,
+            _aggregator: aggregator_task,
+        }
+    }
+
+    async fn stop(self) {
+        self._aggregator.abort();
+        self.mock.stop().await;
+    }
+}
+
+/// LMS round-trip: a real mock server, a real adapter, real bus events, and the
+/// MCP tool call driven over the real `/mcp` route.
+///
+/// This also pins `hifi_control`'s action map at the point where it is actually
+/// observable — the backend command the mock receives. `playpause` must become
+/// LMS `pause` (a toggle) and not `play`; `previous` and `prev` must both become
+/// `playlist index -1`. `tools/list` says nothing about any of this.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_round_trip_pins_the_action_map_and_the_volume_sign() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    // hifi_zones sees the discovered player.
+    let text = result_text(&h.app.call_tool("hifi_zones", json!({})).await);
+    let zones: Value = serde_json::from_str(&text).expect("hifi_zones must return JSON");
+    let zone = zones
+        .as_array()
+        .and_then(|z| z.iter().find(|z| z.get("zone_id") == Some(&json!(zone_id))))
+        .unwrap_or_else(|| panic!("hifi_zones must include {zone_id}: {text}"));
+    assert_eq!(zone.get("zone_name"), Some(&json!("Living Room")));
+    assert_eq!(zone.get("volume"), Some(&json!(42.0)));
+
+    // hifi_now_playing sees the track.
+    let text = result_text(
+        &h.app
+            .call_tool("hifi_now_playing", json!({ "zone_id": zone_id }))
+            .await,
+    );
+    let np: Value = serde_json::from_str(&text).expect("hifi_now_playing must return JSON");
+    assert_eq!(np.get("title"), Some(&json!("So What")));
+    assert_eq!(np.get("artist"), Some(&json!("Miles Davis")));
+    assert_eq!(np.get("album"), Some(&json!("Kind of Blue")));
+
+    // The MCP action -> backend command map, observed on the wire.
+    let expected: &[(&str, Value, &[&str])] = &[
+        ("play", Value::Null, &["play"]),
+        ("pause", Value::Null, &["pause"]),
+        // playpause maps to backend "play_pause", which LMS expresses as a bare
+        // "pause" toggle. Mapping it to "play" instead would break the toggle.
+        ("playpause", Value::Null, &["pause"]),
+        ("next", Value::Null, &["playlist", "index", "+1"]),
+        ("previous", Value::Null, &["playlist", "index", "-1"]),
+        ("prev", Value::Null, &["playlist", "index", "-1"]),
+        // Absolute volume.
+        ("volume_set", json!(30), &["mixer", "volume", "30"]),
+        // Relative volume, and the sign that no snapshot can see.
+        ("volume_up", json!(7), &["mixer", "volume", "+7"]),
+        ("volume_down", json!(7), &["mixer", "volume", "-7"]),
+        // Defaulted delta of 5.
+        ("volume_up", Value::Null, &["mixer", "volume", "+5"]),
+        ("volume_down", Value::Null, &["mixer", "volume", "-5"]),
+    ];
+
+    for (action, value, expected_command) in expected {
+        h.mock.clear_commands().await;
+
+        let mut args = json!({ "zone_id": zone_id, "action": action });
+        if !value.is_null() {
+            args["value"] = value.clone();
+        }
+        let text = result_text(&h.app.call_tool("hifi_control", args).await);
+        assert!(
+            !text.starts_with("Error:"),
+            "hifi_control {action} failed: {text}"
+        );
+
+        let commands = h.mock.write_commands(h.player_id).await;
+        let expected_command: Vec<String> =
+            expected_command.iter().map(|s| s.to_string()).collect();
+        assert!(
+            commands.contains(&expected_command),
+            "hifi_control action={action:?} value={value} must send {expected_command:?}; \
+             mock received {commands:?}"
+        );
+    }
+
+    h.stop().await;
+}
+
+/// `hifi_control` returns the action name plus the zone's post-command state.
+/// The prose framing is what a model reads back to the user.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_control_result_reports_action_and_current_state() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    let text = result_text(
+        &h.app
+            .call_tool("hifi_control", json!({ "zone_id": zone_id, "action": "play" }))
+            .await,
+    );
+
+    assert!(
+        text.starts_with("Action 'play' executed.\n\nCurrent state:\n{"),
+        "hifi_control must report the action and then the zone state: {text:?}"
+    );
+    let state_json = text
+        .split_once("Current state:\n")
+        .map(|(_, json)| json)
+        .expect("current state block");
+    let parsed: Value = serde_json::from_str(state_json)
+        .unwrap_or_else(|e| panic!("state block must be JSON: {e}\n{state_json}"));
+    assert_eq!(parsed.get("zone_id"), Some(&json!(zone_id)));
+
+    h.stop().await;
+}
+
+/// HQPlayer round-trip against the mock's TCP XML protocol: `hifi_hqplayer_status`
+/// must report the live connection rather than the disconnected default.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hqplayer_round_trip_reports_a_live_connection() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let mock = MockHqpServer::start().await;
+
+    let state = build_state(None).await;
+    state
+        .hqplayer
+        .configure(
+            mock.addr().ip().to_string(),
+            Some(mock.addr().port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    state
+        .hqplayer
+        .connect()
+        .await
+        .expect("HQPlayer must connect to the mock");
+
+    let app = TestApp::with_state(state.clone());
+
+    let mut connected = false;
+    for _ in 0..50 {
+        if state.hqplayer.get_status().await.connected {
+            connected = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(connected, "HQPlayer adapter never connected to the mock");
+
+    let text = result_text(&app.call_tool("hifi_hqplayer_status", json!({})).await);
+    let parsed: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("hifi_hqplayer_status must return JSON: {e}\n{text}"));
+    assert_eq!(
+        parsed.get("connected"),
+        Some(&json!(true)),
+        "hifi_hqplayer_status must report the live connection: {text}"
+    );
+    assert_eq!(
+        parsed.get("host"),
+        Some(&json!(mock.addr().ip().to_string())),
+        "hifi_hqplayer_status must report the configured host: {text}"
+    );
+
+    mock.stop().await;
+}
+
+/// OpenHome and UPnP have no `configure()` — they are SSDP-discovery only, so a
+/// mock cannot be injected without a discovery seam that #394 has no mandate to
+/// add. What is verifiable today, and what the refactor could break, is that
+/// their prefixes reach *their* adapters: the mock devices answer SSDP-shaped
+/// HTTP, and each adapter refuses an unknown id with its own distinctive wording.
+///
+/// So this asserts the routing edge (already covered above) *and* that the mock
+/// devices are reachable, documenting the gap rather than papering over it.
+/// Closing it properly belongs with whichever issue first needs OpenHome/UPnP
+/// content operations (#399 / #400).
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn openhome_and_upnp_prefixes_reach_their_own_adapters() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let openhome_mock = MockOpenHomeDevice::start().await;
+    let upnp_mock = MockUpnpRenderer::start().await;
+
+    // The mock devices are live and serving their descriptions.
+    let client = reqwest::Client::new();
+    for url in [
+        openhome_mock.description_url(),
+        upnp_mock.description_url(),
+    ] {
+        let body = client
+            .get(&url)
+            .send()
+            .await
+            .expect("mock device must respond")
+            .text()
+            .await
+            .expect("mock device body");
+        assert!(
+            body.contains("MediaRenderer") || body.contains("av-openhome-org"),
+            "unexpected device description at {url}: {body}"
+        );
+    }
+
+    let app = TestApp::new().await;
+
+    // Routing: each prefix reaches its own adapter, identified by the adapter's
+    // own refusal wording. `Device not found` is OpenHome's; `Renderer not found`
+    // is UPnP's. A mis-wired refactor would surface Roon's wording instead.
+    let text = result_text(
+        &app.call_tool(
+            "hifi_control",
+            json!({ "zone_id": "openhome:mock-uuid", "action": "play" }),
+        )
+        .await,
+    );
+    assert_eq!(text, "Error: Control error: Device not found: mock-uuid");
+
+    let text = result_text(
+        &app.call_tool(
+            "hifi_control",
+            json!({ "zone_id": "upnp:mock-uuid", "action": "play" }),
+        )
+        .await,
+    );
+    assert_eq!(text, "Error: Control error: Renderer not found: mock-uuid");
+
+    openhome_mock.stop().await;
+    upnp_mock.stop().await;
+}
+
+// =============================================================================
+// 8. No orphaned fields
+// =============================================================================
+//
+// AGENTS.md: "No orphaned fields - Don't return data (like item_key) that can't
+// be used by any tool." This encodes that guardrail as a test.
+//
+// Every field name any tool returns must appear below, classified as either
+// consumed by some tool's input or explicitly display-only WITH A REASON. The
+// inventory is read from real tool responses, so adding a field to a response
+// type fails this test until it is classified.
+
+/// Why a returned field is not an input to any tool.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FieldRole {
+    /// Consumed by the named tool parameter — the field closes a loop.
+    Consumed(&'static str),
+    /// Deliberately display-only. The reason is required, not decorative: a bare
+    /// allowlist reads as approval, and at least one entry here is a known defect
+    /// rather than a design choice.
+    DisplayOnly(&'static str),
+}
+
+use FieldRole::{Consumed, DisplayOnly};
+
+/// Today's truth, including its defects. `#394` freezes this; it fixes nothing.
+const FIELD_ROLES: &[(&str, FieldRole)] = &[
+    // Zone identity closes the loop: every zone-scoped tool takes it.
+    ("zone_id", Consumed("hifi_now_playing/hifi_control/hifi_play.zone_id")),
+    ("zone_name", DisplayOnly(
+        "human label; every tool addresses a zone by zone_id, never by name",
+    )),
+    ("state", DisplayOnly(
+        "playback state readout; hifi_control.action is the write path",
+    )),
+    ("volume", DisplayOnly(
+        "current level readout; hifi_control.value is the write path",
+    )),
+    ("is_muted", DisplayOnly(
+        "mute readout with no corresponding write: hifi_control has no mute action",
+    )),
+    ("title", DisplayOnly(
+        "hifi_search returns {title, subtitle} and no key, so the only route from \
+         'found it' to 'playing it' is handing the title back to hifi_play, which \
+         re-searches and takes the first match. That is #392's keystone finding and \
+         #396's job — NOT an endorsed design. Listed to freeze today's behavior.",
+    )),
+    ("artist", DisplayOnly(
+        "now-playing readout; hifi_play takes a free-text query, not a field",
+    )),
+    ("album", DisplayOnly(
+        "now-playing readout; hifi_play takes a free-text query, not a field",
+    )),
+    ("subtitle", DisplayOnly(
+        "search-result label, same defect as `title`; see #396",
+    )),
+    // hifi_status / hifi_hqplayer_status readouts.
+    ("connected", DisplayOnly(
+        "boolean health readout; nothing takes a connection state as input",
+    )),
+    ("host", DisplayOnly(
+        "diagnostic address; configuring a host is an HTTP/settings concern, not an MCP tool",
+    )),
+    ("core_name", DisplayOnly(
+        "Roon core label for the operator; no tool selects a core",
+    )),
+    ("roon", DisplayOnly(
+        "hifi_status grouping key, not a value a client passes anywhere",
+    )),
+    ("hqplayer", DisplayOnly(
+        "hifi_status grouping key, not a value a client passes anywhere",
+    )),
+    ("pipeline", DisplayOnly(
+        "hifi_hqplayer_status grouping key wrapping the pipeline readout",
+    )),
+    ("filter", DisplayOnly(
+        "pipeline readout; hifi_hqplayer_set_pipeline writes it via \
+         setting='filter1x'/'filterNx', which is a different name",
+    )),
+    ("shaper", Consumed("hifi_hqplayer_set_pipeline.setting='shaper'")),
+    ("rate", Consumed("hifi_hqplayer_set_pipeline.setting='rate'")),
+];
+
+/// Collect every key name reachable in a JSON value, at any depth.
+fn collect_keys(value: &Value, into: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                into.insert(k.clone());
+                collect_keys(v, into);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_keys(item, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn no_tool_returns_an_unclassified_field() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    // Drive every tool that returns structured data, with a live LMS zone so the
+    // zone and now-playing payloads are fully populated rather than empty.
+    let structured_calls: Vec<(&str, Value)> = vec![
+        ("hifi_zones", json!({})),
+        ("hifi_now_playing", json!({ "zone_id": zone_id })),
+        ("hifi_status", json!({})),
+        ("hifi_hqplayer_status", json!({})),
+    ];
+
+    let mut returned = std::collections::BTreeSet::new();
+    for (tool, args) in structured_calls {
+        let text = result_text(&h.app.call_tool(tool, args).await);
+        let parsed: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{tool} must return JSON: {e}\n{text}"));
+        collect_keys(&parsed, &mut returned);
+    }
+
+    // `hifi_search`'s result fields are unreachable without a live music library,
+    // so they are listed explicitly. Keep in sync with `McpSearchResult`.
+    for field in ["title", "subtitle"] {
+        returned.insert(field.to_string());
+    }
+    // `McpPipelineStatus` only serializes when HQPlayer is connected with a live
+    // pipeline. Keep in sync with that struct.
+    for field in ["state", "filter", "shaper", "rate"] {
+        returned.insert(field.to_string());
+    }
+
+    let unclassified: Vec<&String> = returned
+        .iter()
+        .filter(|f| !FIELD_ROLES.iter().any(|(name, _)| *name == f.as_str()))
+        .collect();
+    assert!(
+        unclassified.is_empty(),
+        "MCP tools return field(s) {unclassified:?} that are neither consumed by a \
+         tool input nor classified as display-only.\n\n\
+         AGENTS.md: \"No orphaned fields - Don't return data (like item_key) that \
+         can't be used by any tool.\"\n\n\
+         Add each one to FIELD_ROLES in tests/mcp_contract.rs, either as \
+         Consumed(\"<tool>.<param>\") or as DisplayOnly with a real reason. If the \
+         honest reason is \"a client cannot act on this\", the field is the bug."
+    );
+
+    // Every display-only justification must actually say something.
+    for (field, role) in FIELD_ROLES {
+        if let DisplayOnly(reason) = role {
+            assert!(
+                reason.len() > 15,
+                "{field}: display-only fields need a real reason, not {reason:?}"
+            );
+        }
+    }
+
+    // Guard against the table rotting into a list of fields nothing returns.
+    let stale: Vec<&str> = FIELD_ROLES
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !returned.contains(*name))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "FIELD_ROLES lists field(s) {stale:?} that no tool returns any more — \
+         remove them so the table stays evidence rather than folklore"
+    );
+
+    h.stop().await;
 }
