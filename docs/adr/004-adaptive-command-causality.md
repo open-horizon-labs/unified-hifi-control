@@ -23,15 +23,18 @@ Adaptive immediate commands use four explicit ownership layers.
 
 1. **Application service — generic advisory preflight and routing.** It reads one `AdaptiveView` snapshot and rejects an unknown producer, non-Live or stale state, mismatched expected revision, unavailable/wrong-lane control, and invalid semantic value. It never mutates a snapshot and never calls an adapter without a producer reservation.
 2. **Producer coordinator — liveness, linearization, and document causality.** One per-instance publisher actor owns the non-cloneable `AdapterRun` for the manager lifecycle and alone performs observation, reservation, completion, retirement, and stop publications. It rechecks the exact expected epoch/revisions, deduplicates correlation plus request fingerprint, allocates a dedicated operation generation, appends explicit `CommandOutcome::Pending`, advances state revision, and awaits admission. Only then may execution be queued. It retains an append-only operation ledger and merges it into every later observed document before revision materialization.
-3. **Immediate-command actor — accepted-job lifetime and dispatch fencing.** A bounded actor owns accepted jobs independently of the submitting caller. Immediately before native dispatch it asks the producer coordinator to validate the opaque lease again. If the producer run, generation, or conflict-set ownership has changed, it terminalizes the operation as not-attempted Superseded and does not call the adapter. Graceful shutdown closes and drains this actor before adapters are stopped. Caller cancellation cannot abandon a reserved operation: cancellation before dispatch becomes Superseded/NotAttempted; after I/O begins, the actor continues through typed completion.
+3. **Immediate-command actor — accepted-job lifetime and dispatch fencing.** A bounded actor owns accepted jobs independently of the submitting caller. Immediately before native dispatch it asks the producer coordinator to atomically validate the opaque lease and record a coordinator-only executor-begun fence. If the producer run, generation, or conflict-set ownership has changed, it terminalizes the operation as not-attempted Superseded and does not call the adapter. The fence is ordering state, not write-attempt evidence, and is never projected into the producer document. Graceful shutdown closes and drains this actor before adapters are stopped. Caller cancellation cannot abandon a reserved operation: cancellation before dispatch becomes Superseded/NotAttempted; after execution begins, the actor continues through typed completion.
 4. **Native executor — typed protocol evidence.** The HQPlayer executor accepts only a validated semantic command and returns a contract-free typed receipt distinguishing no attempt, possible attempt, daemon acknowledgement/rejection, authoritative same-session readback, divergence, and unavailable readback. It never imports adaptive outcome types and never exposes native indexes. The manager holds its lifecycle transaction across exact-instance resolution and native execution so removal or reconfiguration cannot race a dispatched command.
 
 Completion carries an opaque lease containing producer identity, producer epoch, adapter-run ID, conflict set, and operation generation. The publisher accepts a transition only if that lease is still current. A native operation retains the run ID, never the RAII run lease; stop or replacement therefore makes a late completion stale instead of extending producer liveness.
 
-Before the native executor returns a typed receipt, `Pending` is explicitly a no-send state. A
-matching observation in that interval resolves the operation as `Ignored` with
-`NotAttempted`; it must never manufacture `Applied`/`Confirmed`. Receipt evidence is the only
-source of attempted-write truth. Instance removal may arrive after the manager has finished the
+Before the final dispatch fence, `Pending` is explicitly a no-send state. A matching observation in
+that interval resolves the operation as `Ignored` with `NotAttempted`; it must never manufacture
+`Applied`/`Confirmed`. Once the executor-begun fence is installed, `Pending` means the attempt is
+unknown: matching or conflicting observations may update producer state but cannot resolve that
+operation. Receipt evidence is the only source of attempted-write truth, and admitting typed
+completion clears the fence atomically with its operation transition. Manager stop refuses to drop
+the run while a fence remains. Instance removal may arrive after the manager has finished the
 native call but before the command actor publishes that receipt, so it records retirement intent
 and blocks new work while retaining the coordinator. Retirement occurs only after the receipt's
 terminal operation is admitted; the compact retired coordinator then preserves exact correlation
@@ -50,9 +53,12 @@ Every operation records its control, requested semantic value, lane, correlation
 Terminal publications are a serialization frontier: while one is deferred, observations and new
 reservations first flush the immutable terminal candidate rather than publishing a different
 document at the same next revision. Documents retain the newest 32 terminal operations; compacted
-records retain bounded correlation/fingerprint tombstones (256) so an old gesture cannot become a
-fresh write. Unresolved records are never compacted; admission applies backpressure at 32
-unresolved operations instead of silently forgetting uncertainty.
+records retain bounded correlation/fingerprint tombstones (256) so a recent compacted gesture
+cannot become a fresh write. Retired producer identities are globally bounded at 64 as well as
+bounded within each retained ledger. Correlation identity is therefore a finite replay window,
+not perpetual storage; an expired client request must still pass the current epoch/revision
+preflight before it can reserve native I/O. Unresolved records are never compacted; admission
+applies backpressure at 32 unresolved operations instead of silently forgetting uncertainty.
 
 ## Options considered
 
@@ -96,7 +102,7 @@ Deferred. A producer actor owning observation, command execution, and publicatio
 - **Publisher complexity:** require barrier-based tests for observation/pending/completion ordering and stale run replacement.
 - **Cancellation and shutdown races:** make accepted jobs actor-owned, drain before adapter shutdown, and test cancellation after reservation, during I/O, and while completion publication is queued.
 - **False receipt strength:** define and test an evidence policy per semantic operation; defer operations that cannot meet it.
-- **Unbounded ledger growth:** define retention/compaction before public surfaces depend on long histories; never silently discard active or unresolved operations.
+- **Unbounded ledger growth:** bound terminal ledgers, correlation tombstones, and retired instance identities; never silently discard active or unresolved operations.
 - **Future producers need a different model:** keep the command service generic but the coordinator producer-owned; revisit bidirectional actors after a second producer supplies evidence.
 
 ## Notes

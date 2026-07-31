@@ -957,6 +957,11 @@ const MAX_TERMINAL_OPERATIONS: usize = 32;
 /// silently treating an old gesture as new would repeat native I/O.
 const MAX_CORRELATION_TOMBSTONES: usize = 256;
 
+/// Retired instance identities retain bounded duplicate-correlation truth. Instance names are
+/// configuration input, so bounding each retired ledger is insufficient by itself: a stream of
+/// distinct removed names must not grow coordinator memory forever.
+const MAX_RETIRED_INSTANCES: usize = 64;
+
 /// An unresolved outcome carries real uncertainty and therefore must never be compacted away.
 /// The producer applies backpressure instead of allowing a disconnected/indeterminate stream to
 /// grow memory forever. One pipeline command may still be Pending in addition to these records.
@@ -1143,6 +1148,10 @@ struct HqpInstanceCoordinator {
     correlation_tombstones: HashMap<String, HqpCommandFingerprint>,
     correlation_tombstone_order: VecDeque<String>,
     active_pipeline: Option<u64>,
+    /// Generations whose final lease check passed and whose executor call has begun. This is
+    /// coordinator-only causality state: it is not write-attempt evidence and never enters the
+    /// producer document. Only the typed receipt may clear it.
+    dispatch_in_progress: HashSet<u64>,
     execution_target: Option<HqpNativeExecutionTarget>,
     deferred_commit: Option<HqpDeferredCommit>,
     retirement_requested: Option<ProducerEpoch>,
@@ -1153,6 +1162,7 @@ struct HqpDeferredCommit {
     tracker: RevisionTracker,
     ledger: Vec<OperationRecord>,
     active_pipeline: Option<u64>,
+    dispatch_in_progress: HashSet<u64>,
     correlation_tombstones: HashMap<String, HqpCommandFingerprint>,
     correlation_tombstone_order: VecDeque<String>,
 }
@@ -1196,7 +1206,12 @@ enum HqpCoordinatorCommand {
         request: HqpImmediateCommandRequest,
         reply: oneshot::Sender<Result<Option<HqpCommandReservation>, HqpCoordinatorRefusal>>,
     },
+    #[cfg(test)]
     Validate {
+        lease: HqpCommandLease,
+        reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
+    },
+    BeginDispatch {
         lease: HqpCommandLease,
         reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
     },
@@ -1221,12 +1236,32 @@ struct HqpPublisherCoordinator {
     run: Option<AdapterRun>,
     instances: HashMap<String, HqpInstanceCoordinator>,
     retired_instances: HashMap<String, HqpRetiredInstance>,
+    retired_instance_order: VecDeque<String>,
     #[cfg(test)]
     refused_publications: usize,
     stop_requested: bool,
 }
 
 impl HqpPublisherCoordinator {
+    fn retain_retired_instance(&mut self, instance_name: String, retired: HqpRetiredInstance) {
+        self.retired_instance_order
+            .retain(|retained| retained != &instance_name);
+        self.retired_instances
+            .insert(instance_name.clone(), retired);
+        self.retired_instance_order.push_back(instance_name);
+        while self.retired_instance_order.len() > MAX_RETIRED_INSTANCES {
+            if let Some(expired) = self.retired_instance_order.pop_front() {
+                self.retired_instances.remove(&expired);
+            }
+        }
+    }
+
+    fn remove_retired_instance(&mut self, instance_name: &str) {
+        self.retired_instances.remove(instance_name);
+        self.retired_instance_order
+            .retain(|retained| retained != instance_name);
+    }
+
     fn has_deferred_commits(&self) -> bool {
         self.instances
             .values()
@@ -1241,6 +1276,17 @@ impl HqpPublisherCoordinator {
                     .iter()
                     .any(|operation| operation.outcome == CommandOutcome::Pending)
         })
+    }
+
+    fn finish_stop_if_quiescent(&mut self) {
+        let quiescent = self.instances.values().all(|state| {
+            state.deferred_commit.is_none()
+                && state.dispatch_in_progress.is_empty()
+                && !has_pending_operations(state)
+        });
+        if self.stop_requested && quiescent {
+            self.run.take();
+        }
     }
 
     async fn retry_deferred_commits(&mut self) {
@@ -1283,9 +1329,7 @@ impl HqpPublisherCoordinator {
             }
             self.instances.insert(name, state);
         }
-        if self.stop_requested && !self.has_deferred_commits() {
-            self.run.take();
-        }
+        self.finish_stop_if_quiescent();
     }
 
     async fn retire_admitted_instance(
@@ -1295,6 +1339,7 @@ impl HqpPublisherCoordinator {
         producer_epoch: ProducerEpoch,
     ) -> Result<(), HqpCoordinatorRefusal> {
         debug_assert!(!has_pending_operations(&state));
+        debug_assert!(state.dispatch_in_progress.is_empty());
         if let Some(run) = self.run.as_ref() {
             let producer_id = format!("hqplayer:{instance_name}");
             let retirement = self
@@ -1316,7 +1361,7 @@ impl HqpPublisherCoordinator {
                 }
             }
         }
-        self.retired_instances.insert(
+        self.retain_retired_instance(
             instance_name,
             HqpRetiredInstance {
                 producer_epoch,
@@ -1342,6 +1387,7 @@ impl HqpPublisherCoordinator {
                 state.tracker = commit.tracker;
                 state.ledger = commit.ledger;
                 state.active_pipeline = commit.active_pipeline;
+                state.dispatch_in_progress = commit.dispatch_in_progress;
                 state.correlation_tombstones = commit.correlation_tombstones;
                 state.correlation_tombstone_order = commit.correlation_tombstone_order;
                 state.deferred_commit = None;
@@ -1397,8 +1443,12 @@ impl HqpPublisherCoordinator {
                 HqpCoordinatorCommand::LookupCorrelation { request, reply } => {
                     let _ = reply.send(self.lookup_correlation(&request));
                 }
+                #[cfg(test)]
                 HqpCoordinatorCommand::Validate { lease, reply } => {
                     let _ = reply.send(self.validate(&lease));
+                }
+                HqpCoordinatorCommand::BeginDispatch { lease, reply } => {
+                    let _ = reply.send(self.begin_dispatch(&lease));
                 }
                 HqpCoordinatorCommand::Complete {
                     lease,
@@ -1476,8 +1526,9 @@ impl HqpPublisherCoordinator {
         if let Some(error) = first_failure {
             return Err(error);
         }
-        // The sole run is dropped only after every pending audit transition was admitted.
-        self.run.take();
+        // The sole run is dropped only after every pending audit transition was admitted and no
+        // executor-begun fence is awaiting typed receipt truth.
+        self.finish_stop_if_quiescent();
         Ok(())
     }
 
@@ -1491,6 +1542,15 @@ impl HqpPublisherCoordinator {
         let mut changed = false;
         for operation in &mut candidate_ledger {
             if operation.outcome != CommandOutcome::Pending {
+                continue;
+            }
+            if operation
+                .generation
+                .is_some_and(|generation| state.dispatch_in_progress.contains(&generation))
+            {
+                // The executor call began, but its receipt has not reached the coordinator. Stop
+                // cannot call this a no-send or discard the operation; the typed completion owns
+                // that truth and will clear the fence.
                 continue;
             }
             operation.write_attempt = WriteAttempt::NotAttempted;
@@ -1510,8 +1570,18 @@ impl HqpPublisherCoordinator {
                 .map_err(|_| HqpCoordinatorRefusal::IllegalTransition)?;
             changed = true;
         }
+        let dispatch_still_in_progress = candidate_ledger.iter().any(|operation| {
+            operation.outcome == CommandOutcome::Pending
+                && operation
+                    .generation
+                    .is_some_and(|generation| state.dispatch_in_progress.contains(&generation))
+        });
         if !changed {
-            return Ok(());
+            return if dispatch_still_in_progress {
+                Err(HqpCoordinatorRefusal::LeaseStillCurrent)
+            } else {
+                Ok(())
+            };
         }
 
         let mut correlation_tombstones = state.correlation_tombstones.clone();
@@ -1538,11 +1608,17 @@ impl HqpPublisherCoordinator {
                 tracker: candidate_tracker,
                 ledger: candidate_ledger,
                 active_pipeline: None,
+                dispatch_in_progress: state.dispatch_in_progress.clone(),
                 correlation_tombstones,
                 correlation_tombstone_order,
             },
         )
-        .await
+        .await?;
+        if dispatch_still_in_progress {
+            Err(HqpCoordinatorRefusal::LeaseStillCurrent)
+        } else {
+            Ok(())
+        }
     }
 
     fn lookup_correlation(
@@ -1646,7 +1722,7 @@ impl HqpPublisherCoordinator {
             }
             // A strictly newer producer epoch is the only observation that can supersede an
             // instance retirement. Its correlation namespace is fresh by producer identity.
-            self.retired_instances.remove(&instance_name);
+            self.remove_retired_instance(&instance_name);
         }
         let mut state = self.instances.remove(&instance_name).unwrap_or_default();
         if let Some(commit) = state.deferred_commit.clone() {
@@ -1659,7 +1735,11 @@ impl HqpPublisherCoordinator {
             }
         }
         let mut candidate_ledger = state.ledger.clone();
-        let converged = reconcile_operations(&projected, &mut candidate_ledger)?;
+        let converged = reconcile_operations(
+            &projected,
+            &mut candidate_ledger,
+            &state.dispatch_in_progress,
+        )?;
         let mut correlation_tombstones = state.correlation_tombstones.clone();
         let mut correlation_tombstone_order = state.correlation_tombstone_order.clone();
         prune_terminal_history(
@@ -2001,6 +2081,28 @@ impl HqpPublisherCoordinator {
             .ok_or(HqpCoordinatorRefusal::StaleLease)
     }
 
+    fn begin_dispatch(&mut self, lease: &HqpCommandLease) -> Result<(), HqpCoordinatorRefusal> {
+        if self.stop_requested {
+            return Err(HqpCoordinatorRefusal::LifecycleNotRunning);
+        }
+        self.validate(lease)?;
+        let instance_name = lease
+            .producer_id
+            .strip_prefix("hqplayer:")
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        let state = self
+            .instances
+            .get_mut(instance_name)
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        if state.retirement_requested.is_some() {
+            return Err(HqpCoordinatorRefusal::StaleLease);
+        }
+        if !state.dispatch_in_progress.insert(lease.generation) {
+            return Err(HqpCoordinatorRefusal::LeaseStillCurrent);
+        }
+        Ok(())
+    }
+
     /// Return already-published terminal truth for a late actor callback. In particular, instance
     /// retirement removes the document from the public view, but must not make a completion retry
     /// look like a fresh lease or make the accepted operation's audit disappear.
@@ -2052,10 +2154,12 @@ impl HqpPublisherCoordinator {
                     if !has_pending_operations(&state) {
                         self.retire_admitted_instance(instance_name, state, epoch)
                             .await?;
+                        self.finish_stop_if_quiescent();
                         return Ok(completed);
                     }
                 }
                 self.instances.insert(instance_name, state);
+                self.finish_stop_if_quiescent();
                 Ok(completed)
             }
             Err(error) => {
@@ -2107,12 +2211,15 @@ impl HqpPublisherCoordinator {
         candidate_tracker
             .materialize(candidate_document)
             .map_err(|error| HqpCoordinatorRefusal::RevisionFailed(format!("{error:?}")))?;
+        let mut dispatch_in_progress = state.dispatch_in_progress.clone();
+        dispatch_in_progress.remove(&lease.generation);
         self.publish_deferred(
             state,
             HqpDeferredCommit {
                 tracker: candidate_tracker,
                 ledger: candidate_ledger,
                 active_pipeline: None,
+                dispatch_in_progress,
                 correlation_tombstones,
                 correlation_tombstone_order,
             },
@@ -2140,10 +2247,27 @@ impl HqpPublisherCoordinator {
             .remove(&instance_name)
             .ok_or(HqpCoordinatorRefusal::StaleLease)?;
         let result = self
-            .supersede_stale_for_instance(&mut state, lease, active_run, at)
+            .supersede_stale_for_instance(&mut state, lease, active_run, self.stop_requested, at)
             .await;
-        self.instances.insert(instance_name, state);
-        result
+        match result {
+            Ok(superseded) => {
+                if let Some(epoch) = state.retirement_requested {
+                    if !has_pending_operations(&state) {
+                        self.retire_admitted_instance(instance_name, state, epoch)
+                            .await?;
+                        self.finish_stop_if_quiescent();
+                        return Ok(superseded);
+                    }
+                }
+                self.instances.insert(instance_name, state);
+                self.finish_stop_if_quiescent();
+                Ok(superseded)
+            }
+            Err(error) => {
+                self.instances.insert(instance_name, state);
+                Err(error)
+            }
+        }
     }
 
     async fn supersede_stale_for_instance(
@@ -2151,10 +2275,16 @@ impl HqpPublisherCoordinator {
         state: &mut HqpInstanceCoordinator,
         lease: &HqpCommandLease,
         active_run: Option<AdapterRunId>,
+        lifecycle_stopping: bool,
         at: Timestamp,
     ) -> Result<OperationRecord, HqpCoordinatorRefusal> {
-        let invalidated =
-            lease.run_id != active_run || state.tracker.epoch != Some(lease.producer_epoch.0);
+        if state.dispatch_in_progress.contains(&lease.generation) {
+            return Err(HqpCoordinatorRefusal::LeaseStillCurrent);
+        }
+        let invalidated = lease.run_id != active_run
+            || state.tracker.epoch != Some(lease.producer_epoch.0)
+            || state.retirement_requested.is_some()
+            || lifecycle_stopping;
         if !invalidated {
             return Err(HqpCoordinatorRefusal::LeaseStillCurrent);
         }
@@ -2226,6 +2356,7 @@ impl HqpPublisherCoordinator {
                 tracker: candidate_tracker,
                 ledger: candidate_ledger,
                 active_pipeline: None,
+                dispatch_in_progress: state.dispatch_in_progress.clone(),
                 correlation_tombstones,
                 correlation_tombstone_order,
             },
@@ -2284,6 +2415,7 @@ fn semantic_request_matches(document: &ProducerDocument, request: &OperationRequ
 fn reconcile_operations(
     document: &ProducerDocument,
     ledger: &mut [OperationRecord],
+    dispatch_in_progress: &HashSet<u64>,
 ) -> Result<HashSet<OperationId>, HqpCoordinatorRefusal> {
     let mut converged = HashSet::new();
     for index in 0..ledger.len() {
@@ -2303,8 +2435,14 @@ fn reconcile_operations(
                     .as_ref()
                     .is_some_and(|later_request| later_request.control == request.control)
         });
+        let executor_begun = dispatch_in_progress.contains(&generation);
 
-        let resolution = if producer_restarted || (!matches && has_later_generation) {
+        let resolution = if executor_begun {
+            // The final lease check passed and the executor call began, but no receipt exists yet.
+            // Observations may update producer state while that call is in flight; they cannot
+            // claim this operation was a no-send or otherwise pre-empt its typed receipt.
+            None
+        } else if producer_restarted || (!matches && has_later_generation) {
             Some((
                 CommandOutcome::Superseded,
                 RecoveryState::ReplanRequired,
@@ -2471,6 +2609,7 @@ impl HqpAdaptivePublisher {
                 run: None,
                 instances: HashMap::new(),
                 retired_instances: HashMap::new(),
+                retired_instance_order: VecDeque::new(),
                 #[cfg(test)]
                 refused_publications: 0,
                 stop_requested: false,
@@ -2514,11 +2653,25 @@ impl HqpAdaptivePublisher {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn validate(
         &self,
         lease: &HqpCommandLease,
     ) -> Result<(), HqpCoordinatorRefusal> {
         self.request(|reply| HqpCoordinatorCommand::Validate {
+            lease: lease.clone(),
+            reply,
+        })
+        .await
+    }
+
+    /// Atomically perform the final lease check and fence this generation as executing.
+    /// The fence is internal ordering state, not evidence that a native write was attempted.
+    pub(crate) async fn begin_dispatch(
+        &self,
+        lease: &HqpCommandLease,
+    ) -> Result<(), HqpCoordinatorRefusal> {
+        self.request(|reply| HqpCoordinatorCommand::BeginDispatch {
             lease: lease.clone(),
             reply,
         })
@@ -3748,6 +3901,10 @@ mod tests {
             .await
             .expect("reservation admitted");
         publisher
+            .begin_dispatch(reservation.lease())
+            .await
+            .expect("final lease check fences the begun executor");
+        publisher
             .instance_removed("main", 7)
             .await
             .expect("removal waits for the actor's receipt completion");
@@ -3790,6 +3947,65 @@ mod tests {
             .expect("late duplicate preserves the attempted receipt audit");
         assert_eq!(duplicate.outcome, CommandOutcome::Indeterminate);
         assert_eq!(duplicate.write_attempt, WriteAttempt::Attempted);
+
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn manager_stop_cannot_terminalize_or_drop_an_executor_begun_operation() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let reservation = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("initial"),
+                "stop-during-executor",
+                "PCM",
+            ))
+            .await
+            .expect("reserve");
+        publisher
+            .begin_dispatch(reservation.lease())
+            .await
+            .expect("executor begun fence");
+
+        assert!(publisher.manager_stopped().await.is_err());
+        let pending = view.snapshot(&key).expect("in-flight snapshot retained");
+        let operation = pending
+            .document
+            .operations
+            .iter()
+            .find(|operation| operation.id == reservation.operation().id)
+            .expect("in-flight audit retained");
+        assert_eq!(operation.outcome, CommandOutcome::Pending);
+        assert_eq!(operation.write_attempt, WriteAttempt::NotAttempted);
+
+        publisher
+            .complete(
+                reservation.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Indeterminate,
+                    WriteAttempt::Attempted,
+                    Timestamp::new("2026-07-31T00:00:01Z"),
+                    Some(RecoveryState::AwaitingReadback),
+                    None,
+                ),
+            )
+            .await
+            .expect("typed receipt survives stop race");
+        let retained = view.snapshot(&key).expect("last-known receipt audit");
+        assert_eq!(
+            retained.document.operations[0].outcome,
+            CommandOutcome::Indeterminate
+        );
+        assert_eq!(
+            retained.document.operations[0].write_attempt,
+            WriteAttempt::Attempted
+        );
 
         shutdown.cancel();
         actor_task.await.expect("actor joins");
@@ -4187,6 +4403,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executor_begun_matching_observation_waits_for_typed_receipt_and_receipt_wins() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let reservation = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("initial"),
+                "executor-observation-barrier",
+                "PCM",
+            ))
+            .await
+            .expect("reserve");
+
+        publisher
+            .begin_dispatch(reservation.lease())
+            .await
+            .expect("final lease validation and executor-begun fence are atomic");
+        let mut matching = sample();
+        matching.mode_is_source = false;
+        matching.mode.selected = "PCM".to_string();
+        publisher
+            .observed(matching.clone())
+            .await
+            .expect("matching producer observation admitted behind fence");
+        let while_executing = view.snapshot(&key).expect("executing snapshot");
+        let operation = while_executing
+            .document
+            .operations
+            .iter()
+            .find(|operation| operation.id == reservation.operation().id)
+            .expect("operation retained");
+        assert_eq!(operation.outcome, CommandOutcome::Pending);
+        assert_eq!(operation.write_attempt, WriteAttempt::NotAttempted);
+
+        publisher
+            .complete(
+                reservation.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Rejected,
+                    WriteAttempt::Attempted,
+                    Timestamp::new("2026-07-31T00:00:01Z"),
+                    Some(RecoveryState::NotRequired),
+                    None,
+                ),
+            )
+            .await
+            .expect("typed receipt clears fence and establishes operation truth");
+        publisher
+            .observed(matching)
+            .await
+            .expect("later matching observation cannot rewrite terminal receipt");
+        let terminal = view.snapshot(&key).expect("terminal snapshot");
+        let operation = terminal
+            .document
+            .operations
+            .iter()
+            .find(|operation| operation.id == reservation.operation().id)
+            .expect("terminal audit retained");
+        assert_eq!(operation.outcome, CommandOutcome::Rejected);
+        assert_eq!(operation.write_attempt, WriteAttempt::Attempted);
+        assert_eq!(operation.history.len(), 1);
+        assert_eq!(operation.history[0].from, CommandOutcome::Pending);
+        assert_eq!(operation.history[0].to, CommandOutcome::Rejected);
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
     async fn terminal_ledger_and_correlation_tombstones_are_bounded_but_unresolved_are_retained() {
         let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
         let key = crate::producers::ProducerKey {
@@ -4248,6 +4537,93 @@ mod tests {
                 .expect("newest lookup")
                 .is_some(),
             "newest terminal correlation remains idempotent"
+        );
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn retired_instance_correlation_truth_is_globally_bounded_across_distinct_names() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        publisher
+            .instance_removed("main", 7)
+            .await
+            .expect("fixture instance retires");
+
+        let mut oldest_request = None;
+        let mut newest_request = None;
+        for index in 0..=MAX_RETIRED_INSTANCES {
+            let instance_name = format!("retired-{index}");
+            let mut observation = sample();
+            observation.instance_name = instance_name.clone();
+            observation.instance_label = Some(instance_name.clone());
+            observation.execution_target.instance_name = instance_name.clone();
+            publisher
+                .observed(observation)
+                .await
+                .expect("distinct instance observation admits");
+
+            let key = crate::producers::ProducerKey {
+                producer_id: format!("hqplayer:{instance_name}"),
+                role: TargetRole::DspEngine,
+                zone_id: None,
+            };
+            let snapshot = view.snapshot(&key).expect("instance snapshot");
+            let request = crate::producers::hqplayer_command::HqpImmediateCommandRequest {
+                key,
+                expected: snapshot.document.position(),
+                control: ControlId::new(CONTROL_PIPELINE_MODE),
+                requested: ControlValue::choice(choice_id(CONTROL_PIPELINE_MODE, "PCM")),
+                lane: ApplyLane::Immediate,
+                correlation_id: format!("retired-correlation-{index}"),
+            };
+            if index == 0 {
+                oldest_request = Some(request.clone());
+            }
+            newest_request = Some(request.clone());
+            let reservation = publisher
+                .reserve(
+                    crate::producers::hqplayer_command::preflight(&snapshot, &request)
+                        .expect("retired request preflight"),
+                )
+                .await
+                .expect("retired request reserves");
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Applied,
+                        WriteAttempt::Confirmed,
+                        Timestamp::new(format!("2026-07-31T00:02:{:02}Z", index % 60)),
+                        Some(RecoveryState::NotRequired),
+                        None,
+                    ),
+                )
+                .await
+                .expect("retired request completes");
+            publisher
+                .instance_removed(&instance_name, 7)
+                .await
+                .expect("completed instance retires");
+        }
+
+        assert!(
+            publisher
+                .lookup_correlation(oldest_request.as_ref().expect("oldest request"))
+                .await
+                .expect("expired retired lookup is not an error")
+                .is_none(),
+            "the oldest distinct retired identity is evicted at the global bound"
+        );
+        assert!(
+            publisher
+                .lookup_correlation(newest_request.as_ref().expect("newest request"))
+                .await
+                .expect("newest retired lookup")
+                .is_some(),
+            "the newest retired identity keeps exact duplicate truth"
         );
 
         publisher.manager_stopped().await.expect("manager stops");

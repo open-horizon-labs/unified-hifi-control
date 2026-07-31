@@ -70,7 +70,7 @@ trait HqpCommandCoordinator: Send + Sync {
         command: HqpValidatedCommand,
     ) -> Result<HqpCommandReservation, HqpCoordinatorRefusal>;
 
-    async fn validate(&self, lease: &HqpCommandLease) -> Result<(), HqpCoordinatorRefusal>;
+    async fn begin_dispatch(&self, lease: &HqpCommandLease) -> Result<(), HqpCoordinatorRefusal>;
 
     async fn complete(
         &self,
@@ -101,8 +101,8 @@ impl HqpCommandCoordinator for HqpAdaptivePublisher {
         HqpAdaptivePublisher::reserve(self, command).await
     }
 
-    async fn validate(&self, lease: &HqpCommandLease) -> Result<(), HqpCoordinatorRefusal> {
-        HqpAdaptivePublisher::validate(self, lease).await
+    async fn begin_dispatch(&self, lease: &HqpCommandLease) -> Result<(), HqpCoordinatorRefusal> {
+        HqpAdaptivePublisher::begin_dispatch(self, lease).await
     }
 
     async fn complete(
@@ -334,7 +334,7 @@ impl HqpImmediateCommandActor {
             return;
         }
 
-        if let Err(refusal) = self.coordinator.validate(&lease).await {
+        if let Err(refusal) = self.coordinator.begin_dispatch(&lease).await {
             if let Err(error) = self
                 .coordinator
                 .supersede_stale_before_dispatch(&lease, now())
@@ -371,11 +371,10 @@ impl HqpImmediateCommandActor {
             return;
         };
 
-        // The executor's typed receipt is the sole source of native-attempt evidence. In
-        // particular, do not publish `Attempted` merely because this actor is about to make the
-        // call: lifecycle stop between such a marker and the first native byte is a proven
-        // no-write case. The reserved target makes that stop race safe: a moved/removed instance
-        // returns `NativeSettingReceipt::NotAttempted` and no stale target is replayed.
+        // The coordinator fence says only that the executor call began; it remains deliberately
+        // outside the producer document. The executor's typed receipt is still the sole source of
+        // native-attempt evidence. A moved/removed reserved target returns `NotAttempted`, while
+        // observations and lifecycle teardown wait rather than guessing before this receipt.
         let evidence = match setting {
             Some(setting) => match self.executor.execute(&execution_target, setting).await {
                 Ok(receipt) => receipt_evidence(receipt),
@@ -750,9 +749,12 @@ mod tests {
             Ok(reservation)
         }
 
-        async fn validate(&self, _lease: &HqpCommandLease) -> Result<(), HqpCoordinatorRefusal> {
+        async fn begin_dispatch(
+            &self,
+            _lease: &HqpCommandLease,
+        ) -> Result<(), HqpCoordinatorRefusal> {
             self.validations.fetch_add(1, Ordering::SeqCst);
-            push(&self.sequence, "validate");
+            push(&self.sequence, "begin_dispatch");
             if self.validation_fails.load(Ordering::SeqCst) {
                 Err(HqpCoordinatorRefusal::StaleLease)
             } else {
@@ -1154,7 +1156,7 @@ mod tests {
         assert!(wait_for_count(&coordinator.completions, 1).await);
         assert_eq!(
             *lock(&sequence),
-            vec!["reserve", "validate", "execute", "complete"]
+            vec!["reserve", "begin_dispatch", "execute", "complete"]
         );
         assert_eq!(
             *lock(&executor.last_target),
@@ -1194,7 +1196,7 @@ mod tests {
         assert!(wait_for_count(&coordinator.completions, 1).await);
         assert_eq!(
             *lock(&sequence),
-            vec!["reserve", "validate", "execute", "complete"],
+            vec!["reserve", "begin_dispatch", "execute", "complete"],
             "attempt evidence must come from the executor receipt, not a pre-execution marker"
         );
         assert!(handle.shutdown().await.is_ok());
@@ -1220,7 +1222,10 @@ mod tests {
             .is_ok());
         assert!(wait_for_count(&coordinator.supersessions, 1).await);
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(*lock(&sequence), vec!["reserve", "validate", "supersede"]);
+        assert_eq!(
+            *lock(&sequence),
+            vec!["reserve", "begin_dispatch", "supersede"]
+        );
         assert!(handle.shutdown().await.is_ok());
         assert!(task.await.is_ok());
     }
@@ -1244,7 +1249,10 @@ mod tests {
             .is_ok());
         assert!(wait_for_count(&coordinator.completions, 1).await);
         assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(*lock(&sequence), vec!["reserve", "validate", "complete"]);
+        assert_eq!(
+            *lock(&sequence),
+            vec!["reserve", "begin_dispatch", "complete"]
+        );
         assert!(handle.shutdown().await.is_ok());
         assert!(task.await.is_ok());
     }
