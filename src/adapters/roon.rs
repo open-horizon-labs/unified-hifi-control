@@ -334,6 +334,49 @@ impl RoonAdapter {
         Ok(())
     }
 
+    /// Test seam (issue #408): run the Roon event loop against a Core at a known
+    /// address, skipping SOOD multicast discovery.
+    ///
+    /// **Not for production use** — `AdapterLogic::run` is the production entry
+    /// point and always discovers. This exists so `tests/roon_protocol.rs` can
+    /// drive the *real* event loop (including the pending-browse/load correlation
+    /// maps) against `tests/mock_servers/roon_core.rs`. Driving the real loop is
+    /// the whole point: a test that reimplemented the loop would assert nothing
+    /// about this file.
+    ///
+    /// SOOD-based discovery against a fake was rejected deliberately: it needs UDP
+    /// multicast, which is process-global and already the cause of this repo's two
+    /// flaky `/hqp/discover` tests.
+    ///
+    /// Returns when the Core is lost or `stop()` is called.
+    #[doc(hidden)]
+    pub async fn run_event_loop_against_core_for_tests(
+        &self,
+        ip: std::net::IpAddr,
+        port: &str,
+    ) -> Result<()> {
+        let base_url = self
+            .base_url
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| "http://test.invalid".to_string());
+        let shutdown = self.shutdown.read().await.clone();
+
+        run_roon_loop(
+            self.state.clone(),
+            self.bus.clone(),
+            base_url,
+            shutdown,
+            self.knob_store.clone(),
+            CoreConnect::Direct {
+                ip,
+                port: port.to_string(),
+            },
+        )
+        .await
+    }
+
     /// Stop the Roon adapter (internal - use Startable trait)
     async fn stop_internal(&self) {
         use std::sync::atomic::Ordering;
@@ -1301,6 +1344,7 @@ impl AdapterLogic for RoonAdapter {
             base_url,
             ctx.shutdown,
             self.knob_store.clone(),
+            CoreConnect::Discovery,
         )
         .await
     }
@@ -1460,6 +1504,17 @@ fn roon_zone_to_bus_zone(zone: &Zone) -> BusZone {
     }
 }
 
+/// How the event loop obtains its connection to a Roon Core.
+///
+/// Production always uses [`CoreConnect::Discovery`]; `Direct` exists only for
+/// `RoonAdapter::run_event_loop_against_core_for_tests` (issue #408).
+enum CoreConnect {
+    /// SOOD multicast discovery, then WebSocket to whatever answers.
+    Discovery,
+    /// WebSocket straight to a known address, no discovery.
+    Direct { ip: std::net::IpAddr, port: String },
+}
+
 /// Main Roon event loop
 async fn run_roon_loop(
     state: Arc<RwLock<RoonState>>,
@@ -1467,6 +1522,7 @@ async fn run_roon_loop(
     base_url: String,
     shutdown: CancellationToken,
     knob_store: Option<KnobStore>,
+    connect: CoreConnect,
 ) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
 
@@ -1518,15 +1574,29 @@ async fn run_roon_loop(
     let state_path_clone = state_path_str.clone();
     let get_roon_state = move || RoonApi::load_roon_state(&state_path_clone);
 
-    // Start discovery
-    let (mut handles, mut core_rx) = roon
-        .start_discovery(Box::new(get_roon_state), provided, Some(services))
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Failed to start Roon discovery"))?;
-
-    tracing::info!(
-        "Roon discovery started, waiting for core (authorize in Roon → Settings → Extensions)..."
-    );
+    // Start discovery (or, for tests, connect straight to a known Core)
+    let (mut handles, mut core_rx) = match connect {
+        CoreConnect::Discovery => {
+            let started = roon
+                .start_discovery(Box::new(get_roon_state), provided, Some(services))
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Failed to start Roon discovery"))?;
+            tracing::info!(
+                "Roon discovery started, waiting for core (authorize in Roon → Settings → Extensions)..."
+            );
+            started
+        }
+        CoreConnect::Direct { ip, ref port } => {
+            let connected = roon
+                .ws_connect(Box::new(get_roon_state), provided, Some(services), &ip, port)
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Failed to connect to Roon Core at {}:{}", ip, port)
+                })?;
+            tracing::info!("Connected directly to Roon Core at {}:{}", ip, port);
+            connected
+        }
+    };
 
     // Event processing task
     let state_for_events = state.clone();
