@@ -47,6 +47,7 @@
 
 pub mod admission;
 mod aggregator;
+pub mod control_plane;
 pub mod event;
 pub mod hqplayer;
 pub(crate) mod hqplayer_command;
@@ -56,6 +57,7 @@ pub(crate) mod hqplayer_command;
 pub mod hqplayer_command_service;
 pub mod run;
 pub mod runtime;
+pub mod surface;
 
 pub use admission::{
     admit, Admission, AdmissionKind, AdmissionRefusal, AdmittedDocument, IntentRepair, LaneDefect,
