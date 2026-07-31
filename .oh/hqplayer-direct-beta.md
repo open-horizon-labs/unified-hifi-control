@@ -248,7 +248,47 @@ Checked and **not** found to be defects:
 
 ## Dissent
 
-_Pending._
+**Status:** complete · **Updated:** 2026-07-31 · **Verdict:** PROCEED
+
+Actively argued against the chosen approach and the Review pass's own conclusions before locking in.
+
+1. **The shared function widened its own accepted vocabulary — reopening reviewed code, not just
+   reusing it.** `dispatch_hqplayer_action` initially accepted `"volume_set"` as a synonym for
+   `"volume"`, a spelling only MCP uses. That is a behavior change to the exact function #328/#391
+   already reviewed and dissented on, for the sake of a caller that hadn't been written yet — the
+   opposite of "audit #329/#328, do not rewrite." **Closed:** moved the translation to the MCP call
+   site (commit `c4e9a1c`); `dispatch_hqplayer_action`'s accepted actions are now byte-for-byte what
+   `control_hqplayer` recognized before this branch touched it.
+2. **Is Candidate B's dependency direction (`src/mcp` → `src/knobs::routes`) actually sound, or is
+   it avoidance of Candidate C's larger diff?** Checked `docs/ARCHITECTURE.md` and
+   `tests/architecture_lint.rs` for any rule treating `knobs`, `api`, and `mcp` as anything but peer
+   surfaces (`architecture_lint.rs:282` lists all three together as surfaces that must route through
+   the aggregator) — none found. The dependency is real but not circular, and Rust's module system
+   does not encode "knobs is ESP32-only" as a constraint; nothing enforces it. Accepted as sound, not
+   merely convenient; Candidate C remains banked for #331 if a true application-service layer
+   emerges there.
+3. **A future edit to the shared function for one surface's benefit could silently change the
+   other's behavior**, since both now call one function. This is the design's whole point (one
+   command core cannot diverge by construction) and also its main risk. Mitigated only by the
+   function's own doc comment stating both callers, and by both surfaces' test suites running in the
+   same `cargo test --all-features` pass — not by anything structural. Recorded as an accepted
+   trade-off, not a defect: the alternative (Candidate A) has the identical risk in the opposite
+   direction — silent divergence instead of silent coupling — and divergence is the worse failure
+   mode for a safety-critical volume/transport path.
+4. **Is the real MCP client (rust-mcp-sdk, dev-dependency) a meaningfully more faithful test than
+   calling `handle_call_tool_request` directly, or extra machinery for its own sake?** Considered a
+   hand-rolled `Arc<dyn McpServer>` stub with ~15 `unimplemented!()` methods to avoid the
+   dev-dependency. Rejected: the stub only proves the handler's Rust-level logic, not the JSON-RPC
+   framing/session/tool-call encoding a real client depends on — and getting 15 trait method
+   signatures exactly right against a pinned SDK version is itself a source of drift no test would
+   catch. The real client is more faithful and, once written, no larger in the test file.
+5. **Did "checked and not a defect" in Review understate anything?** Re-examined the settings-toggle
+   gap: confirmed by reading `src/adapters/hqplayer.rs` and `HqpInstanceManager` end to end that no
+   toggle-awareness exists below the knob-routes filtering layer for *any* backend — this is not an
+   HQPlayer-specific finding dressed up as general, it is general.
+
+No change to the chosen approach (Candidate B) or its scope survived this pass except item 1's
+narrowing. Final verdict: **PROCEED to live-rig validation.**
 
 ---
 
