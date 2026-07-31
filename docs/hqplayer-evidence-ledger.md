@@ -252,8 +252,10 @@ Each row below is an `open` or `pending-live` claim, with the acquisition plan t
 
 ### HQP-C-063 — the client boundary now is what HQP-C-004 describes · **fixed here**
 
-**Outcome first:** #347 landed both halves, and the row is `retired` — a status change, not a deletion, so
-a reader arriving from an old link sees what was true and what changed.
+**Outcome first:** #347 removed the adapter's numeric-string fallback; #368 completes the frozen
+numeric HTTP boundary by making resolution and application one endpoint operation. The row is
+`retired` — a status change, not a deletion, so a reader arriving from an old link sees what was true
+and what changed.
 
 HQP-C-004 previously said clients *"never"* exchange list indices or enum IDs. That was false at `6d688bd`,
 and an independent review caught it. Two evidenced paths:
@@ -265,11 +267,14 @@ and an independent review caught it. Two evidenced paths:
   `resolve_shaper_index` each tried `parse::<u32>()` and treated the result as a **direct list index** when
   the name was not in the cached enumeration (`:2081`, `:2186`, `:2247`).
 
-**What #347 did, and the shape of the fix.** The request contracts are frozen, so the number is *kept* —
-`HqpAdapter::apply_legacy_index` resolves it against the enumeration the daemon is serving now and
-returns the **name** while retaining one endpoint operation lease across resolution and application.
-That name is what travels inward. A position the current list does not have is an error at the boundary
-rather than an index forwarded to the wire. The resolvers no longer parse anything.
+**What #347 did.** The semantic resolvers no longer parse numeric strings: live setters accept names
+and resolve those names through the daemon's current enumeration.
+
+**What #368 adds for the frozen numeric route.** The request contract still carries a number, so
+`HqpAdapter::apply_legacy_index` resolves that position against the enumeration the daemon is serving
+now and passes the resolved **name** inward to `set_*_under_operation` while retaining one endpoint
+operation lease across resolution and application. A position the current list does not have is an
+error at the boundary rather than an index forwarded to the wire.
 
 **The proof shape changed with it, and that is the point of the earlier note.** This row previously had no
 executable proof because a check asserting the fallback *still existed* would fail on the happy path. Now
@@ -277,8 +282,10 @@ that the fallback is gone, the tripwire can point the other way and does:
 `no_production_control_path_parses_a_setting_name_as_an_index` fails if a resolver ever parses a name back
 into an index, which is a check that only fires on a regression.
 
-**Settled by:** #347. `a_numeric_string_is_never_accepted_as_a_setting_name` drives the three semantic
-setters with `"1"`, `"7"` and `"4"` and requires all three to be refused with nothing on the wire.
+**Settled by:** #347 and #368. `a_numeric_string_is_never_accepted_as_a_setting_name` drives the three
+semantic setters with `"1"`, `"7"` and `"4"` and requires all three to be refused with nothing on the
+wire; `legacy_index_resolution_and_apply_share_one_endpoint` proves the compatibility route resolves
+and applies its value under one endpoint lease.
 
 ### HQP-C-064 — the shaper setter had no hermetic coverage · **closed here**
 

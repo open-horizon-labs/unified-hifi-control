@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
-use mock_servers::hqplayer::corpus::VERIFIED_PROFILE;
+use mock_servers::hqplayer::corpus::{self, VERIFIED_PROFILE};
 use mock_servers::hqplayer::model::DaemonModel;
 use mock_servers::hqplayer::wire::{ReplyGate, WirePolicy, WireServer};
 use unified_hifi_control::adapters::hqplayer::{
@@ -75,16 +75,21 @@ async fn assert_reconfigure_is_waiting(
 }
 
 async fn connected_pair() -> (WireServer, WireServer, Arc<HqpAdapter>) {
-    let first = WireServer::start(
-        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
-        WirePolicy::default(),
-    )
-    .await;
-    let second = WireServer::start(
-        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
-        WirePolicy::default(),
-    )
-    .await;
+    let (_, first, _, second, adapter) = connected_pair_with_models().await;
+    (first, second, adapter)
+}
+
+async fn connected_pair_with_models() -> (
+    DaemonModel,
+    WireServer,
+    DaemonModel,
+    WireServer,
+    Arc<HqpAdapter>,
+) {
+    let first_model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    let first = WireServer::start(Arc::new(first_model.clone()), WirePolicy::default()).await;
+    let second_model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    let second = WireServer::start(Arc::new(second_model.clone()), WirePolicy::default()).await;
     let adapter = Arc::new(HqpAdapter::new(create_bus()));
     adapter
         .configure(
@@ -100,7 +105,7 @@ async fn connected_pair() -> (WireServer, WireServer, Arc<HqpAdapter>) {
         .connect()
         .await
         .expect("coherent endpoint A session");
-    (first, second, adapter)
+    (first_model, first, second_model, second, adapter)
 }
 
 struct ProfileWeb {
@@ -327,7 +332,12 @@ async fn post_write_session_loss_is_ambiguous_without_cross_session_retry() {
 /// leased separately from the named semantic write it selects.
 #[tokio::test]
 async fn legacy_index_resolution_and_apply_share_one_endpoint() {
-    let (first, second, adapter) = connected_pair().await;
+    let (first_model, first, second_model, second, adapter) = connected_pair_with_models().await;
+    assert_eq!(
+        corpus::enum_entries(&corpus::document(VERIFIED_PROFILE, "modes"), "ModesItem").len(),
+        3,
+        "this regression depends on verified list position 2"
+    );
     let gate = ReplyGate::new("GetModes");
     first.set_policy(WirePolicy {
         reply_gate: Some(gate.clone()),
@@ -354,6 +364,16 @@ async fn legacy_index_resolution_and_apply_share_one_endpoint() {
     reconfigure.await.expect("configure completes after apply");
     assert_eq!(first.stats().element_count("SetMode"), 1);
     assert_eq!(second.stats().element_count("SetMode"), 0);
+    assert_eq!(
+        first_model.state().mode_index,
+        2,
+        "list position 2 resolves to SDM (DSD) and is applied on endpoint A"
+    );
+    assert_ne!(
+        second_model.state().mode_index,
+        2,
+        "the resolved value must not leak to endpoint B"
+    );
 
     first.stop();
     second.stop();
@@ -363,7 +383,16 @@ async fn legacy_index_resolution_and_apply_share_one_endpoint() {
 /// must remain one operation.
 #[tokio::test]
 async fn matrix_index_resolution_and_apply_share_one_endpoint() {
-    let (first, second, adapter) = connected_pair().await;
+    let (first_model, first, second_model, second, adapter) = connected_pair_with_models().await;
+    assert_eq!(
+        corpus::enum_entries(
+            &corpus::document(VERIFIED_PROFILE, "matrix_profiles"),
+            "MatrixProfile"
+        )
+        .len(),
+        3,
+        "this regression depends on the verified matrix-profile list"
+    );
     let gate = ReplyGate::new("MatrixListProfiles");
     first.set_policy(WirePolicy {
         reply_gate: Some(gate.clone()),
@@ -387,6 +416,16 @@ async fn matrix_index_resolution_and_apply_share_one_endpoint() {
     assert_eq!(first.stats().element_count("MatrixSetProfile"), 1);
     assert_eq!(second.stats().element_count("MatrixSetProfile"), 0);
     assert_eq!(second.stats().element_count("State"), 0);
+    assert_eq!(
+        first_model.state().matrix_profile,
+        "Speakers",
+        "list position 1 resolves to Speakers and is applied on endpoint A"
+    );
+    assert_ne!(
+        second_model.state().matrix_profile,
+        "Speakers",
+        "the resolved profile must not leak to endpoint B"
+    );
 
     first.stop();
     second.stop();
@@ -492,7 +531,9 @@ async fn timing_out_an_operation_releases_queued_reconfiguration() {
     let (first, second, adapter) = connected_pair().await;
     adapter
         .set_timeouts(HqpTimeouts {
-            response: Duration::from_millis(50),
+            // `wait_for_request` has a 200 ms observation budget; leave enough time after it sees
+            // the request to prove configure is queued behind the still-held operation lease.
+            response: Duration::from_millis(400),
             ..fast_timeouts()
         })
         .await;
@@ -507,15 +548,8 @@ async fn timing_out_an_operation_releases_queued_reconfiguration() {
     };
     wait_for_request(&first, "GetModes", modes_before).await;
 
-    let second_port = second.port();
-    let reconfigure = {
-        let adapter = adapter.clone();
-        tokio::spawn(async move {
-            adapter
-                .configure("127.0.0.1".to_string(), Some(second_port), None, None, None)
-                .await;
-        })
-    };
+    let (configure_started, reconfigure) = queue_native_reconfigure(adapter.clone(), second.port());
+    assert_reconfigure_is_waiting(&configure_started, &reconfigure).await;
 
     assert!(setting.await.expect("setter task joins").is_err());
     tokio::time::timeout(Duration::from_millis(500), reconfigure)
@@ -594,6 +628,7 @@ async fn profile_post_and_native_refresh_stay_on_one_endpoint() {
         "configure must remain queued while endpoint A's profile POST is unresolved"
     );
     assert_eq!(adapter.endpoint_generation().await, endpoint_before);
+    let filters_before = first.stats().element_count("GetFilters");
     first_web.release_post.notify_one();
 
     let load_error = load
@@ -601,7 +636,7 @@ async fn profile_post_and_native_refresh_stay_on_one_endpoint() {
         .expect("profile task joins")
         .expect_err("recovery cannot prove which profile became active");
     assert!(
-        load_error.to_string().contains("ambiguous"),
+        load_error.to_string().contains("outcome is ambiguous"),
         "the recovered but unverified load must be explicit: {load_error}"
     );
     reconfigure
@@ -615,7 +650,10 @@ async fn profile_post_and_native_refresh_stay_on_one_endpoint() {
     assert_eq!(first_web.count("POST "), 1);
     assert_eq!(second_web.count("GET "), 0);
     assert_eq!(second_web.count("POST "), 0);
-    assert!(first.stats().element_count("GetFilters") > 0);
+    assert!(
+        first.stats().element_count("GetFilters") > filters_before,
+        "the ambiguous profile load must force a native enumeration refresh on endpoint A"
+    );
     assert_eq!(second.stats().element_count("GetFilters"), 0);
     assert_eq!(
         adapter.endpoint_generation().await,
@@ -687,6 +725,12 @@ async fn profile_post_server_error_is_reported_as_ambiguous() {
         )
         .await;
     adapter.set_timeouts(fast_timeouts()).await;
+    adapter.connect().await.expect("coherent native session");
+    adapter
+        .get_pipeline_status()
+        .await
+        .expect("precondition: native setting caches are populated");
+    let filters_before = native.stats().element_count("GetFilters");
 
     let error = adapter
         .load_profile("raw-a")
@@ -698,6 +742,18 @@ async fn profile_post_server_error_is_reported_as_ambiguous() {
     );
     assert_eq!(web.count("GET "), 1);
     assert_eq!(web.count("POST "), 1);
+    assert!(
+        adapter.get_cached_profiles().await.is_empty(),
+        "an ambiguous 5xx response invalidates the persistent profile cache"
+    );
+    adapter
+        .get_pipeline_status()
+        .await
+        .expect("native settings recover after ambiguous profile invalidation");
+    assert!(
+        native.stats().element_count("GetFilters") > filters_before,
+        "an ambiguous 5xx response invalidates and refills the native setting cache"
+    );
 
     native.stop();
     web.stop();

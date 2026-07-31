@@ -1150,6 +1150,12 @@ struct ChainSnapshot {
     rates: Vec<RateItem>,
 }
 
+/// Result of the optional, non-chain-scoped volume-capability read.
+enum PipelineVolumeRange {
+    Observed { range: VolumeRange, generation: u64 },
+    FixedFallback(VolumeRange),
+}
+
 /// **One** freshly fetched chain-scoped family, on its way into the cache.
 ///
 /// The counterpart of [`ChainSnapshot`] for the single-family path, and one value rather than a
@@ -2397,14 +2403,19 @@ impl HqpAdapter {
     /// before the proof, that is merely a fill the read then has to do; done after it, it empties the
     /// cache the proof was about and the read publishes four empty lists as this daemon's settings.
     ///
-    /// A failure is not the read's failure. The range is not chain-scoped and nothing joins it to a
-    /// list index; a daemon that will not answer `VolumeRange` still has settings worth reporting, and
-    /// the default renders as a fixed-volume device rather than as a wrong one.
-    async fn ensure_volume_range(&self) -> (VolumeRange, u64) {
+    /// A lost reply or timeout is not the read's failure. The range is not chain-scoped and nothing
+    /// joins it to a list index; a daemon that will not answer `VolumeRange` still has settings worth
+    /// reporting, and the default renders as a fixed-volume device rather than as a wrong one. An
+    /// explicit `result="Error"` remains terminal because the daemon authoritatively rejected the
+    /// query rather than merely omitting the optional capability.
+    async fn ensure_volume_range(&self) -> Result<PipelineVolumeRange> {
         {
             let state = self.state.read().await;
             if let Some(range) = state.volume_range.clone() {
-                return (range, state.transport_generation);
+                return Ok(PipelineVolumeRange::Observed {
+                    range,
+                    generation: state.transport_generation,
+                });
             }
         }
         match self.get_volume_range_with_generation().await {
@@ -2414,11 +2425,12 @@ impl HqpAdapter {
                 if state.transport_generation == generation {
                     state.volume_range = Some(range.clone());
                 }
-                (range, generation)
+                Ok(PipelineVolumeRange::Observed { range, generation })
             }
+            Err(error) if error.downcast_ref::<HqpRejected>().is_some() => Err(error),
             Err(e) => {
                 tracing::debug!("HQPlayer volume range unavailable ({e}); reporting fixed volume");
-                (VolumeRange::default(), self.transport_generation().await)
+                Ok(PipelineVolumeRange::FixedFallback(VolumeRange::default()))
             }
         }
     }
@@ -4864,7 +4876,17 @@ impl HqpAdapter {
         let (state, playback_status, snapshot, vol_range) = loop {
             // (1) Reconnect-capable, so it goes ahead of everything the proof will cover. On the
             // first read of a connection this is always a real request.
-            let (vol_range, attempt_generation) = self.ensure_volume_range().await;
+            let (vol_range, attempt_generation) = match self.ensure_volume_range().await? {
+                PipelineVolumeRange::Observed { range, generation } => (range, generation),
+                PipelineVolumeRange::FixedFallback(range) => {
+                    // A timeout/lost reply discarded the old socket. Establish the replacement
+                    // before dating the complete pipeline attempt, so its later generation fence
+                    // covers the session that serves the setting lists and state rather than the
+                    // failed session whose optional volume capability is being replaced.
+                    self.ensure_connected().await?;
+                    (range, self.transport_generation().await)
+                }
+            };
 
             // (2) asks one question: *is there a complete set, and what is its identity*. Lazy-fill
             // only if there is not — on the first read after connect
@@ -5476,6 +5498,51 @@ impl HqpAdapter {
         state.config_title = None;
     }
 
+    /// Reconcile one received profile-POST response through the single recovery contract.
+    async fn reconcile_profile_post_response(
+        &self,
+        response: reqwest::Response,
+        profile_value: &str,
+        operation: &str,
+    ) -> Result<()> {
+        if response.status().is_server_error() {
+            self.invalidate_profile_dependent_cache().await;
+            return Err(anyhow!(
+                "{operation} outcome is ambiguous: server returned {} after receiving the \
+                 mutating request",
+                response.status()
+            ));
+        }
+        if response.status().is_client_error() {
+            return Err(anyhow!("Profile load failed: {}", response.status()));
+        }
+
+        // A profile replaces the daemon's settings wholesale, so everything cached from before it
+        // describes a configuration that no longer exists. Drop first: `refresh_lists` correctly
+        // preserves an existing cache after a transient read failure, but that behavior would retain
+        // exactly the pre-profile universe that has just become unsafe.
+        self.invalidate_profile_dependent_cache().await;
+        if !self.refresh_lists().await {
+            return Err(anyhow!(
+                "{operation} was accepted, but the native setting universe did not recover \
+                 coherently; the outcome is ambiguous"
+            ));
+        }
+        self.fetch_profiles_under_operation()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "{operation} was accepted and native settings recovered, but the persistent \
+                     form did not recover for readback; the outcome is ambiguous ({error})"
+                )
+            })?;
+        Err(anyhow!(
+            "{operation} was accepted and the server recovered, but the outcome is ambiguous: the \
+             supported protocol exposes no authoritative active-profile readback, so whether \
+             profile {profile_value:?} was applied is unknown"
+        ))
+    }
+
     /// Get cached profiles
     pub async fn get_cached_profiles(&self) -> Vec<HqpProfile> {
         self.state.read().await.profiles.clone()
@@ -5577,86 +5644,20 @@ impl HqpAdapter {
                             ));
                         }
                     };
-                    if response.status().is_server_error() {
-                        self.invalidate_profile_dependent_cache().await;
-                        return Err(anyhow!(
-                            "HQPlayer profile POST retry outcome is ambiguous: server returned {} \
-                             after receiving the mutating request",
-                            response.status()
-                        ));
-                    }
-                    if response.status().is_client_error() {
-                        return Err(anyhow!("Profile load failed: {}", response.status()));
-                    }
-                    // A profile replaces the daemon's settings wholesale, so everything cached from
-                    // before it describes a configuration that no longer exists. Dropped *first*,
-                    // because `refresh_lists` deliberately leaves an existing cache alone when it
-                    // cannot publish a coherent replacement — right for a transient read, and here it
-                    // would preserve exactly the lists that just stopped being true.
-                    //
-                    // This held by accident before: a failing refresh times out, and the timeout path
-                    // invalidates. That is a side effect of a different concern, and the rate-based
-                    // chain check would not have caught what it missed — a profile can change filters
-                    // and shapers while leaving the rate list alone. CodeRabbit found the gap.
-                    self.invalidate_profile_dependent_cache().await;
-                    if !self.refresh_lists().await {
-                        return Err(anyhow!(
-                            "HQPlayer profile POST was accepted, but the native setting universe \
-                             did not recover coherently; the outcome is ambiguous"
-                        ));
-                    }
-                    self.fetch_profiles_under_operation()
-                        .await
-                        .map_err(|error| {
-                            anyhow!(
-                            "HQPlayer profile POST was accepted and native settings recovered, but \
-                             the persistent form did not recover for readback; the outcome is \
-                             ambiguous ({error})"
+                    return self
+                        .reconcile_profile_post_response(
+                            response,
+                            profile_value,
+                            "HQPlayer profile POST retry",
                         )
-                        })?;
-                    return Err(anyhow!(
-                        "HQPlayer profile POST was accepted and the server recovered, but the \
-                         supported protocol exposes no authoritative active-profile readback; \
-                         whether profile {profile_value:?} was applied is ambiguous"
-                    ));
+                        .await;
                 }
             }
             return Err(anyhow!("Authentication failed"));
         }
 
-        if response.status().is_server_error() {
-            self.invalidate_profile_dependent_cache().await;
-            return Err(anyhow!(
-                "HQPlayer profile POST outcome is ambiguous: server returned {} after receiving \
-                 the mutating request",
-                response.status()
-            ));
-        }
-        if response.status().is_client_error() {
-            return Err(anyhow!("Profile load failed: {}", response.status()));
-        }
-
-        // Drop then refresh; see the note on the retry path above for why the order matters.
-        self.invalidate_profile_dependent_cache().await;
-        if !self.refresh_lists().await {
-            return Err(anyhow!(
-                "HQPlayer profile POST was accepted, but the native setting universe did not \
-                 recover coherently; the outcome is ambiguous"
-            ));
-        }
-        self.fetch_profiles_under_operation()
+        self.reconcile_profile_post_response(response, profile_value, "HQPlayer profile POST")
             .await
-            .map_err(|error| {
-                anyhow!(
-                    "HQPlayer profile POST was accepted and native settings recovered, but the \
-                 persistent form did not recover for readback; the outcome is ambiguous ({error})"
-                )
-            })?;
-        Err(anyhow!(
-            "HQPlayer profile POST was accepted and the server recovered, but the supported \
-             protocol exposes no authoritative active-profile readback; whether profile \
-             {profile_value:?} was applied is ambiguous"
-        ))
     }
 
     /// Check if this is HQPlayer Embedded (supports profiles)

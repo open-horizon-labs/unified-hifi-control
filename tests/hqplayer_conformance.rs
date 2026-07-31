@@ -7727,6 +7727,72 @@ async fn a_lost_volume_range_reply_does_not_publish_the_cache_its_reconnect_empt
     h.stop();
 }
 
+/// A daemon may serve its complete setting universe while never answering `VolumeRange`. The
+/// pipeline contract treats that missing, non-chain-scoped capability as fixed volume; reconnecting
+/// after its timeout must not make the transport-generation fence reject an otherwise coherent
+/// settings read.
+///
+/// **Label: client-red.** CodeRabbit found that the fallback was dated to the failed transport, so
+/// the replacement transport deterministically made both pipeline attempts fail.
+#[tokio::test]
+async fn an_unresponsive_volume_range_still_yields_a_fixed_volume_pipeline() {
+    let h = Harness::connected_then_policy(
+        WirePolicy {
+            silent_for_element: Some("VolumeRange".to_string()),
+            ..WirePolicy::default()
+        },
+        fast_timeouts(),
+    )
+    .await;
+    h.adapter.disconnect().await;
+
+    let pipeline = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("missing VolumeRange degrades to a fixed-volume pipeline");
+
+    assert!(
+        pipeline.volume.is_fixed,
+        "the fallback must advertise fixed volume rather than invent variable-volume bounds"
+    );
+    assert_eq!(
+        published_families(&pipeline).len(),
+        4,
+        "the non-chain-scoped fallback must not discard coherent setting families"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn an_explicit_volume_range_rejection_is_terminal_not_a_fallback() {
+    let h = Harness::verified().await;
+    h.adapter.disconnect().await;
+    h.model.arm(|faults| {
+        faults.reject_next.push((
+            "VolumeRange".to_string(),
+            "volume capability unavailable".to_string(),
+        ));
+    });
+
+    let error = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect_err("an explicit daemon rejection is not a missing-capability timeout");
+
+    assert!(
+        error.to_string().contains("HQPlayer rejected VolumeRange"),
+        "the daemon's terminal rejection must remain visible: {error}"
+    );
+    assert_eq!(
+        h.model.request_count("VolumeRange"),
+        2,
+        "one handshake read plus one terminal pipeline request; no fallback retry"
+    );
+    h.stop();
+}
+
 // -----------------------------------------------------------------------------
 // A semantic setter reports the *name* it was asked for, not the index it sent
 // -----------------------------------------------------------------------------
