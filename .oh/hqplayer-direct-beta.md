@@ -201,7 +201,7 @@ default-instance-only scope.
 | API contract | `cargo test --test api_contract` | **2 passed**; `api_routes.txt` byte-identical |
 | Architecture/adaptive lints | `architecture_lint` / `adaptive_dependency_lint` / `adaptive_publication_lint` | **9 / 7 / 57 passed** |
 | Release UI | `dx build --release --platform web --features web` | **client + server build completed successfully** |
-| Live rig | see Ship section | pending |
+| Live rig | see "Live-rig validation attempt" section | **blocked**: rig-side `GetInfo` crash, unchanged since #382; stopped before mutation |
 
 ---
 
@@ -289,6 +289,47 @@ Actively argued against the chosen approach and the Review pass's own conclusion
 
 No change to the chosen approach (Candidate B) or its scope survived this pass except item 1's
 narrowing. Final verdict: **PROCEED to live-rig validation.**
+
+---
+
+## Live-rig validation attempt (192.168.1.61)
+
+**Status:** stopped before mutation, per constraint · **2026-07-31**
+
+Non-mutating checks first, as required. Findings, in order:
+
+1. **Host reachable.** `ping` succeeds (round trip ~0.4 ms — same LAN). No credentials were needed
+   or used for any step below; the native HQPlayer protocol on port 4321 is unauthenticated.
+2. **TCP connect to port 4321 succeeds and stays open if nothing is sent.** A bare connect, held
+   idle for several seconds with no data written, closes cleanly with no reset and no unsolicited
+   data. The daemon process is listening and accepting connections.
+3. **Sending the exact `GetInfo` request `HqpAdapter::build_request` constructs
+   (`<?xml version="1.0"?><GetInfo/>`) resets the connection every time** — three consecutive
+   attempts, all `ECONNRESET`, with no partial reply. This isolates the fault to request parsing,
+   not connection setup: the daemon accepts the TCP handshake but crashes/resets on receiving its
+   first real request.
+
+This exactly reproduces the rig-side fault already recorded against this host by PR #382 ("its
+native 4321 connection currently resets during the initial GetInfo exchange, including from the
+HQPlayer host itself") and by prior-session memory (libmicrohttpd 1.0.6 crash). **It has not been
+fixed since**, as of this session.
+
+**Stopping here, per the task's own rule:** live validation is authorized to proceed only past
+non-mutating checks, and even the first non-mutating check — `GetInfo` — cannot complete. There is
+therefore no live state to baseline, nothing to restore, and no basis for attempting pause/seek/
+volume tests: a restoration guarantee cannot be evaluated against a daemon that resets before
+answering a read. No mutation of any kind was attempted against this host. Fixing the daemon-side
+crash requires host access (SSH/package-level) this session was not given credentials for and which
+is outside this issue's scope regardless — #401/#350 validate UHC's client behavior, not HQPlayer
+Embedded's own service health.
+
+**What this means for #350's live-rig checklist:** every hardware-dependent row (metadata, transport,
+seek, decimal volume, external-controller convergence, reconnect, linked-DSP coexistence) is
+**pending, not passed** — labeled that way explicitly per #350's own constraint ("Label every
+hardware-dependent row pending until run; do not describe it as passed"). Hermetic coverage
+(`tests/mcp_hqplayer_control.rs`, `tests/hqplayer_direct_zone.rs`) is what stands behind this PR;
+live verification needs either this rig's daemon-side fault fixed, or a different reachable HQPlayer
+6.0.2 Embedded instance.
 
 ---
 
