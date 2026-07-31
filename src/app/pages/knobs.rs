@@ -314,7 +314,7 @@ pub fn Knobs() -> Element {
 
             p { class: "mb-6 text-muted",
                 a {
-                    class: "link",
+                    class: "link inline-flex min-h-11 items-center -my-2",
                     href: "https://community.roonlabs.com/t/50-esp32-s3-knob-roon-controller/311363",
                     target: "_blank",
                     rel: "noopener",
@@ -374,7 +374,7 @@ pub fn Knobs() -> Element {
                             }
                         }
                     }
-                    div { class: "flex items-center gap-4",
+                    div { class: "flex flex-col items-stretch gap-3 sm:flex-row sm:items-center sm:gap-4",
                         button {
                             id: "fetch-btn",
                             class: "btn btn-primary",
@@ -383,7 +383,7 @@ pub fn Knobs() -> Element {
                             onclick: fetch_firmware,
                             "Fetch Latest from GitHub"
                         }
-                        a { class: "link", href: "/knobs/flash", "Flash a new knob" }
+                        a { class: "link inline-flex min-h-11 items-center", href: "/knobs/flash", "Flash a new knob" }
                         if let Some((is_err, ref msg)) = fw_message() {
                             if is_err {
                                 span { class: "status-err", "{msg}" }

@@ -78,7 +78,7 @@ pub fn Layout(props: LayoutProps) -> Element {
             hide_lms: props.hide_lms,
             hide_knobs: props.hide_knobs,
         }
-        main { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-4 overflow-x-hidden",
+        main { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-4",
             {props.children}
         }
         footer { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center py-3",
