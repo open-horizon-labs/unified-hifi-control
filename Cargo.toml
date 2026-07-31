@@ -149,6 +149,10 @@ required-features = ["server"]
 tokio-test = "0.4"
 serial_test = "3"
 syn = { version = "2", features = ["full", "parsing", "visit"] }
+# Token-level inspection for tests/adaptive_publication_lint.rs. Already in the lock
+# graph as a transitive dependency of syn; declared so the lint can walk TokenTree
+# without stringifying a macro body, which made string literals fabricate matches.
+proc-macro2 = "1"
 walkdir = "2"
 tempfile = "3"
 

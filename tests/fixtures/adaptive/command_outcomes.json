@@ -1,0 +1,402 @@
+{
+  "schema_version": "1.0",
+  "producer": {
+    "producer_id": "hqplayer:living-room",
+    "producer_type": "hqplayer",
+    "epoch": 7
+  },
+  "target": {
+    "role": "instance"
+  },
+  "revisions": {
+    "control_plane": 12,
+    "state": 4211
+  },
+  "lanes": [
+    { "lane": "native", "state": "connected", "last_success": "2026-07-30T11:07:00Z" },
+    { "lane": "persistent", "state": "connected", "last_success": "2026-07-30T11:06:00Z" }
+  ],
+  "controls": [
+    {
+      "id": "hqplayer.pipeline.mode",
+      "kind": "enumeration",
+      "label_key": "control.pipeline.mode",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "sdm" },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4211 }
+        }
+      ],
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "live_immediate",
+        "disruption": "playback_interruption",
+        "risk": "disruptive",
+        "verification": { "verify_via": "hqplayer.pipeline.mode", "verify_lane": "observed" }
+      }
+    },
+    {
+      "id": "hqplayer.volume.level",
+      "kind": "numeric_range",
+      "label_key": "control.volume.level",
+      "unit": "dB",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "decimal", "value": -12.0 },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4211 }
+        }
+      ],
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "verified_pending",
+        "disruption": "none",
+        "risk": "caution",
+        "verification": {
+          "verify_via": "hqplayer.volume.level",
+          "verify_lane": "observed",
+          "provisional_ack": true
+        }
+      }
+    }
+  ],
+  "draft_policy": {
+    "mode": "actor_scoped",
+    "on_conflict": "last_actor_takeover",
+    "retention": {
+      "survives_reconnect": false,
+      "survives_producer_restart": false,
+      "on_epoch_change": "expire"
+    }
+  },
+  "operations": [
+    {
+      "id": "op-provisional-9001",
+      "correlation_id": "corr-9001",
+      "change_set": "cs-web-3f9a",
+      "generation": 3,
+      "write_attempt": "acknowledged_provisional",
+      "outcome": "indeterminate",
+      "observed": { "epoch": 7, "control_plane": 12, "state": 4207 },
+      "recovery": "awaiting_readback",
+      "reason": {
+        "code": "requires_connection",
+        "scope": "lane",
+        "display_text_key": "reason.possibly_applied_awaiting_readback",
+        "detail": "write acknowledged on the wire; connection dropped before readback"
+      }
+    },
+    {
+      "id": "op-converged-9002",
+      "correlation_id": "corr-9002",
+      "write_attempt": "confirmed",
+      "outcome": "applied",
+      "observed": { "epoch": 7, "control_plane": 12, "state": 4211 },
+      "history": [
+        {
+          "from": "indeterminate",
+          "to": "applied",
+          "at": "2026-07-30T11:07:02Z",
+          "observed": { "epoch": 7, "control_plane": 12, "state": 4211 }
+        }
+      ],
+      "recovery": "not_required"
+    },
+    {
+      "id": "op-noop-9003",
+      "correlation_id": "corr-9003",
+      "write_attempt": "confirmed",
+      "outcome": "ignored",
+      "observed": { "epoch": 7, "control_plane": 12, "state": 4211 },
+      "reason": {
+        "code": "not_applicable_in_mode",
+        "scope": "observed",
+        "display_text_key": "reason.value_already_matches"
+      }
+    },
+    {
+      "id": "op-refused-9004",
+      "correlation_id": "corr-9004",
+      "write_attempt": "attempted",
+      "outcome": "rejected",
+      "observed": { "epoch": 7, "control_plane": 12, "state": 4209 },
+      "reason": {
+        "code": "requires_authorization",
+        "scope": "producer",
+        "display_text_key": "reason.positive_gain_requires_authorization"
+      }
+    },
+    {
+      "id": "op-replaced-9005",
+      "correlation_id": "corr-9005",
+      "change_set": "cs-web-2c10",
+      "generation": 1,
+      "write_attempt": "not_attempted",
+      "outcome": "superseded",
+      "reason": {
+        "code": "superseded",
+        "scope": "draft",
+        "display_text_key": "reason.newer_generation_staged"
+      }
+    },
+    {
+      "id": "op-offline-9006",
+      "correlation_id": "corr-9006",
+      "write_attempt": "not_attempted",
+      "outcome": "disconnected",
+      "reason": {
+        "code": "requires_connection",
+        "scope": "lane",
+        "display_text_key": "reason.native_lane_down"
+      }
+    },
+    {
+      "id": "op-silent-9007",
+      "correlation_id": "corr-9007",
+      "write_attempt": "attempted",
+      "outcome": "timed_out",
+      "observed": { "epoch": 7, "control_plane": 12, "state": 4210 },
+      "recovery": "awaiting_reconnect",
+      "reason": {
+        "code": "requires_connection",
+        "scope": "lane",
+        "display_text_key": "reason.no_response_within_budget"
+      }
+    },
+    {
+      "id": "op-held-9008",
+      "correlation_id": "corr-9008",
+      "write_attempt": "confirmed",
+      "outcome": "held",
+      "observed": { "epoch": 7, "control_plane": 12, "state": 4211 },
+      "reason": {
+        "code": "chain_not_loaded",
+        "scope": "observed",
+        "display_text_key": "reason.stored_for_dormant_chain"
+      }
+    },
+    {
+      "id": "op-restart-9009",
+      "correlation_id": "corr-9009",
+      "write_attempt": "confirmed",
+      "outcome": "restart_required",
+      "observed": { "epoch": 7, "control_plane": 12, "state": 4211 },
+      "reason": {
+        "code": "restart_required",
+        "scope": "producer",
+        "display_text_key": "reason.stored_inert_until_restart"
+      }
+    },
+    {
+      "id": "op-expired-9010",
+      "correlation_id": "corr-9010",
+      "change_set": "cs-auto-1104",
+      "generation": 5,
+      "write_attempt": "not_attempted",
+      "outcome": "expired",
+      "history": [
+        {
+          "from": "held",
+          "to": "expired",
+          "at": "2026-07-30T07:00:00Z",
+          "reason": {
+            "code": "expired",
+            "scope": "draft",
+            "display_text_key": "reason.held_intent_expired"
+          }
+        }
+      ],
+      "reason": {
+        "code": "expired",
+        "scope": "draft",
+        "display_text_key": "reason.held_intent_expired",
+        "detail": "held intent proved invalid after the epoch changed and was not revalidated"
+      }
+    },
+    {
+      "id": "op-multirev-9011",
+      "correlation_id": "corr-9011",
+      "change_set": "cs-web-2c13",
+      "generation": 2,
+      "write_attempt": "attempted",
+      "outcome": "partially_applied",
+      "observed": { "epoch": 7, "control_plane": 12, "state": 4211 },
+      "steps": [
+        {
+          "index": 0,
+          "control": "hqplayer.pipeline.mode",
+          "lane": "immediate",
+          "observed": { "epoch": 7, "control_plane": 12, "state": 4192 },
+          "outcome": "applied"
+        },
+        {
+          "index": 1,
+          "control": "hqplayer.volume.level",
+          "lane": "immediate",
+          "observed": { "epoch": 7, "control_plane": 13, "state": 4205 },
+          "outcome": "rejected",
+          "reason": {
+            "code": "stale_base",
+            "scope": "draft",
+            "display_text_key": "reason.capabilities_changed_mid_plan",
+            "detail": "target-chain capabilities only became observable after step 0 changed mode"
+          }
+        }
+      ],
+      "revision_boundaries": [
+        { "epoch": 7, "control_plane": 12, "state": 4192 },
+        { "epoch": 7, "control_plane": 13, "state": 4205 }
+      ],
+      "recovery": "replan_required",
+      "reason": {
+        "code": "stale_base",
+        "scope": "draft",
+        "display_text_key": "reason.retry_is_a_new_plan"
+      }
+    },
+    {
+      "id": "op-compensating-9012",
+      "correlation_id": "corr-9012",
+      "write_attempt": "attempted",
+      "outcome": "compensating",
+      "observed": { "epoch": 7, "control_plane": 13, "state": 4206 },
+      "steps": [
+        {
+          "index": 0,
+          "control": "hqplayer.pipeline.mode",
+          "lane": "composite",
+          "observed": { "epoch": 7, "control_plane": 13, "state": 4206 },
+          "outcome": "applied"
+        }
+      ],
+      "recovery": "compensating"
+    },
+    {
+      "id": "op-compensated-9013",
+      "correlation_id": "corr-9013",
+      "write_attempt": "confirmed",
+      "outcome": "compensated",
+      "observed": { "epoch": 7, "control_plane": 13, "state": 4208 },
+      "history": [
+        {
+          "from": "compensating",
+          "to": "compensated",
+          "at": "2026-07-30T11:06:55Z",
+          "observed": { "epoch": 7, "control_plane": 13, "state": 4208 }
+        }
+      ],
+      "recovery": "not_required"
+    },
+    {
+      "id": "op-stuck-9014",
+      "correlation_id": "corr-9014",
+      "write_attempt": "attempted",
+      "outcome": "recovery_required",
+      "observed": { "epoch": 7, "control_plane": 13, "state": 4209 },
+      "recovery": "manual_intervention_required",
+      "reason": {
+        "code": "locked_by_producer",
+        "scope": "producer",
+        "display_text_key": "reason.cannot_compensate_automatically"
+      }
+    },
+    {
+      "id": "op-divergent-9015",
+      "correlation_id": "corr-9015",
+      "write_attempt": "confirmed",
+      "outcome": "divergent",
+      "observed": { "epoch": 7, "control_plane": 13, "state": 4211 },
+      "history": [
+        {
+          "from": "indeterminate",
+          "to": "divergent",
+          "at": "2026-07-30T11:07:10Z",
+          "observed": { "epoch": 7, "control_plane": 13, "state": 4211 },
+          "reason": {
+            "code": "unobservable",
+            "scope": "observed",
+            "display_text_key": "reason.readback_matched_neither_value"
+          }
+        }
+      ],
+      "recovery": "replan_required",
+      "reason": {
+        "code": "unobservable",
+        "scope": "observed",
+        "display_text_key": "reason.readback_matched_neither_value"
+      }
+    },
+    {
+      "id": "op-deprecated-9016",
+      "correlation_id": "corr-9016",
+      "write_attempt": "confirmed",
+      "outcome": "applied",
+      "observed": { "epoch": 7, "control_plane": 13, "state": 4211 },
+      "reason": {
+        "code": "deprecated",
+        "scope": "producer",
+        "display_text_key": "reason.control_is_deprecated"
+      }
+    },
+    {
+      "id": "op-unconfigured-9017",
+      "correlation_id": "corr-9017",
+      "write_attempt": "not_attempted",
+      "outcome": "rejected",
+      "reason": {
+        "code": "lane_unconfigured",
+        "scope": "lane",
+        "display_text_key": "reason.persistent_lane_never_configured"
+      }
+    },
+    {
+      "id": "op-unsupported-9018",
+      "correlation_id": "corr-9018",
+      "write_attempt": "not_attempted",
+      "outcome": "rejected",
+      "reason": {
+        "code": "not_supported",
+        "scope": "producer",
+        "display_text_key": "reason.producer_does_not_implement"
+      }
+    },
+    {
+      "id": "op-capability-9019",
+      "correlation_id": "corr-9019",
+      "write_attempt": "not_attempted",
+      "outcome": "rejected",
+      "reason": {
+        "code": "requires_capability",
+        "scope": "producer",
+        "display_text_key": "reason.missing_capability"
+      }
+    },
+    {
+      "id": "op-conflict-9020",
+      "correlation_id": "corr-9020",
+      "write_attempt": "not_attempted",
+      "outcome": "rejected",
+      "reason": {
+        "code": "conflicting_sibling",
+        "scope": "draft",
+        "display_text_key": "reason.sibling_conflict"
+      }
+    },
+    {
+      "id": "op-unknown-constraint-9021",
+      "correlation_id": "corr-9021",
+      "write_attempt": "not_attempted",
+      "outcome": "rejected",
+      "reason": {
+        "code": "unknown_constraint",
+        "scope": "draft",
+        "display_text_key": "reason.producer_validation_refused"
+      }
+    }
+  ]
+}
