@@ -21,6 +21,7 @@
 //! tx.send(data).map_err(|_| anyhow!("Receiver dropped"))?;
 //! ```
 
+use proc_macro2::{TokenStream, TokenTree};
 use std::fs;
 use std::path::Path;
 use syn::visit::Visit;
@@ -50,6 +51,35 @@ impl IgnoredSendVisitor {
     fn is_wildcard_pattern(&self, pat: &Pat) -> bool {
         matches!(pat, Pat::Wild(_))
     }
+
+    fn inspect_macro_tokens(&mut self, tokens: TokenStream) {
+        let rendered = tokens.to_string();
+        for statement in rendered.split(';') {
+            let ignored_let = statement.contains("let _ =") && statement.contains(". send");
+            let trimmed = statement.trim();
+            let bare_send = trimmed.contains(". send")
+                && !trimmed.contains('=')
+                && !trimmed.starts_with("if ")
+                && !trimmed.starts_with("match ")
+                && !trimmed.contains(". is_err")
+                && !trimmed.contains(". is_ok")
+                && !trimmed.contains(". map_err")
+                && !trimmed.contains(". unwrap")
+                && !trimmed.contains(". expect")
+                && !trimmed.ends_with('?');
+            if ignored_let || bare_send {
+                self.violations.push((
+                    self.current_file.clone(),
+                    "ignored ...send(...) inside macro hides channel failure".to_string(),
+                ));
+            }
+        }
+        for token in tokens {
+            if let TokenTree::Group(group) = token {
+                self.inspect_macro_tokens(group.stream());
+            }
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for IgnoredSendVisitor {
@@ -59,16 +89,7 @@ impl<'ast> Visit<'ast> for IgnoredSendVisitor {
         // exact failure pattern this lint exists to prevent. Token rendering preserves statement
         // separators and punctuation with normalized whitespace, which is sufficient to identify
         // a wildcard binding whose expression contains a `.send(...)` call.
-        let rendered = mac.tokens.to_string();
-        for statement in rendered.split(';') {
-            if statement.contains("let _ =") && statement.contains(". send") {
-                self.violations.push((
-                    self.current_file.clone(),
-                    "let _ = ...send(...) inside macro - ignoring send result hides failures"
-                        .to_string(),
-                ));
-            }
-        }
+        self.inspect_macro_tokens(mac.tokens.clone());
         syn::visit::visit_macro(self, mac);
     }
 
@@ -208,6 +229,28 @@ fn detects_ignored_send_inside_macro_tokens() {
     assert!(
         !visitor.violations.is_empty(),
         "Should detect ignored send results hidden inside macro token streams"
+    );
+}
+
+#[test]
+fn detects_bare_send_inside_macro_tokens() {
+    let bad_code = r#"
+        async fn example(mut commands: Receiver<Command>) {
+            tokio::select! {
+                command = commands.recv() => {
+                    command.reply.send(Ok(()));
+                }
+            }
+        }
+    "#;
+
+    let syntax: File = syn::parse_file(bad_code).unwrap();
+    let mut visitor = IgnoredSendVisitor::new("test.rs".to_string());
+    visitor.visit_file(&syntax);
+
+    assert!(
+        !visitor.violations.is_empty(),
+        "Should detect bare send results hidden inside macro token streams"
     );
 }
 
