@@ -120,6 +120,159 @@ type BrowseRequest = oneshot::Sender<Result<BrowseResult>>;
 /// Pending load request - stores the oneshot sender to deliver the result
 type LoadRequest = oneshot::Sender<Result<LoadResult>>;
 
+// =============================================================================
+// Core-reported browse rejections (issue #405)
+// =============================================================================
+//
+// Roon Core answers an unusable browse or load request with a named error
+// instead of a result. The pinned fork surfaces that as
+// `Parsed::Error(RoonApiError::Browse*)`, carrying both the originating
+// `req_id` and the request's `multi_session_key` (see the fork's
+// `src/browse.rs:174-188`).
+//
+// Before #405 the event loop dropped those messages, so the waiting caller sat
+// out the full `BROWSE_TIMEOUT` and then reported "Browse request timed out" -
+// the same thing an unreachable Core produces. The types below carry the
+// Core's actual answer back to the caller, promptly and distinguishably.
+
+/// Which browse/load rejection Roon Core reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoonBrowseErrorKind {
+    /// The `item_key` is not valid in the browse session it was used in: it has
+    /// expired, the session was reset, or it was minted somewhere else.
+    /// Recoverable - re-acquire the key (search or browse again) and retry.
+    InvalidItemKey,
+    /// The `level` / `pop_levels` in the request do not exist in this session.
+    /// Recoverable - browse again from a level the caller still holds.
+    InvalidLevels,
+    /// The `zone_or_output_id` in the request is unknown to the Core. Not
+    /// fixed by retrying: the caller has to name a zone that exists.
+    ZoneNotFound,
+    /// The Core reported an unexpected failure for this request.
+    UnexpectedError,
+}
+
+impl RoonBrowseErrorKind {
+    /// Stable machine-readable tag for logs and callers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidItemKey => "invalid_item_key",
+            Self::InvalidLevels => "invalid_levels",
+            Self::ZoneNotFound => "zone_not_found",
+            Self::UnexpectedError => "unexpected_error",
+        }
+    }
+
+    /// True when the caller can recover by re-acquiring its reference and
+    /// retrying immediately, rather than by waiting for the Core.
+    pub fn is_recoverable(self) -> bool {
+        matches!(self, Self::InvalidItemKey | Self::InvalidLevels)
+    }
+
+    /// Human-readable explanation, including the recovery instruction where
+    /// there is one. Deliberately never contains the word "timeout" - callers
+    /// and operators must be able to tell these apart at a glance.
+    fn explain(self) -> &'static str {
+        match self {
+            Self::InvalidItemKey => {
+                "Roon Core rejected the item key: it is no longer valid in this \
+                 browse session - search or browse again to get a fresh key"
+            }
+            Self::InvalidLevels => {
+                "Roon Core rejected the browse level: this browse session is not \
+                 at that level - browse again from a level you still hold"
+            }
+            Self::ZoneNotFound => {
+                "Roon Core does not recognise the zone or output in this browse \
+                 request"
+            }
+            Self::UnexpectedError => {
+                "Roon Core reported an unexpected error for this browse request"
+            }
+        }
+    }
+}
+
+/// A browse or load request that Roon Core answered with a rejection.
+///
+/// Distinct from a timeout: the Core answered, and it answered "no". Returned
+/// inside the `anyhow::Error` that `browse`, `load`, `search`, `play_item` and
+/// `search_and_play` already return, so no signature changes; recover it with
+/// [`RoonBrowseError::from_error`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoonBrowseError {
+    /// What the Core rejected.
+    pub kind: RoonBrowseErrorKind,
+    /// The `multi_session_key` the rejected request ran in, as reported by the
+    /// Core. `None` only if the request carried no session key.
+    pub session_key: Option<String>,
+}
+
+impl RoonBrowseError {
+    fn new(kind: RoonBrowseErrorKind, session_key: Option<&str>) -> Self {
+        Self {
+            kind,
+            session_key: session_key.map(str::to_string),
+        }
+    }
+
+    /// Recover the typed rejection from an error returned by the browse-backed
+    /// adapter methods. `None` means the failure was something else - a
+    /// timeout, a lost Core, or Browse not being connected - so callers can
+    /// keep those classes apart without matching on message text.
+    pub fn from_error(err: &anyhow::Error) -> Option<&Self> {
+        err.downcast_ref::<Self>()
+    }
+}
+
+impl std::error::Error for RoonBrowseError {}
+
+impl std::fmt::Display for RoonBrowseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind.explain())?;
+        if let Some(session_key) = &self.session_key {
+            write!(f, " (browse session '{}')", session_key)?;
+        }
+        Ok(())
+    }
+}
+
+/// Where a Core rejection ended up. Reported for logging and asserted by the
+/// correlation tests; the caller-visible effect is the resolved oneshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorRouting {
+    /// Delivered to the pending browse holding this `req_id`.
+    Browse,
+    /// Delivered to the pending load holding this `req_id`.
+    Load,
+    /// Delivered to the pending image request holding this `req_id`.
+    Image,
+    /// The waiter was found and removed, but its receiver was already gone.
+    ReceiverGone,
+    /// No request with this `req_id` is pending - it was already resolved, or
+    /// the caller timed out and cleaned up. Dropping the rejection is correct.
+    NoWaiter,
+    /// A request with this `req_id` is pending but carries a different session
+    /// or image key, so it was left alone to hit its own timeout rather than
+    /// being resolved with someone else's rejection.
+    KeyMismatch,
+}
+
+/// Deliver a Core rejection to a waiting browse or load request.
+/// Returns whether the waiter was still listening.
+fn deliver_browse_rejection<T>(
+    sender: oneshot::Sender<Result<T>>,
+    kind: RoonBrowseErrorKind,
+    session_key: Option<&str>,
+) -> bool {
+    sender
+        .send(Err(anyhow::Error::new(RoonBrowseError::new(
+            kind,
+            session_key,
+        ))))
+        .is_ok()
+}
+
 /// Image data returned from Roon
 #[derive(Debug, Clone)]
 pub struct ImageData {
@@ -244,6 +397,29 @@ struct RoonState {
     pending_browses: HashMap<usize, (Option<String>, BrowseRequest)>,
     /// Pending load requests: request_id -> (session_key, oneshot sender)
     pending_loads: HashMap<usize, (Option<String>, LoadRequest)>,
+}
+
+impl RoonState {
+    /// Route a Core browse/load rejection to the exact request waiting on it.
+    ///
+    /// TODO(#405): not implemented yet - this reproduces the pre-#405 behavior
+    /// (the rejection is dropped and no waiter is resolved) so the correlation
+    /// tests fail against it.
+    fn route_browse_rejection(
+        &mut self,
+        _req_id: usize,
+        _session_key: Option<&str>,
+        _kind: RoonBrowseErrorKind,
+    ) -> ErrorRouting {
+        ErrorRouting::NoWaiter
+    }
+
+    /// Route a Core image rejection to the request waiting on it.
+    ///
+    /// TODO(#405): not implemented yet - see `route_browse_rejection`.
+    fn route_image_rejection(&mut self, _req_id: usize, _image_key: &str) -> ErrorRouting {
+        ErrorRouting::NoWaiter
+    }
 }
 
 /// Roon adapter
@@ -2050,6 +2226,361 @@ mod tests {
         assert!(
             bus_zone.volume_control.is_none(),
             "should be None when output has no volume"
+        );
+    }
+
+    // =========================================================================
+    // Core-reported browse rejections (issue #405)
+    // =========================================================================
+    //
+    // Test strategy: these unit-scope the correlation logic. They do NOT drive
+    // a Roon protocol mock - `tests/mock_servers/roon.rs` holds state and
+    // speaks no protocol, and building a protocol-level Roon fake is #408's
+    // job. Duplicating it here would conflict with that work. What is scoped
+    // here is exactly the concurrency-sensitive part: which waiter a rejection
+    // resolves when several requests are in flight, and what happens to the
+    // ones it must not touch.
+    //
+    // Coverage boundary, stated so the next agent does not over-trust it: the
+    // tests exercise the real routing functions, the real `oneshot` channels
+    // and the real `BROWSE_TIMEOUT`. They do not exercise the fork's
+    // `parse_msg`, nor the three-line result match in `browse()`/`load()` that
+    // hands the oneshot payload back to the caller.
+
+    use std::time::Instant;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    /// Queue a pending browse the way `browse()` does, returning its receiver.
+    fn pending_browse(
+        state: &mut RoonState,
+        req_id: usize,
+        session_key: &str,
+    ) -> oneshot::Receiver<Result<BrowseResult>> {
+        let (tx, rx) = oneshot::channel();
+        state
+            .pending_browses
+            .insert(req_id, (Some(session_key.to_string()), tx));
+        rx
+    }
+
+    /// Queue a pending load the way `load()` does, returning its receiver.
+    fn pending_load(
+        state: &mut RoonState,
+        req_id: usize,
+        session_key: &str,
+    ) -> oneshot::Receiver<Result<LoadResult>> {
+        let (tx, rx) = oneshot::channel();
+        state
+            .pending_loads
+            .insert(req_id, (Some(session_key.to_string()), tx));
+        rx
+    }
+
+    /// Queue a pending image request the way `get_image()` does.
+    fn pending_image(
+        state: &mut RoonState,
+        req_id: usize,
+        image_key: &str,
+    ) -> oneshot::Receiver<Option<ImageData>> {
+        let (tx, rx) = oneshot::channel();
+        state
+            .pending_images
+            .insert(req_id, (image_key.to_string(), tx));
+        rx
+    }
+
+    /// The rejection a receiver was resolved with, or a description of why it
+    /// was not resolved.
+    fn rejection_kind<T>(rx: &mut oneshot::Receiver<Result<T>>) -> RoonBrowseErrorKind {
+        match rx.try_recv() {
+            Ok(Err(err)) => match RoonBrowseError::from_error(&err) {
+                Some(rejection) => rejection.kind,
+                None => unreachable!("resolved with an untyped error: {err}"),
+            },
+            Ok(Ok(_)) => unreachable!("resolved with a success result"),
+            Err(TryRecvError::Empty) => unreachable!("waiter was never resolved"),
+            Err(TryRecvError::Closed) => unreachable!("waiter's sender was dropped"),
+        }
+    }
+
+    fn assert_still_waiting<T>(rx: &mut oneshot::Receiver<Result<T>>, what: &str) {
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "{what} must still be waiting - it was resolved or its sender dropped"
+        );
+    }
+
+    #[test]
+    fn browse_rejection_resolves_only_the_matching_waiter() {
+        // Several browse and load requests in flight, as the adapter routinely
+        // has during search() and play_item(). One is rejected by the Core.
+        let mut state = RoonState::default();
+        let mut first = pending_browse(&mut state, 11, "search_a");
+        let mut rejected = pending_browse(&mut state, 12, "search_b");
+        let mut third = pending_browse(&mut state, 13, "search_c");
+        let mut load_a = pending_load(&mut state, 14, "search_a");
+        let mut load_b = pending_load(&mut state, 15, "search_b");
+
+        let routing = state.route_browse_rejection(
+            12,
+            Some("search_b"),
+            RoonBrowseErrorKind::InvalidItemKey,
+        );
+
+        assert_eq!(routing, ErrorRouting::Browse);
+        assert_eq!(
+            rejection_kind(&mut rejected),
+            RoonBrowseErrorKind::InvalidItemKey
+        );
+        assert_still_waiting(&mut first, "browse 11");
+        assert_still_waiting(&mut third, "browse 13");
+        assert_still_waiting(&mut load_a, "load 14");
+        // load 15 shares the rejected request's session key: proof that
+        // correlation is by req_id, not by scanning for a session key.
+        assert_still_waiting(&mut load_b, "load 15");
+
+        // Only the resolved entry leaves the map; nothing is stranded.
+        assert!(!state.pending_browses.contains_key(&12));
+        assert_eq!(state.pending_browses.len(), 2);
+        assert_eq!(state.pending_loads.len(), 2);
+    }
+
+    #[test]
+    fn load_rejection_resolves_the_load_not_a_browse_sharing_its_session() {
+        // A browse and a load in the same browse session, both pending. A
+        // session-key scan would resolve whichever the map yielded first; the
+        // req_id in the rejection says exactly which one the Core refused.
+        let mut state = RoonState::default();
+        let mut browse = pending_browse(&mut state, 20, "play_item_1");
+        let mut load = pending_load(&mut state, 21, "play_item_1");
+
+        let routing = state.route_browse_rejection(
+            21,
+            Some("play_item_1"),
+            RoonBrowseErrorKind::InvalidItemKey,
+        );
+
+        assert_eq!(routing, ErrorRouting::Load);
+        assert_eq!(
+            rejection_kind(&mut load),
+            RoonBrowseErrorKind::InvalidItemKey
+        );
+        assert_still_waiting(&mut browse, "browse 20");
+        assert!(state.pending_browses.contains_key(&20));
+        assert!(!state.pending_loads.contains_key(&21));
+    }
+
+    #[test]
+    fn rejection_with_a_mismatched_session_key_leaves_the_waiter_alone() {
+        // `Moo` restarts its request-id counter at 0 on every reconnect, so a
+        // rejection on a new connection can carry a req_id that a stale, not
+        // yet timed-out waiter still occupies. Resolving it would be a
+        // mis-correlation; the waiter is left to its existing timeout instead.
+        let mut state = RoonState::default();
+        let mut stale = pending_browse(&mut state, 7, "browse_old");
+
+        let routing = state.route_browse_rejection(
+            7,
+            Some("browse_new"),
+            RoonBrowseErrorKind::InvalidItemKey,
+        );
+
+        assert_eq!(routing, ErrorRouting::KeyMismatch);
+        assert_still_waiting(&mut stale, "browse 7");
+        assert!(
+            state.pending_browses.contains_key(&7),
+            "the waiter must stay in the map so its own timeout still cleans up"
+        );
+    }
+
+    #[test]
+    fn rejection_for_an_unknown_req_id_is_a_noop() {
+        let mut state = RoonState::default();
+        let mut other = pending_browse(&mut state, 30, "browse_x");
+
+        let routing = state.route_browse_rejection(
+            999,
+            Some("browse_x"),
+            RoonBrowseErrorKind::UnexpectedError,
+        );
+
+        assert_eq!(routing, ErrorRouting::NoWaiter);
+        assert_still_waiting(&mut other, "browse 30");
+        assert_eq!(state.pending_browses.len(), 1);
+    }
+
+    #[test]
+    fn a_second_rejection_for_the_same_req_id_cannot_double_resolve() {
+        let mut state = RoonState::default();
+        let mut rx = pending_browse(&mut state, 40, "browse_y");
+
+        let first = state.route_browse_rejection(
+            40,
+            Some("browse_y"),
+            RoonBrowseErrorKind::InvalidItemKey,
+        );
+        let second = state.route_browse_rejection(
+            40,
+            Some("browse_y"),
+            RoonBrowseErrorKind::InvalidItemKey,
+        );
+
+        assert_eq!(first, ErrorRouting::Browse);
+        assert_eq!(second, ErrorRouting::NoWaiter);
+        assert_eq!(rejection_kind(&mut rx), RoonBrowseErrorKind::InvalidItemKey);
+        assert!(state.pending_browses.is_empty());
+    }
+
+    #[test]
+    fn rejection_after_the_caller_timed_out_is_a_noop() {
+        // `browse()` removes its own entry when BROWSE_TIMEOUT fires. A
+        // rejection arriving afterwards must not panic or resurrect anything.
+        let mut state = RoonState::default();
+        let _rx = pending_browse(&mut state, 50, "browse_z");
+        state.pending_browses.remove(&50);
+
+        let routing =
+            state.route_browse_rejection(50, Some("browse_z"), RoonBrowseErrorKind::InvalidLevels);
+
+        assert_eq!(routing, ErrorRouting::NoWaiter);
+        assert!(state.pending_browses.is_empty());
+    }
+
+    #[test]
+    fn rejection_with_a_dropped_receiver_still_clears_the_entry() {
+        let mut state = RoonState::default();
+        let rx = pending_browse(&mut state, 60, "browse_w");
+        drop(rx);
+
+        let routing = state.route_browse_rejection(
+            60,
+            Some("browse_w"),
+            RoonBrowseErrorKind::InvalidItemKey,
+        );
+
+        assert_eq!(routing, ErrorRouting::ReceiverGone);
+        assert!(
+            state.pending_browses.is_empty(),
+            "a gone receiver must not leave a stranded map entry"
+        );
+    }
+
+    #[test]
+    fn every_browse_rejection_kind_is_routed() {
+        // Routing only InvalidItemKey would leave the other three Core
+        // rejections hanging their callers for the full timeout.
+        for kind in [
+            RoonBrowseErrorKind::InvalidItemKey,
+            RoonBrowseErrorKind::InvalidLevels,
+            RoonBrowseErrorKind::ZoneNotFound,
+            RoonBrowseErrorKind::UnexpectedError,
+        ] {
+            let mut state = RoonState::default();
+            let mut rx = pending_browse(&mut state, 70, "browse_all");
+
+            let routing = state.route_browse_rejection(70, Some("browse_all"), kind);
+
+            assert_eq!(routing, ErrorRouting::Browse, "kind {kind:?} was not routed");
+            assert_eq!(rejection_kind(&mut rx), kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_item_key_resolves_far_inside_the_browse_timeout() {
+        // The point of the issue: promptness. Awaited exactly as `browse()`
+        // awaits it, with the real BROWSE_TIMEOUT.
+        let mut state = RoonState::default();
+        let rx = pending_browse(&mut state, 80, "browse_prompt");
+
+        let started = Instant::now();
+        let routing = state.route_browse_rejection(
+            80,
+            Some("browse_prompt"),
+            RoonBrowseErrorKind::InvalidItemKey,
+        );
+        let result = tokio::time::timeout(BROWSE_TIMEOUT, rx).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(routing, ErrorRouting::Browse);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a rejected item key must not wait out BROWSE_TIMEOUT ({BROWSE_TIMEOUT:?}); \
+             took {elapsed:?}"
+        );
+        let Ok(Ok(Err(err))) = result else {
+            unreachable!("expected a typed rejection inside the timeout");
+        };
+        let Some(rejection) = RoonBrowseError::from_error(&err) else {
+            unreachable!("expected a RoonBrowseError, got: {err}");
+        };
+        assert_eq!(rejection.kind, RoonBrowseErrorKind::InvalidItemKey);
+        assert_eq!(rejection.session_key.as_deref(), Some("browse_prompt"));
+    }
+
+    #[test]
+    fn image_rejection_resolves_the_matching_image_request() {
+        let mut state = RoonState::default();
+        let mut wanted = pending_image(&mut state, 90, "image_a");
+        let mut other = pending_image(&mut state, 91, "image_b");
+
+        let routing = state.route_image_rejection(90, "image_a");
+
+        assert_eq!(routing, ErrorRouting::Image);
+        // `get_image` reads None as "Image not found".
+        assert!(matches!(wanted.try_recv(), Ok(None)));
+        assert!(matches!(other.try_recv(), Err(TryRecvError::Empty)));
+        assert!(!state.pending_images.contains_key(&90));
+        assert!(state.pending_images.contains_key(&91));
+    }
+
+    #[test]
+    fn image_rejection_with_a_mismatched_key_leaves_the_waiter_alone() {
+        let mut state = RoonState::default();
+        let mut rx = pending_image(&mut state, 92, "image_a");
+
+        let routing = state.route_image_rejection(92, "image_somewhere_else");
+
+        assert_eq!(routing, ErrorRouting::KeyMismatch);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(state.pending_images.contains_key(&92));
+    }
+
+    #[test]
+    fn a_rejection_is_distinguishable_from_a_timeout_and_a_lost_core() {
+        // The three failure classes the issue insists must stay apart.
+        let rejected = anyhow::Error::new(RoonBrowseError::new(
+            RoonBrowseErrorKind::InvalidItemKey,
+            Some("browse_1"),
+        ));
+        let timed_out = anyhow::anyhow!("Browse request timed out");
+        let not_connected =
+            anyhow::anyhow!("Browse service not available - not connected to Roon");
+
+        let Some(rejection) = RoonBrowseError::from_error(&rejected) else {
+            unreachable!("a rejection must be recoverable from the anyhow error");
+        };
+        assert_eq!(rejection.kind, RoonBrowseErrorKind::InvalidItemKey);
+        assert!(rejection.kind.is_recoverable());
+        assert!(RoonBrowseError::from_error(&timed_out).is_none());
+        assert!(RoonBrowseError::from_error(&not_connected).is_none());
+
+        // And the message a caller sees says what to do, without ever reading
+        // like a timeout.
+        let message = rejected.to_string();
+        assert!(message.contains("search or browse again"), "{message}");
+        assert!(!message.contains("timed out"), "{message}");
+        assert!(message.contains("browse_1"), "{message}");
+    }
+
+    #[test]
+    fn only_reference_rejections_are_marked_recoverable() {
+        assert!(RoonBrowseErrorKind::InvalidItemKey.is_recoverable());
+        assert!(RoonBrowseErrorKind::InvalidLevels.is_recoverable());
+        assert!(!RoonBrowseErrorKind::ZoneNotFound.is_recoverable());
+        assert!(!RoonBrowseErrorKind::UnexpectedError.is_recoverable());
+        assert_eq!(
+            RoonBrowseErrorKind::InvalidItemKey.as_str(),
+            "invalid_item_key"
         );
     }
 }
