@@ -20,16 +20,21 @@
 //!
 //! ## Order of checks
 //!
-//! Version, then constraint bounds, then zone identity, then lane values, then history,
-//! then coherence repair, then ordering. Repair runs **before** the ordering comparison so
+//! Version, then constraint bounds, then zone identity, then lane values, then all timestamp
+//! fields, then document shape, then history, then coherence repair, then ordering. Repair runs **before** the
+//! ordering comparison so
 //! that both sides of that comparison are repaired: the stored document is post-repair, and
 //! comparing a raw incoming document against it would report a spurious difference and
 //! refuse an identical republication as [`AdmissionRefusal::NotAdvanced`].
 
+use chrono::DateTime;
+use std::collections::BTreeSet;
+
+use super::run::AdapterRunId;
 use crate::adaptive::{
-    ChangeSetId, CommandOutcome, ControlId, DocumentRevisions, EntryValidity, Grounding,
-    IntentIncoherence, OperationId, ProducerDocument, ProducerEpoch, Reason, ReasonCode, Refusal,
-    TargetRole, ValueLane, CONSUMER_SCHEMA_VERSION,
+    AvailabilityState, ChangeSetId, CommandOutcome, ControlId, DocumentRevisions, EntryValidity,
+    Grounding, IntentIncoherence, OperationId, ProducerDocument, ProducerEpoch, Reason, ReasonCode,
+    Refusal, TargetRole, TransportLane, ValueLane, CONSUMER_SCHEMA_VERSION,
 };
 use crate::bus::PrefixedZoneId;
 
@@ -125,6 +130,98 @@ pub enum AdmissionRefusal {
     IrreparableIntent {
         /// What survived the repair.
         violations: Vec<IntentIncoherence>,
+    },
+    /// The publishing adapter run is no longer live.
+    ///
+    /// Adapter lifecycle rather than producer identity, and the two are deliberately separate:
+    /// this says *our* connection that sent the document has been replaced or ended, not that
+    /// the engine behind it is gone. Decided from the synchronously-maintained run registry, so
+    /// it holds however long the document sat in the channel and whatever public-bus events
+    /// were processed meanwhile. See [`super::run`].
+    StaleAdapterRun {
+        /// The adapter.
+        adapter: String,
+        /// The run that published it.
+        published_by: AdapterRunId,
+        /// The run that is live now, if any.
+        active: Option<AdapterRunId>,
+    },
+    /// The adapter tried to speak for a producer outside its namespace.
+    ProducerOwnershipMismatch {
+        /// Adapter that attempted the publication.
+        adapter: String,
+        /// Producer id it does not own.
+        producer_id: String,
+    },
+    /// The producer was retired, and this document does not announce a restart.
+    ///
+    /// Lifecycle rather than document coherence, so it is decided by the aggregator and never
+    /// by [`admit`]: the gate is pure and sees one document, while "this producer has been
+    /// retired" is a fact about the store. Raised when a publication is delivered after an
+    /// explicit actor retirement retired its key — and *only* then. Adapter lifecycle does not
+    /// reach this variant; that is [`AdmissionRefusal::StaleAdapterRun`], because an adapter
+    /// stopping says nothing about whether the engine behind it still exists. A strictly newer
+    /// [`ProducerEpoch`] is a restart and is admitted instead.
+    ProducerRetired {
+        /// The epoch the producer held when it was retired.
+        retired_at: ProducerEpoch,
+        /// The epoch offered by the late document.
+        incoming: ProducerEpoch,
+    },
+    /// A control publishes the same value lane twice.
+    ///
+    /// One lane is one reading. Two `desired` lanes make "the staged value" ambiguous, and
+    /// `effective_view` resolves a single lane, so C1 coherence could be satisfied by one
+    /// entry and contradicted by the other in the same document.
+    DuplicateValueLane {
+        /// The control carrying it.
+        control: ControlId,
+        /// The lane published twice.
+        lane: ValueLane,
+    },
+    /// The document publishes health for the same transport lane twice.
+    ///
+    /// [`super::LaneWitness`] is keyed by lane, so a duplicate is not merely redundant - it
+    /// is unrepresentable, and folding it would silently keep whichever entry happened to
+    /// come last in a `Vec`.
+    DuplicateLaneHealth {
+        /// The lane published twice.
+        lane: TransportLane,
+    },
+    /// Some [`crate::adaptive::Timestamp`] in the document is not an RFC 3339 instant.
+    ///
+    /// Every timestamp field, not only a lane's `last_success`: the type documents itself as
+    /// RFC 3339 and consumers parse all of them. `field` is a dotted path so a producer author
+    /// is told which one, since a document carries many.
+    TimestampNotRfc3339 {
+        /// Dotted path to the offending field.
+        field: String,
+        /// The offending value, quoted back so the author can see what was published.
+        value: String,
+    },
+    /// A lane's `last_success` is not an RFC 3339 instant.
+    ///
+    /// [`crate::adaptive::Timestamp`] documents itself as RFC 3339, and every consumer that judges freshness
+    /// has to parse it. An unparseable value is not a degraded reading but no reading at all,
+    /// and admitting one puts a string no consumer can interpret where one it can is expected.
+    /// Refused rather than dropped, because silently blanking the field would hide a producer
+    /// bug that only its author can fix.
+    LaneTimestampNotRfc3339 {
+        /// The lane carrying it.
+        lane: TransportLane,
+        /// The offending value, quoted back so the author can see what was published.
+        value: String,
+    },
+    /// A control is unavailable, deprecated or unknown without saying why.
+    ///
+    /// `Availability::is_well_formed` is published as a rule by the contract and was called
+    /// by nothing on this path. A consumer that can see "disabled" but not why cannot
+    /// explain itself, and the user cannot escape the state that caused it.
+    AvailabilityNotWellFormed {
+        /// The control carrying it.
+        control: ControlId,
+        /// The state asserted with no reason.
+        state: AvailabilityState,
     },
     /// A recorded outcome transition the contract calls impossible.
     IllegalOutcomeHistory {
@@ -229,6 +326,12 @@ pub fn admit(previous: Option<&ProducerDocument>, incoming: ProducerDocument) ->
     if let Some(refusal) = first_lane_defect(&incoming) {
         return Admission::Refused(refusal);
     }
+    if let Some(refusal) = first_timestamp_defect(&incoming) {
+        return Admission::Refused(refusal);
+    }
+    if let Some(refusal) = first_shape_defect(&incoming) {
+        return Admission::Refused(refusal);
+    }
     if let Some(refusal) = first_illegal_transition(&incoming) {
         return Admission::Refused(refusal);
     }
@@ -262,6 +365,95 @@ pub fn admit(previous: Option<&ProducerDocument>, incoming: ProducerDocument) ->
         repairs,
         kind,
     })
+}
+
+fn first_timestamp_defect(document: &ProducerDocument) -> Option<AdmissionRefusal> {
+    fn invalid(field: String, timestamp: &crate::adaptive::Timestamp) -> Option<AdmissionRefusal> {
+        if DateTime::parse_from_rfc3339(timestamp.as_str()).is_ok() {
+            return None;
+        }
+        Some(AdmissionRefusal::TimestampNotRfc3339 {
+            field,
+            value: timestamp.as_str().to_string(),
+        })
+    }
+
+    for (lane_index, health) in document.lanes.iter().enumerate() {
+        if let Some(timestamp) = &health.freshness.observed_at {
+            if let Some(refusal) = invalid(
+                format!("lanes[{lane_index}].freshness.observed_at"),
+                timestamp,
+            ) {
+                return Some(refusal);
+            }
+        }
+    }
+    for (control_index, control) in document.controls.iter().enumerate() {
+        for (value_index, value) in control.values.iter().enumerate() {
+            if let Some(timestamp) = &value.freshness.observed_at {
+                if let Some(refusal) = invalid(
+                    format!(
+                        "controls[{control_index}].values[{value_index}].freshness.observed_at"
+                    ),
+                    timestamp,
+                ) {
+                    return Some(refusal);
+                }
+            }
+        }
+        for (divergence_index, divergence) in control.divergences.iter().enumerate() {
+            if let Some(timestamp) = &divergence.detected_at {
+                if let Some(refusal) = invalid(
+                    format!(
+                        "controls[{control_index}].divergences[{divergence_index}].detected_at"
+                    ),
+                    timestamp,
+                ) {
+                    return Some(refusal);
+                }
+            }
+        }
+    }
+    if let Some(policy) = &document.draft_policy {
+        if let Some(timestamp) = &policy.retention.expires_at {
+            if let Some(refusal) = invalid("draft_policy.retention.expires_at".into(), timestamp) {
+                return Some(refusal);
+            }
+        }
+    }
+    for (change_set_index, change_set) in document.change_sets.iter().enumerate() {
+        if let Some(refusal) = invalid(
+            format!("change_sets[{change_set_index}].created_at"),
+            &change_set.created_at,
+        ) {
+            return Some(refusal);
+        }
+        if let Some(refusal) = invalid(
+            format!("change_sets[{change_set_index}].updated_at"),
+            &change_set.updated_at,
+        ) {
+            return Some(refusal);
+        }
+        if let Some(timestamp) = &change_set.retention.expires_at {
+            if let Some(refusal) = invalid(
+                format!("change_sets[{change_set_index}].retention.expires_at"),
+                timestamp,
+            ) {
+                return Some(refusal);
+            }
+        }
+    }
+    for (operation_index, operation) in document.operations.iter().enumerate() {
+        for (history_index, transition) in operation.history.iter().enumerate() {
+            if let Some(refusal) = invalid(
+                format!("operations[{operation_index}].history[{history_index}].at"),
+                &transition.at,
+            ) {
+                return Some(refusal);
+            }
+        }
+    }
+    None
 }
 
 /// How `incoming` relates to `held`, or why it may not replace it.
@@ -345,6 +537,76 @@ fn first_lane_defect(document: &ProducerDocument) -> Option<AdmissionRefusal> {
             }
         }
     }
+    None
+}
+
+/// The first structural defect in the document's lane health or controls, if any.
+///
+/// Four more rules the contract states — three with a published predicate — that had no code
+/// path applying them: the defect class decision 3 of `.oh/adaptive-publication.md` names
+/// outright. All four refuse rather than repair, because none has a repair that does not invent
+/// something: choosing between two lanes with the same name picks one of two readings the
+/// producer never disambiguated, inventing a reason for an unexplained unavailability tells the
+/// user something no producer said, and guessing at a malformed instant fabricates a freshness
+/// claim.
+///
+/// **Every rule here applies to unrecognized members too, and that is deliberate.** Forward
+/// compatibility means an unknown member stays *representable* — the control is kept, its
+/// observed value is kept, and the unknown state passes through unnormalized. It does not mean
+/// structural invariants lapse when a name is unfamiliar:
+///
+/// * A duplicate lane is ambiguous whether or not this build knows the lane's name, and
+///   [`super::LaneWitness`] is keyed by `TransportLane` including its `Unrecognized` arm, so a
+///   duplicate genuinely collides.
+/// * `Availability::is_well_formed` is true for `available` and requires at least one reason
+///   for *every* other state, `Unrecognized` included. An unknown state is the case where that
+///   reason matters most, because a consumer cannot even fall back on knowing what the state
+///   means — exempting it would make the invariant weakest exactly where it is needed.
+///
+/// This is a narrower reading than [`first_lane_defect`] takes, and the difference is real
+/// rather than an inconsistency: there, `LaneValue::is_consistent` returns `false` *because of*
+/// an unrecognized grounding, so applying it would refuse a document for using a newer
+/// vocabulary. Here the predicate is indifferent to the state's name and turns only on whether
+/// a reason is present, which is a shape every version agrees on.
+fn first_shape_defect(document: &ProducerDocument) -> Option<AdmissionRefusal> {
+    let mut lanes_seen: BTreeSet<&TransportLane> = BTreeSet::new();
+    for health in &document.lanes {
+        if !lanes_seen.insert(&health.lane) {
+            return Some(AdmissionRefusal::DuplicateLaneHealth {
+                lane: health.lane.clone(),
+            });
+        }
+        // Checked here rather than trusted downstream, so no unparseable instant is ever
+        // stored, served, or compared. `chrono` is the same parser the aggregator's witness
+        // uses, which is what makes "admitted implies comparable" true rather than hopeful.
+        if let Some(last_success) = &health.last_success {
+            if DateTime::parse_from_rfc3339(last_success.as_str()).is_err() {
+                return Some(AdmissionRefusal::LaneTimestampNotRfc3339 {
+                    lane: health.lane.clone(),
+                    value: last_success.as_str().to_string(),
+                });
+            }
+        }
+    }
+
+    for control in &document.controls {
+        let mut value_lanes: BTreeSet<&ValueLane> = BTreeSet::new();
+        for value in &control.values {
+            if !value_lanes.insert(&value.lane) {
+                return Some(AdmissionRefusal::DuplicateValueLane {
+                    control: control.id.clone(),
+                    lane: value.lane.clone(),
+                });
+            }
+        }
+        if !control.availability.is_well_formed() {
+            return Some(AdmissionRefusal::AvailabilityNotWellFormed {
+                control: control.id.clone(),
+                state: control.availability.state.clone(),
+            });
+        }
+    }
+
     None
 }
 

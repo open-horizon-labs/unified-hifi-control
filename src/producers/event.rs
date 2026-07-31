@@ -15,35 +15,14 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use super::admission::{AdmissionRefusal, ProducerKey};
-use crate::adaptive::{DocumentRevisions, ProducerDocument};
+use crate::adaptive::{DocumentRevisions, ProducerEpoch};
 
-/// Producer lifecycle on the internal bus.
+/// Aggregator egress notifications on the internal bus.
 ///
-/// Ingress variants are written by adapters and read only by the aggregator. Egress
-/// variants are written by the aggregator so an in-repository consumer can learn that
-/// something changed without being handed an unadmitted document.
+/// This enum deliberately has no producer ingress variants. Adapters can only publish through
+/// [`super::AdaptiveHandle`], whose bounded command channel cannot silently lag or drop state.
 #[derive(Debug, Clone)]
 pub enum AdaptiveEvent {
-    /// An adapter published a producer document. Not yet admitted.
-    ProducerPublished {
-        /// The published document. Boxed: a document is large relative to the other
-        /// variants and this enum travels through a broadcast channel.
-        document: Box<ProducerDocument>,
-    },
-    /// A producer is gone. Distinct from a disconnected producer, which keeps publishing
-    /// documents marked stale.
-    ProducerRemoved {
-        /// Stable producer id.
-        ///
-        /// **Known limit, recorded for #325.** This removes *every* target of that
-        /// producer. A producer that publishes several documents — say an `instance`-scoped
-        /// one and a `dsp_engine` one bound to a zone — cannot retire one target and keep
-        /// another, because the event carries no [`ProducerKey`]. Not fixed here: no
-        /// producer has more than one target yet, and adding a key to the event without a
-        /// caller that needs it would be guessing at the shape. #325 will meet this first,
-        /// and the fix is additive (a variant carrying a key).
-        producer_id: String,
-    },
     /// The aggregator admitted a document. Carries a pointer, never a payload: a consumer
     /// that wants the content must read the snapshot from the aggregator.
     SnapshotAdmitted {
@@ -61,9 +40,21 @@ pub enum AdaptiveEvent {
         /// Why.
         refusal: AdmissionRefusal,
     },
+    /// A committed producer retirement changed the read-only view.
+    ProducerRetired {
+        /// Stable producer id whose targets are no longer visible.
+        producer_id: String,
+        /// Producer epoch retired through.
+        retired_through: ProducerEpoch,
+        /// Number of visible target snapshots removed.
+        removed: usize,
+    },
 }
 
-/// A broadcast channel for [`AdaptiveEvent`].
+/// Broadcast egress for admitted/refused notifications.
+///
+/// Lag here can only make a consumer re-read the current [`super::AdaptiveView`]; it cannot
+/// lose producer state because this channel is never used for ingress.
 pub struct AdaptiveBus {
     sender: broadcast::Sender<AdaptiveEvent>,
 }
@@ -80,7 +71,7 @@ impl AdaptiveBus {
     /// The send result is inspected rather than discarded: `tests/ignored_send_lint.rs`
     /// allowlists `bus/mod.rs` only, and a silent drop here is precisely the failure a
     /// producer author would have no way to diagnose.
-    pub fn publish(&self, event: AdaptiveEvent) {
+    pub(super) fn publish(&self, event: AdaptiveEvent) {
         if self.sender.send(event).is_err() {
             tracing::trace!("adaptive bus has no subscribers; event dropped");
         }
@@ -99,8 +90,8 @@ impl AdaptiveBus {
 
 impl Default for AdaptiveBus {
     fn default() -> Self {
-        // Larger than the public bus's 256: a producer document is published on every poll
-        // of every producer, and the aggregator is the only consumer that matters.
+        // Egress is only a re-read hint, but a generous buffer avoids needless lag recovery
+        // when several consumers briefly fall behind a burst of producer polls.
         Self::new(1024)
     }
 }
@@ -109,6 +100,6 @@ impl Default for AdaptiveBus {
 pub type SharedAdaptiveBus = Arc<AdaptiveBus>;
 
 /// Create a shared internal adaptive bus.
-pub fn create_adaptive_bus() -> SharedAdaptiveBus {
+pub(super) fn create_adaptive_bus() -> SharedAdaptiveBus {
     Arc::new(AdaptiveBus::default())
 }

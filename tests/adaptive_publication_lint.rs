@@ -79,7 +79,9 @@ use std::fs;
 use std::path::Path;
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
-use syn::{Attribute, Expr, ExprLit, File, Item, ItemEnum, Lit, Meta, Token, UseTree};
+use syn::{
+    Attribute, Expr, ExprLit, File, Item, ItemEnum, Lit, Meta, Token, Type, UseTree, Visibility,
+};
 use walkdir::WalkDir;
 
 const EVENT_MODULE: &str = "src/producers/event.rs";
@@ -102,7 +104,7 @@ const EVENT_ALLOWED_IMPORTS: &[&str] = &[
     "super::admission::AdmissionRefusal",
     "super::admission::ProducerKey",
     "crate::adaptive::DocumentRevisions",
-    "crate::adaptive::ProducerDocument",
+    "crate::adaptive::ProducerEpoch",
 ];
 
 /// Exactly what `AdaptiveEvent` may derive.
@@ -550,6 +552,486 @@ fn trait_impls_for(file: &File, type_name: &str) -> Vec<String> {
     };
     visitor.visit_file(file);
     visitor.found
+}
+
+/// Every alias in `file` that gives the internal event a second name.
+///
+/// [`trait_impls_for`] matches an impl's self type by its last path segment against the literal
+/// `AdaptiveEvent`. So this implements a serialization trait for the internal event while every
+/// allowlist in `event.rs` stays clean and the crate-wide impl sweep sees an impl for a type it
+/// has never heard of:
+///
+/// ```ignore
+/// type Ev = AdaptiveEvent;
+/// impl serde::Serialize for Ev { /* ... */ }
+/// ```
+///
+/// **Prohibited rather than resolved.** Following aliases needs name resolution, which this
+/// file deliberately does not attempt — a half-built resolver would fail silently, which is the
+/// one outcome a lint must never have. The alias is banned instead: if the internal event can
+/// only ever be spelled `AdaptiveEvent`, matching that single spelling is sufficient. The cost
+/// is a rule to be told about; the benefit is that the guarantee does not depend on this test
+/// file being cleverer than the next escape.
+fn adaptive_event_aliases(file: &File) -> Vec<String> {
+    #[derive(Default)]
+    struct AliasVisitor {
+        found: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for AliasVisitor {
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if type_tail_is(&item.ty, ADAPTIVE_EVENT) {
+                self.found
+                    .push(format!("type {} = {ADAPTIVE_EVENT}", item.ident));
+            }
+            visit::visit_item_type(self, item);
+        }
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            for leaf in flatten_use_tree(&item.tree) {
+                let Some((original, rename)) = leaf.split_once(" as ") else {
+                    continue;
+                };
+                if original.rsplit("::").next() == Some(ADAPTIVE_EVENT) {
+                    self.found.push(format!("use {ADAPTIVE_EVENT} as {rename}"));
+                }
+            }
+            visit::visit_item_use(self, item);
+        }
+    }
+    let mut visitor = AliasVisitor::default();
+    visitor.visit_file(file);
+    visitor.found
+}
+
+/// Whether `ty` is a path type whose final segment is `name`.
+fn type_tail_is(ty: &Type, name: &str) -> bool {
+    struct TailVisitor<'a> {
+        name: &'a str,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for TailVisitor<'_> {
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            if path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == self.name)
+            {
+                self.found = true;
+            }
+            visit::visit_type_path(self, path);
+        }
+    }
+    let mut visitor = TailVisitor { name, found: false };
+    visitor.visit_type(ty);
+    visitor.found
+}
+
+/// Whether a `::`-joined path names a forbidden module as a whole segment.
+///
+/// Split on separators and compared for equality, so `adaptive_extras` is not `adaptive` — the
+/// same boundary-anchoring [`is_sweep_exempt`] applies to directory names.
+fn path_names_forbidden_module(path: &str) -> bool {
+    path.split(" as ")
+        .next()
+        .unwrap_or(path)
+        .split("::")
+        .any(|segment| FORBIDDEN_MODULES.contains(&segment.trim()))
+}
+
+/// Exported re-exports and aliases that launder a forbidden module's types through a root.
+///
+/// `src/lib.rs` and `src/main.rs` are exempt from both reference sweeps, because the
+/// composition root must name `producers` to construct the aggregator. That exemption is a hole
+/// if the root may also *re-export*: this in `lib.rs`
+///
+/// ```ignore
+/// pub use crate::adaptive::ProducerDocument as Doc;
+/// ```
+///
+/// lets `src/api/mod.rs` write `use crate::Doc;` and `Json(doc)`, which names neither forbidden
+/// module and so passes [`forbidden_module_references`] untouched — publishing the v1 contract
+/// from a public endpoint with every lint green.
+///
+/// Exported uses, aliases, functions, constants and statics are covered. Visibility is what
+/// makes a root item reachable from another module; private helpers remain composition details.
+/// Type syntax is traversed recursively, so wrapping a forbidden type does not launder it.
+fn root_launderings(file: &File) -> Vec<String> {
+    #[derive(Default)]
+    struct AliasCollector<'ast> {
+        aliases: Vec<(String, &'ast Type)>,
+        imports: Vec<(String, String)>,
+        macros: std::collections::BTreeSet<String>,
+    }
+    impl<'ast> Visit<'ast> for AliasCollector<'ast> {
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            self.aliases.push((item.ident.to_string(), &item.ty));
+            visit::visit_item_type(self, item);
+        }
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            for leaf in flatten_use_tree(&item.tree) {
+                let (source, introduced) = leaf.split_once(" as ").map_or_else(
+                    || (leaf.as_str(), leaf.rsplit("::").next().unwrap_or(&leaf)),
+                    |(source, rename)| (source, rename),
+                );
+                self.imports
+                    .push((introduced.to_string(), source.to_string()));
+            }
+            visit::visit_item_use(self, item);
+        }
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if let Some(name) = &item.ident {
+                self.macros.insert(name.to_string());
+            }
+            visit::visit_item_macro(self, item);
+        }
+    }
+    let mut collector = AliasCollector::default();
+    collector.visit_file(file);
+    let mut tainted_aliases = std::collections::BTreeSet::new();
+    loop {
+        let before = tainted_aliases.len();
+        for (name, ty) in &collector.aliases {
+            if type_names_forbidden_module_or_alias(ty, &tainted_aliases) {
+                tainted_aliases.insert(name.clone());
+            }
+        }
+        for (introduced, source) in &collector.imports {
+            if path_names_forbidden_module(source)
+                || source
+                    .split("::")
+                    .any(|segment| tainted_aliases.contains(segment))
+            {
+                tainted_aliases.insert(introduced.clone());
+            }
+        }
+        if tainted_aliases.len() == before {
+            break;
+        }
+    }
+
+    struct RootVisitor<'a> {
+        found: Vec<String>,
+        tainted_aliases: &'a std::collections::BTreeSet<String>,
+        macro_names: &'a std::collections::BTreeSet<String>,
+    }
+    impl RootVisitor<'_> {
+        fn type_is_forbidden(&self, ty: &Type) -> bool {
+            type_names_forbidden_module_or_alias(ty, self.tainted_aliases)
+        }
+
+        fn signature_is_forbidden(&self, signature: &syn::Signature) -> bool {
+            signature_names_forbidden_module_or_alias(signature, self.tainted_aliases)
+        }
+    }
+    impl<'ast> Visit<'ast> for RootVisitor<'_> {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            for leaf in flatten_use_tree(&item.tree) {
+                if !is_exported(&item.vis)
+                    && leaf.rsplit("::").next() == Some("*")
+                    && (path_names_forbidden_module(&leaf)
+                        || leaf
+                            .split("::")
+                            .any(|segment| self.tainted_aliases.contains(segment)))
+                {
+                    self.found
+                        .push(format!("private glob from forbidden module {leaf}"));
+                }
+                if is_exported(&item.vis) {
+                    if path_names_forbidden_module(&leaf)
+                        || leaf
+                            .split("::")
+                            .any(|segment| self.tainted_aliases.contains(segment))
+                    {
+                        self.found.push(format!("exported use {leaf}"));
+                    }
+                    let source = leaf
+                        .split_once(" as ")
+                        .map_or(leaf.as_str(), |(source, _)| source);
+                    if source
+                        .rsplit("::")
+                        .next()
+                        .is_some_and(|name| self.macro_names.contains(name))
+                    {
+                        self.found.push(format!("exported macro use {leaf}"));
+                    }
+                }
+            }
+            visit::visit_item_use(self, item);
+        }
+        fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+            if is_exported(&item.vis)
+                && (self.type_is_forbidden(&item.ty)
+                    || generics_names_forbidden_module_or_alias(
+                        &item.generics,
+                        self.tainted_aliases,
+                    ))
+            {
+                self.found.push(format!("exported type {}", item.ident));
+            }
+            visit::visit_item_type(self, item);
+        }
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if is_exported(&item.vis) && self.signature_is_forbidden(&item.sig) {
+                self.found.push(format!("exported fn {}", item.sig.ident));
+            }
+            visit::visit_item_fn(self, item);
+        }
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            if is_exported(&item.vis)
+                && (generics_names_forbidden_module_or_alias(&item.generics, self.tainted_aliases)
+                    || item
+                        .fields
+                        .iter()
+                        .any(|field| is_exported(&field.vis) && self.type_is_forbidden(&field.ty)))
+            {
+                self.found.push(format!("exported struct {}", item.ident));
+            }
+            visit::visit_item_struct(self, item);
+        }
+        fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+            if is_exported(&item.vis)
+                && (generics_names_forbidden_module_or_alias(&item.generics, self.tainted_aliases)
+                    || item
+                        .variants
+                        .iter()
+                        .flat_map(|variant| variant.fields.iter())
+                        .any(|field| self.type_is_forbidden(&field.ty)))
+            {
+                self.found.push(format!("exported enum {}", item.ident));
+            }
+            visit::visit_item_enum(self, item);
+        }
+        fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
+            if is_exported(&item.vis)
+                && (generics_names_forbidden_module_or_alias(&item.generics, self.tainted_aliases)
+                    || item
+                        .fields
+                        .named
+                        .iter()
+                        .any(|field| is_exported(&field.vis) && self.type_is_forbidden(&field.ty)))
+            {
+                self.found.push(format!("exported union {}", item.ident));
+            }
+            visit::visit_item_union(self, item);
+        }
+        fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
+            if is_exported(&item.vis)
+                && (generics_names_forbidden_module_or_alias(&item.generics, self.tainted_aliases)
+                    || bounds_name_forbidden_module_or_alias(
+                        &item.supertraits,
+                        self.tainted_aliases,
+                    )
+                    || item.items.iter().any(|trait_item| match trait_item {
+                        syn::TraitItem::Fn(method) => self.signature_is_forbidden(&method.sig),
+                        syn::TraitItem::Const(item) => self.type_is_forbidden(&item.ty),
+                        syn::TraitItem::Type(item) => {
+                            trait_item_type_names_forbidden_module_or_alias(
+                                item,
+                                self.tainted_aliases,
+                            )
+                        }
+                        _ => false,
+                    }))
+            {
+                self.found.push(format!("exported trait {}", item.ident));
+            }
+            visit::visit_item_trait(self, item);
+        }
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            if generics_names_forbidden_module_or_alias(&item.generics, self.tainted_aliases)
+                || self.type_is_forbidden(&item.self_ty)
+                || item.trait_.as_ref().is_some_and(|(_, path, _)| {
+                    syn_path_names_forbidden_module_or_alias(path, self.tainted_aliases)
+                })
+            {
+                self.found.push("impl on forbidden type".to_string());
+            }
+            let trait_impl = item.trait_.is_some();
+            for impl_item in &item.items {
+                match impl_item {
+                    syn::ImplItem::Fn(method)
+                        if (trait_impl || is_exported(&method.vis))
+                            && self.signature_is_forbidden(&method.sig) =>
+                    {
+                        self.found
+                            .push(format!("exported method {}", method.sig.ident));
+                    }
+                    syn::ImplItem::Const(item)
+                        if (trait_impl || is_exported(&item.vis))
+                            && self.type_is_forbidden(&item.ty) =>
+                    {
+                        self.found
+                            .push(format!("exported associated const {}", item.ident));
+                    }
+                    syn::ImplItem::Type(item) if self.type_is_forbidden(&item.ty) => {
+                        self.found
+                            .push(format!("exported associated type {}", item.ident));
+                    }
+                    _ => {}
+                }
+            }
+            visit::visit_item_impl(self, item);
+        }
+        fn visit_item_foreign_mod(&mut self, item: &'ast syn::ItemForeignMod) {
+            for foreign in &item.items {
+                match foreign {
+                    syn::ForeignItem::Fn(function)
+                        if is_exported(&function.vis)
+                            && self.signature_is_forbidden(&function.sig) =>
+                    {
+                        self.found
+                            .push(format!("exported foreign fn {}", function.sig.ident));
+                    }
+                    syn::ForeignItem::Static(item)
+                        if is_exported(&item.vis) && self.type_is_forbidden(&item.ty) =>
+                    {
+                        self.found
+                            .push(format!("exported foreign static {}", item.ident));
+                    }
+                    _ => {}
+                }
+            }
+            visit::visit_item_foreign_mod(self, item);
+        }
+        fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+            if is_exported(&item.vis) && self.type_is_forbidden(&item.ty) {
+                self.found.push(format!("exported const {}", item.ident));
+            }
+            visit::visit_item_const(self, item);
+        }
+        fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+            if is_exported(&item.vis) && self.type_is_forbidden(&item.ty) {
+                self.found.push(format!("exported static {}", item.ident));
+            }
+            visit::visit_item_static(self, item);
+        }
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if item
+                .attrs
+                .iter()
+                .any(|attribute| attribute.path().is_ident("macro_export"))
+            {
+                self.found.push("exported macro".to_string());
+            }
+            if token_stream_names_forbidden_module_or_alias(&item.mac.tokens, self.tainted_aliases)
+            {
+                self.found
+                    .push("macro tokens name a forbidden type".to_string());
+            }
+            visit::visit_item_macro(self, item);
+        }
+    }
+    let mut visitor = RootVisitor {
+        found: Vec::new(),
+        tainted_aliases: &tainted_aliases,
+        macro_names: &collector.macros,
+    };
+    visitor.visit_file(file);
+    visitor.found
+}
+
+fn token_stream_names_forbidden_module_or_alias(
+    tokens: &proc_macro2::TokenStream,
+    aliases: &std::collections::BTreeSet<String>,
+) -> bool {
+    tokens.clone().into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Ident(ident) => {
+            let ident = ident.to_string();
+            FORBIDDEN_MODULES.contains(&ident.as_str()) || aliases.contains(&ident)
+        }
+        proc_macro2::TokenTree::Group(group) => {
+            token_stream_names_forbidden_module_or_alias(&group.stream(), aliases)
+        }
+        proc_macro2::TokenTree::Punct(_) | proc_macro2::TokenTree::Literal(_) => false,
+    })
+}
+
+fn signature_names_forbidden_module_or_alias(
+    signature: &syn::Signature,
+    aliases: &std::collections::BTreeSet<String>,
+) -> bool {
+    let mut visitor = ForbiddenPathVisitor::new(aliases);
+    visitor.visit_signature(signature);
+    visitor.found
+}
+
+fn generics_names_forbidden_module_or_alias(
+    generics: &syn::Generics,
+    aliases: &std::collections::BTreeSet<String>,
+) -> bool {
+    let mut visitor = ForbiddenPathVisitor::new(aliases);
+    visitor.visit_generics(generics);
+    visitor.found
+}
+
+fn bounds_name_forbidden_module_or_alias(
+    bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::token::Plus>,
+    aliases: &std::collections::BTreeSet<String>,
+) -> bool {
+    let mut visitor = ForbiddenPathVisitor::new(aliases);
+    for bound in bounds {
+        visitor.visit_type_param_bound(bound);
+    }
+    visitor.found
+}
+
+fn trait_item_type_names_forbidden_module_or_alias(
+    item: &syn::TraitItemType,
+    aliases: &std::collections::BTreeSet<String>,
+) -> bool {
+    let mut visitor = ForbiddenPathVisitor::new(aliases);
+    visitor.visit_trait_item_type(item);
+    visitor.found
+}
+
+fn syn_path_names_forbidden_module_or_alias(
+    path: &syn::Path,
+    aliases: &std::collections::BTreeSet<String>,
+) -> bool {
+    let mut visitor = ForbiddenPathVisitor::new(aliases);
+    visitor.visit_path(path);
+    visitor.found
+}
+
+/// Whether a type's path names a forbidden module as a whole segment.
+fn type_names_forbidden_module_or_alias(
+    ty: &Type,
+    aliases: &std::collections::BTreeSet<String>,
+) -> bool {
+    let mut visitor = ForbiddenPathVisitor::new(aliases);
+    visitor.visit_type(ty);
+    visitor.found
+}
+
+struct ForbiddenPathVisitor<'a> {
+    found: bool,
+    aliases: &'a std::collections::BTreeSet<String>,
+}
+
+impl<'a> ForbiddenPathVisitor<'a> {
+    fn new(aliases: &'a std::collections::BTreeSet<String>) -> Self {
+        Self {
+            found: false,
+            aliases,
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for ForbiddenPathVisitor<'_> {
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if path.segments.iter().any(|segment| {
+            FORBIDDEN_MODULES.contains(&segment.ident.to_string().as_str())
+                || self.aliases.contains(&segment.ident.to_string())
+        }) {
+            self.found = true;
+        }
+        visit::visit_path(self, path);
+    }
+}
+
+/// Whether this visibility makes a name reachable from another module.
+fn is_exported(vis: &Visibility) -> bool {
+    !matches!(vis, Visibility::Inherited)
 }
 
 /// Every `#[cfg(...)]` argument applying to module `name`, including from an enclosing
@@ -1179,6 +1661,586 @@ fn lint_no_module_anywhere_implements_a_trait_for_adaptive_event() {
          any module, so this guarantee cannot be enforced in one file. If an impl becomes \
          necessary, allow it here having checked it is not a serialization trait under \
          another name."
+    );
+}
+
+// =============================================================================
+// Boundary 4: a forbidden type cannot be renamed out of reach of the other three
+//
+// Every lint above matches a *name*: `AdaptiveEvent` for the impl sweeps, `adaptive` and
+// `producers` for the reference sweeps. A second name defeats all of them at once, and none of
+// them would report anything - the failure mode is a green test file, which is exactly the
+// class this file exists to stop reproducing. Rather than resolve aliases, the aliases are
+// banned; see `adaptive_event_aliases` and `root_launderings` for why that trade is the right
+// way round.
+// =============================================================================
+
+/// The files exempt from both reference sweeps, and therefore the ones that can launder.
+const ROOT_FILES: &[&str] = &["src/lib.rs", "src/main.rs"];
+
+#[test]
+fn an_alias_for_the_internal_event_is_rejected() {
+    // Mutation probes. Each is an escape that the impl sweeps alone cannot see, because the
+    // impl's self type is not spelled `AdaptiveEvent`.
+    for (label, source) in [
+        (
+            "a bare local alias plus a serde impl on it",
+            "type Ev = AdaptiveEvent;\nimpl serde::Serialize for Ev {}\n",
+        ),
+        (
+            "an alias written through the module path",
+            "type Ev = crate::producers::event::AdaptiveEvent;\n",
+        ),
+        (
+            "an alias reached through super",
+            "mod wire {\n    type Ev = super::AdaptiveEvent;\n}\n",
+        ),
+        (
+            "a renamed import",
+            "use crate::producers::event::AdaptiveEvent as Ev;\n",
+        ),
+        (
+            "a renamed import inside a grouped use tree",
+            "use crate::producers::event::{AdaptiveEvent as Ev, ProducerKey};\n",
+        ),
+        (
+            "an alias declared inside a nested module",
+            "mod outer {\n    mod inner {\n        type Ev = crate::producers::event::AdaptiveEvent;\n    }\n}\n",
+        ),
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            !adaptive_event_aliases(&file).is_empty(),
+            "{label}: an alias for the internal event went unreported:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn a_type_that_merely_resembles_the_internal_event_is_not_rejected() {
+    // Near misses, so the prohibition cannot be satisfied by being indiscriminate.
+    for (label, source) in [
+        (
+            "a prefix-sharing type name",
+            "type Ev = AdaptiveEventLog;\n",
+        ),
+        (
+            "an import with no rename",
+            "use crate::producers::event::AdaptiveEvent;\n",
+        ),
+        (
+            "an unrelated alias",
+            "type Zones = std::collections::BTreeMap<String, Zone>;\n",
+        ),
+        (
+            "a rename of something else entirely",
+            "use serde::Serialize as S;\n",
+        ),
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            adaptive_event_aliases(&file).is_empty(),
+            "{label}: the alias prohibition over-reached: {:?}\n{source}",
+            adaptive_event_aliases(&file)
+        );
+    }
+}
+
+#[test]
+fn lint_no_source_aliases_the_internal_event() {
+    let mut violations = Vec::new();
+    let mut swept = 0usize;
+    for (path, text) in rust_sources_under("src") {
+        swept += 1;
+        let file = parse_source(&path, &text);
+        for alias in adaptive_event_aliases(&file) {
+            violations.push(format!("{path}: {alias}"));
+        }
+    }
+    assert!(
+        swept > 50,
+        "the sweep covered only {swept} files, which means it is not walking src/"
+    );
+    assert!(
+        violations.is_empty(),
+        "{ADAPTIVE_EVENT} is reachable under a second name, which defeats every impl and \
+         reference lint at once: {violations:?}\nName it directly, or extend the impl sweeps to \
+         follow the alias before allowing one."
+    );
+}
+
+#[test]
+fn a_root_reexport_of_a_forbidden_type_is_rejected() {
+    // The other half. These live in a file both reference sweeps skip, so nothing else looks.
+    for (label, source) in [
+        (
+            "a renamed pub use of a contract type",
+            "pub use crate::adaptive::ProducerDocument as Doc;\n",
+        ),
+        (
+            "an un-renamed pub use",
+            "pub use crate::adaptive::ProducerDocument;\n",
+        ),
+        (
+            "a pub(crate) use of the publication layer",
+            "pub(crate) use crate::producers::ProducerAggregator as Agg;\n",
+        ),
+        (
+            "a pub use of a whole forbidden module",
+            "pub use crate::adaptive;\n",
+        ),
+        (
+            "a public type alias",
+            "pub type Doc = crate::adaptive::ProducerDocument;\n",
+        ),
+        (
+            "a re-export nested in a public shim module",
+            "pub mod shim {\n    pub use crate::adaptive::ProducerDocument as D;\n}\n",
+        ),
+        (
+            "a grouped re-export hiding one forbidden leaf",
+            "pub use crate::{bus::BusEvent, adaptive::ProducerDocument as D};\n",
+        ),
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            !root_launderings(&file).is_empty(),
+            "{label}: a root re-export laundered a forbidden type:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn a_root_use_that_launders_nothing_is_not_rejected() {
+    for (label, source) in [
+        (
+            "a private use, which no other module can reach",
+            "use crate::producers::ProducerAggregator;\n",
+        ),
+        (
+            "a public re-export of an unrelated module",
+            "pub use crate::bus::BusEvent;\n",
+        ),
+        (
+            "a prefix-sharing sibling module",
+            "pub use crate::adaptive_extras::Helper;\n",
+        ),
+        (
+            "a public alias of an unrelated type",
+            "pub type Zones = crate::bus::ZoneMap;\n",
+        ),
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            root_launderings(&file).is_empty(),
+            "{label}: the re-export prohibition over-reached: {:?}\n{source}",
+            root_launderings(&file)
+        );
+    }
+}
+
+#[test]
+fn the_impl_sweep_alone_is_blind_to_an_aliased_serde_impl() {
+    // The reason the prohibition exists rather than an extension of `trait_impls_for`, kept as
+    // an executable statement rather than a claim in a comment. If `trait_impls_for` ever
+    // learns to resolve aliases, this fails and the prohibition can be reconsidered - which is
+    // the right way for that decision to come back up.
+    let source = "type Ev = AdaptiveEvent;\nimpl serde::Serialize for Ev {}\n";
+    let file = parse_source("probe.rs", source);
+    assert!(
+        trait_impls_for(&file, ADAPTIVE_EVENT).is_empty(),
+        "trait_impls_for now sees through an alias, so the alias prohibition may be redundant"
+    );
+    assert!(
+        !adaptive_event_aliases(&file).is_empty(),
+        "an escape no other lint can see must be caught by the alias prohibition"
+    );
+}
+
+#[test]
+fn the_reference_sweep_alone_is_blind_to_a_laundered_root_reexport() {
+    // The surface half of the escape: `crate::Doc` names neither forbidden module, so the
+    // sweep over `src/` has nothing to report even though this is a contract type in a
+    // serializable position.
+    let surface = parse_source("probe.rs", "use crate::Doc;\nfn f(d: Doc) -> Doc { d }\n");
+    assert!(
+        forbidden_module_references(&surface, module_depth("src/api/mod.rs")).is_empty(),
+        "the reference sweep now resolves a laundered alias, so the root prohibition may be \
+         redundant"
+    );
+    // Which is why it has to be stopped where it is created.
+    let root = parse_source(
+        "src/lib.rs",
+        "pub use crate::adaptive::ProducerDocument as Doc;\n",
+    );
+    assert!(
+        !root_launderings(&root).is_empty(),
+        "the escape must be caught at the root that creates the name"
+    );
+}
+
+#[test]
+fn lint_the_composition_root_launders_no_forbidden_type() {
+    let mut violations = Vec::new();
+    let mut checked = 0usize;
+    for path in ROOT_FILES {
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        checked += 1;
+        let file = parse_source(path, &text);
+        for laundering in root_launderings(&file) {
+            violations.push(format!("{path}: {laundering}"));
+        }
+    }
+    assert_eq!(
+        checked,
+        ROOT_FILES.len(),
+        "a composition root named in ROOT_FILES was not found, so this lint checked {checked} \
+         of {} files and would pass by reading nothing",
+        ROOT_FILES.len()
+    );
+    assert!(
+        violations.is_empty(),
+        "a crate root re-exports a contract or publication type under a name the reference \
+         sweeps cannot see: {violations:?}\nThe roots are exempt from those sweeps precisely \
+         because they must name these modules to wire them; that exemption does not extend to \
+         handing the names onward."
+    );
+}
+
+#[test]
+fn red_alias_prohibition_sees_through_non_path_type_syntax() {
+    // The alias checker matched only `Type::Path`, so any wrapping syntax slipped past it and
+    // took the impl sweep with it - the impl's self type is then not spelled `AdaptiveEvent`.
+    for (label, source) in [
+        (
+            "a parenthesised alias",
+            "type Ev = (AdaptiveEvent);\nimpl serde::Serialize for Ev {}\n",
+        ),
+        (
+            "a doubly parenthesised alias",
+            "type Ev = ((AdaptiveEvent));\n",
+        ),
+        (
+            "the event as a generic argument",
+            "type Ev = Box<AdaptiveEvent>;\n",
+        ),
+        (
+            "the event inside a nested generic argument",
+            "type Ev = Result<Vec<AdaptiveEvent>, ()>;\n",
+        ),
+        (
+            "the event behind a reference",
+            "type Ev = &'static AdaptiveEvent;\n",
+        ),
+        ("the event in a tuple", "type Ev = (AdaptiveEvent, u8);\n"),
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            !adaptive_event_aliases(&file).is_empty(),
+            "{label}: an alias for the internal event went unreported:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn red_root_laundering_covers_exported_function_signatures() {
+    // The root exemption also covers `pub fn`, which the checker never looked at: a public
+    // function whose signature names a contract type hands it to any surface that calls it,
+    // and the reference sweeps skip the roots entirely.
+    for (label, source) in [
+        (
+            "a public function returning a contract type",
+            "pub fn leak() -> crate::adaptive::ProducerDocument { todo!() }\n",
+        ),
+        (
+            "a public function taking one",
+            "pub fn sink(d: crate::adaptive::ProducerDocument) {}\n",
+        ),
+        (
+            "a public function returning the publication layer",
+            "pub fn agg() -> crate::producers::ProducerAggregator { todo!() }\n",
+        ),
+        (
+            "a public function returning it wrapped",
+            "pub fn maybe() -> Option<crate::adaptive::ProducerDocument> { None }\n",
+        ),
+        (
+            "a public const",
+            "pub const D: crate::adaptive::ProducerDocument = todo!();\n",
+        ),
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            !root_launderings(&file).is_empty(),
+            "{label}: a root laundered a forbidden type through a signature:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn red_root_laundering_resolves_private_alias_chains_in_exported_signatures() {
+    for (label, source) in [
+        (
+            "a private alias returned publicly",
+            "type Hidden = crate::adaptive::ProducerDocument; pub fn leak() -> Hidden { todo!() }\n",
+        ),
+        (
+            "a transitive private alias returned publicly",
+            "type Hidden = crate::adaptive::ProducerDocument; type MoreHidden = Option<Hidden>; pub fn leak() -> MoreHidden { todo!() }\n",
+        ),
+        (
+            "a private publication alias in a public field",
+            "type Hidden = crate::producers::ProducerSnapshot; pub struct Envelope { pub value: Hidden }\n",
+        ),
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            !root_launderings(&file).is_empty(),
+            "{label}: a private alias laundered a forbidden type:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn red_root_laundering_resolves_private_import_aliases_and_shadowing() {
+    for (label, source) in [
+        (
+            "a private import alias returned publicly",
+            "use crate::adaptive::ProducerDocument as Hidden; pub fn leak() -> Hidden { todo!() }\n",
+        ),
+        (
+            "a private import without rename returned publicly",
+            "use crate::adaptive::ProducerDocument; pub fn leak() -> ProducerDocument { todo!() }\n",
+        ),
+        (
+            "a nested benign alias cannot overwrite a forbidden root alias",
+            "type Hidden = crate::adaptive::ProducerDocument; mod nested { type Hidden = u8; } pub fn leak() -> Hidden { todo!() }\n",
+        ),
+        (
+            "a private forbidden glob feeding a public signature",
+            "use crate::adaptive::*; pub fn leak() -> ProducerDocument { todo!() }\n",
+        ),
+        (
+            "a transitive private module alias feeding a public signature",
+            "use crate::adaptive as hidden; use hidden::ProducerDocument as Doc; pub fn leak() -> Doc { todo!() }\n",
+        ),
+        (
+            "a public re-export through a private module alias",
+            "use crate::adaptive as hidden; pub use hidden::ProducerDocument;\n",
+        ),
+        (
+            "a private glob through a private module alias",
+            "use crate::adaptive as hidden; use hidden::*; pub fn leak() -> ProducerDocument { todo!() }\n",
+        ),
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            !root_launderings(&file).is_empty(),
+            "{label}: a private binding laundered a forbidden type:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn red_root_laundering_prohibits_exported_macros_in_exempt_roots() {
+    for source in [
+        "#[macro_export] macro_rules! leak { () => { crate::adaptive::ProducerDocument } }\n",
+        "macro_rules! leak { () => { crate::adaptive::ProducerDocument } } pub(crate) use leak;\n",
+        "macro_rules! leak { () => { pub fn leak() -> crate::adaptive::ProducerDocument { todo!() } } } leak!();\n",
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            !root_launderings(&file).is_empty(),
+            "an exported macro could launder an arbitrary forbidden path:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn red_root_laundering_covers_exported_aggregate_and_method_signatures() {
+    for (label, source) in [
+        (
+            "a public tuple-struct field",
+            "pub struct Envelope(pub crate::adaptive::ProducerDocument);\n",
+        ),
+        (
+            "a public named struct field",
+            "pub struct Envelope { pub doc: crate::adaptive::ProducerDocument }\n",
+        ),
+        (
+            "a public enum payload",
+            "pub enum Message { Document(crate::adaptive::ProducerDocument) }\n",
+        ),
+        (
+            "a public trait method",
+            "pub trait Source { fn document(&self) -> crate::adaptive::ProducerDocument; }\n",
+        ),
+        (
+            "a public inherent method",
+            "pub struct Root; impl Root { pub fn document(&self) -> crate::adaptive::ProducerDocument { todo!() } }\n",
+        ),
+        (
+            "a public union field",
+            "pub union Envelope { pub doc: std::mem::ManuallyDrop<crate::adaptive::ProducerDocument> }\n",
+        ),
+        (
+            "a public trait associated const",
+            "pub trait Source { const DOCUMENT: crate::adaptive::ProducerDocument; }\n",
+        ),
+        (
+            "a public trait associated type default",
+            "pub trait Source { type Document = crate::adaptive::ProducerDocument; }\n",
+        ),
+        (
+            "a trait impl associated type",
+            "pub struct Root; impl Iterator for Root { type Item = crate::adaptive::ProducerDocument; fn next(&mut self) -> Option<Self::Item> { None } }\n",
+        ),
+        (
+            "a public function where-clause",
+            "pub fn leak<T>() where T: Iterator<Item = crate::adaptive::ProducerDocument> {}\n",
+        ),
+        (
+            "a public trait supertrait bound",
+            "pub trait Source: Iterator<Item = crate::adaptive::ProducerDocument> {}\n",
+        ),
+        (
+            "a public associated-type bound without a default",
+            "pub trait Source { type Documents: Iterator<Item = crate::adaptive::ProducerDocument>; }\n",
+        ),
+        (
+            "a root trait impl on a forbidden publication type",
+            "impl serde::Serialize for crate::producers::ProducerSnapshot { fn serialize<S>(&self, _: S) -> Result<S::Ok, S::Error> where S: serde::Serializer { todo!() } }\n",
+        ),
+        (
+            "a root impl on a private forbidden alias",
+            "type Hidden = crate::producers::ProducerSnapshot; impl Hidden { pub fn leak(&self) {} }\n",
+        ),
+        (
+            "an impl-level where-clause",
+            "pub struct Root<T>(T); impl<T> Root<T> where T: Iterator<Item = crate::adaptive::ProducerDocument> { pub fn ok(&self) {} }\n",
+        ),
+        (
+            "an exported foreign function",
+            "unsafe extern \"Rust\" { pub fn leak() -> crate::adaptive::ProducerDocument; }\n",
+        ),
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            !root_launderings(&file).is_empty(),
+            "{label}: a root laundered a forbidden type through an exported aggregate or method:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn red_root_laundering_still_ignores_innocent_signatures() {
+    for (label, source) in [
+        (
+            "a private function naming a forbidden type",
+            "fn wire() -> crate::producers::ProducerAggregator { todo!() }\n",
+        ),
+        (
+            "a public function over unrelated types",
+            "pub fn zones() -> Vec<crate::bus::Zone> { vec![] }\n",
+        ),
+        (
+            "a prefix-sharing sibling module",
+            "pub fn helper() -> crate::adaptive_extras::Helper { todo!() }\n",
+        ),
+    ] {
+        let file = parse_source("probe.rs", source);
+        assert!(
+            root_launderings(&file).is_empty(),
+            "{label}: the root prohibition over-reached: {:?}\n{source}",
+            root_launderings(&file)
+        );
+    }
+}
+
+#[test]
+fn every_adaptive_timestamp_field_is_in_the_admission_validation_ledger() {
+    #[derive(Default)]
+    struct TimestampFieldVisitor {
+        fields: std::collections::BTreeSet<String>,
+    }
+    impl<'ast> Visit<'ast> for TimestampFieldVisitor {
+        fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+            for (index, field) in item.fields.iter().enumerate() {
+                if type_tail_is(&field.ty, "Timestamp") {
+                    let field_name = field
+                        .ident
+                        .as_ref()
+                        .map_or_else(|| index.to_string(), ToString::to_string);
+                    self.fields.insert(format!("{}.{field_name}", item.ident));
+                }
+            }
+            visit::visit_item_struct(self, item);
+        }
+    }
+
+    let sources = rust_sources_under("src/adaptive");
+    assert!(!sources.is_empty(), "no adaptive sources were inspected");
+    let mut visitor = TimestampFieldVisitor::default();
+    for (path, source) in sources {
+        visitor.visit_file(&parse_source(&path, &source));
+    }
+    let expected = std::collections::BTreeSet::from([
+        "ChangeSet.created_at".to_string(),
+        "ChangeSet.updated_at".to_string(),
+        "Divergence.detected_at".to_string(),
+        "Freshness.observed_at".to_string(),
+        "LaneHealth.last_success".to_string(),
+        "OutcomeTransition.at".to_string(),
+        "Retention.expires_at".to_string(),
+    ]);
+    assert_eq!(
+        visitor.fields, expected,
+        "Timestamp fields changed; add admission validation and a malformed-value counterexample before updating this ledger"
+    );
+}
+
+#[test]
+fn lint_the_run_module_stays_serialization_free_and_std_only() {
+    // `AdapterRunId` and `PublicationOrigin` are stamped onto every ingress `AdaptiveEvent`, so
+    // they are now part of the internal bus's payload shape. The event enum's own guarantee -
+    // that it cannot reach a wire - is only as strong as the types it carries, and none of the
+    // allowlists above look at this file. Held to the same rule: no serde, and nothing from
+    // outside `std`, so a serialization trait cannot arrive as a transitive dependency either.
+    let path = "src/producers/run.rs";
+    let file = parse_file_at(path);
+
+    let foreign: Vec<String> = imports_of(&file)
+        .into_iter()
+        .filter(|import| !import.starts_with("std::"))
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "{path} imports something outside std: {foreign:?}\nTypes carried by AdaptiveEvent must \
+         stay as unserializable as the event itself."
+    );
+
+    let mut serializable = Vec::new();
+    for item in &file.items {
+        let (name, attrs) = match item {
+            Item::Struct(inner) => (inner.ident.to_string(), &inner.attrs),
+            Item::Enum(inner) => (inner.ident.to_string(), &inner.attrs),
+            _ => continue,
+        };
+        for derive in derives_in(attrs) {
+            if derive.contains("Serialize") || derive.contains("Deserialize") {
+                serializable.push(format!("derive({derive}) on {name}"));
+            }
+        }
+    }
+    assert!(
+        serializable.is_empty(),
+        "{path} derives serde for a type the internal bus carries: {serializable:?}"
+    );
+    assert!(
+        !file.items.is_empty(),
+        "no items were found at all, which means the parse is not reaching {path}"
     );
 }
 

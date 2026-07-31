@@ -10,7 +10,8 @@
 //! consumable by any HTTP client, ESP32 firmware included. Putting a producer document in
 //! that enum would be a response-schema change to a public endpoint *and* publication of
 //! the v1 contract outside this repository. #324 is scoped to do neither, so producer
-//! lifecycle rides a separate internal [`AdaptiveBus`] whose event type derives no serde.
+//! lifecycle rides a bounded actor command channel. Its optional admitted/refused notification
+//! channel derives no serde and never carries ingress state.
 //!
 //! ## Why the aggregator is a gate rather than a store
 //!
@@ -45,12 +46,28 @@
 //!   intent the user never staged. Demotion lowers validity and touches nothing else.
 
 pub mod admission;
-pub mod aggregator;
+mod aggregator;
 pub mod event;
+pub mod run;
+pub mod runtime;
 
 pub use admission::{
     admit, Admission, AdmissionKind, AdmissionRefusal, AdmittedDocument, IntentRepair, LaneDefect,
     ProducerKey, CONTROL_REMOVED_TEXT_KEY,
 };
-pub use aggregator::{LaneWitness, ProducerAggregator, ProducerPresence, ProducerSnapshot};
-pub use event::{create_adaptive_bus, AdaptiveBus, AdaptiveEvent, SharedAdaptiveBus};
+/// Debug-profile compatibility seam for the direct integration-test harness.
+///
+/// This is intentionally broader than `cfg(test)`: integration tests compile the library as a
+/// dependency and therefore cannot see library `cfg(test)` items. Ordinary debug builds expose
+/// the seam; release builds expose adaptive mutation only through the actor. Do not treat a
+/// debug profile as an actor-boundary proof.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use aggregator::ProducerAggregator;
+pub use aggregator::{LaneWitness, ProducerPresence, ProducerSnapshot};
+pub use event::AdaptiveEvent;
+pub use run::{AdapterRun, AdapterRunId, AdapterRuns, PublicationOrigin};
+pub use runtime::{
+    AdaptiveHandle, AdaptivePublishError, AdaptiveRuntime, AdaptiveRuntimeClosed, AdaptiveView,
+    ProducerActor, RetirementOutcome,
+};

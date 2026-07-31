@@ -145,6 +145,11 @@ Two constraints come from that reading rather than from the issue text, and both
 
 ### Recommendation
 
+> **Historical revision 1 — withdrawn.** The separate-broadcast-bus recommendation and its
+> lifecycle decisions below are retained only as the audit trail for why revision 2 was
+> necessary. They are not current design requirements. The authoritative recommendation,
+> decisions, and invariants begin at **“Solution Space — revision 2.”**
+
 **Selected:** Option D — separate internal `AdaptiveBus`, aggregator as sole admission gate
 **Level:** Reframe
 
@@ -166,7 +171,8 @@ out of `admit()`, because no other object of that type exists in the process.
 
 ### The decisions this issue must make explicitly
 
-Five, each recorded here because "an ADR paragraph is not an owner".
+Seven, each recorded here because "an ADR paragraph is not an owner". Decisions 6 and 7 were
+added after dissent review on PR #363.
 
 **1. C1/C2 incoherence → demote, never refuse, never fabricate.**
 
@@ -223,6 +229,80 @@ enforcement would be defence in depth, and is only worth taking if it does not d
 This discharges the obligation `fdc1ca4` recorded at the field, and it can only be done
 here: the prefix vocabulary lives in the server-only bus module, which the shared contract
 layer may not name.
+
+**6. Three more published-and-unapplied invariants. Decision: refuse.**
+
+The same defect class as decision 3 — *the contract published a rule and no code path applied
+it* — found in three more places by dissent review on #363.
+
+| Invariant | Refusal | Why refuse rather than repair |
+|---|---|---|
+| A control publishes one value lane twice | `DuplicateValueLane` | One lane is one reading. Two `desired` lanes make "the staged value" ambiguous, and because `effective_view` resolves a single lane, C1 could be satisfied by one and contradicted by the other in the same document. Picking one invents a disambiguation the producer never made. |
+| The document publishes health for one transport lane twice | `DuplicateLaneHealth` | `LaneWitness` is keyed by lane, so a duplicate is not redundant but unrepresentable. Folding it would silently keep whichever entry came last in a `Vec`. |
+| `Availability` is not well formed | `AvailabilityNotWellFormed` | A consumer that can see "not usable" but not why cannot explain itself, and the user cannot escape the state that caused it. Inventing a reason tells the user something no producer said. |
+| `LaneHealth.last_success` is not RFC 3339 | `LaneTimestampNotRfc3339` | `Timestamp` documents itself as RFC 3339 and every freshness judgement has to parse it. An unparseable value is not a degraded reading but no reading, and admitting one puts a string no consumer can interpret where one it can is expected. Refused on the *first* document too: there is no predecessor to fall back on, so the alternatives are publishing garbage or silently blanking a field, and blanking hides a producer bug only its author can fix. |
+
+**Unrecognized vocabulary members are held to all of these.** Forward compatibility means an
+unknown member stays *representable* — the control is kept, its observed value is kept, the
+unknown state passes through unnormalized — not that structural invariants lapse when a name is
+unfamiliar. An unknown availability state is precisely where a reason matters most, because a
+consumer cannot even fall back on knowing what the state means. This is a narrower reading than
+decision 3 takes of `LaneValue::is_consistent`, and the difference is real rather than an
+inconsistency: that predicate returns `false` *because of* an unrecognized grounding, so
+applying it would refuse a document for using a newer vocabulary, whereas these turn only on
+shapes every version agrees about.
+
+**7. Adapter lifecycle is settled by internal run identity, never by the public bus.**
+
+`crate::bus::BusEvent` and `AdaptiveEvent` are independent broadcast channels drained by one
+`select!` that imposes no order between them. So this interleaving is unremarkable: run *N*
+publishes a document; it sits unread in the adaptive channel; `AdapterStopping` then
+`AdapterConnected` are both processed from the public channel; only then is the document read
+and admitted as current. **Any scheme that treats a public-bus event as the "everything before
+this is stale" marker is defeated by that ordering** — including an epoch tombstone cleared on
+reconnect, which the reconnect disarms before the straggler it exists to stop arrives. The
+mirror case breaks too: a delayed `AdapterStopping` from run *N*, read after run *N+1* has begun
+publishing, would flush a live run's producers.
+
+So identity is carried *in the event* and allocated **synchronously**:
+
+* `AdapterRuns::begin` takes a lock, allocates a monotonic `AdapterRunId`, and records it as
+  that adapter's live run **before returning** — so "run *N+1* is live" is already true before
+  run *N+1* publishes anything.
+* Every ingress `AdaptiveEvent` carries a `PublicationOrigin { adapter, run }`. Publications and
+  removals from a run that is not live are refused (`StaleAdapterRun`) or ignored, however long
+  they sat in a channel and whatever else was processed meanwhile.
+* **Withdrawn:** `AdapterStopping` was treated as a hint that triggered a sweep. Revision 2
+  proved even that destructive sweep unnecessary and unsafe as a source of state removal.
+  Stop events are now informational; ended-run snapshots project `LastKnown`, and only an
+  explicit producer retirement removes state.
+* Ordering therefore comes from a counter under a lock, not from the relative delivery order of
+  two channels — the one thing this design cannot assume.
+
+**Run identity is not producer epoch, and the two lifecycles stay apart.**
+
+| | Whose | Meaning |
+|---|---|---|
+| `AdapterRunId` | ours | one connection attempt by one adapter in this process |
+| `ProducerEpoch` | the producer's | its own restart counter, which only it can bump |
+
+An adapter reconnecting to an unchanged engine is a **new run at the same epoch and must be able
+to republish** — so adapter lifecycle never writes an epoch bar, which is what stranded that
+case. A new run's first publication also *supersedes* the previous run's snapshot rather than
+being ordered against it, because an ended run's view is no longer evidence of anything and
+comparing revisions across the boundary would refuse a reconnect that legitimately sees a lower
+counter. Lane witnesses survive: those are aggregator-observed and belong to the lane, not to our
+connection.
+
+An explicit `ProducerRemoved` is the *other* lifecycle and keeps its own rule: the producer said
+it is gone, so only the producer can contradict that, with a strictly higher `ProducerEpoch`. No
+adapter reconnect clears it.
+
+**Residual, recorded rather than mitigated.** An adapter that dies without ending its run leaves
+that run live, so its stragglers stay admissible until something begins a new run for the same
+adapter — `begin` supersedes unconditionally, so one reconnect is enough. Already-admitted
+producers of a crashed adapter linger until a stop hint or a new run arrives; nothing times them
+out, because the aggregator holds no clock.
 
 ### The reshaping window — decision, not deferral
 
@@ -498,14 +578,178 @@ Five mutations, each verified to have applied first: stop recursing into `cfg_at
 the derive allowlist; drop `UseTree::Rename`; accept `any(...)` as a server gate; swallow
 parse errors. Each is detected.
 
+## Solution Space: lifecycle soundness (revision 2)
+**Updated:** 2026-07-31
+**Supersedes:** the `AdapterStopping`/`AdapterConnected` tombstone lifecycle recorded in
+decision 7 above. That design is withdrawn, not amended.
+
+**Problem:** aggregator-owned adaptive state must be non-regressing, non-resurrectable,
+lifecycle-correct and recoverable under concurrency, crash/cancel, reconnect and
+bounded-channel lag — with `BusEvent`/HTTP frozen and unadmitted documents internal.
+
+**Key constraint:** lifecycle authority was distributed across two independent async channels
+plus a lock-free registry, and every decision read state at a moment unrelated to when it
+acted. No patch to a *rule* fixes that; it is a shape problem.
+
+### Root causes behind the nine dissent findings
+
+| Root cause | Findings |
+|---|---|
+| **R1. Decision and mutation are not atomic** — registry `Mutex` and store `RwLock` are separate; liveness is checked before `store.write().await` | 1, 7 |
+| **R2. Lifecycle facts travel as lossy, unordered, under-addressed events** — `broadcast` drops on lag; two channels have no mutual order; retirement carries no key or epoch. Documents survive loss (idempotent snapshots); *transitions* do not | 3, 5 |
+| **R3. Ownership and ordering are inferred, not recorded** — cleanup string-matches `producer_type`/id prefix; refusals carry no origin; a new run discards ordering instead of rebasing it; dead runs are never reaped and presence trusts the producer's own flag | 2, 4, 6 |
+| **R4. Validation coverage is incomplete** — orthogonal to lifecycle, needed under every candidate | 8, 9 |
+
+Two reframes drove the candidate set. **Commands are not notifications:** publish and retire
+must not be lost, must be ordered, and deserve a verdict; admitted/refused are fan-out and
+losing one is harmless because a reader can re-read. One lossy fan-out carried both, and that
+conflation *is* R2. **Watermarks, not tombstones:** a tombstone is a negative record you must
+remember and can fail to create (finding 5); a monotonic watermark keyed on producer identity
+makes resurrection unrepresentable, covers keys never seen, and survives reconnect because it
+is not keyed on the adapter run.
+
+### Candidates Considered
+
+| Option | Level | Approach | Trade-off |
+|---|---|---|---|
+| A | Local Optimum | Atomic run-registry/store locking; explicit rebase rule replacing `previous = None` | Closes R1 and finding 2; R2/R3 untouched; lock discipline is an unenforceable convention |
+| B | Reframe | Single-consumer bounded mpsc command ingress; `broadcast` for admitted/refused egress only | Backpressure replaces loss; needs a queue policy per command kind |
+| C | Reframe | Synchronous aggregator command API; adapters await a verdict | Inverts the adapter→aggregator dependency the architecture forbids |
+| D | Redesign | Durable journal, per-run sequence, replay | Gap detection and restart recovery; introduces persistence #327 owns |
+| E | Redesign | Single-writer actor, bounded mpsc inbox with oneshot replies, watermark ledger keyed on producer identity, RAII run leases, read-only snapshot handle, lossy egress broadcast | Largest change; read projection still needs a short shared lock, while mutation authority stays with one actor |
+
+### Evaluation
+
+**A — atomic locking.** Partial. Closes findings 1, 7 and (with a rebase rule) 2; leaves 3, 4,
+5, 6. "Never check liveness outside the store lock" is not expressible in the type system, so
+the next inserted `.await` silently reopens finding 1. Couples publication throughput to
+lifecycle churn. Subsumed by E.
+
+**B — bounded mpsc ingress.** Substantial. One consumer means no concurrent mutation, so R1
+dissolves rather than being guarded; bounded mpsc replaces loss with backpressure (finding 3);
+total ingress order removes the "two channels, no mutual order" premise, so `AdapterStopping`
+can stop being an input. Needs an explicit per-kind queue policy. Does not by itself fix 2, 4,
+5, 6.
+
+**C — synchronous command API.** Mechanically sufficient, disqualified on dependency direction:
+adapters would hold the aggregator, which `docs/ARCHITECTURE.md` and `AGENTS.md` forbid — this
+is Option E of the original analysis, rejected then for the same reason. It also serialises
+adapter poll loops against the aggregator. Its one desirable half — a synchronous verdict — is
+recoverable inside E via a oneshot reply, because the publisher then holds only a sender.
+
+**D — journal + sequence + replay.** Right answer to a question #324 was not asked. Durability
+is #327's, and a journal breaks #324's cleanly-revertible property ("a plain revert; no data
+migration, nothing persists a producer document"). The journal and explicit per-run sequence
+remain deferred together; the bounded inbox provides the in-process order #324 requires.
+
+**E — actor + watermark ledger + RAII leases.** Addresses R1, R2 and R3 as one shape rather
+than three patch sets: exclusive write ownership plus one run/store linearization guard kills both TOCTOU classes; bounded lossless inbox
+kills finding 3; a watermark ledger outliving snapshots kills 2 and 5 including unseen keys;
+recorded origins kill 6 and 7's refusal clearing; RAII leases plus read-time presence kill 4.
+Cost: the read path becomes a snapshot handle backed by a short read lock, which is an API
+decision for #326 rather than an implementation detail.
+
+### Recommendation
+
+**Selected:** Option **E**, absorbing A's atomicity through an explicit run/store guard, B's
+channel split as its ingress, and C's oneshot verdict as an option on commands. D's journal and
+sequence layer remain deferred with durability to #327.
+**Level:** Redesign.
+
+Seven of nine findings are consequences of three structural facts. Patching them individually
+is what produced the withdrawn design: each fix was locally correct and the composition was
+not. A single writer plus a guard held from liveness decision through store commit makes the
+check/act race unrepresentable; a watermark ledger makes resurrection unrepresentable; recorded
+origins make ownership a fact rather than a guess.
+
+**Accepted trade-offs.** The read path changes shape. Watermarks grow with distinct producer
+identities and nothing evicts them within a process. Backpressure becomes observable to
+publishers — the correct failure mode, but a new one. RAII covers cancel, task abort, and
+panic-unwind, but not `mem::forget`, process abort, or `panic = "abort"`; unconditional
+supersession on `begin` stays as the backstop.
+
+### Decisions fixed for #324 (owner-confirmed)
+
+1. Publishers **may await** bounded backpressure.
+2. **No document coalescing.** Every ingress command is lossless and ordered.
+3. Retirement is scoped `producer_id` + `epoch` + `origin` and **must cover unseen keys**.
+   The explicit epoch is the sole new retirement authority: rejected documents identify keys
+   to clear but their claimed epochs never raise a floor.
+4. Watermarks stay **in memory**; durable journal/replay deferred to **#327**.
+5. `AdapterStopping` is **not** an authoritative ingress path — run leases are. Ended runs
+   remain visible as `LastKnown`; only explicit producer retirement removes snapshots.
+6. Presence **degrades to `LastKnown`** whenever the admitting run is no longer live.
+7. Reads go through a **read-only snapshot/watch handle**, not synchronous aggregator calls.
+8. Frozen `BusEvent`/HTTP/API contracts maintained.
+
+### Invariants
+
+- **I1 Serialization.** No `.await` between reading lifecycle state and committing the mutation
+  it authorises. One actor owns ingress writes, and the run guard remains held through the
+  synchronous store mutation; read projections acquire locks in the same run-then-store order.
+- **I2 Watermark monotonicity.** Per key, `high_(epoch, revisions)` and
+  `retired_through_epoch` never decrease — including across explicit retirement. A refused
+  document changes neither; the applied retirement floor is the explicit request or a higher
+  floor already retained, and egress reports that applied value.
+- **I3 No resurrection.** Admitted only if `epoch > retired_through_epoch` **and**
+  `(epoch, revisions)` does not regress against the watermark — regardless of run, and
+  regardless of whether the key was ever seen. Retirement through epoch *N* removes only
+  snapshots and diagnostics at epoch *N* or lower; a newer admitted restart remains visible.
+- **I4 Run authority has an explicit linearization point.** Publications are checked against
+  run liveness in the same synchronous turn as store mutation. Retirement reserves bounded
+  capacity and commits authority while the lease is live; once committed, dropping the lease
+  cannot revoke the queued retirement. A stale lease returns `StaleAdapterRun` before enqueue.
+- **I5 Ownership enforced at the trusted internal namespace boundary.** Every
+  publication/retirement must use an allocator-issued live lease whose adapter matches the
+  producer-id namespace. Origins cannot be synthesized through the public API; a wrong-owner
+  command failure is returned/emitted but never occupies the producer's retained document-
+  refusal slot. No cleanup path matches `producer_type`, and the adapter/producer prefix
+  convention remains trusted internal input.
+- **I6 Retirement is total and lossless through its floor.** Retiring *P* through epoch *N*
+  removes every known key/diagnostic of *P* at *N* or lower and installs a producer-wide floor
+  covering unseen keys, without removing a newer restart. It cannot be dropped by channel
+  pressure and returns an explicit committed, applied, or stale-run outcome.
+- **I7 Command losslessness.** No ingress command is dropped. A non-lossy cancellation token
+  closes ingress only after producing adapters stop, then drains accepted commands before the
+  composition root joins the actor. SSE uses a separate early-cancellation token. Wrong-owner
+  commands fail synchronously before queueing (including detached publication), so they never
+  depend on a lossy hint. Only state-change egress notifications may be lost; consumers recover
+  by re-reading the view.
+- **I8 Presence honesty.** `Live` only if the admitting run is live, evaluated at read time so
+  it does not depend on a cleanup command having been delivered.
+- **I9 Timestamp validity.** Every `Timestamp` in an admitted document parses as RFC 3339 —
+  all fields, not only `LaneHealth.last_success`.
+- **I10 Alias closure.** No second name for internal-event types under any type syntax, and no
+  exported root function, const/static, struct/union field, enum payload, trait associated
+  item, trait/impl/generic bound, inherent-method signature, private type/import alias chain,
+  forbidden glob, impl target, or exported/re-exported macro can launder contract/publication
+  types.
+
+### Unresolved assumptions
+
+- Watermarks are unevicted within a process. Fine for #324; revisit jointly with #327 if they
+  must survive restart.
+- Retirement is producer-scoped, so it cannot retire one target of a multi-target producer.
+  Target-granular retirement remains deferred to #325.
+- Presence degradation on a dead run is a semantic #326's consumers have not been told about.
+- `AdapterStopping` is informational only. Last-known snapshots remain until explicit producer
+  retirement; that retirement emits an egress invalidation hint.
+- Direct aggregator helpers remain available in ordinary **debug-profile** builds because Rust
+  integration tests compile the library as a dependency and do not activate its `cfg(test)`.
+  This is an explicit compatibility seam, not a test-only claim. Release builds structurally
+  omit the re-export and direct methods; the actor-only guarantee is a release-artifact
+  guarantee. `cargo test --release --test adaptive_publication` consequently does not compile,
+  while the release library/application check does.
+
 ## Ship
-**Updated:** 2026-07-30
-**Status:** staged (draft PR, nothing merged, deployed or marked ready)
+**Updated:** 2026-07-31
+**Status:** implementation and local gates green; exact-head review/dissent and push pending;
+draft PR only
 
 **Delivery path.** PR #363 (draft) → base `feat/issue-323-adaptive-producer-contract`
-(PR #362, also draft) → #362 merges to `v3` → #363 retargets to `v3` → CI → maintainer
-review → squash merge. Two hops, because this is a stacked PR and the prerequisite is not
-merged.
+(PR #362, draft/CLEAN) → base `fix/issue-338-rust-1-97-lint` (PR #339, draft) → `v3` →
+retarget each dependent PR as its base merges → CI on the `v3`-targeting hop → maintainer
+review → squash merge. Three stacked hops; neither prerequisite is merged.
 
 **Delivery-path tax, measured rather than guessed:**
 
@@ -520,24 +764,28 @@ merged.
    `tests/fixtures/api_routes.txt` differs from the base. It does not, so the job takes the
    `api_changed=false` branch and reports "No API contract changes detected". No label is
    needed and none must be added.
-3. **A pre-existing `v3` lint failure blocks merge**, not caused here:
-   `src/app/pages/zones.rs:269` trips `clippy::unnecessary_sort_by` on CI's newer
-   toolchain. Owned by #338 ("CI: restore the v3 lint baseline under Rust 1.97"), which is
-   open. #362 hit the same wall.
+3. **The pre-existing `v3` Rust 1.97 lint repair is now the bottom stack.** #338 is represented
+   by draft PR #339 (`fix/issue-338-rust-1-97-lint` → `v3`); #362 currently targets that branch
+   and GitHub reports it CLEAN. This branch still cannot reach `v3` until both prerequisites
+   move.
 4. **`docker.yml` is `master`-only**, so a `v3` merge publishes no image. Release artifacts
    only on tag `v*` or a published release.
-5. **PR #362 is `BLOCKED`** on GitHub's own mergeability check, so the first hop is not
-   currently available regardless of this branch's state.
+5. **The stack, not a merge conflict, is the current gate.** PR #362 is draft/CLEAN, while
+   bottom PR #339 remains draft; no hop is authorized to merge automatically.
 
 **Rollback.** A plain revert. `src/producers/` is referenced from exactly two places outside
 itself — `pub mod producers;` in `src/lib.rs` and the construct-and-spawn in `src/main.rs` —
-and nothing publishes to it, so reverting removes a task that subscribes to two channels and
-waits. No data migration: nothing persists a producer document. The one caveat is
+and nothing publishes to it, so reverting removes the bounded actor and its shutdown
+subscription. No data migration: nothing persists a producer document. The one caveat is
 `ReasonCode::ControlRemoved` and `control_removed_after_advance.json`, which are contract
 surface: reverting those after #325 maps onto them would be a compatibility break, so this
 rollback is clean only while this branch is the tip.
 
-**Verified rather than asserted:** `tests/fixtures/api_routes.txt` byte-identical to
-`origin/v3`; zero `.route(` lines added or removed in `src/main.rs`; `src/api/` and
-`src/bus/` untouched; PR #363 carries no labels; worktree clean; every commit
-forward-only, no force push.
+**Latest local evidence:** the full all-features suite, focused lifecycle 25/25 (also 25/25 in
+the release profile), publication 107/107, contract isolation 57/57,
+`cargo clippy --lib --all-features -- -D warnings`, and
+`cargo check --release --all-features` all pass after the final dissent round.
+`tests/fixtures/api_routes.txt`
+remains byte-identical to `origin/v3`; zero `.route(` lines were added or removed in
+`src/main.rs`; `src/api/` and `src/bus/` are untouched; PR #363 carries no labels. The worktree
+is intentionally dirty until the reviewed checkpoint is committed; no force push is used.
