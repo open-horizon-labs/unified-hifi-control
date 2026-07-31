@@ -351,11 +351,18 @@ impl ServerHandler for HifiMcpHandler {
                 // because it is a separate switch in a separate file (#401).
                 if args.zone_id.starts_with("hqplayer:") {
                     let instance = args.zone_id.trim_start_matches("hqplayer:");
+                    // MCP's own action spelling for an absolute volume write; `dispatch_hqplayer_action`
+                    // keeps exactly the vocabulary #328/#391 already reviewed, so the translation
+                    // happens at this boundary rather than widening the shared core's accepted input.
+                    let hqp_action = match args.action.as_str() {
+                        "volume_set" => "volume",
+                        other => other,
+                    };
                     return match crate::knobs::routes::dispatch_hqplayer_action(
                         &self.state,
                         &args.zone_id,
                         instance,
-                        &args.action,
+                        hqp_action,
                         args.value,
                     )
                     .await

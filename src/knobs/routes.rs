@@ -772,10 +772,7 @@ pub(crate) async fn dispatch_hqplayer_action(
             let target = (f64::from(vc.value) + delta).clamp(f64::from(vc.min), f64::from(vc.max));
             adapter.set_volume_db(quantise_db(target)).await
         }
-        // `volume_set` is MCP's spelling for the same absolute write (`HifiControlTool`'s action
-        // vocabulary predates this zone; accepting it here means one recognized name reaches every
-        // surface instead of forcing a translation at each call site).
-        "vol_abs" | "volume" | "volume_set" => {
+        "vol_abs" | "volume" => {
             let vc = require_volume_control(zone.as_ref())?;
             // SAFETY: no numeric default, in either direction. `unwrap_or(50.0)` on a dB zone means
             // +50 dB, which is above every possible maximum; `unwrap_or(0.0)` means full scale. A
