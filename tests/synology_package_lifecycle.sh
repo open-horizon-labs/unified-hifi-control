@@ -24,6 +24,8 @@ chmod +x "${TEST_ROOT}/target/unified-hifi-control" "${TEST_ROOT}/scripts/start-
 
 docker run --rm \
     --platform "${SYNOLOGY_TEST_PLATFORM:-linux/amd64}" \
+    --env "TEST_HOST_UID=$(id -u)" \
+    --env "TEST_HOST_GID=$(id -g)" \
     --mount "type=bind,source=${TEST_ROOT},target=/var/packages/unified-hifi-control" \
     "$IMAGE" \
     bash -euo pipefail -c '
@@ -73,6 +75,10 @@ docker run --rm \
 
         run_as_package "/var/packages/unified-hifi-control/scripts/preuninst"
         run_as_package "/var/packages/unified-hifi-control/scripts/postuninst"
+
+        # Restore bind-mount ownership so the host-side cleanup trap works on
+        # Linux runners where container UID ownership is preserved.
+        chown -R "$TEST_HOST_UID:$TEST_HOST_GID" /var/packages/unified-hifi-control
     '
 
 echo "Synology unprivileged lifecycle test passed."
