@@ -256,7 +256,7 @@ Without the WASM bundle, components render but don't work (no navigation, no but
 dx build --release --platform web
 
 # Run from the dx output directory (contains public/wasm/ assets)
-./target/dx/unified-hifi-control/release/web/unified-hifi-control
+./target/dx/unified-hifi-control/release/web/server
 ```
 
 **Why `cargo run` doesn't work:**

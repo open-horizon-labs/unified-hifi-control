@@ -189,11 +189,11 @@ The v3 rewrite was motivated by packaging requests (NAS users wanted native pack
 ### Prerequisites
 
 - Rust 1.84+ with `wasm32-unknown-unknown` target
-- [Dioxus CLI](https://dioxuslabs.com/learn/0.6/getting_started)
+- [Dioxus CLI](https://dioxuslabs.com/learn/0.7/getting_started)
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo install dioxus-cli --locked
+cargo install dioxus-cli@0.7.10 --locked
 cp scripts/pre-commit .git/hooks/
 ```
 
@@ -204,7 +204,7 @@ make css                                              # Build Tailwind CSS
 dx build --release --platform web --features web      # Build server + WASM
 
 cd target/dx/unified-hifi-control/release/web
-PORT=8088 ./unified-hifi-control                      # Run at http://localhost:8088
+PORT=8088 ./server                                    # Run at http://localhost:8088
 ```
 
 For hot reload during development:
