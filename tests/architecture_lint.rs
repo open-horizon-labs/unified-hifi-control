@@ -240,6 +240,69 @@ fn aggregator_exists_in_app_state() {
     );
 }
 
+/// The immediate HQPlayer command actor is the only production bridge from declarative intent to
+/// native `Set*` I/O. Socket conformance is an integration test, so debug builds intentionally
+/// expose a narrow test seam; a release build must keep the command vocabulary, receipt, reserved
+/// target and manager executor inside this crate.
+#[test]
+fn hqplayer_native_execution_is_release_internal() {
+    let adapter = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("adapters")
+        .join("hqplayer.rs");
+    let source = fs::read_to_string(adapter).expect("read HQPlayer adapter source");
+
+    for expected in [
+        "native_execution_test_seam!(pub(crate));",
+        "pub(crate) execution_target: HqpNativeExecutionTarget",
+        "pub(crate) async fn native_execution_target",
+        "pub(crate) async fn execute_reserved_native_setting",
+    ] {
+        assert!(
+            source.contains(expected),
+            "release HQPlayer native execution must remain internal; missing `{expected}`"
+        );
+    }
+
+    assert!(
+        source.contains("#[cfg(debug_assertions)]\n    #[doc(hidden)]\n    pub async fn execute_reserved_native_setting"),
+        "only the debug conformance seam may expose the manager executor"
+    );
+
+    let producers = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("producers")
+        .join("mod.rs");
+    let producer_source = fs::read_to_string(producers).expect("read producer module source");
+    assert!(
+        producer_source.contains("#[doc(hidden)]\npub mod hqplayer_command_service;"),
+        "the binary composition root needs the shared command actor, but it must not be an advertised API"
+    );
+
+    for relative in ["src/api", "src/mcp", "src/knobs"] {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+        for entry in WalkDir::new(root)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "rs"))
+        {
+            let content = fs::read_to_string(entry.path()).expect("read production surface");
+            for forbidden in [
+                "execute_reserved_native_setting",
+                "native_execution_target()",
+                "HqpNativeExecutionTarget",
+                "HqpNativeSetting",
+            ] {
+                assert!(
+                    !content.contains(forbidden),
+                    "{} bypasses the shared HQPlayer command service via `{forbidden}`",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+}
+
 /// Adapter-to-prefix mapping for zone_id consistency check
 /// Format: (adapter_file, format_prefix, prefixed_zone_id_constructor)
 const ADAPTER_PREFIXES: &[(&str, &str, &str)] = &[

@@ -4,25 +4,34 @@
 //! the projector accepts exactly one coherent value and cannot reach a socket, cache,
 //! clock, or adapter handle.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{anyhow, Result};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::adapters::hqplayer::{
-    HqpNativeObservation, HqpNativeObservationSink, HqpNativeSelection, HqpNativeTransportState,
+    HqpNativeExecutionTarget, HqpNativeObservation, HqpNativeObservationSink, HqpNativeSelection,
+    HqpNativeTransportState,
 };
 use crate::adaptive::{
     ApplyEffect, ApplyLane, ApplySemantics, Availability, AvailabilityState, Choice, ChoiceSet,
-    Control, ControlGroup, ControlId, ControlKind, ControlValue, Disruption, DocumentRevisions,
-    Extensions, Freshness, LaneHealth, LaneState, LaneValue, NumericRange, ProducerDocument,
-    ProducerEpoch, ProducerIdentity, ProducerTarget, Provenance, Reason, ReasonCode, ReasonScope,
-    RiskClass, TargetRole, Timestamp, TransportLane, ValueLane, Verification,
+    CommandOutcome, Control, ControlGroup, ControlId, ControlKind, ControlValue, Disruption,
+    DocumentRevisions, Extensions, Freshness, LaneHealth, LaneState, LaneValue, NumericRange,
+    OperationId, OperationRecord, OperationRequest, ProducerDocument, ProducerEpoch,
+    ProducerIdentity, ProducerTarget, Provenance, Reason, ReasonCode, ReasonScope, RecoveryState,
+    RiskClass, TargetRole, Timestamp, TransportLane, ValueLane, Verification, WriteAttempt,
     CONSUMER_SCHEMA_VERSION,
 };
-use crate::producers::{AdapterRun, AdaptiveHandle, Admission, RetirementOutcome};
+use crate::producers::hqplayer_command::{
+    fingerprint, preflight, HqpCommandFingerprint, HqpImmediateCommandRequest, HqpPreflightRefusal,
+    HqpValidatedCommand,
+};
+use crate::producers::{
+    AdapterRun, AdapterRunId, AdaptiveHandle, Admission, ProducerKey, ProducerPresence,
+    ProducerSnapshot, RetirementOutcome,
+};
 
 const CONTROL_TRANSPORT_STATE: &str = "hqplayer.transport.state";
 const CONTROL_TRANSPORT_PLAY: &str = "hqplayer.transport.play";
@@ -184,7 +193,7 @@ pub(super) enum RevisionError {
     CounterExhausted { plane: &'static str },
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct RevisionTracker {
     epoch: Option<u64>,
     control_plane: u64,
@@ -907,7 +916,6 @@ fn canonical_state(document: &ProducerDocument) -> ProducerDocument {
     canonical.constraints.clear();
     canonical.draft_policy = None;
     canonical.change_sets.clear();
-    canonical.operations.clear();
     for control in &mut canonical.controls {
         control.kind = ControlKind::Text;
         control.label_key = None;
@@ -934,124 +942,1683 @@ fn canonical_state(document: &ProducerDocument) -> ProducerDocument {
 /// every adaptive concern: projection, per-instance revision history, the shared HQPlayer adapter
 /// run, last-known transitions and definitive retirement.
 pub struct HqpAdaptivePublisher {
+    commands: mpsc::Sender<HqpCoordinatorCommand>,
+}
+
+/// Terminal operation audit retained per HQPlayer instance after all unresolved records.
+///
+/// Correlation tombstones are retained for exactly the same records, so memory use is bounded
+/// without silently discarding an operation which may still converge after reconnect.
+const MAX_TERMINAL_OPERATIONS: usize = 32;
+
+/// Terminal operation records are compacted from the public document after this many entries,
+/// but their correlation fingerprints remain as a bounded no-replay fence for longer. A client
+/// must choose a fresh correlation once its original audit record no longer fits in the document;
+/// silently treating an old gesture as new would repeat native I/O.
+const MAX_CORRELATION_TOMBSTONES: usize = 256;
+
+/// An unresolved outcome carries real uncertainty and therefore must never be compacted away.
+/// The producer applies backpressure instead of allowing a disconnected/indeterminate stream to
+/// grow memory forever. One pipeline command may still be Pending in addition to these records.
+const MAX_UNRESOLVED_OPERATIONS: usize = 32;
+
+/// Correlations are opaque client input, but cannot be allowed to grow retained coordinator state
+/// without bound. This mirrors the command boundary and remains enforced here for internal callers.
+const MAX_CORRELATION_ID_BYTES: usize = 256;
+
+/// A terminal publication gets one coordinator-owned retry. Generated terminal documents are
+/// deterministic, so retrying cannot duplicate native I/O or allocate another operation.
+const TERMINAL_PUBLICATION_RETRIES: usize = 1;
+
+/// One conservative serialization domain for the first immediate HQPlayer slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HqpConflictSet {
+    Pipeline,
+}
+
+/// Opaque proof that one Pending operation was admitted by the active producer run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HqpCommandLease {
+    producer_id: String,
+    producer_epoch: ProducerEpoch,
+    run_id: Option<AdapterRunId>,
+    conflict_set: HqpConflictSet,
+    generation: u64,
+    correlation_id: String,
+    operation_id: OperationId,
+    execution_target: Option<HqpNativeExecutionTarget>,
+}
+
+impl HqpCommandLease {
+    /// Test-only opaque token for command-actor fakes. A real coordinator always rejects it.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        producer_id: impl Into<String>,
+        producer_epoch: u64,
+        generation: u64,
+        correlation_id: impl Into<String>,
+    ) -> Self {
+        let producer_id = producer_id.into();
+        let correlation_id = correlation_id.into();
+        Self {
+            operation_id: OperationId::new(format!("{producer_id}:operation:{generation}")),
+            producer_id,
+            producer_epoch: ProducerEpoch(producer_epoch),
+            run_id: None,
+            conflict_set: HqpConflictSet::Pipeline,
+            generation,
+            correlation_id,
+            execution_target: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_execution_target(
+        producer_id: impl Into<String>,
+        producer_epoch: u64,
+        generation: u64,
+        correlation_id: impl Into<String>,
+        execution_target: HqpNativeExecutionTarget,
+    ) -> Self {
+        let mut lease = Self::for_test(producer_id, producer_epoch, generation, correlation_id);
+        lease.execution_target = Some(execution_target);
+        lease
+    }
+
+    /// Exact coherent native identity captured by the admitted producer observation.
+    pub(crate) fn execution_target(&self) -> Option<&HqpNativeExecutionTarget> {
+        self.execution_target.as_ref()
+    }
+}
+
+/// Whether a reservation allocated a new operation or found the caller's exact retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HqpReservationDisposition {
+    New,
+    Duplicate,
+}
+
+/// An admitted Pending operation and the opaque token needed to dispatch it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HqpCommandReservation {
+    lease: HqpCommandLease,
+    operation: OperationRecord,
+    disposition: HqpReservationDisposition,
+}
+
+impl HqpCommandReservation {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        lease: HqpCommandLease,
+        operation: OperationRecord,
+        is_duplicate: bool,
+    ) -> Self {
+        Self {
+            lease,
+            operation,
+            disposition: if is_duplicate {
+                HqpReservationDisposition::Duplicate
+            } else {
+                HqpReservationDisposition::New
+            },
+        }
+    }
+
+    pub(crate) fn lease(&self) -> &HqpCommandLease {
+        &self.lease
+    }
+
+    pub(crate) fn execution_target(&self) -> Option<&HqpNativeExecutionTarget> {
+        self.lease.execution_target()
+    }
+
+    pub(crate) fn operation(&self) -> &OperationRecord {
+        &self.operation
+    }
+
+    pub(crate) fn is_duplicate(&self) -> bool {
+        self.disposition == HqpReservationDisposition::Duplicate
+    }
+}
+
+/// Typed evidence supplied by the command actor after native execution.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HqpCommandCompletion {
+    outcome: CommandOutcome,
+    write_attempt: WriteAttempt,
+    at: Timestamp,
+    recovery: Option<RecoveryState>,
+    reason: Option<Reason>,
+}
+
+impl HqpCommandCompletion {
+    pub(crate) fn new(
+        outcome: CommandOutcome,
+        write_attempt: WriteAttempt,
+        at: Timestamp,
+        recovery: Option<RecoveryState>,
+        reason: Option<Reason>,
+    ) -> Self {
+        Self {
+            outcome,
+            write_attempt,
+            at,
+            recovery,
+            reason,
+        }
+    }
+}
+
+/// Typed coordinator refusals. They never get classified by parsing an error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HqpCoordinatorRefusal {
+    CoordinatorClosed,
+    LifecycleNotRunning,
+    ProducerUnknown,
+    Preflight(HqpPreflightRefusal),
+    CorrelationConflict,
+    InvalidCorrelation,
+    ConflictBusy,
+    UnresolvedRetentionFull,
+    StaleLease,
+    LeaseStillCurrent,
+    IllegalTransition,
+    RevisionFailed(String),
+    PublicationFailed(String),
+    RetirementFailed(String),
+}
+
+#[derive(Clone)]
+struct HqpCorrelationReservation {
+    fingerprint: HqpCommandFingerprint,
+    lease: HqpCommandLease,
+}
+
+#[derive(Clone, Default)]
+struct HqpInstanceCoordinator {
+    tracker: RevisionTracker,
+    ledger: Vec<OperationRecord>,
+    next_generation: u64,
+    correlations: HashMap<String, HqpCorrelationReservation>,
+    correlation_tombstones: HashMap<String, HqpCommandFingerprint>,
+    correlation_tombstone_order: VecDeque<String>,
+    active_pipeline: Option<u64>,
+    execution_target: Option<HqpNativeExecutionTarget>,
+    deferred_commit: Option<HqpDeferredCommit>,
+    retirement_requested: Option<ProducerEpoch>,
+}
+
+#[derive(Clone)]
+struct HqpDeferredCommit {
+    tracker: RevisionTracker,
+    ledger: Vec<OperationRecord>,
+    active_pipeline: Option<u64>,
+    correlation_tombstones: HashMap<String, HqpCommandFingerprint>,
+    correlation_tombstone_order: VecDeque<String>,
+}
+
+/// Retired producers are no longer visible to adaptive consumers, but retain exact terminal
+/// correlation truth long enough for an in-flight command actor (or a duplicate gesture) to
+/// learn the terminal outcome rather than accidentally treating removal as permission to replay.
+#[derive(Clone)]
+struct HqpRetiredInstance {
+    producer_epoch: ProducerEpoch,
+    ledger: Vec<OperationRecord>,
+    correlations: HashMap<String, HqpCorrelationReservation>,
+}
+
+enum HqpCoordinatorCommand {
+    ManagerStarted {
+        reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
+    },
+    Observed {
+        observation: Box<HqpNativeObservation>,
+        reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
+    },
+    TransientFailure {
+        instance_name: String,
+        observed_at: SystemTime,
+        reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
+    },
+    InstanceRemoved {
+        instance_name: String,
+        producer_epoch: u64,
+        reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
+    },
+    ManagerStopped {
+        reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
+    },
+    Reserve {
+        command: HqpValidatedCommand,
+        reply: oneshot::Sender<Result<HqpCommandReservation, HqpCoordinatorRefusal>>,
+    },
+    LookupCorrelation {
+        request: HqpImmediateCommandRequest,
+        reply: oneshot::Sender<Result<Option<HqpCommandReservation>, HqpCoordinatorRefusal>>,
+    },
+    Validate {
+        lease: HqpCommandLease,
+        reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
+    },
+    Complete {
+        lease: HqpCommandLease,
+        completion: HqpCommandCompletion,
+        reply: oneshot::Sender<Result<OperationRecord, HqpCoordinatorRefusal>>,
+    },
+    SupersedeStaleBeforeDispatch {
+        lease: HqpCommandLease,
+        at: Timestamp,
+        reply: oneshot::Sender<Result<OperationRecord, HqpCoordinatorRefusal>>,
+    },
+    #[cfg(test)]
+    RefuseNextPublication {
+        reply: oneshot::Sender<Result<(), HqpCoordinatorRefusal>>,
+    },
+}
+
+struct HqpPublisherCoordinator {
     handle: AdaptiveHandle,
-    run: Mutex<Option<Arc<AdapterRun>>>,
-    trackers: Mutex<HashMap<String, RevisionTracker>>,
+    run: Option<AdapterRun>,
+    instances: HashMap<String, HqpInstanceCoordinator>,
+    retired_instances: HashMap<String, HqpRetiredInstance>,
+    #[cfg(test)]
+    refused_publications: usize,
+    stop_requested: bool,
+}
+
+impl HqpPublisherCoordinator {
+    fn has_deferred_commits(&self) -> bool {
+        self.instances
+            .values()
+            .any(|state| state.deferred_commit.is_some())
+    }
+
+    fn has_requested_retirements(&self) -> bool {
+        self.instances.values().any(|state| {
+            state.retirement_requested.is_some()
+                && !state
+                    .ledger
+                    .iter()
+                    .any(|operation| operation.outcome == CommandOutcome::Pending)
+        })
+    }
+
+    async fn retry_deferred_commits(&mut self) {
+        let names = self.instances.keys().cloned().collect::<Vec<_>>();
+        for name in names {
+            let Some(mut state) = self.instances.remove(&name) else {
+                continue;
+            };
+            let admitted = if let Some(commit) = state.deferred_commit.clone() {
+                self.publish_deferred(&mut state, commit).await.is_ok()
+            } else {
+                true
+            };
+            if !admitted {
+                // Retained for the next bounded timer tick. The exact candidate is immutable, so
+                // retries cannot allocate a new operation or repeat native I/O.
+                self.instances.insert(name, state);
+                continue;
+            }
+            if let Some(epoch) = state.retirement_requested {
+                if !has_pending_operations(&state) {
+                    // The command actor may have been between native receipt and coordinator
+                    // completion when removal arrived. Retire only after that receipt's terminal
+                    // publication is admitted, never by guessing from a Pending record.
+                    let _ = self.retire_admitted_instance(name, state, epoch).await;
+                    continue;
+                }
+            }
+            if self.stop_requested {
+                // A deferred completion commit must become admitted before the
+                // stop transition can build on its revision. Chain the stop transition now rather
+                // than dropping the run with a freshly admitted Pending operation.
+                let _ = self
+                    .terminalize_pending_without_dispatch(
+                        &mut state,
+                        contract_timestamp(SystemTime::now()),
+                        "HQPlayer manager stopped before native execution",
+                    )
+                    .await;
+            }
+            self.instances.insert(name, state);
+        }
+        if self.stop_requested && !self.has_deferred_commits() {
+            self.run.take();
+        }
+    }
+
+    async fn retire_admitted_instance(
+        &mut self,
+        instance_name: String,
+        state: HqpInstanceCoordinator,
+        producer_epoch: ProducerEpoch,
+    ) -> Result<(), HqpCoordinatorRefusal> {
+        debug_assert!(!has_pending_operations(&state));
+        if let Some(run) = self.run.as_ref() {
+            let producer_id = format!("hqplayer:{instance_name}");
+            let retirement = self
+                .handle
+                .retire(run, &producer_id, producer_epoch)
+                .await
+                .map_err(|error| HqpCoordinatorRefusal::RetirementFailed(error.to_string()));
+            match retirement {
+                Ok(RetirementOutcome::Retired { .. } | RetirementOutcome::Committed) => {}
+                Ok(outcome) => {
+                    self.instances.insert(instance_name, state);
+                    return Err(HqpCoordinatorRefusal::RetirementFailed(format!(
+                        "{outcome:?}"
+                    )));
+                }
+                Err(error) => {
+                    self.instances.insert(instance_name, state);
+                    return Err(error);
+                }
+            }
+        }
+        self.retired_instances.insert(
+            instance_name,
+            HqpRetiredInstance {
+                producer_epoch,
+                ledger: state.ledger,
+                correlations: state.correlations,
+            },
+        );
+        Ok(())
+    }
+
+    async fn publish_deferred(
+        &mut self,
+        state: &mut HqpInstanceCoordinator,
+        commit: HqpDeferredCommit,
+    ) -> Result<(), HqpCoordinatorRefusal> {
+        let document = commit
+            .tracker
+            .last_document
+            .clone()
+            .ok_or(HqpCoordinatorRefusal::ProducerUnknown)?;
+        match self.publish_terminal(document).await {
+            Ok(()) => {
+                state.tracker = commit.tracker;
+                state.ledger = commit.ledger;
+                state.active_pipeline = commit.active_pipeline;
+                state.correlation_tombstones = commit.correlation_tombstones;
+                state.correlation_tombstone_order = commit.correlation_tombstone_order;
+                state.deferred_commit = None;
+                retain_live_correlations(state);
+                Ok(())
+            }
+            Err(error) => {
+                state.deferred_commit = Some(commit);
+                Err(error)
+            }
+        }
+    }
+
+    async fn run(mut self, mut commands: mpsc::Receiver<HqpCoordinatorCommand>) {
+        let mut retry = tokio::time::interval(std::time::Duration::from_millis(100));
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                maybe_command = commands.recv() => {
+                    let Some(command) = maybe_command else { break };
+                    match command {
+                HqpCoordinatorCommand::ManagerStarted { reply } => {
+                    let _ = reply.send(self.manager_started());
+                }
+                HqpCoordinatorCommand::Observed { observation, reply } => {
+                    let result = self.observed(*observation).await;
+                    let _ = reply.send(result);
+                }
+                HqpCoordinatorCommand::TransientFailure {
+                    instance_name,
+                    observed_at,
+                    reply,
+                } => {
+                    let result = self.transient_failure(instance_name, observed_at).await;
+                    let _ = reply.send(result);
+                }
+                HqpCoordinatorCommand::InstanceRemoved {
+                    instance_name,
+                    producer_epoch,
+                    reply,
+                } => {
+                    let result = self.instance_removed(instance_name, producer_epoch).await;
+                    let _ = reply.send(result);
+                }
+                HqpCoordinatorCommand::ManagerStopped { reply } => {
+                    let result = self.manager_stopped().await;
+                    let _ = reply.send(result);
+                }
+                HqpCoordinatorCommand::Reserve { command, reply } => {
+                    let result = self.reserve(command).await;
+                    let _ = reply.send(result);
+                }
+                HqpCoordinatorCommand::LookupCorrelation { request, reply } => {
+                    let _ = reply.send(self.lookup_correlation(&request));
+                }
+                HqpCoordinatorCommand::Validate { lease, reply } => {
+                    let _ = reply.send(self.validate(&lease));
+                }
+                HqpCoordinatorCommand::Complete {
+                    lease,
+                    completion,
+                    reply,
+                } => {
+                    let result = self.complete(&lease, completion).await;
+                    let _ = reply.send(result);
+                }
+                HqpCoordinatorCommand::SupersedeStaleBeforeDispatch { lease, at, reply } => {
+                    let result = self.supersede_stale_before_dispatch(&lease, at).await;
+                    let _ = reply.send(result);
+                }
+                #[cfg(test)]
+                HqpCoordinatorCommand::RefuseNextPublication { reply } => {
+                    self.refused_publications += 1;
+                    let _ = reply.send(Ok(()));
+                }
+                    }
+                }
+                _ = retry.tick(), if self.has_deferred_commits() || self.has_requested_retirements() => {
+                    self.retry_deferred_commits().await;
+                }
+            }
+        }
+        // Dropping the sole, non-clone run lease synchronously ends publisher liveness.
+        self.run.take();
+    }
+
+    fn manager_started(&mut self) -> Result<(), HqpCoordinatorRefusal> {
+        if self.run.is_none() {
+            self.run = Some(self.handle.begin_run("hqplayer"));
+            self.stop_requested = false;
+        }
+        Ok(())
+    }
+
+    async fn manager_stopped(&mut self) -> Result<(), HqpCoordinatorRefusal> {
+        if self.run.is_none() {
+            return Ok(());
+        }
+        self.stop_requested = true;
+        let stopped_at = contract_timestamp(SystemTime::now());
+        let instance_names = self.instances.keys().cloned().collect::<Vec<_>>();
+        let mut first_failure = None;
+        for instance_name in instance_names {
+            let Some(mut state) = self.instances.remove(&instance_name) else {
+                continue;
+            };
+            let result = if let Some(commit) = state.deferred_commit.clone() {
+                match self.publish_deferred(&mut state, commit).await {
+                    Ok(()) => {
+                        self.terminalize_pending_without_dispatch(
+                            &mut state,
+                            stopped_at.clone(),
+                            "HQPlayer manager stopped before native execution",
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                self.terminalize_pending_without_dispatch(
+                    &mut state,
+                    stopped_at.clone(),
+                    "HQPlayer manager stopped before native execution",
+                )
+                .await
+            };
+            self.instances.insert(instance_name, state);
+            if let Err(error) = result {
+                first_failure.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_failure {
+            return Err(error);
+        }
+        // The sole run is dropped only after every pending audit transition was admitted.
+        self.run.take();
+        Ok(())
+    }
+
+    async fn terminalize_pending_without_dispatch(
+        &mut self,
+        state: &mut HqpInstanceCoordinator,
+        at: Timestamp,
+        detail: &str,
+    ) -> Result<(), HqpCoordinatorRefusal> {
+        let mut candidate_ledger = state.ledger.clone();
+        let mut changed = false;
+        for operation in &mut candidate_ledger {
+            if operation.outcome != CommandOutcome::Pending {
+                continue;
+            }
+            operation.write_attempt = WriteAttempt::NotAttempted;
+            operation.recovery = Some(RecoveryState::ReplanRequired);
+            operation
+                .transition(
+                    CommandOutcome::Superseded,
+                    at.clone(),
+                    None,
+                    Some(Reason {
+                        code: ReasonCode::Superseded,
+                        scope: ReasonScope::Producer,
+                        display_text_key: None,
+                        detail: Some(detail.to_string()),
+                    }),
+                )
+                .map_err(|_| HqpCoordinatorRefusal::IllegalTransition)?;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+
+        let mut correlation_tombstones = state.correlation_tombstones.clone();
+        let mut correlation_tombstone_order = state.correlation_tombstone_order.clone();
+        prune_terminal_history(
+            &mut candidate_ledger,
+            &state.correlations,
+            &mut correlation_tombstones,
+            &mut correlation_tombstone_order,
+        );
+        let mut candidate_document = state
+            .tracker
+            .last_document
+            .clone()
+            .ok_or(HqpCoordinatorRefusal::ProducerUnknown)?;
+        candidate_document.operations = candidate_ledger.clone();
+        let mut candidate_tracker = state.tracker.clone();
+        candidate_tracker
+            .materialize(candidate_document)
+            .map_err(|error| HqpCoordinatorRefusal::RevisionFailed(format!("{error:?}")))?;
+        self.publish_deferred(
+            state,
+            HqpDeferredCommit {
+                tracker: candidate_tracker,
+                ledger: candidate_ledger,
+                active_pipeline: None,
+                correlation_tombstones,
+                correlation_tombstone_order,
+            },
+        )
+        .await
+    }
+
+    fn lookup_correlation(
+        &self,
+        request: &HqpImmediateCommandRequest,
+    ) -> Result<Option<HqpCommandReservation>, HqpCoordinatorRefusal> {
+        validate_correlation(&request.correlation_id)?;
+        let instance_name = request
+            .key
+            .producer_id
+            .strip_prefix("hqplayer:")
+            .filter(|name| !name.is_empty())
+            .ok_or(HqpCoordinatorRefusal::ProducerUnknown)?;
+        let expected_fingerprint = fingerprint(request);
+        if let Some(state) = self.instances.get(instance_name) {
+            if let Some(existing) = state.correlations.get(&request.correlation_id) {
+                return reservation_for_correlation(existing, &state.ledger, &expected_fingerprint)
+                    .map(Some);
+            }
+            if state
+                .correlation_tombstones
+                .contains_key(&request.correlation_id)
+            {
+                return Err(HqpCoordinatorRefusal::CorrelationConflict);
+            }
+        }
+        if let Some(retired) = self.retired_instances.get(instance_name) {
+            if let Some(existing) = retired.correlations.get(&request.correlation_id) {
+                return reservation_for_correlation(
+                    existing,
+                    &retired.ledger,
+                    &expected_fingerprint,
+                )
+                .map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn publish(&mut self, document: ProducerDocument) -> Result<(), HqpCoordinatorRefusal> {
+        #[cfg(test)]
+        if self.refused_publications > 0 {
+            self.refused_publications -= 1;
+            return Err(HqpCoordinatorRefusal::PublicationFailed(
+                "injected publication refusal".to_string(),
+            ));
+        }
+        let run = self
+            .run
+            .as_ref()
+            .ok_or(HqpCoordinatorRefusal::LifecycleNotRunning)?;
+        match self
+            .handle
+            .publish(run, document)
+            .await
+            .map_err(|error| HqpCoordinatorRefusal::PublicationFailed(error.to_string()))?
+        {
+            Admission::Admitted(_) => Ok(()),
+            Admission::Refused(refusal) => Err(HqpCoordinatorRefusal::PublicationFailed(format!(
+                "{refusal:?}"
+            ))),
+        }
+    }
+
+    async fn publish_terminal(
+        &mut self,
+        document: ProducerDocument,
+    ) -> Result<(), HqpCoordinatorRefusal> {
+        let mut last_failure = None;
+        for _ in 0..=TERMINAL_PUBLICATION_RETRIES {
+            match self.publish(document.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(error @ HqpCoordinatorRefusal::PublicationFailed(_)) => {
+                    last_failure = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_failure.unwrap_or_else(|| {
+            HqpCoordinatorRefusal::PublicationFailed(
+                "terminal publication retry budget was empty".to_string(),
+            )
+        }))
+    }
+
+    async fn observed(
+        &mut self,
+        observation: HqpNativeObservation,
+    ) -> Result<(), HqpCoordinatorRefusal> {
+        if self.run.is_none() || self.stop_requested {
+            return Err(HqpCoordinatorRefusal::LifecycleNotRunning);
+        }
+        let instance_name = observation.instance_name.clone();
+        let execution_target = observation.execution_target.clone();
+        let mut projected = project_native(&observation).map_err(|error| {
+            HqpCoordinatorRefusal::RevisionFailed(format!("projection: {error:?}"))
+        })?;
+        if let Some(retired) = self.retired_instances.get(&instance_name) {
+            if observation.producer_epoch <= retired.producer_epoch.0 {
+                return Err(HqpCoordinatorRefusal::StaleLease);
+            }
+            // A strictly newer producer epoch is the only observation that can supersede an
+            // instance retirement. Its correlation namespace is fresh by producer identity.
+            self.retired_instances.remove(&instance_name);
+        }
+        let mut state = self.instances.remove(&instance_name).unwrap_or_default();
+        if let Some(commit) = state.deferred_commit.clone() {
+            // A deferred terminal commit is a serialization frontier. Materializing this poll
+            // from the prior tracker would otherwise offer the aggregator a different document
+            // at the terminal candidate's exact revision and strand the operation forever.
+            if let Err(error) = self.publish_deferred(&mut state, commit).await {
+                self.instances.insert(instance_name, state);
+                return Err(error);
+            }
+        }
+        let mut candidate_ledger = state.ledger.clone();
+        let converged = reconcile_operations(&projected, &mut candidate_ledger)?;
+        let mut correlation_tombstones = state.correlation_tombstones.clone();
+        let mut correlation_tombstone_order = state.correlation_tombstone_order.clone();
+        prune_terminal_history(
+            &mut candidate_ledger,
+            &state.correlations,
+            &mut correlation_tombstones,
+            &mut correlation_tombstone_order,
+        );
+        projected.operations = candidate_ledger.clone();
+        let mut candidate_tracker = state.tracker.clone();
+        let mut candidate = candidate_tracker
+            .materialize(projected)
+            .map_err(|error| HqpCoordinatorRefusal::RevisionFailed(format!("{error:?}")))?
+            .document;
+        if !converged.is_empty() {
+            let observed_revision = candidate.position();
+            for operation in &mut candidate_ledger {
+                if !converged.contains(&operation.id) {
+                    continue;
+                }
+                operation.observed = Some(observed_revision);
+                if let Some(transition) = operation.history.last_mut() {
+                    transition.observed = Some(observed_revision);
+                }
+            }
+            // Adding the citable revision does not create a second state transition: rematerialize
+            // from the admitted base so the observation and operation share one atomic position.
+            candidate.operations = candidate_ledger.clone();
+            candidate_tracker = state.tracker.clone();
+            candidate = candidate_tracker
+                .materialize(candidate)
+                .map_err(|error| HqpCoordinatorRefusal::RevisionFailed(format!("{error:?}")))?
+                .document;
+        }
+        let result = self.publish(candidate).await;
+        if result.is_ok() {
+            state.tracker = candidate_tracker;
+            state.ledger = candidate_ledger;
+            state.correlation_tombstones = correlation_tombstones;
+            state.correlation_tombstone_order = correlation_tombstone_order;
+            state.execution_target = Some(execution_target);
+            if state.active_pipeline.is_some_and(|generation| {
+                !state.ledger.iter().any(|operation| {
+                    operation.generation == Some(generation)
+                        && operation.outcome == CommandOutcome::Pending
+                })
+            }) {
+                state.active_pipeline = None;
+            }
+            retain_live_correlations(&mut state);
+        }
+        self.instances.insert(instance_name, state);
+        result
+    }
+
+    async fn transient_failure(
+        &mut self,
+        instance_name: String,
+        observed_at: SystemTime,
+    ) -> Result<(), HqpCoordinatorRefusal> {
+        if self.run.is_none() || self.stop_requested {
+            return Err(HqpCoordinatorRefusal::LifecycleNotRunning);
+        }
+        let mut state = self.instances.remove(&instance_name).unwrap_or_default();
+        if let Some(commit) = state.deferred_commit.clone() {
+            if let Err(error) = self.publish_deferred(&mut state, commit).await {
+                self.instances.insert(instance_name, state);
+                return Err(error);
+            }
+        }
+        let mut candidate_tracker = state.tracker.clone();
+        let candidate = candidate_tracker
+            .mark_transient_failure(contract_timestamp(observed_at))
+            .map_err(|error| HqpCoordinatorRefusal::RevisionFailed(format!("{error:?}")))?
+            .map(|outcome| outcome.document);
+        let result = if let Some(mut document) = candidate {
+            document.operations = state.ledger.clone();
+            // Re-materialize after overlaying the ledger. Ordinarily this is content-identical,
+            // but it keeps the invariant local if a future projector retains fewer records.
+            candidate_tracker = state.tracker.clone();
+            let candidate = candidate_tracker
+                .materialize(document)
+                .map_err(|error| HqpCoordinatorRefusal::RevisionFailed(format!("{error:?}")))?
+                .document;
+            let result = self.publish(candidate).await;
+            if result.is_ok() {
+                state.tracker = candidate_tracker;
+            }
+            result
+        } else {
+            Ok(())
+        };
+        self.instances.insert(instance_name, state);
+        result
+    }
+
+    async fn instance_removed(
+        &mut self,
+        instance_name: String,
+        producer_epoch: u64,
+    ) -> Result<(), HqpCoordinatorRefusal> {
+        let Some(mut state) = self.instances.remove(&instance_name) else {
+            return Ok(());
+        };
+        if let Some(commit) = state.deferred_commit.clone() {
+            if let Err(error) = self.publish_deferred(&mut state, commit).await {
+                self.instances.insert(instance_name, state);
+                return Err(error);
+            }
+        }
+        let epoch = ProducerEpoch(producer_epoch);
+        if has_pending_operations(&state) {
+            // `execute_reserved_native_setting` serializes removal against native I/O, but its
+            // typed receipt reaches this actor only after that method returns. Therefore removal
+            // may beat `complete` while Pending actually has write evidence in flight. Keep the
+            // coordinator and correlation alive, block new work, and retire only after the actor
+            // has admitted the receipt's terminal truth.
+            state.retirement_requested = Some(epoch);
+            self.instances.insert(instance_name, state);
+            return Ok(());
+        }
+        self.retire_admitted_instance(instance_name, state, epoch)
+            .await
+    }
+
+    async fn reserve(
+        &mut self,
+        command: HqpValidatedCommand,
+    ) -> Result<HqpCommandReservation, HqpCoordinatorRefusal> {
+        validate_correlation(&command.request.correlation_id)?;
+        if self.stop_requested {
+            return Err(HqpCoordinatorRefusal::LifecycleNotRunning);
+        }
+        let run_id = self
+            .run
+            .as_ref()
+            .map(AdapterRun::id)
+            .ok_or(HqpCoordinatorRefusal::LifecycleNotRunning)?;
+        let instance_name = command
+            .request
+            .key
+            .producer_id
+            .strip_prefix("hqplayer:")
+            .filter(|name| !name.is_empty())
+            .ok_or(HqpCoordinatorRefusal::ProducerUnknown)?
+            .to_string();
+        let mut state = self
+            .instances
+            .remove(&instance_name)
+            .ok_or(HqpCoordinatorRefusal::ProducerUnknown)?;
+        if let Some(commit) = state.deferred_commit.clone() {
+            if let Err(error) = self.publish_deferred(&mut state, commit).await {
+                self.instances.insert(instance_name, state);
+                return Err(error);
+            }
+        }
+
+        let result = self.reserve_for_instance(&mut state, command, run_id).await;
+        self.instances.insert(instance_name, state);
+        result
+    }
+
+    async fn reserve_for_instance(
+        &mut self,
+        state: &mut HqpInstanceCoordinator,
+        command: HqpValidatedCommand,
+        run_id: AdapterRunId,
+    ) -> Result<HqpCommandReservation, HqpCoordinatorRefusal> {
+        if state
+            .correlation_tombstones
+            .contains_key(&command.request.correlation_id)
+        {
+            // The public audit record was compacted, but replaying an old gesture must never
+            // allocate a fresh generation or repeat native I/O.
+            return Err(HqpCoordinatorRefusal::CorrelationConflict);
+        }
+        if let Some(existing) = state.correlations.get(&command.request.correlation_id) {
+            if existing.fingerprint != command.fingerprint {
+                return Err(HqpCoordinatorRefusal::CorrelationConflict);
+            }
+            let operation = state
+                .ledger
+                .iter()
+                .find(|operation| operation.id == existing.lease.operation_id)
+                .cloned()
+                .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+            return Ok(HqpCommandReservation {
+                lease: existing.lease.clone(),
+                operation,
+                disposition: HqpReservationDisposition::Duplicate,
+            });
+        }
+        if state.retirement_requested.is_some() {
+            return Err(HqpCoordinatorRefusal::LifecycleNotRunning);
+        }
+
+        let document = state
+            .tracker
+            .last_document
+            .as_ref()
+            .cloned()
+            .ok_or(HqpCoordinatorRefusal::ProducerUnknown)?;
+        let snapshot = ProducerSnapshot {
+            key: ProducerKey::of(&document),
+            document: Arc::new(document),
+            lanes: BTreeMap::new(),
+            presence: ProducerPresence::Live,
+            repairs: Vec::new(),
+            last_refusal: None,
+        };
+        let checked =
+            preflight(&snapshot, &command.request).map_err(HqpCoordinatorRefusal::Preflight)?;
+        if checked.fingerprint != command.fingerprint {
+            return Err(HqpCoordinatorRefusal::CorrelationConflict);
+        }
+        if state.active_pipeline.is_some() {
+            return Err(HqpCoordinatorRefusal::ConflictBusy);
+        }
+        if state
+            .ledger
+            .iter()
+            .filter(|operation| operation_is_unresolved(operation))
+            .count()
+            >= MAX_UNRESOLVED_OPERATIONS
+        {
+            return Err(HqpCoordinatorRefusal::UnresolvedRetentionFull);
+        }
+
+        let generation = state.next_generation.checked_add(1).ok_or_else(|| {
+            HqpCoordinatorRefusal::RevisionFailed("operation generation exhausted".to_string())
+        })?;
+        let producer_epoch = snapshot.document.producer.epoch;
+        let execution_target = state
+            .execution_target
+            .clone()
+            .filter(|target| {
+                target.instance_name
+                    == instance_name_from_producer_id(&command.request.key.producer_id)
+                    && target.producer_epoch == producer_epoch.0
+            })
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        let operation_id = OperationId::new(format!(
+            "{}:operation:{generation}",
+            command.request.key.producer_id
+        ));
+        let lease = HqpCommandLease {
+            producer_id: command.request.key.producer_id.clone(),
+            producer_epoch,
+            run_id: Some(run_id),
+            conflict_set: HqpConflictSet::Pipeline,
+            generation,
+            correlation_id: command.request.correlation_id.clone(),
+            operation_id: operation_id.clone(),
+            execution_target: Some(execution_target),
+        };
+        let operation = OperationRecord {
+            id: operation_id,
+            correlation_id: command.request.correlation_id.clone(),
+            request: Some(OperationRequest {
+                control: command.request.control.clone(),
+                requested: command.request.requested.clone(),
+                lane: command.request.lane.clone(),
+                base: command.request.expected,
+            }),
+            change_set: None,
+            generation: Some(generation),
+            write_attempt: WriteAttempt::NotAttempted,
+            outcome: CommandOutcome::Pending,
+            observed: Some(command.request.expected),
+            steps: Vec::new(),
+            revision_boundaries: Vec::new(),
+            history: Vec::new(),
+            recovery: None,
+            reason: None,
+            extensions: Extensions::default(),
+        };
+
+        let mut candidate_ledger = state.ledger.clone();
+        candidate_ledger.push(operation.clone());
+        let mut candidate_document = (*snapshot.document).clone();
+        candidate_document.operations = candidate_ledger.clone();
+        let mut candidate_tracker = state.tracker.clone();
+        let candidate = candidate_tracker
+            .materialize(candidate_document)
+            .map_err(|error| HqpCoordinatorRefusal::RevisionFailed(format!("{error:?}")))?
+            .document;
+        self.publish(candidate).await?;
+
+        state.tracker = candidate_tracker;
+        state.ledger = candidate_ledger;
+        state.next_generation = generation;
+        state.active_pipeline = Some(generation);
+        state.correlations.insert(
+            command.request.correlation_id,
+            HqpCorrelationReservation {
+                fingerprint: checked.fingerprint,
+                lease: lease.clone(),
+            },
+        );
+        Ok(HqpCommandReservation {
+            lease,
+            operation,
+            disposition: HqpReservationDisposition::New,
+        })
+    }
+
+    fn validate(&self, lease: &HqpCommandLease) -> Result<(), HqpCoordinatorRefusal> {
+        let active_run = self.run.as_ref().map(AdapterRun::id);
+        if lease.run_id.is_none() || lease.run_id != active_run {
+            return Err(HqpCoordinatorRefusal::StaleLease);
+        }
+        let instance_name = lease
+            .producer_id
+            .strip_prefix("hqplayer:")
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        let state = self
+            .instances
+            .get(instance_name)
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        if state.tracker.epoch != Some(lease.producer_epoch.0)
+            || lease.conflict_set != HqpConflictSet::Pipeline
+            || state.active_pipeline != Some(lease.generation)
+        {
+            return Err(HqpCoordinatorRefusal::StaleLease);
+        }
+        let Some(correlation) = state.correlations.get(&lease.correlation_id) else {
+            return Err(HqpCoordinatorRefusal::StaleLease);
+        };
+        if correlation.lease != *lease {
+            return Err(HqpCoordinatorRefusal::StaleLease);
+        }
+        let pending = state.ledger.iter().any(|operation| {
+            operation.id == lease.operation_id
+                && operation.generation == Some(lease.generation)
+                && operation.outcome == CommandOutcome::Pending
+        });
+        pending
+            .then_some(())
+            .ok_or(HqpCoordinatorRefusal::StaleLease)
+    }
+
+    /// Return already-published terminal truth for a late actor callback. In particular, instance
+    /// retirement removes the document from the public view, but must not make a completion retry
+    /// look like a fresh lease or make the accepted operation's audit disappear.
+    fn retained_terminal_operation(&self, lease: &HqpCommandLease) -> Option<OperationRecord> {
+        let instance_name = lease.producer_id.strip_prefix("hqplayer:")?;
+        let retired = self
+            .retired_instances
+            .get(instance_name)
+            .map(|state| (&state.ledger, &state.correlations));
+        retired.into_iter().find_map(|(ledger, correlations)| {
+            let correlation = correlations.get(&lease.correlation_id)?;
+            (correlation.lease == *lease).then_some(())?;
+            ledger
+                .iter()
+                .find(|operation| {
+                    operation.id == lease.operation_id
+                        && operation.generation == Some(lease.generation)
+                        && operation.outcome != CommandOutcome::Pending
+                })
+                .cloned()
+        })
+    }
+
+    async fn complete(
+        &mut self,
+        lease: &HqpCommandLease,
+        completion: HqpCommandCompletion,
+    ) -> Result<OperationRecord, HqpCoordinatorRefusal> {
+        if self.validate(lease).is_err() {
+            return self
+                .retained_terminal_operation(lease)
+                .ok_or(HqpCoordinatorRefusal::StaleLease);
+        }
+        let instance_name = lease
+            .producer_id
+            .strip_prefix("hqplayer:")
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?
+            .to_string();
+        let mut state = self
+            .instances
+            .remove(&instance_name)
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        match self
+            .complete_for_instance(&mut state, lease, completion)
+            .await
+        {
+            Ok(completed) => {
+                if let Some(epoch) = state.retirement_requested {
+                    if !has_pending_operations(&state) {
+                        self.retire_admitted_instance(instance_name, state, epoch)
+                            .await?;
+                        return Ok(completed);
+                    }
+                }
+                self.instances.insert(instance_name, state);
+                Ok(completed)
+            }
+            Err(error) => {
+                self.instances.insert(instance_name, state);
+                Err(error)
+            }
+        }
+    }
+
+    async fn complete_for_instance(
+        &mut self,
+        state: &mut HqpInstanceCoordinator,
+        lease: &HqpCommandLease,
+        completion: HqpCommandCompletion,
+    ) -> Result<OperationRecord, HqpCoordinatorRefusal> {
+        let mut candidate_ledger = state.ledger.clone();
+        let operation = candidate_ledger
+            .iter_mut()
+            .find(|operation| {
+                operation.id == lease.operation_id && operation.generation == Some(lease.generation)
+            })
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        operation.write_attempt = completion.write_attempt;
+        operation.recovery = completion.recovery;
+        operation
+            // The native receipt may justify the outcome, but it cannot cite an adaptive
+            // observation revision that has not been projected and admitted yet. A later
+            // coherent observation can supply that revision without back-dating evidence.
+            .transition(completion.outcome, completion.at, None, completion.reason)
+            .map_err(|_| HqpCoordinatorRefusal::IllegalTransition)?;
+        let completed = operation.clone();
+
+        let mut correlation_tombstones = state.correlation_tombstones.clone();
+        let mut correlation_tombstone_order = state.correlation_tombstone_order.clone();
+        prune_terminal_history(
+            &mut candidate_ledger,
+            &state.correlations,
+            &mut correlation_tombstones,
+            &mut correlation_tombstone_order,
+        );
+
+        let mut candidate_document = state
+            .tracker
+            .last_document
+            .clone()
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        candidate_document.operations = candidate_ledger.clone();
+        let mut candidate_tracker = state.tracker.clone();
+        candidate_tracker
+            .materialize(candidate_document)
+            .map_err(|error| HqpCoordinatorRefusal::RevisionFailed(format!("{error:?}")))?;
+        self.publish_deferred(
+            state,
+            HqpDeferredCommit {
+                tracker: candidate_tracker,
+                ledger: candidate_ledger,
+                active_pipeline: None,
+                correlation_tombstones,
+                correlation_tombstone_order,
+            },
+        )
+        .await?;
+        Ok(completed)
+    }
+
+    async fn supersede_stale_before_dispatch(
+        &mut self,
+        lease: &HqpCommandLease,
+        at: Timestamp,
+    ) -> Result<OperationRecord, HqpCoordinatorRefusal> {
+        if let Some(terminal) = self.retained_terminal_operation(lease) {
+            return Ok(terminal);
+        }
+        let active_run = self.run.as_ref().map(AdapterRun::id);
+        let instance_name = lease
+            .producer_id
+            .strip_prefix("hqplayer:")
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?
+            .to_string();
+        let mut state = self
+            .instances
+            .remove(&instance_name)
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        let result = self
+            .supersede_stale_for_instance(&mut state, lease, active_run, at)
+            .await;
+        self.instances.insert(instance_name, state);
+        result
+    }
+
+    async fn supersede_stale_for_instance(
+        &mut self,
+        state: &mut HqpInstanceCoordinator,
+        lease: &HqpCommandLease,
+        active_run: Option<AdapterRunId>,
+        at: Timestamp,
+    ) -> Result<OperationRecord, HqpCoordinatorRefusal> {
+        let invalidated =
+            lease.run_id != active_run || state.tracker.epoch != Some(lease.producer_epoch.0);
+        if !invalidated {
+            return Err(HqpCoordinatorRefusal::LeaseStillCurrent);
+        }
+        let correlation = state
+            .correlations
+            .get(&lease.correlation_id)
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        if correlation.lease != *lease {
+            return Err(HqpCoordinatorRefusal::StaleLease);
+        }
+        if let Some(operation) = state.ledger.iter().find(|operation| {
+            operation.id == lease.operation_id
+                && operation.generation == Some(lease.generation)
+                && operation.outcome == CommandOutcome::Superseded
+                && operation.write_attempt == WriteAttempt::NotAttempted
+        }) {
+            return Ok(operation.clone());
+        }
+        if state.active_pipeline != Some(lease.generation) {
+            return Err(HqpCoordinatorRefusal::StaleLease);
+        }
+
+        let mut candidate_ledger = state.ledger.clone();
+        let operation = candidate_ledger
+            .iter_mut()
+            .find(|operation| {
+                operation.id == lease.operation_id
+                    && operation.generation == Some(lease.generation)
+                    && operation.outcome == CommandOutcome::Pending
+            })
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        operation.write_attempt = WriteAttempt::NotAttempted;
+        operation.recovery = Some(RecoveryState::ReplanRequired);
+        let reason = Reason {
+            code: ReasonCode::Superseded,
+            scope: ReasonScope::Producer,
+            display_text_key: None,
+            detail: Some(
+                "producer run or epoch advanced before HQPlayer native dispatch".to_string(),
+            ),
+        };
+        operation
+            .transition(CommandOutcome::Superseded, at, None, Some(reason))
+            .map_err(|_| HqpCoordinatorRefusal::IllegalTransition)?;
+        let superseded = operation.clone();
+
+        let mut correlation_tombstones = state.correlation_tombstones.clone();
+        let mut correlation_tombstone_order = state.correlation_tombstone_order.clone();
+        prune_terminal_history(
+            &mut candidate_ledger,
+            &state.correlations,
+            &mut correlation_tombstones,
+            &mut correlation_tombstone_order,
+        );
+
+        let mut candidate_document = state
+            .tracker
+            .last_document
+            .clone()
+            .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+        candidate_document.operations = candidate_ledger.clone();
+        let mut candidate_tracker = state.tracker.clone();
+        candidate_tracker
+            .materialize(candidate_document)
+            .map_err(|error| HqpCoordinatorRefusal::RevisionFailed(format!("{error:?}")))?;
+        self.publish_deferred(
+            state,
+            HqpDeferredCommit {
+                tracker: candidate_tracker,
+                ledger: candidate_ledger,
+                active_pipeline: None,
+                correlation_tombstones,
+                correlation_tombstone_order,
+            },
+        )
+        .await?;
+        Ok(superseded)
+    }
+}
+
+fn validate_correlation(correlation_id: &str) -> Result<(), HqpCoordinatorRefusal> {
+    if correlation_id.is_empty() || correlation_id.len() > MAX_CORRELATION_ID_BYTES {
+        return Err(HqpCoordinatorRefusal::InvalidCorrelation);
+    }
+    Ok(())
+}
+
+fn instance_name_from_producer_id(producer_id: &str) -> &str {
+    producer_id.strip_prefix("hqplayer:").unwrap_or_default()
+}
+
+fn operation_is_unresolved(operation: &OperationRecord) -> bool {
+    operation.outcome.awaits_convergence()
+}
+
+fn has_pending_operations(state: &HqpInstanceCoordinator) -> bool {
+    state
+        .ledger
+        .iter()
+        .any(|operation| operation.outcome == CommandOutcome::Pending)
+}
+
+fn semantic_request_matches(document: &ProducerDocument, request: &OperationRequest) -> bool {
+    let Some(control) = document.control(&request.control) else {
+        return false;
+    };
+    if control.observed() == Some(&request.requested) {
+        return true;
+    }
+
+    // HQPlayer reports its `[source]` mode through the contract's meaningful `Empty` value. It is
+    // still selected through the runtime choice identity, so convergence must compare that choice's
+    // engine identity rather than treating every `Empty` observation as a match.
+    control.id.as_str() == CONTROL_PIPELINE_MODE
+        && control.observed() == Some(&ControlValue::Empty)
+        && matches!(
+            &request.requested,
+            ControlValue::Choice(requested)
+                if control.choices.as_ref().is_some_and(|choices| {
+                    choices.choices.iter().any(|choice| {
+                        choice.id == *requested && choice.engine_name.as_deref() == Some("[source]")
+                    })
+                })
+        )
+}
+
+fn reconcile_operations(
+    document: &ProducerDocument,
+    ledger: &mut [OperationRecord],
+) -> Result<HashSet<OperationId>, HqpCoordinatorRefusal> {
+    let mut converged = HashSet::new();
+    for index in 0..ledger.len() {
+        if !ledger[index].outcome.awaits_convergence() {
+            continue;
+        }
+        let Some(request) = ledger[index].request.clone() else {
+            continue;
+        };
+        let matches = semantic_request_matches(document, &request);
+        let generation = ledger[index].generation.unwrap_or_default();
+        let producer_restarted = request.base.epoch != document.producer.epoch;
+        let has_later_generation = ledger.iter().skip(index + 1).any(|later| {
+            later.generation.unwrap_or_default() > generation
+                && later
+                    .request
+                    .as_ref()
+                    .is_some_and(|later_request| later_request.control == request.control)
+        });
+
+        let resolution = if producer_restarted || (!matches && has_later_generation) {
+            Some((
+                CommandOutcome::Superseded,
+                RecoveryState::ReplanRequired,
+                Some(Reason {
+                    code: ReasonCode::Superseded,
+                    scope: ReasonScope::Producer,
+                    display_text_key: None,
+                    detail: Some(if producer_restarted {
+                        "HQPlayer producer epoch advanced before convergence".to_string()
+                    } else {
+                        "a later HQPlayer operation generation replaced this request".to_string()
+                    }),
+                }),
+            ))
+        } else if matches {
+            // A matching poll can race a queued command before the native executor runs. It is
+            // authoritative evidence that the requested value is already present, but it is not
+            // evidence that this operation sent anything. Keep that distinction explicit so the
+            // actor cannot later turn a no-send into a claimed write.
+            let no_send = ledger[index].outcome == CommandOutcome::Pending
+                && ledger[index].write_attempt == WriteAttempt::NotAttempted;
+            Some((
+                if no_send {
+                    CommandOutcome::Ignored
+                } else {
+                    CommandOutcome::Applied
+                },
+                RecoveryState::NotRequired,
+                None,
+            ))
+        } else if matches!(
+            ledger[index].outcome,
+            CommandOutcome::Indeterminate | CommandOutcome::TimedOut
+        ) {
+            Some((
+                CommandOutcome::Divergent,
+                RecoveryState::ReplanRequired,
+                None,
+            ))
+        } else {
+            None
+        };
+
+        let Some((outcome, recovery, reason)) = resolution else {
+            continue;
+        };
+        let operation = &mut ledger[index];
+        operation.write_attempt = if outcome == CommandOutcome::Applied {
+            WriteAttempt::Confirmed
+        } else {
+            operation.write_attempt.clone()
+        };
+        operation.recovery = Some(recovery);
+        operation
+            .transition(
+                outcome,
+                document
+                    .lanes
+                    .iter()
+                    .find(|lane| lane.lane == TransportLane::Native)
+                    .and_then(|lane| lane.freshness.observed_at.clone())
+                    .unwrap_or_else(|| Timestamp::new("unknown")),
+                None,
+                reason,
+            )
+            .map_err(|_| HqpCoordinatorRefusal::IllegalTransition)?;
+        converged.insert(operation.id.clone());
+    }
+    Ok(converged)
+}
+
+/// Keep every unresolved operation and only the newest bounded terminal audit records. Compacting
+/// a document record does not forget its correlation: a separate bounded tombstone prevents an
+/// old gesture from becoming a fresh native write merely because its audit fell off the surface.
+fn prune_terminal_history(
+    ledger: &mut Vec<OperationRecord>,
+    correlations: &HashMap<String, HqpCorrelationReservation>,
+    tombstones: &mut HashMap<String, HqpCommandFingerprint>,
+    tombstone_order: &mut VecDeque<String>,
+) {
+    let terminal_count = ledger
+        .iter()
+        .filter(|operation| !operation_is_unresolved(operation))
+        .count();
+    let mut terminal_to_drop = terminal_count.saturating_sub(MAX_TERMINAL_OPERATIONS);
+    if terminal_to_drop == 0 {
+        return;
+    }
+    ledger.retain(|operation| {
+        if terminal_to_drop > 0 && !operation_is_unresolved(operation) {
+            terminal_to_drop -= 1;
+            if let Some(reservation) = correlations.get(&operation.correlation_id) {
+                retain_correlation_tombstone(
+                    tombstones,
+                    tombstone_order,
+                    operation.correlation_id.clone(),
+                    reservation.fingerprint.clone(),
+                );
+            }
+            false
+        } else {
+            true
+        }
+    });
+}
+
+fn retain_correlation_tombstone(
+    tombstones: &mut HashMap<String, HqpCommandFingerprint>,
+    order: &mut VecDeque<String>,
+    correlation_id: String,
+    fingerprint: HqpCommandFingerprint,
+) {
+    if tombstones
+        .insert(correlation_id.clone(), fingerprint)
+        .is_none()
+    {
+        order.push_back(correlation_id);
+    }
+    while order.len() > MAX_CORRELATION_TOMBSTONES {
+        if let Some(expired) = order.pop_front() {
+            tombstones.remove(&expired);
+        }
+    }
+}
+
+fn reservation_for_correlation(
+    existing: &HqpCorrelationReservation,
+    ledger: &[OperationRecord],
+    expected_fingerprint: &HqpCommandFingerprint,
+) -> Result<HqpCommandReservation, HqpCoordinatorRefusal> {
+    if existing.fingerprint != *expected_fingerprint {
+        return Err(HqpCoordinatorRefusal::CorrelationConflict);
+    }
+    let operation = ledger
+        .iter()
+        .find(|operation| operation.id == existing.lease.operation_id)
+        .cloned()
+        .ok_or(HqpCoordinatorRefusal::StaleLease)?;
+    Ok(HqpCommandReservation {
+        lease: existing.lease.clone(),
+        operation,
+        disposition: HqpReservationDisposition::Duplicate,
+    })
+}
+
+fn retain_live_correlations(state: &mut HqpInstanceCoordinator) {
+    let retained = state
+        .ledger
+        .iter()
+        .map(|operation| operation.id.clone())
+        .collect::<HashSet<_>>();
+    state
+        .correlations
+        .retain(|_, reservation| retained.contains(&reservation.lease.operation_id));
 }
 
 impl HqpAdaptivePublisher {
     pub fn new(handle: AdaptiveHandle) -> Self {
-        Self {
-            handle,
-            run: Mutex::new(None),
-            trackers: Mutex::new(HashMap::new()),
-        }
+        const COORDINATOR_CAPACITY: usize = 32;
+        let (commands, receiver) = mpsc::channel(COORDINATOR_CAPACITY);
+        tokio::spawn(
+            HqpPublisherCoordinator {
+                handle,
+                run: None,
+                instances: HashMap::new(),
+                retired_instances: HashMap::new(),
+                #[cfg(test)]
+                refused_publications: 0,
+                stop_requested: false,
+            }
+            .run(receiver),
+        );
+        Self { commands }
     }
 
-    async fn current_run(&self) -> Result<Arc<AdapterRun>> {
-        self.run
-            .lock()
+    async fn request<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T, HqpCoordinatorRefusal>>) -> HqpCoordinatorCommand,
+    ) -> Result<T, HqpCoordinatorRefusal> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(build(reply))
             .await
-            .clone()
-            .ok_or_else(|| anyhow!("HQPlayer producer lifecycle is not running"))
+            .map_err(|_| HqpCoordinatorRefusal::CoordinatorClosed)?;
+        response
+            .await
+            .map_err(|_| HqpCoordinatorRefusal::CoordinatorClosed)?
     }
 
-    async fn publish(&self, run: &AdapterRun, document: ProducerDocument) -> Result<()> {
-        match self.handle.publish(run, document).await? {
-            Admission::Admitted(_) => Ok(()),
-            Admission::Refused(refusal) => Err(anyhow!(
-                "HQPlayer producer document was refused: {refusal:?}"
-            )),
-        }
+    pub(crate) async fn reserve(
+        &self,
+        command: HqpValidatedCommand,
+    ) -> Result<HqpCommandReservation, HqpCoordinatorRefusal> {
+        self.request(|reply| HqpCoordinatorCommand::Reserve { command, reply })
+            .await
+    }
+
+    /// Find an exact prior correlation before checking the caller's now-stale base revision.
+    pub(crate) async fn lookup_correlation(
+        &self,
+        request: &HqpImmediateCommandRequest,
+    ) -> Result<Option<HqpCommandReservation>, HqpCoordinatorRefusal> {
+        self.request(|reply| HqpCoordinatorCommand::LookupCorrelation {
+            request: request.clone(),
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn validate(
+        &self,
+        lease: &HqpCommandLease,
+    ) -> Result<(), HqpCoordinatorRefusal> {
+        self.request(|reply| HqpCoordinatorCommand::Validate {
+            lease: lease.clone(),
+            reply,
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn refuse_next_publication(&self) {
+        self.request(|reply| HqpCoordinatorCommand::RefuseNextPublication { reply })
+            .await
+            .expect("test coordinator accepts publication fault");
+    }
+
+    pub(crate) async fn complete(
+        &self,
+        lease: &HqpCommandLease,
+        completion: HqpCommandCompletion,
+    ) -> Result<OperationRecord, HqpCoordinatorRefusal> {
+        self.request(|reply| HqpCoordinatorCommand::Complete {
+            lease: lease.clone(),
+            completion,
+            reply,
+        })
+        .await
+    }
+
+    /// Terminalize an exact Pending lease which became stale before native dispatch.
+    ///
+    /// This is deliberately separate from completion: only the command actor at its
+    /// immediately-before-I/O validation point can truthfully assert `NotAttempted`.
+    pub(crate) async fn supersede_stale_before_dispatch(
+        &self,
+        lease: &HqpCommandLease,
+        at: Timestamp,
+    ) -> Result<OperationRecord, HqpCoordinatorRefusal> {
+        self.request(
+            |reply| HqpCoordinatorCommand::SupersedeStaleBeforeDispatch {
+                lease: lease.clone(),
+                at,
+                reply,
+            },
+        )
+        .await
     }
 }
 
 #[async_trait::async_trait]
 impl HqpNativeObservationSink for HqpAdaptivePublisher {
     async fn manager_started(&self) -> Result<()> {
-        let mut run = self.run.lock().await;
-        if run.is_none() {
-            *run = Some(Arc::new(self.handle.begin_run("hqplayer")));
-        }
-        Ok(())
+        self.request(|reply| HqpCoordinatorCommand::ManagerStarted { reply })
+            .await
+            .map_err(|error| anyhow!("HQPlayer coordinator start failed: {error:?}"))
     }
 
     async fn observed(&self, observation: HqpNativeObservation) -> Result<()> {
-        let instance_name = observation.instance_name.clone();
-        let projected = project_native(&observation).map_err(|error| {
-            anyhow!("HQPlayer adaptive projection refused coherent observation: {error:?}")
-        })?;
-        let document = {
-            let mut trackers = self.trackers.lock().await;
-            trackers
-                .entry(instance_name)
-                .or_default()
-                .materialize(projected)
-                .map_err(|error| {
-                    anyhow!("HQPlayer adaptive revision refused observation: {error:?}")
-                })?
-                .document
-        };
-        let run = self.current_run().await?;
-        self.publish(&run, document).await
+        self.request(|reply| HqpCoordinatorCommand::Observed {
+            observation: Box::new(observation),
+            reply,
+        })
+        .await
+        .map_err(|error| anyhow!("HQPlayer coordinator observation failed: {error:?}"))
     }
 
     async fn transient_failure(&self, instance_name: &str, observed_at: SystemTime) -> Result<()> {
-        let document = {
-            let mut trackers = self.trackers.lock().await;
-            trackers
-                .entry(instance_name.to_string())
-                .or_default()
-                .mark_transient_failure(contract_timestamp(observed_at))
-                .map_err(|error| {
-                    anyhow!(
-                        "HQPlayer adaptive tracker could not retain failed observation: {error:?}"
-                    )
-                })?
-                .map(|outcome| outcome.document)
-        };
-        let Some(document) = document else {
-            return Ok(());
-        };
-        let run = self.current_run().await?;
-        self.publish(&run, document).await
+        self.request(|reply| HqpCoordinatorCommand::TransientFailure {
+            instance_name: instance_name.to_string(),
+            observed_at,
+            reply,
+        })
+        .await
+        .map_err(|error| anyhow!("HQPlayer coordinator failure update failed: {error:?}"))
     }
 
     async fn instance_removed(&self, instance_name: &str, producer_epoch: u64) -> Result<()> {
-        let run = self.run.lock().await.clone();
-        if let Some(run) = run {
-            let producer_id = format!("hqplayer:{instance_name}");
-            match self
-                .handle
-                .retire(&run, &producer_id, ProducerEpoch(producer_epoch))
-                .await?
-            {
-                RetirementOutcome::Retired { .. } | RetirementOutcome::Committed => {}
-                outcome => {
-                    return Err(anyhow!(
-                        "HQPlayer producer retirement was not applied: {outcome:?}"
-                    ));
-                }
-            }
-        }
-        self.trackers.lock().await.remove(instance_name);
-        Ok(())
+        self.request(|reply| HqpCoordinatorCommand::InstanceRemoved {
+            instance_name: instance_name.to_string(),
+            producer_epoch,
+            reply,
+        })
+        .await
+        .map_err(|error| anyhow!("HQPlayer coordinator retirement failed: {error:?}"))
     }
 
     async fn manager_stopped(&self) -> Result<()> {
         // Ending the shared lease after all native workers join makes every retained HQPlayer
         // document last-known. Ordinary shutdown does not retire producer identities.
-        self.run.lock().await.take();
-        Ok(())
+        self.request(|reply| HqpCoordinatorCommand::ManagerStopped { reply })
+            .await
+            .map_err(|error| anyhow!("HQPlayer coordinator stop failed: {error:?}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::hqplayer::{HqpNativeMetadata, HqpNativeVolume};
+    use crate::adapters::hqplayer::{HqpNativeExecutionTarget, HqpNativeMetadata, HqpNativeVolume};
     use crate::adaptive::{
-        AvailabilityState, ControlId, ControlKind, ControlValue, LaneState, TargetRole, ValueLane,
+        ApplyLane, AvailabilityState, CommandOutcome, ControlId, ControlKind, ControlValue,
+        LaneState, OperationId, OperationRecord, OperationRequest, RevisionRef, TargetRole,
+        ValueLane, WriteAttempt,
     };
     use crate::producers::{admit, Admission, AdmissionKind};
     use std::time::Duration;
@@ -1062,6 +2629,12 @@ mod tests {
             instance_label: Some("Listening room".to_string()),
             product_version: Some("6.0.2".to_string()),
             producer_epoch: 7,
+            execution_target: HqpNativeExecutionTarget {
+                instance_name: "main".to_string(),
+                producer_epoch: 7,
+                endpoint_generation: 1,
+                transport_generation: 1,
+            },
             observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_016_400),
             transport: HqpNativeTransportState::Playing,
             metadata: HqpNativeMetadata {
@@ -1119,6 +2692,54 @@ mod tests {
             Some(ControlValue::Choice(choice)) => choice.clone(),
             other => panic!("{id} did not carry an observed choice: {other:?}"),
         }
+    }
+
+    fn pending_operation(base: RevisionRef) -> OperationRecord {
+        OperationRecord {
+            id: OperationId::new("hqplayer:main:operation:1"),
+            correlation_id: "gesture-1".to_string(),
+            request: Some(OperationRequest {
+                control: ControlId::new(CONTROL_PIPELINE_MODE),
+                requested: ControlValue::choice(choice_id(CONTROL_PIPELINE_MODE, "PCM")),
+                lane: ApplyLane::Immediate,
+                base,
+            }),
+            change_set: None,
+            generation: Some(1),
+            write_attempt: WriteAttempt::NotAttempted,
+            outcome: CommandOutcome::Pending,
+            observed: Some(base),
+            steps: Vec::new(),
+            revision_boundaries: Vec::new(),
+            history: Vec::new(),
+            recovery: None,
+            reason: None,
+            extensions: Extensions::default(),
+        }
+    }
+
+    #[test]
+    fn operation_only_changes_advance_state_revision_without_advancing_control_plane() {
+        let mut tracker = RevisionTracker::default();
+        let first = tracker
+            .materialize(project_native(&sample()).expect("initial projection"))
+            .expect("initial revision");
+        let base = first.document.position();
+
+        let mut with_pending = project_native(&sample()).expect("pending projection");
+        with_pending.operations.push(pending_operation(base));
+        let pending = tracker
+            .materialize(with_pending)
+            .expect("operation-only revision");
+
+        assert!(!pending.control_plane_advanced);
+        assert!(pending.state_advanced);
+        assert_eq!(
+            pending.document.revisions,
+            DocumentRevisions::new(1, 2),
+            "admitting Pending must be visible as a producer state change"
+        );
+        assert_eq!(pending.document.operations.len(), 1);
     }
 
     #[test]
@@ -1584,5 +3205,1125 @@ mod tests {
             .materialize(project_native(&next_epoch).expect("new-epoch projection"))
             .expect("new epoch resets exhausted counters");
         assert_eq!(recovered.document.revisions, DocumentRevisions::new(1, 1));
+    }
+
+    async fn coordinator_fixture() -> (
+        HqpAdaptivePublisher,
+        crate::producers::AdaptiveView,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (handle, actor, view) = crate::producers::AdaptiveRuntime::build(shutdown.clone(), 16);
+        let actor_task = tokio::spawn(actor.run());
+        let publisher = HqpAdaptivePublisher::new(handle);
+        publisher.manager_started().await.expect("manager starts");
+        publisher.observed(sample()).await.expect("sample admitted");
+        (publisher, view, shutdown, actor_task)
+    }
+
+    fn validated_mode_command(
+        snapshot: &crate::producers::ProducerSnapshot,
+        correlation_id: &str,
+        engine_name: &str,
+    ) -> crate::producers::hqplayer_command::HqpValidatedCommand {
+        let request = crate::producers::hqplayer_command::HqpImmediateCommandRequest {
+            key: snapshot.key.clone(),
+            expected: snapshot.document.position(),
+            control: ControlId::new(CONTROL_PIPELINE_MODE),
+            requested: ControlValue::choice(choice_id(CONTROL_PIPELINE_MODE, engine_name)),
+            lane: ApplyLane::Immediate,
+            correlation_id: correlation_id.to_string(),
+        };
+        crate::producers::hqplayer_command::preflight(snapshot, &request)
+            .expect("mode request passes advisory preflight")
+    }
+
+    #[tokio::test]
+    async fn coordinator_reserves_pending_before_returning_and_preserves_it_across_observation() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let before = view.snapshot(&key).expect("initial snapshot");
+
+        let reservation = publisher
+            .reserve(validated_mode_command(&before, "gesture-1", "PCM"))
+            .await
+            .expect("pending reservation");
+
+        assert!(!reservation.is_duplicate());
+        let pending = view.snapshot(&key).expect("pending snapshot");
+        assert_eq!(
+            pending.document.revisions.control_plane,
+            before.document.revisions.control_plane
+        );
+        assert_eq!(
+            pending.document.revisions.state.0,
+            before.document.revisions.state.0 + 1
+        );
+        assert_eq!(pending.document.operations.len(), 1);
+        assert_eq!(
+            pending.document.operations[0].outcome,
+            CommandOutcome::Pending
+        );
+        assert_eq!(
+            pending.document.operations[0]
+                .request
+                .as_ref()
+                .expect("request")
+                .base,
+            before.document.position()
+        );
+
+        let mut next_observation = sample();
+        next_observation.metadata.title = Some("Next signal".to_string());
+        publisher
+            .observed(next_observation)
+            .await
+            .expect("later observation admitted");
+        let observed = view.snapshot(&key).expect("observed snapshot");
+        assert_eq!(observed.document.operations, pending.document.operations);
+        assert_eq!(
+            observed.document.revisions.state.0,
+            pending.document.revisions.state.0 + 1
+        );
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn coordinator_deduplicates_a_correlation_and_refuses_conflicting_reuse() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let snapshot = view.snapshot(&key).expect("initial snapshot");
+        let original = validated_mode_command(&snapshot, "gesture-1", "PCM");
+        let conflicting = validated_mode_command(&snapshot, "gesture-1", "SDM");
+
+        let first = publisher
+            .reserve(original.clone())
+            .await
+            .expect("first reserve");
+        let duplicate = publisher
+            .reserve(original)
+            .await
+            .expect("deduplicated reserve");
+        assert!(duplicate.is_duplicate());
+        assert_eq!(duplicate.operation().id, first.operation().id);
+        assert_eq!(
+            view.snapshot(&key)
+                .expect("snapshot")
+                .document
+                .operations
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            publisher.reserve(conflicting).await,
+            Err(HqpCoordinatorRefusal::CorrelationConflict)
+        );
+
+        let pending = view.snapshot(&key).expect("pending snapshot");
+        let another_correlation = validated_mode_command(&pending, "gesture-2", "SDM");
+        assert_eq!(
+            publisher.reserve(another_correlation).await,
+            Err(HqpCoordinatorRefusal::ConflictBusy),
+            "the five coupled pipeline controls share one conservative conflict set"
+        );
+        publisher
+            .complete(
+                first.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Superseded,
+                    WriteAttempt::NotAttempted,
+                    Timestamp::new("2026-07-31T00:00:01Z"),
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("test releases first conflict");
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn coordinator_rejects_stale_run_lease_and_does_not_publish_its_completion() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let snapshot = view.snapshot(&key).expect("initial snapshot");
+        let reservation = publisher
+            .reserve(validated_mode_command(&snapshot, "gesture-1", "PCM"))
+            .await
+            .expect("reserve");
+        publisher.manager_stopped().await.expect("old run stops");
+        publisher.manager_started().await.expect("new run starts");
+        assert_eq!(
+            publisher.validate(reservation.lease()).await,
+            Err(HqpCoordinatorRefusal::StaleLease)
+        );
+        assert_eq!(
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Applied,
+                        WriteAttempt::Confirmed,
+                        Timestamp::new("2026-07-31T00:00:01Z"),
+                        None,
+                        None,
+                    ),
+                )
+                .await,
+            Err(HqpCoordinatorRefusal::StaleLease)
+        );
+        let stopped = view.snapshot(&key).expect("terminal retained snapshot");
+        assert_eq!(
+            stopped.document.operations[0].outcome,
+            CommandOutcome::Superseded
+        );
+        assert_eq!(
+            stopped.document.operations[0].write_attempt,
+            WriteAttempt::NotAttempted
+        );
+
+        publisher.manager_stopped().await.expect("new run stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn coordinator_supersedes_a_pending_generation_invalidated_before_dispatch() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let initial = view.snapshot(&key).expect("initial snapshot");
+        let reservation = publisher
+            .reserve(validated_mode_command(&initial, "gesture-1", "PCM"))
+            .await
+            .expect("reserve before producer restart");
+
+        let mut restarted = sample();
+        restarted.producer_epoch += 1;
+        restarted.execution_target.producer_epoch += 1;
+        publisher
+            .observed(restarted)
+            .await
+            .expect("new producer epoch admitted");
+        assert_eq!(
+            publisher.validate(reservation.lease()).await,
+            Err(HqpCoordinatorRefusal::StaleLease)
+        );
+
+        let superseded = publisher
+            .supersede_stale_before_dispatch(
+                reservation.lease(),
+                Timestamp::new("2026-07-31T00:00:01Z"),
+            )
+            .await
+            .expect("stale pre-dispatch generation terminalizes");
+        assert_eq!(superseded.outcome, CommandOutcome::Superseded);
+        assert_eq!(superseded.write_attempt, WriteAttempt::NotAttempted);
+        assert_eq!(superseded.recovery, Some(RecoveryState::ReplanRequired));
+        let reason = superseded.reason.as_ref().expect("supersession reason");
+        assert_eq!(reason.code, ReasonCode::Superseded);
+        assert_eq!(reason.scope, ReasonScope::Producer);
+
+        let after_invalidation = view.snapshot(&key).expect("superseded snapshot");
+        assert_eq!(
+            after_invalidation.document.operations[0].outcome,
+            CommandOutcome::Superseded
+        );
+        let next = publisher
+            .reserve(validated_mode_command(
+                &after_invalidation,
+                "gesture-2",
+                "SDM",
+            ))
+            .await
+            .expect("released conflict admits later command");
+        assert_eq!(
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Applied,
+                        WriteAttempt::Confirmed,
+                        Timestamp::new("2026-07-31T00:00:02Z"),
+                        None,
+                        None,
+                    ),
+                )
+                .await,
+            Err(HqpCoordinatorRefusal::StaleLease),
+            "late completion from the invalidated generation cannot overwrite its successor"
+        );
+        publisher
+            .complete(
+                next.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Superseded,
+                    WriteAttempt::NotAttempted,
+                    Timestamp::new("2026-07-31T00:00:03Z"),
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("test releases successor");
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn coordinator_terminal_transition_advances_revision_and_releases_conflict_set() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let snapshot = view.snapshot(&key).expect("initial snapshot");
+        let reservation = publisher
+            .reserve(validated_mode_command(&snapshot, "gesture-1", "PCM"))
+            .await
+            .expect("reserve");
+        let pending = view.snapshot(&key).expect("pending snapshot");
+
+        publisher
+            .complete(
+                reservation.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Applied,
+                    WriteAttempt::Confirmed,
+                    Timestamp::new("2026-07-31T00:00:01Z"),
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("terminal completion");
+
+        let complete = view.snapshot(&key).expect("terminal snapshot");
+        assert_eq!(
+            complete.document.revisions.state.0,
+            pending.document.revisions.state.0 + 1
+        );
+        let operation = &complete.document.operations[0];
+        assert_eq!(operation.outcome, CommandOutcome::Applied);
+        assert_eq!(operation.write_attempt, WriteAttempt::Confirmed);
+        assert_eq!(operation.history.len(), 1);
+        assert_eq!(operation.history[0].from, CommandOutcome::Pending);
+        assert_eq!(operation.history[0].to, CommandOutcome::Applied);
+
+        let next_snapshot = view.snapshot(&key).expect("completed snapshot");
+        let next = publisher
+            .reserve(validated_mode_command(&next_snapshot, "gesture-2", "SDM"))
+            .await
+            .expect("new generation reserves after terminal completion");
+        assert_eq!(
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Applied,
+                        WriteAttempt::Confirmed,
+                        Timestamp::new("2026-07-31T00:00:02Z"),
+                        None,
+                        None,
+                    ),
+                )
+                .await,
+            Err(HqpCoordinatorRefusal::StaleLease),
+            "an older generation cannot overwrite the newer Pending operation"
+        );
+        let indeterminate = publisher
+            .complete(
+                next.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Indeterminate,
+                    WriteAttempt::Attempted,
+                    Timestamp::new("2026-07-31T00:00:03Z"),
+                    Some(RecoveryState::AwaitingReadback),
+                    None,
+                ),
+            )
+            .await
+            .expect("native ambiguity is retained truthfully");
+        assert_eq!(indeterminate.outcome, CommandOutcome::Indeterminate);
+        assert_eq!(indeterminate.write_attempt, WriteAttempt::Attempted);
+        assert_eq!(
+            indeterminate.recovery,
+            Some(RecoveryState::AwaitingReadback)
+        );
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn coordinator_stop_terminalizes_every_pre_receipt_pending_as_no_send_before_run_ends() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let main_key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let mut second_observation = sample();
+        second_observation.instance_name = "second".to_string();
+        second_observation.execution_target.instance_name = "second".to_string();
+        publisher
+            .observed(second_observation)
+            .await
+            .expect("second producer admitted");
+        let second_key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:second".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+
+        let reserved = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&main_key).expect("main snapshot"),
+                "reserved-on-stop",
+                "PCM",
+            ))
+            .await
+            .expect("reserved operation");
+        let second_reserved = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&second_key).expect("second snapshot"),
+                "second-reserved-on-stop",
+                "PCM",
+            ))
+            .await
+            .expect("second reserved operation");
+
+        publisher.manager_stopped().await.expect("manager stops");
+
+        let reserved_terminal = view.snapshot(&main_key).expect("main retained");
+        let reserved_operation = reserved_terminal
+            .document
+            .operations
+            .iter()
+            .find(|operation| operation.id == reserved.operation().id)
+            .expect("reserved audit retained");
+        assert_eq!(reserved_operation.outcome, CommandOutcome::Superseded);
+        assert_eq!(reserved_operation.write_attempt, WriteAttempt::NotAttempted);
+        assert_eq!(
+            reserved_operation.recovery,
+            Some(RecoveryState::ReplanRequired)
+        );
+        assert!(reserved_operation.reason.is_some());
+
+        let second_terminal = view.snapshot(&second_key).expect("second retained");
+        let second_operation = second_terminal
+            .document
+            .operations
+            .iter()
+            .find(|operation| operation.id == second_reserved.operation().id)
+            .expect("second audit retained");
+        assert_eq!(second_operation.outcome, CommandOutcome::Superseded);
+        assert_eq!(second_operation.write_attempt, WriteAttempt::NotAttempted);
+        assert_eq!(
+            second_operation.recovery,
+            Some(RecoveryState::ReplanRequired)
+        );
+        assert!(second_operation.reason.is_some());
+        assert_eq!(
+            publisher.validate(reserved.lease()).await,
+            Err(HqpCoordinatorRefusal::StaleLease)
+        );
+        assert_eq!(
+            publisher.validate(second_reserved.lease()).await,
+            Err(HqpCoordinatorRefusal::StaleLease)
+        );
+
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn instance_removal_defers_retirement_until_inflight_reservation_reports_no_send_truth() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let reservation = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("initial"),
+                "remove-before-receipt",
+                "PCM",
+            ))
+            .await
+            .expect("reservation admitted before removal");
+
+        publisher
+            .instance_removed("main", 7)
+            .await
+            .expect("removal records retirement intent without erasing accepted work");
+        assert!(
+            view.snapshot(&key).is_some(),
+            "the producer remains until the actor reports whether native I/O happened"
+        );
+
+        let no_send = publisher
+            .complete(
+                reservation.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Superseded,
+                    WriteAttempt::NotAttempted,
+                    Timestamp::new("2026-07-31T00:00:01Z"),
+                    Some(RecoveryState::ReplanRequired),
+                    None,
+                ),
+            )
+            .await
+            .expect("no-send receipt terminalizes before retirement");
+        assert_eq!(no_send.outcome, CommandOutcome::Superseded);
+        assert_eq!(no_send.write_attempt, WriteAttempt::NotAttempted);
+        assert!(
+            view.snapshot(&key).is_none(),
+            "retirement follows terminal admission"
+        );
+
+        let late = publisher
+            .complete(
+                reservation.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Applied,
+                    WriteAttempt::Confirmed,
+                    Timestamp::new("2026-07-31T00:00:02Z"),
+                    Some(RecoveryState::NotRequired),
+                    None,
+                ),
+            )
+            .await
+            .expect("late duplicate reads retained terminal audit rather than disappearing");
+        assert_eq!(late.outcome, CommandOutcome::Superseded);
+        assert_eq!(late.write_attempt, WriteAttempt::NotAttempted);
+        assert_eq!(late.recovery, Some(RecoveryState::ReplanRequired));
+
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn instance_removal_arriving_before_typed_receipt_completion_preserves_attempt_truth() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let reservation = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("initial"),
+                "remove-after-receipt",
+                "PCM",
+            ))
+            .await
+            .expect("reservation admitted");
+        publisher
+            .instance_removed("main", 7)
+            .await
+            .expect("removal waits for the actor's receipt completion");
+        assert!(
+            view.snapshot(&key).is_some(),
+            "removal must not classify a still-Pending write as no-send"
+        );
+        let retained = publisher
+            .complete(
+                reservation.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Indeterminate,
+                    WriteAttempt::Attempted,
+                    Timestamp::new("2026-07-31T00:00:01Z"),
+                    Some(RecoveryState::AwaitingReadback),
+                    None,
+                ),
+            )
+            .await
+            .expect("receipt terminalizes before deferred retirement");
+        assert_eq!(retained.outcome, CommandOutcome::Indeterminate);
+        assert_eq!(retained.write_attempt, WriteAttempt::Attempted);
+        assert!(
+            view.snapshot(&key).is_none(),
+            "retirement follows attempted receipt truth"
+        );
+
+        let duplicate = publisher
+            .complete(
+                reservation.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Superseded,
+                    WriteAttempt::NotAttempted,
+                    Timestamp::new("2026-07-31T00:00:02Z"),
+                    Some(RecoveryState::ReplanRequired),
+                    None,
+                ),
+            )
+            .await
+            .expect("late duplicate preserves the attempted receipt audit");
+        assert_eq!(duplicate.outcome, CommandOutcome::Indeterminate);
+        assert_eq!(duplicate.write_attempt, WriteAttempt::Attempted);
+
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn coordinator_retries_one_terminal_publication_failure_without_stranding_conflict() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let reservation = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("initial"),
+                "retry-publication",
+                "PCM",
+            ))
+            .await
+            .expect("reserve");
+        publisher.refuse_next_publication().await;
+        publisher
+            .complete(
+                reservation.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Applied,
+                    WriteAttempt::Confirmed,
+                    Timestamp::new("2026-07-31T00:00:01Z"),
+                    Some(RecoveryState::NotRequired),
+                    None,
+                ),
+            )
+            .await
+            .expect("coordinator-owned retry admits terminal state");
+
+        let next_snapshot = view.snapshot(&key).expect("terminal snapshot");
+        publisher
+            .reserve(validated_mode_command(
+                &next_snapshot,
+                "after-publication-retry",
+                "SDM",
+            ))
+            .await
+            .expect("publication retry releases the conflict set");
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn coordinator_durably_retries_terminal_publication_after_caller_returns() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let reservation = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("initial"),
+                "durable-publication",
+                "PCM",
+            ))
+            .await
+            .expect("reserve");
+        for _ in 0..3 {
+            publisher.refuse_next_publication().await;
+        }
+        assert!(matches!(
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Applied,
+                        WriteAttempt::Confirmed,
+                        Timestamp::new("2026-07-31T00:00:01Z"),
+                        Some(RecoveryState::NotRequired),
+                        None,
+                    ),
+                )
+                .await,
+            Err(HqpCoordinatorRefusal::PublicationFailed(_))
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if view
+                    .snapshot(&key)
+                    .expect("snapshot retained")
+                    .document
+                    .operations[0]
+                    .outcome
+                    == CommandOutcome::Applied
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("coordinator retries its immutable deferred terminal commit");
+
+        let next_snapshot = view.snapshot(&key).expect("deferred commit admitted");
+        publisher
+            .reserve(validated_mode_command(
+                &next_snapshot,
+                "after-durable-retry",
+                "SDM",
+            ))
+            .await
+            .expect("admitted deferred commit releases conflict");
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn deferred_terminal_commit_blocks_observation_until_its_revision_is_admitted() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let reservation = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("initial"),
+                "terminal-frontier",
+                "PCM",
+            ))
+            .await
+            .expect("reserve");
+        // `complete` owns two immediate terminal attempts; the third fault is consumed by the
+        // concurrent observation's frontier flush. It must not publish a competing document at
+        // the terminal candidate's same next revision.
+        for _ in 0..3 {
+            publisher.refuse_next_publication().await;
+        }
+        assert!(matches!(
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Applied,
+                        WriteAttempt::Confirmed,
+                        Timestamp::new("2026-07-31T00:00:01Z"),
+                        Some(RecoveryState::NotRequired),
+                        None,
+                    ),
+                )
+                .await,
+            Err(HqpCoordinatorRefusal::PublicationFailed(_))
+        ));
+
+        let mut competing_observation = sample();
+        competing_observation.metadata.title = Some("must wait behind terminal".to_string());
+        publisher
+            .observed(competing_observation)
+            .await
+            .expect("observation either flushes the terminal frontier first or follows it");
+        assert_eq!(
+            view.snapshot(&key)
+                .expect("frontier snapshot")
+                .document
+                .operations[0]
+                .outcome,
+            CommandOutcome::Applied,
+            "the terminal candidate is admitted before the competing observation can advance"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if view
+                    .snapshot(&key)
+                    .expect("terminal snapshot")
+                    .document
+                    .operations[0]
+                    .outcome
+                    == CommandOutcome::Applied
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("deferred terminal retry is admitted before a successor");
+
+        let successor = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("terminal snapshot"),
+                "successor-after-frontier",
+                "SDM",
+            ))
+            .await
+            .expect("successor is usable after terminal frontier clears");
+        assert_eq!(successor.operation().outcome, CommandOutcome::Pending);
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn coherent_observation_converges_pending_and_source_empty_semantically() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let pcm = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("source snapshot"),
+                "to-pcm",
+                "PCM",
+            ))
+            .await
+            .expect("PCM reserved");
+        let mut pcm_observation = sample();
+        pcm_observation.mode_is_source = false;
+        pcm_observation.mode.selected = "PCM".to_string();
+        publisher
+            .observed(pcm_observation.clone())
+            .await
+            .expect("PCM converged");
+        let pcm_snapshot = view.snapshot(&key).expect("PCM snapshot");
+        let pcm_operation = pcm_snapshot
+            .document
+            .operations
+            .iter()
+            .find(|operation| operation.id == pcm.operation().id)
+            .expect("PCM operation");
+        assert_eq!(pcm_operation.outcome, CommandOutcome::Ignored);
+        assert_eq!(pcm_operation.write_attempt, WriteAttempt::NotAttempted);
+        assert_eq!(
+            pcm_operation.observed,
+            Some(pcm_snapshot.document.position())
+        );
+
+        let source = publisher
+            .reserve(validated_mode_command(
+                &pcm_snapshot,
+                "to-source",
+                "[source]",
+            ))
+            .await
+            .expect("source reserved");
+        publisher
+            .observed(sample())
+            .await
+            .expect("source Empty converged");
+        let source_snapshot = view.snapshot(&key).expect("source snapshot");
+        assert_eq!(
+            control(&source_snapshot.document, CONTROL_PIPELINE_MODE).observed(),
+            Some(&ControlValue::Empty)
+        );
+        let source_operation = source_snapshot
+            .document
+            .operations
+            .iter()
+            .find(|operation| operation.id == source.operation().id)
+            .expect("source operation");
+        assert_eq!(source_operation.outcome, CommandOutcome::Ignored);
+        assert_eq!(source_operation.write_attempt, WriteAttempt::NotAttempted);
+        assert_eq!(
+            source_operation.observed,
+            Some(source_snapshot.document.position())
+        );
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn later_generation_supersedes_unresolved_predecessor_during_convergence() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let first = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("initial"),
+                "first-generation",
+                "PCM",
+            ))
+            .await
+            .expect("first reserved");
+        publisher
+            .complete(
+                first.lease(),
+                HqpCommandCompletion::new(
+                    CommandOutcome::Indeterminate,
+                    WriteAttempt::Attempted,
+                    Timestamp::new("2026-07-31T00:00:01Z"),
+                    Some(RecoveryState::AwaitingReadback),
+                    None,
+                ),
+            )
+            .await
+            .expect("first unresolved");
+        let second = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("unresolved snapshot"),
+                "second-generation",
+                "SDM",
+            ))
+            .await
+            .expect("second reserved");
+
+        let mut observed = sample();
+        observed.mode_is_source = false;
+        observed.mode.selected = "SDM".to_string();
+        publisher.observed(observed).await.expect("SDM observed");
+        let converged = view.snapshot(&key).expect("converged snapshot");
+        let first = converged
+            .document
+            .operations
+            .iter()
+            .find(|operation| operation.id == first.operation().id)
+            .expect("first retained");
+        let second = converged
+            .document
+            .operations
+            .iter()
+            .find(|operation| operation.id == second.operation().id)
+            .expect("second retained");
+        assert_eq!(first.outcome, CommandOutcome::Superseded);
+        assert_eq!(second.outcome, CommandOutcome::Ignored);
+        assert_eq!(second.write_attempt, WriteAttempt::NotAttempted);
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn matching_poll_before_native_execution_resolves_as_ignored_no_send() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let reservation = publisher
+            .reserve(validated_mode_command(
+                &view.snapshot(&key).expect("initial"),
+                "setter-poll-race",
+                "PCM",
+            ))
+            .await
+            .expect("reserve");
+        let mut racing_poll = sample();
+        racing_poll.metadata.title = Some("poll raced setter".to_string());
+        publisher
+            .observed(racing_poll)
+            .await
+            .expect("racing observation admitted");
+        let raced = view.snapshot(&key).expect("raced snapshot");
+        let operation = raced
+            .document
+            .operations
+            .iter()
+            .find(|operation| operation.id == reservation.operation().id)
+            .expect("operation retained");
+        assert_eq!(operation.outcome, CommandOutcome::Pending);
+        assert_eq!(operation.write_attempt, WriteAttempt::NotAttempted);
+
+        let mut converged = sample();
+        converged.mode_is_source = false;
+        converged.mode.selected = "PCM".to_string();
+        publisher
+            .observed(converged)
+            .await
+            .expect("later convergence");
+        let ignored = view.snapshot(&key).expect("ignored snapshot");
+        assert_eq!(
+            ignored.document.operations[0].outcome,
+            CommandOutcome::Ignored
+        );
+        assert_eq!(
+            ignored.document.operations[0].write_attempt,
+            WriteAttempt::NotAttempted
+        );
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn terminal_ledger_and_correlation_tombstones_are_bounded_but_unresolved_are_retained() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let mut oldest_request = None;
+        let mut newest_request = None;
+        for index in 0..(MAX_TERMINAL_OPERATIONS + 3) {
+            let snapshot = view.snapshot(&key).expect("iteration snapshot");
+            let request = crate::producers::hqplayer_command::HqpImmediateCommandRequest {
+                key: key.clone(),
+                expected: snapshot.document.position(),
+                control: ControlId::new(CONTROL_PIPELINE_MODE),
+                requested: ControlValue::choice(choice_id(CONTROL_PIPELINE_MODE, "PCM")),
+                lane: ApplyLane::Immediate,
+                correlation_id: format!("bounded-{index}"),
+            };
+            if index == 0 {
+                oldest_request = Some(request.clone());
+            }
+            newest_request = Some(request.clone());
+            let reservation = publisher
+                .reserve(
+                    crate::producers::hqplayer_command::preflight(&snapshot, &request)
+                        .expect("request preflight"),
+                )
+                .await
+                .expect("reserve");
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Applied,
+                        WriteAttempt::Confirmed,
+                        Timestamp::new(format!("2026-07-31T00:00:{index:02}Z")),
+                        Some(RecoveryState::NotRequired),
+                        None,
+                    ),
+                )
+                .await
+                .expect("complete");
+        }
+
+        let retained = view.snapshot(&key).expect("retained snapshot");
+        assert_eq!(retained.document.operations.len(), MAX_TERMINAL_OPERATIONS);
+        assert_eq!(
+            publisher
+                .lookup_correlation(oldest_request.as_ref().expect("oldest"))
+                .await,
+            Err(HqpCoordinatorRefusal::CorrelationConflict),
+            "compacted terminal correlations remain no-replay tombstones"
+        );
+        assert!(
+            publisher
+                .lookup_correlation(newest_request.as_ref().expect("newest"))
+                .await
+                .expect("newest lookup")
+                .is_some(),
+            "newest terminal correlation remains idempotent"
+        );
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn unresolved_operation_retention_applies_backpressure_instead_of_growing_without_bound()
+    {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        for index in 0..MAX_UNRESOLVED_OPERATIONS {
+            let reservation = publisher
+                .reserve(validated_mode_command(
+                    &view.snapshot(&key).expect("current snapshot"),
+                    &format!("unresolved-{index}"),
+                    "PCM",
+                ))
+                .await
+                .expect("bounded unresolved record admits before cap");
+            publisher
+                .complete(
+                    reservation.lease(),
+                    HqpCommandCompletion::new(
+                        CommandOutcome::Indeterminate,
+                        WriteAttempt::Attempted,
+                        Timestamp::new(format!("2026-07-31T00:01:{index:02}Z")),
+                        Some(RecoveryState::AwaitingReadback),
+                        None,
+                    ),
+                )
+                .await
+                .expect("unresolved receipt is retained");
+        }
+        assert_eq!(
+            publisher
+                .reserve(validated_mode_command(
+                    &view.snapshot(&key).expect("cap snapshot"),
+                    "unresolved-over-cap",
+                    "PCM",
+                ))
+                .await,
+            Err(HqpCoordinatorRefusal::UnresolvedRetentionFull),
+            "the coordinator backpressures rather than silently evicting uncertainty"
+        );
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
+    }
+
+    #[tokio::test]
+    async fn coordinator_rejects_empty_and_oversized_correlations_even_if_preflight_is_bypassed() {
+        let (publisher, view, shutdown, actor_task) = coordinator_fixture().await;
+        let key = crate::producers::ProducerKey {
+            producer_id: "hqplayer:main".to_string(),
+            role: TargetRole::DspEngine,
+            zone_id: None,
+        };
+        let snapshot = view.snapshot(&key).expect("initial");
+        for correlation_id in [String::new(), "x".repeat(MAX_CORRELATION_ID_BYTES + 1)] {
+            let mut command = validated_mode_command(&snapshot, "valid", "PCM");
+            command.request.correlation_id = correlation_id;
+            assert_eq!(
+                publisher.reserve(command).await,
+                Err(HqpCoordinatorRefusal::InvalidCorrelation)
+            );
+        }
+
+        publisher.manager_stopped().await.expect("manager stops");
+        shutdown.cancel();
+        actor_task.await.expect("actor joins");
     }
 }

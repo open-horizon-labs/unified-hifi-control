@@ -890,63 +890,72 @@ impl std::fmt::Display for HqpRejected {
 
 impl std::error::Error for HqpRejected {}
 
-/// Authoritative readback evidence for one native setting operation.
-///
-/// This intentionally names protocol facts, not adaptive command outcomes.  The adapter knows
-/// whether its same-session `State` observation matched; the producer layer decides what that
-/// means for a correlated operation later.  Keeping it here means that layer never has to recover
-/// an attempt boundary by inspecting an `anyhow` display string.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NativeSettingReadback {
-    /// `State` read the requested semantic value after the operation.
-    Verified,
-    /// The preflight/readback proof established that no write was needed.
-    Noop,
-    /// `State` was available but held a different value.
-    Divergent { requested: String, observed: String },
-    /// The native session could not provide an authoritative readback.
-    Unavailable { reason: String },
+// Native execution is intentionally internal.  The debug-profile visibility exists solely for
+// `tests/hqplayer_conformance.rs`, whose socket fake is an integration test and therefore cannot
+// see library `cfg(test)` items.  Release consumers cannot construct a setting, forge a target, or
+// inspect a receipt; they must use the shared command service.
+macro_rules! native_execution_test_seam {
+    ($visibility:vis) => {
+        /// Authoritative readback evidence for one native setting operation.
+        #[doc(hidden)]
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        $visibility enum NativeSettingReadback {
+            Verified,
+            Noop,
+            Divergent { requested: String, observed: String },
+            Unavailable { reason: String },
+        }
+
+        /// Native evidence retained by semantic pipeline setters.
+        #[doc(hidden)]
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        $visibility enum NativeSettingReceipt {
+            NotAttempted { reason: String, readback: NativeSettingReadback },
+            Suppressed { reason: String },
+            DaemonRejected(HqpRejected),
+            DaemonAcknowledged { readback: NativeSettingReadback },
+            PossibleAttempt { reason: String, readback: NativeSettingReadback },
+        }
+
+        /// Semantic names/Hz only; never native list positions.
+        #[doc(hidden)]
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        $visibility enum HqpNativeSetting {
+            Mode(String),
+            Filter1x(String),
+            FilterNx(String),
+            Shaper(String),
+            Rate(u32),
+        }
+
+        /// Exact producer identity retained in an opaque command lease.
+        #[doc(hidden)]
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        $visibility struct HqpNativeExecutionTarget {
+            pub instance_name: String,
+            pub producer_epoch: u64,
+            pub endpoint_generation: u64,
+            pub transport_generation: u64,
+        }
+    };
 }
 
-/// Native evidence retained by the five semantic pipeline setters.
-///
-/// This is deliberately contract-free: it does not mention adaptive controls, operation IDs, or
-/// user-facing status.  It distinguishes the facts the wire can establish: no send, a reply that
-/// explicitly rejected or acknowledged the request, and a request that may have left the process
-/// but never supplied usable acknowledgement.  The accompanying [`NativeSettingReadback`] remains
-/// separate so a caller never mistakes `result="OK"` for proof of application.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NativeSettingReceipt {
-    /// No request was attempted.  A no-op can still have a verified readback.
-    NotAttempted {
-        reason: String,
-        readback: NativeSettingReadback,
-    },
-    /// The daemon explicitly refused this request.  This is not inferred from a string.
-    DaemonRejected(HqpRejected),
-    /// The daemon explicitly returned `result="OK"`; readback determines whether it applied.
-    DaemonAcknowledged { readback: NativeSettingReadback },
-    /// A request may have been written, but acknowledgement was unavailable or non-explicit.
-    PossibleAttempt {
-        reason: String,
-        readback: NativeSettingReadback,
-    },
-}
-
-/// Semantic setting commands whose native evidence is available to the producer layer.
-///
-/// Values remain semantic names/Hz values; native list positions never cross this adapter boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Wired by the producer command service in the next #329 slice.
-pub(crate) enum HqpNativeSetting<'a> {
-    Mode(&'a str),
-    Filter1x(&'a str),
-    FilterNx(&'a str),
-    Shaper(&'a str),
-    Rate(u32),
-}
+#[cfg(debug_assertions)]
+native_execution_test_seam!(pub);
+#[cfg(not(debug_assertions))]
+native_execution_test_seam!(pub(crate));
 
 impl NativeSettingReceipt {
+    fn with_readback(self, readback: NativeSettingReadback) -> Self {
+        match self {
+            Self::NotAttempted { reason, .. } => Self::NotAttempted { reason, readback },
+            Self::Suppressed { reason } => Self::Suppressed { reason },
+            Self::DaemonRejected(rejected) => Self::DaemonRejected(rejected),
+            Self::DaemonAcknowledged { .. } => Self::DaemonAcknowledged { readback },
+            Self::PossibleAttempt { reason, .. } => Self::PossibleAttempt { reason, readback },
+        }
+    }
+
     /// Preserve the pre-existing adapter surface while the immediate-command service is introduced.
     ///
     /// Public setters still return `Result<SettingOutcome>`; this is the one intentional collapse
@@ -964,6 +973,10 @@ impl NativeSettingReceipt {
                 reason: format!(
                     "the write was not attempted ({reason}); native readback was {readback:?}"
                 ),
+            }),
+            Self::Suppressed { reason } => Ok(SettingOutcome::Suppressed {
+                what: what.to_string(),
+                reason,
             }),
             Self::DaemonRejected(rejected) => Err(anyhow!(rejected)),
             Self::DaemonAcknowledged {
@@ -1242,6 +1255,8 @@ struct CoherentPipelineSnapshot {
     host: String,
     instance_name: String,
     producer_epoch: u64,
+    endpoint_generation: u64,
+    transport_generation: u64,
     observed_at: SystemTime,
 }
 
@@ -1251,6 +1266,8 @@ struct CoherentSessionIdentity {
     host: String,
     instance_name: String,
     producer_epoch: u64,
+    endpoint_generation: u64,
+    transport_generation: u64,
 }
 
 /// Contract-free observation exported by the native adapter. Publication policy and adaptive
@@ -1261,6 +1278,9 @@ pub struct HqpNativeObservation {
     pub instance_label: Option<String>,
     pub product_version: Option<String>,
     pub producer_epoch: u64,
+    /// Exact native identity proven by the same coherent observation. The producer coordinator
+    /// retains this out of the declarative document and copies it into the opaque command lease.
+    pub(crate) execution_target: HqpNativeExecutionTarget,
     pub observed_at: SystemTime,
     pub transport: HqpNativeTransportState,
     pub metadata: HqpNativeMetadata,
@@ -1837,6 +1857,27 @@ pub struct HqpAdapter {
 }
 
 impl HqpAdapter {
+    fn store_captured_receipt(
+        captured: &std::sync::Mutex<Option<NativeSettingReceipt>>,
+        receipt: NativeSettingReceipt,
+    ) {
+        let mut guard = match captured.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(receipt);
+    }
+
+    fn take_captured_receipt(
+        captured: &std::sync::Mutex<Option<NativeSettingReceipt>>,
+    ) -> Option<NativeSettingReceipt> {
+        let mut guard = match captured.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.take()
+    }
+
     pub fn new(bus: SharedBus) -> Self {
         #[allow(clippy::expect_used)] // HTTP client creation only fails if TLS setup fails
         let http_client = Client::builder()
@@ -2095,6 +2136,43 @@ impl HqpAdapter {
         self.state.read().await.transport_generation
     }
 
+    /// Capture the exact producer identity currently eligible for an immediate command.
+    async fn native_execution_target_inner(&self) -> Option<HqpNativeExecutionTarget> {
+        let state = self.state.read().await;
+        let poisoned = self
+            .transport_poisoned
+            .load(std::sync::atomic::Ordering::Acquire);
+        if poisoned || !state.connected || state.host.is_none() {
+            return None;
+        }
+        Some(HqpNativeExecutionTarget {
+            instance_name: state
+                .instance_name
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+            producer_epoch: state.producer_epoch,
+            endpoint_generation: state.endpoint_generation,
+            transport_generation: state.transport_generation,
+        })
+    }
+
+    /// Debug-only integration-test seam. Production composition receives this identity only from
+    /// a coherent observation and retains it in the command lease.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn native_execution_target(&self) -> Option<HqpNativeExecutionTarget> {
+        self.native_execution_target_inner().await
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub(crate) async fn native_execution_target(&self) -> Option<HqpNativeExecutionTarget> {
+        self.native_execution_target_inner().await
+    }
+
+    async fn matches_native_execution_target(&self, target: &HqpNativeExecutionTarget) -> bool {
+        self.native_execution_target().await.as_ref() == Some(target)
+    }
+
     /// Capture the envelope fields for a coherent observation under the same native-session
     /// fence as its State, Status, volume range and chain lists. This helper deliberately reads no
     /// chain cache: the verified `ChainSnapshot` remains the only source of list data.
@@ -2117,6 +2195,8 @@ impl HqpAdapter {
                 .clone()
                 .unwrap_or_else(|| "default".to_string()),
             producer_epoch: state.producer_epoch,
+            endpoint_generation: state.endpoint_generation,
+            transport_generation: state.transport_generation,
         })
     }
 
@@ -2539,6 +2619,12 @@ impl HqpAdapter {
             product_version: Some(snapshot.info.version.clone())
                 .filter(|version| !version.is_empty()),
             producer_epoch: snapshot.producer_epoch,
+            execution_target: HqpNativeExecutionTarget {
+                instance_name: snapshot.instance_name.clone(),
+                producer_epoch: snapshot.producer_epoch,
+                endpoint_generation: snapshot.endpoint_generation,
+                transport_generation: snapshot.transport_generation,
+            },
             observed_at: snapshot.observed_at,
             transport: match snapshot.playback_status.state {
                 0 => HqpNativeTransportState::Stopped,
@@ -2852,6 +2938,20 @@ impl HqpAdapter {
         Ok((modes, generation))
     }
 
+    async fn fresh_modes_on_transport(&self, generation: u64) -> Result<(Vec<ListItem>, u64)> {
+        let since = self.chain_generation().await;
+        let xml = Self::build_request("GetModes", &[]);
+        let response = self.send_command_on_transport(&xml, generation).await?;
+        let modes = Self::parse_items(&response, "ModesItem", |item| ListItem {
+            index: Self::parse_attr_u32(item, "index"),
+            name: Self::parse_attr(item, "name").unwrap_or_default(),
+            value: Self::parse_attr_i32(item, "value"),
+        });
+        self.publish_fresh_family(FreshFamily::Modes(modes.clone()), since)
+            .await?;
+        Ok((modes, generation))
+    }
+
     /// Fetch the loaded chain's filter list from the daemon and cache it.
     async fn fresh_filters(&self) -> Result<Vec<FilterItem>> {
         let since = self.chain_generation().await;
@@ -2864,6 +2964,21 @@ impl HqpAdapter {
     async fn fresh_filters_with_generation(&self) -> Result<(Vec<FilterItem>, u64)> {
         let since = self.chain_generation().await;
         let (filters, generation) = self.get_filters_with_generation().await?;
+        self.publish_fresh_family(FreshFamily::Filters(filters.clone()), since)
+            .await?;
+        Ok((filters, generation))
+    }
+
+    async fn fresh_filters_on_transport(&self, generation: u64) -> Result<(Vec<FilterItem>, u64)> {
+        let since = self.chain_generation().await;
+        let xml = Self::build_request("GetFilters", &[]);
+        let response = self.send_command_on_transport(&xml, generation).await?;
+        let filters = Self::parse_items(&response, "FiltersItem", |item| FilterItem {
+            index: Self::parse_attr_u32(item, "index"),
+            name: Self::parse_attr(item, "name").unwrap_or_default(),
+            value: Self::parse_attr_i32(item, "value"),
+            arg: Self::parse_attr_u32(item, "arg"),
+        });
         self.publish_fresh_family(FreshFamily::Filters(filters.clone()), since)
             .await?;
         Ok((filters, generation))
@@ -2886,6 +3001,20 @@ impl HqpAdapter {
         Ok((shapers, generation))
     }
 
+    async fn fresh_shapers_on_transport(&self, generation: u64) -> Result<(Vec<ListItem>, u64)> {
+        let since = self.chain_generation().await;
+        let xml = Self::build_request("GetShapers", &[]);
+        let response = self.send_command_on_transport(&xml, generation).await?;
+        let shapers = Self::parse_items(&response, "ShapersItem", |item| ListItem {
+            index: Self::parse_attr_u32(item, "index"),
+            name: Self::parse_attr(item, "name").unwrap_or_default(),
+            value: Self::parse_attr_i32(item, "value"),
+        });
+        self.publish_fresh_family(FreshFamily::Shapers(shapers.clone()), since)
+            .await?;
+        Ok((shapers, generation))
+    }
+
     /// Fetch the loaded chain's rate list from the daemon and cache it.
     ///
     /// The rate list is also what the read path and [`Self::refresh_lists`] **probe** with — through
@@ -2903,6 +3032,47 @@ impl HqpAdapter {
         self.publish_fresh_family(FreshFamily::Rates(rates.clone()), since)
             .await?;
         Ok((rates, generation))
+    }
+
+    async fn fresh_rates_on_transport(&self, generation: u64) -> Result<(Vec<RateItem>, u64)> {
+        let since = self.chain_generation().await;
+        let xml = Self::build_request("GetRates", &[]);
+        let response = self.send_command_on_transport(&xml, generation).await?;
+        let rates = Self::parse_items(&response, "RatesItem", |item| RateItem {
+            index: Self::parse_attr_u32(item, "index"),
+            rate: Self::parse_attr_u32(item, "rate"),
+        });
+        self.publish_fresh_family(FreshFamily::Rates(rates.clone()), since)
+            .await?;
+        Ok((rates, generation))
+    }
+
+    async fn command_modes(&self, fence: Option<u64>) -> Result<(Vec<ListItem>, u64)> {
+        match fence {
+            Some(generation) => self.fresh_modes_on_transport(generation).await,
+            None => self.fresh_modes_with_generation().await,
+        }
+    }
+
+    async fn command_filters(&self, fence: Option<u64>) -> Result<(Vec<FilterItem>, u64)> {
+        match fence {
+            Some(generation) => self.fresh_filters_on_transport(generation).await,
+            None => self.fresh_filters_with_generation().await,
+        }
+    }
+
+    async fn command_shapers(&self, fence: Option<u64>) -> Result<(Vec<ListItem>, u64)> {
+        match fence {
+            Some(generation) => self.fresh_shapers_on_transport(generation).await,
+            None => self.fresh_shapers_with_generation().await,
+        }
+    }
+
+    async fn command_rates(&self, fence: Option<u64>) -> Result<(Vec<RateItem>, u64)> {
+        match fence {
+            Some(generation) => self.fresh_rates_on_transport(generation).await,
+            None => self.fresh_rates_with_generation().await,
+        }
     }
 
     /// Fingerprint of a name-keyed list — modes and shapers.
@@ -3401,11 +3571,13 @@ impl HqpAdapter {
         let actual_generation = self.transport_generation().await;
         let has_connection = self.connection.lock().await.is_some();
         if !has_connection || actual_generation != expected_generation {
-            return Err(HqpSessionChanged {
-                expected: expected_generation,
-                actual: actual_generation,
-            }
-            .into());
+            return Ok(NativeSettingDelivery::NotAttempted {
+                reason: HqpSessionChanged {
+                    expected: expected_generation,
+                    actual: actual_generation,
+                }
+                .to_string(),
+            });
         }
 
         let mut request_attempted = false;
@@ -4463,26 +4635,7 @@ impl HqpAdapter {
     /// The proof amplifies requests: an ordinary semantic write adds a closing list read, while one
     /// visible pre-write transition can perform a second no-op decision plus its proof. The restart
     /// is deliberately capped at one and never repeats a mutation.
-    async fn proven_setting<T, R, Fetch, FetchFut, Decide, DecideFut>(
-        &self,
-        family: &SemanticFamily<T, R>,
-        requested: &R,
-        fetch: Fetch,
-        decide: Decide,
-    ) -> Result<SettingOutcome>
-    where
-        R: std::fmt::Display + ?Sized,
-        Fetch: Fn() -> FetchFut,
-        FetchFut: std::future::Future<Output = Result<(Vec<T>, u64)>>,
-        Decide: Fn(u32, u64) -> DecideFut,
-        DecideFut: std::future::Future<Output = Result<SettingOutcome>>,
-    {
-        let _operation_guard = self.operation_lock.lock().await;
-        self.proven_setting_under_operation(family, requested, fetch, decide)
-            .await
-    }
-
-    /// [`Self::proven_setting`] while the caller already owns the root operation lease.
+    /// Run the semantic proof while the caller already owns the root operation lease.
     ///
     /// Kept separate because a fair non-reentrant lock plus a public-to-public nested call is a
     /// deadlock as soon as reconfiguration queues between them.
@@ -4490,6 +4643,7 @@ impl HqpAdapter {
         &self,
         family: &SemanticFamily<T, R>,
         requested: &R,
+        fence: Option<u64>,
         fetch: Fetch,
         decide: Decide,
     ) -> Result<SettingOutcome>
@@ -4628,8 +4782,25 @@ impl HqpAdapter {
                 }
             };
             if family.refuses_source_mode {
-                let modes = match self.fresh_modes().await {
-                    Ok(modes) => modes,
+                let modes = match self.command_modes(fence).await {
+                    Ok((modes, modes_generation)) if modes_generation == attempt_generation => {
+                        modes
+                    }
+                    Ok((_, modes_generation)) => {
+                        let error = HqpSessionChanged {
+                            expected: attempt_generation,
+                            actual: modes_generation,
+                        };
+                        if attempted_write {
+                            return Ok(SettingOutcome::Ambiguous {
+                                what: what.to_string(),
+                                reason: format!(
+                                    "a {what} write may have reached the wire, but the configured mode came from another session ({error})"
+                                ),
+                            });
+                        }
+                        return Err(error.into());
+                    }
                     Err(error) if attempted_write => {
                         return Ok(SettingOutcome::Ambiguous {
                             what: what.to_string(),
@@ -5041,41 +5212,9 @@ impl HqpAdapter {
     }
 
     async fn set_mode_under_operation(&self, mode_name: &str) -> Result<SettingOutcome> {
-        self.proven_setting_under_operation(
-            &Self::MODE,
-            mode_name,
-            || self.fresh_modes_with_generation(),
-            |mode_index, generation| async move {
-                let state = self.get_state_on_transport(generation).await?;
-                if u32::from(state.mode) == mode_index {
-                    tracing::debug!(
-                        "HQPlayer is already in mode {mode_index}; not writing it, because SetMode \
-                         clears the rate pin even when the mode does not change"
-                    );
-                    return NativeSettingReceipt::NotAttempted {
-                        reason:
-                            "State already held the requested mode; SetMode was not sent because \
-                                 it clears an exact-rate pin even when unchanged"
-                                .to_string(),
-                        readback: NativeSettingReadback::Noop,
-                    }
-                    .into_setting_outcome("mode");
-                }
-
-                let xml = Self::build_request("SetMode", &[("value", &mode_index.to_string())]);
-                let outcome = self
-                    .write_setting_on_transport(generation, &xml, "mode", mode_index, |s| {
-                        Some(u32::from(s.mode))
-                    })
-                    .await?;
-                // A mode change reloads the chain whatever the readback said, so nothing cached
-                // about it survives. This is also what makes the cleared pin honest: there is no
-                // remembered rate to report, only the one the daemon now holds.
-                self.invalidate_chain_cache().await;
-                Ok(outcome)
-            },
-        )
-        .await
+        self.execute_mode_receipt_under_operation(mode_name, None)
+            .await?
+            .into_setting_outcome("mode")
     }
 
     /// The request both sides of the pair travel in, built in one place so they cannot drift.
@@ -5158,6 +5297,7 @@ impl HqpAdapter {
         self.proven_setting_under_operation(
             &Self::FILTER_PAIR,
             filter_name,
+            None,
             || self.fresh_filters_with_generation(),
             |index, generation| async move {
                 let state = self.get_state_on_transport(generation).await?;
@@ -5206,53 +5346,10 @@ impl HqpAdapter {
         side: FilterSide,
         filter_name: &str,
     ) -> Result<SettingOutcome> {
-        let family = match side {
-            FilterSide::OneX => &Self::FILTER_1X,
-            FilterSide::Nx => &Self::FILTER_NX,
-        };
         let what = side.field();
-        self.proven_setting_under_operation(
-            family,
-            filter_name,
-            || self.fresh_filters_with_generation(),
-            |index, generation| async move {
-                let state = self.get_state_on_transport(generation).await?;
-                let (Some(current_1x), Some(current_nx)) = (state.filter1x, state.filter_nx) else {
-                    return Ok(SettingOutcome::Suppressed {
-                        what: what.to_string(),
-                        reason: "the daemon's State does not report both filter1x and filterNx, and \
-                                 SetFilter writes both sides at once; sending it would overwrite the \
-                                 sibling with a guess"
-                            .to_string(),
-                    });
-                };
-
-                let current = match side {
-                    FilterSide::OneX => current_1x,
-                    FilterSide::Nx => current_nx,
-                };
-                if current == index {
-                    return NativeSettingReceipt::NotAttempted {
-                        reason: format!("State already held the requested {what} filter"),
-                        readback: NativeSettingReadback::Noop,
-                    }
-                    .into_setting_outcome(what);
-                }
-
-                let (send_nx, send_1x) = match side {
-                    FilterSide::OneX => (current_nx, index),
-                    FilterSide::Nx => (index, current_1x),
-                };
-                tracing::debug!("SetFilter: value={send_nx} (Nx), value1x={send_1x} (1x)");
-                let xml = Self::filter_request(send_nx, send_1x);
-                self.write_setting_on_transport(generation, &xml, what, index, |s| match side {
-                    FilterSide::OneX => s.filter1x,
-                    FilterSide::Nx => s.filter_nx,
-                })
-                .await
-            },
-        )
-        .await
+        self.execute_filter_receipt_under_operation(side, filter_name, None)
+            .await?
+            .into_setting_outcome(what)
     }
 
     /// Resolve a filter name against the list the daemon is serving **now**.
@@ -5307,28 +5404,9 @@ impl HqpAdapter {
     }
 
     async fn set_shaper_under_operation(&self, shaper_name: &str) -> Result<SettingOutcome> {
-        self.proven_setting_under_operation(
-            &Self::SHAPER,
-            shaper_name,
-            || self.fresh_shapers_with_generation(),
-            |shaper_index, generation| async move {
-                if self.get_state_on_transport(generation).await?.shaper == shaper_index {
-                    return NativeSettingReceipt::NotAttempted {
-                        reason: "State already held the requested shaper".to_string(),
-                        readback: NativeSettingReadback::Noop,
-                    }
-                    .into_setting_outcome("shaper");
-                }
-
-                let xml =
-                    Self::build_request("SetShaping", &[("value", &shaper_index.to_string())]);
-                self.write_setting_on_transport(generation, &xml, "shaper", shaper_index, |s| {
-                    Some(s.shaper)
-                })
-                .await
-            },
-        )
-        .await
+        self.execute_shaper_receipt_under_operation(shaper_name, None)
+            .await?
+            .into_setting_outcome("shaper")
     }
 
     /// Whether the daemon's **configured** mode is the source-following one.
@@ -5361,131 +5439,361 @@ impl HqpAdapter {
         // Source-mode suppression lives inside the decision so every retry re-evaluates it before a
         // write; checking only once outside the bracket would let a transition to `[source]` during
         // the first attempt send a pin on the retry.
-        self.proven_setting(
-            &Self::RATE,
-            &rate_value,
-            || self.fresh_rates_with_generation(),
-            |index, generation| async move {
-                let modes = self.fresh_modes().await?;
-                let state = self.get_state_on_transport(generation).await?;
-                if let Some(mode_name) = Self::configured_source_mode(&modes, &state) {
-                    return Ok(SettingOutcome::Suppressed {
-                        what: "rate".to_string(),
-                        reason: format!(
-                            "the configured mode is '{mode_name}', in which the daemon acknowledges \
-                             a rate pin and applies nothing — the rate is governed by persistent \
-                             configuration there, so the write was not sent"
-                        ),
-                    });
-                }
-                if state.rate == index {
-                    return NativeSettingReceipt::NotAttempted {
-                        reason: "State already held the requested rate pin".to_string(),
-                        readback: NativeSettingReadback::Noop,
-                    }
-                    .into_setting_outcome("rate");
-                }
-
-                let xml = Self::build_request("SetRate", &[("value", &index.to_string())]);
-                self.write_setting_on_transport(generation, &xml, "rate", index, |s| {
-                    Some(s.rate)
-                })
-                .await
-            },
-        )
-        .await
+        let _operation_guard = self.operation_lock.lock().await;
+        self.execute_rate_receipt_under_operation(rate_value, None)
+            .await?
+            .into_setting_outcome("rate")
     }
 
     /// Execute one semantic pipeline command and retain typed native evidence for its caller.
     ///
-    /// This is the producer-facing seam for the five #329 controls.  It deliberately accepts no
-    /// native index and imports no producer/adaptive vocabulary.  The mature public setters remain
-    /// intact for existing routes; this method converts their already-typed outcome/error boundary
-    /// without classifying `anyhow` display text.  Where that legacy boundary has already collapsed
-    /// an explicit acknowledgement into `Applied`/`Ignored`, this method reports the conservative
-    /// `PossibleAttempt` evidence rather than inventing an acknowledgement.  The lower native write
-    /// seam retains explicit acknowledgement/rejection for the subsequent full receipt migration.
-    #[allow(dead_code)] // Internal producer seam; no public route owns it yet.
+    /// This is the producer-facing seam for the five #329 controls. It deliberately accepts no
+    /// native index and imports no producer/adaptive vocabulary. Unlike the public setters, it
+    /// does **not** collapse a delivery fact into [`SettingOutcome`] and then try to reconstruct it:
+    /// doing so loses the difference between an explicit `OK`, a lost reply after a write, and a
+    /// pre-send failure. The public setters retain their established result contract below.
     pub(crate) async fn execute_native_setting(
         &self,
-        setting: HqpNativeSetting<'_>,
+        target: &HqpNativeExecutionTarget,
+        setting: HqpNativeSetting,
     ) -> Result<NativeSettingReceipt> {
-        let (what, result) = match setting {
-            HqpNativeSetting::Mode(value) => ("mode", self.set_mode(value).await),
-            HqpNativeSetting::Filter1x(value) => ("filter1x", self.set_filter_1x(value).await),
-            HqpNativeSetting::FilterNx(value) => ("filterNx", self.set_filter_nx(value).await),
-            HqpNativeSetting::Shaper(value) => ("shaper", self.set_shaper(value).await),
-            HqpNativeSetting::Rate(value) => ("rate", self.set_rate(value).await),
-        };
-        Self::receipt_from_legacy_setting_result(what, result)
+        let _operation_guard = self.operation_lock.lock().await;
+        if !self.matches_native_execution_target(target).await {
+            return Ok(NativeSettingReceipt::NotAttempted {
+                reason: "reserved native producer identity moved before adapter execution"
+                    .to_string(),
+                readback: NativeSettingReadback::Unavailable {
+                    reason: "the adapter no longer owns the reserved endpoint/session".to_string(),
+                },
+            });
+        }
+        let fence = Some(target.transport_generation);
+        match setting {
+            HqpNativeSetting::Mode(value) => {
+                self.execute_mode_receipt_under_operation(&value, fence)
+                    .await
+            }
+            HqpNativeSetting::Filter1x(value) => {
+                self.execute_filter_receipt_under_operation(FilterSide::OneX, &value, fence)
+                    .await
+            }
+            HqpNativeSetting::FilterNx(value) => {
+                self.execute_filter_receipt_under_operation(FilterSide::Nx, &value, fence)
+                    .await
+            }
+            HqpNativeSetting::Shaper(value) => {
+                self.execute_shaper_receipt_under_operation(&value, fence)
+                    .await
+            }
+            HqpNativeSetting::Rate(value) => {
+                self.execute_rate_receipt_under_operation(value, fence)
+                    .await
+            }
+        }
     }
 
-    /// Convert the frozen `Result<SettingOutcome>` API without trying to recover facts from error
-    /// prose.  The conservative possible-attempt cases are intentional: `SettingOutcome::Applied`
-    /// proves readback but no longer carries whether the reply said `result="OK"`.
-    fn receipt_from_legacy_setting_result(
-        what: &str,
-        result: Result<SettingOutcome>,
+    async fn execute_mode_receipt_under_operation(
+        &self,
+        mode_name: &str,
+        fence: Option<u64>,
     ) -> Result<NativeSettingReceipt> {
-        match result {
-            Ok(SettingOutcome::AlreadySet) => Ok(NativeSettingReceipt::NotAttempted {
-                reason: "the semantic setter proved the requested value was already selected"
-                    .to_string(),
-                readback: NativeSettingReadback::Noop,
-            }),
-            Ok(SettingOutcome::Suppressed { reason, .. }) => {
-                Ok(NativeSettingReceipt::NotAttempted {
-                    reason,
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let outcome = self
+            .proven_setting_under_operation(
+                &Self::MODE,
+                mode_name,
+                fence,
+                || self.command_modes(fence),
+                |mode_index, generation| {
+                    let captured = captured.clone();
+                    async move {
+                        let state = self.get_state_on_transport(generation).await?;
+                        let receipt = if u32::from(state.mode) == mode_index {
+                            NativeSettingReceipt::NotAttempted {
+                                reason: "State already held the requested mode; SetMode was not sent because it clears an exact-rate pin even when unchanged".to_string(),
+                                readback: NativeSettingReadback::Noop,
+                            }
+                        } else {
+                            let xml = Self::build_request(
+                                "SetMode",
+                                &[("value", &mode_index.to_string())],
+                            );
+                            let receipt = self
+                                .write_setting_receipt_on_transport(
+                                    generation,
+                                    &xml,
+                                    "mode",
+                                    mode_index,
+                                    |s| Some(u32::from(s.mode)),
+                                )
+                                .await?;
+                            if !matches!(receipt, NativeSettingReceipt::NotAttempted { .. }) {
+                                self.invalidate_chain_cache().await;
+                            }
+                            receipt
+                        };
+                        Self::store_captured_receipt(&captured, receipt.clone());
+                        receipt.into_setting_outcome("mode")
+                    }
+                },
+            )
+            .await;
+        let delivery = Self::take_captured_receipt(&captured);
+        Self::semantic_receipt(outcome, delivery, "mode", fence.is_some())
+    }
+
+    async fn execute_filter_receipt_under_operation(
+        &self,
+        side: FilterSide,
+        filter_name: &str,
+        fence: Option<u64>,
+    ) -> Result<NativeSettingReceipt> {
+        let what = side.field();
+        let family = match side {
+            FilterSide::OneX => &Self::FILTER_1X,
+            FilterSide::Nx => &Self::FILTER_NX,
+        };
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let outcome = self
+            .proven_setting_under_operation(
+                family,
+                filter_name,
+                fence,
+                || self.command_filters(fence),
+                |index, generation| {
+                    let captured = captured.clone();
+                    async move {
+                        let state = self.get_state_on_transport(generation).await?;
+                        let receipt = match (state.filter1x, state.filter_nx) {
+                            (Some(current_1x), Some(current_nx)) => {
+                                let current = match side {
+                                    FilterSide::OneX => current_1x,
+                                    FilterSide::Nx => current_nx,
+                                };
+                                if current == index {
+                                    NativeSettingReceipt::NotAttempted {
+                                        reason: format!(
+                                            "State already held the requested {what} filter"
+                                        ),
+                                        readback: NativeSettingReadback::Noop,
+                                    }
+                                } else {
+                                    let (send_nx, send_1x) = match side {
+                                        FilterSide::OneX => (current_nx, index),
+                                        FilterSide::Nx => (index, current_1x),
+                                    };
+                                    let xml = Self::filter_request(send_nx, send_1x);
+                                    self.write_setting_receipt_on_transport(
+                                        generation,
+                                        &xml,
+                                        what,
+                                        index,
+                                        |s| match side {
+                                            FilterSide::OneX => s.filter1x,
+                                            FilterSide::Nx => s.filter_nx,
+                                        },
+                                    )
+                                    .await?
+                                }
+                            }
+                            _ => NativeSettingReceipt::NotAttempted {
+                                reason: "the daemon's State does not report both filter1x and filterNx, and SetFilter writes both sides at once; sending it would overwrite the sibling with a guess".to_string(),
+                                readback: NativeSettingReadback::Unavailable {
+                                    reason: "the required sibling selection was unavailable during preflight".to_string(),
+                                },
+                            },
+                        };
+                        Self::store_captured_receipt(&captured, receipt.clone());
+                        receipt.into_setting_outcome(what)
+                    }
+                },
+            )
+            .await;
+        let delivery = Self::take_captured_receipt(&captured);
+        Self::semantic_receipt(outcome, delivery, what, fence.is_some())
+    }
+
+    async fn execute_shaper_receipt_under_operation(
+        &self,
+        shaper_name: &str,
+        fence: Option<u64>,
+    ) -> Result<NativeSettingReceipt> {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let outcome = self
+            .proven_setting_under_operation(
+                &Self::SHAPER,
+                shaper_name,
+                fence,
+                || self.command_shapers(fence),
+                |shaper_index, generation| {
+                    let captured = captured.clone();
+                    async move {
+                        let state = self.get_state_on_transport(generation).await?;
+                        let receipt = if state.shaper == shaper_index {
+                            NativeSettingReceipt::NotAttempted {
+                                reason: "State already held the requested shaper".to_string(),
+                                readback: NativeSettingReadback::Noop,
+                            }
+                        } else {
+                            let xml = Self::build_request(
+                                "SetShaping",
+                                &[("value", &shaper_index.to_string())],
+                            );
+                            self.write_setting_receipt_on_transport(
+                                generation,
+                                &xml,
+                                "shaper",
+                                shaper_index,
+                                |s| Some(s.shaper),
+                            )
+                            .await?
+                        };
+                        Self::store_captured_receipt(&captured, receipt.clone());
+                        receipt.into_setting_outcome("shaper")
+                    }
+                },
+            )
+            .await;
+        let delivery = Self::take_captured_receipt(&captured);
+        Self::semantic_receipt(outcome, delivery, "shaper", fence.is_some())
+    }
+
+    async fn execute_rate_receipt_under_operation(
+        &self,
+        rate_value: u32,
+        fence: Option<u64>,
+    ) -> Result<NativeSettingReceipt> {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let outcome = self
+            .proven_setting_under_operation(
+                &Self::RATE,
+                &rate_value,
+                fence,
+                || self.command_rates(fence),
+                |rate_index, generation| {
+                    let captured = captured.clone();
+                    async move {
+                        let (modes, modes_generation) = self.command_modes(fence).await?;
+                        if modes_generation != generation {
+                            return Err(HqpSessionChanged {
+                                expected: generation,
+                                actual: modes_generation,
+                            }
+                            .into());
+                        }
+                        let state = self.get_state_on_transport(generation).await?;
+                        let receipt = if let Some(mode_name) =
+                            Self::configured_source_mode(&modes, &state)
+                        {
+                            NativeSettingReceipt::NotAttempted {
+                                reason: format!(
+                                    "the configured mode is '{mode_name}', in which the daemon acknowledges a rate pin and applies nothing — the rate is governed by persistent configuration there, so the write was not sent"
+                                ),
+                                readback: NativeSettingReadback::Unavailable {
+                                    reason: "source-mode preflight suppresses rate writes".to_string(),
+                                },
+                            }
+                        } else if state.rate == rate_index {
+                            NativeSettingReceipt::NotAttempted {
+                                reason: "State already held the requested rate pin".to_string(),
+                                readback: NativeSettingReadback::Noop,
+                            }
+                        } else {
+                            let xml = Self::build_request(
+                                "SetRate",
+                                &[("value", &rate_index.to_string())],
+                            );
+                            self.write_setting_receipt_on_transport(
+                                generation,
+                                &xml,
+                                "rate",
+                                rate_index,
+                                |s| Some(s.rate),
+                            )
+                            .await?
+                        };
+                        Self::store_captured_receipt(&captured, receipt.clone());
+                        receipt.into_setting_outcome("rate")
+                    }
+                },
+            )
+            .await;
+        let delivery = Self::take_captured_receipt(&captured);
+        Self::semantic_receipt(outcome, delivery, "rate", fence.is_some())
+    }
+
+    /// Join the mature semantic bracket's verdict back to the delivery fact captured at the exact
+    /// write boundary. The bracket owns meaning; the captured receipt owns whether the daemon
+    /// explicitly acknowledged, rejected, or may have received the request.
+    fn semantic_receipt(
+        outcome: Result<SettingOutcome>,
+        delivery: Option<NativeSettingReceipt>,
+        what: &str,
+        reserved_execution: bool,
+    ) -> Result<NativeSettingReceipt> {
+        if let Some(NativeSettingReceipt::DaemonRejected(rejected)) = delivery.as_ref() {
+            return Ok(NativeSettingReceipt::DaemonRejected(rejected.clone()));
+        }
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            // The reserved execution path carries a transport fence. If the semantic proof fails
+            // before its decision closure recorded any delivery evidence, no Set* request entered
+            // the write path. Preserve that fact as typed native evidence rather than making the
+            // producer infer it from an error string. Public setters keep their established error
+            // contract, including invalid semantic names and preflight failures.
+            Err(error) if reserved_execution && delivery.is_none() => {
+                let reason = format!(
+                    "the reserved {what} operation ended before a native write was attempted ({error})"
+                );
+                return Ok(NativeSettingReceipt::NotAttempted {
                     readback: NativeSettingReadback::Unavailable {
-                        reason: "the semantic setter suppressed the write before an authoritative \
-                                 post-write readback"
-                            .to_string(),
+                        reason: reason.clone(),
+                    },
+                    reason,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        match outcome {
+            SettingOutcome::Applied => Ok(delivery
+                .unwrap_or(NativeSettingReceipt::NotAttempted {
+                    reason: "semantic proof reported application without a captured write"
+                        .to_string(),
+                    readback: NativeSettingReadback::Unavailable {
+                        reason: "native delivery evidence was unavailable".to_string(),
                     },
                 })
-            }
-            Ok(SettingOutcome::Applied) => Ok(NativeSettingReceipt::PossibleAttempt {
-                reason:
-                    "the legacy semantic result proves matching same-session readback but does \
-                         not retain the daemon acknowledgement bit"
-                        .to_string(),
-                readback: NativeSettingReadback::Verified,
+                .with_readback(NativeSettingReadback::Verified)),
+            SettingOutcome::AlreadySet => Ok(NativeSettingReceipt::NotAttempted {
+                reason: format!("State already held the requested {what}"),
+                readback: NativeSettingReadback::Noop,
             }),
-            Ok(SettingOutcome::Ignored {
+            SettingOutcome::Ignored {
                 requested,
                 observed,
                 ..
-            }) => Ok(NativeSettingReceipt::PossibleAttempt {
-                reason: "the legacy semantic result proves a divergent same-session readback but \
-                         does not retain the daemon acknowledgement bit"
-                    .to_string(),
-                readback: NativeSettingReadback::Divergent {
-                    requested,
-                    observed,
-                },
-            }),
-            Ok(SettingOutcome::Ambiguous { reason, .. }) => {
-                Ok(NativeSettingReceipt::PossibleAttempt {
-                    reason,
+            } => Ok(delivery
+                .unwrap_or(NativeSettingReceipt::NotAttempted {
+                    reason: "semantic proof found divergence without a captured write".to_string(),
                     readback: NativeSettingReadback::Unavailable {
-                        reason: format!(
-                            "the legacy {what} setter reported ambiguous delivery without an \
-                             authoritative receipt"
-                        ),
+                        reason: "native delivery evidence was unavailable".to_string(),
                     },
                 })
+                .with_readback(NativeSettingReadback::Divergent {
+                    requested,
+                    observed,
+                })),
+            SettingOutcome::Suppressed { reason, .. } => {
+                Ok(NativeSettingReceipt::Suppressed { reason })
             }
-            Err(error) => match error.downcast::<HqpRejected>() {
-                Ok(rejected) => Ok(NativeSettingReceipt::DaemonRejected(rejected)),
-                Err(error) => Ok(NativeSettingReceipt::NotAttempted {
-                    reason: error.to_string(),
+            SettingOutcome::Ambiguous { reason, .. } => Ok(delivery
+                .unwrap_or(NativeSettingReceipt::NotAttempted {
+                    reason: reason.clone(),
                     readback: NativeSettingReadback::Unavailable {
-                        reason: format!(
-                            "the semantic {what} setter ended before it could return native \
-                             delivery evidence"
-                        ),
+                        reason: reason.clone(),
                     },
-                }),
-            },
+                })
+                .with_readback(NativeSettingReadback::Unavailable { reason })),
         }
     }
 
@@ -6104,6 +6412,8 @@ impl HqpAdapter {
             host: session.host,
             instance_name: session.instance_name,
             producer_epoch: session.producer_epoch,
+            endpoint_generation: session.endpoint_generation,
+            transport_generation: session.transport_generation,
             observed_at: SystemTime::now(),
         })
     }
@@ -6988,6 +7298,70 @@ impl HqpInstanceManager {
     pub async fn get(&self, name: &str) -> Option<Arc<HqpAdapter>> {
         let instances = self.instances.read().await;
         instances.get(name).cloned()
+    }
+
+    /// Execute one semantic native setting against the exact managed instance.
+    ///
+    /// The lifecycle transaction deliberately spans lookup and the complete adapter operation.
+    /// Removal or same-name reconfiguration therefore cannot replace the selected adapter or its
+    /// endpoint while a command is resolving, writing, and reading back native state.
+    async fn execute_reserved_native_setting_inner(
+        &self,
+        target: &HqpNativeExecutionTarget,
+        setting: HqpNativeSetting,
+    ) -> Result<NativeSettingReceipt> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
+        let Some(adapter) = self
+            .instances
+            .read()
+            .await
+            .get(&target.instance_name)
+            .cloned()
+        else {
+            return Ok(NativeSettingReceipt::NotAttempted {
+                reason: format!(
+                    "reserved HQPlayer instance '{}' is no longer configured",
+                    target.instance_name
+                ),
+                readback: NativeSettingReadback::Unavailable {
+                    reason: "the reserved producer no longer exists".to_string(),
+                },
+            });
+        };
+        if !adapter.matches_native_execution_target(target).await {
+            return Ok(NativeSettingReceipt::NotAttempted {
+                reason: format!(
+                    "HQPlayer instance '{}' no longer has the producer epoch, endpoint, and native session against which this command was reserved",
+                    target.instance_name
+                ),
+                readback: NativeSettingReadback::Unavailable {
+                    reason: "reserved native producer identity moved before execution".to_string(),
+                },
+            });
+        }
+        adapter.execute_native_setting(target, setting).await
+    }
+
+    /// Debug-only integration-test seam. Production callers use the actor-owned command service.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub async fn execute_reserved_native_setting(
+        &self,
+        target: &HqpNativeExecutionTarget,
+        setting: HqpNativeSetting,
+    ) -> Result<NativeSettingReceipt> {
+        self.execute_reserved_native_setting_inner(target, setting)
+            .await
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub(crate) async fn execute_reserved_native_setting(
+        &self,
+        target: &HqpNativeExecutionTarget,
+        setting: HqpNativeSetting,
+    ) -> Result<NativeSettingReceipt> {
+        self.execute_reserved_native_setting_inner(target, setting)
+            .await
     }
 
     /// Get the default instance (creates if not exists)

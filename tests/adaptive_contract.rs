@@ -1392,6 +1392,8 @@ mod outcomes {
         for resolution in [
             CommandOutcome::Applied,
             CommandOutcome::Rejected,
+            CommandOutcome::TimedOut,
+            CommandOutcome::Indeterminate,
             CommandOutcome::Divergent,
             CommandOutcome::Unrecognized("later_terminal_outcome".to_string()),
         ] {

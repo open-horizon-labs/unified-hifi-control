@@ -34,9 +34,11 @@ mod mock_servers;
 use std::sync::Arc;
 use std::sync::Once;
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use unified_hifi_control::adapters::hqplayer::{
-    framing, HqpAdapter, HqpRejected, HqpTimeouts, SettingOutcome,
+    framing, HqpAdapter, HqpInstanceManager, HqpNativeExecutionTarget, HqpNativeSetting,
+    HqpRejected, HqpTimeouts, NativeSettingReadback, NativeSettingReceipt, SettingOutcome,
 };
 use unified_hifi_control::bus::create_bus;
 
@@ -48,7 +50,9 @@ use mock_servers::hqplayer::model::{
     LoadedChain, Metadata,
 };
 use mock_servers::hqplayer::tier1;
-use mock_servers::hqplayer::wire::{Chunking, Disruption, Responder, WirePolicy, WireServer};
+use mock_servers::hqplayer::wire::{
+    Chunking, Disruption, ReplyGate, Responder, WirePolicy, WireServer,
+};
 
 // =============================================================================
 // Harness
@@ -144,6 +148,659 @@ impl Harness {
     fn stop(self) {
         self.server.stop();
     }
+}
+
+async fn manager_instance(
+    manager: &HqpInstanceManager,
+    name: &str,
+    server: &WireServer,
+) -> Arc<HqpAdapter> {
+    let adapter = manager.get_or_create(name).await;
+    adapter
+        .configure(
+            "127.0.0.1".to_string(),
+            Some(server.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    adapter.set_timeouts(fast_timeouts()).await;
+    adapter.connect().await.expect("connect managed fake");
+    adapter
+}
+
+async fn native_target(manager: &HqpInstanceManager, name: &str) -> HqpNativeExecutionTarget {
+    manager
+        .get(name)
+        .await
+        .expect("managed instance exists")
+        .native_execution_target()
+        .await
+        .expect("managed instance has a coherent native producer session")
+}
+
+async fn wait_for_reply_gate(gate: &ReplyGate) {
+    tokio::time::timeout(Duration::from_secs(1), gate.wait_until_reached())
+        .await
+        .expect("fake daemon reaches gated native setting");
+}
+
+async fn assert_manager_mutation_waits(started: &Notify, task: &tokio::task::JoinHandle<()>) {
+    started.notified().await;
+    assert!(
+        !task.is_finished(),
+        "manager mutation must remain queued behind in-flight native execution"
+    );
+}
+
+fn assert_verified_receipt(receipt: NativeSettingReceipt) {
+    assert!(
+        matches!(
+            receipt,
+            NativeSettingReceipt::DaemonAcknowledged {
+                readback: NativeSettingReadback::Verified
+            } | NativeSettingReceipt::PossibleAttempt {
+                readback: NativeSettingReadback::Verified,
+                ..
+            }
+        ),
+        "semantic execution must retain verified native readback"
+    );
+}
+
+/// The native command seam must retain the daemon's explicit acknowledgement.  Reconstructing a
+/// receipt from `SettingOutcome::Applied` cannot satisfy this: that legacy outcome intentionally
+/// discards the wire-level `result="OK"` bit.
+#[tokio::test]
+async fn native_setting_receipts_keep_explicit_acknowledgement_for_all_five_semantic_controls() {
+    let cases = [
+        (
+            HqpNativeSetting::Mode("SDM (DSD)".to_string()),
+            "SetMode",
+            "GetModes",
+        ),
+        (
+            HqpNativeSetting::Filter1x("poly-sinc-gauss-long".to_string()),
+            "SetFilter",
+            "GetFilters",
+        ),
+        (
+            HqpNativeSetting::FilterNx("poly-sinc-gauss-long".to_string()),
+            "SetFilter",
+            "GetFilters",
+        ),
+        (
+            HqpNativeSetting::Shaper("NS5".to_string()),
+            "SetShaping",
+            "GetShapers",
+        ),
+        (HqpNativeSetting::Rate(705_600), "SetRate", "GetRates"),
+    ];
+
+    for (setting, element, enumeration) in cases {
+        isolate_config_dir();
+        let server = WireServer::start(
+            Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+            WirePolicy::default(),
+        )
+        .await;
+        let manager = HqpInstanceManager::new(create_bus());
+        manager_instance(&manager, "rig", &server).await;
+
+        let receipt = manager
+            .execute_reserved_native_setting(&native_target(&manager, "rig").await, setting)
+            .await
+            .expect("semantic native execution");
+        assert!(
+            matches!(
+                receipt,
+                NativeSettingReceipt::DaemonAcknowledged {
+                    readback: NativeSettingReadback::Verified
+                }
+            ),
+            "{element} must retain its explicit acknowledgement and same-session proof"
+        );
+        assert_eq!(server.stats().element_count(element), 1);
+        assert!(
+            server.stats().element_count(enumeration) >= 2,
+            "{element} must be bracketed by a closing {enumeration} semantic-name proof"
+        );
+        server.stop();
+    }
+}
+
+#[tokio::test]
+async fn native_setting_receipt_reports_noop_without_sending_setmode() {
+    isolate_config_dir();
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let manager = HqpInstanceManager::new(create_bus());
+    manager_instance(&manager, "rig", &server).await;
+
+    let receipt = manager
+        .execute_reserved_native_setting(
+            &native_target(&manager, "rig").await,
+            HqpNativeSetting::Mode("PCM".to_string()),
+        )
+        .await
+        .expect("no-op is a receipt, not a transport error");
+    assert!(matches!(
+        receipt,
+        NativeSettingReceipt::NotAttempted {
+            readback: NativeSettingReadback::Noop,
+            ..
+        }
+    ));
+    assert_eq!(server.stats().element_count("SetMode"), 0);
+    server.stop();
+}
+
+#[tokio::test]
+async fn native_setting_receipt_reports_a_session_loss_before_send_as_not_attempted() {
+    isolate_config_dir();
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let manager = Arc::new(HqpInstanceManager::new(create_bus()));
+    let adapter = manager_instance(&manager, "rig", &server).await;
+    let gate = ReplyGate::new("State");
+    server.set_policy(WirePolicy {
+        reply_gate: Some(gate.clone()),
+        ..WirePolicy::default()
+    });
+
+    let execution = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .execute_reserved_native_setting(
+                    &native_target(&manager, "rig").await,
+                    HqpNativeSetting::Shaper("NS5".to_string()),
+                )
+                .await
+        })
+    };
+    wait_for_reply_gate(&gate).await;
+    // The shaper list and preflight State are now in flight, but the SetShaping request has not
+    // entered the write path. Replace the native session before allowing State to return.
+    adapter.disconnect().await;
+    gate.release();
+
+    let receipt = execution
+        .await
+        .expect("execution task joins")
+        .expect("a proven pre-send loss is returned as native evidence");
+    assert!(matches!(
+        receipt,
+        NativeSettingReceipt::NotAttempted {
+            readback: NativeSettingReadback::Unavailable { .. },
+            ..
+        }
+    ));
+    assert_eq!(server.stats().element_count("SetShaping"), 0);
+    server.stop();
+}
+
+#[tokio::test]
+async fn native_setting_receipt_keeps_explicit_daemon_rejection_typed() {
+    isolate_config_dir();
+    let model = Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE));
+    model.arm(|faults| {
+        faults
+            .reject_next
+            .push(("SetShaping".to_string(), "invalid shaper".to_string()));
+    });
+    let server = WireServer::start(model, WirePolicy::default()).await;
+    let manager = HqpInstanceManager::new(create_bus());
+    manager_instance(&manager, "rig", &server).await;
+
+    let receipt = manager
+        .execute_reserved_native_setting(
+            &native_target(&manager, "rig").await,
+            HqpNativeSetting::Shaper("NS5".to_string()),
+        )
+        .await
+        .expect("an explicit wire rejection is native evidence, not an adapter error");
+    assert!(matches!(
+        receipt,
+        NativeSettingReceipt::DaemonRejected(HqpRejected { .. })
+    ));
+    server.stop();
+}
+
+#[tokio::test]
+async fn native_setting_receipt_marks_a_lost_post_write_reply_as_possible_attempt() {
+    isolate_config_dir();
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy {
+            apply_then_drop_reply_for_element: Some("SetShaping".to_string()),
+            ..WirePolicy::default()
+        },
+    )
+    .await;
+    let manager = HqpInstanceManager::new(create_bus());
+    manager_instance(&manager, "rig", &server).await;
+
+    let receipt = manager
+        .execute_reserved_native_setting(
+            &native_target(&manager, "rig").await,
+            HqpNativeSetting::Shaper("NS5".to_string()),
+        )
+        .await
+        .expect("lost delivery is reported as evidence, not misclassified as a pre-send failure");
+    assert!(matches!(
+        receipt,
+        NativeSettingReceipt::PossibleAttempt {
+            readback: NativeSettingReadback::Unavailable { .. },
+            ..
+        }
+    ));
+    server.stop();
+}
+
+#[tokio::test]
+async fn native_setting_receipt_keeps_acknowledged_divergence_separate_from_delivery() {
+    isolate_config_dir();
+    let model = Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE));
+    model.arm(|faults| faults.accept_but_ignore.push("SetShaping".to_string()));
+    let server = WireServer::start(model, WirePolicy::default()).await;
+    let manager = HqpInstanceManager::new(create_bus());
+    manager_instance(&manager, "rig", &server).await;
+
+    let receipt = manager
+        .execute_reserved_native_setting(
+            &native_target(&manager, "rig").await,
+            HqpNativeSetting::Shaper("NS5".to_string()),
+        )
+        .await
+        .expect("accepted-but-ignored setter returns a receipt");
+    assert!(matches!(
+        receipt,
+        NativeSettingReceipt::DaemonAcknowledged {
+            readback: NativeSettingReadback::Divergent { .. }
+        }
+    ));
+    server.stop();
+}
+
+#[tokio::test]
+async fn native_setting_receipt_keeps_acknowledgement_when_same_session_readback_fails() {
+    isolate_config_dir();
+    let gate = ReplyGate::new("SetShaping");
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy {
+            reply_gate: Some(gate.clone()),
+            ..WirePolicy::default()
+        },
+    )
+    .await;
+    let manager = Arc::new(HqpInstanceManager::new(create_bus()));
+    manager_instance(&manager, "rig", &server).await;
+
+    let execution = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .execute_reserved_native_setting(
+                    &native_target(&manager, "rig").await,
+                    HqpNativeSetting::Shaper("NS5".to_string()),
+                )
+                .await
+        })
+    };
+    wait_for_reply_gate(&gate).await;
+    // The SetShaping reply has not been sent yet. Change only the subsequent State request so the
+    // receipt sees an explicit acknowledgement followed by a failed same-session verification.
+    server.set_policy(WirePolicy {
+        silent_for_element: Some("State".to_string()),
+        ..WirePolicy::default()
+    });
+    gate.release();
+
+    let receipt = execution
+        .await
+        .expect("execution task joins")
+        .expect("acknowledgement with failed readback is still a receipt");
+    assert!(matches!(
+        receipt,
+        NativeSettingReceipt::DaemonAcknowledged {
+            readback: NativeSettingReadback::Unavailable { .. }
+        }
+    ));
+    server.stop();
+}
+
+#[tokio::test]
+async fn manager_native_setting_dispatches_to_the_exact_named_instance() {
+    isolate_config_dir();
+    let left = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let right = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let manager = HqpInstanceManager::new(create_bus());
+    manager_instance(&manager, "left", &left).await;
+    manager_instance(&manager, "right", &right).await;
+
+    let receipt = manager
+        .execute_reserved_native_setting(
+            &native_target(&manager, "right").await,
+            HqpNativeSetting::Shaper("NS5".to_string()),
+        )
+        .await
+        .expect("execute on exact managed instance");
+    assert_verified_receipt(receipt);
+    assert_eq!(left.stats().element_count("SetShaping"), 0);
+    assert_eq!(right.stats().element_count("SetShaping"), 1);
+
+    left.stop();
+    right.stop();
+}
+
+#[tokio::test]
+async fn reserved_native_setting_is_not_attempted_after_instance_removal() {
+    isolate_config_dir();
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let manager = HqpInstanceManager::new(create_bus());
+    manager_instance(&manager, "rig", &server).await;
+    let target = native_target(&manager, "rig").await;
+
+    assert!(manager.remove_instance("rig").await);
+    let receipt = manager
+        .execute_reserved_native_setting(&target, HqpNativeSetting::Shaper("NS5".to_string()))
+        .await
+        .expect("stale reservation returns typed native evidence");
+
+    assert!(matches!(receipt, NativeSettingReceipt::NotAttempted { .. }));
+    assert_eq!(server.stats().element_count("SetShaping"), 0);
+    server.stop();
+}
+
+#[tokio::test]
+async fn reserved_native_setting_is_not_attempted_after_endpoint_reconfiguration() {
+    isolate_config_dir();
+    let first = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let replacement = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let manager = HqpInstanceManager::new(create_bus());
+    manager_instance(&manager, "rig", &first).await;
+    let target = native_target(&manager, "rig").await;
+
+    manager
+        .add_instance(
+            "rig".to_string(),
+            "127.0.0.1".to_string(),
+            Some(replacement.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    let receipt = manager
+        .execute_reserved_native_setting(&target, HqpNativeSetting::Shaper("NS5".to_string()))
+        .await
+        .expect("stale endpoint reservation returns typed native evidence");
+
+    assert!(matches!(receipt, NativeSettingReceipt::NotAttempted { .. }));
+    assert_eq!(first.stats().element_count("SetShaping"), 0);
+    assert_eq!(replacement.stats().element_count("SetShaping"), 0);
+    first.stop();
+    replacement.stop();
+}
+
+#[tokio::test]
+async fn reserved_native_setting_is_not_attempted_after_same_endpoint_reconnect() {
+    isolate_config_dir();
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let manager = HqpInstanceManager::new(create_bus());
+    let adapter = manager_instance(&manager, "rig", &server).await;
+    let target = native_target(&manager, "rig").await;
+
+    adapter.disconnect().await;
+    adapter
+        .connect()
+        .await
+        .expect("replacement native handshake");
+    let receipt = manager
+        .execute_reserved_native_setting(&target, HqpNativeSetting::Shaper("NS5".to_string()))
+        .await
+        .expect("stale session reservation returns typed native evidence");
+
+    assert!(matches!(receipt, NativeSettingReceipt::NotAttempted { .. }));
+    assert_eq!(server.stats().element_count("SetShaping"), 0);
+    server.stop();
+}
+
+#[tokio::test]
+async fn typed_filter_receipt_does_not_verify_a_name_after_the_loaded_chain_moves() {
+    isolate_config_dir();
+    let model = Arc::new(DaemonModel::with_profile(SYNTHETIC_HAZARD_PROFILE));
+    let server = WireServer::start(model.clone(), WirePolicy::default()).await;
+    let manager = HqpInstanceManager::new(create_bus());
+    manager_instance(&manager, "rig", &server).await;
+    model.external_change(|state| {
+        state.mode_index = 0;
+        state.playback = 2;
+        state.filter_1x_index = 3;
+        state.filter_nx_index = 3;
+    });
+    model.switch_chain_after_request("GetFilters", LoadedChain::Sdm);
+    let target = native_target(&manager, "rig").await;
+
+    let receipt = manager
+        .execute_reserved_native_setting(
+            &target,
+            HqpNativeSetting::Filter1x("SYN-pcm-7".to_string()),
+        )
+        .await
+        .expect("chain movement is typed native evidence");
+
+    assert!(
+        !matches!(
+            receipt,
+            NativeSettingReceipt::DaemonAcknowledged {
+                readback: NativeSettingReadback::Verified
+            } | NativeSettingReceipt::PossibleAttempt {
+                readback: NativeSettingReadback::Verified,
+                ..
+            }
+        ),
+        "a numeric position applied after a chain move must not verify the requested filter name"
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn typed_shaper_receipt_does_not_verify_a_name_after_the_loaded_chain_moves() {
+    isolate_config_dir();
+    let model = Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE));
+    let server = WireServer::start(model.clone(), WirePolicy::default()).await;
+    let manager = HqpInstanceManager::new(create_bus());
+    manager_instance(&manager, "rig", &server).await;
+    model.external_change(|state| {
+        state.mode_index = 0;
+        state.playback = 2;
+        state.shaper_index = 1;
+    });
+    model.switch_chain_after_request("GetShapers", LoadedChain::Sdm);
+    let target = native_target(&manager, "rig").await;
+
+    let receipt = manager
+        .execute_reserved_native_setting(&target, HqpNativeSetting::Shaper("NS9".to_string()))
+        .await
+        .expect("chain movement is typed native evidence");
+
+    assert!(
+        !matches!(
+            receipt,
+            NativeSettingReceipt::DaemonAcknowledged {
+                readback: NativeSettingReadback::Verified
+            } | NativeSettingReceipt::PossibleAttempt {
+                readback: NativeSettingReadback::Verified,
+                ..
+            }
+        ),
+        "a numeric position applied after a chain move must not verify the requested shaper name"
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn manager_removal_waits_for_in_flight_native_execution() {
+    isolate_config_dir();
+    let gate = ReplyGate::new("SetShaping");
+    let server = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy {
+            reply_gate: Some(gate.clone()),
+            ..WirePolicy::default()
+        },
+    )
+    .await;
+    let manager = Arc::new(HqpInstanceManager::new(create_bus()));
+    manager_instance(&manager, "rig", &server).await;
+
+    let execution = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .execute_reserved_native_setting(
+                    &native_target(&manager, "rig").await,
+                    HqpNativeSetting::Shaper("NS5".to_string()),
+                )
+                .await
+        })
+    };
+    wait_for_reply_gate(&gate).await;
+
+    let started = Arc::new(Notify::new());
+    let removal = {
+        let manager = manager.clone();
+        let started = started.clone();
+        tokio::spawn(async move {
+            started.notify_one();
+            assert!(manager.remove_instance("rig").await);
+        })
+    };
+    assert_manager_mutation_waits(&started, &removal).await;
+    gate.release();
+
+    let receipt = execution
+        .await
+        .expect("execution task joins")
+        .expect("execution completes before removal");
+    assert_verified_receipt(receipt);
+    removal.await.expect("removal follows execution");
+    assert!(manager.get("rig").await.is_none());
+    server.stop();
+}
+
+#[tokio::test]
+async fn manager_reconfiguration_waits_for_in_flight_native_execution() {
+    isolate_config_dir();
+    let gate = ReplyGate::new("SetShaping");
+    let first = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy {
+            reply_gate: Some(gate.clone()),
+            ..WirePolicy::default()
+        },
+    )
+    .await;
+    let second = WireServer::start(
+        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+        WirePolicy::default(),
+    )
+    .await;
+    let manager = Arc::new(HqpInstanceManager::new(create_bus()));
+    manager_instance(&manager, "rig", &first).await;
+
+    let execution = {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            manager
+                .execute_reserved_native_setting(
+                    &native_target(&manager, "rig").await,
+                    HqpNativeSetting::Shaper("NS5".to_string()),
+                )
+                .await
+        })
+    };
+    wait_for_reply_gate(&gate).await;
+
+    let started = Arc::new(Notify::new());
+    let reconfigure = {
+        let manager = manager.clone();
+        let started = started.clone();
+        let second_port = second.port();
+        tokio::spawn(async move {
+            started.notify_one();
+            manager
+                .add_instance(
+                    "rig".to_string(),
+                    "127.0.0.1".to_string(),
+                    Some(second_port),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+        })
+    };
+    assert_manager_mutation_waits(&started, &reconfigure).await;
+    gate.release();
+
+    let receipt = execution
+        .await
+        .expect("execution task joins")
+        .expect("execution completes before reconfiguration");
+    assert_verified_receipt(receipt);
+    reconfigure
+        .await
+        .expect("reconfiguration follows execution");
+    assert_eq!(first.stats().element_count("SetShaping"), 1);
+    assert_eq!(second.stats().element_count("SetShaping"), 0);
+    assert_eq!(
+        manager
+            .get("rig")
+            .await
+            .expect("reconfigured instance remains")
+            .get_status()
+            .await
+            .port,
+        second.port()
+    );
+
+    first.stop();
+    second.stop();
 }
 
 // =============================================================================
@@ -1335,7 +1992,7 @@ async fn tier1_live_read_only_verification_when_opted_in() {
     adapter
         .connect()
         .await
-        .unwrap_or_else(|e| panic!("connect to HQPlayer at {host}:{port}: {e}"));
+        .unwrap_or_else(|e| panic!("connect to HQPlayer at {host}:{port}: {e:#}"));
 
     let capture = tier1::capture(&adapter)
         .await

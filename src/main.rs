@@ -218,7 +218,7 @@ mod server {
         // must not run until the public socket is bound below. This preserves bind-before-startup
         // while allowing HQPlayer's manager to own the handle for its whole lifecycle.
         let producer_shutdown_token = CancellationToken::new();
-        let (adaptive_handle, producer_actor, _adaptive_view) =
+        let (adaptive_handle, producer_actor, adaptive_view) =
             producers::AdaptiveRuntime::build(producer_shutdown_token.clone(), 1024);
         let hqp_adaptive_publisher = Arc::new(producers::hqplayer::HqpAdaptivePublisher::new(
             adaptive_handle,
@@ -228,9 +228,16 @@ mod server {
         let hqp_instances = Arc::new(
             adapters::hqplayer::HqpInstanceManager::new_with_native_sink(
                 bus.clone(),
-                hqp_adaptive_publisher,
+                hqp_adaptive_publisher.clone(),
             ),
         );
+        let (hqp_command_handle, hqp_command_actor) =
+            producers::hqplayer_command_service::HqpImmediateCommandActor::build(
+                adaptive_view,
+                hqp_adaptive_publisher,
+                hqp_instances.clone(),
+                32,
+            );
         hqp_instances.load_from_config().await;
         let instance_count = hqp_instances.instance_count().await;
         if instance_count > 0 {
@@ -340,6 +347,7 @@ mod server {
         let producer_actor_task = tokio::spawn(async move {
             producer_actor.run().await;
         });
+        let hqp_command_actor_task = tokio::spawn(hqp_command_actor.run());
         tracing::info!("ProducerActor started");
 
         // Single loop to start all enabled adapters
@@ -648,6 +656,16 @@ mod server {
 
         // Cleanup: publish ShuttingDown event and stop adapters
         tracing::info!("Shutting down adapters...");
+
+        // Close immediate-command ingress and drain accepted work before broadcasting shutdown.
+        // Some adapters react to that broadcast independently of the coordinator, so publishing it
+        // first would let native lifecycle teardown race an already-admitted command.
+        if let Err(error) = hqp_command_handle.shutdown().await {
+            tracing::warn!(?error, "HQPlayer command actor did not drain cleanly");
+        }
+        if let Err(error) = hqp_command_actor_task.await {
+            tracing::warn!(%error, "HQPlayer command actor exited with a join error");
+        }
 
         // Publish ShuttingDown event for any bus listeners
         bus.publish(bus::BusEvent::ShuttingDown {

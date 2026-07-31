@@ -160,6 +160,13 @@ impl CommandOutcome {
         if self.is_terminal() {
             return false;
         }
+        // Pending is the admitted, pre-execution state. Native execution may establish a
+        // terminal result or may end with an unresolved delivery/readback result that still
+        // awaits convergence. Rejecting those ambiguous transitions would strand the operation
+        // at Pending and erase the most important fact the command path learned.
+        if self == &Self::Pending {
+            return true;
+        }
         // Nothing may regress into an unresolved state.
         !matches!(next, Self::Pending | Self::Indeterminate | Self::TimedOut)
     }

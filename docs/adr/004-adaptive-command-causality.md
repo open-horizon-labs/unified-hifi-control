@@ -28,6 +28,15 @@ Adaptive immediate commands use four explicit ownership layers.
 
 Completion carries an opaque lease containing producer identity, producer epoch, adapter-run ID, conflict set, and operation generation. The publisher accepts a transition only if that lease is still current. A native operation retains the run ID, never the RAII run lease; stop or replacement therefore makes a late completion stale instead of extending producer liveness.
 
+Before the native executor returns a typed receipt, `Pending` is explicitly a no-send state. A
+matching observation in that interval resolves the operation as `Ignored` with
+`NotAttempted`; it must never manufacture `Applied`/`Confirmed`. Receipt evidence is the only
+source of attempted-write truth. Instance removal may arrive after the manager has finished the
+native call but before the command actor publishes that receipt, so it records retirement intent
+and blocks new work while retaining the coordinator. Retirement occurs only after the receipt's
+terminal operation is admitted; the compact retired coordinator then preserves exact correlation
+truth for a late duplicate callback.
+
 `CommandOutcome::Pending` is an explicit non-terminal state. It is not evidence of producer state, sets `awaits_convergence`, and may transition to Applied, Ignored, Rejected, Superseded, Disconnected, TimedOut, Indeterminate, or a future recognized terminal outcome. No terminal outcome can regress to Pending.
 
 Operation content participates in canonical state equivalence. Pending, terminal, convergence, and supersession transitions advance the state revision. Volatile lane timing and health refreshes remain revision-neutral. Observations merge the ledger instead of clearing it, so operation history cannot disappear after a poll.
@@ -37,6 +46,13 @@ Immediate commands are serialized by declared conflict set, not merely by contro
 The supported-operation policy is machine-checkable. Descriptors that #375 publishes as mutable but whose evidence is owned by #328 receive a structured deferred refusal from this service rather than falling through generic dispatch.
 
 Every operation records its control, requested semantic value, lane, correlation, observed base revision, write attempt, outcome, and transition history. Repeating the same correlation and request fingerprint returns the existing operation without another send; reusing a correlation for different intent is rejected.
+
+Terminal publications are a serialization frontier: while one is deferred, observations and new
+reservations first flush the immutable terminal candidate rather than publishing a different
+document at the same next revision. Documents retain the newest 32 terminal operations; compacted
+records retain bounded correlation/fingerprint tombstones (256) so an old gesture cannot become a
+fresh write. Unresolved records are never compacted; admission applies backpressure at 32
+unresolved operations instead of silently forgetting uncertainty.
 
 ## Options considered
 

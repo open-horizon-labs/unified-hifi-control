@@ -49,6 +49,11 @@ pub mod admission;
 mod aggregator;
 pub mod event;
 pub mod hqplayer;
+pub(crate) mod hqplayer_command;
+// The command actor is composition infrastructure. It is public only so the binary composition
+// root can construct the one shared service; native command vocabulary remains release-internal.
+#[doc(hidden)]
+pub mod hqplayer_command_service;
 pub mod run;
 pub mod runtime;
 
