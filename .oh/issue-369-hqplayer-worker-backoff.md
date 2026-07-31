@@ -5,6 +5,7 @@
 **Parent:** #311
 **Program:** #310
 **Branch:** `feat/issue-369-hqplayer-worker-backoff`
+**Draft PR:** #373 (stacked on #371)
 
 ## Aim
 **Updated:** 2026-07-31
@@ -131,7 +132,8 @@ and upper bounds; policy qualification uses the conservative last-coherent-to-re
 
 - [x] Implementation, hermetic tests, exact-diff review, and dissent are complete.
 - [x] Issue #369 states the release panic constraint and dependency on #372.
-- [ ] Commit and push the focused stacked branch.
-- [ ] Open a draft PR stacked on #371 and post the six exact-head workflow reports.
-- [ ] Request CodeRabbit and validate report output contracts.
+- [x] Commit and push the focused stacked branch.
+- [x] Open draft PR #373 stacked on #371.
+- [x] Request CodeRabbit.
+- [ ] Post the six exact-head workflow reports and validate their output contracts.
 - [ ] Live qualification remains a pre-merge gate; no merge is authorized.
