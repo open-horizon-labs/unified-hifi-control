@@ -1,15 +1,36 @@
-#!/bin/bash
+#!/bin/sh
 
 PACKAGE_NAME="unified-hifi-control"
 PACKAGE_DIR="/var/packages/${PACKAGE_NAME}"
-TARGET_DIR="${PACKAGE_DIR}/target"
-PID_FILE="/var/run/${PACKAGE_NAME}.pid"
-LOG_FILE="/var/log/${PACKAGE_NAME}.log"
+TARGET_DIR="${SYNOPKG_PKGDEST:-${PACKAGE_DIR}/target}"
+VAR_DIR="${PACKAGE_DIR}/var"
+HOME_DIR="${PACKAGE_DIR}/home"
+BINARY="${TARGET_DIR}/unified-hifi-control"
+PID_FILE="${VAR_DIR}/${PACKAGE_NAME}.pid"
+LOG_FILE="${VAR_DIR}/${PACKAGE_NAME}.log"
+
+read_pid() {
+    cat "$PID_FILE" 2>/dev/null || true
+}
+
+pid_is_running() {
+    PID=$1
+
+    [ -n "$PID" ] || return 1
+    kill -0 "$PID" 2>/dev/null || return 1
+
+    # Avoid signaling an unrelated process if DSM has reused a stale PID.
+    if [ -r "/proc/${PID}/cmdline" ]; then
+        tr '\000' '\n' < "/proc/${PID}/cmdline" | grep -Fqx "$BINARY" || return 1
+    fi
+
+    return 0
+}
 
 start_daemon() {
     if [ -f "$PID_FILE" ]; then
-        PID=$(cat "$PID_FILE")
-        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        PID=$(read_pid)
+        if pid_is_running "$PID"; then
             echo "${PACKAGE_NAME} is already running"
             return 0
         fi
@@ -19,20 +40,26 @@ start_daemon() {
 
     echo "Starting ${PACKAGE_NAME}..."
 
-    if ! cd "${TARGET_DIR}"; then
+    mkdir -p "$VAR_DIR"
+
+    if ! cd "$TARGET_DIR"; then
         echo "Failed to change to ${TARGET_DIR}"
         return 1
     fi
 
-    # Start the binary
-    nohup "${TARGET_DIR}/unified-hifi-control" >> "$LOG_FILE" 2>&1 &
+    export HOME="$HOME_DIR"
+    export UHC_CONFIG_DIR="$VAR_DIR"
+    export UHC_DATA_DIR="$VAR_DIR"
+    export RUST_LOG="${RUST_LOG:-info}"
+
+    nohup "$BINARY" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
     # Wait for process to start (configurable via STARTUP_WAIT)
     sleep "${STARTUP_WAIT:-2}"
 
-    PID=$(cat "$PID_FILE" 2>/dev/null)
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+    PID=$(read_pid)
+    if pid_is_running "$PID"; then
         echo "${PACKAGE_NAME} started successfully"
         return 0
     else
@@ -50,13 +77,19 @@ stop_daemon() {
 
     echo "Stopping ${PACKAGE_NAME}..."
 
-    PID=$(cat "$PID_FILE" 2>/dev/null)
-    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+    PID=$(read_pid)
+    if pid_is_running "$PID"; then
         kill "$PID"
-        sleep 2
 
-        if kill -0 "$PID" 2>/dev/null; then
-            kill -9 "$PID"
+        WAITED=0
+        while pid_is_running "$PID" && [ "$WAITED" -lt "${SHUTDOWN_TIMEOUT:-10}" ]; do
+            sleep 1
+            WAITED=$((WAITED + 1))
+        done
+
+        if pid_is_running "$PID"; then
+            echo "${PACKAGE_NAME} did not stop gracefully; sending SIGKILL"
+            kill -9 "$PID" 2>/dev/null || true
         fi
     fi
 
@@ -67,12 +100,13 @@ stop_daemon() {
 
 daemon_status() {
     if [ -f "$PID_FILE" ]; then
-        PID=$(cat "$PID_FILE" 2>/dev/null)
-        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        PID=$(read_pid)
+        if pid_is_running "$PID"; then
             return 0  # Running
         fi
+        return 1  # Process is dead but PID file exists
     fi
-    return 1  # Not running
+    return 3  # Normally stopped
 }
 
 case "$1" in
@@ -92,8 +126,9 @@ case "$1" in
             echo "${PACKAGE_NAME} is running"
             exit 0
         else
+            STATUS=$?
             echo "${PACKAGE_NAME} is not running"
-            exit 1
+            exit "$STATUS"
         fi
         ;;
     *)

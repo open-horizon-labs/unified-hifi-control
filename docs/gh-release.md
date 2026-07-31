@@ -229,7 +229,12 @@ Web assets (CSS, images) are **embedded directly in the binary** using Rust's `i
 
 ### NAS Packages
 
-**Synology SPK:** Built directly with `tar` (not the 1GB pkgscripts-ng toolkit). See [Synology Developer Guide](https://help.synology.com/developer-guide/synology_package/introduction.html) for SPK structure.
+**Synology SPK:** Built by `build/synology/build-spk.sh` using the documented tar
+layout (without the 1GB pkgscripts-ng toolkit). An always-on CI contract test
+validates DSM-compatible versions, platform families, extracted size, metadata,
+and an unprivileged start/status/stop lifecycle. See the
+[Synology Developer Guide](https://help.synology.com/developer-guide/synology_package/introduction.html)
+for SPK structure.
 
 **QNAP QPKG:** Uses `qbuild` via Docker.
 

@@ -1,10 +1,10 @@
-#!/bin/bash
+#!/bin/sh
 # Post-upgrade script
 # Runs after upgrade completes
 
 PACKAGE_NAME="unified-hifi-control"
 PACKAGE_DIR="/var/packages/${PACKAGE_NAME}"
-TARGET_DIR="${PACKAGE_DIR}/target"
+TARGET_DIR="${SYNOPKG_PKGDEST:-${PACKAGE_DIR}/target}"
 
 # Make binary executable
 chmod +x "${TARGET_DIR}/unified-hifi-control"

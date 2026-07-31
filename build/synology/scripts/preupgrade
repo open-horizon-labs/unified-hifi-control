@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Pre-upgrade script
 # Runs before upgrade begins (service already stopped by DSM)
 

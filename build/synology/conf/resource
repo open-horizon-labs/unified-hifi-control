@@ -1,1 +1,5 @@
-{}
+{
+  "port-config": {
+    "protocol-file": "port_conf/unified-hifi-control.sc"
+  }
+}
