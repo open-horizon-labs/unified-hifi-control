@@ -42,8 +42,40 @@ network if you need a player.
 | `players_mute_all_unmuted.json` | Same query with nothing muted. |
 | `players_no_playerprefs.json` | The same `players` query **without** `playerprefs:` — no `mute` key on any player. Proves the tag is what adds it, and that the old call could not have known mute. |
 | `mixer_muting_query_muted.json` / `..._unmuted.json` | `mixer muting ?` → `{"_muting": 1}` / `{"_muting": 0}`. The per-player query, kept as the documented alternative to the batched one. |
-| `status_squeezelite_muted.json` | `status` on a **muted** real squeezelite player still reports a plain positive `"mixer volume": 42` and carries **no mute key at all**. This is why `status` alone cannot report mute, and why the volume value is not secretly negated. |
+| `status_squeezelite_muted.json` | `status` on a **muted** real squeezelite player carries **no mute key at all**, and reports `"mixer volume": -42` — LMS **negates** the volume once its mute fade completes. Both halves matter: `status` cannot report mute directly, and the raw value it does report goes negative, which the adapter used to hand straight to a `VolumeControl` declared `min: 0.0`. See the timing table below. |
 | `status_tags_aAdltKc.json` | **Defect 4.** The adapter's exact `tags:aAdltKc` string. `l` yields `"album": "Ember Light"` (album **title**, not `album_id`); `A` yields per-role `albumartist`/`trackartist`; `a` yields `artist`; `d` `duration`; `t` `tracknum`. Also shows `artwork_track_id` is **absent**, because that field is tag `J` which this string does not request. |
+
+## Mute is immediate; the negated volume lags it (no fixture file — this is timing)
+
+`mixer muting` schedules a volume fade and only writes the negated volume when the
+fade finishes, so `status`'s `mixer volume` is a **lagging** mute signal while the
+`mute` pref is an immediate one. Measured on the real squeezelite player at volume
+42, polling `status`, `mixer muting ?` and `players … playerprefs:mute` together:
+
+| Time after `mixer muting 1` | `status`'s `mixer volume` | `mixer muting ?` | `playerprefs:mute` |
+|---|---|---|---|
+| 0.04 s | `42` | `"1"` | `"1"` |
+| 0.78 s | `-42` | `"1"` | `"1"` |
+| 0.78 s – 8.6 s | `-42` | `"1"` | `"1"` |
+
+| Time after `mixer muting 0` | `status`'s `mixer volume` | `mixer muting ?` | `playerprefs:mute` |
+|---|---|---|---|
+| 0.07 s | `-42` | `"0"` | `"0"` |
+| 0.84 s onward | `42` | `"0"` | `"0"` |
+
+Two consequences the adapter relies on:
+
+1. The **pref** is correct in every window, so `playerprefs:mute` is the primary
+   signal. A sign-based reading alone would report unmuted for ~0.8 s after a mute.
+2. A negative `mixer volume` is nonetheless a *sufficient* condition for muted, so
+   the adapter also treats it as one. It can only ever produce a false **negative**,
+   never a false positive, which makes it safe to OR with the pref — and it needs no
+   tagged parameter, so it still works if `playerprefs:` is unavailable.
+
+An earlier reading of this recorded a positive `42` while muted and concluded LMS
+does not negate the volume. That reading was taken inside the sub-second fade window
+and was wrong; `tests/lms_adapter_defects.rs::muted_player_volume_is_not_negated`
+caught it against `status_squeezelite_muted.json`.
 
 ## Failure mode (no fixture file — there is no response to record)
 
