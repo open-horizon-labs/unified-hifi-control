@@ -2522,11 +2522,8 @@ mod tests {
         let mut load_a = pending_load(&mut state, 14, "search_a");
         let mut load_b = pending_load(&mut state, 15, "search_b");
 
-        let routing = state.route_browse_rejection(
-            12,
-            Some("search_b"),
-            RoonBrowseErrorKind::InvalidItemKey,
-        );
+        let routing =
+            state.route_browse_rejection(12, Some("search_b"), RoonBrowseErrorKind::InvalidItemKey);
 
         assert_eq!(routing, ErrorRouting::Browse);
         assert_eq!(
@@ -2639,16 +2636,10 @@ mod tests {
         let mut state = RoonState::default();
         let mut rx = pending_browse(&mut state, 40, "browse_y");
 
-        let first = state.route_browse_rejection(
-            40,
-            Some("browse_y"),
-            RoonBrowseErrorKind::InvalidItemKey,
-        );
-        let second = state.route_browse_rejection(
-            40,
-            Some("browse_y"),
-            RoonBrowseErrorKind::InvalidItemKey,
-        );
+        let first =
+            state.route_browse_rejection(40, Some("browse_y"), RoonBrowseErrorKind::InvalidItemKey);
+        let second =
+            state.route_browse_rejection(40, Some("browse_y"), RoonBrowseErrorKind::InvalidItemKey);
 
         assert_eq!(first, ErrorRouting::Browse);
         assert_eq!(second, ErrorRouting::NoWaiter);
@@ -2677,11 +2668,8 @@ mod tests {
         let rx = pending_browse(&mut state, 60, "browse_w");
         drop(rx);
 
-        let routing = state.route_browse_rejection(
-            60,
-            Some("browse_w"),
-            RoonBrowseErrorKind::InvalidItemKey,
-        );
+        let routing =
+            state.route_browse_rejection(60, Some("browse_w"), RoonBrowseErrorKind::InvalidItemKey);
 
         assert_eq!(routing, ErrorRouting::ReceiverGone);
         assert!(
@@ -2705,7 +2693,11 @@ mod tests {
 
             let routing = state.route_browse_rejection(70, Some("browse_all"), kind);
 
-            assert_eq!(routing, ErrorRouting::Browse, "kind {kind:?} was not routed");
+            assert_eq!(
+                routing,
+                ErrorRouting::Browse,
+                "kind {kind:?} was not routed"
+            );
             assert_eq!(rejection_kind(&mut rx), kind);
         }
     }
@@ -2778,8 +2770,7 @@ mod tests {
             Some("browse_1"),
         ));
         let timed_out = anyhow::anyhow!("Browse request timed out");
-        let not_connected =
-            anyhow::anyhow!("Browse service not available - not connected to Roon");
+        let not_connected = anyhow::anyhow!("Browse service not available - not connected to Roon");
 
         let Some(rejection) = RoonBrowseError::from_error(&rejected) else {
             unreachable!("a rejection must be recoverable from the anyhow error");
