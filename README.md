@@ -28,8 +28,12 @@ docker pull muness/unified-hifi-control:latest
 ### Synology NAS (DSM 7)
 
 Download the SPK package from [Releases](https://github.com/open-horizon-labs/unified-hifi-control/releases):
-- `unified-hifi-control_*_apollolake.spk` — Intel x86_64 (DS918+, DS920+, etc.)
-- `unified-hifi-control_*_rtd1296.spk` — ARM64 (DS220+, DS420+, etc.)
+- `unified-hifi-control-x86_64-*-dsm7.spk` — Synology x86_64 platform family
+- `unified-hifi-control-armv8-*-dsm7.spk` — Synology ARMv8 platform family
+
+In Package Center, choose **Manual Install** and select the SPK matching the NAS's
+Package Architecture. DSM 7 warns before installing third-party packages; this is
+expected because DSM 7 no longer uses third-party package signing.
 
 ### QNAP NAS
 

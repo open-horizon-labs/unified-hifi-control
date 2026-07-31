@@ -402,6 +402,18 @@ jobs:
           RUSTC_WRAPPER: "sccache"
         run: cargo test --workspace
 
+  synology-package-test:
+    name: Synology Package Contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate SPK metadata and structure
+        run: tests/synology_package_contract.sh
+
+      - name: Test lifecycle as an unprivileged package user
+        run: tests/synology_package_lifecycle.sh
+
   # Build WASM assets once - shared by all platform builds
   # WASM is platform-independent, so we build once and share
   # Uses content-based caching to skip build when source unchanged
@@ -1176,21 +1188,22 @@ jobs:
   # Note: Web assets are embedded in the binary (ADR 002)
   build-synology:
     name: Build Synology SPK (${{ matrix.arch }})
-    needs: [plan, build-linux-x64, build-linux-arm]
+    needs: [plan, build-linux-x64, build-linux-arm, synology-package-test]
     if: |
       always() &&
       needs.plan.outputs.build_synology == 'true' &&
-      needs.build-linux-x64.result == 'success'
+      needs.build-linux-x64.result == 'success' &&
+      needs.synology-package-test.result == 'success'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: apollolake
+          - arch: x86_64
             cpu_arch: x86_64
             target: x86_64-unknown-linux-musl
             binary: unified-hifi-linux-x64
-          - arch: rtd1296
+          - arch: armv8
             cpu_arch: armv8
             target: aarch64-unknown-linux-musl
             binary: unified-hifi-linux-arm64
@@ -1209,36 +1222,16 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           name: binary-${{ matrix.target }}
-          path: build/synology/package/
-
-      - name: Rename binary
-        run: |
-          mv build/synology/package/${{ matrix.binary }} build/synology/package/unified-hifi-control
-          chmod +x build/synology/package/unified-hifi-control
-
-      - name: Update INFO file
-        run: |
-          sed -i "s/version=\"{{VERSION}}\"/version=\"${{ needs.plan.outputs.version }}\"/" build/synology/INFO
-          sed -i "s/arch=\"{{ARCH}}\"/arch=\"${{ matrix.arch }}\"/" build/synology/INFO
+          path: dist/synology-binary/
 
       - name: Build Synology SPK
         run: |
-          cd build/synology
-
-          # Create package.tgz with binary
-          tar -czf package.tgz -C package .
-
-          # Add extractsize to INFO (package.tgz size in KB)
-          EXTRACT_SIZE=$(du -k package.tgz | cut -f1)
-          echo "extractsize=\"${EXTRACT_SIZE}\"" >> INFO
-
-          # Create SPK (exclude empty WIZARD_UIFILES - optional component)
-          # Naming convention: {package}-{cpu_arch}-{version}-dsm7.spk (matches Tailscale)
-          mkdir -p ../../dist/installers
           SPK_NAME="unified-hifi-control-${{ matrix.cpu_arch }}-${{ needs.plan.outputs.version }}-dsm7.spk"
-          tar -cvf "../../dist/installers/${SPK_NAME}" \
-            INFO PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG \
-            package.tgz scripts conf
+          build/synology/build-spk.sh \
+            "${{ needs.plan.outputs.version }}" \
+            "${{ matrix.arch }}" \
+            "dist/synology-binary/${{ matrix.binary }}" \
+            "dist/installers/${SPK_NAME}"
 
       - name: Upload Synology package
         uses: actions/upload-artifact@v7
@@ -1835,6 +1828,7 @@ jobs:
       - plan
       - lint
       - test
+      - synology-package-test
       - build-wasm
       - build-linux-x64
       - smoke-test

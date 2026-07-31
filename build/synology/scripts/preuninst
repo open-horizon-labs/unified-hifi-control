@@ -1,17 +1,6 @@
-#!/bin/bash
+#!/bin/sh
 
-PACKAGE_NAME="unified-hifi-control"
-PID_FILE="/var/run/${PACKAGE_NAME}.pid"
-
-# Stop the service if running
-if [ -f "$PID_FILE" ]; then
-    PID=$(cat "$PID_FILE")
-    if kill -0 "$PID" 2>/dev/null; then
-        kill "$PID"
-        sleep 2
-        kill -9 "$PID" 2>/dev/null
-    fi
-    rm -f "$PID_FILE"
-fi
+# DSM stops the service before invoking this validation hook. Keep preuninst
+# side-effect free so a failed uninstall can be aborted safely.
 
 exit 0
