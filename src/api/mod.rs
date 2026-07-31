@@ -519,20 +519,19 @@ pub async fn roon_play_handler(
 /// recovery instruction. Everything else - a timed-out or unreachable Core, a
 /// Core-side fault - keeps the 500 it has always had. Browse-not-connected is
 /// still checked before the request is issued and still answers 503.
-fn roon_browse_failure(err: &anyhow::Error, prefix: &str) -> axum::response::Response {
+fn roon_browse_failure(err: &anyhow::Error, prefix: Option<&str>) -> axum::response::Response {
     use crate::adapters::roon::{RoonBrowseError, RoonBrowseErrorKind};
 
     let status = match RoonBrowseError::from_error(err).map(|rejection| rejection.kind) {
-        Some(RoonBrowseErrorKind::InvalidItemKey) | Some(RoonBrowseErrorKind::ZoneNotFound) => {
+        Some(RoonBrowseErrorKind::InvalidItemKey | RoonBrowseErrorKind::ZoneNotFound) => {
             StatusCode::NOT_FOUND
         }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
-    let error = if prefix.is_empty() {
-        err.to_string()
-    } else {
-        format!("{}: {}", prefix, err)
+    let error = match prefix {
+        Some(prefix) => format!("{}: {}", prefix, err),
+        None => err.to_string(),
     };
 
     (status, Json(ErrorResponse { error })).into_response()
@@ -576,7 +575,7 @@ pub async fn roon_play_item_handler(
             Json(serde_json::json!({ "message": message })),
         )
             .into_response(),
-        Err(e) => roon_browse_failure(&e, ""),
+        Err(e) => roon_browse_failure(&e, None),
     }
 }
 
@@ -667,7 +666,7 @@ pub async fn roon_browse_handler(
     // Browse to the level
     let browse_result = match state.roon.browse(opts).await {
         Ok(result) => result,
-        Err(e) => return roon_browse_failure(&e, ""),
+        Err(e) => return roon_browse_failure(&e, None),
     };
 
     // Load items at this level
@@ -699,7 +698,7 @@ pub async fn roon_browse_handler(
                         }
                     })
                     .collect(),
-                Err(e) => return roon_browse_failure(&e, "Browse load error"),
+                Err(e) => return roon_browse_failure(&e, Some("Browse load error")),
             }
         } else {
             vec![]
