@@ -1,0 +1,191 @@
+[
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "List all available playback zones (Roon, LMS, OpenHome, UPnP)",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "hifi_zones"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Get current playback state for a zone (track, artist, album, play state, volume)",
+    "inputSchema": {
+      "properties": {
+        "zone_id": {
+          "description": "The zone ID to query (get from hifi_zones)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "zone_id"
+      ],
+      "type": "object"
+    },
+    "name": "hifi_now_playing"
+  },
+  {
+    "description": "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down",
+          "type": "string"
+        },
+        "value": {
+          "description": "For volume actions: the level (0-100 for volume_set) or amount to change",
+          "nullable": true,
+          "type": "number"
+        },
+        "zone_id": {
+          "description": "The zone ID to control",
+          "type": "string"
+        }
+      },
+      "required": [
+        "zone_id",
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "hifi_control"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins (zone_id recommended as different players may have different sources configured).",
+    "inputSchema": {
+      "properties": {
+        "query": {
+          "description": "Search query (e.g., \"Hotel California\", \"Eagles\", \"jazz piano\")",
+          "type": "string"
+        },
+        "source": {
+          "description": "Where to search: \"library\" (default), \"tidal\", or \"qobuz\". Roon only; LMS searches all providers.",
+          "nullable": true,
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Zone ID for context-aware results. Recommended for LMS (different players may have different sources).",
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "hifi_search"
+  },
+  {
+    "description": "Search and play music. Searches and plays, queues, or starts radio from the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; LMS searches all providers.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "What to do: \"play\" (default), \"queue\", or \"radio\". radio is Roon-only.",
+          "nullable": true,
+          "type": "string"
+        },
+        "query": {
+          "description": "What to play (e.g., \"early Michael Jackson\", \"Dark Side of the Moon\")",
+          "type": "string"
+        },
+        "source": {
+          "description": "Where to search: \"library\" (default), \"tidal\", or \"qobuz\". Roon only; LMS searches all providers.",
+          "nullable": true,
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Zone ID to play on (get from hifi_zones)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query",
+        "zone_id"
+      ],
+      "type": "object"
+    },
+    "name": "hifi_play"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Get overall bridge status (Roon connection, HQPlayer config)",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "hifi_status"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Get HQPlayer Embedded status and current pipeline settings",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "hifi_hqplayer_status"
+  },
+  {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "List available HQPlayer Embedded configurations",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "hifi_hqplayer_profiles"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true
+    },
+    "description": "Load an HQPlayer Embedded configuration (will restart HQPlayer)",
+    "inputSchema": {
+      "properties": {
+        "profile": {
+          "description": "Configuration name to load (get from hifi_hqplayer_profiles)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "profile"
+      ],
+      "type": "object"
+    },
+    "name": "hifi_hqplayer_load_profile"
+  },
+  {
+    "description": "Change an HQPlayer pipeline setting (mode, samplerate, filter1x, filterNx, shaper, dither)",
+    "inputSchema": {
+      "properties": {
+        "setting": {
+          "description": "Setting to change: mode, samplerate, filter1x, filterNx, shaper, dither",
+          "type": "string"
+        },
+        "value": {
+          "description": "New value for the setting",
+          "type": "string"
+        }
+      },
+      "required": [
+        "setting",
+        "value"
+      ],
+      "type": "object"
+    },
+    "name": "hifi_hqplayer_set_pipeline"
+  }
+]
