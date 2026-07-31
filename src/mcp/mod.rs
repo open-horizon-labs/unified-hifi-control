@@ -32,7 +32,7 @@ const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 /// List all available playback zones
 #[mcp_tool(
     name = "hifi_zones",
-    description = "List all available playback zones (Roon, LMS, OpenHome, UPnP)",
+    description = "List all available playback zones (Roon, LMS, OpenHome, UPnP, direct HQPlayer)",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -53,15 +53,15 @@ pub struct HifiNowPlayingTool {
 /// Control playback
 #[mcp_tool(
     name = "hifi_control",
-    description = "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume"
+    description = "Control playback: play, pause, playpause (toggle), next, previous, stop, seek, mute, or adjust volume. Direct HQPlayer zones (zone_id starting hqplayer:) additionally support stop, seek, and mute; their volume is decimal dB, not 0-100."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiControlTool {
     /// The zone ID to control
     pub zone_id: String,
-    /// Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down
+    /// Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down. Direct HQPlayer zones also accept: stop, seek, mute.
     pub action: String,
-    /// For volume actions: the level (0-100 for volume_set) or amount to change
+    /// For volume actions: the level (0-100 for volume_set on Roon/LMS zones; decimal dB for direct HQPlayer zones) or the amount to change (dB for HQPlayer). For seek (HQPlayer only): the target position in seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
 }
@@ -343,6 +343,63 @@ impl ServerHandler for HifiMcpHandler {
             }
 
             HifiTools::HifiControlTool(args) => {
+                // A direct HQPlayer zone is routed through the same dispatch/capability-check
+                // function the knob `/control` handler uses (`dispatch_hqplayer_action`), not
+                // reimplemented here. Before this arm existed, a `hqplayer:` zone id fell through
+                // to the Roon branch below and every HQPlayer command reached Roon with the prefix
+                // stripped — the same defect #391 fixed in `knob_control_handler`, unfixed here
+                // because it is a separate switch in a separate file (#401).
+                if args.zone_id.starts_with("hqplayer:") {
+                    let instance = args.zone_id.trim_start_matches("hqplayer:");
+                    return match crate::knobs::routes::dispatch_hqplayer_action(
+                        &self.state,
+                        &args.zone_id,
+                        instance,
+                        &args.action,
+                        args.value,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if let Some(zone) = self.state.aggregator.get_zone(&args.zone_id).await
+                            {
+                                let np = McpNowPlaying {
+                                    zone_id: zone.zone_id,
+                                    zone_name: zone.zone_name,
+                                    state: zone.state.to_string(),
+                                    title: zone.now_playing.as_ref().map(|n| n.title.clone()),
+                                    artist: zone.now_playing.as_ref().map(|n| n.artist.clone()),
+                                    album: zone.now_playing.as_ref().map(|n| n.album.clone()),
+                                    volume: zone.volume_control.as_ref().map(|v| v.value as f64),
+                                    is_muted: zone.volume_control.as_ref().map(|v| v.is_muted),
+                                };
+                                let json = serde_json::to_string_pretty(&np)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                Ok(Self::text_result(format!(
+                                    "Action '{}' executed.\n\nCurrent state:\n{}",
+                                    args.action, json
+                                )))
+                            } else {
+                                Ok(Self::text_result(format!(
+                                    "Action '{}' executed.",
+                                    args.action
+                                )))
+                            }
+                        }
+                        Err(err) => {
+                            let message = match err {
+                                crate::knobs::routes::HqpDispatchError::NotFound(m) => m,
+                                crate::knobs::routes::HqpDispatchError::BadRequest {
+                                    message,
+                                    ..
+                                } => message,
+                                crate::knobs::routes::HqpDispatchError::Backend(m) => m,
+                            };
+                            Self::error_result(message)
+                        }
+                    };
+                }
+
                 // Map MCP actions to backend actions
                 let backend_action = match args.action.as_str() {
                     "play" => "play",
@@ -817,7 +874,11 @@ pub fn create_mcp_extension(state: AppState) -> axum::Extension<McpExtState> {
             Use hifi_zones to list available zones, hifi_now_playing to see what's playing, \
             hifi_control for playback control, hifi_search to find music, and hifi_play to play it.\n\n\
             Note: hifi_search and hifi_play currently work with Roon and LMS zones only. \
-            Transport controls (play/pause/next/volume) work with all zones (Roon, LMS, OpenHome, UPnP).\n\n\
+            Transport controls (play/pause/next/volume) work with all zones (Roon, LMS, OpenHome, UPnP, \
+            direct HQPlayer). A direct HQPlayer zone (zone_id starting hqplayer:) additionally supports \
+            stop, seek, and mute, and its volume is decimal dB rather than 0-100 — see hifi_control's \
+            own description for the exact semantics. hifi_hqplayer_status/profiles/load_profile/set_pipeline \
+            always operate on the default configured HQPlayer instance; they take no zone_id.\n\n\
             To build a playlist: call hifi_play multiple times with action='queue'. The first track \
             can use action='play' to start playback, then subsequent tracks use action='queue' to add to the queue."
                 .into(),

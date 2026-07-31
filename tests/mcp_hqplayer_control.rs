@@ -195,11 +195,7 @@ impl Rig {
             None,
             None,
         );
-        client
-            .clone()
-            .start()
-            .await
-            .expect("start mcp test client");
+        client.clone().start().await.expect("start mcp test client");
 
         Self {
             manager,
@@ -251,7 +247,10 @@ impl Rig {
         adapter
     }
 
-    async fn zone_when(&self, mut condition: impl FnMut(&unified_hifi_control::bus::Zone) -> bool) -> unified_hifi_control::bus::Zone {
+    async fn zone_when(
+        &self,
+        mut condition: impl FnMut(&unified_hifi_control::bus::Zone) -> bool,
+    ) -> unified_hifi_control::bus::Zone {
         for _ in 0..200 {
             if let Some(zone) = self.aggregator.get_zone("hqplayer:rig").await {
                 if condition(&zone) {
@@ -377,7 +376,10 @@ async fn mcp_transport_reaches_the_selected_hqplayer_instance_and_not_roon() {
 
     let before = model.request_count("Pause");
     let result = rig
-        .call_tool("hifi_control", json!({"zone_id": "hqplayer:rig", "action": "pause"}))
+        .call_tool(
+            "hifi_control",
+            json!({"zone_id": "hqplayer:rig", "action": "pause"}),
+        )
         .await;
     let text = text_of(&result);
     assert!(
@@ -463,7 +465,11 @@ async fn mcp_playpause_resolves_against_the_published_state() {
         )
         .await;
     assert!(!text_of(&result).starts_with("Error"));
-    assert_eq!(model.request_count("Pause"), 1, "playing + playpause must pause");
+    assert_eq!(
+        model.request_count("Pause"),
+        1,
+        "playing + playpause must pause"
+    );
     assert_eq!(model.request_count("Play"), 0);
     rig.zone_when(|z| z.state == PlaybackState::Paused).await;
 
@@ -564,9 +570,15 @@ async fn mcp_mute_routes_to_the_hqplayer_instance_and_is_reported_from_the_floor
     );
 
     let result = rig
-        .call_tool("hifi_control", json!({"zone_id": "hqplayer:rig", "action": "mute"}))
+        .call_tool(
+            "hifi_control",
+            json!({"zone_id": "hqplayer:rig", "action": "mute"}),
+        )
         .await;
-    assert!(!text_of(&result).starts_with("Error"), "mute must succeed via MCP");
+    assert!(
+        !text_of(&result).starts_with("Error"),
+        "mute must succeed via MCP"
+    );
     assert_eq!(model.request_count("VolumeMute"), 1);
 
     rig.zone_when(|z| {
