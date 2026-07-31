@@ -91,8 +91,6 @@ pub struct SurfaceCapabilities {
     /// disable the whole control. Swapping one for the other silently deletes a published
     /// constraint.
     pub per_choice_reasons: bool,
-    /// Whether the surface can display reason text at all, as opposed to a bare state.
-    pub reason_text: bool,
     /// The highest risk class this surface may advertise as invokable.
     ///
     /// [`RiskClass::Unrecognized`] sorts above every recognized member, so a risk class from a
@@ -102,12 +100,11 @@ pub struct SurfaceCapabilities {
 }
 
 impl SurfaceCapabilities {
-    /// A surface that can render every primitive this build knows, with full reason text.
+    /// A surface that can render every primitive this build knows, including per-choice reasons.
     pub fn unrestricted() -> Self {
         Self {
             renders_kinds: ControlKind::known().into_iter().collect(),
             per_choice_reasons: true,
-            reason_text: true,
             max_risk: RiskClass::Destructive,
         }
     }
@@ -178,7 +175,6 @@ impl SurfaceProfile {
                 .into_iter()
                 .collect(),
                 per_choice_reasons: false,
-                reason_text: false,
                 max_risk: RiskClass::Caution,
             },
             budget: SurfaceBudget {
@@ -973,7 +969,13 @@ struct Invalidation {
 impl Invalidation {
     fn of(document: &ProducerDocument) -> Self {
         let mut by_control = BTreeMap::new();
-        for operation in &document.operations {
+        // Two outstanding writes can invalidate the same enumeration, and the surface is shown one
+        // of them. Choosing by operation id rather than by position in `operations` keeps that
+        // choice independent of a `Vec` order the producer never promised — the same arbitrariness
+        // #324 refused to depend on when it demoted every C2 claimant instead of keeping the first.
+        let mut operations: Vec<&OperationRecord> = document.operations.iter().collect();
+        operations.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        for operation in operations {
             if operation.outcome.is_state_evidence() {
                 continue;
             }
@@ -1118,27 +1120,27 @@ fn narrow(
         })
         .collect();
 
-    let mut kept: Vec<Choice> = choices
+    // Membership first: every held selection, then fill to the budget from the top of the
+    // authority's list. The budget can be exceeded when a control holds more selections than the
+    // surface asked for — deliberately, because a control whose own value is missing from its
+    // options is a state the user cannot reason about, and a list one item too long is not.
+    let mut kept: BTreeSet<&str> = choices
         .iter()
-        .filter(|choice| selected.contains(&choice.id))
-        .cloned()
+        .map(|choice| choice.id.as_str())
+        .filter(|id| selected.contains(*id))
         .collect();
     for choice in choices {
         if kept.len() >= budget {
             break;
         }
-        if selected.contains(&choice.id) {
-            continue;
-        }
-        kept.push(choice.clone());
+        kept.insert(choice.id.as_str());
     }
-    // Restore the authority's own order; keeping the selection is about membership, not position.
-    let mut ordered: Vec<Choice> = choices
+    // Then position: the authority's own order, which the contract says is meaningful.
+    let ordered: Vec<Choice> = choices
         .iter()
-        .filter(|choice| kept.iter().any(|keeper| keeper.id == choice.id))
+        .filter(|choice| kept.contains(choice.id.as_str()))
         .cloned()
         .collect();
-    ordered.truncate(kept.len().max(selected.len()));
     let dropped = choices.len() - ordered.len();
     (ordered, (dropped > 0).then_some(dropped))
 }

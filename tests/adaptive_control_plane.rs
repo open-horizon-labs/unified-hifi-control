@@ -260,6 +260,87 @@ fn the_observed_lane_never_carries_staged_or_held_intent() {
 }
 
 #[test]
+fn every_surface_follows_one_operation_under_one_correlation() {
+    let mut document = pipeline();
+    document.operations = vec![operation(
+        "op-mode-1",
+        "hqplayer.pipeline.mode",
+        CommandOutcome::Pending,
+    )];
+
+    let views: Vec<RenderedProjection> = [web(), mcp(), device(64)]
+        .iter()
+        .map(|profile| rendered(document.clone(), profile))
+        .collect();
+    let seen: Vec<(String, String, CommandOutcome, bool)> = views
+        .iter()
+        .map(|view| {
+            let mode = view.control("hqplayer.pipeline.mode").expect("projected");
+            let operation = &mode.operations[0];
+            (
+                operation.id.as_str().to_string(),
+                operation.correlation_id.clone(),
+                operation.outcome.clone(),
+                operation.is_state_evidence,
+            )
+        })
+        .collect();
+
+    assert!(
+        seen.windows(2).all(|pair| pair[0] == pair[1]),
+        "the same operation must read identically on every surface, or two clients watching one \
+         write disagree about whether it landed: {seen:?}"
+    );
+    assert_eq!(seen[0].1, "corr-op-mode-1");
+    assert!(
+        !seen[0].3,
+        "a pending write is not evidence about the engine"
+    );
+}
+
+#[test]
+fn the_only_prose_keys_this_layer_originates_are_its_own_declared_ones() {
+    // #343 owns catalog provenance. A projector that invented a key would put an unowned string
+    // where a governed one is expected, and nothing downstream would notice.
+    let surface_keys = [
+        WITHHELD_UNRENDERABLE_KIND,
+        WITHHELD_PER_CHOICE_REASON,
+        WITHHELD_RISK_EXCEEDS_SURFACE,
+    ];
+    let omitted_keys = [OMITTED_BUDGET_EXHAUSTED, OMITTED_CONTAINER_DROPPED];
+
+    let view = rendered(pipeline(), &device(6));
+    let mut withheld = 0usize;
+    for control in &view.controls {
+        if let Mutability::WithheldFromSurface { reason } = &control.mutability {
+            withheld += 1;
+            let key = reason
+                .display_text_key
+                .as_deref()
+                .expect("a surface-originated reason must be addressable in the catalog");
+            assert!(
+                surface_keys.contains(&key),
+                "{}: {key} is not a key this layer declares",
+                control.id
+            );
+            assert_eq!(reason.code, ReasonCode::RequiresCapability);
+        }
+    }
+    for entry in &view.omitted {
+        assert!(
+            omitted_keys.contains(&entry.display_text_key),
+            "{}: {} is not a key this layer declares",
+            entry.id,
+            entry.display_text_key
+        );
+    }
+    assert!(
+        withheld + view.omitted.len() > 0,
+        "the fixture must actually exercise this"
+    );
+}
+
+#[test]
 fn availability_reasons_survive_projection_on_every_surface() {
     for profile in [web(), mcp(), device(64)] {
         let view = rendered(pipeline(), &profile);
