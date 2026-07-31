@@ -1514,14 +1514,18 @@ impl HqpAdapter {
         )
     }
 
-    /// Ask whether the loaded chain has moved, and **publish nothing either way**.
+    /// Whether the daemon's chain still matches the one the cache was filled from, **publishing
+    /// nothing either way**. Drops the cache when it does not.
     ///
-    /// The read path's probe. Deliberately not [`Self::fresh_rates`], which caches what it fetched:
+    /// The read path's check. Deliberately not [`Self::fresh_rates`], which caches what it fetched:
     /// caching here would publish one family on its own, so a poll that detected a transition would
     /// leave a caller holding the new chain's rates beside no filters and no shapers — a partial view,
     /// offered as a whole one. Detection and publication are separate jobs, and [`Self::refresh_lists`]
     /// owns the second.
-    async fn chain_probe(&self) -> Result<()> {
+    ///
+    /// Nothing cached yet reads as a match: there is no previous observation for the daemon to
+    /// contradict, and the caller's own lazy fill is what settles it.
+    async fn chain_still_matches_cache(&self) -> Result<bool> {
         let fingerprint = Self::rates_fingerprint(&self.get_rates().await?);
         let previous = self.state.read().await.rates_fingerprint;
         if previous.is_some_and(|p| p != fingerprint) {
@@ -1530,8 +1534,9 @@ impl HqpAdapter {
                  chain-scoped list"
             );
             self.invalidate_chain_cache().await;
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Refresh every cached list, publishing **one coherent snapshot or none at all**.
@@ -2579,17 +2584,6 @@ impl HqpAdapter {
         Ok(outcome)
     }
 
-    /// Send `SetFilter` with **both** arguments.
-    ///
-    /// The daemon's `SetFilter` writes both sides: `value` alone sets 1x and Nx together, and
-    /// `value1x` splits them. There is therefore no such thing as a one-sided write on the wire — a
-    /// caller that omits the sibling is overwriting it with whatever it passed as `value`. Taking both
-    /// indices is what makes that impossible to express, rather than merely discouraged.
-    ///
-    /// **Indices in, and no readback.** This is the raw form: it resolves no name and confirms
-    /// nothing, so it is not a control path. Every advertised surface goes through
-    /// [`Self::set_filter_1x`] or [`Self::set_filter_nx`], which resolve a semantic name against the
-    /// loaded chain's list and verify the result.
     /// The request both sides of the pair travel in, built in one place so they cannot drift.
     fn filter_request(value_nx: u32, value1x: u32) -> String {
         let nx = value_nx.to_string();
@@ -2597,11 +2591,41 @@ impl HqpAdapter {
         Self::build_request("SetFilter", &[("value", &nx), ("value1x", &one_x)])
     }
 
-    pub async fn set_filter(&self, value_nx: u32, value1x: u32) -> Result<()> {
+    /// The observable both sides of the pair are verified against, as one value.
+    ///
+    /// The pair is what was requested, so reporting half of it back would be the same mistake as
+    /// writing half of it. `None` when the daemon reports neither sibling — `verify_applied` turns an
+    /// absent field into `Ambiguous`, which is what "nothing can be established" honestly is.
+    fn filter_pair_observation(state: &HqpState) -> Option<String> {
+        match (state.filter1x, state.filter_nx) {
+            (Some(one_x), Some(nx)) => Some(format!("1x={one_x},Nx={nx}")),
+            _ => None,
+        }
+    }
+
+    /// Send `SetFilter` with **both** arguments, by index.
+    ///
+    /// The daemon's `SetFilter` writes both sides: `value` alone sets 1x and Nx together, and
+    /// `value1x` splits them. There is therefore no such thing as a one-sided write on the wire — a
+    /// caller that omits the sibling is overwriting it with whatever it passed as `value`. Taking both
+    /// indices is what makes that impossible to express, rather than merely discouraged.
+    ///
+    /// **Indices in — and that is the only thing this form gives up.** It answered `Ok(())` on
+    /// `result="OK"` alone until an independent review pointed out that a public method doing so is a
+    /// false success whatever it is called, so it is verified like every other write: `OK` is not
+    /// proof of application here any more than anywhere else (HQP-C-028).
+    ///
+    /// Every advertised surface goes through [`Self::set_filter_1x`], [`Self::set_filter_nx`] or
+    /// [`Self::set_filter_pair`], which additionally resolve a semantic name against the loaded
+    /// chain's list. This form exists for a caller that already holds indices — the conformance
+    /// suite's cross-lane checks, which feed a persistent-domain enum ID to the live lane and require
+    /// it to be refused.
+    pub async fn set_filter(&self, value_nx: u32, value1x: u32) -> Result<SettingOutcome> {
         tracing::debug!("SetFilter: value={value_nx} (Nx), value1x={value1x} (1x)");
-        self.send_command(&Self::filter_request(value_nx, value1x))
-            .await?;
-        Ok(())
+        let expected = format!("1x={value1x},Nx={value_nx}");
+        let xml = Self::filter_request(value_nx, value1x);
+        self.write_setting(&xml, "filter", expected, Self::filter_pair_observation)
+            .await
     }
 
     /// Set only the 1x filter, preserving the Nx filter the daemon reports.
@@ -2638,15 +2662,8 @@ impl HqpAdapter {
         let expected = format!("1x={index},Nx={index}");
         tracing::debug!("SetFilter (both sides): value={index}, value1x={index}");
         let xml = Self::filter_request(index, index);
-        self.write_setting(&xml, "filter", expected, |s| {
-            match (s.filter1x, s.filter_nx) {
-                (Some(one_x), Some(nx)) => Some(format!("1x={one_x},Nx={nx}")),
-                // Absent rather than mismatched: `verify_applied` turns a field the daemon never
-                // reports into `Ambiguous`, which is the truthful answer when nothing can be seen.
-                _ => None,
-            }
-        })
-        .await
+        self.write_setting(&xml, "filter", expected, Self::filter_pair_observation)
+            .await
     }
 
     /// One side of the filter pair, carrying the authoritative other side with it.
@@ -2974,34 +2991,77 @@ impl HqpAdapter {
 
     /// Get full pipeline status
     pub async fn get_pipeline_status(&self) -> Result<PipelineStatus> {
-        // Core data: State + Status (2 TCP commands)
-        let state = self.get_state().await?;
-        let playback_status = self.get_playback_status().await.unwrap_or_default();
-
-        // Chain probe. The lists this view publishes are scoped to the chain the daemon has *loaded*,
-        // and under `[source]` that chain moves without `State.mode` moving at all (HQP-C-007) — so
-        // "refresh when a list is empty" served the previous chain's options indefinitely, and a UI
-        // offering PCM filters over a loaded DSD chain is a lie a user acts on.
+        // `State` reports settings as **list indices**, and an index means nothing apart from the list
+        // it came from. So the lists are settled first and `State` is read after them, then the chain
+        // is checked once more: if it moved while `State` was being read, the index and the list
+        // describe different chains and neither answer is the daemon's.
         //
-        // The rate list is the probe because it is the smallest chain-scoped enumeration and the two
-        // chains' rate lists were observed disjoint (HQP-C-020). Its fingerprint changing drops every
-        // chain-scoped cache, which the lazy fill below then repopulates. A probe failure is not fatal
-        // to a read: the caller still gets `State` and `Status`.
-        if let Err(e) = self.chain_probe().await {
-            tracing::warn!("HQPlayer chain probe failed, serving cached enumerations: {e}");
-        }
+        // Reading `State` first — as this did — is the same misselection this issue exists to end,
+        // arriving through the read path and needing no write at all: under `[source]` the chain moves
+        // without `State.mode` moving (HQP-C-007), so a pre-transition index was resolved against
+        // post-transition lists.
+        //
+        // The rate list is the check because it is the smallest chain-scoped enumeration and the two
+        // chains' rate lists were observed disjoint (HQP-C-020). One retry, not a loop: a daemon whose
+        // chain is flapping would otherwise hold this open, and after the retry the lists and `State`
+        // are at least read in the right order.
+        //
+        // **Residual, and it cannot be closed from here.** The check confirms the chain is the same
+        // *now* as when the lists were published; a move out and back inside that window leaves it
+        // agreeing. Only a daemon-side atomic snapshot could do better, and the protocol has none.
+        let mut state = None;
+        let mut playback_status = HqpStatus::default();
+        for attempt in 0..2 {
+            // Lazy-fill whatever is missing — on the first read after connect, that is all of it.
+            let needs_lists = {
+                let cached = self.state.read().await;
+                cached.modes.is_empty()
+                    || cached.filters.is_empty()
+                    || cached.shapers.is_empty()
+                    || cached.rates.is_empty()
+            };
+            if needs_lists {
+                self.refresh_lists().await;
+            }
 
-        // Lazy-fill whatever the probe left empty — on the first read after connect, that is all of it.
-        let needs_lists = {
-            let cached = self.state.read().await;
-            cached.modes.is_empty()
-                || cached.filters.is_empty()
-                || cached.shapers.is_empty()
-                || cached.rates.is_empty()
-        };
-        if needs_lists {
-            self.refresh_lists().await;
+            let observed = self.get_state().await?;
+            playback_status = self.get_playback_status().await.unwrap_or_default();
+
+            // A check failure is not fatal to a read: the caller still gets `State` and `Status`.
+            match self.chain_still_matches_cache().await {
+                Ok(true) => {
+                    state = Some(observed);
+                    break;
+                }
+                Ok(false) if attempt == 0 => {
+                    tracing::info!(
+                        "HQPlayer's loaded chain moved while its state was being read; re-reading \
+                         rather than resolving one chain's indices against another's lists"
+                    );
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        "HQPlayer's loaded chain moved again during the re-read; publishing the \
+                         freshly read state against the freshly read lists"
+                    );
+                    state = Some(observed);
+                }
+                Err(e) => {
+                    tracing::warn!("HQPlayer chain check failed, serving cached enumerations: {e}");
+                    state = Some(observed);
+                }
+            }
+            if state.is_some() {
+                break;
+            }
         }
+        let state = match state {
+            Some(state) => state,
+            // Unreachable in practice: the loop only leaves this `None` by exhausting both attempts
+            // without setting it, and the second attempt always sets it. Read it once more rather
+            // than unwrap, so a future edit to the loop cannot turn a logic slip into a panic.
+            None => self.get_state().await?,
+        };
 
         // Lazy-load volume range if not cached
         let needs_vol_range = {

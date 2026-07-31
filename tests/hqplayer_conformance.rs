@@ -7076,3 +7076,110 @@ async fn a_both_sides_filter_write_that_is_ignored_reports_both_sides() {
     );
     h.stop();
 }
+
+// -----------------------------------------------------------------------------
+// The indices and the lists they are resolved against must describe the same chain
+// (CodeRabbit, review of 2eb699e)
+// -----------------------------------------------------------------------------
+
+/// `State` reports settings as **list indices**, and an index is only meaningful beside the list it
+/// came from. Reading `State` *before* settling the enumerations means a pre-transition index is
+/// resolved against post-transition lists — the same misselection this issue exists to end, arriving
+/// through the read path instead of the write path, and needing no write at all.
+///
+/// The Opal corpus is what makes it observable: its SDM excerpt is shorter than its PCM one, so an
+/// index the daemon clamps across the transition resolves to nothing in the list that is then used.
+///
+/// **Label: client-red.** Before this, the published 1x filter was empty while the daemon held
+/// `poly-sinc-xtr`.
+#[tokio::test]
+async fn a_chain_change_between_the_state_read_and_the_list_read_is_not_published() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`
+        s.playback = 2;
+        // Index 7 exists in the 12-entry PCM excerpt and not in the 5-entry SDM one, so the daemon
+        // clamps it across the transition and the two chains disagree about what 7 means.
+        s.filter_1x_index = 7;
+        s.filter_nx_index = 7;
+    });
+    let before = h.adapter.get_pipeline_status().await.expect("pipeline");
+    assert_eq!(
+        before.settings.filter1x.selected.value.as_str(),
+        "poly-sinc-gauss-long",
+        "precondition: the PCM chain's list gives index 7 this name"
+    );
+
+    // The source moves the chain in the gap the client cannot see: after `State` has answered and
+    // before the enumerations are read.
+    h.model
+        .switch_chain_after_request("State", LoadedChain::Sdm);
+
+    let after = h.adapter.get_pipeline_status().await.expect("pipeline");
+
+    let held = h.model.state().filter_1x_index;
+    let truth = corpus::enum_entries(
+        &corpus::document(VERIFIED_PROFILE, "filters_sdm"),
+        "FiltersItem",
+    )
+    .into_iter()
+    .find(|e| e.index == held)
+    .map(|e| e.name)
+    .expect("the daemon's own index resolves in the chain it now has loaded");
+
+    assert_eq!(
+        after.settings.filter1x.selected.value, truth,
+        "the published selection must be what the daemon's current index names in the chain it \
+         currently has loaded; an index read before the lists were settled belongs to neither"
+    );
+    h.stop();
+}
+
+/// The raw index form of `SetFilter` is an escape hatch, not a control path — but an escape hatch
+/// that answers `Ok(())` on `result="OK"` alone is a false success with a public name on it. It goes
+/// through the same verification as every other write.
+///
+/// **Label: client-red.** Before this it reported success for a write the daemon acknowledged and
+/// dropped.
+#[tokio::test]
+async fn a_raw_filter_write_the_daemon_acknowledges_and_drops_is_not_reported_as_success() {
+    let h = Harness::verified().await;
+    h.model
+        .arm(|f| f.accept_but_ignore.push("SetFilter".to_string()));
+    let before = h.model.state();
+    assert_ne!(
+        before.filter_nx_index, 2,
+        "precondition: the requested index must differ from the one held, or a readback proves \
+         nothing either way"
+    );
+
+    let outcome = h.adapter.set_filter(2, 2).await;
+
+    assert!(
+        h.model.request_count("SetFilter") > 0,
+        "the write must actually have been attempted: this is a daemon-side no-op"
+    );
+    assert_eq!(
+        (
+            h.model.state().filter_1x_index,
+            h.model.state().filter_nx_index
+        ),
+        (before.filter_1x_index, before.filter_nx_index),
+        "precondition: the daemon really did not move"
+    );
+    // Strengthened from `outcome.is_err()` after the fix landed: the RED was captured against the
+    // pre-fix `Result<()>`, where an ignored write was `Ok(())`. The collapse is what every
+    // advertised surface applies, so this asserts what a client would see — and additionally that
+    // the outcome is `Ignored` rather than some other non-success, which the bare `is_err()` could
+    // not distinguish.
+    assert!(
+        matches!(outcome, Ok(SettingOutcome::Ignored { .. })),
+        "an acknowledged-but-dropped write is `Ignored` — not applied, and not a transport failure"
+    );
+    assert!(
+        outcome.applied().is_err(),
+        "`result=\"OK\"` is not proof of application on the raw path either — and a public method \
+         that says otherwise is the false success this issue exists to remove"
+    );
+    h.stop();
+}
