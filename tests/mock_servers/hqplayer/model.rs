@@ -341,8 +341,13 @@ struct Inner {
     status_active_mode: ActiveModeReporting,
     /// Which filter fields `State` carries. See [`FilterFieldReporting`].
     filter_fields: FilterFieldReporting,
-    /// `(element, chain)` — move the loaded chain once, right after that element is answered.
-    chain_switch_after: Option<(String, LoadedChain)>,
+    /// `(element, chain)` queue — each entry moves the loaded chain once, right after that element
+    /// is answered, in the order they were armed.
+    ///
+    /// A queue rather than a single slot because a client that retries has more than one window to
+    /// be caught in, and "the chain moved during the retry as well" is the case a bounded retry must
+    /// answer for. One slot could only ever express the first.
+    chain_switch_after: Vec<(String, LoadedChain)>,
     enums: Enumerations,
     /// Every request line received, in order, so a test can assert on the value the client actually
     /// put on the wire (AC5) instead of on timing.
@@ -374,7 +379,7 @@ impl DaemonModel {
             state_active_mode: ActiveModeReporting::EchoesConfiguredMode,
             status_active_mode: ActiveModeReporting::EchoesConfiguredMode,
             filter_fields: FilterFieldReporting::default(),
-            chain_switch_after: None,
+            chain_switch_after: Vec::new(),
             enums: Enumerations::load(profile),
             requests: Vec::new(),
         };
@@ -454,6 +459,9 @@ impl DaemonModel {
     /// **Provenance: derived-upstream, tier-2-only** — the same source-following observation as
     /// [`LoadedChain`]. That a change can land between two requests needs no separate evidence: it
     /// follows from the chain being able to move at all while the client is connected.
+    ///
+    /// Calls queue: arming twice moves the chain on the next two matching requests, in order, which
+    /// is how a client's *retry* window is reached as well as its first.
     pub fn switch_chain_after_request(&self, element: &str, chain: LoadedChain) {
         let mut inner = self.lock();
         assert_eq!(
@@ -461,7 +469,7 @@ impl DaemonModel {
             "switch_chain_after_request requires configured [source] mode, for the same reason \
              source_loads_chain does: in PCM or SDM the configured mode *is* the chain"
         );
-        inner.chain_switch_after = Some((element.to_string(), chain));
+        inner.chain_switch_after.push((element.to_string(), chain));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1166,12 +1174,14 @@ impl Responder for DaemonModel {
         // A source-driven chain change landing *inside* a client's multi-request conversation. Applied
         // after the reply is built, so this request still sees the chain it asked about and every
         // later one sees the new chain — which is exactly how a change between two requests looks.
-        let due = matches!(inner.chain_switch_after, Some((ref el, _)) if *el == element);
+        let due = inner
+            .chain_switch_after
+            .first()
+            .is_some_and(|(el, _)| *el == element);
         if due {
-            if let Some((_, chain)) = inner.chain_switch_after.take() {
-                inner.state.loaded_chain = chain;
-                inner.clamp_to_loaded_chain();
-            }
+            let (_, chain) = inner.chain_switch_after.remove(0);
+            inner.state.loaded_chain = chain;
+            inner.clamp_to_loaded_chain();
         }
 
         Some(reply)

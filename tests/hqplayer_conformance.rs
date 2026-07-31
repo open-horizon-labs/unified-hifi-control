@@ -7183,3 +7183,59 @@ async fn a_raw_filter_write_the_daemon_acknowledges_and_drops_is_not_reported_as
     );
     h.stop();
 }
+
+/// A bounded retry has to be allowed to **fail**. When the chain moves during the state read on the
+/// retry as well, the client has nothing coherent to publish: the lists it holds are from the chain
+/// before that second move, and noticing the move drops them. Answering `Ok` there hands back a
+/// `PipelineStatus` whose option lists are empty and whose selections resolve to nothing, presented
+/// as this daemon's settings.
+///
+/// "I could not read this coherently" is a truthful answer and the route already renders it — the
+/// pipeline handler has always had an error arm. "Here are no filters at all" is not.
+///
+/// **Label: client-red.** Before this, the second mismatch set the state and published anyway.
+#[tokio::test]
+async fn a_chain_that_moves_on_both_the_read_and_the_retry_is_reported_rather_than_published() {
+    let h = Harness::verified().await;
+    h.model.external_change(|s| {
+        s.mode_index = 0; // configured `[source]`
+        s.playback = 2;
+        s.filter_1x_index = 7;
+        s.filter_nx_index = 7;
+    });
+    h.adapter
+        .get_pipeline_status()
+        .await
+        .expect("precondition: a settled daemon reads fine");
+
+    // Two transitions, each landing on a `State` read: the first catches the initial read, the
+    // second catches the retry. A daemon whose source is flapping does exactly this.
+    h.model
+        .switch_chain_after_request("State", LoadedChain::Sdm);
+    h.model
+        .switch_chain_after_request("State", LoadedChain::Pcm);
+
+    let outcome = h.adapter.get_pipeline_status().await;
+
+    match outcome {
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("chain"),
+                "the failure must say what could not be established — that the loaded chain kept \
+                 moving — rather than surfacing as some unrelated read error. Got: {message}"
+            );
+        }
+        Ok(published) => {
+            let families = published_families(&published);
+            panic!(
+                "a read that could not settle must not be reported as a successful one. It \
+                 published {families:?}, with filter1x selected as {:?} out of {} options — a \
+                 caller cannot tell that from a daemon that genuinely offers nothing",
+                published.settings.filter1x.selected.value,
+                published.settings.filter1x.options.len()
+            );
+        }
+    }
+    h.stop();
+}

@@ -3039,12 +3039,20 @@ impl HqpAdapter {
                          rather than resolving one chain's indices against another's lists"
                     );
                 }
+                // The retry moved too. There is nothing coherent to publish and no third attempt:
+                // the lists in hand came from the chain before *this* move, and noticing the move
+                // dropped them, so what is left is a state read against nothing. Answering `Ok`
+                // here hands back empty option lists and selections that resolve to nothing,
+                // presented as this daemon's settings — a caller cannot tell that from a daemon
+                // that genuinely offers no filters. The route has always had an error arm; this is
+                // what it is for.
                 Ok(false) => {
-                    tracing::warn!(
-                        "HQPlayer's loaded chain moved again during the re-read; publishing the \
-                         freshly read state against the freshly read lists"
-                    );
-                    state = Some(observed);
+                    let _ = observed;
+                    return Err(anyhow!(
+                        "HQPlayer's loaded chain moved while its settings were being read, and \
+                         again during the re-read; refusing to report settings that belong to no \
+                         single chain"
+                    ));
                 }
                 Err(e) => {
                     tracing::warn!("HQPlayer chain check failed, serving cached enumerations: {e}");
