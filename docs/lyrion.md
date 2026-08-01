@@ -79,8 +79,63 @@ Request specific fields with the `tags` parameter:
 
 ```javascript
 ['status', '-', 1, 'tags:aAdltKc']
-// a=artist, A=album, d=duration, l=album_id, t=tracknum, K=artwork_url, c=coverid
 ```
+
+This adapter's string requests: `a` artist, `A` per-role contributors, `d` duration,
+`l` album title, `t` tracknum, `K` artwork_url, `c` coverid.
+
+**An earlier version of this section was wrong**: it described `l` as the album id and
+`A` as the album. Both are false — `l` is the album title and `e` is the album id —
+and anyone extending the string from that legend would request the wrong fields. The
+table below is read from LMS's own `%tagMap` in
+`Slim/Control/Queries.pm` at 9.1.2 and confirmed against a live server; the recorded
+response is `tests/fixtures/lms/status_tags_aAdltKc.json`.
+
+| Tag | Key in the response | Value |
+|-----|--------------------|-------|
+| `a` | `artist` | Track artist name |
+| `A` | `albumartist`, `trackartist`, `composer`, … | Per-**role** contributor names — one key per role present, not a single field |
+| `s` | `artist_id` | Artist (contributor) id |
+| `l` | `album` | Album **title** |
+| `e` | `album_id` | Album id |
+| `g` | `genre` | Genre name |
+| `p` | `genre_id` | Genre id |
+| `d` | `duration` | Seconds |
+| `t` | `tracknum` | Track number |
+| `y` | `year` | Year |
+| `u` | `url` | Track URL |
+| `c` | `coverid` | Cover id, for `/music/<coverid>/cover.jpg` |
+| `K` | `artwork_url` | Artwork URL, relative for streaming content (see above) |
+| `J` | `artwork_track_id` | The album's artwork track id |
+
+Two things to know before extending the string:
+
+- **`A` returns several keys, not one.** Which keys depends on the roles present on
+  the track, so treat it as a set.
+- **`artwork_track_id` requires `J`, which this adapter does not request.** The
+  artwork fallback chain in `get_player_status` reads `coverid` → `artwork_track_id`
+  → `id`, so its middle arm is currently unreachable and artwork falls through to
+  the track's own `id`. Adding `J` costs nothing on the wire but changes
+  `image_key` for tracks with no `coverid`, and `image_key` is client-visible — so
+  it is deliberately left alone rather than changed as a side effect. See #407.
+
+### `mixer volume` is negative while muted
+
+`status` has **no mute key**. Mute lives in the per-player `mute` pref, and LMS
+*negates* the volume pref while muted, so `status` reports e.g. `"mixer volume": -42`.
+The negation lags the mute by roughly 0.8 s, because `mixer muting` schedules a fade
+and only writes the negated value when it finishes.
+
+The adapter therefore reports `player.volume` as the magnitude, and takes mute from
+two signals OR-ed together:
+
+1. `players 0 100 playerprefs:mute` — the pref, correct immediately. Rides on the
+   `players` call the poll already makes, so mute costs **no extra round-trip**;
+   `mixer muting ?` would cost one per player per poll.
+2. A negative `mixer volume` from `status` — needs no tagged parameter, but lags,
+   so it can only ever produce a false negative.
+
+`mixer muting <0|1>` sets mute, and `mixer volume <n>` clears it as a side effect.
 
 ## Authentication
 

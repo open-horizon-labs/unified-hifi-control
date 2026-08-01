@@ -48,9 +48,36 @@ impl MockPlayer {
     }
 }
 
+/// A command as it arrived on the wire: the target player id and the raw
+/// command array LMS was asked to run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedCommand {
+    pub player_id: String,
+    pub command: Vec<Value>,
+}
+
+impl RecordedCommand {
+    /// The command array rendered as strings, e.g. `["mixer", "volume", "-5"]`.
+    /// Convenient for asserting on the exact backend command an MCP action
+    /// produced without matching on `Value` variants.
+    pub fn parts(&self) -> Vec<String> {
+        self.command
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect()
+    }
+}
+
 /// Mock LMS server state
 struct MockLmsState {
     players: HashMap<String, MockPlayer>,
+    /// Every command received, in arrival order. Lets a test assert which
+    /// backend command an MCP action actually produced (issue #394) rather than
+    /// only observing the resulting state.
+    commands: Vec<RecordedCommand>,
 }
 
 /// Mock LMS Server
@@ -65,6 +92,7 @@ impl MockLmsServer {
     pub async fn start() -> Self {
         let state = Arc::new(RwLock::new(MockLmsState {
             players: HashMap::new(),
+            commands: Vec::new(),
         }));
 
         let app = Router::new()
@@ -124,6 +152,32 @@ impl MockLmsServer {
         }
     }
 
+    /// Drop the recorded command log. Call before the action under test so
+    /// polling traffic (`players`, `status`) does not have to be filtered out.
+    pub async fn clear_commands(&self) {
+        self.state.write().await.commands.clear();
+    }
+
+    /// Commands received for `player_id`, excluding the read-only polling
+    /// commands the adapter issues on its own schedule.
+    pub async fn write_commands(&self, player_id: &str) -> Vec<Vec<String>> {
+        const POLLING: &[&str] = &["players", "status", "serverstatus", "syncgroups"];
+        self.state
+            .read()
+            .await
+            .commands
+            .iter()
+            .filter(|c| c.player_id == player_id)
+            .filter(|c| {
+                c.command
+                    .first()
+                    .and_then(Value::as_str)
+                    .is_none_or(|first| !POLLING.contains(&first))
+            })
+            .map(RecordedCommand::parts)
+            .collect()
+    }
+
     /// Stop the mock server
     pub async fn stop(self) {
         self.handle.abort();
@@ -166,6 +220,13 @@ async fn handle_jsonrpc(
         .first()
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
+
+    // Record every command before dispatching, so tests can assert which
+    // backend command an MCP action produced (issue #394).
+    state.write().await.commands.push(RecordedCommand {
+        player_id: player_id.to_string(),
+        command: commands.clone(),
+    });
 
     // Handle commands that modify state
     match command {

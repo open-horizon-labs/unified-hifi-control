@@ -1,637 +1,57 @@
-//! MCP (Model Context Protocol) server for AI assistant integration
+//! MCP (Model Context Protocol) server for AI assistant integration.
 //!
-//! Provides HTTP endpoints for MCP clients with both Streamable HTTP and SSE transports.
-//! Routes are integrated into the main Axum app on port 8088 at /mcp endpoint.
+//! Provides HTTP endpoints for MCP clients over the Streamable HTTP transport.
+//! Routes are integrated into the main Axum app on port 8088 at `/mcp`.
+//!
+//! # Layout
+//!
+//! This module is the transport and wiring layer only. Everything else lives in
+//! a submodule, so concurrent work on the MCP surface (epic #392) edits
+//! different files:
+//!
+//! | Module      | Responsibility                                           |
+//! |-------------|----------------------------------------------------------|
+//! | `mod.rs`    | Axum route handlers, session recovery, SDK wiring        |
+//! | [`server`]  | the `initialize` result: identity, capabilities, protocol |
+//! | [`handler`] | the `ServerHandler` impl: advertise tools, dispatch calls |
+//! | [`tools`]   | tool definitions + handlers, by family                   |
+//! | [`types`]   | response shapes and result constructors                  |
+//! | [`routing`] | zone-prefix -> adapter, in exactly one place             |
+//!
+//! # The MCP surface is pinned by tests
+//!
+//! `tests/mcp_contract.rs` snapshots `tools/list` and `initialize` against
+//! committed fixtures and pins every tool's runtime behavior, including the
+//! error strings a model reads. Epic #392 is additive-only, so a fixture diff on
+//! a PR in that epic is a bug report, not a chore. Regenerate deliberately:
+//!
+//! ```sh
+//! UPDATE_MCP_FIXTURES=1 cargo test --test mcp_contract
+//! ```
 
-use crate::api::{load_app_settings, AppState};
-use async_trait::async_trait;
+pub mod handler;
+pub mod routing;
+pub mod server;
+pub mod tools;
+pub mod types;
+
+use crate::api::AppState;
 use axum::http::{HeaderMap, Method, Uri};
 use axum::{body::Body, extract::Extension, response::IntoResponse};
 use rust_mcp_sdk::{
     id_generator::{FastIdGenerator, UuidGenerator},
-    macros::{mcp_tool, JsonSchema},
-    mcp_server::{McpAppState, McpHttpHandler, ServerHandler, ToMcpServerHandler},
-    schema::{
-        schema_utils::CallToolError, CallToolRequestParams, CallToolResult, Implementation,
-        InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, RpcError,
-        ServerCapabilities, ServerCapabilitiesTools, TextContent,
-    },
+    mcp_server::{McpAppState, McpHttpHandler, ToMcpServerHandler},
     session_store::InMemorySessionStore,
-    tool_box, McpServer, TransportOptions,
+    TransportOptions,
 };
-use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
+
+pub use handler::HifiMcpHandler;
+pub use server::server_details;
+pub use tools::HifiTools;
 
 /// MCP session header name
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
-
-// ============================================================================
-// Tool Definitions
-// ============================================================================
-
-/// List all available playback zones
-#[mcp_tool(
-    name = "hifi_zones",
-    description = "List all available playback zones (Roon, LMS, OpenHome, UPnP)",
-    read_only_hint = true
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiZonesTool {}
-
-/// Get current playback state for a zone
-#[mcp_tool(
-    name = "hifi_now_playing",
-    description = "Get current playback state for a zone (track, artist, album, play state, volume)",
-    read_only_hint = true
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiNowPlayingTool {
-    /// The zone ID to query (get from hifi_zones)
-    pub zone_id: String,
-}
-
-/// Control playback
-#[mcp_tool(
-    name = "hifi_control",
-    description = "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume"
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiControlTool {
-    /// The zone ID to control
-    pub zone_id: String,
-    /// Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down
-    pub action: String,
-    /// For volume actions: the level (0-100 for volume_set) or amount to change
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<f64>,
-}
-
-/// Search for music
-#[mcp_tool(
-    name = "hifi_search",
-    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins (zone_id recommended as different players may have different sources configured).",
-    read_only_hint = true
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiSearchTool {
-    /// Search query (e.g., "Hotel California", "Eagles", "jazz piano")
-    pub query: String,
-    /// Zone ID for context-aware results. Recommended for LMS (different players may have different sources).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub zone_id: Option<String>,
-    /// Where to search: "library" (default), "tidal", or "qobuz". Roon only; LMS searches all providers.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-}
-
-/// Search and play music in one command
-#[mcp_tool(
-    name = "hifi_play",
-    description = "Search and play music. Searches and plays, queues, or starts radio from the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; LMS searches all providers."
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiPlayTool {
-    /// What to play (e.g., "early Michael Jackson", "Dark Side of the Moon")
-    pub query: String,
-    /// Zone ID to play on (get from hifi_zones)
-    pub zone_id: String,
-    /// Where to search: "library" (default), "tidal", or "qobuz". Roon only; LMS searches all providers.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// What to do: "play" (default), "queue", or "radio". radio is Roon-only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-}
-
-/// Get overall bridge status
-#[mcp_tool(
-    name = "hifi_status",
-    description = "Get overall bridge status (Roon connection, HQPlayer config)",
-    read_only_hint = true
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiStatusTool {}
-
-/// Get HQPlayer status
-#[mcp_tool(
-    name = "hifi_hqplayer_status",
-    description = "Get HQPlayer Embedded status and current pipeline settings",
-    read_only_hint = true
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiHqplayerStatusTool {}
-
-/// List HQPlayer profiles
-#[mcp_tool(
-    name = "hifi_hqplayer_profiles",
-    description = "List available HQPlayer Embedded configurations",
-    read_only_hint = true
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiHqplayerProfilesTool {}
-
-/// Load an HQPlayer profile
-#[mcp_tool(
-    name = "hifi_hqplayer_load_profile",
-    description = "Load an HQPlayer Embedded configuration (will restart HQPlayer)",
-    destructive_hint = true
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiHqplayerLoadProfileTool {
-    /// Configuration name to load (get from hifi_hqplayer_profiles)
-    pub profile: String,
-}
-
-/// Change an HQPlayer pipeline setting
-#[mcp_tool(
-    name = "hifi_hqplayer_set_pipeline",
-    description = "Change an HQPlayer pipeline setting (mode, samplerate, filter1x, filterNx, shaper, dither)"
-)]
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
-pub struct HifiHqplayerSetPipelineTool {
-    /// Setting to change: mode, samplerate, filter1x, filterNx, shaper, dither
-    pub setting: String,
-    /// New value for the setting
-    pub value: String,
-}
-
-// Generate toolbox enum with all tools
-tool_box!(
-    HifiTools,
-    [
-        HifiZonesTool,
-        HifiNowPlayingTool,
-        HifiControlTool,
-        HifiSearchTool,
-        HifiPlayTool,
-        HifiStatusTool,
-        HifiHqplayerStatusTool,
-        HifiHqplayerProfilesTool,
-        HifiHqplayerLoadProfileTool,
-        HifiHqplayerSetPipelineTool
-    ]
-);
-
-// ============================================================================
-// Response Types (for JSON serialization)
-// ============================================================================
-
-#[derive(Debug, Serialize)]
-struct McpZone {
-    zone_id: String,
-    zone_name: String,
-    state: String,
-    volume: Option<f64>,
-    is_muted: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct McpNowPlaying {
-    zone_id: String,
-    zone_name: String,
-    state: String,
-    title: Option<String>,
-    artist: Option<String>,
-    album: Option<String>,
-    volume: Option<f64>,
-    is_muted: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct McpSearchResult {
-    title: String,
-    subtitle: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct McpHqpStatus {
-    connected: bool,
-    host: Option<String>,
-    pipeline: Option<McpPipelineStatus>,
-}
-
-#[derive(Debug, Serialize)]
-struct McpPipelineStatus {
-    state: String,
-    filter: String,
-    shaper: String,
-    rate: u32,
-}
-
-// ============================================================================
-// Server Handler
-// ============================================================================
-
-/// MCP server handler with access to app state
-pub struct HifiMcpHandler {
-    state: AppState,
-}
-
-impl HifiMcpHandler {
-    pub fn new(state: AppState) -> Self {
-        Self { state }
-    }
-
-    fn text_result(text: String) -> CallToolResult {
-        CallToolResult::text_content(vec![TextContent::from(text)])
-    }
-
-    fn error_result(msg: String) -> Result<CallToolResult, CallToolError> {
-        Ok(CallToolResult::text_content(vec![TextContent::from(
-            format!("Error: {}", msg),
-        )]))
-    }
-
-    fn json_result<T: Serialize>(data: &T) -> CallToolResult {
-        let json = serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string());
-        Self::text_result(json)
-    }
-
-    // Helper method for volume control
-    async fn set_volume(
-        &self,
-        zone_id: &str,
-        value: f64,
-        relative: bool,
-    ) -> Result<CallToolResult, CallToolError> {
-        let result = if zone_id.starts_with("lms:") {
-            self.state
-                .lms
-                .change_volume(zone_id, value as f32, relative)
-                .await
-        } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
-            self.state
-                .roon
-                .change_volume(zone_id, value as f32, relative)
-                .await
-        } else {
-            return Self::error_result("Volume control not supported for this zone type".into());
-        };
-
-        match result {
-            Ok(()) => Ok(Self::text_result(format!(
-                "Volume {}",
-                if relative { "adjusted" } else { "set" }
-            ))),
-            Err(e) => Self::error_result(format!("Volume error: {}", e)),
-        }
-    }
-}
-
-#[async_trait]
-impl ServerHandler for HifiMcpHandler {
-    async fn handle_list_tools_request(
-        &self,
-        _params: Option<PaginatedRequestParams>,
-        _runtime: Arc<dyn McpServer>,
-    ) -> Result<ListToolsResult, RpcError> {
-        let mut tools = HifiTools::tools();
-
-        // Filter out HQPlayer tools if adapter is disabled in settings
-        let settings = load_app_settings();
-        if !settings.adapters.hqplayer {
-            tools.retain(|t| !t.name.starts_with("hifi_hqplayer"));
-        }
-
-        Ok(ListToolsResult {
-            meta: None,
-            next_cursor: None,
-            tools,
-        })
-    }
-
-    async fn handle_call_tool_request(
-        &self,
-        params: CallToolRequestParams,
-        _runtime: Arc<dyn McpServer>,
-    ) -> Result<CallToolResult, CallToolError> {
-        let tool: HifiTools = HifiTools::try_from(params).map_err(CallToolError::new)?;
-
-        match tool {
-            HifiTools::HifiZonesTool(_) => {
-                let zones = self.state.aggregator.get_zones().await;
-                let mcp_zones: Vec<McpZone> = zones
-                    .into_iter()
-                    .map(|z| McpZone {
-                        zone_id: z.zone_id,
-                        zone_name: z.zone_name,
-                        state: z.state.to_string(),
-                        volume: z.volume_control.as_ref().map(|v| v.value as f64),
-                        is_muted: z.volume_control.as_ref().map(|v| v.is_muted),
-                    })
-                    .collect();
-                Ok(Self::json_result(&mcp_zones))
-            }
-
-            HifiTools::HifiNowPlayingTool(args) => {
-                match self.state.aggregator.get_zone(&args.zone_id).await {
-                    Some(z) => {
-                        let np = McpNowPlaying {
-                            zone_id: z.zone_id,
-                            zone_name: z.zone_name,
-                            state: z.state.to_string(),
-                            title: z.now_playing.as_ref().map(|n| n.title.clone()),
-                            artist: z.now_playing.as_ref().map(|n| n.artist.clone()),
-                            album: z.now_playing.as_ref().map(|n| n.album.clone()),
-                            volume: z.volume_control.as_ref().map(|v| v.value as f64),
-                            is_muted: z.volume_control.as_ref().map(|v| v.is_muted),
-                        };
-                        Ok(Self::json_result(&np))
-                    }
-                    None => Self::error_result(format!("Zone not found: {}", args.zone_id)),
-                }
-            }
-
-            HifiTools::HifiControlTool(args) => {
-                // Map MCP actions to backend actions
-                let backend_action = match args.action.as_str() {
-                    "play" => "play",
-                    "pause" => "pause",
-                    "playpause" => "play_pause",
-                    "next" => "next",
-                    "previous" | "prev" => "previous",
-                    "volume_set" => {
-                        if let Some(v) = args.value {
-                            return self.set_volume(&args.zone_id, v, false).await;
-                        }
-                        return Self::error_result("volume_set requires a value (0-100)".into());
-                    }
-                    "volume_up" => {
-                        let delta = args.value.unwrap_or(5.0);
-                        return self.set_volume(&args.zone_id, delta, true).await;
-                    }
-                    "volume_down" => {
-                        let delta = args.value.unwrap_or(5.0);
-                        return self.set_volume(&args.zone_id, -delta, true).await;
-                    }
-                    other => other,
-                };
-
-                // Determine which adapter to use based on zone_id prefix
-                let result = if args.zone_id.starts_with("lms:") {
-                    self.state
-                        .lms
-                        .control(&args.zone_id, backend_action, None)
-                        .await
-                } else if args.zone_id.starts_with("openhome:") {
-                    self.state
-                        .openhome
-                        .control(&args.zone_id, backend_action, None)
-                        .await
-                } else if args.zone_id.starts_with("upnp:") {
-                    self.state
-                        .upnp
-                        .control(&args.zone_id, backend_action, None)
-                        .await
-                } else {
-                    // Default to Roon
-                    self.state.roon.control(&args.zone_id, backend_action).await
-                };
-
-                match result {
-                    Ok(()) => {
-                        // Return updated state
-                        if let Some(zone) = self.state.aggregator.get_zone(&args.zone_id).await {
-                            let np = McpNowPlaying {
-                                zone_id: zone.zone_id,
-                                zone_name: zone.zone_name,
-                                state: zone.state.to_string(),
-                                title: zone.now_playing.as_ref().map(|n| n.title.clone()),
-                                artist: zone.now_playing.as_ref().map(|n| n.artist.clone()),
-                                album: zone.now_playing.as_ref().map(|n| n.album.clone()),
-                                volume: zone.volume_control.as_ref().map(|v| v.value as f64),
-                                is_muted: zone.volume_control.as_ref().map(|v| v.is_muted),
-                            };
-                            let json = serde_json::to_string_pretty(&np)
-                                .unwrap_or_else(|_| "{}".to_string());
-                            Ok(Self::text_result(format!(
-                                "Action '{}' executed.\n\nCurrent state:\n{}",
-                                args.action, json
-                            )))
-                        } else {
-                            Ok(Self::text_result(format!(
-                                "Action '{}' executed.",
-                                args.action
-                            )))
-                        }
-                    }
-                    Err(e) => Self::error_result(format!("Control error: {}", e)),
-                }
-            }
-
-            HifiTools::HifiSearchTool(args) => {
-                // Route based on zone_id prefix
-                if args.zone_id.as_ref().is_some_and(|z| z.starts_with("lms:")) {
-                    // LMS search - uses globalsearch for all providers (library, TIDAL, Qobuz, etc.)
-                    match self
-                        .state
-                        .lms
-                        .search(&args.query, args.zone_id.as_deref(), Some(10))
-                        .await
-                    {
-                        Ok(results) => {
-                            let mcp_results: Vec<McpSearchResult> = results
-                                .into_iter()
-                                .map(|item| {
-                                    let subtitle = match item.result_type {
-                                        crate::adapters::lms::LmsSearchResultType::Album => {
-                                            item.artist.map(|a| format!("Album by {}", a))
-                                        }
-                                        crate::adapters::lms::LmsSearchResultType::Artist => {
-                                            Some("Artist".to_string())
-                                        }
-                                        crate::adapters::lms::LmsSearchResultType::Track => {
-                                            match (&item.artist, &item.album) {
-                                                (Some(a), Some(al)) => {
-                                                    Some(format!("{} - {}", a, al))
-                                                }
-                                                (Some(a), None) => Some(a.clone()),
-                                                _ => None,
-                                            }
-                                        }
-                                    };
-                                    McpSearchResult {
-                                        title: item.title,
-                                        subtitle,
-                                    }
-                                })
-                                .collect();
-                            Ok(Self::json_result(&mcp_results))
-                        }
-                        Err(e) => Self::error_result(format!("Search error: {}", e)),
-                    }
-                } else {
-                    // Roon search (default)
-                    use crate::adapters::roon::SearchSource;
-
-                    let source = match args.source.as_deref() {
-                        Some("tidal") => SearchSource::Tidal,
-                        Some("qobuz") => SearchSource::Qobuz,
-                        _ => SearchSource::Library,
-                    };
-                    let zone_id = args.zone_id.as_deref();
-
-                    match self
-                        .state
-                        .roon
-                        .search(&args.query, zone_id, Some(10), source)
-                        .await
-                    {
-                        Ok(results) => {
-                            let mcp_results: Vec<McpSearchResult> = results
-                                .into_iter()
-                                .map(|item| McpSearchResult {
-                                    title: item.title,
-                                    subtitle: item.subtitle,
-                                })
-                                .collect();
-                            Ok(Self::json_result(&mcp_results))
-                        }
-                        Err(e) => Self::error_result(format!("Search error: {}", e)),
-                    }
-                }
-            }
-
-            HifiTools::HifiPlayTool(args) => {
-                // Route based on zone_id prefix
-                if args.zone_id.starts_with("lms:") {
-                    use crate::adapters::lms::LmsPlayAction;
-
-                    // LMS: source param ignored (library only), radio not supported
-                    if args.action.as_deref() == Some("radio") {
-                        return Self::error_result(
-                            "Radio mode not supported for LMS. Use 'play' or 'queue'.".into(),
-                        );
-                    }
-
-                    let action = LmsPlayAction::parse(args.action.as_deref());
-
-                    match self
-                        .state
-                        .lms
-                        .search_and_play(&args.query, &args.zone_id, action)
-                        .await
-                    {
-                        Ok(message) => Ok(Self::text_result(message)),
-                        Err(e) => Self::error_result(format!("Play error: {}", e)),
-                    }
-                } else {
-                    // Roon play (default)
-                    use crate::adapters::roon::{PlayAction, SearchSource};
-
-                    let source = match args.source.as_deref() {
-                        Some("tidal") => SearchSource::Tidal,
-                        Some("qobuz") => SearchSource::Qobuz,
-                        _ => SearchSource::Library,
-                    };
-                    let action = PlayAction::parse(args.action.as_deref().unwrap_or("play"));
-
-                    match self
-                        .state
-                        .roon
-                        .search_and_play(&args.query, &args.zone_id, source, action)
-                        .await
-                    {
-                        Ok(message) => Ok(Self::text_result(message)),
-                        Err(e) => Self::error_result(format!("Play error: {}", e)),
-                    }
-                }
-            }
-
-            HifiTools::HifiStatusTool(_) => {
-                let roon_status = self.state.roon.get_status().await;
-                let hqp_status = self.state.hqplayer.get_status().await;
-
-                let status = serde_json::json!({
-                    "roon": {
-                        "connected": roon_status.connected,
-                        "core_name": roon_status.core_name,
-                    },
-                    "hqplayer": {
-                        "connected": hqp_status.connected,
-                        "host": hqp_status.host,
-                    }
-                });
-                Ok(Self::json_result(&status))
-            }
-
-            HifiTools::HifiHqplayerStatusTool(_) => {
-                let status = self.state.hqplayer.get_status().await;
-                let pipeline = self.state.hqplayer.get_pipeline_status().await.ok();
-
-                let mcp_status = McpHqpStatus {
-                    connected: status.connected,
-                    host: status.host,
-                    pipeline: pipeline.map(|p| McpPipelineStatus {
-                        state: p.status.state,
-                        filter: p.status.active_filter,
-                        shaper: p.status.active_shaper,
-                        rate: p.status.active_rate,
-                    }),
-                };
-                Ok(Self::json_result(&mcp_status))
-            }
-
-            HifiTools::HifiHqplayerProfilesTool(_) => {
-                let profiles = self.state.hqplayer.get_cached_profiles().await;
-                let profile_names: Vec<String> = profiles.into_iter().map(|p| p.title).collect();
-                Ok(Self::json_result(&profile_names))
-            }
-
-            HifiTools::HifiHqplayerLoadProfileTool(args) => {
-                match self.state.hqplayer.load_profile(&args.profile).await {
-                    Ok(()) => Ok(Self::text_result(format!(
-                        "Loaded profile: {}",
-                        args.profile
-                    ))),
-                    Err(e) => Self::error_result(format!("Failed to load profile: {}", e)),
-                }
-            }
-
-            HifiTools::HifiHqplayerSetPipelineTool(args) => {
-                // All settings now use name-based lookups - adapter handles conversion
-                // Only samplerate needs numeric parsing (Hz value)
-                let result = match args.setting.as_str() {
-                    "mode" => {
-                        // Accepts name like "PCM", "DSD", "[source]"
-                        self.state.hqplayer.set_mode(&args.value).await
-                    }
-                    "filter1x" | "filter_1x" => {
-                        self.state.hqplayer.set_filter_1x(&args.value).await
-                    }
-                    "filterNx" | "filter_nx" | "filternx" => {
-                        self.state.hqplayer.set_filter_nx(&args.value).await
-                    }
-                    "shaper" | "dither" => self.state.hqplayer.set_shaper(&args.value).await,
-                    "rate" | "samplerate" => {
-                        // Samplerate uses Hz value (e.g., "48000", "96000")
-                        if let Ok(v) = args.value.parse::<u32>() {
-                            self.state.hqplayer.set_rate(v).await
-                        } else {
-                            return Self::error_result(
-                                "Invalid rate value (expected Hz like 48000, 96000)".into(),
-                            );
-                        }
-                    }
-                    _ => {
-                        return Self::error_result(format!(
-                            "Unknown setting: {}. Valid: mode, samplerate, filter1x, filterNx, shaper, dither",
-                            args.setting
-                        ));
-                    }
-                };
-
-                match result {
-                    Ok(()) => Ok(Self::text_result(format!(
-                        "Set {} to {}",
-                        args.setting, args.value
-                    ))),
-                    Err(e) => Self::error_result(format!("Failed to set {}: {}", args.setting, e)),
-                }
-            }
-        }
-    }
-}
 
 // ============================================================================
 // MCP State Container (for Extension layer)
@@ -796,33 +216,6 @@ pub async fn handle_mcp_delete(
 ///
 /// Call this to get the extension layer, then add MCP routes and the layer to your router.
 pub fn create_mcp_extension(state: AppState) -> axum::Extension<McpExtState> {
-    let server_details = InitializeResult {
-        server_info: Implementation {
-            name: "unified-hifi-control".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-            title: Some("Unified Hi-Fi Control".into()),
-            description: Some("Control your music system via MCP".into()),
-            icons: vec![],
-            website_url: Some("https://github.com/open-horizon-labs/unified-hifi-control".into()),
-        },
-        capabilities: ServerCapabilities {
-            tools: Some(ServerCapabilitiesTools { list_changed: None }),
-            ..Default::default()
-        },
-        meta: None,
-        instructions: Some(
-            "Unified Hi-Fi Control MCP Server - Control Your Music System\n\n\
-            Use hifi_zones to list available zones, hifi_now_playing to see what's playing, \
-            hifi_control for playback control, hifi_search to find music, and hifi_play to play it.\n\n\
-            Note: hifi_search and hifi_play currently work with Roon and LMS zones only. \
-            Transport controls (play/pause/next/volume) work with all zones (Roon, LMS, OpenHome, UPnP).\n\n\
-            To build a playlist: call hifi_play multiple times with action='queue'. The first track \
-            can use action='play' to start playback, then subsequent tracks use action='queue' to add to the queue."
-                .into(),
-        ),
-        protocol_version: ProtocolVersion::V2025_11_25.into(),
-    };
-
     let handler = HifiMcpHandler::new(state);
 
     // Create MCP app state (mirrors what HyperServer does internally)
@@ -830,7 +223,7 @@ pub fn create_mcp_extension(state: AppState) -> axum::Extension<McpExtState> {
         session_store: Arc::new(InMemorySessionStore::new()),
         id_generator: Arc::new(UuidGenerator {}),
         stream_id_gen: Arc::new(FastIdGenerator::new(Some("s_"))),
-        server_details: Arc::new(server_details),
+        server_details: Arc::new(server::server_details()),
         handler: handler.to_mcp_server_handler(),
         ping_interval: Duration::from_secs(12),
         transport_options: Arc::new(TransportOptions::default()),

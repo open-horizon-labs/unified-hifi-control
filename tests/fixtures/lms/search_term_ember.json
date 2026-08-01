@@ -1,0 +1,73 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "search",
+      "0",
+      10,
+      "term:Ember"
+    ]
+  ],
+  "result": {
+    "albums_count": 3,
+    "albums_loop": [
+      {
+        "album": "Ember Light",
+        "album_id": 1
+      },
+      {
+        "album": "Northern Ember",
+        "album_id": 2
+      },
+      {
+        "album": "Quiet Circuits",
+        "album_id": 3
+      }
+    ],
+    "contributors_count": 1,
+    "contributors_loop": [
+      {
+        "contributor": "Ember Valley Quartet",
+        "contributor_id": 3
+      }
+    ],
+    "count": 12,
+    "tracks_count": 8,
+    "tracks_loop": [
+      {
+        "track": "Ember Rising",
+        "track_id": 1
+      },
+      {
+        "track": "Slow Ember",
+        "track_id": 2
+      },
+      {
+        "track": "Ember Dawn",
+        "track_id": 4
+      },
+      {
+        "track": "Ember Coda",
+        "track_id": 8
+      },
+      {
+        "track": "Borealis Waltz",
+        "track_id": 3
+      },
+      {
+        "track": "Aurora Interlude",
+        "track_id": 5
+      },
+      {
+        "track": "Circuit One",
+        "track_id": 6
+      },
+      {
+        "track": "Circuit Two",
+        "track_id": 7
+      }
+    ]
+  }
+}
