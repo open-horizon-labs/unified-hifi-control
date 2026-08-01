@@ -43,30 +43,36 @@
 //!
 //! # PROVENANCE — read this before trusting a shape
 //!
-//! **No live Roon Core was reachable when this was written** (no pairing token
+//! **No live Roon Core was reachable when this was written** — no pairing token
 //! exists in this machine's config dir, and pairing requires a human to authorize
-//! the extension in Roon → Settings → Extensions). So the shapes here have two
-//! different pedigrees, and they are not equally trustworthy:
+//! the extension in Roon → Settings → Extensions. So nothing here was recorded off
+//! a Core *by this work*. Rather than hand-write shapes and let the fake agree with
+//! its author, the uncertain ones were chased down in published sources. Four
+//! pedigrees, and they are not equally trustworthy:
 //!
 //! | Pedigree | What it covers | Confidence |
 //! |---|---|---|
-//! | **From the fork** | which fields exist, which are required vs optional, enum spellings (`"action_list"`, `"list"`, …), the four browse error names, the handshake order | high — a shape the fork's `serde` accepts is a shape the adapter can consume |
-//! | **From this repo's adapter** | that the browse root contains `Library` / `TIDAL` / `Qobuz`, that each contains a `Search` item, that an action list contains `Play Now` / `Queue` / `Start Radio` | high as *expectations* — `src/adapters/roon.rs` will not work against anything else |
-//! | **INFERRED** | root list title (`Explore`), `level` numbering from 0, `action: "none"` as the reply to invoking an action item, whether a real Core sends a body with `InvalidItemKey`, **whether a real Core spells the four error names the way the fork matches them**, whether an `item_key` minted under one `multi_session_key` resolves under another | **unverified** — every one is marked `INFERRED:` at its use site |
+//! | **From the fork** (`06dd807`) | which fields exist, required vs optional, the handshake order, the 10s read timeout | high — a shape the fork's `serde` accepts is a shape the adapter can consume |
+//! | **From RoonLabs' published API** (`RoonLabs/node-roon-api-browse`, `node-roon-api`) | `list.level` "increases from 0"; `action` ∈ `message`/`none`/`list`/`replace_item`/`remove_item`; `hint` ∈ `null`/`action`/`action_list`/`list`/`header`; the `input_prompt` shape; `InvalidRequest` as a real reply to an unknown service | high — RoonLabs' own JSDoc, quoted at the use sites below |
+//! | **Recorded off real Cores by third parties** | `MOO/1 COMPLETE InvalidItemKey` as a verbatim wire frame, and the `"<int>:<int>"` shape of a real `item_key` — see the `ItemKeyScope` docs for the citations | good — real Cores, but other people's logs, not a controlled run |
+//! | **From this repo's adapter** | that the browse root contains `Library` / `TIDAL` / `Qobuz`, that each contains a `Search` item, that an action list contains `Play Now` / `Queue` / `Start Radio` | high as *expectations* — `src/adapters/roon.rs` will not work against anything else, and **that is not the same as Roon being that way** |
+//! | **INFERRED** | root list title (`Explore`); whether a real Core sends a *body* with an error; whether the *other three* error names are spelled as the fork matches them; whether search results are category-grouped | **unverified** — each marked `INFERRED:` at its use site |
 //!
-//! The last row is the dangerous one. Two entries in it are load-bearing:
+//! Two entries are load-bearing:
 //!
-//! * **The four error names.** The fork matches string literals, and anything else
+//! * **The error names.** The fork matches four string literals; anything else
 //!   becomes `Parsed::None`, which it drops — so a Core that spells one differently
 //!   makes the caller time out as if unreachable, with every test here still green.
-//!   #405's PR flagged this as #408's to pin, and it is pinned as far as it can be:
-//!   [`FakeRoonCore::reject_item_key_with_name`] and
-//!   [`FakeRoonCore::FORK_ERROR_NAMES`] make the *consequence* testable. Verifying
-//!   the names themselves needs a real Core.
-//! * **`item_key` portability across sessions.** The empirical unknown #405 must
-//!   answer against the operator's rig; this fake makes it *configurable*
-//!   ([`ItemKeyScope`]) rather than pretending to know, so a test can pin either
-//!   answer and be re-pointed once it is known.
+//!   #405's PR flagged this as #408's to pin. `InvalidItemKey` is now **corroborated
+//!   verbatim** from real Cores (see [`ItemKeyScope`]); `InvalidLevels`,
+//!   `UnexpectedError` and `ZoneNotFound` are **not** — RoonLabs' published browse
+//!   API documents errors only as "an error code or false if no error" and never
+//!   enumerates them, and the three names appear nowhere in `node-roon-api`. So the
+//!   consequence is pinned instead: [`FakeRoonCore::reject_item_key_with_name`] and
+//!   [`FakeRoonCore::FORK_ERROR_NAMES`] make it testable.
+//! * **`item_key` portability across sessions.** Configurable ([`ItemKeyScope`])
+//!   rather than decided — and third-party evidence now points *against* the
+//!   assumption this repo makes. See that type's docs.
 //!
 //! # What this fake does NOT prove
 //!
@@ -121,7 +127,9 @@ pub enum Hint {
 impl Hint {
     fn wire(self) -> &'static str {
         match self {
-            // FROM FORK: browse.rs::ItemHint, #[serde(rename_all = "snake_case")]
+            // FROM FORK: browse.rs::ItemHint, #[serde(rename_all = "snake_case")].
+            // Corroborated by RoonLabs' published JSDoc, which documents exactly
+            // these five: null "Unknown", "action", "action_list", "list", "header".
             Hint::List => "list",
             Hint::Action => "action",
             Hint::ActionList => "action_list",
@@ -318,9 +326,36 @@ impl FakeLibrary {
 /// caller's key inside it (`src/adapters/roon.rs:1105-1122`), so the repo already
 /// assumes [`ItemKeyScope::Global`] — but `/roon/play_item` has no in-repo callers
 /// and no test, so it may never have worked. The fake refuses to decide.
+///
+/// # Third-party evidence points against the repo's assumption
+///
+/// Not a controlled experiment, and not this repo's code path — but recorded off
+/// real Roon Cores, which is more than anything else here has:
+///
+/// * Home Assistant issue `home-assistant/core#137605`: playing a Roon playlist
+///   from a script "works successfully on the first attempt but fails on the second
+///   attempt", logging `Could not play id:122:4, result: MOO/1 COMPLETE
+///   InvalidItemKey` (and the same for `130:12`, `133:13`, `109:7`, `135:5`). Same
+///   shape as UHC's `play_item`: hold a key from an earlier lookup, browse it later.
+/// * Roon Labs community thread 23129: `item_key`s "change with each refresh" —
+///   `"115:0"` becoming `"116:0"`.
+///
+/// Read together: a key from an earlier lookup does **not** reliably resolve later.
+/// That is [`ItemKeyScope::PerSession`] behaviour, and if it is right then
+/// `/roon/play_item` is broken as #405 feared and #396's ref design changes.
+///
+/// The default here stays `Global` because that is what the adapter's code assumes,
+/// and these tests describe the adapter. **Do not read the default as a claim about
+/// Roon.** `a_foreign_item_key_is_rejected_when_keys_are_session_scoped` exercises
+/// the other setting; flip the default once the operator's rig settles it.
+///
+/// Two caveats against over-reading the citations: Home Assistant's integration is
+/// not UHC and may reuse keys differently, and neither source states the *rule* —
+/// only that reuse fails in practice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemKeyScope {
-    /// Any session may use any key. Matches what this repo assumes today. Default.
+    /// Any session may use any key. Matches what this repo assumes today. Default —
+    /// see the type docs: that is the adapter's assumption, not a fact about Roon.
     Global,
     /// A key only resolves in the session that minted it; elsewhere the Core
     /// answers `InvalidItemKey`.
@@ -409,8 +444,10 @@ impl Arena {
     }
 
     fn key_of(&self, index: usize) -> String {
-        // INFERRED: real Roon item keys look like short opaque colon-separated
-        // strings. Only their opacity matters to this repo.
+        // RECORDED (third-party): real keys are two colon-separated integers —
+        // `122:4`, `130:12`, `115:0` — from home-assistant/core#137605 logs and
+        // Roon Labs community thread 23129. Same shape as this. Only their opacity
+        // matters to the adapter; the nonce keeps tests from hardcoding them.
         format!("{}:{}", self.nonce, index)
     }
 
@@ -626,6 +663,15 @@ impl FakeRoonCore {
     /// The four browse error names the pinned fork recognises, in the order they
     /// appear in `browse.rs`. Pinned by a test so a fork bump that renames one is
     /// visible here rather than as a mysterious timeout.
+    ///
+    /// Corroboration status, because they are not equal:
+    /// * `InvalidItemKey` — **recorded verbatim** off real Cores as
+    ///   `MOO/1 COMPLETE InvalidItemKey` (home-assistant/core#137605).
+    /// * `InvalidLevels`, `UnexpectedError`, `ZoneNotFound` — **unverified.**
+    ///   RoonLabs' published browse API documents errors only as "an error code or
+    ///   false if no error" and never enumerates them; none of the three appears in
+    ///   `node-roon-api`. A Roon Labs community thread shows the prose "Zone not
+    ///   found", which is not evidence of the wire spelling.
     pub const FORK_ERROR_NAMES: [&'static str; 4] = [
         "InvalidItemKey",
         "InvalidLevels",
@@ -948,8 +994,11 @@ async fn refuse(
             .push((req_id, name.to_string(), session_key.to_string()));
     }
     // FROM FORK: browse.rs:169-183 keys purely off the message name.
-    // INFERRED: whether a real Core attaches a body. None is sent, because a body
-    // that parsed as BrowseResult/LoadResult would be taken for success.
+    // RECORDED (third-party): home-assistant/core#137605 logs the whole reply as
+    // `MOO/1 COMPLETE InvalidItemKey` — verb, name, and nothing else — which is
+    // exactly this frame.
+    // INFERRED: that a real Core attaches no body at all. None is sent here, since
+    // a body that parsed as BrowseResult/LoadResult would be taken for success.
     send(writer, "COMPLETE", name, req_id, None).await;
 }
 
@@ -1088,8 +1137,11 @@ async fn handle_request(
         RequestKind::Browse => handle_browse(req_id, &body, &core, &writer, &root_title).await,
         RequestKind::Load => handle_load(req_id, &body, &core, &writer).await,
         RequestKind::Unknown => {
-            // Mirrors the fork's own reply to an unknown service (lib.rs:588-592)
-            // so an unmodelled call fails fast instead of hanging for 10s.
+            // Mirrors the fork's own reply to an unknown service (lib.rs:588-592).
+            // FROM ROONLABS' PUBLISHED API: `InvalidRequest` with an `error` string
+            // is what node-roon-api itself sends for "unknown service" and "unknown
+            // request name", so this is the real shape, not an invention. It also
+            // means an unmodelled call fails fast instead of hanging for 10s.
             let body = json!({ "error": format!("FakeRoonCore does not model {name}") });
             respond(
                 &core,
@@ -1211,8 +1263,11 @@ async fn handle_browse(
         // Invoking an action does not produce a list.
         if node_hint == Some(Hint::Action) {
             drop(state);
-            // INFERRED: a real Core answers an invoked action with action "none"
-            // or a "message". Nothing in this repo reads it — `execute_play_action`
+            // FROM ROONLABS' PUBLISHED API: `action: "none"` is documented as "No
+            // action is required" (node-roon-api-browse JSDoc), so this is a legal
+            // reply rather than a guess. INFERRED: that it is the one a real Core
+            // picks for an invoked action, rather than "message".
+            // Nothing in this repo reads it — `execute_play_action`
             // discards the BrowseResult (src/adapters/roon.rs:1276-1284) — so the
             // load-bearing assertion is that the request arrived, which the
             // request log carries.
@@ -1301,7 +1356,8 @@ async fn handle_load(req_id: usize, body: &Value, core: &Arc<RwLock<CoreState>>,
         }
         if let Some(prompt) = &node.input_prompt {
             // FROM FORK: browse.rs:70-75 InputPrompt { prompt, action, value,
-            // is_password }.
+            // is_password } — matching RoonLabs' published JSDoc, where `action` is
+            // "The verb that goes with this action".
             item["input_prompt"] = json!({ "prompt": prompt, "action": "Search" });
         }
         let keyed = node.keyed;
@@ -1338,7 +1394,8 @@ fn current_list(state: &CoreState, session_key: &str) -> Value {
 fn list_json(title: &str, count: usize, level: u32) -> Value {
     // FROM FORK: browse.rs:57-65 List { title, count, level, subtitle?,
     // image_key?, display_offset?, hint? }.
-    // INFERRED: levels numbered from 0 at the browse root.
+    // FROM ROONLABS' PUBLISHED API: `level` is documented as "increases from 0"
+    // (node-roon-api-browse JSDoc), so root = 0 is documented, not inferred.
     json!({ "title": title, "count": count, "level": level })
 }
 

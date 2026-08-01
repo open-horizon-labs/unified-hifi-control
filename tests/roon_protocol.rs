@@ -1113,12 +1113,19 @@ async fn concurrent_browses_with_one_rejected_do_not_disturb_the_others() {
 /// differently, the caller times out exactly as it did before #405 — and every
 /// test in this file stays green, because this fake sends the fork's own literals.
 ///
-/// **No live Core was reachable, so whether Roon really uses these four spellings
-/// is unverified.** This test pins the *consequence* of being wrong rather than
-/// pretending to have checked: with an unrecognised name, the Core answered
-/// instantly and the caller still waits out `BROWSE_TIMEOUT`.
+/// Corroboration, chased rather than assumed: `InvalidItemKey` **is** real, recorded
+/// verbatim off Roon Cores as `MOO/1 COMPLETE InvalidItemKey`
+/// (`home-assistant/core#137605`). `InvalidLevels`, `UnexpectedError` and
+/// `ZoneNotFound` are **not** corroborated anywhere — RoonLabs' published browse API
+/// documents errors only as "an error code or false if no error", and none of the
+/// three appears in `node-roon-api`.
 ///
-/// If someone reaches a real Core: confirm the four names below, and if any differs,
+/// So this test pins the *consequence* of being wrong rather than pretending to have
+/// checked: with an unrecognised name the Core answers instantly and the caller still
+/// waits out `BROWSE_TIMEOUT`. It passes with #405 applied too — routing the error
+/// does not help when the fork never recognises it.
+///
+/// If someone reaches a real Core: confirm the other three names, and if any differs,
 /// this is the failure you will be looking at.
 #[tokio::test]
 async fn an_unrecognised_error_name_degrades_to_an_indistinguishable_timeout() {

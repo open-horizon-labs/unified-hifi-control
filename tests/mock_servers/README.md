@@ -109,43 +109,98 @@ adapter.
 
 ### Which shapes are inferred rather than recorded
 
-**No live Roon Core was reachable when this was written** — this machine's config
-directory has no `roon_state.json`, so there is no pairing token, and obtaining one
-requires a human to authorize the extension in Roon's UI. So nothing here is
-recorded from a Core. Two pedigrees, unequal confidence:
+**No live Roon Core was reachable** — this machine's config directory has no
+`roon_state.json`, so there is no pairing token, and obtaining one requires a human
+to authorize the extension in Roon's UI. So nothing here was recorded off a Core *by
+this work*.
 
-*From the pinned fork* (`~/.cargo/git/checkouts/rust-roon-api-*/06dd807`) — which
-fields exist, which are required, enum spellings, the four browse error names, the
-handshake order. High confidence: a shape the fork accepts is a shape the adapter
-can consume.
+The alternative to recording is not hand-writing shapes and letting the fake agree
+with its author — that is exactly the failure #408 exists to end, and #407 found a
+real client-visible bug precisely because it recorded rather than assumed. So the
+uncertain shapes were chased into published sources instead. **Five pedigrees,
+unequal confidence:**
 
-*From this repo's adapter* — that the root contains `Library` / `TIDAL` / `Qobuz`,
-that each contains a `Search` item, that an action list contains
-`Play Now` / `Queue` / `Start Radio`. High confidence as *expectations*:
-`src/adapters/roon.rs` will not work against anything else.
+**1. From the pinned fork** (`~/.cargo/git/checkouts/rust-roon-api-*/06dd807`) —
+which fields exist, which are required, the handshake order, the 10s read timeout. A
+shape the fork's `serde` accepts is a shape the adapter can consume.
 
-*Inferred, unverified* — each marked `INFERRED:` at its use site in `roon_core.rs`:
+**2. From RoonLabs' own published API** (`RoonLabs/node-roon-api-browse`,
+`RoonLabs/node-roon-api`) — quoted at the use sites:
 
-| Shape | Why it is a guess | Consequence if wrong |
-|---|---|---|
-| root list title `"Explore"` | never read by this repo | none — cosmetic |
-| `list.level` numbered from 0 at the root | plausible, unchecked | #399's "report your position" would be off by one |
-| `action: "none"` in reply to invoking an action item | the adapter discards this BrowseResult | none today; would matter if a caller started reading it |
-| `InvalidItemKey` carries no body | the fork keys only off the name | none for the fork; a real body that parsed as a `BrowseResult` would be read as success |
-| `item_key` format | opacity is all this repo needs | none |
-| **the four browse error *names*** | only evidence is the fork's own literals | **a Core that spells one differently is dropped inside the dependency, and the caller times out as if unreachable — with every test here still green** |
-| **`item_key` portability across `multi_session_key`s** | **this is the epic's open question** | if keys are *not* portable, `/roon/play_item` is broken and #396's ref design changes |
+| Shape | RoonLabs' words |
+|---|---|
+| `list.level` | "increases from 0" — so root = 0 is **documented**, not inferred |
+| `action` values | `message`, `none` ("No action is required"), `list`, `replace_item`, `remove_item` |
+| `hint` values | `null` ("Unknown"), `action`, `action_list`, `list`, `header` |
+| `input_prompt` | `prompt`, `action` ("The verb that goes with this action"), `value`, `is_password` |
+| `InvalidRequest` | what `node-roon-api` itself sends for "unknown service" / "unknown request name" — the shape this fake uses for unmodelled calls |
 
-The error-name row is the one #405's PR (#412) explicitly handed to this issue: the
-fork matches `"InvalidItemKey"`, `"InvalidLevels"`, `"UnexpectedError"` and
-`"ZoneNotFound"` against `msg["name"]`, and anything else becomes `Parsed::None`,
-which it drops. This fake sends the fork's own literals, so it can never catch a
-mismatch. What it *can* do — and does — is pin the consequence:
+**3. Recorded off real Cores, by third parties** — real Cores, but other people's
+logs rather than a controlled run:
+
+* `MOO/1 COMPLETE InvalidItemKey`, verbatim, in `home-assistant/core#137605`:
+  `Could not play id:122:4, result: MOO/1 COMPLETE InvalidItemKey` (also `130:12`,
+  `133:13`, `109:7`, `135:5`). Confirms the name **and** that the reply is just verb
+  and name.
+* Real `item_key`s are two colon-separated integers and "change with each refresh" —
+  `"115:0"` becoming `"116:0"` (Roon Labs community thread 23129).
+
+**4. From this repo's adapter** — the `Library`/`TIDAL`/`Qobuz` → `Search` hierarchy
+and the `Play Now`/`Queue`/`Start Radio` action titles. High confidence as
+*expectations*; `src/adapters/roon.rs` will not work against anything else. **That is
+not the same as Roon being that way.**
+
+**5. Inferred and unverified** — each marked `INFERRED:` at its use site:
+
+| Shape | Consequence if wrong |
+|---|---|
+| root list title `"Explore"` | none — never read |
+| a real Core sends *no body* with an error | none for the fork; a real body that parsed as a `BrowseResult` would read as success |
+| `action: "none"` is the reply a Core picks for an invoked action | none today — the adapter discards that `BrowseResult` |
+| **`InvalidLevels` / `UnexpectedError` / `ZoneNotFound` spellings** | **dropped inside the dependency; the caller times out as if the Core were unreachable, with every test here still green** |
+| search results are flat rather than category-grouped | `is_category` / `try_category_playable` untested |
+| **`item_key` portability across `multi_session_key`s** | if keys are *not* portable, `/roon/play_item` is broken and #396's ref design changes |
+
+### The error names: one corroborated, three not
+
+#405's PR (#412) handed this issue the wire half it could not reach. Result:
+
+* `InvalidItemKey` — **corroborated verbatim off real Cores** (above).
+* `InvalidLevels`, `UnexpectedError`, `ZoneNotFound` — **unverified.** RoonLabs'
+  published browse API documents errors only as "an error code or false if no error"
+  and never enumerates them; none of the three appears anywhere in `node-roon-api`.
+  A community thread shows the prose "Zone not found", which is not evidence of a
+  wire spelling.
+
+This fake sends the fork's literals, so it can never catch a mismatch. What it does
+instead is pin the consequence:
 `an_unrecognised_error_name_degrades_to_an_indistinguishable_timeout` makes the Core
-answer instantly with an unrecognised name and asserts the caller still times out.
-`FakeRoonCore::FORK_ERROR_NAMES` pins the four literals so a fork bump that renames
-one fails here rather than as a mysterious timeout. **Verifying the names needs a
-real Core.**
+answer instantly with an unrecognised name and asserts the caller still times out —
+and it passes with #405 applied, because the fix does not help when the name is
+unrecognised. `FakeRoonCore::FORK_ERROR_NAMES` pins the literals so a fork bump that
+renames one fails here rather than as a mysterious timeout.
+
+### Third-party evidence contradicts the repo's `item_key` assumption
+
+`RoonAdapter::play_item` mints a *fresh* session key and browses the caller's key
+inside it, so the repo assumes keys are global. Two recorded observations point the
+other way:
+
+* `home-assistant/core#137605` — playing a Roon playlist from a script "works
+  successfully on the first attempt but fails on the second", with
+  `MOO/1 COMPLETE InvalidItemKey`. Same shape as UHC's `play_item`: hold a key from
+  an earlier lookup, browse it later.
+* Community thread 23129 — item keys "change with each refresh".
+
+That is `ItemKeyScope::PerSession` behaviour. **Neither source states the rule**, and
+Home Assistant is not UHC, so this is evidence rather than proof — but it is enough
+that #396 should not design on the assumption keys are portable, and enough that
+`/roon/play_item` should be assumed broken until the rig says otherwise.
+
+The default stays `Global` because that is what the adapter's code assumes and these
+tests describe the adapter. **Do not read the default as a claim about Roon.**
+`a_foreign_item_key_is_rejected_when_keys_are_session_scoped` exercises the other
+setting; flip the default once the rig settles it.
 
 That last row is the one that matters. `RoonAdapter::play_item` mints a fresh,
 unrelated session key and browses the caller's key inside it, so the repo already
