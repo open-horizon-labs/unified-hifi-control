@@ -521,6 +521,9 @@ struct CoreState {
     /// Per-item_key delay override, so a test can force responses to arrive out
     /// of order and prove correlation is by request, not by arrival.
     key_delays: HashMap<String, Duration>,
+    /// Per-`level` delay override for `load` requests, which carry no item_key
+    /// (issue #416). Same purpose as `key_delays`, for the load side.
+    level_delays: HashMap<u64, Duration>,
     zones: Vec<Value>,
     log: Vec<RecordedRequest>,
     /// What this Core answered, in send order: (request id, message name).
@@ -573,6 +576,7 @@ impl FakeRoonCore {
             reject_next_browse: false,
             delay: Duration::ZERO,
             key_delays: HashMap::new(),
+            level_delays: HashMap::new(),
             zones: vec![default_zone("zone_fake_1", "Fake Living Room")],
             log: Vec::new(),
             sent: Vec::new(),
@@ -631,6 +635,22 @@ impl FakeRoonCore {
             .await
             .key_delays
             .insert(item_key.to_string(), delay);
+    }
+
+    /// Delay only loads carrying `level`, so *load* responses can be forced to
+    /// arrive out of order (issue #416).
+    ///
+    /// The `item_key` hook above cannot do this: a `load` request carries no item
+    /// key. `LoadOpts::level` is the field that selects which level of the session's
+    /// stack is paged, so it is the load-side analogue - it names the content the
+    /// response will carry, which is exactly what a correlation test needs to hold
+    /// fixed while it varies arrival order.
+    pub async fn set_delay_for_load_level(&self, level: u32, delay: Duration) {
+        self.state
+            .write()
+            .await
+            .level_delays
+            .insert(level as u64, delay);
     }
 
     /// Answer `InvalidItemKey` for every browse carrying this key.
@@ -1085,6 +1105,11 @@ async fn handle_request(
             .get("item_key")
             .and_then(Value::as_str)
             .and_then(|k| st.key_delays.get(k).copied())
+            .or_else(|| {
+                body.get("level")
+                    .and_then(Value::as_u64)
+                    .and_then(|level| st.level_delays.get(&level).copied())
+            })
             .unwrap_or(st.delay);
         (delay, kind)
     };

@@ -584,7 +584,10 @@ pub struct BrowseRequest {
     pub pop_all: bool,
     #[serde(default)]
     pub input: Option<String>,
-    /// Session key for maintaining browse state across requests
+    /// Session key for maintaining browse state across requests.
+    ///
+    /// See [`roon_browse_handler`] for what supplying one does and does not
+    /// guarantee when two clients use the same value at the same time (#416).
     #[serde(default)]
     pub session_key: Option<String>,
 }
@@ -621,6 +624,39 @@ pub struct BrowseItemResponse {
 }
 
 /// POST /roon/browse - Browse the Roon library hierarchy
+///
+/// # What a caller-supplied `session_key` guarantees (#416)
+///
+/// It **is** the identity of a browse *position*: Roon keeps a stack of levels per
+/// `multi_session_key`, so passing the same key back is how a client stays where it
+/// was and how `pop_all` returns it to the root. Reusing it is the intended use.
+///
+/// It is **not** a lock, a lease, or a request identifier, and nothing here or in
+/// the adapter rejects two clients that pick the same value:
+///
+/// * **Results are correlated per request, not per session.** Since #416 a browse or
+///   load result is routed to the request that asked for it, by the MOO `request_id`
+///   the Core echoes back. Two clients sharing a key can no longer be handed each
+///   other's lists - which they silently could before, since the adapter resolved
+///   whichever pending request in that session it found first.
+/// * **The Core-side level stack is still shared.** Correlation makes each *answer*
+///   honest; it cannot make two clients' navigation coherent. Concurrent browses
+///   under one key all push onto the same stack, so a client's next `load` may page
+///   the level the other client just entered, and a `pop_all` resets both. Pinned by
+///   `a_shared_session_key_is_one_level_stack_however_well_results_correlate` in
+///   `tests/roon_protocol.rs`.
+/// * **Therefore: one navigating client, one session key.** Omit `session_key` and a
+///   fresh one is minted for that request alone; the response reports it as
+///   `session_key` so a client can choose to continue in it. Anything building a
+///   multi-client navigation surface on this route - #399's MCP browse handle - must
+///   mint one key per client session and keep concurrent use of a single key out of
+///   reach, not merely undocumented. If a design genuinely needs two clients at one
+///   position, the missing piece is serialising requests per key; that is a separate
+///   change and it does not replace this one.
+///
+/// The parameter is kept rather than removed: it is the only way to walk a hierarchy
+/// across requests, and removing it would be an API change requiring explicit
+/// approval.
 pub async fn roon_browse_handler(
     State(state): State<AppState>,
     Json(req): Json<BrowseRequest>,

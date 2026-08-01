@@ -17,6 +17,13 @@
 //! `concurrent_browses_one_rejected_leaves_the_rejected_caller_hanging`. Both are
 //! #405's subject. When #405 lands, they flip from "hangs" to "returns a typed,
 //! recoverable error promptly" — the instrument is here so that flip is provable.
+//!
+//! One test has already made that trip. #408 shipped
+//! `concurrent_browses_in_one_session_cross_deliver_their_results`, which asserted
+//! the cross-delivery defect was *present* and told its successor to invert it. #416
+//! did exactly that: see the "Same-session concurrency" section at the end of this
+//! file, where three tests now assert correct correlation and one names the hazard
+//! correlation cannot remove.
 
 mod mock_servers;
 
@@ -111,6 +118,18 @@ fn browse_root(session: &str) -> BrowseOpts {
 fn load_all(session: &str) -> LoadOpts {
     LoadOpts {
         multi_session_key: Some(session.to_string()),
+        count: Some(100),
+        ..Default::default()
+    }
+}
+
+/// Load a named level of a session's stack. `None` means "wherever the session is",
+/// which is what every caller in this repo asks for; naming a level is how #416's
+/// load-side correlation test keeps three concurrent loads distinguishable.
+fn load_at_level(session: &str, level: Option<u32>) -> LoadOpts {
+    LoadOpts {
+        multi_session_key: Some(session.to_string()),
+        level,
         count: Some(100),
         ..Default::default()
     }
@@ -1335,36 +1354,56 @@ async fn app_state_with(roon: Arc<RoonAdapter>) -> unified_hifi_control::api::Ap
     )
 }
 
-/// **Found by this instrument.** Two browses in flight under the *same*
-/// `multi_session_key` cross-deliver their results, silently.
+// =============================================================================
+// Same-session concurrency (issue #416)
+// =============================================================================
+//
+// These three tests were found by, and now guard, #416: three requests in flight
+// under one `multi_session_key`, answered *out of order*, each caller must get the
+// answer to its own request.
+//
+// The two `each_receive_their_own` tests were the defect-pinning tests #408 shipped
+// (`concurrent_browses_in_one_session_cross_deliver_their_results`), inverted
+// exactly as their own comment instructed. Both still run eight trials, because the
+// old failure was probabilistic: the winning waiter came out of `HashMap` iteration
+// order, so any single trial got the right answer by luck about one time in eight.
+// Eight clean trials is the evidence that correlation is now exact rather than
+// lucky. Do not reduce the trial count.
+//
+// What they do *not* prove is in the third test: correct correlation makes each
+// *answer* honest, and does nothing about the Core-side level stack a shared
+// session key implies. That is why `/roon/browse`'s handler carries a note rather
+// than a guarantee.
+
+/// **Found by this instrument, fixed by #416.** Three browses in flight under one
+/// `multi_session_key`, answered in the reverse of the request order — each caller
+/// gets the list it asked for.
 ///
-/// `pending_browses` is keyed by `req_id` but scanned by session key
-/// (`src/adapters/roon.rs`, the `Parsed::BrowseResult` arm):
-/// `.iter().find(|(_, (key, _))| key == &session_key)` returns an *arbitrary*
-/// matching entry when more than one request shares a session. So the caller that
-/// asked for `Library` is handed `TIDAL`'s list, with no error and no way to tell.
+/// Before #416, `pending_browses` was keyed by `req_id` but *scanned* by session key
+/// (`src/adapters/roon.rs`, the `Parsed::BrowseResult` arm:
+/// `.iter().find(|(_, (key, _))| key == &session_key)`), so an arbitrary matching
+/// entry won and the caller that asked for `Library` could be handed `TIDAL`'s list
+/// — no error, no way to tell. It reproduced in 7 of 8 trials, and it survived #405,
+/// which made `req_id` primary for the *error* arms only.
 ///
-/// #405's issue text calls the req_id / session-key mismatch "the whole problem" but
-/// frames it as error routing. It is already a **success-path correctness bug**.
+/// The per-key delays make the Core answer request 3 first and request 1 last, so a
+/// correlation that went by arrival order rather than by request would fail here
+/// too. The Core's own answers are per-request correct throughout — every trial's
+/// `expected` is what the fake sent, in request order — so anything else this test
+/// sees was scrambled inside `src/adapters/roon.rs`.
 ///
-/// Reachability: the adapter's own callers (`search`, `search_and_play`, `play_item`)
-/// each mint a private key and run sequentially, so they are safe. `POST /roon/browse`
-/// takes a **caller-supplied** `session_key` and has no in-repo callers today, so
-/// nothing here triggers it — but any external client can, and #399's navigation
-/// handle will hand clients a reusable session identity, which is exactly the shape
-/// that triggers it.
-///
-/// This test asserts the defect is **present**, over eight trials, because a single
-/// trial gets the right answer by luck about one time in eight. When it starts
-/// failing, the bug is fixed: invert it to compare each trial against `expected`.
+/// Reachability of the defect it guards: the adapter's own callers (`search`,
+/// `search_and_play`, `play_item`) each mint a private key and run sequentially, so
+/// they were safe. `POST /roon/browse` takes a **caller-supplied** `session_key`, so
+/// any external client could trigger it, and #399's navigation handle is that exact
+/// shape.
 #[tokio::test]
-async fn concurrent_browses_in_one_session_cross_deliver_their_results() {
+async fn concurrent_browses_in_one_session_each_receive_their_own_result() {
     let core = FakeRoonCore::start().await;
     let adapter = connected(&core).await;
 
     const TRIALS: usize = 8;
     let expected = ["Library", "TIDAL", "Qobuz"];
-    let mut crossed = 0;
     let mut observed = Vec::new();
 
     for trial in 0..TRIALS {
@@ -1389,24 +1428,180 @@ async fn concurrent_browses_in_one_session_cross_deliver_their_results() {
         .await
         .into_iter()
         .map(|r| {
-            r.expect("every browse resolves; only the payload is wrong")
+            r.expect("every browse resolves; before #416 only the payload was wrong")
                 .list
                 .map(|l| l.title)
                 .unwrap_or_default()
         })
         .collect();
 
-        if got != expected {
-            crossed += 1;
-        }
         observed.push(got);
     }
 
-    assert!(
-        crossed > 0,
-        "TODAY: same-session concurrency cross-delivers browse results. If this \
-assertion fails, the defect is fixed - invert it to assert each caller got the \
-list it asked for. Asked {expected:?} in every trial; got {observed:?}"
+    for (trial, got) in observed.iter().enumerate() {
+        assert_eq!(
+            got.as_slice(),
+            expected.as_slice(),
+            "trial {trial}: each caller must receive the list it asked for. \
+             All trials: {observed:?}"
+        );
+    }
+
+    core.stop().await;
+}
+
+/// The same defect on the load side, which `Parsed::LoadResult` shared verbatim.
+///
+/// Three loads in flight under one session key, each naming a different `level` of
+/// that session's stack, answered in the reverse of the request order. Each caller
+/// must get its own level's page — distinguishable here by both the list title and
+/// the item count, so a cross-delivery cannot hide behind a coincidence.
+///
+/// A load carries no `item_key`, so forcing out-of-order load responses needed the
+/// fake's `set_delay_for_load_level` hook, added by #416 alongside this test.
+#[tokio::test]
+async fn concurrent_loads_in_one_session_each_receive_their_own_page() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+
+    const TRIALS: usize = 8;
+    // Three levels deep: root (4 rows), Library (3 rows), Artists (25 rows).
+    let expected = [("Explore", 4), ("Library", 3), ("Artists", 25)];
+    let mut observed = Vec::new();
+
+    // Answer level 0 last and level 2 first.
+    for (level, delay) in [(0u32, 180u64), (1, 120), (2, 60)] {
+        core.set_delay_for_load_level(level, Duration::from_millis(delay))
+            .await;
+    }
+
+    for trial in 0..TRIALS {
+        let session = format!("shared_load_session_{trial}");
+        adapter.browse(browse_root(&session)).await.unwrap();
+        let root = adapter
+            .load(load_at_level(&session, None))
+            .await
+            .expect("root level");
+        let library_key = root.items[0].item_key.clone().unwrap();
+        adapter
+            .browse(browse_at(&session, Some(&library_key)))
+            .await
+            .unwrap();
+        let library = adapter
+            .load(load_at_level(&session, None))
+            .await
+            .expect("library level");
+        let artists_key = library.items[1].item_key.clone().unwrap();
+        adapter
+            .browse(browse_at(&session, Some(&artists_key)))
+            .await
+            .unwrap();
+
+        let got: Vec<(String, usize)> = futures::future::join_all(
+            (0..3u32).map(|level| adapter.load(load_at_level(&session, Some(level)))),
+        )
+        .await
+        .into_iter()
+        .map(|r| {
+            let page = r.expect("every load resolves; before #416 only the payload was wrong");
+            (page.list.title, page.items.len())
+        })
+        .collect();
+
+        observed.push(got);
+    }
+
+    for (trial, got) in observed.iter().enumerate() {
+        let got: Vec<(&str, usize)> = got.iter().map(|(t, n)| (t.as_str(), *n)).collect();
+        assert_eq!(
+            got.as_slice(),
+            expected.as_slice(),
+            "trial {trial}: each caller must receive the page it asked for. \
+             All trials: {observed:?}"
+        );
+    }
+
+    core.stop().await;
+}
+
+/// What #416 does **not** fix, pinned so nobody reads the two tests above as a
+/// licence to share a session key.
+///
+/// A `multi_session_key` names one browse *position* on the Core - a stack of
+/// levels that `browse` pushes onto and `pop_all` / `pop_levels` unwind. Correct
+/// correlation guarantees each caller is handed the answer to its own request; it
+/// cannot make three callers' pushes onto one stack coherent. After three
+/// concurrent browses in one session, the stack holds all three levels, and a
+/// following `load` with no explicit level pages whichever landed last - not the
+/// one this caller asked for.
+///
+/// Two clients that must navigate independently need two session keys. That is what
+/// `roon_browse_handler`'s note says and what #399's nav handle has to enforce.
+///
+/// Scope of the evidence: the level stack is the *fake's* model of Roon's session
+/// semantics (`tests/mock_servers/roon_core.rs`, `handle_browse`), derived from the
+/// fork and from this repo's own `pop_all` usage. It has not been recorded off a
+/// live Core. So read this as "UHC's own model of a session says sharing one is
+/// incoherent", which is enough to justify the note - not as a measurement of Roon.
+#[tokio::test]
+async fn a_shared_session_key_is_one_level_stack_however_well_results_correlate() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+    let session = "one_stack_three_callers";
+
+    adapter.browse(browse_root(session)).await.unwrap();
+    let root = adapter.load(load_all(session)).await.unwrap();
+    let keys: Vec<String> = (0..3)
+        .map(|i| root.items[i].item_key.clone().unwrap())
+        .collect();
+    for (i, key) in keys.iter().enumerate() {
+        core.set_delay_for_item_key(key, Duration::from_millis(60 * (3 - i) as u64))
+            .await;
+    }
+
+    let got: Vec<String> = futures::future::join_all(
+        keys.iter()
+            .map(|k| adapter.browse(browse_at(session, Some(k)))),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.expect("browse").list.map(|l| l.title).unwrap_or_default())
+    .collect();
+
+    // Each caller was told the truth about its own request - which is order
+    // independent, because each future asked for `keys[i]` and must be handed
+    // `keys[i]`'s list whatever order the answers arrived in.
+    assert_eq!(got, vec!["Library", "TIDAL", "Qobuz"]);
+
+    // ...onto a single stack. Which of the three landed last is the Core's
+    // scheduling business, so this asserts the shape and not the sequence: three
+    // concurrent browses from one root produced one four-level stack, not three
+    // independent two-level ones. (An earlier draft pinned the exact order the
+    // delays happened to produce, which would have flaked on a loaded machine for
+    // no extra claim.)
+    let levels = core.session_levels(session).await;
+    assert_eq!(
+        levels.len(),
+        4,
+        "one session key is one level stack; three concurrent browses all push onto \
+         it, got {levels:?}"
+    );
+    assert_eq!(levels[0], "Explore", "stack {levels:?}");
+    let mut pushed = levels[1..].to_vec();
+    pushed.sort();
+    assert_eq!(
+        pushed,
+        vec!["Library", "Qobuz", "TIDAL"],
+        "stack {levels:?}"
+    );
+
+    // So the session's own idea of "here" is whichever push landed last, not the
+    // one any particular caller made.
+    let here = adapter.load(load_all(session)).await.unwrap();
+    assert_eq!(
+        Some(&here.list.title),
+        levels.last(),
+        "a following load pages the level that landed last, whoever asked for it"
     );
 
     core.stop().await;
