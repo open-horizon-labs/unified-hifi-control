@@ -58,14 +58,14 @@ urlencoding = "2"
 url = "2"
 
 # XML parsing (shared)
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 
 # Logging (shared - tracing works in WASM)
 tracing = "0.1"
 
 # Error handling (shared)
 thiserror = "2"
-anyhow = "1"
+anyhow = "1.0.103"
 
 # Date/time (shared)
 chrono = { version = "0.4", features = ["serde"] }
