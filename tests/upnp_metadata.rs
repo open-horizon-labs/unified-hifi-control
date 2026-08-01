@@ -150,3 +150,81 @@ async fn upnp_track_metadata_survives_a_repeat_poll() {
 
     mock.stop().await;
 }
+
+/// Internet radio and many DLNA servers keep one stream URI for a whole session
+/// and change only `TrackMetaData` per track. A guard comparing `TrackURI` alone
+/// pins now-playing to the first track forever.
+#[tokio::test]
+async fn upnp_reparses_when_metadata_changes_under_a_constant_track_uri() {
+    let mock = MockUpnpRenderer::start().await;
+    mock.set_state("PLAYING").await;
+    mock.set_track(
+        "radio://stream",
+        "First Song",
+        "First Artist",
+        "Album A",
+        ART,
+    )
+    .await;
+
+    let bus = create_bus();
+    let adapter = UPnPAdapter::new(bus);
+    probe(&adapter, &mock).await;
+
+    let first = adapter
+        .get_now_playing("mock-upnp-uuid-12345")
+        .await
+        .expect("renderer is known");
+    assert_eq!(first.line1, "First Song");
+
+    // Same TrackURI, different metadata — as a radio stream reports a new track.
+    mock.set_track(
+        "radio://stream",
+        "Second Song",
+        "Second Artist",
+        "Album B",
+        "http://10.0.0.5/art/99.jpg",
+    )
+    .await;
+    probe(&adapter, &mock).await;
+
+    let second = adapter
+        .get_now_playing("mock-upnp-uuid-12345")
+        .await
+        .expect("renderer is known");
+    assert_eq!(
+        second.line1, "Second Song",
+        "a constant TrackURI must not freeze now-playing metadata"
+    );
+    assert_eq!(second.line2, "Second Artist");
+    assert_eq!(second.line3, "Album B");
+    assert_eq!(
+        second.image_key.as_deref(),
+        Some("http://10.0.0.5/art/99.jpg")
+    );
+
+    mock.stop().await;
+}
+
+/// track_metadata must not be advertised as unsupported now that it is read.
+#[tokio::test]
+async fn upnp_zone_does_not_advertise_track_metadata_as_unsupported() {
+    let mock = MockUpnpRenderer::start().await;
+    mock.set_track("uri://1", "Track", "Artist", "Album", ART)
+        .await;
+
+    let bus = create_bus();
+    let adapter = UPnPAdapter::new(bus);
+    probe(&adapter, &mock).await;
+
+    let zones = adapter.get_zones().await;
+    let zone = zones.first().expect("one zone");
+    assert!(
+        !zone.unsupported.contains(&"track_metadata".to_string()),
+        "clients reading `unsupported` would hide metadata the adapter now reads"
+    );
+    // Still unsupported: the art URI is parsed, but UHC does not fetch the bytes.
+    assert!(zone.unsupported.contains(&"album_art".to_string()));
+
+    mock.stop().await;
+}

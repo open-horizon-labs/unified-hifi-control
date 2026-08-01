@@ -19,7 +19,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::StreamExt;
 use quick_xml::de::from_str as xml_from_str;
-use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use ssdp_client::{SearchTarget, URN};
@@ -65,6 +64,11 @@ pub struct UPnPRenderer {
     /// Last seen TrackURI, used to skip re-parsing unchanged metadata.
     #[serde(skip)]
     pub last_track_uri: Option<String>,
+    /// Last seen raw TrackMetaData. Internet radio and many DLNA servers keep
+    /// one stream URI for a whole session and change only the metadata, so the
+    /// URI alone cannot tell us whether the track changed.
+    #[serde(skip)]
+    pub last_track_metadata: Option<String>,
 }
 
 /// UPnP adapter status
@@ -258,6 +262,7 @@ impl UPnPAdapter {
             let renderer = UPnPRenderer {
                 track_info: None,
                 last_track_uri: None,
+                last_track_metadata: None,
                 uuid: uuid.clone(),
                 name: format!("Renderer {}", &uuid[..8.min(uuid.len())]),
                 manufacturer: None,
@@ -468,7 +473,7 @@ impl UPnPAdapter {
             .await;
 
             if let Ok(response) = transport_info {
-                if let Some(new_state) = Self::extract_xml_value(&response, "CurrentTransportState")
+                if let Some(new_state) = didl::extract_xml_value(&response, "CurrentTransportState")
                 {
                     let new_state = match new_state.as_str() {
                         "PLAYING" => "playing",
@@ -516,8 +521,14 @@ impl UPnPAdapter {
 
                 let mut s = state.write().await;
                 if let Some(renderer) = s.renderers.get_mut(uuid) {
-                    if renderer.last_track_uri.as_deref() != track_uri.as_deref() {
+                    // Compare metadata too: a constant TrackURI (internet radio,
+                    // many DLNA servers) would otherwise pin now-playing to the
+                    // first track for the whole session.
+                    let changed = renderer.last_track_uri.as_deref() != track_uri.as_deref()
+                        || renderer.last_track_metadata.as_deref() != metadata.as_deref();
+                    if changed {
                         renderer.last_track_uri = track_uri;
+                        renderer.last_track_metadata = metadata.clone();
 
                         match metadata {
                             Some(meta) => {
@@ -570,7 +581,7 @@ impl UPnPAdapter {
             .await;
 
             if let Ok(response) = volume {
-                if let Some(vol_str) = Self::extract_xml_value(&response, "CurrentVolume") {
+                if let Some(vol_str) = didl::extract_xml_value(&response, "CurrentVolume") {
                     if let Ok(vol) = vol_str.parse::<i32>() {
                         let mut s = state.write().await;
                         if let Some(renderer) = s.renderers.get_mut(uuid) {
@@ -591,7 +602,7 @@ impl UPnPAdapter {
             .await;
 
             if let Ok(response) = mute {
-                if let Some(mute_str) = Self::extract_xml_value(&response, "CurrentMute") {
+                if let Some(mute_str) = didl::extract_xml_value(&response, "CurrentMute") {
                     let mut s = state.write().await;
                     if let Some(renderer) = s.renderers.get_mut(uuid) {
                         renderer.muted = mute_str == "1" || mute_str.eq_ignore_ascii_case("true");
@@ -645,21 +656,6 @@ impl UPnPAdapter {
     }
 
     /// Extract XML value, handling optional namespace prefixes (e.g., <u:Volume> or <Volume>)
-    fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
-        // Build regex pattern to match tag with optional namespace prefix and attributes
-        // Matches: <prefix:tag attr="...">value</prefix:tag> or <tag attr="...">value</tag>
-        let pattern = format!(
-            r"<(?:[^:>]+:)?{}\b[^>]*>([^<]*)</(?:[^:>]+:)?{}>",
-            regex::escape(tag),
-            regex::escape(tag)
-        );
-
-        let re = Regex::new(&pattern).ok()?;
-        re.captures(xml)
-            .and_then(|caps| caps.get(1))
-            .map(|m| m.as_str().to_string())
-    }
-
     /// Stop discovery (internal - use Startable trait)
     async fn stop_internal(&self) {
         // Cancel background tasks first
@@ -716,10 +712,14 @@ impl UPnPAdapter {
                         is_muted: r.muted,
                     }),
                     // Pure UPnP doesn't support these
+                    // track_metadata is now read from GetPositionInfo, so it
+                    // must not be advertised as unsupported - clients that read
+                    // this list would hide it. album_art stays: the URI is
+                    // parsed, but UHC does not yet fetch or proxy the bytes
+                    // (#418).
                     unsupported: vec![
                         "next".to_string(),
                         "previous".to_string(),
-                        "track_metadata".to_string(),
                         "album_art".to_string(),
                     ],
                 }
@@ -769,6 +769,7 @@ impl UPnPAdapter {
                     av_transport_url: Some(av_url.to_string()),
                     rendering_control_url: Some(rc_url.to_string()),
                     last_track_uri: None,
+                    last_track_metadata: None,
                 });
         }
         Self::poll_renderer(
