@@ -21,6 +21,20 @@ export LOGF=${QPKG_ROOT}/unified-hifi-control.log
 # by other local users.
 umask 077
 
+# A PID file is only a hint: after a crash or reboot its numeric PID can be reused by an
+# unrelated process. Refuse to signal unless /proc still identifies the package binary.
+is_our_pid() {
+    PID_TO_CHECK=$1
+    case "$PID_TO_CHECK" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$PID_TO_CHECK" -gt 1 ] 2>/dev/null || return 1
+    kill -0 "$PID_TO_CHECK" 2>/dev/null || return 1
+    EXPECTED_EXE=$(readlink -f "${QPKG_ROOT}/unified-hifi-control" 2>/dev/null) || return 1
+    ACTUAL_EXE=$(readlink -f "/proc/${PID_TO_CHECK}/exe" 2>/dev/null) || return 1
+    [ -n "$EXPECTED_EXE" ] && [ "$ACTUAL_EXE" = "$EXPECTED_EXE" ]
+}
+
 case "$1" in
   start)
     ENABLED=$(/sbin/getcfg $QPKG_NAME Enable -u -d FALSE -f $CONF)
@@ -42,11 +56,13 @@ case "$1" in
     # Kill by PID file first
     if [ -e "$PIDF" ]; then
         PID=$(cat "$PIDF")
-        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        if is_our_pid "$PID"; then
             # Graceful shutdown first, then force if needed
             kill "$PID" 2>/dev/null
             sleep 2
-            kill -0 "$PID" 2>/dev/null && kill -9 "$PID" 2>/dev/null
+            # Re-check identity: the original process may have exited and the PID may already
+            # have been reused during the grace period.
+            is_our_pid "$PID" && kill -9 "$PID" 2>/dev/null
         fi
         rm -f "$PIDF"
     fi
@@ -60,7 +76,7 @@ case "$1" in
     ;;
 
   status)
-    if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then
+    if [ -f "$PIDF" ] && is_our_pid "$(cat "$PIDF")"; then
         echo "$QPKG_NAME is running."
         exit 0
     else
