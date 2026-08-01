@@ -245,6 +245,76 @@ fn play_ref_args(r#ref: &str, zone_id: &str, action: Option<&str>) -> HifiPlayRe
 // Roon: mint, resolve, and the session-reentry design this issue turns on
 // =============================================================================
 
+/// **Found live** (ship-gate re-review): a real Core's search results mix the
+/// actual hit with grouping rows -- searching "kind of blue" against nuc14
+/// returned "Kind of Blue" *and* "Artists" (7 Results), "Albums" (32
+/// Results), "Composers", "Tracks", "Works" -- all sharing the same
+/// `hint: "list"` and a real, navigable `item_key`. `FakeRoonCore`'s search
+/// model never produced this shape (it returns a flat, substring-matched
+/// list of real hits only), so nothing caught `handle_search` minting a ref
+/// for a category row indistinguishably from real content. Resolving one
+/// lands in `resolve_item_key`'s "guess the first item" fallback and can
+/// silently play something the client never asked for -- precisely the
+/// failure mode #396 exists to prevent.
+///
+/// This constructs a library whose "Library" search results include both a
+/// real hit and a category-shaped row (title exactly "Albums", matching
+/// `crate::adapters::roon::CATEGORY_NAMES`) to prove the fix:
+/// `crate::adapters::roon::is_category` now excludes category rows from
+/// minting regardless of how real their `item_key` looks.
+#[tokio::test]
+async fn a_category_grouping_row_never_gets_a_ref() {
+    let mut library = mock_servers::roon_core::FakeLibrary::standard();
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![
+            mock_servers::roon_core::album("Kind of Blue", "Miles Davis", &["So What"]),
+            // Real Roon's category rows: title is exactly the category name,
+            // same `hint: "list"` as real content, a real item_key. The
+            // subtitle carries the query term only so the fake's
+            // substring-match search model includes it -- real Roon includes
+            // these unconditionally, for a reason this fake's simpler
+            // flat-list search model does not represent.
+            mock_servers::roon_core::FakeItem::list("Albums")
+                .with_subtitle("32 Results for kind of blue"),
+        ],
+    );
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let search = handle_search(&state, search_args("kind of blue")).await;
+    let results = search_results_of(&search);
+    assert_eq!(
+        results.len(),
+        2,
+        "expected the real hit and the category row, got {results:?}"
+    );
+
+    let kob = results
+        .iter()
+        .find(|r| r.get("title") == Some(&Value::String("Kind of Blue".to_string())))
+        .expect("Kind of Blue must be among the results");
+    assert!(
+        kob.get("ref").and_then(Value::as_str).is_some(),
+        "real content must still get a ref: {kob:?}"
+    );
+
+    let albums_row = results
+        .iter()
+        .find(|r| r.get("title") == Some(&Value::String("Albums".to_string())))
+        .expect("the category row must be among the results");
+    assert_eq!(
+        albums_row.get("ref"),
+        None,
+        "a category grouping row must never get a ref, even though it has a real \
+         item_key: {albums_row:?}"
+    );
+
+    core.stop().await;
+}
+
 /// The straight-line path: search mints a `ref`, `hifi_play_ref` resolves it
 /// to the same action `play_item` would reach, and the Core was actually
 /// asked to invoke Play Now on the album `hifi_search` found.

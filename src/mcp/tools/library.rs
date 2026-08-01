@@ -226,11 +226,24 @@ pub async fn handle_search(
                 Ok((session_key, results)) => {
                     let mut mcp_results = Vec::with_capacity(results.len());
                     for item in results {
-                        // #396: only an item with a real, navigable item_key
-                        // gets a ref. A row with no item_key (a header, or a
-                        // non-navigable result) mints nothing.
+                        // #396 (found live, ship-gate re-review): a real
+                        // Core's search results mix the actual hit with
+                        // grouping rows ("Albums", "Tracks", "Artists", ...)
+                        // that carry the same `hint: "list"` and a real
+                        // `item_key` -- `FakeRoonCore`'s search model never
+                        // included these, so nothing caught this minting a
+                        // ref for them indistinguishably from real content.
+                        // `crate::adapters::roon::is_category` is the
+                        // adapter's own, pre-existing knowledge of exactly
+                        // this set; resolving a category's ref would land in
+                        // `resolve_item_key`'s "guess the first item"
+                        // fallback and could silently play something the
+                        // client never asked for. Only a real, navigable
+                        // item_key on a non-category row gets a ref; a
+                        // category row (or one with no item_key at all —
+                        // a header, or non-navigable) mints nothing.
                         let ref_token = match &item.item_key {
-                            Some(item_key) => Some(
+                            Some(item_key) if !crate::adapters::roon::is_category(&item) => Some(
                                 state
                                     .mcp_refs
                                     .mint(RefTarget::Roon {
@@ -242,7 +255,7 @@ pub async fn handle_search(
                                     })
                                     .await,
                             ),
-                            None => None,
+                            _ => None,
                         };
                         mcp_results.push(McpSearchResult {
                             title: item.title,

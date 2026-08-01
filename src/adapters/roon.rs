@@ -101,7 +101,19 @@ fn find_playable_item(items: &[BrowseItem]) -> Option<&BrowseItem> {
 }
 
 /// Check if an item is a category (Albums, Tracks, etc.) rather than playable content
-fn is_category(item: &BrowseItem) -> bool {
+///
+/// `pub(crate)` since #396's ship-gate re-review: a real Roon Core's search
+/// results include these grouping rows alongside the actual top hit (e.g.
+/// searching "kind of blue" returns "Kind of Blue" *and* "Albums (32
+/// Results)", "Tracks (34 Results)", ... all with the same `hint: "list"` and
+/// a real `item_key`) -- `tests/mock_servers/roon_core.rs`'s search model
+/// never included these grouping rows, so no test caught that
+/// `crate::mcp::tools::library::handle_search` was minting a ref for them
+/// indistinguishably from real content. Resolving one lands in
+/// `resolve_item_key`'s "guess the first item" fallback, which can silently
+/// play unrelated content -- see that function's call site in
+/// `src/mcp/tools/library.rs` for how this is now excluded from minting.
+pub(crate) fn is_category(item: &BrowseItem) -> bool {
     CATEGORY_NAMES.contains(&item.title.as_str())
 }
 
