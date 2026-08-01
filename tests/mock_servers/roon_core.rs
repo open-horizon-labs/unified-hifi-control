@@ -15,7 +15,9 @@
 //! # Wire protocol
 //!
 //! Everything below is read off the pinned fork
-//! (`open-horizon-labs/rust-roon-api@ohc/main`, checkout `06dd807`), not invented:
+//! (`open-horizon-labs/rust-roon-api@ohc/main`, checkout `06dd807`), not invented.
+//! Where a shape is also documented by RoonLabs or recorded off a real Core, the
+//! PROVENANCE section below says so and the use site cites it:
 //!
 //! * Transport: WebSocket at `ws://<ip>:<port>/api`, binary frames (`moo.rs::Moo::new`).
 //! * Frame: `MOO/1 <VERB> <NAME>\n` then `Request-Id: <n>\n`, optional
@@ -77,10 +79,13 @@
 //! # What this fake does NOT prove
 //!
 //! It proves the adapter is self-consistent and that it drives `roon_api` correctly.
-//! It **cannot** prove the adapter matches a real Roon Core, because the fake's
-//! semantics were derived from the same repo the adapter lives in. Green here means
-//! "unchanged", not "correct". See `tests/mock_servers/README.md` for the full
-//! covered/not-covered table.
+//! It **cannot** prove the adapter matches a real Roon Core. Individual shapes are
+//! now backed by RoonLabs' published API or by logs off real Cores, which is better
+//! than nothing — but the *navigation model* (a `Search` item under
+//! `Library`/`TIDAL`/`Qobuz`, flat search results, an action list holding
+//! `Play Now`) came from `src/adapters/roon.rs` itself, so on that the fake cannot
+//! disagree with the adapter. Green here means "unchanged", not "correct". See
+//! `tests/mock_servers/README.md` for the full covered/not-covered table.
 //!
 //! # Failing loudly rather than looking like coverage
 //!
