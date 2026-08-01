@@ -123,8 +123,7 @@ fn lms_flag(value: Option<&Value>) -> bool {
 /// not depend on one. Reading only `id` is the #407 defect that made
 /// `search_library()` return an empty vec against every real server.
 fn loop_entity_id(row: &Value, entity: &str) -> Option<i64> {
-    lms_i64(row.get(format!("{}_id", entity)).or_else(|| row.get("id")))
-        .filter(|id| *id > 0)
+    lms_i64(row.get(format!("{}_id", entity)).or_else(|| row.get("id"))).filter(|id| *id > 0)
 }
 
 /// What LMS actually does when a request fails, spelled out once.
@@ -1823,8 +1822,8 @@ async fn update_players_internal(
                 // aggregator's event-fed cache, so a mute toggled from another
                 // controller (iPeng, Squeezer, the LMS web UI) would otherwise
                 // never reach /zones unless the volume happened to change too.
-                let volume_changed = old_player.volume != player.volume
-                    || old_player.muted != player.muted;
+                let volume_changed =
+                    old_player.volume != player.volume || old_player.muted != player.muted;
                 (np_changed, state_changed, volume_changed)
             } else {
                 // New player - will be handled by ZoneDiscovered
@@ -2703,7 +2702,10 @@ mod tests {
 
         // String form, and non-positive or missing ids are not addressable -
         // playlistcontrol cannot act on them.
-        assert_eq!(loop_entity_id(&json!({"album_id": "12"}), "album"), Some(12));
+        assert_eq!(
+            loop_entity_id(&json!({"album_id": "12"}), "album"),
+            Some(12)
+        );
         assert_eq!(loop_entity_id(&json!({"album_id": 0}), "album"), None);
         assert_eq!(loop_entity_id(&json!({"album_id": -1}), "album"), None);
         assert_eq!(loop_entity_id(&json!({"album": "no id"}), "album"), None);
@@ -2713,9 +2715,17 @@ mod tests {
     fn describe_command_names_the_player_and_the_command() {
         let described = describe_command(
             Some("02:00:00:00:00:11"),
-            &[json!("players"), json!(0), json!(100), json!("playerprefs:mute")],
+            &[
+                json!("players"),
+                json!(0),
+                json!(100),
+                json!("playerprefs:mute"),
+            ],
         );
-        assert_eq!(described, "02:00:00:00:00:11 players 0 100 playerprefs:mute");
+        assert_eq!(
+            described,
+            "02:00:00:00:00:11 players 0 100 playerprefs:mute"
+        );
 
         // Server-scoped calls pass no player id; the message must still be clear.
         let server = describe_command(None, &[json!("search"), json!(0), json!(10)]);

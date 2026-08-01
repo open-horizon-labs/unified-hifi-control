@@ -64,7 +64,10 @@ async fn live_search_library_returns_addressable_results() {
         Err(e) => panic!("live search failed: {e:#}"),
     };
 
-    println!("live search for {term:?} returned {} results:", results.len());
+    println!(
+        "live search for {term:?} returned {} results:",
+        results.len()
+    );
     for r in &results {
         println!("  {:?} id={} {:?}", r.result_type, r.id, r.title);
     }
@@ -158,7 +161,10 @@ async fn live_mute_round_trip() {
         if let BusEvent::ZoneDiscovered { zone } = event {
             if zone.zone_id.ends_with(&player) {
                 if let Some(vc) = zone.volume_control {
-                    println!("ZoneDiscovered: value={} is_muted={}", vc.value, vc.is_muted);
+                    println!(
+                        "ZoneDiscovered: value={} is_muted={}",
+                        vc.value, vc.is_muted
+                    );
                     assert!(vc.value >= 0.0, "zone volume must not be negative");
                     baseline_muted = Some(vc.is_muted);
                 }

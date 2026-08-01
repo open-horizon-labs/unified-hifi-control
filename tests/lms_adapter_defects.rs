@@ -36,7 +36,11 @@ use unified_hifi_control::bus::{create_bus, BusEvent, SharedBus};
 /// Load a recorded live LMS response and return its `result` member — exactly
 /// what `LmsRpc::execute` hands back to its callers.
 fn fixture_result(name: &str) -> Value {
-    let path = format!("{}/tests/fixtures/lms/{}.json", env!("CARGO_MANIFEST_DIR"), name);
+    let path = format!(
+        "{}/tests/fixtures/lms/{}.json",
+        env!("CARGO_MANIFEST_DIR"),
+        name
+    );
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(e) => panic!("recorded fixture {path} is missing: {e}"),
@@ -75,7 +79,11 @@ struct ReplayState {
 }
 
 impl ReplayServer {
-    async fn start(players_fixture: &str, status_fixture: &str, search_fixture: Option<&str>) -> Self {
+    async fn start(
+        players_fixture: &str,
+        status_fixture: &str,
+        search_fixture: Option<&str>,
+    ) -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let players_name = Arc::new(Mutex::new(players_fixture.to_string()));
 
@@ -168,10 +176,7 @@ async fn replay(State(state): State<ReplayState>, Json(body): Json<Value>) -> Js
                 })
                 .unwrap_or(false);
             if !asked_for_mute {
-                if let Some(players) = res
-                    .get_mut("players_loop")
-                    .and_then(|v| v.as_array_mut())
-                {
+                if let Some(players) = res.get_mut("players_loop").and_then(|v| v.as_array_mut()) {
                     for p in players.iter_mut() {
                         if let Some(obj) = p.as_object_mut() {
                             obj.remove("mute");
@@ -211,7 +216,8 @@ async fn start_closing_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 /// through a proxy that turns the closed socket into a valid empty response.
 async fn start_empty_body_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     start_raw_server(Some(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n".to_string(),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n"
+            .to_string(),
     ))
     .await
 }
@@ -361,10 +367,7 @@ async fn search_library_returns_results_from_recorded_live_response() {
         Some(t) => t,
         None => panic!("no Track result parsed from tracks_loop[].track_id"),
     };
-    assert_eq!(
-        track.id, 1,
-        "track id must come from `track_id`, not `id`"
-    );
+    assert_eq!(track.id, 1, "track id must come from `track_id`, not `id`");
     assert_eq!(track.title, "Ember Rising");
 
     // Every result must carry a usable playback handle, or search_and_play cannot
@@ -601,10 +604,7 @@ async fn players_query_requests_mute_pref_without_extra_round_trips() {
     );
     let asks_for_mute = players_calls[0]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .any(|v| v.as_str() == Some("playerprefs:mute"))
-        })
+        .map(|a| a.iter().any(|v| v.as_str() == Some("playerprefs:mute")))
         .unwrap_or(false);
     assert!(
         asks_for_mute,
@@ -649,7 +649,10 @@ async fn mute_state_from_recorded_players_response_reaches_zones() {
         let zone = zones.iter().find(|z| z.zone_id == zone_id);
         let zone = match zone {
             Some(z) => z,
-            None => panic!("zone {zone_id} not discovered; got {:?}", zones.iter().map(|z| &z.zone_id).collect::<Vec<_>>()),
+            None => panic!(
+                "zone {zone_id} not discovered; got {:?}",
+                zones.iter().map(|z| &z.zone_id).collect::<Vec<_>>()
+            ),
         };
         match zone.volume_control.as_ref() {
             Some(vc) => vc.is_muted,
@@ -736,8 +739,7 @@ async fn mute_change_alone_publishes_volume_changed() {
 #[serial_test::serial(lms_config)]
 async fn muted_player_volume_is_not_negated() {
     clear_lms_config();
-    let server =
-        ReplayServer::start("players_mute_mixed", "status_squeezelite_muted", None).await;
+    let server = ReplayServer::start("players_mute_mixed", "status_squeezelite_muted", None).await;
     let (bus, mut rx) = test_bus();
     let adapter = configured_adapter(bus, server.addr()).await;
 
@@ -834,13 +836,11 @@ fn docs_tag_legend_matches_recorded_response() {
         "tags:aAdltKc does not request `J`, so artwork_track_id is never present"
     );
 
-    let doc = match std::fs::read_to_string(format!(
-        "{}/docs/lyrion.md",
-        env!("CARGO_MANIFEST_DIR")
-    )) {
-        Ok(d) => d,
-        Err(e) => panic!("docs/lyrion.md unreadable: {e}"),
-    };
+    let doc =
+        match std::fs::read_to_string(format!("{}/docs/lyrion.md", env!("CARGO_MANIFEST_DIR"))) {
+            Ok(d) => d,
+            Err(e) => panic!("docs/lyrion.md unreadable: {e}"),
+        };
     assert!(
         !doc.contains("l=album_id"),
         "docs/lyrion.md still claims `l=album_id`; `l` is the album title and `e` \
