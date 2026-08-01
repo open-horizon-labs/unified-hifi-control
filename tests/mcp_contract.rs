@@ -3230,6 +3230,14 @@ async fn argument_parse_failures_get_an_envelope_and_unknown_tools_do_not() {
         "isError must survive: it is the only place the surface uses it"
     );
     let env = envelope(&result, "missing zone_id");
+    // This is the one envelope built outside the tool modules (in
+    // `crate::mcp::handler`), so it is the one whose `schema` presence is least
+    // exercised — assert it here rather than relying on the 23 cases above.
+    assert_eq!(
+        env.get("schema"),
+        Some(&json!("uhc.mcp.envelope/1")),
+        "the pre-dispatch envelope must declare its schema like every other: {env}"
+    );
     assert_eq!(env.get("tool"), Some(&json!("hifi_control")));
     assert_eq!(env.get("outcome"), Some(&json!("invalid")));
     let refusal = env.get("refusal").expect("a refusal is expected");

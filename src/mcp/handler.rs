@@ -110,6 +110,10 @@ fn invalid_arguments_envelope(tool: &'static str, error: &CallToolError) -> Enve
     let message = error.to_string();
     let parameter = tools::static_param(tool, &message);
 
+    // `write` rather than `read` even for the read-only tools. Unobservable —
+    // `refuse` overwrites the outcome and no envelope field records read vs.
+    // write — but stated because a future field derived from that distinction
+    // would be wrong here, and because a parse failure genuinely is neither.
     let env = Envelope::write(tool, "parse_arguments");
     match parameter {
         Some(parameter) => env.refuse(Refusal::InvalidParameter {

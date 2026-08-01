@@ -365,7 +365,11 @@ pub struct Envelope {
     pub outcome: Outcome,
     /// The MCP tool name.
     pub tool: &'static str,
-    /// The server's normalized name for what it did.
+    /// The server's normalized name for **what the call asked for**.
+    ///
+    /// Not "what it did": on a refusal nothing was done, and `volume_set` with no
+    /// `value` still reports `volume_absolute` because that is what was requested
+    /// and rejected. Pair it with `outcome` to know whether it happened.
     ///
     /// **Not a capability name** — #398 owns capability vocabulary and may map
     /// operations onto it. **Not a closed set:** `hifi_control` ends its action
