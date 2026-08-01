@@ -1,7 +1,7 @@
 //! Overall bridge status.
 
 use crate::api::AppState;
-use crate::mcp::types::json_result;
+use crate::mcp::envelope::Envelope;
 use rust_mcp_sdk::{
     macros::{mcp_tool, JsonSchema},
     schema::{schema_utils::CallToolError, CallToolResult},
@@ -40,5 +40,8 @@ pub async fn handle_status(state: &AppState) -> Result<CallToolResult, CallToolE
             "host": hqp_status.host,
         }
     });
-    Ok(json_result(&status))
+    // No scope: this tool reports on the bridge, spanning every provider. The
+    // `json!` value is already a map, so `data` and the text agree exactly here —
+    // the declaration-order/BTreeMap divergence only applies to struct payloads.
+    Ok(Envelope::read("hifi_status", "get_status").json_result(&status))
 }

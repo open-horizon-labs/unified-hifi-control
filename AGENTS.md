@@ -186,14 +186,42 @@ MCP (Model Context Protocol) enables AI assistants (Claude, ChatGPT, BoltAI, etc
 
 ### Current Capabilities
 
+Three states, not two (per epic #392): ✅ supported, ⛔ the provider's protocol
+cannot do it, 🚧 the provider can but UHC has not wired it to MCP. Collapsing the
+last two into "unsupported" makes UHC's gaps look like provider limitations, which
+is how LMS came to be understated in earlier drafts of this table.
+
 | Feature | Roon | LMS | OpenHome | UPnP |
 |---------|------|-----|----------|------|
 | Discovery (zones) | ✅ | ✅ | ✅ | ✅ |
 | Transport (play/pause/next) | ✅ | ✅ | ✅ | ✅ |
-| Volume control | ✅ | ✅ | ❌ | ❌ |
-| Search | ✅ | ✅ | ❌ | ❌ |
-| Play by query | ✅ | ✅ | ❌ | ❌ |
-| Queue building | ✅ | ✅ | ❌ | ❌ |
+| Volume control | ✅ | ✅ | 🚧 | 🚧 |
+| Search | ✅ | ✅ | ⛔ | ⛔ |
+| Play by query | ✅ | ✅ | ⛔ | ⛔ |
+| Queue building | ✅ | ✅ | ⛔ | ⛔ |
+
+**OpenHome/UPnP volume was ❌ in this table and that was wrong.** Both adapters
+implement it — `control()` handles `vol_abs`/`volume` and `vol_rel` against
+OpenHome's `Volume:1` service and UPnP's `RenderingControl` `SetVolume` — and both
+are reachable in production, because `POST /openhome/control` and
+`POST /upnp/control` pass `action` and `value` straight through
+(`src/api/mod.rs:1278`, `:1345`). Only the MCP volume path declines to call them
+(`src/mcp/routing.rs`, `VolumeRoute::Unsupported`). MCP therefore reports these as
+`not_implemented` with `tracked_by: "#398"`, not as a provider limitation — see
+`src/mcp/tools/transport.rs` and
+`tests/mcp_contract.rs::openhome_and_upnp_volume_is_reported_as_a_uhc_gap_not_a_provider_limit`.
+
+This table is still hand-maintained. #398 derives it from the routing layer so it
+cannot drift again.
+
+### Structured results
+
+Every tool returns its human-readable text **plus** a structured envelope on
+`structuredContent` (issue #395), carrying outcome, scope, the resolved action and
+parameters, observed state where the aggregator has it, and a classified reason
+when refused. The shape and its compatibility rules are documented in
+`src/mcp/envelope.rs`; downstream issues attach their payloads to `data` rather
+than inventing parallel shapes.
 
 ### Tool Design Principles
 

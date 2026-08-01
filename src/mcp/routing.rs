@@ -34,6 +34,8 @@
 //! unify these into one rule changes behavior; `tests/mcp_contract.rs`
 //! (`volume_routing_differs_from_transport_routing`) fails if you try.
 
+use crate::mcp::envelope::Provider;
+
 /// Which adapter a zone id refers to, by prefix alone.
 ///
 /// Classification is purely syntactic: it says nothing about whether the zone
@@ -118,6 +120,33 @@ pub enum LibraryRoute {
     Roon,
 }
 
+/// The zone-id prefixes that name an adapter, for refusals that have to say what
+/// a valid zone id looks like.
+///
+/// Derived from the same list [`ZoneTarget::classify`] matches on, so a new
+/// adapter cannot be added without this following.
+///
+/// # The bare unprefixed form is deliberately omitted
+///
+/// A zone id with no `:` at all also works today — `classify` sends it to Roon.
+/// It is left out because #398 is removing that default, and because pointing a
+/// client at a form that is about to stop working is worse than pointing it at
+/// four that will keep working. Every value listed here does work; the list is
+/// deliberately incomplete rather than wrong.
+pub const ACCEPTED_ZONE_PREFIXES: &[&str] = &["roon:", "lms:", "openhome:", "upnp:"];
+
+/// The `hifi_control` actions every adapter's transport path accepts.
+///
+/// Used to answer "what does this zone support instead?" when volume is refused
+/// (#395 requires an `unsupported` result to say what *is* available). This is a
+/// routing-derived answer, not a capability matrix: #398 owns the real one and
+/// should replace this.
+///
+/// One action per entry, not a comma-joined sentence: an envelope's
+/// `refusal.alternatives` entry has to be something a client can call verbatim,
+/// and `"hifi_control action=play, pause, next"` is not.
+pub const TRANSPORT_ACTIONS: &[&str] = &["play", "pause", "playpause", "next", "previous"];
+
 impl ZoneTarget {
     /// Transport routing. `Unknown` falls through to Roon — today's behavior.
     pub fn for_transport(self) -> TransportRoute {
@@ -146,6 +175,29 @@ impl ZoneTarget {
             Self::Lms => LibraryRoute::Lms,
             // Everything else, Unknown included, goes to Roon today.
             Self::Roon | Self::OpenHome | Self::Upnp | Self::Unknown => LibraryRoute::Roon,
+        }
+    }
+
+    /// The provider for an envelope [`Scope`](crate::mcp::envelope::Scope).
+    ///
+    /// **The single source of `scope.provider`, for every tool and every path.**
+    ///
+    /// Deliberately derived from identification rather than from the route taken.
+    /// An earlier draft asked the *route* — so `sonos:x` reported `roon`, because
+    /// that is where transport sends it. The execute-gate dissent blocked that:
+    /// it turns the silent Roon default into a positive claim that a Sonos zone
+    /// is a Roon zone, in the one field #398 is about to build a capability
+    /// matrix on. `Unknown` reports `unknown`, and the Roon-shaped failure detail
+    /// beside it is what makes the default visible instead of authoritative.
+    pub fn provider(self) -> Provider {
+        match self {
+            Self::Lms => Provider::Lms,
+            Self::OpenHome => Provider::OpenHome,
+            Self::Upnp => Provider::Upnp,
+            // Includes the bare-id case. That default is documented in this
+            // module rather than silent, unlike the Unknown one.
+            Self::Roon => Provider::Roon,
+            Self::Unknown => Provider::Unknown,
         }
     }
 }
