@@ -5045,3 +5045,126 @@ async fn unknown_or_stale_resource_uri_is_a_proper_error() {
         );
     }
 }
+
+/// The issue's hard constraint — "a resource and its equivalent tool must
+/// never be able to disagree" — is enforced structurally for all five
+/// resources (`hqp_status_payload`/`hqp_profiles_payload` are the single
+/// function each of the tool and the resource call), but the acceptance
+/// criteria only require a *test* for zones and now-playing. This closes that
+/// gap for HQPlayer status specifically, reusing
+/// `hqplayer_round_trip_reports_a_live_connection`'s mock-server harness so the
+/// payload is non-trivial (`connected: true`, a real `host`), not just the
+/// vacuously-equal all-`None`/disconnected case.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hqplayer_status_resource_agrees_with_the_tool_for_a_live_connection() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let mock = MockHqpServer::start().await;
+
+    let state = build_state(None).await;
+    state
+        .hqplayer
+        .configure(
+            mock.addr().ip().to_string(),
+            Some(mock.addr().port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    state
+        .hqplayer
+        .connect()
+        .await
+        .expect("HQPlayer must connect to the mock");
+
+    let app = TestApp::with_state(state.clone());
+
+    let mut connected = false;
+    for _ in 0..50 {
+        if state.hqplayer.get_status().await.connected {
+            connected = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(connected, "HQPlayer adapter never connected to the mock");
+
+    let tool_text = result_text(&app.call_tool("hifi_hqplayer_status", json!({})).await);
+    let tool_value: Value = serde_json::from_str(&tool_text)
+        .unwrap_or_else(|e| panic!("hifi_hqplayer_status must return JSON: {e}\n{tool_text}"));
+    assert_eq!(
+        tool_value.get("connected"),
+        Some(&json!(true)),
+        "sanity: the mock's connection must reach the tool at all: {tool_value}"
+    );
+
+    let read = app.read_resource("hifi://hqplayer/status").await;
+    let resource_text = read
+        .pointer("/result/contents/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("hifi://hqplayer/status must return text contents: {read}"));
+    let resource_value: Value =
+        serde_json::from_str(resource_text).expect("resource contents must be JSON");
+
+    assert_eq!(
+        tool_value, resource_value,
+        "hifi://hqplayer/status must carry exactly the hifi_hqplayer_status tool's payload"
+    );
+
+    mock.stop().await;
+}
+
+/// The profiles counterpart to the status test above. Trivially equal with no
+/// profiles cached (both are `[]`), which is honest: `get_cached_profiles`
+/// needs a `list_profiles` round-trip the mock doesn't drive here, and the
+/// point of this test is the shared-function property (`hqp_profiles_payload`
+/// is the one place either path reads from), not a specific profile list.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hqplayer_profiles_resource_agrees_with_hifi_hqplayer_profiles_tool() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let tool_text = result_text(&app.call_tool("hifi_hqplayer_profiles", json!({})).await);
+    let tool_value: Value =
+        serde_json::from_str(&tool_text).expect("hifi_hqplayer_profiles must return JSON");
+
+    let read = app.read_resource("hifi://hqplayer/profiles").await;
+    let resource_text = read
+        .pointer("/result/contents/0/text")
+        .and_then(Value::as_str)
+        .expect("hifi://hqplayer/profiles must return text contents");
+    let resource_value: Value =
+        serde_json::from_str(resource_text).expect("resource contents must be JSON");
+
+    assert_eq!(
+        tool_value, resource_value,
+        "hifi://hqplayer/profiles must carry exactly the hifi_hqplayer_profiles tool's payload"
+    );
+}
+
+/// `hifi://status`'s counterpart. Both paths call `status_payload` directly, so
+/// this is the last of the five resources without a dedicated agreement test.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn status_resource_agrees_with_hifi_status_tool() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let tool_text = result_text(&app.call_tool("hifi_status", json!({})).await);
+    let tool_value: Value = serde_json::from_str(&tool_text).expect("hifi_status must return JSON");
+
+    let read = app.read_resource("hifi://status").await;
+    let resource_text = read
+        .pointer("/result/contents/0/text")
+        .and_then(Value::as_str)
+        .expect("hifi://status must return text contents");
+    let resource_value: Value =
+        serde_json::from_str(resource_text).expect("resource contents must be JSON");
+
+    assert_eq!(
+        tool_value, resource_value,
+        "hifi://status must carry exactly the hifi_status tool's payload"
+    );
+}
