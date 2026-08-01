@@ -345,8 +345,9 @@ impl RoonAdapter {
     /// about this file.
     ///
     /// SOOD-based discovery against a fake was rejected deliberately: it needs UDP
-    /// multicast, which is process-global and already the cause of this repo's two
-    /// flaky `/hqp/discover` tests.
+    /// multicast, which is process-global, cannot be scoped to one test, and is why
+    /// this repo's `/hqp/discover` tests already pass in CI while failing on a
+    /// developer machine.
     ///
     /// Returns when the Core is lost or `stop()` is called.
     #[doc(hidden)]
