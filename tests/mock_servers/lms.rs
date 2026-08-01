@@ -71,6 +71,21 @@ impl RecordedCommand {
     }
 }
 
+/// One library entry for the `search` (library fallback) and
+/// `albums`/`artists`/`titles` (existence-check) handlers below.
+///
+/// #396: purpose-built for that issue's ref tests, not a general #417 fix —
+/// see `tests/mock_servers/README.md` and this module's own docs on the
+/// difference. Real LMS keys each type's own entity id `<type>_id`
+/// (`album_id`, `contributor_id`, `track_id`); this mock mirrors that, one
+/// `HashMap` per kind, rather than modeling LMS's actual database.
+#[derive(Debug, Clone)]
+pub struct MockLibraryItem {
+    pub id: i64,
+    pub title: String,
+    pub artist: String,
+}
+
 /// Mock LMS server state
 struct MockLmsState {
     players: HashMap<String, MockPlayer>,
@@ -78,6 +93,12 @@ struct MockLmsState {
     /// backend command an MCP action actually produced (issue #394) rather than
     /// only observing the resulting state.
     commands: Vec<RecordedCommand>,
+    /// Library items for `search` (the `search_library` fallback path) and for
+    /// the `albums`/`artists`/`titles` existence checks
+    /// `LmsAdapter::assert_library_id_exists` (#396) issues before a mutating
+    /// `playlistcontrol` call. Keyed by [`LmsSearchResultType`]-shaped kind:
+    /// `"album"`, `"artist"`, `"track"`.
+    library: HashMap<&'static str, Vec<MockLibraryItem>>,
 }
 
 /// Mock LMS Server
@@ -93,6 +114,7 @@ impl MockLmsServer {
         let state = Arc::new(RwLock::new(MockLmsState {
             players: HashMap::new(),
             commands: Vec::new(),
+            library: HashMap::new(),
         }));
 
         let app = Router::new()
@@ -158,6 +180,24 @@ impl MockLmsServer {
         self.state.write().await.commands.clear();
     }
 
+    /// Seed the library albums the `search` (term-based) and `albums`
+    /// (id-existence) handlers answer from. Replaces whatever was set before
+    /// -- call again with a shorter list to simulate a rescan that dropped an
+    /// id, which is exactly what
+    /// `LmsAdapter::assert_library_id_exists` (#396) has to notice before a
+    /// mutating `playlistcontrol` call.
+    pub async fn set_library_albums(&self, albums: Vec<(i64, &str, &str)>) {
+        let items = albums
+            .into_iter()
+            .map(|(id, title, artist)| MockLibraryItem {
+                id,
+                title: title.to_string(),
+                artist: artist.to_string(),
+            })
+            .collect();
+        self.state.write().await.library.insert("album", items);
+    }
+
     /// Commands received for `player_id`, excluding the read-only polling
     /// commands the adapter issues on its own schedule.
     pub async fn write_commands(&self, player_id: &str) -> Vec<Vec<String>> {
@@ -197,6 +237,16 @@ struct JsonRpcRequest {
 struct JsonRpcResponse {
     id: Value,
     result: Value,
+}
+
+/// Read a tagged `"<tag>:<value>"` parameter out of a command array, the way
+/// LMS's own CLI encodes filters (`term:query`, `album_id:5`, ...).
+fn filter_value<'a>(commands: &'a [Value], tag: &str) -> Option<&'a str> {
+    let prefix = format!("{tag}:");
+    commands
+        .iter()
+        .filter_map(Value::as_str)
+        .find_map(|s| s.strip_prefix(prefix.as_str()))
 }
 
 /// Handle JSON-RPC requests
@@ -351,6 +401,60 @@ async fn handle_jsonrpc(
         "playlist" => {
             // Playlist control (next/prev) - return empty success
             json!({})
+        }
+        // The `search_library` fallback path (`LmsAdapter::search_library`):
+        // `["search", 0, limit, "term:<query>"]`, answered from `library`
+        // rather than the catch-all `{}` every other command still gets.
+        // #396: this is what lets an MCP-level test mint a durable `Library`
+        // ref without needing a full #417 globalsearch fix.
+        "search" => {
+            let query = filter_value(commands, "term")
+                .unwrap_or_default()
+                .to_lowercase();
+            let albums_loop: Vec<Value> = state
+                .library
+                .get("album")
+                .into_iter()
+                .flatten()
+                .filter(|item| {
+                    item.title.to_lowercase().contains(&query)
+                        || item.artist.to_lowercase().contains(&query)
+                })
+                .map(|item| {
+                    json!({
+                        "album_id": item.id,
+                        "album": item.title,
+                        "artist": item.artist,
+                    })
+                })
+                .collect();
+            if albums_loop.is_empty() {
+                json!({})
+            } else {
+                json!({ "albums_loop": albums_loop })
+            }
+        }
+        // The existence check `LmsAdapter::assert_library_id_exists` (#396)
+        // issues before a mutating `playlistcontrol`:
+        // `["albums", 0, 1, "album_id:<id>"]` (and the `artists`/`titles`
+        // analogues, unmodeled here since #396's tests only exercise the
+        // album path -- they fall to the catch-all `{"count": 0}` shape via
+        // `_`, which is the safe direction: an unmodeled kind reads as "not
+        // found" rather than "found").
+        "albums" => {
+            let requested_id =
+                filter_value(commands, "album_id").and_then(|v| v.parse::<i64>().ok());
+            let count = match requested_id {
+                Some(id) => state
+                    .library
+                    .get("album")
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item.id == id)
+                    .count(),
+                None => 0,
+            };
+            json!({ "count": count })
         }
         _ => {
             json!({})

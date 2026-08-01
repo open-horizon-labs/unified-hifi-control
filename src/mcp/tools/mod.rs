@@ -33,7 +33,7 @@ pub use hqplayer::{
     HifiHqplayerLoadProfileTool, HifiHqplayerProfilesTool, HifiHqplayerSetPipelineTool,
     HifiHqplayerStatusTool,
 };
-pub use library::{HifiPlayTool, HifiSearchTool};
+pub use library::{HifiPlayRefTool, HifiPlayTool, HifiSearchTool};
 pub use status::HifiStatusTool;
 pub use transport::HifiControlTool;
 pub use zones::{HifiNowPlayingTool, HifiZonesTool};
@@ -59,7 +59,10 @@ tool_box!(
         HifiHqplayerSetPipelineTool,
         // Appended by #398. Appending is the whole rule: the ten above keep
         // their positions, so `tools/list` reads as an additive diff.
-        HifiCapabilitiesTool
+        HifiCapabilitiesTool,
+        // Appended by #396 (opaque content refs): the one consumer of
+        // hifi_search's new `ref` field.
+        HifiPlayRefTool
     ]
 );
 
@@ -85,6 +88,7 @@ pub fn static_name(name: &str) -> Option<&'static str> {
         "hifi_hqplayer_load_profile" => "hifi_hqplayer_load_profile",
         "hifi_hqplayer_set_pipeline" => "hifi_hqplayer_set_pipeline",
         "hifi_capabilities" => "hifi_capabilities",
+        "hifi_play_ref" => "hifi_play_ref",
         _ => return None,
     })
 }
@@ -106,6 +110,7 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
         "hifi_control" => &["zone_id", "action", "value"],
         "hifi_search" => &["query", "zone_id", "source"],
         "hifi_play" => &["query", "zone_id", "source", "action"],
+        "hifi_play_ref" => &["ref", "zone_id", "action"],
         "hifi_hqplayer_load_profile" => &["profile"],
         "hifi_hqplayer_set_pipeline" => &["setting", "value"],
         _ => &[],
@@ -149,8 +154,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn advertises_eleven_tools_when_hqplayer_is_enabled() {
-        assert_eq!(list_tools(true).len(), 11);
+    fn advertises_twelve_tools_when_hqplayer_is_enabled() {
+        assert_eq!(list_tools(true).len(), 12);
     }
 
     /// The filter must remove exactly the four HQPlayer tools and nothing else.
@@ -159,7 +164,7 @@ mod tests {
         let enabled: Vec<String> = list_tools(true).into_iter().map(|t| t.name).collect();
         let disabled: Vec<String> = list_tools(false).into_iter().map(|t| t.name).collect();
 
-        assert_eq!(disabled.len(), 7);
+        assert_eq!(disabled.len(), 8);
         assert!(disabled.iter().all(|n| !n.starts_with("hifi_hqplayer")));
 
         let removed: Vec<&String> = enabled.iter().filter(|n| !disabled.contains(n)).collect();

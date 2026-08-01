@@ -1239,7 +1239,11 @@ impl RoonAdapter {
         }
     }
 
-    /// Search the Roon library, TIDAL, or Qobuz
+    /// Search the Roon library, TIDAL, or Qobuz.
+    ///
+    /// Thin wrapper over [`Self::search_with_session`] that drops the session
+    /// key, preserving this method's exact pre-#396 signature and behavior --
+    /// `/roon/search` (`src/api/mod.rs`) calls this one, unchanged.
     pub async fn search(
         &self,
         query: &str,
@@ -1247,6 +1251,25 @@ impl RoonAdapter {
         limit: Option<usize>,
         source: SearchSource,
     ) -> Result<Vec<BrowseItem>> {
+        self.search_with_session(query, zone_id, limit, source)
+            .await
+            .map(|(_session_key, items)| items)
+    }
+
+    /// [`Self::search`], plus the `multi_session_key` the search minted.
+    ///
+    /// #396: a returned `item_key`'s scope is that session, not the Core in
+    /// general -- see `tests/mock_servers/roon_core.rs`'s `ItemKeyScope` docs
+    /// for the third-party evidence this rests on. A ref minted from these
+    /// results must record the session key here so [`Self::play_ref`] can
+    /// resolve it inside the same session rather than a fresh, unrelated one.
+    pub async fn search_with_session(
+        &self,
+        query: &str,
+        zone_id: Option<&str>,
+        limit: Option<usize>,
+        source: SearchSource,
+    ) -> Result<(String, Vec<BrowseItem>)> {
         let session_key = format!(
             "search_{}",
             std::time::SystemTime::now()
@@ -1331,16 +1354,16 @@ impl RoonAdapter {
         if let Some(list) = &search_result.list {
             if list.count > 0 {
                 let load_opts = LoadOpts {
-                    multi_session_key: Some(session_key),
+                    multi_session_key: Some(session_key.clone()),
                     count: Some(limit.unwrap_or(DEFAULT_SEARCH_LIMIT)),
                     ..Default::default()
                 };
                 let load_result = self.load(load_opts).await?;
-                return Ok(load_result.items);
+                return Ok((session_key, load_result.items));
             }
         }
 
-        Ok(vec![])
+        Ok((session_key, vec![]))
     }
 
     /// Search and play the first matching result
@@ -1658,7 +1681,16 @@ impl RoonAdapter {
         Ok(None)
     }
 
-    /// Play an item by its item_key
+    /// Play an item by its item_key, in a session minted just for this call.
+    ///
+    /// **This bets that `item_key`s are portable across `multi_session_key`s.**
+    /// That bet is unproven in this repo (zero other callers, no test before
+    /// #408) and public evidence points against it -- see
+    /// `tests/mock_servers/roon_core.rs`'s `ItemKeyScope` docs. It is kept,
+    /// unchanged, only because `/roon/play_item` (`src/api/mod.rs`) is
+    /// existing, exposed HTTP surface with its own contract; #396's ref
+    /// resolution path is [`Self::play_ref`] below, which re-enters the
+    /// session that actually minted the key instead of taking this bet.
     pub async fn play_item(
         &self,
         item_key: &str,
@@ -1682,10 +1714,63 @@ impl RoonAdapter {
 
         let bare_zone_id = strip_roon_prefix(zone_id);
 
+        // A freshly-minted session's stack is always empty, so `pop_all` and
+        // "start from nothing" are equivalent here -- `false` changes nothing
+        // observable and keeps this call's own protocol trace identical to
+        // before this method was split out of `resolve_item_key`.
+        self.resolve_item_key(&session_key, item_key, bare_zone_id, action, false)
+            .await
+    }
+
+    /// Resolve a `hifi_play_ref` (#396): play an item_key **inside the session
+    /// that minted it**, rather than a fresh, unrelated one.
+    ///
+    /// This is `play_item`'s exact resolution logic with one change:
+    /// `multi_session_key` is the caller-supplied minting session, and the
+    /// first browse sets `pop_all: true` to reset that session's stack to the
+    /// root before entering the item. That reset matters when a client holds
+    /// two refs minted by the same search (they share one `multi_session_key`,
+    /// see `search_with_session`): without it, resolving the second ref would
+    /// inherit wherever the first resolution's navigation left the stack,
+    /// rather than starting from the state the ref was actually minted in.
+    pub async fn play_ref(
+        &self,
+        item_key: &str,
+        multi_session_key: &str,
+        zone_id: &str,
+        action: PlayAction,
+    ) -> Result<String> {
+        if item_key.is_empty() {
+            return Err(anyhow::anyhow!("item_key cannot be empty"));
+        }
+        if item_key.len() > 500 {
+            return Err(anyhow::anyhow!("item_key appears malformed (too long)"));
+        }
+
+        let bare_zone_id = strip_roon_prefix(zone_id);
+        self.resolve_item_key(multi_session_key, item_key, bare_zone_id, action, true)
+            .await
+    }
+
+    /// Shared body of [`Self::play_item`] and [`Self::play_ref`]: browse into
+    /// `item_key` within `session_key`, find (or navigate to) a playable
+    /// action, and invoke it.
+    async fn resolve_item_key(
+        &self,
+        session_key: &str,
+        item_key: &str,
+        bare_zone_id: &str,
+        action: PlayAction,
+        pop_all: bool,
+    ) -> Result<String> {
+        let session_key = session_key.to_string();
+        let bare_zone_id = bare_zone_id.to_string();
+
         self.browse(BrowseOpts {
             multi_session_key: Some(session_key.clone()),
             item_key: Some(item_key.to_string()),
-            zone_or_output_id: Some(bare_zone_id.to_string()),
+            zone_or_output_id: Some(bare_zone_id.clone()),
+            pop_all,
             ..Default::default()
         })
         .await?;
@@ -1705,7 +1790,7 @@ impl RoonAdapter {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
             return self
-                .execute_play_action(&session_key, bare_zone_id, &title, &key, action)
+                .execute_play_action(&session_key, &bare_zone_id, &title, &key, action)
                 .await;
         }
 
@@ -1716,7 +1801,7 @@ impl RoonAdapter {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
             return self
-                .execute_play_action(&session_key, bare_zone_id, "Album", &key, action)
+                .execute_play_action(&session_key, &bare_zone_id, "Album", &key, action)
                 .await;
         }
 
@@ -1726,7 +1811,7 @@ impl RoonAdapter {
                 self.browse(BrowseOpts {
                     multi_session_key: Some(session_key.clone()),
                     item_key: Some(key.clone()),
-                    zone_or_output_id: Some(bare_zone_id.to_string()),
+                    zone_or_output_id: Some(bare_zone_id.clone()),
                     ..Default::default()
                 })
                 .await?;
@@ -1746,7 +1831,7 @@ impl RoonAdapter {
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
                     return self
-                        .execute_play_action(&session_key, bare_zone_id, &title, &item_key, action)
+                        .execute_play_action(&session_key, &bare_zone_id, &title, &item_key, action)
                         .await;
                 }
 
@@ -1756,7 +1841,13 @@ impl RoonAdapter {
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
                     return self
-                        .execute_play_action(&session_key, bare_zone_id, &first.title, &key, action)
+                        .execute_play_action(
+                            &session_key,
+                            &bare_zone_id,
+                            &first.title,
+                            &key,
+                            action,
+                        )
                         .await;
                 }
             }

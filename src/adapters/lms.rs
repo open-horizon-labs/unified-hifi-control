@@ -818,6 +818,78 @@ impl LmsPlayAction {
     }
 }
 
+/// One resolved way to play/queue/insert an LMS result, independent of how it
+/// was found.
+///
+/// Extracted from `search_and_play`'s three-way branch (issue #396) so
+/// `hifi_play_ref` can execute a *specific* target — not `results[0]` — via
+/// [`LmsAdapter::play_target`], without `LmsRpc::execute` becoming public.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LmsPlayTarget {
+    /// `playlistcontrol cmd:<...> <kind>_id:<id>`. Durable: an LMS database
+    /// id, surviving both UHC and LMS restarts. Invalidated only by a rescan
+    /// that reassigns ids — which is why [`LmsAdapter::play_target`] verifies
+    /// it still exists before mutating the queue.
+    Library { kind: LmsSearchResultType, id: i64 },
+    /// `playlist <load|add|insert> <url>`. Mostly durable: a plugin-resolvable
+    /// URL that survives restarts and dies only if the plugin is removed or a
+    /// subscription lapses.
+    Url { url: String },
+    /// `globalsearch playlist <play|add|insert> item_id:<id>`.
+    ///
+    /// **Not an identifier.** Verified against live Lyrion 9.1.2: this is a
+    /// positional breadcrumb of the form `<session>.<index>.<index>` that
+    /// changes across identical calls, and a *fabricated* session id resolves
+    /// successfully — LMS silently re-walks the position on a cache miss — so
+    /// a stale or wrong value here plays the wrong content with **no error**.
+    /// #396's hard rule: never mint a ref through this variant. It exists
+    /// only so `play_target` can still serve `search_and_play`'s existing,
+    /// unref'd first-result path unchanged.
+    GlobalSearchItem { item_id: String },
+}
+
+impl LmsPlayTarget {
+    /// The target `search_and_play` resolves its (only ever first) hit to,
+    /// preserving the exact precedence that method always used — `item_id`,
+    /// then `url`, then a positive library id — so extracting `play_target`
+    /// changes no observable behavior on that path.
+    pub fn from_search_hit(result: &LmsSearchResult) -> Option<Self> {
+        if let Some(item_id) = &result.item_id {
+            Some(Self::GlobalSearchItem {
+                item_id: item_id.clone(),
+            })
+        } else if let Some(url) = &result.url {
+            Some(Self::Url { url: url.clone() })
+        } else if result.id > 0 {
+            Some(Self::Library {
+                kind: result.result_type,
+                id: result.id,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// The target #396's ref minter should record for this result, or `None`
+    /// if nothing about it is safe to mint a ref for.
+    ///
+    /// Different precedence than [`Self::from_search_hit`], and deliberately
+    /// so: a ref is a promise that outlives this call, so it prefers whichever
+    /// handle is durable — `Library` (a persistent database id) over `Url`
+    /// (mostly durable) over minting nothing at all. `GlobalSearchItem` is
+    /// never mintable, full stop; see that variant's own docs for why.
+    pub fn mintable(result: &LmsSearchResult) -> Option<Self> {
+        if result.id > 0 {
+            Some(Self::Library {
+                kind: result.result_type,
+                id: result.id,
+            })
+        } else {
+            result.url.clone().map(|url| Self::Url { url })
+        }
+    }
+}
+
 /// Internal state
 struct LmsState {
     host: Option<String>,
@@ -1585,6 +1657,14 @@ impl LmsAdapter {
     /// Searches using globalsearch (includes streaming services), finds the first
     /// playable result, and executes the specified action (play, queue, or insert).
     /// Uses URL-based playback for streaming items, playlistcontrol for library items.
+    ///
+    /// #396: the actual command construction now lives in [`Self::play_target`],
+    /// reached through [`LmsPlayTarget::from_search_hit`] so this method's
+    /// observable behavior — including which of the three addressing paths a
+    /// result with more than one handle takes — is unchanged from before the
+    /// extraction. `hifi_play_ref`'s resolution path calls `play_target`
+    /// directly, with a target this method never sees: a *specific* result's,
+    /// not `results[0]`'s.
     pub async fn search_and_play(
         &self,
         query: &str,
@@ -1602,66 +1682,14 @@ impl LmsAdapter {
 
         // Take the first result
         let result = &results[0];
-
-        // Determine playback method based on item type:
-        // 1. item_id present (globalsearch streaming) -> use "globalsearch playlist play item_id:XXX"
-        // 2. url present (direct URL) -> use "playlist load/add URL"
-        // 3. otherwise (library item) -> use "playlistcontrol" with entity ID
-        if let Some(ref item_id) = result.item_id {
-            // Globalsearch streaming item - use globalsearch playlist command
-            let method = match action {
-                LmsPlayAction::Play => "play",
-                LmsPlayAction::Queue => "add",
-                LmsPlayAction::Insert => "insert",
-            };
-            let item_id_param = format!("item_id:{}", item_id);
-            self.rpc
-                .execute(
-                    Some(player_id),
-                    vec![
-                        json!("globalsearch"),
-                        json!("playlist"),
-                        json!(method),
-                        json!(item_id_param),
-                    ],
-                )
-                .await?;
-        } else if let Some(ref url) = result.url {
-            // Direct URL item - use playlist command with URL
-            let method = match action {
-                LmsPlayAction::Play => "load",
-                LmsPlayAction::Queue => "add",
-                LmsPlayAction::Insert => "insert",
-            };
-            self.rpc
-                .execute(
-                    Some(player_id),
-                    vec![json!("playlist"), json!(method), json!(url)],
-                )
-                .await?;
-        } else if result.id > 0 {
-            // Library item - use playlistcontrol with entity ID
-            let id_param = match result.result_type {
-                LmsSearchResultType::Album => format!("album_id:{}", result.id),
-                LmsSearchResultType::Artist => format!("artist_id:{}", result.id),
-                LmsSearchResultType::Track => format!("track_id:{}", result.id),
-            };
-
-            let cmd_param = format!("cmd:{}", action.to_lms_cmd());
-
-            self.rpc
-                .execute(
-                    Some(player_id),
-                    vec![json!("playlistcontrol"), json!(cmd_param), json!(id_param)],
-                )
-                .await?;
-        } else {
-            // No valid playback handle - this shouldn't happen if parse_single_item works correctly
-            return Err(anyhow!(
+        let target = LmsPlayTarget::from_search_hit(result).ok_or_else(|| {
+            anyhow!(
                 "No playable result found for '{}' (missing item_id, url, and valid id)",
                 query
-            ));
-        }
+            )
+        })?;
+
+        self.play_target(&target, player_id, action).await?;
 
         // Build response message
         let action_verb = match action {
@@ -1697,6 +1725,143 @@ impl LmsAdapter {
         );
 
         Ok(format!("{} {}", action_verb, what))
+    }
+
+    /// Execute one resolved [`LmsPlayTarget`]: `play`, `queue`, or `insert`
+    /// (play-next) where the target supports it.
+    ///
+    /// #396: this is the one path `hifi_play_ref` uses to resolve a ref. It
+    /// never re-searches and never takes `results[0]` — the defect the issue
+    /// exists to remove from ref resolution. `LmsRpc::execute`
+    /// (`src/adapters/lms.rs`) stays private; this is the purpose-specific
+    /// `pub` method that replaces handing MCP arbitrary CLI construction.
+    ///
+    /// # Validate before mutate
+    ///
+    /// A stale [`LmsPlayTarget::Library`] id is checked against the live
+    /// database *before* the mutating command runs, because
+    /// `playlistcontrol cmd:load` with an id that no longer exists clears the
+    /// queue and *then* fails — a wipe reported as a failure is still a wipe.
+    ///
+    /// **`Url` targets are not pre-validated.** LMS exposes no cheap existence
+    /// check for an arbitrary streaming or plugin URL, and `playlist load
+    /// <bad-url>` returns a normal `{}` while emptying the queue regardless of
+    /// whether it is checked first. This is a known, stated gap, not a
+    /// silently-accepted one — see the issue for why ref minting still
+    /// prefers `Url` over [`LmsPlayTarget::GlobalSearchItem`] in spite of it:
+    /// an unresolvable URL is at least a real failure mode, where a positional
+    /// breadcrumb is a *silent* one.
+    pub async fn play_target(
+        &self,
+        target: &LmsPlayTarget,
+        player_id: &str,
+        action: LmsPlayAction,
+    ) -> Result<()> {
+        let player_id = strip_lms_prefix(player_id);
+
+        match target {
+            LmsPlayTarget::GlobalSearchItem { item_id } => {
+                // Globalsearch streaming item - use globalsearch playlist command
+                let method = match action {
+                    LmsPlayAction::Play => "play",
+                    LmsPlayAction::Queue => "add",
+                    LmsPlayAction::Insert => "insert",
+                };
+                let item_id_param = format!("item_id:{}", item_id);
+                self.rpc
+                    .execute(
+                        Some(player_id),
+                        vec![
+                            json!("globalsearch"),
+                            json!("playlist"),
+                            json!(method),
+                            json!(item_id_param),
+                        ],
+                    )
+                    .await?;
+            }
+            LmsPlayTarget::Url { url } => {
+                // Direct URL item - use playlist command with URL
+                let method = match action {
+                    LmsPlayAction::Play => "load",
+                    LmsPlayAction::Queue => "add",
+                    LmsPlayAction::Insert => "insert",
+                };
+                self.rpc
+                    .execute(
+                        Some(player_id),
+                        vec![json!("playlist"), json!(method), json!(url)],
+                    )
+                    .await?;
+            }
+            LmsPlayTarget::Library { kind, id } => {
+                self.assert_library_id_exists(player_id, *kind, *id).await?;
+
+                let id_param = match kind {
+                    LmsSearchResultType::Album => format!("album_id:{}", id),
+                    LmsSearchResultType::Artist => format!("artist_id:{}", id),
+                    LmsSearchResultType::Track => format!("track_id:{}", id),
+                };
+                let cmd_param = format!("cmd:{}", action.to_lms_cmd());
+
+                self.rpc
+                    .execute(
+                        Some(player_id),
+                        vec![json!("playlistcontrol"), json!(cmd_param), json!(id_param)],
+                    )
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Confirm a [`LmsPlayTarget::Library`] id still exists before a mutating
+    /// `playlistcontrol` call touches the queue.
+    ///
+    /// Uses the dedicated taggedlist query for `kind` (`albums`/`artists`/
+    /// `titles`), filtered by the same `<kind>_id` tag that query's own result
+    /// rows are keyed by (`album_id`, `artist_id`, `track_id`) — the shape
+    /// LMS's published CLI reference documents for these three queries.
+    /// **Unverified against a live server**: this repo has already found one
+    /// LMS CLI naming surprise 9.1.2 disagreed with the published docs on
+    /// (`contributors_loop[].contributor_id`, not `artist_id` — see
+    /// `search_library`'s doc comment), so treat this filter's exact tag name
+    /// with the same caution until it is checked against a real instance.
+    async fn assert_library_id_exists(
+        &self,
+        player_id: &str,
+        kind: LmsSearchResultType,
+        id: i64,
+    ) -> Result<()> {
+        let (query, id_tag) = match kind {
+            LmsSearchResultType::Album => ("albums", "album_id"),
+            LmsSearchResultType::Artist => ("artists", "artist_id"),
+            LmsSearchResultType::Track => ("titles", "track_id"),
+        };
+        let result = self
+            .rpc
+            .execute(
+                Some(player_id),
+                vec![
+                    json!(query),
+                    json!(0),
+                    json!(1),
+                    json!(format!("{}:{}", id_tag, id)),
+                ],
+            )
+            .await?;
+        let count = result.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
+        if count < 1 {
+            anyhow::bail!(
+                "{} id {} no longer exists in the LMS library (rescanned since this ref \
+                 was minted?); refusing rather than issuing playlistcontrol, which would \
+                 clear the queue and then fail",
+                kind,
+                id
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2709,6 +2874,160 @@ mod tests {
         assert_eq!(loop_entity_id(&json!({"album_id": 0}), "album"), None);
         assert_eq!(loop_entity_id(&json!({"album_id": -1}), "album"), None);
         assert_eq!(loop_entity_id(&json!({"album": "no id"}), "album"), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // LmsPlayTarget (#396): ref-minting safety
+    //
+    // The hard rule this section exists to prove: a `GlobalSearchItem` handle
+    // -- LMS's positional breadcrumb, verified against live Lyrion 9.1.2 to
+    // change across identical calls and to silently re-resolve a fabricated
+    // id by position on a cache miss -- must never be the thing a ref mints
+    // through. Break `mintable` to prefer it and this section fails.
+    // -------------------------------------------------------------------------
+
+    fn result_with(
+        id: i64,
+        url: Option<&str>,
+        item_id: Option<&str>,
+        result_type: LmsSearchResultType,
+    ) -> LmsSearchResult {
+        LmsSearchResult {
+            result_type,
+            id,
+            title: "Some Title".to_string(),
+            artist: Some("Some Artist".to_string()),
+            album: None,
+            url: url.map(String::from),
+            item_id: item_id.map(String::from),
+        }
+    }
+
+    #[test]
+    fn mintable_never_returns_a_global_search_item_target() {
+        // The unsafe case: only a positional breadcrumb is available. No ref
+        // must be mintable for this -- an absent ref is honest, a ref through
+        // this handle can silently play the wrong thing.
+        let breadcrumb_only = result_with(0, None, Some("3.7.2"), LmsSearchResultType::Track);
+        assert_eq!(LmsPlayTarget::mintable(&breadcrumb_only), None);
+
+        // Even when a breadcrumb is present *alongside* a durable handle,
+        // `mintable` must still prefer the durable one rather than merely
+        // tolerating the breadcrumb's absence.
+        let both = result_with(
+            42,
+            Some("http://stream.example/track"),
+            Some("3.7.2"),
+            LmsSearchResultType::Track,
+        );
+        assert_eq!(
+            LmsPlayTarget::mintable(&both),
+            Some(LmsPlayTarget::Library {
+                kind: LmsSearchResultType::Track,
+                id: 42
+            })
+        );
+
+        // And no `LmsPlayTarget::mintable` result is ever the `GlobalSearchItem`
+        // variant, for any input -- the general form of the rule above.
+        for result in [
+            result_with(0, None, Some("1.0.0"), LmsSearchResultType::Track),
+            result_with(0, None, Some("9.9.9"), LmsSearchResultType::Album),
+            result_with(7, None, Some("2.1.4"), LmsSearchResultType::Artist),
+            result_with(
+                0,
+                Some("http://x"),
+                Some("5.5.5"),
+                LmsSearchResultType::Track,
+            ),
+        ] {
+            assert!(
+                !matches!(
+                    LmsPlayTarget::mintable(&result),
+                    Some(LmsPlayTarget::GlobalSearchItem { .. })
+                ),
+                "mintable() must never yield GlobalSearchItem, got {:?} for {:?}",
+                LmsPlayTarget::mintable(&result),
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn mintable_prefers_library_then_url_then_nothing() {
+        let library_only = result_with(5, None, None, LmsSearchResultType::Album);
+        assert_eq!(
+            LmsPlayTarget::mintable(&library_only),
+            Some(LmsPlayTarget::Library {
+                kind: LmsSearchResultType::Album,
+                id: 5
+            })
+        );
+
+        let url_only = result_with(
+            0,
+            Some("http://stream.example/x"),
+            None,
+            LmsSearchResultType::Track,
+        );
+        assert_eq!(
+            LmsPlayTarget::mintable(&url_only),
+            Some(LmsPlayTarget::Url {
+                url: "http://stream.example/x".to_string()
+            })
+        );
+
+        let neither = result_with(0, None, None, LmsSearchResultType::Track);
+        assert_eq!(LmsPlayTarget::mintable(&neither), None);
+    }
+
+    /// `from_search_hit` is `search_and_play`'s existing precedence
+    /// (`item_id`, then `url`, then a positive library id), extracted
+    /// unchanged -- this is what makes the extraction behavior-preserving.
+    /// It is a *different* precedence than `mintable`'s on purpose: it feeds
+    /// only `search_and_play`'s unref'd first-result path, which this issue
+    /// leaves untouched.
+    #[test]
+    fn from_search_hit_preserves_search_and_plays_original_precedence() {
+        let all_three = result_with(
+            5,
+            Some("http://stream.example/x"),
+            Some("1.2.3"),
+            LmsSearchResultType::Track,
+        );
+        assert_eq!(
+            LmsPlayTarget::from_search_hit(&all_three),
+            Some(LmsPlayTarget::GlobalSearchItem {
+                item_id: "1.2.3".to_string()
+            }),
+            "item_id must win when present, matching search_and_play's original order"
+        );
+
+        let url_and_id = result_with(
+            5,
+            Some("http://stream.example/x"),
+            None,
+            LmsSearchResultType::Track,
+        );
+        assert_eq!(
+            LmsPlayTarget::from_search_hit(&url_and_id),
+            Some(LmsPlayTarget::Url {
+                url: "http://stream.example/x".to_string()
+            }),
+            "url must win over a bare library id when there is no item_id"
+        );
+
+        let id_only = result_with(5, None, None, LmsSearchResultType::Track);
+        assert_eq!(
+            LmsPlayTarget::from_search_hit(&id_only),
+            Some(LmsPlayTarget::Library {
+                kind: LmsSearchResultType::Track,
+                id: 5
+            })
+        );
+
+        let nothing = result_with(0, None, None, LmsSearchResultType::Track);
+        assert_eq!(LmsPlayTarget::from_search_hit(&nothing), None);
     }
 
     #[test]

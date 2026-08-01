@@ -57,14 +57,20 @@ pub struct McpNowPlaying {
 
 /// A search hit.
 ///
-/// Note what is missing: any stable identifier. A client that finds something
-/// here can only hand the title back to `hifi_play`, which re-searches and takes
-/// the first match. That is #392's keystone finding and #396's job; it is
-/// recorded as a known defect in `FIELD_ROLES`, not endorsed here.
+/// `ref` (#396) is additive and optional: it is `Some` exactly when the result
+/// has a durable-enough handle to mint a ref for (a Roon `item_key`, or an LMS
+/// `Library`/`Url` target — never an LMS `GlobalSearchItem`, a positional
+/// breadcrumb that can silently mis-resolve; see
+/// `crate::adapters::lms::LmsPlayTarget`). An absent `ref` is honest: some
+/// results genuinely have no safe way to be addressed later, and minting one
+/// anyway would trade "no ref" for "a ref that might play the wrong thing".
+/// `title`/`subtitle` are unchanged from before this issue.
 #[derive(Debug, Serialize)]
 pub struct McpSearchResult {
     pub title: String,
     pub subtitle: Option<String>,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
 }
 
 /// `hifi_play`'s structured payload: the adapter's own message about what it
