@@ -33,6 +33,15 @@ use crate::producers::{
     ProducerSnapshot, RetirementOutcome,
 };
 
+/// HQPlayer `product_version` prefixes this build has actually verified against captured protocol
+/// evidence.
+///
+/// The authority is the corpus under `tests/fixtures/hqplayer/` and the ledger in
+/// `.oh/hqplayer-evidence-ledger.md`: a 5.x legacy daemon and two 6.0.4 captures. Anything outside
+/// those series still renders every runtime-enumerated control — the engine remains the authority
+/// on what it accepts — but a surface is told the series is unverified (#331).
+pub const HQP_VERIFIED_PRODUCT_SERIES: &[&str] = &["5.", "6.0."];
+
 const CONTROL_TRANSPORT_STATE: &str = "hqplayer.transport.state";
 const CONTROL_TRANSPORT_PLAY: &str = "hqplayer.transport.play";
 const CONTROL_TRANSPORT_PAUSE: &str = "hqplayer.transport.pause";
