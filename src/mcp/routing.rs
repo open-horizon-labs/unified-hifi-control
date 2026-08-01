@@ -267,7 +267,10 @@ mod tests {
     #[test]
     fn volume_refuses_where_transport_defaults_to_roon() {
         assert_eq!(ZoneTarget::classify("lms:x").for_volume(), VolumeRoute::Lms);
-        assert_eq!(ZoneTarget::classify("roon:x").for_volume(), VolumeRoute::Roon);
+        assert_eq!(
+            ZoneTarget::classify("roon:x").for_volume(),
+            VolumeRoute::Roon
+        );
         assert_eq!(ZoneTarget::classify("bare").for_volume(), VolumeRoute::Roon);
 
         for zone_id in ["openhome:x", "upnp:x", "sonos:x"] {

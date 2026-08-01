@@ -228,6 +228,9 @@ mod tests {
             None
         );
         // A parameter another tool declares must not be borrowed.
-        assert_eq!(static_param("hifi_now_playing", "missing field `query`"), None);
+        assert_eq!(
+            static_param("hifi_now_playing", "missing field `query`"),
+            None
+        );
     }
 }

@@ -83,16 +83,12 @@ impl ServerHandler for HifiMcpHandler {
             HifiTools::HifiNowPlayingTool(args) => {
                 tools::zones::handle_now_playing(state, args).await
             }
-            HifiTools::HifiControlTool(args) => {
-                tools::transport::handle_control(state, args).await
-            }
+            HifiTools::HifiControlTool(args) => tools::transport::handle_control(state, args).await,
             HifiTools::HifiSearchTool(args) => tools::library::handle_search(state, args).await,
             HifiTools::HifiPlayTool(args) => tools::library::handle_play(state, args).await,
             HifiTools::HifiStatusTool(_) => tools::status::handle_status(state).await,
             HifiTools::HifiHqplayerStatusTool(_) => tools::hqplayer::handle_status(state).await,
-            HifiTools::HifiHqplayerProfilesTool(_) => {
-                tools::hqplayer::handle_profiles(state).await
-            }
+            HifiTools::HifiHqplayerProfilesTool(_) => tools::hqplayer::handle_profiles(state).await,
             HifiTools::HifiHqplayerLoadProfileTool(args) => {
                 tools::hqplayer::handle_load_profile(state, args).await
             }

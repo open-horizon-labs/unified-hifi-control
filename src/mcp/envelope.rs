@@ -629,7 +629,9 @@ mod tests {
         );
 
         // `data` says the same thing, in BTreeMap order.
-        let structured = result.structured_content.expect("envelope must be attached");
+        let structured = result
+            .structured_content
+            .expect("envelope must be attached");
         let data = structured.get("data").expect("data must be set");
         assert_eq!(data, &serde_json::json!({ "alpha": 2, "zebra": 1 }));
 

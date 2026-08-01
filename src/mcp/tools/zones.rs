@@ -70,7 +70,8 @@ pub async fn handle_now_playing(
     args: HifiNowPlayingTool,
 ) -> Result<CallToolResult, CallToolError> {
     let target = crate::mcp::routing::ZoneTarget::classify(&args.zone_id);
-    let env = Envelope::read("hifi_now_playing", "get_now_playing").param("zone_id", &*args.zone_id);
+    let env =
+        Envelope::read("hifi_now_playing", "get_now_playing").param("zone_id", &*args.zone_id);
 
     match state.aggregator.get_zone(&args.zone_id).await {
         Some(zone) => {
@@ -79,9 +80,7 @@ pub async fn handle_now_playing(
                 zone_id: Some(args.zone_id.clone()),
                 zone_name: Some(zone.zone_name.clone()),
             };
-            Ok(env
-                .scope(scope)
-                .json_result(&now_playing_from_zone(zone)))
+            Ok(env.scope(scope).json_result(&now_playing_from_zone(zone)))
         }
         // The id is echoed back so a client can tell a typo from an absent zone.
         // The envelope goes further and names the tool that lists valid ids,

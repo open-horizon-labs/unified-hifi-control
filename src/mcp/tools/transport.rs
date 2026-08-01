@@ -90,7 +90,14 @@ pub async fn handle_control(
             return Envelope::write("hifi_control", "volume_absolute")
                 .param("zone_id", &*args.zone_id)
                 .param("action", "volume_set")
-                .scope(Scope::for_zone(state, &args.zone_id, ZoneTarget::classify(&args.zone_id).provider()).await)
+                .scope(
+                    Scope::for_zone(
+                        state,
+                        &args.zone_id,
+                        ZoneTarget::classify(&args.zone_id).provider(),
+                    )
+                    .await,
+                )
                 .refused(
                     "volume_set requires a value (0-100)",
                     Refusal::invalid_parameter(
@@ -132,7 +139,12 @@ pub async fn handle_control(
                 .control(&args.zone_id, backend_action, None)
                 .await
         }
-        TransportRoute::Upnp => state.upnp.control(&args.zone_id, backend_action, None).await,
+        TransportRoute::Upnp => {
+            state
+                .upnp
+                .control(&args.zone_id, backend_action, None)
+                .await
+        }
         TransportRoute::Roon => state.roon.control(&args.zone_id, backend_action).await,
     };
 
@@ -202,7 +214,12 @@ async fn set_volume(
         .param("value", value);
 
     let result = match route {
-        VolumeRoute::Lms => state.lms.change_volume(zone_id, value as f32, relative).await,
+        VolumeRoute::Lms => {
+            state
+                .lms
+                .change_volume(zone_id, value as f32, relative)
+                .await
+        }
         VolumeRoute::Roon => {
             state
                 .roon
