@@ -141,7 +141,11 @@ pub const ACCEPTED_ZONE_PREFIXES: &[&str] = &["roon:", "lms:", "openhome:", "upn
 /// (#395 requires an `unsupported` result to say what *is* available). This is a
 /// routing-derived answer, not a capability matrix: #398 owns the real one and
 /// should replace this.
-pub const TRANSPORT_ACTIONS: &str = "play, pause, playpause, next, previous";
+///
+/// One action per entry, not a comma-joined sentence: an envelope's
+/// `refusal.alternatives` entry has to be something a client can call verbatim,
+/// and `"hifi_control action=play, pause, next"` is not.
+pub const TRANSPORT_ACTIONS: &[&str] = &["play", "pause", "playpause", "next", "previous"];
 
 impl ZoneTarget {
     /// Transport routing. `Unknown` falls through to Roon — today's behavior.

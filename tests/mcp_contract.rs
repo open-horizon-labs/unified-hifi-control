@@ -2779,6 +2779,13 @@ async fn unsupported_refusals_name_the_operation_and_an_alternative() {
                 alt.starts_with("hifi_"),
                 "{label}: an alternative must be a callable tool invocation, got {alt:?}"
             );
+            // One invocation per entry. A comma-joined list reads as guidance and
+            // is not callable verbatim, which defeats the point of the field.
+            assert!(
+                !alt.contains(", "),
+                "{label}: each alternative must be one callable invocation, not a \
+                 comma-joined list: {alt:?}"
+            );
         }
 
         // The provider must be identifiable, either from the scope or from the

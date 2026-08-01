@@ -222,7 +222,10 @@ async fn set_volume(
                     Refusal::NotImplemented {
                         operation: operation.to_string(),
                         tracked_by: "#398",
-                        alternatives: vec![format!("hifi_control action={}", TRANSPORT_ACTIONS)],
+                        alternatives: TRANSPORT_ACTIONS
+                            .iter()
+                            .map(|a| format!("hifi_control action={a}"))
+                            .collect(),
                         detail: format!(
                             "UHC's MCP volume path does not call the {} adapter. The adapter \
                              itself implements volume and POST /{}/control exposes it, so this \
