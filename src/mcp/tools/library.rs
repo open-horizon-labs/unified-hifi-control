@@ -1,7 +1,22 @@
 //! Library search and playback.
 //!
-//! Both tools route on `lms:` only; everything else, including an absent
-//! `zone_id`, goes to Roon (see [`crate::mcp::routing`]).
+//! Both tools route on `roon:` and `lms:`. Everything else is refused since #398,
+//! where it used to reach Roon (see [`crate::mcp::routing`]).
+//!
+//! # What #398 changed, and the one default it kept
+//!
+//! `openhome:`, `upnp:` and `hqplayer:` zones were sent to Roon's library, which
+//! searched a library those zones cannot play from and then failed inside Roon —
+//! so the model learned that Roon was broken rather than that the zone has no
+//! library. They are now refused with the reason, sourced from
+//! [`crate::mcp::capabilities`]. Unplaceable ids are refused with the accepted
+//! prefixes.
+//!
+//! **An absent `zone_id` on `hifi_search` still means Roon.** `None` is not a
+//! malformed zone id: there is nothing to route by, LMS `globalsearch` requires a
+//! player id, and this tool's own description documents Roon as the default. It is
+//! reported as `scope.provider: "roon"`, so it is visible rather than silent, and
+//! `tests/mcp_contract.rs::an_absent_zone_id_still_routes_search_to_roon` pins it.
 //!
 //! This module is the primary target for #396 (opaque content references) and
 //! #399 (hierarchical browse). Note what `McpSearchResult` lacks: any stable
@@ -11,8 +26,11 @@
 //! known defect, and out of scope for #394.
 
 use crate::api::AppState;
+use crate::mcp::capabilities::{support, Capability};
 use crate::mcp::envelope::{Envelope, Observed, Refusal, Scope};
-use crate::mcp::routing::{LibraryRoute, ZoneTarget};
+use crate::mcp::routing::{
+    unplaceable_zone_refusal, unplaceable_zone_text, LibraryRoute, ZoneTarget,
+};
 use crate::mcp::types::{McpPlayResult, McpSearchResult};
 use rust_mcp_sdk::{
     macros::{mcp_tool, JsonSchema},
@@ -96,8 +114,9 @@ pub async fn handle_search(
 
     env = match route {
         // LMS ignores `source` entirely, so echoing it back as understood would
-        // claim the server honored something it discarded.
-        LibraryRoute::Lms => env,
+        // claim the server honored something it discarded. A refused zone
+        // reaches no backend at all, so the same reasoning applies.
+        LibraryRoute::Lms | LibraryRoute::Refused(_) => env,
         LibraryRoute::Roon => env.param(
             "source",
             roon_source_name(roon_search_source(args.source.as_deref())),
@@ -108,6 +127,13 @@ pub async fn handle_search(
         Some(zone_id) => env.scope(Scope::for_zone(state, zone_id, target.provider()).await),
         None => env.scope(Scope::provider_only(target.provider())),
     };
+
+    if let LibraryRoute::Refused(refused) = route {
+        // `zone_id` is present whenever the route refuses: an absent one
+        // classifies as Roon and never lands here.
+        let zone_id = args.zone_id.as_deref().unwrap_or_default();
+        return refuse_library_zone(env, zone_id, refused, Capability::Search);
+    }
 
     match route {
         LibraryRoute::Lms => {
@@ -155,6 +181,55 @@ pub async fn handle_search(
                 Err(e) => env.failed(format!("Search error: {}", e)),
             }
         }
+        // Handled above; exhaustive so a new route variant fails to compile
+        // rather than silently taking one of the two library paths.
+        LibraryRoute::Refused(_) => env.failed(
+            "internal routing error: a refused zone reached library dispatch. This is a UHC bug.",
+        ),
+    }
+}
+
+/// Refuse a zone id with no library path.
+///
+/// The classification comes from [`crate::mcp::capabilities`], so this refusal and
+/// `hifi_capabilities`' report cannot disagree about whether a gap belongs to the
+/// provider or to UHC — the distinction #398 exists to keep straight.
+fn refuse_library_zone(
+    env: Envelope,
+    zone_id: &str,
+    target: ZoneTarget,
+    capability: Capability,
+) -> Result<CallToolResult, CallToolError> {
+    match target.prefix() {
+        Some(_) => {
+            let state_of = support(target, capability);
+            // Transport is what an OpenHome or UPnP zone *can* do: it plays
+            // whatever a control point has already put on it.
+            let alternatives = vec![
+                "hifi_control action=play".to_string(),
+                "hifi_capabilities".to_string(),
+            ];
+            let detail = state_of.evidence().unwrap_or_default();
+            match state_of.refusal(capability, alternatives) {
+                Some(refusal) => env.refused(
+                    format!(
+                        "{} zones have no library path from MCP: {detail} \
+                         hifi_capabilities reports what each provider supports.",
+                        target.label()
+                    ),
+                    refusal,
+                ),
+                None => env.failed(format!(
+                    "No library path for {zone_id}, though {} reports this capability as \
+                     supported. This is a UHC routing bug.",
+                    target.label()
+                )),
+            }
+        }
+        None => env.refused(
+            unplaceable_zone_text(zone_id, target),
+            unplaceable_zone_refusal(target),
+        ),
     }
 }
 
@@ -195,6 +270,14 @@ pub async fn handle_play(
 ) -> Result<CallToolResult, CallToolError> {
     let target = ZoneTarget::classify(&args.zone_id);
     let route = target.for_library();
+
+    if let LibraryRoute::Refused(refused) = route {
+        let env = Envelope::write("hifi_play", "play")
+            .param("query", &*args.query)
+            .param("zone_id", &*args.zone_id)
+            .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
+        return refuse_library_zone(env, &args.zone_id, refused, Capability::PlayByQuery);
+    }
 
     match route {
         LibraryRoute::Lms => {
@@ -263,6 +346,10 @@ pub async fn handle_play(
                 Err(e) => env.failed(format!("Play error: {}", e)),
             }
         }
+        // Handled above; exhaustive for the same reason as in `handle_search`.
+        LibraryRoute::Refused(_) => Envelope::write("hifi_play", "play").failed(
+            "internal routing error: a refused zone reached library dispatch. This is a UHC bug.",
+        ),
     }
 }
 

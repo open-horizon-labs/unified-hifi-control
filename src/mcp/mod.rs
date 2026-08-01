@@ -18,6 +18,7 @@
 //! | [`types`]    | response shapes and result constructors                   |
 //! | [`envelope`] | the structured result envelope every tool fills           |
 //! | [`routing`]  | zone-prefix -> adapter, in exactly one place              |
+//! | [`capabilities`] | per-provider capability truth, in three states        |
 //!
 //! # The MCP surface is pinned by tests
 //!
@@ -30,6 +31,7 @@
 //! UPDATE_MCP_FIXTURES=1 cargo test --test mcp_contract
 //! ```
 
+pub mod capabilities;
 pub mod envelope;
 pub mod handler;
 pub mod routing;

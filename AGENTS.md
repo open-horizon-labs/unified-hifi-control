@@ -186,33 +186,47 @@ MCP (Model Context Protocol) enables AI assistants (Claude, ChatGPT, BoltAI, etc
 
 ### Current Capabilities
 
-Three states, not two (per epic #392): ✅ supported, ⛔ the provider's protocol
-cannot do it, 🚧 the provider can but UHC has not wired it to MCP. Collapsing the
-last two into "unsupported" makes UHC's gaps look like provider limitations, which
-is how LMS came to be understated in earlier drafts of this table.
+**This table is generated. Do not hand-edit it.**
 
-| Feature | Roon | LMS | OpenHome | UPnP |
-|---------|------|-----|----------|------|
-| Discovery (zones) | ✅ | ✅ | ✅ | ✅ |
-| Transport (play/pause/next) | ✅ | ✅ | ✅ | ✅ |
-| Volume control | ✅ | ✅ | 🚧 | 🚧 |
-| Search | ✅ | ✅ | ⛔ | ⛔ |
-| Play by query | ✅ | ✅ | ⛔ | ⛔ |
-| Queue building | ✅ | ✅ | ⛔ | ⛔ |
+It is rendered from `hifi_capabilities`' own wire payload by
+`tests/mcp_contract.rs::agents_md_capability_matrix_matches_the_derived_data`,
+which fails on any drift. Regenerate with:
 
-**OpenHome/UPnP volume was ❌ in this table and that was wrong.** Both adapters
-implement it — `control()` handles `vol_abs`/`volume` and `vol_rel` against
-OpenHome's `Volume:1` service and UPnP's `RenderingControl` `SetVolume` — and both
-are reachable in production, because `POST /openhome/control` and
-`POST /upnp/control` pass `action` and `value` straight through
-(`src/api/mod.rs:1278`, `:1345`). Only the MCP volume path declines to call them
-(`src/mcp/routing.rs`, `VolumeRoute::Unsupported`). MCP therefore reports these as
-`not_implemented` with `tracked_by: "#398"`, not as a provider limitation — see
-`src/mcp/tools/transport.rs` and
-`tests/mcp_contract.rs::openhome_and_upnp_volume_is_reported_as_a_uhc_gap_not_a_provider_limit`.
+```sh
+UPDATE_AGENTS_MATRIX=1 cargo test --test mcp_contract agents_md
+```
 
-This table is still hand-maintained. #398 derives it from the routing layer so it
-cannot drift again.
+Three states, not two (per epic #392). Collapsing the last two into "unsupported"
+makes UHC's gaps look like provider limitations, and that is not hypothetical: a
+hand-written `❌` in this very table claimed OpenHome and UPnP could not do volume,
+when both adapters implement `vol_abs`/`vol_rel` and `POST /openhome/control` had
+been exposing it over HTTP the whole time. Only the MCP path declined. #398 wired
+it, and made the table derived so the same error cannot be typed again.
+
+Two things this table does **not** claim:
+
+- **It is per provider, not per device.** A fixed-volume Roon output reports
+  `volume` as supported. UHC cannot currently distinguish "this output has no
+  volume control" from "no volume has been read yet", so `hifi_capabilities` reports
+  the aggregator's `has_volume_control` observation separately rather than guessing.
+- **Every ⛔ for OpenHome and UPnP rests on specification knowledge, not on a call
+  to a device.** Each cell says so in its own footnote. LMS's cells come from a live
+  Lyrion 9.1.2 inventory (#402/#403) and are the strongest rows here.
+
+<!-- BEGIN GENERATED CAPABILITY MATRIX (#398) -->
+<!-- END GENERATED CAPABILITY MATRIX (#398) -->
+
+`hqplayer:` is a fifth zone prefix: `PrefixedZoneId` lists it and `HqpAdapter`
+publishes `ZoneDiscovered` with it, so HQPlayer zones appear in `hifi_zones`. Until
+#398 the MCP routing layer had no arm for it and sent every one of them to Roon.
+#398 recognises the prefix and reports the gap; wiring it is #328.
+
+Two rows the earlier hand-written table had are deliberately absent, rather than
+lost. **Discovery** is not per-provider: `hifi_zones` reads the aggregator, which
+holds every zone type identically, so there is nothing for a three-state value to
+distinguish. **Queue building** was `hifi_play action='queue'` — the same call path
+as `play_by_query`, so it is that row; genuine queue *mutation* is the five
+`queue_*` rows, which is where LMS's advantage over Roon becomes visible.
 
 ### Structured results
 

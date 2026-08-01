@@ -95,6 +95,9 @@ impl ServerHandler for HifiMcpHandler {
             HifiTools::HifiHqplayerSetPipelineTool(args) => {
                 tools::hqplayer::handle_set_pipeline(state, args).await
             }
+            HifiTools::HifiCapabilitiesTool(args) => {
+                tools::capabilities::handle_capabilities(state, args).await
+            }
         }
     }
 }

@@ -1,4 +1,20 @@
 {
+  "hifi_capabilities": {
+    "annotations": {
+      "readOnlyHint": true
+    },
+    "description": "Discover what a zone supports before acting on it. Every capability reports one of three states: 'supported' (a working path exists), 'unsupported' (the provider's protocol cannot do it - never retry), or 'not_implemented' (the provider can, UHC has not wired it yet - tracked_by names the issue). Omit zone_id for every zone and every provider. States are per provider, not per device: a fixed-volume output still reports volume as supported, so check has_volume_control alongside it.",
+    "inputSchema": {
+      "properties": {
+        "zone_id": {
+          "description": "A zone ID to narrow the report to (get from hifi_zones). Omit for all zones.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
   "hifi_control": {
     "description": "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume",
     "inputSchema": {
