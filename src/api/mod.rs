@@ -501,13 +501,7 @@ pub async fn roon_play_handler(
             Json(serde_json::json!({ "message": message })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => roon_browse_failure(&e, None),
     }
 }
 
