@@ -16,6 +16,11 @@ export PATH=$QPKG_ROOT:$PATH
 export PIDF=${QPKG_ROOT}/unified-hifi-control.pid
 export LOGF=${QPKG_ROOT}/unified-hifi-control.log
 
+# Configuration contains server-side credentials and persistent-operation backups.
+# Do not let a permissive NAS-wide umask make newly-created package state readable
+# by other local users.
+umask 077
+
 case "$1" in
   start)
     ENABLED=$(/sbin/getcfg $QPKG_NAME Enable -u -d FALSE -f $CONF)
@@ -45,15 +50,6 @@ case "$1" in
         fi
         rm -f "$PIDF"
     fi
-
-    # Fallback: kill any process listening on our port
-    PORT_PID=$(netstat -tlnp 2>/dev/null | grep ':8088 ' | awk '{print $7}' | cut -d'/' -f1)
-    if [ -n "$PORT_PID" ]; then
-        kill -9 $PORT_PID 2>/dev/null
-    fi
-
-    # Fallback: kill by binary path
-    pkill -9 -f "${QPKG_ROOT}/unified-hifi-control" 2>/dev/null
 
     echo "$QPKG_NAME stopped."
     ;;
