@@ -1,0 +1,16 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "search",
+      "0",
+      10,
+      "term:zzznotfound"
+    ]
+  ],
+  "result": {
+    "count": 0
+  }
+}

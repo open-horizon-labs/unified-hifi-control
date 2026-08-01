@@ -1,0 +1,69 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "players",
+      "0",
+      100,
+      "playerprefs:mute"
+    ]
+  ],
+  "result": {
+    "count": 3,
+    "players_loop": [
+      {
+        "canpoweroff": 0,
+        "connected": 1,
+        "firmware": null,
+        "ip": "172.17.0.1:60364",
+        "isplayer": 0,
+        "isplaying": 0,
+        "model": "http",
+        "modelname": "Web Client",
+        "mute": "0",
+        "name": "Kitchen",
+        "playerid": "02:00:00:00:00:01",
+        "playerindex": "0",
+        "power": 1,
+        "seq_no": 0,
+        "uuid": null
+      },
+      {
+        "canpoweroff": 0,
+        "connected": 1,
+        "firmware": null,
+        "ip": "172.17.0.1:64338",
+        "isplayer": 0,
+        "isplaying": 0,
+        "model": "http",
+        "modelname": "Web Client",
+        "name": "curl from 02:00:00:00:00:02",
+        "playerid": "02:00:00:00:00:02",
+        "playerindex": 1,
+        "power": 1,
+        "seq_no": 0,
+        "uuid": null
+      },
+      {
+        "canpoweroff": 1,
+        "connected": 1,
+        "displaytype": "none",
+        "firmware": 0,
+        "ip": "127.0.0.1:42110",
+        "isplayer": 1,
+        "isplaying": 0,
+        "model": "squeezelite",
+        "modelname": "SqueezeLite",
+        "mute": "0",
+        "name": "Study",
+        "playerid": "02:00:00:00:00:11",
+        "playerindex": 2,
+        "power": 1,
+        "seq_no": 0,
+        "uuid": null
+      }
+    ]
+  }
+}

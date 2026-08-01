@@ -1,0 +1,15 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "02:00:00:00:00:11",
+    [
+      "mixer",
+      "muting",
+      "?"
+    ]
+  ],
+  "result": {
+    "_muting": "0"
+  }
+}
