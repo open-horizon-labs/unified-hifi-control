@@ -52,12 +52,21 @@
 //! |---|---|---|
 //! | **From the fork** | which fields exist, which are required vs optional, enum spellings (`"action_list"`, `"list"`, …), the four browse error names, the handshake order | high — a shape the fork's `serde` accepts is a shape the adapter can consume |
 //! | **From this repo's adapter** | that the browse root contains `Library` / `TIDAL` / `Qobuz`, that each contains a `Search` item, that an action list contains `Play Now` / `Queue` / `Start Radio` | high as *expectations* — `src/adapters/roon.rs` will not work against anything else |
-//! | **INFERRED** | root list title (`Explore`), `level` numbering from 0, `action: "none"` as the reply to invoking an action item, whether a real Core sends a body with `InvalidItemKey`, whether an `item_key` minted under one `multi_session_key` resolves under another | **unverified** — every one is marked `INFERRED:` at its use site |
+//! | **INFERRED** | root list title (`Explore`), `level` numbering from 0, `action: "none"` as the reply to invoking an action item, whether a real Core sends a body with `InvalidItemKey`, **whether a real Core spells the four error names the way the fork matches them**, whether an `item_key` minted under one `multi_session_key` resolves under another | **unverified** — every one is marked `INFERRED:` at its use site |
 //!
-//! The last row is the dangerous one. In particular the `item_key` portability
-//! question is the empirical unknown #405 must answer against the operator's rig;
-//! this fake makes it *configurable* ([`ItemKeyScope`]) rather than pretending to
-//! know, so a test can pin either answer and be re-pointed once it is known.
+//! The last row is the dangerous one. Two entries in it are load-bearing:
+//!
+//! * **The four error names.** The fork matches string literals, and anything else
+//!   becomes `Parsed::None`, which it drops — so a Core that spells one differently
+//!   makes the caller time out as if unreachable, with every test here still green.
+//!   #405's PR flagged this as #408's to pin, and it is pinned as far as it can be:
+//!   [`FakeRoonCore::reject_item_key_with_name`] and
+//!   [`FakeRoonCore::FORK_ERROR_NAMES`] make the *consequence* testable. Verifying
+//!   the names themselves needs a real Core.
+//! * **`item_key` portability across sessions.** The empirical unknown #405 must
+//!   answer against the operator's rig; this fake makes it *configurable*
+//!   ([`ItemKeyScope`]) rather than pretending to know, so a test can pin either
+//!   answer and be re-pointed once it is known.
 //!
 //! # What this fake does NOT prove
 //!
@@ -252,12 +261,20 @@ impl FakeLibrary {
                     "Miles Davis",
                     &["So What", "Blue in Green", "Flamenco Sketches"],
                 ),
-                album("Blue Train", "John Coltrane", &["Blue Train", "Moment's Notice"]),
+                album(
+                    "Blue Train",
+                    "John Coltrane",
+                    &["Blue Train", "Moment's Notice"],
+                ),
             ],
         );
         search_results.insert(
             "TIDAL".to_string(),
-            vec![album("Blue Note Reimagined", "Various Artists", &["Footprints"])],
+            vec![album(
+                "Blue Note Reimagined",
+                "Various Artists",
+                &["Footprints"],
+            )],
         );
 
         Self {
@@ -453,6 +470,8 @@ struct CoreState {
     item_key_scope: ItemKeyScope,
     /// item_keys the Core will reject with `InvalidItemKey`
     rejected_keys: HashSet<String>,
+    /// Per-key override of the rejection's message *name*.
+    rejection_names: HashMap<String, String>,
     /// One-shot: the next browse, whatever it is, is rejected.
     reject_next_browse: bool,
     /// Applied before every response.
@@ -466,6 +485,11 @@ struct CoreState {
     /// Without this, "the adapter hung" and "the Core never replied" are
     /// indistinguishable — and that ambiguity is exactly what #405 is about.
     sent: Vec<(usize, String)>,
+    /// Responses that were browse/load errors, as (request id, name, session key).
+    /// The fork's `Parsed::Error` payload carries exactly this pair, so a test can
+    /// assert the Core correlated its refusal to the right request and session even
+    /// though today's adapter throws the payload away.
+    errors: Vec<(usize, String, String)>,
     core_id: String,
     display_name: String,
     display_version: String,
@@ -474,6 +498,9 @@ struct CoreState {
 // =============================================================================
 // The fake
 // =============================================================================
+
+/// Token handed out by `com.roonlabs.registry:1/register`.
+const REGISTRATION_TOKEN: &str = "fake-token-408";
 
 pub struct FakeRoonCore {
     addr: SocketAddr,
@@ -500,13 +527,17 @@ impl FakeRoonCore {
             minted: HashMap::new(),
             item_key_scope: ItemKeyScope::Global,
             rejected_keys: HashSet::new(),
+            rejection_names: HashMap::new(),
             reject_next_browse: false,
             delay: Duration::ZERO,
             key_delays: HashMap::new(),
             zones: vec![default_zone("zone_fake_1", "Fake Living Room")],
             log: Vec::new(),
             sent: Vec::new(),
-            core_id: "fake-core-408".to_string(),
+            errors: Vec::new(),
+            // Per-instance, so two fakes running concurrently are distinct Cores.
+            // Tests read it back via `core_id()` rather than hardcoding it.
+            core_id: format!("fake-core-408-{}", addr.port()),
             display_name: "Fake Roon Core".to_string(),
             display_version: "2.0.408".to_string(),
         }));
@@ -574,6 +605,34 @@ impl FakeRoonCore {
         self.state.write().await.reject_next_browse = true;
     }
 
+    /// Answer browses carrying `item_key` with an arbitrary error *name*.
+    ///
+    /// The four names the fork recognises are `InvalidItemKey`, `InvalidLevels`,
+    /// `UnexpectedError` and `ZoneNotFound` (`browse.rs:169-183`). **Whether a real
+    /// Roon Core spells them that way is unverified** — the fork's own literals are
+    /// the only evidence, and #405's PR flags the same gap. Any other name yields
+    /// `Parsed::None`, which the fork drops, so the caller times out exactly as it
+    /// did before #405 — with every test still green. This knob exists so that
+    /// consequence can be pinned rather than merely described; see
+    /// `an_unrecognised_error_name_degrades_to_an_indistinguishable_timeout`.
+    pub async fn reject_item_key_with_name(&self, item_key: &str, error_name: &str) {
+        let mut state = self.state.write().await;
+        state.rejected_keys.insert(item_key.to_string());
+        state
+            .rejection_names
+            .insert(item_key.to_string(), error_name.to_string());
+    }
+
+    /// The four browse error names the pinned fork recognises, in the order they
+    /// appear in `browse.rs`. Pinned by a test so a fork bump that renames one is
+    /// visible here rather than as a mysterious timeout.
+    pub const FORK_ERROR_NAMES: [&'static str; 4] = [
+        "InvalidItemKey",
+        "InvalidLevels",
+        "UnexpectedError",
+        "ZoneNotFound",
+    ];
+
     pub async fn set_item_key_scope(&self, scope: ItemKeyScope) {
         self.state.write().await.item_key_scope = scope;
     }
@@ -586,6 +645,16 @@ impl FakeRoonCore {
         self.state.read().await.display_name.clone()
     }
 
+    /// The `core_id` this Core reports, unique per instance.
+    pub async fn core_id(&self) -> String {
+        self.state.read().await.core_id.clone()
+    }
+
+    /// The token this Core hands out on `register`.
+    pub fn token(&self) -> &'static str {
+        REGISTRATION_TOKEN
+    }
+
     // ---- observation -------------------------------------------------------
 
     /// The `item_key` this Core mints for the (first) item with this title.
@@ -593,7 +662,10 @@ impl FakeRoonCore {
     /// construct keys themselves.
     pub async fn key_for_title(&self, title: &str) -> Option<String> {
         let state = self.state.read().await;
-        state.arena.find_by_title(title).map(|i| state.arena.key_of(i))
+        state
+            .arena
+            .find_by_title(title)
+            .map(|i| state.arena.key_of(i))
     }
 
     /// The title of the item a given `item_key` points at.
@@ -656,6 +728,11 @@ impl FakeRoonCore {
     /// remove. Without it, a hang looks the same either way.
     pub async fn responses(&self) -> Vec<(usize, String)> {
         self.state.read().await.sent.clone()
+    }
+
+    /// Browse/load refusals this Core sent, as `(request id, name, session key)`.
+    pub async fn errors_sent(&self) -> Vec<(usize, String, String)> {
+        self.state.read().await.errors.clone()
     }
 
     /// Names of the responses sent, in order.
@@ -855,6 +932,27 @@ async fn respond(
     send(writer, verb, name, req_id, body).await;
 }
 
+/// Refuse a browse/load, recording the `(req_id, name, session_key)` triple the
+/// fork's `Parsed::Error` payload carries.
+async fn refuse(
+    state: &Arc<RwLock<CoreState>>,
+    writer: &Writer,
+    name: &str,
+    req_id: usize,
+    session_key: &str,
+) {
+    {
+        let mut st = state.write().await;
+        st.sent.push((req_id, name.to_string()));
+        st.errors
+            .push((req_id, name.to_string(), session_key.to_string()));
+    }
+    // FROM FORK: browse.rs:169-183 keys purely off the message name.
+    // INFERRED: whether a real Core attaches a body. None is sent, because a body
+    // that parsed as BrowseResult/LoadResult would be taken for success.
+    send(writer, "COMPLETE", name, req_id, None).await;
+}
+
 // =============================================================================
 // Connection handling
 // =============================================================================
@@ -959,14 +1057,30 @@ async fn handle_request(
             // FROM FORK: lib.rs:479 requires the message name "Registered" and a
             // string `token`. A real Core returns more; the fork reads nothing
             // else, so nothing else is invented here.
-            let body = json!({ "token": "fake-token-408" });
-            respond(&core, &writer, "COMPLETE", "Registered", req_id, Some(&body)).await;
+            let body = json!({ "token": REGISTRATION_TOKEN });
+            respond(
+                &core,
+                &writer,
+                "COMPLETE",
+                "Registered",
+                req_id,
+                Some(&body),
+            )
+            .await;
         }
         RequestKind::SubscribeZones => {
             let body = json!({ "zones": core.read().await.zones.clone() });
             // FROM FORK: transport.rs:479 accepts name "Subscribed"; a
             // subscription stays open, hence CONTINUE.
-            respond(&core, &writer, "CONTINUE", "Subscribed", req_id, Some(&body)).await;
+            respond(
+                &core,
+                &writer,
+                "CONTINUE",
+                "Subscribed",
+                req_id,
+                Some(&body),
+            )
+            .await;
         }
         RequestKind::UnsubscribeZones | RequestKind::Ping => {
             respond(&core, &writer, "COMPLETE", "Success", req_id, None).await;
@@ -1061,12 +1175,11 @@ async fn handle_browse(
         || item_key.is_some_and(|k| state.arena.index_of(k).is_none());
     if rejected {
         state.reject_next_browse = false;
+        let name = item_key
+            .and_then(|k| state.rejection_names.get(k).cloned())
+            .unwrap_or_else(|| "InvalidItemKey".to_string());
         drop(state);
-        // FROM FORK: browse.rs:170-172 keys purely off the message name, and
-        // yields Parsed::Error(RoonApiError::BrowseInvalidItemKey((req_id, key))).
-        // INFERRED: whether a real Core attaches a body. None is sent, because a
-        // body that parsed as BrowseResult/LoadResult would be taken for success.
-        respond(core, writer, "COMPLETE", "InvalidItemKey", req_id, None).await;
+        refuse(core, writer, &name, req_id, &session_key).await;
         return;
     }
 
@@ -1088,7 +1201,7 @@ async fn handle_browse(
     if let Some(key) = item_key {
         let Some(index) = state.arena.index_of(key) else {
             drop(state);
-            respond(core, writer, "COMPLETE", "InvalidItemKey", req_id, None).await;
+            refuse(core, writer, "InvalidItemKey", req_id, &session_key).await;
             return;
         };
         let node_hint = state.arena.nodes[index].hint;
@@ -1139,10 +1252,7 @@ async fn handle_browse(
 
 async fn handle_load(req_id: usize, body: &Value, core: &Arc<RwLock<CoreState>>, writer: &Writer) {
     let session_key = session_key_of(body);
-    let offset = body
-        .get("offset")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+    let offset = body.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
     let count = body
         .get("count")
         .and_then(Value::as_u64)
@@ -1158,12 +1268,16 @@ async fn handle_load(req_id: usize, body: &Value, core: &Arc<RwLock<CoreState>>,
             Some(level) => level as usize,
             None => session.levels.len().saturating_sub(1),
         };
-        session.levels.get(index).cloned().map(|level| (index, level))
+        session
+            .levels
+            .get(index)
+            .cloned()
+            .map(|level| (index, level))
     });
     let Some((level_index, level)) = selected else {
         drop(state);
         // FROM FORK: browse.rs:173-175 — loading a session with no browse level.
-        respond(core, writer, "COMPLETE", "InvalidLevels", req_id, None).await;
+        refuse(core, writer, "InvalidLevels", req_id, &session_key).await;
         return;
     };
 

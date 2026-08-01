@@ -23,9 +23,7 @@ mod mock_servers;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mock_servers::roon_core::{
-    album, FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
-};
+use mock_servers::roon_core::{album, FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope};
 use roon_api::browse::{BrowseOpts, LoadOpts};
 use unified_hifi_control::adapters::roon::{PlayAction, RoonAdapter, SearchSource};
 use unified_hifi_control::bus::create_bus;
@@ -118,6 +116,63 @@ fn load_all(session: &str) -> LoadOpts {
     }
 }
 
+/// What the adapter did with a rejection the Core definitely sent.
+#[derive(Debug, PartialEq, Eq)]
+enum RejectionOutcome {
+    /// The rejection was routed to the waiting caller, promptly (#405 / PR #412).
+    RoutedToCaller,
+    /// The rejection was dropped; the caller is still waiting for its 10s timeout.
+    /// This is `v3` before #405.
+    DroppedByAdapter,
+}
+
+/// Await a browse-backed call that the Core has been told to reject, and classify
+/// what the adapter did — enforcing, in both cases, the invariants that hold
+/// regardless of whether #405 has landed.
+///
+/// This is deliberately not "assert it hangs". #405 (PR #412) routes
+/// `Parsed::Error` into the pending maps, and this suite has to be correct on
+/// `v3` both before and after that merges — a test that pinned the hang would
+/// turn red the moment the defect was fixed, which is the wrong signal from a
+/// test whose whole job is to be the end-to-end proof of the fix.
+///
+/// What is enforced either way:
+/// * a rejected request **never** resolves as success;
+/// * if it does resolve, it resolves *promptly* (well inside `BROWSE_TIMEOUT`),
+///   the message does not read as a timeout, and it names the browse session.
+///
+/// The `session` argument is asserted against the message because #405 carries
+/// the `multi_session_key` from the Core's error payload. When #412 is on the
+/// base branch, tighten this to `RoonBrowseError::from_error(&e)` and assert
+/// `kind == InvalidItemKey` directly; the string checks are the strongest
+/// assertions expressible without that type.
+async fn classify_rejection<T: std::fmt::Debug>(
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+    session: &str,
+) -> RejectionOutcome {
+    const BOUND: Duration = Duration::from_millis(750);
+    match tokio::time::timeout(BOUND, fut).await {
+        Ok(Ok(unexpected)) => {
+            panic!("a Core-rejected item key must never resolve as success, got {unexpected:?}")
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            assert!(
+                !msg.to_lowercase().contains("timed out")
+                    && !msg.to_lowercase().contains("timeout"),
+                "a Core rejection must be distinguishable from an unreachable Core, \
+                 got {msg:?}"
+            );
+            assert!(
+                msg.contains(session),
+                "the rejection should name the browse session it happened in, got {msg:?}"
+            );
+            RejectionOutcome::RoutedToCaller
+        }
+        Err(_) => RejectionOutcome::DroppedByAdapter,
+    }
+}
+
 // =============================================================================
 // The fake is validated by the real client library, not by a hand-written client
 // =============================================================================
@@ -134,7 +189,12 @@ async fn roon_core_completes_handshake() {
 
     // The handshake order is the fork's, not ours: info (request id 0) then
     // register. If the fake's framing ever breaks, this test fails first.
-    let names: Vec<String> = core.requests().await.iter().map(|r| r.name.clone()).collect();
+    let names: Vec<String> = core
+        .requests()
+        .await
+        .iter()
+        .map(|r| r.name.clone())
+        .collect();
     assert_eq!(names[0], "com.roonlabs.registry:1/info");
     assert_eq!(core.requests().await[0].req_id, 0);
     assert!(names.contains(&"com.roonlabs.registry:1/register".to_string()));
@@ -153,13 +213,25 @@ async fn roon_core_completes_handshake() {
         state_file.exists(),
         "expected pairing state at {state_file:?}"
     );
-    let saved: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
-    assert_eq!(
-        saved["roonstate"]["tokens"]["fake-core-408"],
-        "fake-token-408",
-        "the token from the fake's Registered reply should be persisted: {saved}"
-    );
+    // Every test in this binary shares the one config directory, so the file is
+    // rewritten concurrently and a read can catch it mid-truncate. Retry until it
+    // parses and carries this Core's own id.
+    let core_id = core.core_id().await;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let saved = loop {
+        let parsed = std::fs::read_to_string(&state_file)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .filter(|v| v["roonstate"]["tokens"][&core_id].is_string());
+        match parsed {
+            Some(v) => break v,
+            None if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await
+            }
+            None => panic!("pairing state never carried a token for {core_id}"),
+        }
+    };
+    assert_eq!(saved["roonstate"]["tokens"][&core_id], core.token());
 
     core.assert_no_unhandled_requests().await;
     core.stop().await;
@@ -241,7 +313,10 @@ async fn search_maps_title_and_subtitle_without_swapping_them() {
 
     // An item_key came back, and it is opaque: nothing in it is derivable from the
     // title. #396 will wrap this in a ref; today it is what /roon/play_item takes.
-    let key = hit.item_key.as_deref().expect("search hit should carry a key");
+    let key = hit
+        .item_key
+        .as_deref()
+        .expect("search hit should carry a key");
     assert!(!key.is_empty());
     assert!(!key.to_lowercase().contains("kind of blue"));
 
@@ -264,7 +339,7 @@ async fn search_results_survive_the_http_boundary() {
 
     let core = FakeRoonCore::start().await;
     let adapter = connected(&core).await;
-    let state = app_state_with(adapter);
+    let state = app_state_with(adapter).await;
 
     let app = Router::new()
         .route(
@@ -311,7 +386,7 @@ async fn browse_items_survive_the_http_boundary() {
 
     let core = FakeRoonCore::start().await;
     let adapter = connected(&core).await;
-    let state = app_state_with(adapter);
+    let state = app_state_with(adapter).await;
 
     let app = Router::new()
         .route(
@@ -357,7 +432,10 @@ async fn browse_items_survive_the_http_boundary() {
         serde_json::json!({ "session_key": "http_browse", "item_key": library_key }),
     )
     .await;
-    let albums_key = library["items"][2]["item_key"].as_str().unwrap().to_string();
+    let albums_key = library["items"][2]["item_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let albums = post_browse(
         app,
@@ -392,7 +470,11 @@ async fn search_mints_one_session_key_and_uses_it_throughout() {
         .expect("search should succeed");
 
     let sessions = core.session_keys().await;
-    assert_eq!(sessions.len(), 1, "search should mint exactly one session key");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "search should mint exactly one session key"
+    );
     assert!(
         sessions[0].starts_with("search_"),
         "session key should be search-scoped, got {:?}",
@@ -412,7 +494,10 @@ async fn search_mints_one_session_key_and_uses_it_throughout() {
     assert!(browses[0].pop_all(), "first browse must pop to the root");
     assert_eq!(browses[0].item_key(), None);
     // Request 2: enter the source by the key the Core minted for it.
-    assert_eq!(browses[1].item_key(), core.key_for_title("Library").await.as_deref());
+    assert_eq!(
+        browses[1].item_key(),
+        core.key_for_title("Library").await.as_deref()
+    );
     assert!(!browses[1].pop_all());
     // Request 3: the query is carried as `input` on the Search item, not as a
     // path or a filter.
@@ -467,7 +552,12 @@ async fn search_with_no_matches_returns_empty_not_an_error() {
     let adapter = connected(&core).await;
 
     let results = adapter
-        .search("no such album anywhere", None, Some(10), SearchSource::Library)
+        .search(
+            "no such album anywhere",
+            None,
+            Some(10),
+            SearchSource::Library,
+        )
         .await
         .expect("an empty result set is not an error");
     assert!(results.is_empty());
@@ -490,7 +580,10 @@ async fn browse_walks_two_levels_and_pop_all_returns_to_the_root() {
     let session = "browse_test_session";
 
     // Level 0: the browse root.
-    let root = adapter.browse(browse_root(session)).await.expect("root browse");
+    let root = adapter
+        .browse(browse_root(session))
+        .await
+        .expect("root browse");
     let root_list = root.list.expect("root browse should carry a list");
     assert_eq!(root_list.level, 0);
     assert_eq!(root_list.count, 4);
@@ -647,24 +740,16 @@ async fn load_without_a_browse_is_refused_not_answered_with_stale_items() {
     let core = FakeRoonCore::start().await;
     let adapter = connected(&core).await;
 
-    // The fake answers InvalidLevels. Today the adapter's catch-all drops that,
-    // so the caller waits out BROWSE_TIMEOUT; #405 covers the routing fix. What
-    // this test pins is that the *Core* refused, which is visible in its
-    // response log even though the adapter cannot see it yet.
-    let pending = tokio::time::timeout(
-        Duration::from_millis(750),
-        adapter.load(load_all("never_browsed")),
-    )
-    .await;
-    assert!(
-        pending.is_err(),
-        "expected the load to still be pending: today's adapter drops Parsed::Error"
-    );
-    assert!(
-        core.response_names().await.contains(&"InvalidLevels".to_string()),
-        "the fake Core must have refused: {:?}",
-        core.response_names().await
-    );
+    // The fake answers InvalidLevels, correlated to the load's own req_id and
+    // session. Whether the caller ever hears about it depends on #405.
+    let outcome =
+        classify_rejection(adapter.load(load_all("never_browsed")), "never_browsed").await;
+    println!("load without a browse: {outcome:?}");
+
+    let errors = core.errors_sent().await;
+    assert_eq!(errors.len(), 1, "exactly one refusal: {errors:?}");
+    assert_eq!(errors[0].1, "InvalidLevels");
+    assert_eq!(errors[0].2, "never_browsed");
 
     core.stop().await;
 }
@@ -702,7 +787,13 @@ async fn play_item_resolves_an_item_key_to_a_play_action() {
     let walked = core.browsed_titles().await;
     assert_eq!(
         walked,
-        vec!["Library", "Search", "Kind of Blue", "Play Album", "Play Now"],
+        vec![
+            "Library",
+            "Search",
+            "Kind of Blue",
+            "Play Album",
+            "Play Now"
+        ],
         "play_item should enter the item, find its action list, and invoke Play Now"
     );
 
@@ -746,7 +837,11 @@ async fn play_item_mints_a_session_key_unrelated_to_the_one_that_minted_the_key(
         .unwrap();
 
     let sessions = core.session_keys().await;
-    assert_eq!(sessions.len(), 2, "search and play_item use separate sessions");
+    assert_eq!(
+        sessions.len(),
+        2,
+        "search and play_item use separate sessions"
+    );
     assert!(sessions[0].starts_with("search_"));
     assert!(sessions[1].starts_with("play_item_"));
 }
@@ -768,20 +863,20 @@ async fn a_foreign_item_key_is_rejected_when_keys_are_session_scoped() {
 
     core.set_item_key_scope(ItemKeyScope::PerSession).await;
 
-    let outcome = tokio::time::timeout(
-        Duration::from_millis(750),
+    // play_item mints its own session, so the rejection lands in that one.
+    let outcome = classify_rejection(
         adapter.play_item(&key, "roon:zone_fake_1", PlayAction::Play),
+        "play_item_",
     )
     .await;
+    println!("play_item against a foreign key: {outcome:?}");
+
+    let errors = core.errors_sent().await;
+    assert_eq!(errors.len(), 1, "exactly one refusal: {errors:?}");
+    assert_eq!(errors[0].1, "InvalidItemKey");
     assert!(
-        outcome.is_err(),
-        "today a rejected key hangs until BROWSE_TIMEOUT rather than failing fast"
-    );
-    assert!(
-        core.response_names()
-            .await
-            .contains(&"InvalidItemKey".to_string()),
-        "the Core should have rejected the foreign key"
+        errors[0].2.starts_with("play_item_"),
+        "the refusal should name play_item's own session: {errors:?}"
     );
 
     core.stop().await;
@@ -805,7 +900,13 @@ async fn search_and_play_navigates_into_a_result_to_find_a_playable_action() {
 
     assert_eq!(
         core.browsed_titles().await,
-        vec!["Library", "Search", "Kind of Blue", "Play Album", "Play Now"],
+        vec![
+            "Library",
+            "Search",
+            "Kind of Blue",
+            "Play Album",
+            "Play Now"
+        ],
         "search_and_play should navigate into the hit before invoking an action"
     );
 
@@ -871,7 +972,10 @@ async fn an_action_the_core_does_not_offer_is_reported_with_what_is_available() 
         .expect_err("Start Radio is not offered");
     let text = error.to_string();
     assert!(text.contains("Start Radio"), "got {text}");
-    assert!(text.contains("Play Now"), "should list what is available: {text}");
+    assert!(
+        text.contains("Play Now"),
+        "should list what is available: {text}"
+    );
 
     core.stop().await;
 }
@@ -883,16 +987,20 @@ async fn an_action_the_core_does_not_offer_is_reported_with_what_is_available() 
 /// The fake emits `InvalidItemKey` on demand and the fork turns it into
 /// `Parsed::Error(RoonApiError::BrowseInvalidItemKey((req_id, session_key)))`.
 ///
-/// **This test pins a defect.** `src/adapters/roon.rs`'s event-loop catch-all
-/// (`_ => {}`) discards `Parsed::Error`, so the pending oneshot is never resolved
-/// and the caller waits out the 10s `BROWSE_TIMEOUT`. The assertions below say
-/// "still pending after 750ms" and "the Core did reply" — together they prove the
-/// error was delivered and dropped, which no test could show before.
+/// This is the end-to-end proof #405 (PR #412) asked for: #412's own correlation
+/// tests are unit-scoped precisely because nothing could drive the wire path.
 ///
-/// When #405 lands, invert this: the browse should return a typed, recoverable
-/// error promptly. Do not delete the test; change the assertion.
+/// On `v3` before #405 the event-loop catch-all discards `Parsed::Error`, so the
+/// caller waits out the 10s `BROWSE_TIMEOUT`; with #405 it gets a typed rejection
+/// promptly. `classify_rejection` enforces what must hold either way — never a
+/// silent success, and if it does resolve, promptly and not looking like a timeout —
+/// and reports which of the two it saw. So this test is correct on both bases and
+/// does not have to be inverted on merge.
+///
+/// What it pins unconditionally is the wire half: the Core answered, named the
+/// error, and correlated it to the rejected request's own `req_id` and session key.
 #[tokio::test]
-async fn browse_error_is_delivered_but_the_adapter_drops_it() {
+async fn a_rejected_item_key_is_answered_immediately_and_correlated() {
     let core = FakeRoonCore::start().await;
     let adapter = connected(&core).await;
 
@@ -904,44 +1012,49 @@ async fn browse_error_is_delivered_but_the_adapter_drops_it() {
     core.reject_item_key(&library_key).await;
 
     let started = Instant::now();
-    let pending = tokio::time::timeout(
-        Duration::from_millis(750),
+    let outcome = classify_rejection(
         adapter.browse(browse_at(session, Some(&library_key))),
+        session,
     )
     .await;
-
-    assert!(
-        pending.is_err(),
-        "TODAY: a Core-rejected item key hangs until BROWSE_TIMEOUT (10s). \
-         When #405 routes Parsed::Error, flip this to assert a prompt typed error."
-    );
+    println!("rejected browse: {outcome:?}");
     assert!(started.elapsed() < Duration::from_secs(2));
 
-    // The Core answered immediately, and named the error. So the 10s the caller
-    // waits is entirely UHC's, not Roon's.
-    assert!(
-        core.response_names()
-            .await
-            .contains(&"InvalidItemKey".to_string()),
-        "the fake must have emitted InvalidItemKey: {:?}",
-        core.response_names().await
+    // The Core answered immediately, named the error, and correlated it to the
+    // right request id *and* the right session key — which is precisely the
+    // `Parsed::Error(BrowseInvalidItemKey((req_id, multi_session_key)))` payload the
+    // adapter throws away. So the 10s the caller waits is entirely UHC's.
+    let rejected_req_id = core
+        .browse_requests()
+        .await
+        .into_iter()
+        .find(|r| r.item_key() == Some(library_key.as_str()) && r.session_key() == Some(session))
+        .expect("the rejected browse should be in the request log")
+        .req_id;
+    assert_eq!(
+        core.errors_sent().await,
+        vec![(
+            rejected_req_id,
+            "InvalidItemKey".to_string(),
+            session.to_string()
+        )],
+        "the refusal must carry the rejected request's own id and session key"
     );
 
     core.stop().await;
 }
 
-/// #405's acceptance criterion: "a test with several in-flight browse/load
-/// requests, where one is rejected, proves the right waiter is resolved and the
-/// others complete normally."
+/// #405's acceptance criterion, end to end: "a test with several in-flight
+/// browse/load requests, where one is rejected, proves the right waiter is resolved
+/// and the others complete normally."
 ///
-/// The instrument for that is here. The rejected waiter's *current* fate is a
-/// hang, and that is what is asserted — but the two healthy requests are proven
-/// to complete, in their own sessions, while the rejected one is outstanding.
-/// The pending maps are keyed by `req_id` and scanned by session key
-/// (`src/adapters/roon.rs`), so a correlation bug in #405's error arm would show
-/// up here as a healthy browse resolving with the wrong list, or not at all.
+/// Three browses in three sessions, the rejected one answered *first* (via a
+/// per-key delay) so its error cannot be mistaken for "whatever arrived last".
+/// The two healthy ones must resolve with their own correct lists whether or not
+/// #405 has landed — a correlation bug in #412's error arm shows up here as a
+/// healthy browse resolving with the wrong list, or not at all.
 #[tokio::test]
-async fn concurrent_browses_one_rejected_leaves_the_rejected_caller_hanging() {
+async fn concurrent_browses_with_one_rejected_do_not_disturb_the_others() {
     let core = FakeRoonCore::start().await;
     let adapter = connected(&core).await;
 
@@ -963,9 +1076,9 @@ async fn concurrent_browses_one_rejected_leaves_the_rejected_caller_hanging() {
 
     let a = adapter.browse(browse_at("c_a", Some(&library_key)));
     let b = adapter.browse(browse_at("c_b", Some(&library_key)));
-    let bad = tokio::time::timeout(
-        Duration::from_millis(1_500),
+    let bad = classify_rejection(
         adapter.browse(browse_at("c_bad", Some(&tidal_key))),
+        "c_bad",
     );
 
     let (a, b, bad) = tokio::join!(a, b, bad);
@@ -982,20 +1095,90 @@ async fn concurrent_browses_one_rejected_leaves_the_rejected_caller_hanging() {
         "the rejected browse must not have advanced its session"
     );
 
+    println!("rejected browse among three in flight: {bad:?}");
+
+    // Exactly one refusal, and it named the rejected request's own session — not
+    // one of the two healthy ones. That pairing is the whole correlation claim.
+    let errors = core.errors_sent().await;
+    assert_eq!(errors.len(), 1, "exactly one refusal: {errors:?}");
+    assert_eq!(errors[0].1, "InvalidItemKey");
+    assert_eq!(errors[0].2, "c_bad");
+
+    core.stop().await;
+}
+
+/// **The unverified assumption #405's PR handed to this issue.** The fork matches
+/// four literal error names against `msg["name"]`; anything else becomes
+/// `Parsed::None`, which the fork drops. So if a real Roon Core spells an error
+/// differently, the caller times out exactly as it did before #405 — and every
+/// test in this file stays green, because this fake sends the fork's own literals.
+///
+/// **No live Core was reachable, so whether Roon really uses these four spellings
+/// is unverified.** This test pins the *consequence* of being wrong rather than
+/// pretending to have checked: with an unrecognised name, the Core answered
+/// instantly and the caller still waits out `BROWSE_TIMEOUT`.
+///
+/// If someone reaches a real Core: confirm the four names below, and if any differs,
+/// this is the failure you will be looking at.
+#[tokio::test]
+async fn an_unrecognised_error_name_degrades_to_an_indistinguishable_timeout() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+
+    let session = "unknown_error_name";
+    adapter.browse(browse_root(session)).await.unwrap();
+    let root = adapter.load(load_all(session)).await.unwrap();
+    let library_key = root.items[0].item_key.clone().unwrap();
+
+    core.reject_item_key_with_name(&library_key, "ItemKeyNoLongerValid")
+        .await;
+
+    let pending = tokio::time::timeout(
+        Duration::from_millis(750),
+        adapter.browse(browse_at(session, Some(&library_key))),
+    )
+    .await;
     assert!(
-        bad.is_err(),
-        "TODAY: the rejected browse hangs. #405 must make this a prompt typed \
-         error while leaving the other two exactly as asserted above."
+        pending.is_err(),
+        "an error name the fork does not recognise is dropped inside the dependency, \
+         so the caller can only time out. This is the cost of the four literals in \
+         browse.rs being unverified against a real Core."
     );
 
-    let names = core.response_names().await;
+    // The Core did answer, instantly, with that name.
     assert_eq!(
-        names.iter().filter(|n| *n == "InvalidItemKey").count(),
-        1,
-        "exactly one request should have been rejected: {names:?}"
+        core.errors_sent().await,
+        vec![(
+            core.browse_requests()
+                .await
+                .into_iter()
+                .find(|r| r.item_key() == Some(library_key.as_str())
+                    && r.session_key() == Some(session))
+                .expect("the rejected browse should be logged")
+                .req_id,
+            "ItemKeyNoLongerValid".to_string(),
+            session.to_string()
+        )]
     );
 
     core.stop().await;
+}
+
+/// The four names are a contract with the pinned fork. If a fork bump renames one,
+/// fail here rather than as an unexplained timeout somewhere else.
+#[test]
+fn the_forks_browse_error_names_are_pinned() {
+    assert_eq!(
+        FakeRoonCore::FORK_ERROR_NAMES,
+        [
+            "InvalidItemKey",
+            "InvalidLevels",
+            "UnexpectedError",
+            "ZoneNotFound"
+        ],
+        "these are the literals roon_api's browse.rs matches on; whether a real Roon \
+         Core uses them is UNVERIFIED"
+    );
 }
 
 // =============================================================================
@@ -1067,9 +1250,10 @@ async fn a_custom_library_is_browsable() {
             FakeItem::list("Ambient"),
         ]),
     ])];
-    library
-        .search_results
-        .insert("Library".to_string(), vec![album("Music for Airports", "Brian Eno", &["1/1"])]);
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![album("Music for Airports", "Brian Eno", &["1/1"])],
+    );
 
     let core = FakeRoonCore::start_with(library).await;
     let adapter = connected(&core).await;
@@ -1107,7 +1291,7 @@ async fn a_custom_library_is_browsable() {
 // AppState for the HTTP-boundary test
 // =============================================================================
 
-fn app_state_with(roon: Arc<RoonAdapter>) -> unified_hifi_control::api::AppState {
+async fn app_state_with(roon: Arc<RoonAdapter>) -> unified_hifi_control::api::AppState {
     use unified_hifi_control::adapters::hqplayer::{HqpInstanceManager, HqpZoneLinkService};
     use unified_hifi_control::adapters::lms::LmsAdapter;
     use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
@@ -1119,7 +1303,7 @@ fn app_state_with(roon: Arc<RoonAdapter>) -> unified_hifi_control::api::AppState
 
     let bus = create_bus();
     let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
-    let hqplayer = futures::executor::block_on(hqp_instances.get_default());
+    let hqplayer = hqp_instances.get_default().await;
     let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
     let lms = Arc::new(LmsAdapter::new(bus.clone()));
     let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
@@ -1142,4 +1326,81 @@ fn app_state_with(roon: Arc<RoonAdapter>) -> unified_hifi_control::api::AppState
         Instant::now(),
         tokio_util::sync::CancellationToken::new(),
     )
+}
+
+/// **Found by this instrument.** Two browses in flight under the *same*
+/// `multi_session_key` cross-deliver their results, silently.
+///
+/// `pending_browses` is keyed by `req_id` but scanned by session key
+/// (`src/adapters/roon.rs`, the `Parsed::BrowseResult` arm):
+/// `.iter().find(|(_, (key, _))| key == &session_key)` returns an *arbitrary*
+/// matching entry when more than one request shares a session. So the caller that
+/// asked for `Library` is handed `TIDAL`'s list, with no error and no way to tell.
+///
+/// #405's issue text calls the req_id / session-key mismatch "the whole problem" but
+/// frames it as error routing. It is already a **success-path correctness bug**.
+///
+/// Reachability: the adapter's own callers (`search`, `search_and_play`, `play_item`)
+/// each mint a private key and run sequentially, so they are safe. `POST /roon/browse`
+/// takes a **caller-supplied** `session_key` and has no in-repo callers today, so
+/// nothing here triggers it — but any external client can, and #399's navigation
+/// handle will hand clients a reusable session identity, which is exactly the shape
+/// that triggers it.
+///
+/// This test asserts the defect is **present**, over eight trials, because a single
+/// trial gets the right answer by luck about one time in eight. When it starts
+/// failing, the bug is fixed: invert it to compare each trial against `expected`.
+#[tokio::test]
+async fn concurrent_browses_in_one_session_cross_deliver_their_results() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+
+    const TRIALS: usize = 8;
+    let expected = ["Library", "TIDAL", "Qobuz"];
+    let mut crossed = 0;
+    let mut observed = Vec::new();
+
+    for trial in 0..TRIALS {
+        let session = format!("shared_session_{trial}");
+        adapter.browse(browse_root(&session)).await.unwrap();
+        let root = adapter.load(load_all(&session)).await.unwrap();
+        let keys: Vec<String> = (0..3)
+            .map(|i| root.items[i].item_key.clone().unwrap())
+            .collect();
+
+        // Responses arrive in the reverse of the request order, so a correlation
+        // that goes by arrival rather than by request is visible.
+        for (i, key) in keys.iter().enumerate() {
+            core.set_delay_for_item_key(key, Duration::from_millis(60 * (3 - i) as u64))
+                .await;
+        }
+
+        let got: Vec<String> = futures::future::join_all(
+            keys.iter()
+                .map(|k| adapter.browse(browse_at(&session, Some(k)))),
+        )
+        .await
+        .into_iter()
+        .map(|r| {
+            r.expect("every browse resolves; only the payload is wrong")
+                .list
+                .map(|l| l.title)
+                .unwrap_or_default()
+        })
+        .collect();
+
+        if got != expected {
+            crossed += 1;
+        }
+        observed.push(got);
+    }
+
+    assert!(
+        crossed > 0,
+        "TODAY: same-session concurrency cross-delivers browse results. If this \
+assertion fails, the defect is fixed - invert it to assert each caller got the \
+list it asked for. Asked {expected:?} in every trial; got {observed:?}"
+    );
+
+    core.stop().await;
 }

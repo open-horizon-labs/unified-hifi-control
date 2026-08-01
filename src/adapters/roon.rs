@@ -1588,7 +1588,13 @@ async fn run_roon_loop(
         }
         CoreConnect::Direct { ip, ref port } => {
             let connected = roon
-                .ws_connect(Box::new(get_roon_state), provided, Some(services), &ip, port)
+                .ws_connect(
+                    Box::new(get_roon_state),
+                    provided,
+                    Some(services),
+                    &ip,
+                    port,
+                )
                 .await
                 .ok_or_else(|| {
                     anyhow::anyhow!("Failed to connect to Roon Core at {}:{}", ip, port)
