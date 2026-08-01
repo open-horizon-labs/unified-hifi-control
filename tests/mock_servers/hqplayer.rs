@@ -132,10 +132,22 @@ async fn handle_connection(stream: TcpStream, state: Arc<RwLock<MockHqpState>>) 
 
 /// Process an XML command and return a response
 async fn process_command(command: &str, state: &Arc<RwLock<MockHqpState>>) -> String {
-    // Skip XML declaration
     let command = command.trim();
-    if command.starts_with("<?xml") {
-        return String::new(); // Ignore declaration line
+
+    // Strip a leading XML declaration rather than discarding the whole line.
+    //
+    // HqpAdapter::build_command emits the declaration and the command on ONE
+    // line (`<?xml version="1.0"?><GetInfo/>`), so rejecting any line starting
+    // with `<?xml` made the mock unreachable from the real adapter: it answered
+    // with nothing and the adapter timed out. A bare declaration line still
+    // yields an empty response, so clients that send them separately are
+    // unaffected.
+    let command = match command.find("?>") {
+        Some(end) if command.starts_with("<?xml") => command[end + 2..].trim(),
+        _ => command,
+    };
+    if command.is_empty() {
+        return String::new();
     }
 
     // Parse command name from XML
