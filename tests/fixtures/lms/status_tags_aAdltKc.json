@@ -1,0 +1,50 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "02:00:00:00:00:11",
+    [
+      "status",
+      "-",
+      1,
+      "tags:aAdltKc"
+    ]
+  ],
+  "result": {
+    "can_seek": 1,
+    "digital_volume_control": 1,
+    "duration": 3,
+    "mixer volume": 42,
+    "mode": "play",
+    "player_connected": 1,
+    "player_ip": "127.0.0.1:42110",
+    "player_name": "Study",
+    "playlist mode": "off",
+    "playlist repeat": 0,
+    "playlist shuffle": 0,
+    "playlist_cur_index": "0",
+    "playlist_loop": [
+      {
+        "album": "Ember Light",
+        "albumartist": "Aurora Borealis Trio",
+        "artist": "Aurora Borealis Trio",
+        "duration": 3,
+        "id": 1,
+        "playlist index": 0,
+        "title": "Ember Rising",
+        "trackartist": "Aurora Borealis Trio",
+        "tracknum": "1"
+      }
+    ],
+    "playlist_timestamp": 1785541723.82539,
+    "playlist_tracks": 3,
+    "power": 1,
+    "randomplay": 0,
+    "rate": 1,
+    "seq_no": 0,
+    "signalstrength": 0,
+    "time": 0,
+    "use_volume_control": 1,
+    "waitingToPlay": 1
+  }
+}

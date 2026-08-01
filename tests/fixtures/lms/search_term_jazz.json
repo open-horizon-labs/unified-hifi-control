@@ -1,0 +1,46 @@
+{
+  "id": 217,
+  "method": "slim.request",
+  "params": [
+    "",
+    [
+      "search",
+      "0",
+      10,
+      "term:Jazz"
+    ]
+  ],
+  "result": {
+    "count": 6,
+    "genres_count": 1,
+    "genres_loop": [
+      {
+        "genre": "Jazz",
+        "genre_id": 1
+      }
+    ],
+    "tracks_count": 5,
+    "tracks_loop": [
+      {
+        "track": "Ember Rising",
+        "track_id": 1
+      },
+      {
+        "track": "Slow Ember",
+        "track_id": 2
+      },
+      {
+        "track": "Borealis Waltz",
+        "track_id": 3
+      },
+      {
+        "track": "Ember Dawn",
+        "track_id": 4
+      },
+      {
+        "track": "Aurora Interlude",
+        "track_id": 5
+      }
+    ]
+  }
+}
