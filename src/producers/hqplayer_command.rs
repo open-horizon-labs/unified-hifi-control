@@ -382,7 +382,7 @@ fn append_json_value(output: &mut Vec<u8>, value: &serde_json::Value) {
             output.push(5);
             output.extend_from_slice(&(values.len() as u64).to_be_bytes());
             let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by_key(|(left, _)| *left);
             for (key, value) in entries {
                 append_bytes(output, key.as_bytes());
                 append_json_value(output, value);
