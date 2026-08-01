@@ -1323,9 +1323,13 @@ async fn hifi_search_and_hifi_play_report_errors_with_their_own_prefixes() {
 /// **Behavior change (#398).** #394's version of this test pinned the Roon
 /// default it froze: a bare id and `sonos:abc` both expected `"Not connected to
 /// Roon"`, with a note that a green run meant "unchanged, never correct". Both now
-/// expect a refusal that names the zone id, and `hqplayer:` — which used to land
-/// in the same Roon default, for a zone type `hifi_zones` actually returns — now
-/// names HQPlayer.
+/// expect a refusal that names the zone id.
+///
+/// **Behavior change (#401/#406).** `hqplayer:` used to land in that same Roon
+/// default, for a zone type `hifi_zones` actually returns; #398 stopped that and
+/// named HQPlayer as a recognised-but-unwired gap; #401/#406 wired it for real,
+/// through the dedicated dispatch rather than through this generic grid — so it
+/// now reaches HQPlayer's own instance lookup instead of being refused by it.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn transport_routing_reaches_each_adapter_and_refuses_the_rest() {
@@ -1348,10 +1352,13 @@ async fn transport_routing_reaches_each_adapter_and_refuses_the_rest() {
             "bare id -> refused",
         ),
         ("sonos:abc", "names no adapter", "unknown prefix -> refused"),
+        // #401/#406: reaches the dedicated HQPlayer dispatch, which fails on
+        // instance lookup rather than on an unwired route — this fixture never
+        // configures an instance named "desktop".
         (
             "hqplayer:desktop",
-            "hqplayer zones are not controllable from MCP yet",
-            "hqplayer: -> named, tracked by #328",
+            "Unknown HQPlayer instance: desktop",
+            "hqplayer: -> dispatched, unknown instance",
         ),
     ];
 
@@ -1390,6 +1397,9 @@ async fn volume_routing_differs_from_transport_routing() {
         // #398 wired these two.
         ("openhome:abc", "Device not found: abc"),
         ("upnp:abc", "Renderer not found: abc"),
+        // #401/#406: dispatched, same as transport above — fails on instance
+        // lookup, not on an unwired route.
+        ("hqplayer:desktop", "Unknown HQPlayer instance: desktop"),
     ];
     for (zone_id, expected_fragment) in volume_reaches_an_adapter {
         let text = result_text(
@@ -1406,11 +1416,11 @@ async fn volume_routing_differs_from_transport_routing() {
     }
 
     // What volume refuses is now exactly what transport refuses: ids UHC cannot
-    // place, plus the one recognised provider with nothing wired.
+    // place. HQPlayer is no longer in this list — it dispatches now, asserted
+    // above.
     for (zone_id, expected_fragment) in [
         ("1601a5d4bare", "has no provider prefix"),
         ("sonos:abc", "names no adapter"),
-        ("hqplayer:desktop", "not controllable from MCP yet"),
     ] {
         let text = result_text(
             &app.call_tool(
@@ -2452,13 +2462,17 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
         || json!({ "setting": "samplerate", "value": "not-a-number" }),
     ),
     // Added by #398, so its expected text is in TEXT_ADDITIONS rather than in the
-    // pre-envelope fixture. It is the only case producing a `not_implemented`
-    // refusal now that OpenHome/UPnP volume is wired, so
-    // `every_refusal_reason_is_actually_produced` depends on it.
+    // pre-envelope fixture. `hifi_control` on an `hqplayer:` zone stopped being
+    // this once #401/#406 wired it to the dedicated dispatch (it is `invalid` /
+    // `unknown_target` now, covered by `hifi_now_playing/unknown_zone`
+    // instead) — `hifi_search` on the same zone type is the one still-gapped
+    // capability `every_refusal_reason_is_actually_produced` depends on for
+    // `not_implemented`, since content operations (#209) are unaffected by
+    // #401/#406.
     (
-        "hifi_control/hqplayer_zone_not_wired",
-        "hifi_control",
-        || json!({ "zone_id": "hqplayer:desktop", "action": "play" }),
+        "hifi_search/hqplayer_zone_not_wired",
+        "hifi_search",
+        || json!({ "query": "q", "zone_id": "hqplayer:desktop" }),
     ),
 ];
 
@@ -2469,12 +2483,12 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
 /// its expected value stated somewhere a reader can see. Every string a tool
 /// returns is therefore accounted for in exactly one of the three places.
 const TEXT_ADDITIONS: &[(&str, &str)] = &[(
-    "hifi_control/hqplayer_zone_not_wired",
-    "Error: hqplayer zones are not controllable from MCP yet: HqpAdapter implements play, \
-     pause, stop, next, previous, seek, set_volume and volume_up/down \
-     (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones \
-     lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them. \
-     hifi_capabilities reports what each provider supports.",
+    "hifi_search/hqplayer_zone_not_wired",
+    "Error: hqplayer zones have no library path from MCP: UHC's HQPlayer adapter speaks \
+     transport, volume, seek and pipeline settings; whether HQPlayer's control protocol \
+     reaches content operations has not been verified here. Reported as not-yet-implemented \
+     rather than as a provider limit, because an unverified 'never' is the more expensive \
+     error. hifi_capabilities reports what each provider supports.",
 )];
 
 /// Every string #398 changes, with the value it replaces.
@@ -2792,10 +2806,11 @@ const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
         "invalid",
         Some("invalid_parameter"),
     ),
-    // The only `not_implemented` left once OpenHome/UPnP volume is wired: a zone
-    // type hifi_zones advertises that hifi_control cannot reach.
+    // The one `not_implemented` left once OpenHome/UPnP volume and (#401/#406)
+    // HQPlayer transport/volume are wired: content operations on a zone type
+    // whose adapter's reach there is unverified (#209), not its protocol limit.
     (
-        "hifi_control/hqplayer_zone_not_wired",
+        "hifi_search/hqplayer_zone_not_wired",
         "unsupported",
         Some("not_implemented"),
     ),
@@ -4209,12 +4224,18 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
 
     // Each adapter's own refusal for an id it does not know. Distinct per
     // adapter, which is what makes the call path observable end to end.
+    //
+    // HQPlayer's fingerprint is instance lookup rather than a per-zone device
+    // lookup: `dispatch_hqplayer_action` resolves `hqplayer:abc`'s instance
+    // ("abc") against `HqpInstanceManager` before it ever looks at the
+    // aggregator, and this fixture configures no instance by that name.
     fn fingerprint(provider: &str) -> &'static str {
         match provider {
             "roon" => "Not connected to Roon",
             "lms" => "LMS host not configured",
             "openhome" => "Device not found",
             "upnp" => "Renderer not found",
+            "hqplayer" => "Unknown HQPlayer instance",
             other => panic!("no adapter fingerprint for {other}"),
         }
     }
@@ -4243,11 +4264,6 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
 
     let mut proved = 0usize;
     for provider in EXPECTED_PROVIDERS {
-        // HQPlayer zones are recognised but nothing is wired, so there is no
-        // supported cell to prove; that is asserted separately.
-        if *provider == "hqplayer" {
-            continue;
-        }
         for (capability, entry) in capabilities_of(&payload, provider) {
             if support_of(&entry) != SUPPORTED {
                 continue;
@@ -4270,13 +4286,14 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             proved += 1;
         }
     }
-    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2 = 15.
+    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2 +
+    // HQPlayer 3 (transport, transport_skip, volume; #401/#406) = 18.
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 15,
-        "{proved} supported cells were proved end to end, expected 15. If a capability was          deliberately wired or unwired, change this number in the same commit."
+        proved, 18,
+        "{proved} supported cells were proved end to end, expected 18. If a capability was          deliberately wired or unwired, change this number in the same commit."
     );
 }
 
@@ -4407,10 +4424,13 @@ async fn an_unrecognised_zone_prefix_is_refused_instead_of_routed_to_roon() {
 }
 
 /// HQPlayer zones are listed by `hifi_zones` and were being forwarded to Roon.
-/// They are now recognised, and reported as a UHC gap with a tracking issue.
+/// They are now recognised and dispatched — #401/#406 wired `hifi_control` to
+/// the same `dispatch_hqplayer_action` core the `/knob` HTTP surface uses — so
+/// an unconfigured instance name is reported as an unknown target to
+/// rediscover, never as a gap and never as a Roon failure.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn hqplayer_zones_are_recognised_and_reported_as_not_wired() {
+async fn hqplayer_zones_are_recognised_and_dispatched() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
@@ -4424,27 +4444,33 @@ async fn hqplayer_zones_are_recognised_and_reported_as_not_wired() {
             !text.contains("Not connected to Roon"),
             "an hqplayer: zone must not be forwarded to the Roon adapter; got {text:?}"
         );
+        assert!(
+            text.contains("Unknown HQPlayer instance: desktop"),
+            "no instance named 'desktop' is configured in this fixture, so dispatch must name \
+             that rather than claim the capability is unwired: {text:?}"
+        );
 
         let env = envelope(&result, "hifi_control");
         assert_eq!(
             env.get("outcome").and_then(Value::as_str),
-            Some("unsupported"),
-            "the zone id is valid and the operation is not wired: {env}"
+            Some("invalid"),
+            "the zone id is well-formed but names no configured instance: {env}"
         );
         assert_eq!(
             env.pointer("/refusal/reason").and_then(Value::as_str),
-            Some("not_implemented"),
-            "HQPlayer's adapter has play/pause/next/volume, so this is UHC's gap: {env}"
+            Some("unknown_target"),
+            "dispatch is wired now; what fails is instance lookup, not routing: {env}"
         );
         assert_eq!(
-            env.pointer("/refusal/tracked_by").and_then(Value::as_str),
-            Some("#328"),
-            "the gap must name the issue that closes it: {env}"
+            env.pointer("/refusal/discover_with")
+                .and_then(Value::as_str),
+            Some("hifi_zones"),
+            "the remedy is to re-discover a currently valid zone id: {env}"
         );
         assert_eq!(
             env.pointer("/scope/provider").and_then(Value::as_str),
             Some("hqplayer"),
-            "the prefix identifies the provider even though nothing is wired: {env}"
+            "the prefix identifies the provider even though this instance is not configured: {env}"
         );
     }
 }

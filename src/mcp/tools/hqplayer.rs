@@ -158,7 +158,7 @@ pub async fn handle_set_pipeline(
 
     // All settings use name-based lookups; the adapter handles the conversion.
     // Only samplerate needs numeric parsing (an Hz value).
-    let result = match args.setting.as_str() {
+    let outcome = match args.setting.as_str() {
         // Accepts a name like "PCM", "DSD", "[source]".
         "mode" => state.hqplayer.set_mode(&args.value).await,
         "filter1x" | "filter_1x" => state.hqplayer.set_filter_1x(&args.value).await,
@@ -200,6 +200,10 @@ pub async fn handle_set_pipeline(
             );
         }
     };
+    // Collapse the richer receipt back to the `Result<()>` this surface has always
+    // answered with — see `SettingOutcome::into_applied_result`'s own doc for why
+    // that is a deliberate no-response-contract-change decision, not a shortcut.
+    let result = outcome.and_then(|o| o.into_applied_result());
 
     match result {
         // No `observed` — same reason as load_profile.

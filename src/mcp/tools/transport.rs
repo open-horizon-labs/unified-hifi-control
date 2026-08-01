@@ -52,7 +52,7 @@
 
 use crate::api::AppState;
 use crate::mcp::capabilities::{support, Capability};
-use crate::mcp::envelope::{Envelope, Observed, Refusal, Scope};
+use crate::mcp::envelope::{Envelope, Observed, Provider, Refusal, Scope};
 use crate::mcp::routing::{
     unplaceable_zone_refusal, unplaceable_zone_text, TransportRoute, VolumeRoute, ZoneTarget,
     CONTROL_ACTIONS, TRANSPORT_ACTIONS,
@@ -86,6 +86,20 @@ pub async fn handle_control(
     state: &AppState,
     args: HifiControlTool,
 ) -> Result<CallToolResult, CallToolError> {
+    // A direct HQPlayer zone is dispatched through its own function
+    // (`crate::knobs::routes::dispatch_hqplayer_action`, the same core the
+    // `/knob` HTTP surface uses) *before* the generic action gate below, not
+    // through [`TransportRoute`]/[`VolumeRoute`]. Its action vocabulary (stop,
+    // seek, mute), its decimal-dB volume, and its zone-state-dependent refusals
+    // (next/previous/play_pause resolved against the last published state) do
+    // not fit the generic 0-100/four-adapter grid those routes model — and that
+    // grid stays [`TransportRoute::Refused`]/[`VolumeRoute::Refused`] for
+    // HQPlayer on purpose, so it still reports the honest "not this path" for
+    // every other caller. #401/#406.
+    if ZoneTarget::classify(&args.zone_id) == ZoneTarget::HqPlayer {
+        return handle_hqplayer_control(state, args).await;
+    }
+
     // The action is checked first, and before the zone is classified. It is a
     // closed set with no I/O behind it, so this is the cheapest fault to name —
     // and naming it does not depend on the zone id being right.
@@ -220,6 +234,126 @@ pub async fn handle_control(
             }
         }
         Err(e) => env.failed(format!("Control error: {}", e)),
+    }
+}
+
+/// Direct HQPlayer transport, skip and volume, dispatched through
+/// [`crate::knobs::routes::dispatch_hqplayer_action`] rather than reimplemented
+/// here — the same capability checks, clamps and command core the `/knob`
+/// HTTP surface uses. #401 found that MCP had its own zone-id switch,
+/// independent of `knob_control_handler`, with the same "falls through to
+/// Roon" defect #391 fixed there; #406 closed it by routing here instead of
+/// widening [`TransportRoute`]/[`VolumeRoute`], whose vocabulary (0-100,
+/// integer, four fixed adapters) HQPlayer does not share.
+///
+/// Every action the dispatch core accepts is forwarded verbatim except
+/// `volume_set`, which is MCP's own spelling for an absolute write; the
+/// translation happens at this boundary rather than widening the shared
+/// core's vocabulary. An action the core does not recognise is refused by the
+/// core itself (`HqpDispatchError::BadRequest` with `code: "UNKNOWN_ACTION"`),
+/// not pre-filtered here — mirroring #406's own shape rather than duplicating
+/// its validation in a second list that could drift from the first.
+async fn handle_hqplayer_control(
+    state: &AppState,
+    args: HifiControlTool,
+) -> Result<CallToolResult, CallToolError> {
+    let instance = args.zone_id.trim_start_matches("hqplayer:");
+    let dispatch_action = match args.action.as_str() {
+        "volume_set" => "volume",
+        other => other,
+    };
+    let operation = match args.action.as_str() {
+        "volume_set" => "volume_absolute",
+        "volume_up" | "volume_down" => "volume_relative",
+        "playpause" => "play_pause",
+        "prev" => "previous",
+        other => other,
+    };
+
+    let env = Envelope::write("hifi_control", operation)
+        .param("zone_id", &*args.zone_id)
+        .param("action", &*args.action);
+    let env = env.param_opt("value", args.value);
+
+    match crate::knobs::routes::dispatch_hqplayer_action(
+        state,
+        &args.zone_id,
+        instance,
+        dispatch_action,
+        args.value,
+    )
+    .await
+    {
+        Ok(()) => {
+            // Read back from the aggregator, exactly like every other zone's
+            // write — but never called "Current state": the adapter's
+            // transport commands are fire-and-forget and the aggregator is
+            // refreshed only by the producer's status poll (2s by default), so
+            // this read is the poll from *before* the command, every time.
+            // Calling it current told an assistant its own pause had not taken
+            // effect. The gap cannot be closed here — a surface may not read
+            // the adapter for state (`docs/ARCHITECTURE.md`,
+            // `tests/architecture_lint.rs`) — so the claim is dropped rather
+            // than a fresher observation invented.
+            let observed = Observed::from_aggregator(state, &args.zone_id).await;
+            let scope = Scope {
+                provider: Provider::HqPlayer,
+                zone_id: Some(args.zone_id.clone()),
+                zone_name: observed.as_ref().map(|o| o.zone.zone_name.clone()),
+            };
+            let env = env.scope(scope);
+            match observed {
+                Some(observed) => {
+                    let json = serde_json::to_string_pretty(&observed.zone)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let text = format!(
+                        "Action '{}' executed.\n\nZone state as last observed *before* this \
+                         command (a direct HQPlayer zone refreshes on its poll interval; call \
+                         hifi_now_playing for the state after it):\n{}",
+                        args.action, json
+                    );
+                    Ok(env.observed(Some(observed)).text_result(text))
+                }
+                None => Ok(env.text_result(format!("Action '{}' executed.", args.action))),
+            }
+        }
+        Err(err) => {
+            let env = env.scope(Scope::for_zone(state, &args.zone_id, Provider::HqPlayer).await);
+            match err {
+                // The instance name, or the zone the aggregator currently
+                // publishes for it, does not exist right now — the client's
+                // remedy is to re-discover, not to resend the same id.
+                crate::knobs::routes::HqpDispatchError::NotFound(message) => env.refused(
+                    message.clone(),
+                    Refusal::UnknownTarget {
+                        parameter: "zone_id",
+                        discover_with: "hifi_zones",
+                        detail: message,
+                    },
+                ),
+                crate::knobs::routes::HqpDispatchError::BadRequest { message, code } => env
+                    .refused(
+                        message.clone(),
+                        Refusal::InvalidParameter {
+                            parameter: hqplayer_bad_request_parameter(code),
+                            accepted: vec![],
+                            detail: message,
+                        },
+                    ),
+                crate::knobs::routes::HqpDispatchError::Backend(message) => {
+                    env.failed(format!("Control error: {}", message))
+                }
+            }
+        }
+    }
+}
+
+/// Which `hifi_control` parameter a [`crate::knobs::routes::HqpDispatchError::BadRequest`]
+/// code is about, for the refusal's `parameter` field.
+fn hqplayer_bad_request_parameter(code: &'static str) -> &'static str {
+    match code {
+        "UNKNOWN_ACTION" | "ACTION_NOT_ALLOWED" | "STATE_UNKNOWN" => "action",
+        _ => "value",
     }
 }
 

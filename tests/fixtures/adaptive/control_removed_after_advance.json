@@ -1,0 +1,85 @@
+{
+  "schema_version": "1.0",
+  "producer": {
+    "producer_id": "hqplayer:living-room",
+    "producer_type": "hqplayer",
+    "epoch": 7
+  },
+  "target": {
+    "role": "dsp_engine",
+    "zone_id": "roon:1601bb42ed14351b99c2926214f6cbb80724"
+  },
+  "revisions": {
+    "control_plane": 13,
+    "state": 4301
+  },
+  "lanes": [
+    { "lane": "native", "state": "connected", "last_success": "2026-07-30T11:18:04Z" }
+  ],
+  "controls": [
+    {
+      "id": "hqplayer.pipeline.mode",
+      "kind": "enumeration",
+      "label_key": "control.pipeline.mode",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "pcm" },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4301 }
+        }
+      ],
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "live_immediate",
+        "disruption": "playback_interruption",
+        "risk": "disruptive",
+        "verification": { "verify_via": "hqplayer.pipeline.mode", "verify_lane": "observed" }
+      }
+    }
+  ],
+  "draft_policy": {
+    "mode": "shared",
+    "on_conflict": "expose_contributors",
+    "retention": {
+      "survives_reconnect": true,
+      "survives_producer_restart": false,
+      "on_epoch_change": "revalidate"
+    }
+  },
+  "change_sets": [
+    {
+      "id": "cs-web-8d40",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "human", "surface": "web", "actor_id": "session-44f1" },
+      "base": { "epoch": 7, "control_plane": 12, "state": 4193 },
+      "generation": 2,
+      "state": "draft",
+      "created_at": "2026-07-30T11:10:00Z",
+      "updated_at": "2026-07-30T11:12:30Z",
+      "entries": [
+        {
+          "control": "hqplayer.pipeline.sdm.shaper",
+          "lane": "staged",
+          "desired": { "type": "choice", "value": "ASDM7EC" },
+          "base_observed": { "type": "choice", "value": "ASDM5EC" },
+          "validity": {
+            "state": "draft_invalid",
+            "reason": {
+              "code": "control_removed",
+              "scope": "draft",
+              "display_text_key": "reason.control_no_longer_exists",
+              "detail": "control hqplayer.pipeline.sdm.shaper is no longer described by this producer document"
+            }
+          }
+        }
+      ],
+      "retention": {
+        "survives_reconnect": true,
+        "survives_producer_restart": false,
+        "on_epoch_change": "revalidate"
+      }
+    }
+  ]
+}

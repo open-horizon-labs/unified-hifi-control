@@ -24,3 +24,7 @@ dist/
 public/tailwind.css
 # Note: public/dx-components-theme.css is hand-authored, NOT generated
 .worktrees/
+
+# Regenerable local index cache for the .oh planning artifacts. The artifacts themselves are
+# tracked; this cache is not. Narrow on purpose - `.oh/` must stay tracked.
+.oh/.cache/

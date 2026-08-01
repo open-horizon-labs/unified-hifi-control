@@ -295,13 +295,15 @@ impl Gap {
 /// capability, it is a gap, and gaps carry evidence this function does not have.
 fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
     let supported = match capability {
-        Capability::Transport => matches!(
-            (target, target.for_transport()),
-            (ZoneTarget::Roon, TransportRoute::Roon)
-                | (ZoneTarget::Lms, TransportRoute::Lms)
-                | (ZoneTarget::OpenHome, TransportRoute::OpenHome)
-                | (ZoneTarget::Upnp, TransportRoute::Upnp)
-        ),
+        Capability::Transport => {
+            matches!(
+                (target, target.for_transport()),
+                (ZoneTarget::Roon, TransportRoute::Roon)
+                    | (ZoneTarget::Lms, TransportRoute::Lms)
+                    | (ZoneTarget::OpenHome, TransportRoute::OpenHome)
+                    | (ZoneTarget::Upnp, TransportRoute::Upnp)
+            ) || hqplayer_control_is_dispatched(target)
+        }
         // Same route as Transport, minus the adapters that refuse the two skip
         // actions. Read from the adapter's own const so the claim cannot drift
         // from the arm that enforces it.
@@ -315,15 +317,17 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
             );
             let adapter_refuses = target == ZoneTarget::Upnp
                 && crate::adapters::upnp::REFUSED_TRANSPORT_ACTIONS.contains(&"next");
-            routes_to_own_adapter && !adapter_refuses
+            (routes_to_own_adapter && !adapter_refuses) || hqplayer_control_is_dispatched(target)
         }
-        Capability::Volume => matches!(
-            (target, target.for_volume()),
-            (ZoneTarget::Roon, VolumeRoute::Roon)
-                | (ZoneTarget::Lms, VolumeRoute::Lms)
-                | (ZoneTarget::OpenHome, VolumeRoute::OpenHome)
-                | (ZoneTarget::Upnp, VolumeRoute::Upnp)
-        ),
+        Capability::Volume => {
+            matches!(
+                (target, target.for_volume()),
+                (ZoneTarget::Roon, VolumeRoute::Roon)
+                    | (ZoneTarget::Lms, VolumeRoute::Lms)
+                    | (ZoneTarget::OpenHome, VolumeRoute::OpenHome)
+                    | (ZoneTarget::Upnp, VolumeRoute::Upnp)
+            ) || hqplayer_control_is_dispatched(target)
+        }
         Capability::Search | Capability::PlayByQuery => matches!(
             (target, target.for_library()),
             (ZoneTarget::Roon, LibraryRoute::Roon) | (ZoneTarget::Lms, LibraryRoute::Lms)
@@ -332,6 +336,25 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
         _ => false,
     };
     supported.then_some(Support::Supported)
+}
+
+/// Whether a direct HQPlayer zone's transport/skip/volume reaches its own
+/// adapter — true since #401/#406, even though [`ZoneTarget::for_transport`]
+/// and [`ZoneTarget::for_volume`] still answer `Refused` for it.
+///
+/// That is not a contradiction: those two functions describe one specific grid
+/// — four adapters called generically through `state.<adapter>.control()` with
+/// a 0-100 (or OpenHome/UPnP integer) volume. HQPlayer's `hifi_control` arm
+/// (`crate::mcp::tools::transport::handle_hqplayer_control`) bypasses that grid
+/// entirely and calls `crate::knobs::routes::dispatch_hqplayer_action` — the
+/// same core the `/knob` HTTP surface uses — directly, because HQPlayer's
+/// action vocabulary (stop, seek, mute), decimal-dB volume and zone-state-aware
+/// refusals do not fit it. This function is therefore the one place that asks
+/// the *dispatch-exists* fact rather than the *route-grid* fact, and
+/// `tests/mcp_contract.rs::every_supported_capability_reaches_that_providers_own_adapter`
+/// proves the claim end to end rather than trusting it.
+fn hqplayer_control_is_dispatched(target: ZoneTarget) -> bool {
+    target == ZoneTarget::HqPlayer
 }
 
 // =============================================================================
@@ -407,12 +430,6 @@ const HQPLAYER_CONTENT_UNVERIFIED: &str = "UHC's HQPlayer adapter speaks transpo
     seek and pipeline settings; whether HQPlayer's control protocol reaches content operations \
     has not been verified here. Reported as not-yet-implemented rather than as a provider \
     limit, because an unverified 'never' is the more expensive error.";
-
-/// HQPlayer transport and volume: the adapter has the methods, MCP has no route.
-const HQPLAYER_ADAPTER_HAS_IT: &str = "HqpAdapter implements play, pause, stop, next, previous, \
-    seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes \
-    hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so \
-    hifi_control cannot reach them.";
 
 /// Every cell routing does not decide.
 ///
@@ -581,13 +598,11 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
          service definitions, not from a device.")),
 
     // -------------------------------------------------------------------------
-    // HQPlayer. Nothing is routed -- hifi_zones lists these zones and
-    // hifi_control cannot reach any of them. The largest gap #398 found, and the
-    // one it does not close.
+    // HQPlayer. Transport, transport_skip and volume are routed since #401/#406
+    // -- not through this grid, but through the dedicated dispatch
+    // `hqplayer_control_is_dispatched` asks about (see its doc comment).
+    // Everything else remains a gap: content operations are unverified (#209).
     // -------------------------------------------------------------------------
-    (ZoneTarget::HqPlayer, Capability::Transport, Gap::NotWired("#328", HQPLAYER_ADAPTER_HAS_IT)),
-    (ZoneTarget::HqPlayer, Capability::TransportSkip, Gap::NotWired("#328", HQPLAYER_ADAPTER_HAS_IT)),
-    (ZoneTarget::HqPlayer, Capability::Volume, Gap::NotWired("#328", HQPLAYER_ADAPTER_HAS_IT)),
     (ZoneTarget::HqPlayer, Capability::Search, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::PlayByQuery, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::PlayByRef, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
@@ -870,20 +885,39 @@ mod tests {
         }
     }
 
-    /// HQPlayer zones appear in `hifi_zones` and nothing is wired to them. The
-    /// honest state is a gap with a tracking issue — never a provider limit,
-    /// since the adapter has the methods.
+    /// HQPlayer zones appear in `hifi_zones`, and since #401/#406 `hifi_control`
+    /// reaches them through the dedicated dispatch path — so transport,
+    /// transport_skip and volume are `Supported`, not a gap.
     #[test]
-    fn hqplayer_transport_and_volume_are_gaps_tracked_by_328() {
+    fn hqplayer_transport_skip_and_volume_are_supported() {
         for capability in [
             Capability::Transport,
             Capability::TransportSkip,
             Capability::Volume,
         ] {
+            assert_eq!(
+                support(ZoneTarget::HqPlayer, capability),
+                Support::Supported,
+                "hqplayer/{}: #401/#406 wired hifi_control to the dedicated HQPlayer dispatch",
+                capability.name()
+            );
+        }
+    }
+
+    /// Content operations remain an honest gap with a tracking issue — never a
+    /// provider limit, since the adapter's own reach here is unverified rather
+    /// than demonstrably absent.
+    #[test]
+    fn hqplayer_content_operations_are_gaps_tracked_by_209() {
+        for capability in [
+            Capability::Search,
+            Capability::PlayByQuery,
+            Capability::Browse,
+        ] {
             match support(ZoneTarget::HqPlayer, capability) {
-                Support::NotImplemented { tracked_by, .. } => assert_eq!(tracked_by, "#328"),
+                Support::NotImplemented { tracked_by, .. } => assert_eq!(tracked_by, "#209"),
                 other => panic!(
-                    "hqplayer/{}: expected a gap tracked by #328, got {other:?}",
+                    "hqplayer/{}: expected a gap tracked by #209, got {other:?}",
                     capability.name()
                 ),
             }
@@ -944,9 +978,9 @@ mod tests {
     /// differently is the defect this module exists to remove.
     #[test]
     fn refusals_carry_the_same_classification_as_the_report() {
-        let gap = support(ZoneTarget::HqPlayer, Capability::Transport);
-        match gap.refusal(Capability::Transport, vec![]) {
-            Some(Refusal::NotImplemented { tracked_by, .. }) => assert_eq!(tracked_by, "#328"),
+        let gap = support(ZoneTarget::HqPlayer, Capability::Search);
+        match gap.refusal(Capability::Search, vec![]) {
+            Some(Refusal::NotImplemented { tracked_by, .. }) => assert_eq!(tracked_by, "#209"),
             other => panic!("expected a not_implemented refusal, got {other:?}"),
         }
 

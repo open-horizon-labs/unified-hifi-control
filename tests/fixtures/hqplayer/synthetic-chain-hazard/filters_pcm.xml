@@ -1,0 +1,21 @@
+<!--
+  provenance:
+    source: SYNTHETIC. Authored for issue #322 to construct one hazard shape. Not observed on any daemon and not derived from any capture.
+    daemon: none - synthetic test profile, no daemon was involved
+    status: synthetic
+    date: 2026-07-30
+    playback: not-applicable
+    tier: never-promotable
+    notes: Synthetic PCM chain for the cross-chain stale-index hazard. NOT EVIDENCE. Every filter name here is deliberately fictional (SYN-* ) so that no row can be mistaken for an Opal observation, copied into the evidence corpus, or promoted by any tier. This profile exists ONLY to construct the shape where a stale index from one chain is IN RANGE in the other and names a DIFFERENT filter, because an out-of-range index would draw result="Error" and a loud rejection is safe while a quiet wrong answer is not. The profile carries only these two documents; the model falls back to the verified Opal profile for everything else, so nothing else is claimed here either.
+-->
+<GetFilters>
+<FiltersItem index="0" name="SYN-pcm-0" value="500" arg="0"/>
+<FiltersItem index="1" name="SYN-pcm-1" value="501" arg="0"/>
+<FiltersItem index="2" name="SYN-pcm-2" value="502" arg="0"/>
+<FiltersItem index="3" name="SYN-pcm-3" value="503" arg="0"/>
+<FiltersItem index="4" name="SYN-pcm-4" value="504" arg="0"/>
+<FiltersItem index="5" name="SYN-pcm-5" value="505" arg="0"/>
+<FiltersItem index="6" name="SYN-pcm-6" value="506" arg="0"/>
+<FiltersItem index="7" name="SYN-pcm-7" value="507" arg="0"/>
+<FiltersItem index="8" name="SYN-pcm-8" value="508" arg="0"/>
+</GetFilters>

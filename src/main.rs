@@ -7,11 +7,8 @@
 mod server {
     use unified_hifi_control::{
         adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
-        mdns,
+        mdns, producers,
     };
-
-    // Import Startable trait for adapter lifecycle methods
-    use adapters::Startable;
 
     // Import load_app_settings for checking adapter enabled state
     use api::load_app_settings;
@@ -217,8 +214,30 @@ mod server {
             knob_store.clone(),
         ));
 
+        // The adaptive handle must exist before a producing adapter is constructed, but its actor
+        // must not run until the public socket is bound below. This preserves bind-before-startup
+        // while allowing HQPlayer's manager to own the handle for its whole lifecycle.
+        let producer_shutdown_token = CancellationToken::new();
+        let (adaptive_handle, producer_actor, adaptive_view) =
+            producers::AdaptiveRuntime::build(producer_shutdown_token.clone(), 1024);
+        let hqp_adaptive_publisher = Arc::new(producers::hqplayer::HqpAdaptivePublisher::new(
+            adaptive_handle,
+        ));
+
         // HQPlayer instance manager (multi-instance support, no settings toggle)
-        let hqp_instances = Arc::new(adapters::hqplayer::HqpInstanceManager::new(bus.clone()));
+        let hqp_instances = Arc::new(
+            adapters::hqplayer::HqpInstanceManager::new_with_native_sink(
+                bus.clone(),
+                hqp_adaptive_publisher.clone(),
+            ),
+        );
+        let (hqp_command_handle, hqp_command_actor) =
+            producers::hqplayer_command_service::HqpImmediateCommandActor::build(
+                adaptive_view,
+                hqp_adaptive_publisher,
+                hqp_instances.clone(),
+                32,
+            );
         hqp_instances.load_from_config().await;
         let instance_count = hqp_instances.instance_count().await;
         if instance_count > 0 {
@@ -249,17 +268,6 @@ mod server {
             let status = hqplayer.get_status().await;
             if let Some(host) = status.host {
                 tracing::info!("HQPlayer default instance: {}:{}", host, status.port);
-            }
-        }
-
-        // Auto-connect HQPlayer if configured (establishes TCP connection at startup)
-        if hqplayer.is_configured().await {
-            match hqplayer.get_pipeline_status().await {
-                Ok(_) => tracing::info!("HQPlayer auto-connected at startup"),
-                Err(e) => tracing::warn!(
-                    "HQPlayer auto-connect failed (will retry on page access): {}",
-                    e
-                ),
             }
         }
 
@@ -296,38 +304,60 @@ mod server {
         // Start enabled adapters (single codepath using coordinator)
         // =========================================================================
 
+        // Subscribe the authoritative aggregator before any producer can publish its initial
+        // discovery snapshot. The bus is broadcast-only and does not replay messages to subscribers
+        // created after adapter startup.
+        let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
+        let (aggregator_ready_tx, aggregator_ready_rx) = tokio::sync::oneshot::channel();
+        let aggregator_for_spawn = zone_aggregator.clone();
+        tokio::spawn(async move {
+            aggregator_for_spawn
+                .run_with_ready(aggregator_ready_tx)
+                .await;
+        });
+        aggregator_ready_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("ZoneAggregator stopped before subscribing to the bus"))?;
+        tracing::info!("ZoneAggregator started");
+
         // Build list of startable adapters
         // Note: lms_cli shares config with lms - both start when LMS is configured
         let startable_adapters: Vec<Arc<dyn adapters::Startable>> = vec![
             roon.clone(),
+            hqp_instances.clone(),
             lms.clone(),
             lms_cli.clone(),
             openhome.clone(),
             upnp.clone(),
         ];
 
+        // Fail before starting adapters or the adaptive actor if the public socket cannot be
+        // acquired. After this point every fallible server exit goes through explicit teardown.
+        let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+
+        // SSE closes as soon as graceful HTTP shutdown begins. Adaptive ingress remains open
+        // until producing adapters have stopped, then drains under its own non-lossy token.
+        let shutdown_token = CancellationToken::new();
+
+        // Construct the bounded command actor before any producer can publish. The handle is
+        // retained for the process lifetime and will be handed to producing adapters by #325;
+        // the read-only view is consumed by #326. No adaptive payload enters the public
+        // BusEvent/SSE contract.
+        let producer_actor_task = tokio::spawn(async move {
+            producer_actor.run().await;
+        });
+        let hqp_command_actor_task = tokio::spawn(hqp_command_actor.run());
+        tracing::info!("ProducerActor started");
+
         // Single loop to start all enabled adapters
         coord.start_all_enabled(&startable_adapters).await;
-
-        // Initialize ZoneAggregator for unified zone state
-        let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
-        let aggregator_for_spawn = zone_aggregator.clone();
-        tokio::spawn(async move {
-            aggregator_for_spawn.run().await;
-        });
-        tracing::info!("ZoneAggregator started");
-
-        // Clone Roon adapter for shutdown access (cheap - just Arc clones)
-        let roon_for_shutdown = roon.clone();
-
-        // Create shutdown token for graceful SSE termination (fixes #73)
-        let shutdown_token = CancellationToken::new();
 
         // Build application state (clone Arcs so we can access adapters for shutdown)
         let state = api::AppState::new(
             roon,
             hqplayer,
-            hqp_instances,
+            hqp_instances.clone(),
             hqp_zone_links,
             lms.clone(),
             openhome.clone(),
@@ -557,7 +587,6 @@ mod server {
         };
 
         // Start server with graceful shutdown
-        let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
         tracing::info!("Listening on http://{}", addr);
 
         // Advertise via mDNS for knob discovery
@@ -593,8 +622,6 @@ mod server {
             None
         };
 
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-
         // Create shutdown future that cancels token before graceful shutdown (fixes #73)
         let graceful_shutdown = {
             let token = shutdown_token.clone();
@@ -616,15 +643,29 @@ mod server {
             }
         };
 
-        axum::serve(
+        let server_result = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(graceful_shutdown)
-        .await?;
+        .await;
+
+        // Graceful signal handling already cancels this token. Cancel again unconditionally so
+        // an Axum error closes SSE streams too.
+        shutdown_token.cancel();
 
         // Cleanup: publish ShuttingDown event and stop adapters
         tracing::info!("Shutting down adapters...");
+
+        // Close immediate-command ingress and drain accepted work before broadcasting shutdown.
+        // Some adapters react to that broadcast independently of the coordinator, so publishing it
+        // first would let native lifecycle teardown race an already-admitted command.
+        if let Err(error) = hqp_command_handle.shutdown().await {
+            tracing::warn!(?error, "HQPlayer command actor did not drain cleanly");
+        }
+        if let Err(error) = hqp_command_actor_task.await {
+            tracing::warn!(%error, "HQPlayer command actor exited with a join error");
+        }
 
         // Publish ShuttingDown event for any bus listeners
         bus.publish(bus::BusEvent::ShuttingDown {
@@ -634,16 +675,26 @@ mod server {
         // Give listeners a moment to react to ShuttingDown
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Stop adapters
-        roon_for_shutdown.stop().await;
+        // Stop every coordinator-owned Startable and wait for its children. Individual stop methods
+        // are idempotent, so adapters that already reacted to ShuttingDown remain safe here.
+        coord
+            .stop_all(state_for_shutdown.startable_adapters.as_ref())
+            .await;
         if let Some(ref fw) = firmware_service {
             fw.stop();
         }
-        lms.stop().await;
-        openhome.stop().await;
-        upnp.stop().await;
+
+        // No producer remains after adapters stop. Close ingress, drain every command already
+        // accepted by the bounded actor, and join it. Public-bus listeners are independently
+        // responsible for their own shutdown; no arbitrary sleep can prove they observed a
+        // broadcast.
+        producer_shutdown_token.cancel();
+        if let Err(error) = producer_actor_task.await {
+            tracing::warn!(%error, "ProducerActor exited with a join error");
+        }
         tracing::info!("Shutdown complete");
 
+        server_result?;
         Ok(())
     }
 
