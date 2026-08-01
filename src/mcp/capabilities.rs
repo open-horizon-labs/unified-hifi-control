@@ -378,6 +378,28 @@ const ROON_QUEUE_IS_READ_PLUS_JUMP: &str = "The Roon API's transport service exp
     pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing \
     further.";
 
+/// Playing a *named* item is a different question from *finding* one, and the ship
+/// gate's dissent caught this module conflating them.
+///
+/// Both renderer protocols can be told to play a specific thing: UPnP's
+/// `AVTransport:1` has `SetAVTransportURI` and `SetNextAVTransportURI`, OpenHome's
+/// `Playlist:1` has `Insert(AfterId, Uri, Metadata)`. What is missing is UHC's
+/// ability to *name* one — there is no library to resolve a reference against. That
+/// is a UHC gap, so the state is `not_implemented`, even though the practical
+/// answer today is still "you cannot do this".
+///
+/// The distinction matters because a `⛔` here would tell a client the operation is
+/// impossible forever, when in fact #396 plus a media-server integration would make
+/// it work. `search`, `browse` and `play_by_query` keep their `⛔`, because no action
+/// in either service set resolves free text at all.
+const PLAY_A_NAMED_URI_EXISTS: &str =
+    "the protocol can play a specific item -- UPnP AVTransport:1 \
+    takes SetAVTransportURI and SetNextAVTransportURI, OpenHome Playlist:1 takes \
+    Insert(AfterId, Uri, Metadata) -- so what is missing is UHC's ability to name one, not the \
+    device's ability to play it. Reported as a UHC gap rather than a provider limit, because a \
+    reference minted against a media server would work. Verified from the UPnP AV and OpenHome \
+    service definitions, not from a device.";
+
 /// HQPlayer content operations: UHC's XML control protocol coverage does not
 /// include them and the protocol's own reach has not been verified here. Reported
 /// as a gap rather than a limit, per this module's bias rule.
@@ -493,7 +515,7 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     // -------------------------------------------------------------------------
     (ZoneTarget::OpenHome, Capability::Search, Gap::ProviderCannot(OPENHOME_RENDERER_HAS_NO_LIBRARY)),
     (ZoneTarget::OpenHome, Capability::PlayByQuery, Gap::ProviderCannot(OPENHOME_RENDERER_HAS_NO_LIBRARY)),
-    (ZoneTarget::OpenHome, Capability::PlayByRef, Gap::ProviderCannot(OPENHOME_RENDERER_HAS_NO_LIBRARY)),
+    (ZoneTarget::OpenHome, Capability::PlayByRef, Gap::NotWired("#396", PLAY_A_NAMED_URI_EXISTS)),
     (ZoneTarget::OpenHome, Capability::Browse, Gap::ProviderCannot(OPENHOME_RENDERER_HAS_NO_LIBRARY)),
     (ZoneTarget::OpenHome, Capability::QueueRead, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
     (ZoneTarget::OpenHome, Capability::QueueJump, Gap::NotWired("#392", OPENHOME_PLAYLIST_SERVICE_UNUSED)),
@@ -531,18 +553,14 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
          reject the call, but that is the device's answer to give, not UHC's to assume.")),
     (ZoneTarget::Upnp, Capability::Search, Gap::ProviderCannot(UPNP_RENDERER_HAS_NO_LIBRARY)),
     (ZoneTarget::Upnp, Capability::PlayByQuery, Gap::ProviderCannot(UPNP_RENDERER_HAS_NO_LIBRARY)),
-    (ZoneTarget::Upnp, Capability::PlayByRef, Gap::ProviderCannot(UPNP_RENDERER_HAS_NO_LIBRARY)),
+    (ZoneTarget::Upnp, Capability::PlayByRef, Gap::NotWired("#396", PLAY_A_NAMED_URI_EXISTS)),
     (ZoneTarget::Upnp, Capability::Browse, Gap::ProviderCannot(UPNP_RENDERER_HAS_NO_LIBRARY)),
     (ZoneTarget::Upnp, Capability::QueueRead, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
     (ZoneTarget::Upnp, Capability::QueueJump, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
     (ZoneTarget::Upnp, Capability::QueueReorder, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
     (ZoneTarget::Upnp, Capability::QueueRemove, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
     (ZoneTarget::Upnp, Capability::QueueClear, Gap::ProviderCannot(UPNP_HAS_NO_QUEUE)),
-    (ZoneTarget::Upnp, Capability::PlayNext, Gap::ProviderCannot(
-        "AVTransport:1's SetNextAVTransportURI does queue one following item, so the action \
-         exists -- but it takes a URI, and a renderer-only integration has no library to \
-         resolve one from (see search). Both facts are stated so the reader can weigh them. \
-         Verified from the UPnP AV service definitions, not from a device.")),
+    (ZoneTarget::Upnp, Capability::PlayNext, Gap::NotWired("#396", PLAY_A_NAMED_URI_EXISTS)),
     (ZoneTarget::Upnp, Capability::RepeatMode, Gap::NotWired("#392",
         "AVTransport:1's SetPlayMode takes REPEAT_ONE and REPEAT_ALL, so repeat is a protocol \
          feature UHC does not use. Verified from the UPnP AV service definitions, not from a \
