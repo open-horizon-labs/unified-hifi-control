@@ -62,7 +62,7 @@ adapter.
 |---|---|
 | Handshake | `registry:1/info` at request id 0, then `register`; `CoreEvent::Registered`; Browse becomes available |
 | Zones | a `Subscribed` payload survives the fork's deserializer and reaches `get_zones()` — a missing required field would otherwise be swallowed silently |
-| Search | full six-request sequence, one `search_{nanos}` session key throughout, query carried as `input`, source selection (Library / TIDAL / Qobuz), empty result sets, `hierarchy=browse` on every request |
+| Search | full six-request sequence, one `search_{nanos}` session key throughout, query carried as `input`, source selection (Library / TIDAL / Qobuz), empty result sets, `hierarchy=browse` on every request. **Flat results only** — see the category-grouping entry below — and against a hierarchy taken from the adapter's own expectations, so this cannot detect the adapter expecting the wrong hierarchy |
 | **title / subtitle mapping** | asymmetric values at three layers: adapter return value, `GET /roon/search`, `POST /roon/browse`. This is the hole #408 exists to close |
 | Browse | two levels down and `pop_all` back to the root; per-session level stacks proven independent; `input_prompt` advertised; unkeyed rows |
 | Load | offset/count paging, short final page, total count vs page size, past-the-end returns empty |
@@ -77,13 +77,19 @@ adapter.
   came from the pinned fork's deserializers and from this repo's own adapter, so
   green means *unchanged*, not *correct*. Both were derived from the same source of
   truth, and that source has never been checked against Roon.
-* **Category-grouped search results.** A real Core returns search hits grouped
-  under `Albums` / `Tracks` / `Artists` rows. The default library returns hits
-  flat, so `is_category`, `try_category_playable` and the second half of
-  `try_navigate_to_playable` (`src/adapters/roon.rs`) are **untested**. A test
-  can build a grouped library itself — `FakeLibrary`'s fields and the `FakeItem`
+* **Category-grouped search results — probably the most-travelled real path.** A
+  real Core returns search hits grouped under `Albums` / `Tracks` / `Artists` rows;
+  `is_category` and `try_category_playable` exist in `src/adapters/roon.rs` because
+  someone saw that. The default library returns hits flat, so those two and the
+  second half of `try_navigate_to_playable` are **untested**, which means the
+  branch a real search most likely takes is the one with no coverage. A test can
+  build a grouped library itself — `FakeLibrary`'s fields and the `FakeItem`
   builders are public — but nobody has verified what the real grouping looks like,
-  so the fake does not ship a guess.
+  so the fake ships no guess.
+* **The hierarchy itself.** `Library` / `TIDAL` / `Qobuz` → `Search` → results is
+  taken from what `src/adapters/roon.rs` requires, so a fake built from it can never
+  disagree with the adapter about navigation. If Roon renamed `Search`, `search()`
+  would break in production and this suite would stay green.
 * **Transport control.** `play` / `pause` / `next` / volume / mute go through
   `com.roonlabs.transport:2/control` and `change_volume`; the fake does not model
   them. It answers `InvalidRequest` and records the call as unhandled — those
@@ -203,6 +209,21 @@ needs a change to the pinned fork.
 
 When that assertion starts failing, the bug is fixed: invert it to compare each
 trial against `expected`.
+
+### Two scheduled edits — do these, do not skip them
+
+1. **When #405 (PR #412) is on `v3`:** tighten `classify_rejection` so
+   `RejectionOutcome::DroppedByAdapter` is a hard failure, and replace the string
+   checks with `RoonBrowseError::from_error(&e)` asserting
+   `kind == RoonBrowseErrorKind::InvalidItemKey` and the session key. As written the
+   helper accepts both outcomes, which means it cannot catch a regression *back* to
+   dropping the error — the exact bug #405 fixed.
+2. **`concurrent_browses_in_one_session_cross_deliver_their_results` will rot.** It
+   asserts a defect is present, so it turns red when the defect is fixed, and the
+   person who sees that red will not know it is good news. The instruction is at the
+   assertion site: invert it, compare each trial against `expected`. It is also the
+   only probabilistic assertion in this repo's suite (eight trials, roughly 1 in
+   10^7 for a false failure).
 
 ### Adding to the fake
 
