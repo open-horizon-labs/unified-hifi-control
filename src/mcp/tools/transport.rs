@@ -76,7 +76,7 @@ pub struct HifiControlTool {
     pub zone_id: String,
     /// Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down
     pub action: String,
-    /// For volume actions: the level (0-100 for volume_set) or amount to change
+    /// For volume actions: 0-100 for normalized providers, or decimal dB for HQPlayer zones; relative amounts use the provider's corresponding scale.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
 }
@@ -133,10 +133,10 @@ pub async fn handle_control(
                     .await,
                 )
                 .refused(
-                    "volume_set requires a value (0-100)",
+                    "volume_set requires a value (0-100, or dB for HQPlayer)",
                     Refusal::invalid_parameter(
                         "value",
-                        &["0-100"],
+                        &["0-100", "HQPlayer dB"],
                         "action='volume_set' sets an absolute level and has no default. \
                          Use volume_up or volume_down for a relative change.",
                     ),

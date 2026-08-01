@@ -3702,6 +3702,37 @@ impl FakeConfigWeb {
     fn stop(self) {
         self.handle.abort();
     }
+
+    /// Behave like an HQPlayer daemon whose authenticated operational pages are unavailable and
+    /// redirect every request to the About page. Following this redirect and parsing the resulting
+    /// HTML as a successful empty profile list is a false observation, not graceful degradation.
+    async fn start_about_redirect() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirecting fake config web");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut head = [0u8; 4096];
+                    let size = sock.read(&mut head).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&head[..size]);
+                    let about = request
+                        .lines()
+                        .next()
+                        .is_some_and(|line| line.split_whitespace().nth(1) == Some("/about"));
+                    let response: &[u8] = if about {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 40\r\nConnection: close\r\n\r\n<html><body><h1>About</h1></body></html>"
+                    } else {
+                        b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /about\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = sock.write_all(response).await;
+                });
+            }
+        });
+        Self { port, handle }
+    }
 }
 
 /// The two pages name different profiles. Whichever set lands in the capture names its source.
@@ -3718,6 +3749,36 @@ const PROFILE_PAGE_SEMANTIC_LANE: &str = r#"<html><body><form>
       <option value="semantic-z">Semantic Lane Z</option>
     </select>
 </form></body></html>"#;
+
+#[tokio::test]
+async fn an_about_redirect_is_not_reported_as_an_empty_profile_or_config_page() {
+    let web = FakeConfigWeb::start_about_redirect().await;
+    let h = Harness::start(VERIFIED_PROFILE, WirePolicy::default(), fast_timeouts()).await;
+    h.adapter.connect().await.expect("connect to fake daemon");
+    configure_without_persisting(
+        &h.adapter,
+        "127.0.0.1",
+        h.server.port(),
+        web.port,
+        "conformance",
+        "conformance",
+    )
+    .await;
+
+    let profiles = h.adapter.fetch_profiles().await;
+    let config = h.adapter.fetch_config_page_raw().await;
+    assert!(
+        profiles.is_err(),
+        "an operational-page redirect must be unavailable, not a successful empty profile list"
+    );
+    assert!(
+        config.is_err(),
+        "an operational-page redirect must be unavailable, not an About page accepted as /config"
+    );
+
+    h.stop();
+    web.stop();
+}
 
 /// Codex finding 7: evidence must be read off the raw lane, not reconstructed after semantic parsing.
 /// `config_profiles` was assigned from the `/config` projection and then unconditionally overwritten

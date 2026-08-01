@@ -701,6 +701,23 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// buffer.
 const RESPONSE_READ_CHUNK: usize = 8 * 1024;
 
+/// Remove the ASCII whitespace HQPlayer writes between native XML documents.
+///
+/// The newline terminates delivery but does not belong to either document. Keeping it in the
+/// connection carry is harmless to XML parsing, but makes the next reply look as though unexplained
+/// bytes preceded it and produces a warning on every healthy command against the real daemon.
+/// Only leading ASCII whitespace is removed: a partial XML follower (including a split UTF-8 code
+/// point) remains byte-for-byte intact.
+fn discard_native_delimiter(buf: &mut Vec<u8>) {
+    let delimiter_len = buf
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    if delimiter_len > 0 {
+        buf.drain(..delimiter_len);
+    }
+}
+
 /// HQPlayer state information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HqpState {
@@ -2207,6 +2224,12 @@ impl HqpAdapter {
         #[allow(clippy::expect_used)] // HTTP client creation only fails if TLS setup fails
         let http_client = Client::builder()
             .timeout(Duration::from_secs(3))
+            // HQPlayer redirects every operational page to `/about` when the daemon is not ready
+            // to serve it (for example while its license/configuration lane is unavailable). A
+            // followed redirect is a final 200 About page, which profile parsing used to report as
+            // a successful empty list. Keep redirects observable so every fixed operational path
+            // fails truthfully instead of accepting a different resource's body.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to create HTTP client");
         let adapter = Self {
@@ -4159,6 +4182,7 @@ impl HqpAdapter {
         // across reads keeps its prefix and completes here instead of being orphaned. The cap below
         // counts these bytes because they are already in `raw`.
         let mut raw: Vec<u8> = std::mem::take(&mut conn.carry);
+        discard_native_delimiter(&mut raw);
         let mut chunk = [0u8; RESPONSE_READ_CHUNK];
         let mut complete = false;
         let mut skipped = 0u32;
@@ -4323,6 +4347,7 @@ impl HqpAdapter {
                                 cursor += next;
                             }
                             conn.carry = raw[cursor..].to_vec();
+                            discard_native_delimiter(&mut conn.carry);
                             // Bytes before the document belong to nothing: not a document, so not
                             // countable as a skipped one. With followers now preserved rather than
                             // orphaned this should be unreachable, which is exactly why it is worth
@@ -8917,6 +8942,17 @@ mod wire_framing_tests {
             HqpAdapter::build_request("GetInfo", &[]),
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><GetInfo/>"
         );
+    }
+
+    #[test]
+    fn native_delimiters_are_discarded_without_touching_a_partial_follower() {
+        let mut carry = b"\r\n\t<Status state=\"2\"".to_vec();
+        discard_native_delimiter(&mut carry);
+        assert_eq!(carry, b"<Status state=\"2\"");
+
+        let mut split_utf8 = vec![0xe2];
+        discard_native_delimiter(&mut split_utf8);
+        assert_eq!(split_utf8, vec![0xe2]);
     }
 }
 

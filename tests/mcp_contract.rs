@@ -1383,7 +1383,7 @@ async fn hifi_control_volume_argument_handling_is_pinned() {
         .await,
     );
     assert_eq!(
-        text, "Error: volume_set requires a value (0-100)",
+        text, "Error: volume_set requires a value (0-100, or dB for HQPlayer)",
         "volume_set without a value must be refused with its documented range"
     );
 
@@ -2742,6 +2742,13 @@ const TEXT_ADDITIONS: &[(&str, &str)] = &[
 ///
 /// `(fixture key, the string #395 froze, the string #398 replaces it with)`
 const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
+    // #328 makes HQPlayer a normal transport/volume provider, but its native
+    // volume unit is dB rather than the normalized 0-100 scale.
+    (
+        "hifi_control/volume_set_without_value",
+        "Error: volume_set requires a value (0-100)",
+        "Error: volume_set requires a value (0-100, or dB for HQPlayer)",
+    ),
     // #398 wires the MCP volume path to the OpenHome and UPnP adapters, which
     // implement vol_abs/vol_rel and have been reachable over HTTP all along. The
     // old string claimed a provider limitation that does not exist.
