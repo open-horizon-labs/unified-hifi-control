@@ -20,7 +20,7 @@
 
 use crate::api::AppState;
 use crate::mcp::envelope::{Envelope, Refusal, Scope};
-use crate::mcp::types::{now_playing_from_zone, McpZone};
+use crate::mcp::types::{now_playing_from_zone, McpNowPlaying, McpZone};
 use rust_mcp_sdk::{
     macros::{mcp_tool, JsonSchema},
     schema::{schema_utils::CallToolError, CallToolResult},
@@ -48,9 +48,20 @@ pub struct HifiNowPlayingTool {
     pub zone_id: String,
 }
 
-pub async fn handle_zones(state: &AppState) -> Result<CallToolResult, CallToolError> {
-    let zones = state.aggregator.get_zones().await;
-    let mcp_zones: Vec<McpZone> = zones
+/// The `hifi_zones` / `hifi://zones` resource payload, read straight from the
+/// aggregator.
+///
+/// Shared by the tool and by [`crate::mcp::resources`] so the two can never
+/// disagree — there is exactly one place that turns aggregator [`Zone`]s into
+/// [`McpZone`]s. `tests/mcp_contract.rs::zones_resource_agrees_with_hifi_zones_tool`
+/// asserts the two paths still produce the same JSON value.
+///
+/// [`Zone`]: crate::bus::Zone
+pub async fn zones_payload(state: &AppState) -> Vec<McpZone> {
+    state
+        .aggregator
+        .get_zones()
+        .await
         .into_iter()
         .map(|z| McpZone {
             zone_id: z.zone_id,
@@ -59,7 +70,30 @@ pub async fn handle_zones(state: &AppState) -> Result<CallToolResult, CallToolEr
             volume: z.volume_control.as_ref().map(|v| v.value as f64),
             is_muted: z.volume_control.as_ref().map(|v| v.is_muted),
         })
-        .collect();
+        .collect()
+}
+
+/// The `hifi_now_playing` / `hifi://zones/{zone_id}` resource payload for one
+/// zone, or `None` when the aggregator holds no such zone.
+///
+/// Used by [`crate::mcp::resources`] for the per-zone resource reader, so a
+/// stale or never-existed zone id produces a proper "not found" there rather
+/// than a panic or an empty success. `handle_now_playing` below reads the same
+/// aggregator through the same [`now_playing_from_zone`] transform, so the two
+/// cannot disagree about what a zone's state is — only about whether a missing
+/// zone is reported as a resource-not-found or as an `hifi_now_playing` refusal,
+/// which is deliberate: a resource URI and a tool's `zone_id` parameter warrant
+/// different error shapes for the same underlying fact.
+pub async fn now_playing_payload(state: &AppState, zone_id: &str) -> Option<McpNowPlaying> {
+    state
+        .aggregator
+        .get_zone(zone_id)
+        .await
+        .map(now_playing_from_zone)
+}
+
+pub async fn handle_zones(state: &AppState) -> Result<CallToolResult, CallToolError> {
+    let mcp_zones = zones_payload(state).await;
 
     // No scope: this tool spans every provider, so naming one would be a lie.
     Ok(Envelope::read("hifi_zones", "list_zones").json_result(&mcp_zones))

@@ -26,11 +26,14 @@ pub struct HifiStatusTool {}
 ///
 /// `tests/mcp_contract.rs::hifi_status_shape_is_pinned` asserts the ordering, so
 /// the mistake is caught — but it is cheaper to not make it.
-pub async fn handle_status(state: &AppState) -> Result<CallToolResult, CallToolError> {
+/// Shared by [`handle_status`] and the `hifi://status` resource
+/// ([`crate::mcp::resources`]), so the tool and the resource read exactly the
+/// same adapter accessors and cannot disagree.
+pub async fn status_payload(state: &AppState) -> serde_json::Value {
     let roon_status = state.roon.get_status().await;
     let hqp_status = state.hqplayer.get_status().await;
 
-    let status = serde_json::json!({
+    serde_json::json!({
         "roon": {
             "connected": roon_status.connected,
             "core_name": roon_status.core_name,
@@ -39,9 +42,12 @@ pub async fn handle_status(state: &AppState) -> Result<CallToolResult, CallToolE
             "connected": hqp_status.connected,
             "host": hqp_status.host,
         }
-    });
+    })
+}
+
+pub async fn handle_status(state: &AppState) -> Result<CallToolResult, CallToolError> {
     // No scope: this tool reports on the bridge, spanning every provider. The
     // `json!` value is already a map, so `data` and the text agree exactly here —
     // the declaration-order/BTreeMap divergence only applies to struct payloads.
-    Ok(Envelope::read("hifi_status", "get_status").json_result(&status))
+    Ok(Envelope::read("hifi_status", "get_status").json_result(&status_payload(state).await))
 }

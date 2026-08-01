@@ -1,8 +1,8 @@
-//! The MCP `ServerHandler`: advertise tools, and dispatch calls to them.
+//! The MCP `ServerHandler`: advertise tools, dispatch calls to them, and (#397)
+//! advertise and serve resources.
 //!
-//! Dispatch only. Every arm delegates to a handler in
-//! [`crate::mcp::tools`]; no tool behavior lives here. #397 extends this impl
-//! with the resource methods.
+//! Dispatch only. Every arm delegates to a handler in [`crate::mcp::tools`] or
+//! [`crate::mcp::resources`]; no tool or resource behavior lives here.
 
 use crate::api::{load_app_settings, AppState};
 use crate::mcp::envelope::{Envelope, Refusal};
@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use rust_mcp_sdk::{
     mcp_server::ServerHandler,
     schema::{
-        schema_utils::CallToolError, CallToolRequestParams, CallToolResult, ListToolsResult,
-        PaginatedRequestParams, RpcError,
+        schema_utils::CallToolError, CallToolRequestParams, CallToolResult,
+        ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResult, RpcError,
     },
     McpServer,
 };
@@ -31,6 +32,19 @@ impl HifiMcpHandler {
 
 #[async_trait]
 impl ServerHandler for HifiMcpHandler {
+    /// Fires once per session, when the client sends `notifications/initialized`
+    /// — the SDK hands us that session's own `runtime` here, which is the only
+    /// place a per-session background notifier can be started. See
+    /// [`crate::mcp::resources::spawn_list_changed_notifier`] for what this
+    /// notifier does and does not promise.
+    async fn on_initialized(&self, runtime: Arc<dyn McpServer>) {
+        crate::mcp::resources::spawn_list_changed_notifier(
+            self.state.bus.clone(),
+            runtime,
+            self.state.shutdown.clone(),
+        );
+    }
+
     async fn handle_list_tools_request(
         &self,
         _params: Option<PaginatedRequestParams>,
@@ -103,6 +117,52 @@ impl ServerHandler for HifiMcpHandler {
                 tools::capabilities::handle_capabilities(state, args).await
             }
         }
+    }
+
+    /// Same settings-based gate as `handle_list_tools_request`: the HQPlayer
+    /// resources are hidden when the adapter is disabled, exactly like the
+    /// HQPlayer tools.
+    async fn handle_list_resources_request(
+        &self,
+        _params: Option<PaginatedRequestParams>,
+        _runtime: Arc<dyn McpServer>,
+    ) -> Result<ListResourcesResult, RpcError> {
+        let settings = load_app_settings();
+        Ok(ListResourcesResult {
+            meta: None,
+            next_cursor: None,
+            resources: crate::mcp::resources::list_resources(
+                &self.state,
+                settings.adapters.hqplayer,
+            )
+            .await,
+        })
+    }
+
+    /// No resource template is advertised — #397's solution-space gate chose
+    /// live per-zone enumeration in `resources/list` instead (a newly
+    /// discovered zone needs no restart there either). This returns a fixed
+    /// empty list rather than the SDK's generic `method_not_found`, because
+    /// resources genuinely exist here; there is just no template shape for any
+    /// of them.
+    async fn handle_list_resource_templates_request(
+        &self,
+        _params: Option<PaginatedRequestParams>,
+        _runtime: Arc<dyn McpServer>,
+    ) -> Result<ListResourceTemplatesResult, RpcError> {
+        Ok(ListResourceTemplatesResult {
+            meta: None,
+            next_cursor: None,
+            resource_templates: vec![],
+        })
+    }
+
+    async fn handle_read_resource_request(
+        &self,
+        params: ReadResourceRequestParams,
+        _runtime: Arc<dyn McpServer>,
+    ) -> Result<ReadResourceResult, RpcError> {
+        crate::mcp::resources::read_resource(&self.state, &params.uri).await
     }
 }
 

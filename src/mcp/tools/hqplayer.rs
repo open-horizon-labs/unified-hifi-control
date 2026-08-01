@@ -198,17 +198,7 @@ fn target_failure(
     }
 }
 
-pub async fn handle_status(
-    state: &AppState,
-    args: HifiHqplayerStatusTool,
-) -> Result<CallToolResult, CallToolError> {
-    let env = Envelope::read("hifi_hqplayer_status", "get_status")
-        .param_opt("zone_id", args.zone_id.as_deref());
-    let target = resolve_target(state, args.zone_id.as_deref()).await;
-    let (adapter, env) = match target_failure(env, target) {
-        Ok(resolved) => resolved,
-        Err(result) => return result,
-    };
+async fn hqp_status_payload_for_adapter(adapter: &HqpAdapter) -> McpHqpStatus {
     let status = adapter.get_status().await;
     let (pipeline, options, options_unavailable_reason) =
         match adapter.get_advanced_options_snapshot().await {
@@ -270,7 +260,7 @@ pub async fn handle_status(
             Err(error) => (None, None, status.connected.then(|| error.to_string())),
         };
 
-    let mcp_status = McpHqpStatus {
+    McpHqpStatus {
         connected: status.connected,
         host: status.host,
         pipeline: pipeline.map(|p| McpPipelineStatus {
@@ -281,8 +271,36 @@ pub async fn handle_status(
         }),
         options,
         options_unavailable_reason,
+    }
+}
+
+/// Shared default-instance payload for the tool and `hifi://hqplayer/status` resource.
+pub async fn hqp_status_payload(state: &AppState) -> McpHqpStatus {
+    hqp_status_payload_for_adapter(&state.hqplayer).await
+}
+
+pub async fn handle_status(
+    state: &AppState,
+    args: HifiHqplayerStatusTool,
+) -> Result<CallToolResult, CallToolError> {
+    let env = Envelope::read("hifi_hqplayer_status", "get_status")
+        .param_opt("zone_id", args.zone_id.as_deref());
+    let target = resolve_target(state, args.zone_id.as_deref()).await;
+    let (adapter, env) = match target_failure(env, target) {
+        Ok(resolved) => resolved,
+        Err(result) => return result,
     };
-    Ok(env.json_result(&mcp_status))
+    Ok(env.json_result(&hqp_status_payload_for_adapter(&adapter).await))
+}
+
+/// Fetch the default instance's profiles for the tool and MCP resource from one implementation.
+pub async fn hqp_profiles_payload(state: &AppState) -> Result<Vec<String>, String> {
+    state
+        .hqplayer
+        .fetch_profiles()
+        .await
+        .map(|profiles| profiles.into_iter().map(|profile| profile.title).collect())
+        .map_err(|error| error.to_string())
 }
 
 pub async fn handle_profiles(
@@ -296,11 +314,10 @@ pub async fn handle_profiles(
         Ok(resolved) => resolved,
         Err(result) => return result,
     };
-    let profiles = match adapter.fetch_profiles().await {
-        Ok(profiles) => profiles,
+    let profile_names: Vec<String> = match adapter.fetch_profiles().await {
+        Ok(profiles) => profiles.into_iter().map(|profile| profile.title).collect(),
         Err(error) => return env.failed(format!("Failed to list profiles: {error}")),
     };
-    let profile_names: Vec<String> = profiles.into_iter().map(|p| p.title).collect();
     Ok(env.json_result(&profile_names))
 }
 
