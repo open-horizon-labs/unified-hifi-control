@@ -99,6 +99,14 @@ fn refusal_reason_of(result: &ToolResult) -> Option<String> {
         .map(str::to_string)
 }
 
+fn operation_of(result: &ToolResult) -> String {
+    structured_of(result)
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>")
+        .to_string()
+}
+
 /// Search results as the JSON array `hifi_search`'s envelope carries in `data`.
 fn search_results_of(result: &ToolResult) -> Vec<Value> {
     structured_of(result)
@@ -394,6 +402,10 @@ async fn roon_play_ref_honors_the_queue_action() {
     )
     .await;
     assert_eq!(outcome_of(&played), "accepted");
+    // `operation` reflects the resolved action, matching hifi_play's own
+    // convention -- a client reading only `operation` can tell this apart
+    // from a plain play, without also reading `params.action`.
+    assert_eq!(operation_of(&played), "queue");
     let invoked = core.browsed_titles().await;
     assert!(invoked.contains(&"Queue".to_string()), "got {invoked:?}");
     assert!(

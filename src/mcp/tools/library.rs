@@ -540,7 +540,14 @@ pub async fn handle_play_ref(
     let target = ZoneTarget::classify(&args.zone_id);
     let route = target.for_library();
 
-    let mut env = Envelope::write("hifi_play_ref", "play_ref")
+    // `operation` starts as whatever was requested (unvalidated) so an early
+    // refusal -- before the ref is even resolved, and so before either
+    // provider's accepted action set applies -- still reports something
+    // meaningful. `play_ref_roon`/`play_ref_lms` overwrite it with the
+    // validated, provider-specific action once one is known, matching
+    // `hifi_play`'s own convention (`roon_action_name`/`lms_action_name`).
+    let requested_action = args.action.as_deref().unwrap_or("play");
+    let mut env = Envelope::write("hifi_play_ref", requested_action)
         .param("ref", &*args.r#ref)
         .param("zone_id", &*args.zone_id)
         .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
@@ -639,7 +646,12 @@ async fn play_ref_roon(
             return env.refused(detail, refusal);
         }
     };
-    let env = env.param("action", action_name);
+    // `operation` follows `hifi_play`'s own convention (`roon_action_name`):
+    // the resolved action, not a constant tool-name-shaped string, so a
+    // client reading only `operation` can tell play_ref=queue from
+    // play_ref=play without also reading `params.action`.
+    let mut env = env.param("action", action_name);
+    env.operation = action_name.to_string();
     let action = PlayAction::parse(action_name);
 
     match state
@@ -676,7 +688,8 @@ async fn play_ref_lms(
             return env.refused(detail, refusal);
         }
     };
-    let env = env.param("action", action_name);
+    let mut env = env.param("action", action_name);
+    env.operation = action_name.to_string();
     let action = LmsPlayAction::parse(Some(action_name));
 
     match state.lms.play_target(&target, &args.zone_id, action).await {
