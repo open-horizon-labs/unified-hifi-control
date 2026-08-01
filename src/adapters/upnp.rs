@@ -4,6 +4,7 @@
 //! Pure UPnP/DLNA has limited metadata support compared to OpenHome.
 //! Specifically, next/previous track are NOT supported by pure UPnP.
 
+use crate::adapters::didl::{self, TrackInfo};
 use crate::adapters::handle::{AdapterHandle, RetryConfig};
 use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
@@ -53,10 +54,14 @@ pub struct UPnPRenderer {
     pub muted: bool,
     #[serde(skip)]
     pub last_seen: std::time::Instant,
+    pub track_info: Option<TrackInfo>,
     #[serde(skip)]
     pub av_transport_url: Option<String>,
     #[serde(skip)]
     pub rendering_control_url: Option<String>,
+    /// Last seen TrackURI, used to skip re-parsing unchanged metadata.
+    #[serde(skip)]
+    pub last_track_uri: Option<String>,
 }
 
 /// UPnP adapter status
@@ -248,6 +253,8 @@ impl UPnPAdapter {
 
             // New renderer
             let renderer = UPnPRenderer {
+                track_info: None,
+                last_track_uri: None,
                 uuid: uuid.clone(),
                 name: format!("Renderer {}", &uuid[..8.min(uuid.len())]),
                 manufacturer: None,
@@ -664,6 +671,48 @@ impl UPnPAdapter {
         let uuid = strip_upnp_prefix(uuid);
         let state = self.state.read().await;
         state.renderers.get(uuid).cloned()
+    }
+
+    /// Register a renderer and poll it once, as SSDP discovery followed by the
+    /// poll loop would. Exists so tests can drive the real poll path against a
+    /// mock renderer; SSDP cannot reach one.
+    #[doc(hidden)]
+    pub async fn probe_renderer_for_test(
+        &self,
+        uuid: &str,
+        name: &str,
+        av_url: &str,
+        rc_url: &str,
+    ) -> anyhow::Result<()> {
+        {
+            let mut s = self.state.write().await;
+            s.renderers
+                .entry(uuid.to_string())
+                .or_insert_with(|| UPnPRenderer {
+                    uuid: uuid.to_string(),
+                    name: name.to_string(),
+                    manufacturer: None,
+                    model: None,
+                    location: av_url.to_string(),
+                    state: "stopped".to_string(),
+                    volume: None,
+                    muted: false,
+                    track_info: None,
+                    last_seen: std::time::Instant::now(),
+                    av_transport_url: Some(av_url.to_string()),
+                    rendering_control_url: Some(rc_url.to_string()),
+                    last_track_uri: None,
+                });
+        }
+        Self::poll_renderer(
+            &self.state,
+            &self.bus,
+            &self.http,
+            uuid,
+            Some(av_url),
+            Some(rc_url),
+        )
+        .await
     }
 
     /// Get now playing info for a renderer
