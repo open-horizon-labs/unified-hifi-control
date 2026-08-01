@@ -150,7 +150,8 @@ mod tests {
 
     #[test]
     fn parse_didl_lite_falls_back_to_dc_creator_and_plain_title() {
-        let xml = r#"<item><title>Bare Title</title><dc:creator>Fallback Artist</dc:creator></item>"#;
+        let xml =
+            r#"<item><title>Bare Title</title><dc:creator>Fallback Artist</dc:creator></item>"#;
         let t = parse_didl_lite(xml).expect("returns Some");
         assert_eq!(t.title, "Bare Title");
         assert_eq!(t.artist, "Fallback Artist");
@@ -186,7 +187,8 @@ mod tests {
 
     #[test]
     fn extract_xml_value_skips_self_closing_tags() {
-        let xml = r#"<item><upnp:albumArtURI /><upnp:albumArtURI>art.jpg</upnp:albumArtURI></item>"#;
+        let xml =
+            r#"<item><upnp:albumArtURI /><upnp:albumArtURI>art.jpg</upnp:albumArtURI></item>"#;
         assert_eq!(
             extract_xml_value(xml, "upnp:albumArtURI").as_deref(),
             Some("art.jpg")

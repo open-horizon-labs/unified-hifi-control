@@ -1,8 +1,11 @@
 //! UPnP/DLNA adapter - discovers and controls UPnP Media Renderers
 //!
 //! Uses SSDP for discovery and UPnP AV Transport service for control.
-//! Pure UPnP/DLNA has limited metadata support compared to OpenHome.
-//! Specifically, next/previous track are NOT supported by pure UPnP.
+//!
+//! Track metadata comes from `AVTransport::GetPositionInfo`, whose
+//! `TrackMetaData` carries DIDL-Lite — the same format OpenHome uses, parsed by
+//! the shared [`crate::adapters::didl`] module. The real difference from
+//! OpenHome is the smaller set of *control* actions, not metadata.
 
 use crate::adapters::didl::{self, TrackInfo};
 use crate::adapters::handle::{AdapterHandle, RetryConfig};
@@ -491,6 +494,70 @@ impl UPnPAdapter {
             }
         }
 
+        // Poll track metadata. AVTransport::GetPositionInfo carries DIDL-Lite in
+        // TrackMetaData, XML-escaped inside the SOAP envelope. Re-parsed only
+        // when TrackURI changes, mirroring the OpenHome adapter so a steady
+        // stream does not re-parse on every tick.
+        if let Some(url) = av_url {
+            let position_info = Self::soap_call(
+                http,
+                url,
+                AV_TRANSPORT_URN,
+                "GetPositionInfo",
+                "<InstanceID>0</InstanceID>",
+            )
+            .await;
+
+            if let Ok(response) = position_info {
+                let track_uri =
+                    didl::extract_xml_value(&response, "TrackURI").filter(|u| !u.is_empty());
+                let metadata =
+                    didl::extract_xml_value(&response, "TrackMetaData").filter(|m| !m.is_empty());
+
+                let mut s = state.write().await;
+                if let Some(renderer) = s.renderers.get_mut(uuid) {
+                    if renderer.last_track_uri.as_deref() != track_uri.as_deref() {
+                        renderer.last_track_uri = track_uri;
+
+                        match metadata {
+                            Some(meta) => {
+                                let decoded = didl::html_decode(&meta);
+                                if let Some(track) = didl::parse_didl_lite(&decoded) {
+                                    let (title, artist, album) = (
+                                        Some(track.title.clone()),
+                                        Some(track.artist.clone()),
+                                        Some(track.album.clone()),
+                                    );
+                                    let image_key = track.album_art_uri.clone();
+                                    renderer.track_info = Some(track);
+                                    bus.publish(BusEvent::NowPlayingChanged {
+                                        zone_id: PrefixedZoneId::upnp(uuid),
+                                        title,
+                                        artist,
+                                        album,
+                                        image_key,
+                                    });
+                                }
+                            }
+                            // A renderer that reports no metadata (commonly when
+                            // stopped) clears rather than retaining a stale track.
+                            None => {
+                                if renderer.track_info.take().is_some() {
+                                    bus.publish(BusEvent::NowPlayingChanged {
+                                        zone_id: PrefixedZoneId::upnp(uuid),
+                                        title: None,
+                                        artist: None,
+                                        album: None,
+                                        image_key: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Poll volume
         if let Some(url) = rc_url {
             let volume = Self::soap_call(
@@ -721,19 +788,25 @@ impl UPnPAdapter {
         let state = self.state.read().await;
         let renderer = state.renderers.get(uuid)?;
 
-        // Pure UPnP doesn't provide track metadata
+        // Track metadata comes from AVTransport::GetPositionInfo when the
+        // renderer supplies it; otherwise fall back to the renderer's own name,
+        // which is all this returned before metadata was wired.
+        let track = renderer.track_info.as_ref();
         Some(UPnPNowPlaying {
             zone_id: uuid.to_string(),
-            line1: renderer.name.clone(),
-            line2: String::new(),
-            line3: String::new(),
+            line1: track
+                .map(|t| t.title.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| renderer.name.clone()),
+            line2: track.map(|t| t.artist.clone()).unwrap_or_default(),
+            line3: track.map(|t| t.album.clone()).unwrap_or_default(),
             is_playing: renderer.state == "playing",
             volume: renderer.volume,
             volume_min: 0,
             volume_max: 100,
             seek_position: None,
             length: None,
-            image_key: None,
+            image_key: track.and_then(|t| t.album_art_uri.clone()),
         })
     }
 
@@ -944,7 +1017,18 @@ fn upnp_renderer_to_zone(renderer: &UPnPRenderer) -> Zone {
             // Use prefixed output_id for consistent aggregator matching
             output_id: Some(format!("upnp:{}", renderer.uuid)),
         }),
-        now_playing: None, // UPnP track info would need separate DIDL-Lite parsing
+        now_playing: renderer
+            .track_info
+            .as_ref()
+            .map(|t| crate::bus::NowPlaying {
+                title: t.title.clone(),
+                artist: t.artist.clone(),
+                album: t.album.clone(),
+                image_key: t.album_art_uri.clone(),
+                seek_position: None,
+                duration: None,
+                metadata: None,
+            }),
         source: "upnp".to_string(),
         is_controllable: renderer.av_transport_url.is_some(),
         is_seekable: false, // Pure UPnP seek support is limited

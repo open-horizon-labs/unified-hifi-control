@@ -892,7 +892,6 @@ pub struct ImageData {
     pub data: Vec<u8>,
 }
 
-
 /// Convert an OpenHome device to a unified Zone representation
 fn openhome_device_to_zone(device: &OpenHomeDevice) -> Zone {
     Zone {
@@ -1029,4 +1028,3 @@ impl AdapterLogic for OpenHomeAdapter {
 
 // Startable trait implementation via macro
 crate::impl_startable!(OpenHomeAdapter, "openhome");
-
