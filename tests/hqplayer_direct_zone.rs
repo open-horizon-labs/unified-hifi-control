@@ -1485,3 +1485,135 @@ async fn transport_is_refused_for_a_zone_the_aggregator_has_withdrawn() {
     let _ = rig.aggregator_task.await;
     server.stop();
 }
+
+/// **Found by the Opus stacked review.** A `VolumeRange` reply whose bounds cannot be ordered must
+/// leave the zone without a volume control — it must not take the polling task down.
+///
+/// `min_db` and `max_db` are both `parse_attr_f64(...).unwrap_or_default()`, so a daemon that
+/// reports `max` but omits `min` yields `min_db = 0.0` against a negative `max_db`. `f64::clamp`
+/// is specified to **panic** when `min > max` or either bound is NaN, and the panic is an
+/// `assert!`, so it fires in release builds too.
+///
+/// #328 added `status.volume_db.clamp(vol_range.min_db, vol_range.max_db)` to
+/// `hqp_status_to_zone`, which runs on the initial handshake and on every subsequent status poll.
+/// A daemon in this shape therefore panics the managed worker before it ever publishes, and the
+/// zone simply never appears — the surface has no zone to show and no error to explain it.
+///
+/// An unorderable range is also not a capability. Publishing a slider whose track runs backwards
+/// is the same class of lie as reporting a working −60…0 dB zone as fixed-volume, so the honest
+/// projection is the one `enabled="0"` already produces: no control at all.
+///
+/// **RED before this fix:** the worker panics with `min > max, or either was NaN`, and
+/// `zone_when` times out because no zone is ever published.
+#[tokio::test]
+async fn an_unorderable_volume_range_is_refused_rather_than_panicking_the_poll() {
+    let model = playing_daemon();
+    model.external_change(|s| {
+        // The daemon answered `VolumeRange` with a negative `max` and no `min` at all.
+        s.volume_range.min_db = 0.0;
+        s.volume_range.max_db = -10.0;
+        s.volume_range.step_db = None;
+        s.volume_range.enabled = true;
+    });
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+
+    // The zone must still be published — everything except the volume capability is observable.
+    let zone = rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+    assert!(
+        zone.volume_control.is_none(),
+        "an unorderable dB range is not a volume capability; got {:?}",
+        zone.volume_control
+    );
+
+    // And the command path refuses rather than computing against those bounds.
+    for action in ["vol_up", "vol_down", "mute"] {
+        let (status, body) = rig
+            .post_control(json!({"zone_id":"hqplayer:rig","action":action}))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "`{action}` must be refused when no usable range was observed; got {body}"
+        );
+        assert_eq!(body["error_code"], "VOLUME_NOT_AVAILABLE");
+    }
+    let (status, _) = rig
+        .post_control(json!({"zone_id":"hqplayer:rig","action":"vol_abs","value":-5.0}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    assert!(
+        model.last_request("Volume").is_none(),
+        "no level may reach the wire when the observed range cannot bound one"
+    );
+
+    rig.shutdown().await;
+    server.stop();
+}
+
+/// **Found by the Opus stacked review.** The same bound, exercised directly on the projection for
+/// the shapes the wire fake cannot express.
+///
+/// NaN reaches `min_db`/`max_db` because `"nan".parse::<f64>()` succeeds, so a daemon or a garbled
+/// frame carrying `min="nan"` is a parse *success* that panics `f64::clamp`. A zero-width range is
+/// the third shape: it never panics, but it is not a control either — nothing can be moved, and
+/// `is_muted` (`value <= min + tolerance`) is unconditionally true, so the zone would report
+/// itself permanently muted.
+#[test]
+fn a_nan_or_zero_width_volume_range_publishes_no_control() {
+    let status = HqpStatus {
+        state: 2,
+        track: 1,
+        track_id: "t".to_string(),
+        position: 5,
+        length: 100,
+        volume: -24,
+        volume_db: -23.5,
+        ..HqpStatus::default()
+    };
+    let range = |min_db: f64, max_db: f64| VolumeRange {
+        min: min_db as i32,
+        max: max_db as i32,
+        step: 1,
+        enabled: true,
+        adaptive: false,
+        min_db,
+        max_db,
+        step_db: Some(0.5),
+    };
+
+    for (label, min_db, max_db) in [
+        ("NaN floor", f64::NAN, 0.0),
+        ("NaN ceiling", -60.0, f64::NAN),
+        ("infinite floor", f64::NEG_INFINITY, 0.0),
+        ("reversed", 0.0, -60.0),
+        ("zero width", -60.0, -60.0),
+    ] {
+        let zone = HqpAdapter::project_direct_zone(
+            "127.0.0.1",
+            Some("rig"),
+            &Default::default(),
+            &status,
+            &range(min_db, max_db),
+        );
+        assert!(
+            zone.volume_control.is_none(),
+            "{label}: a range that cannot bound a level is not a volume control"
+        );
+    }
+
+    // The ordinary range is untouched.
+    let zone = HqpAdapter::project_direct_zone(
+        "127.0.0.1",
+        Some("rig"),
+        &Default::default(),
+        &status,
+        &range(-60.0, 0.0),
+    );
+    let control = zone.volume_control.expect("a usable range still publishes");
+    assert_eq!(control.value, -23.5);
+    assert_eq!(control.min, -60.0);
+    assert_eq!(control.max, 0.0);
+}

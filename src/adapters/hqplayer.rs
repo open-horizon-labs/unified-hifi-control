@@ -1953,6 +1953,26 @@ impl HqpAdapter {
         state.last_observed_volume_range = Some(range.clone());
     }
 
+    /// Can this observed dB range bound a level?
+    ///
+    /// Both bounds are `parse_attr_f64(...).unwrap_or_default()`, so nothing upstream guarantees
+    /// they are ordered or even finite. A daemon that reports `max` and omits `min` yields
+    /// `min_db = 0.0` against a negative `max_db`; `"nan".parse::<f64>()` is a parse *success*, so
+    /// `min="nan"` arrives as NaN. `f64::clamp` is specified to panic on either shape — via
+    /// `assert!`, so in release builds too — and the clamps that consume this range sit in
+    /// `hqp_status_to_zone`, which runs on the handshake and on every status poll. Such a daemon
+    /// therefore panicked the managed worker before it ever published, and the zone simply never
+    /// appeared.
+    ///
+    /// The answer is not a safer clamp but no capability. A slider whose track runs backwards, or
+    /// whose ends are not numbers, is the same class of claim as reporting a working −60…0 dB zone
+    /// as fixed-volume. A zero-width range is refused for the adjacent reason: nothing can be
+    /// moved within it, and `is_muted` below would be unconditionally true, so the zone would
+    /// report itself permanently muted.
+    fn volume_range_is_usable(range: &VolumeRange) -> bool {
+        range.min_db.is_finite() && range.max_db.is_finite() && range.min_db < range.max_db
+    }
+
     /// Comparison tolerance for a dB level that arrived as a double through two independent reads.
     ///
     /// Used only to decide whether the level is *at* the range floor, which is what mute is on this
@@ -7378,7 +7398,9 @@ impl HqpAdapter {
             _ => PlaybackState::Unknown,
         };
 
-        let volume_control = if vol_range.enabled {
+        // `enabled` is the daemon's own claim; usability is whether the bounds it sent can actually
+        // bound a level. Both have to hold — see `volume_range_is_usable`.
+        let volume_control = if vol_range.enabled && Self::volume_range_is_usable(vol_range) {
             // The step the daemon actually sent, if it sent a usable one. The verified live sample
             // sends **no** `step` attribute at all, so `step_db` is routinely `None`; the integer
             // sibling is already `.max(1)` at parse time. A zero or negative step would reach a knob

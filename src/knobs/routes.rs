@@ -819,18 +819,32 @@ fn quantise_db(db: f64) -> f64 {
 /// A zone with no volume control is a zone whose daemon answers `Volume` with a bare
 /// `result="Error"`. Sending one anyway is a request with no safe interpretation on a
 /// hardware-attenuated setup, so it is refused before it reaches the wire.
+///
+/// The bounds are re-checked here even though the projection already refuses an unorderable range
+/// (`HqpAdapter::volume_range_is_usable`). Both `.clamp` calls below panic on `min > max` or a NaN
+/// bound, and a panic in an HTTP or MCP handler is a worse failure than a 400: this function is the
+/// only gate in front of them, so it owns the precondition rather than trusting its caller's caller.
 fn require_volume_control(
     zone: Option<&crate::bus::Zone>,
 ) -> Result<crate::bus::VolumeControl, (StatusCode, Json<serde_json::Value>)> {
-    zone.and_then(|z| z.volume_control.clone()).ok_or_else(|| {
+    let refuse = |message: &str| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "this zone has no volume control",
+                "error": message,
                 "error_code": "VOLUME_NOT_AVAILABLE",
             })),
         )
-    })
+    };
+    let control = zone
+        .and_then(|z| z.volume_control.clone())
+        .ok_or_else(|| refuse("this zone has no volume control"))?;
+    if !(control.min.is_finite() && control.max.is_finite() && control.min < control.max) {
+        return Err(refuse(
+            "this zone's published volume range cannot bound a level",
+        ));
+    }
+    Ok(control)
 }
 
 /// Control Roon zone
