@@ -233,28 +233,37 @@ pub async fn handle_search(
                         // `item_key` -- `FakeRoonCore`'s search model never
                         // included these, so nothing caught this minting a
                         // ref for them indistinguishably from real content.
-                        // `crate::adapters::roon::is_category` is the
-                        // adapter's own, pre-existing knowledge of exactly
-                        // this set; resolving a category's ref would land in
+                        // `crate::adapters::roon::is_ungrounded_grouping`
+                        // combines the adapter's own pre-existing title-list
+                        // check with a second, source-independent signal
+                        // (subtitle shaped like "<N> Results") verified live
+                        // for Library results but not for TIDAL/Qobuz -- see
+                        // that function's own doc comment for why the second
+                        // check is safe to include even where unverified.
+                        // Resolving a grouping row's ref would land in
                         // `resolve_item_key`'s "guess the first item"
                         // fallback and could silently play something the
                         // client never asked for. Only a real, navigable
-                        // item_key on a non-category row gets a ref; a
-                        // category row (or one with no item_key at all —
-                        // a header, or non-navigable) mints nothing.
+                        // item_key on a non-grouping row gets a ref; a
+                        // grouping row (or one with no item_key at all — a
+                        // header, or non-navigable) mints nothing.
                         let ref_token = match &item.item_key {
-                            Some(item_key) if !crate::adapters::roon::is_category(&item) => Some(
-                                state
-                                    .mcp_refs
-                                    .mint(RefTarget::Roon {
-                                        target: RoonRefTarget {
-                                            item_key: item_key.clone(),
-                                            multi_session_key: session_key.clone(),
-                                        },
-                                        title: item.title.clone(),
-                                    })
-                                    .await,
-                            ),
+                            Some(item_key)
+                                if !crate::adapters::roon::is_ungrounded_grouping(&item) =>
+                            {
+                                Some(
+                                    state
+                                        .mcp_refs
+                                        .mint(RefTarget::Roon {
+                                            target: RoonRefTarget {
+                                                item_key: item_key.clone(),
+                                                multi_session_key: session_key.clone(),
+                                            },
+                                            title: item.title.clone(),
+                                        })
+                                        .await,
+                                )
+                            }
                             _ => None,
                         };
                         mcp_results.push(McpSearchResult {

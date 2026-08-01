@@ -117,6 +117,44 @@ pub(crate) fn is_category(item: &BrowseItem) -> bool {
     CATEGORY_NAMES.contains(&item.title.as_str())
 }
 
+/// A second, title-independent signal for the same "this is a grouping row,
+/// not addressable content" question `is_category` answers by name match.
+///
+/// #396's ship-gate re-review verified live (against nuc14, Roon 2.70, a
+/// Library search) that `is_category`'s exact title list is correct for
+/// Library results, but has **no live evidence for TIDAL or Qobuz sources**,
+/// which may group results under different labels `CATEGORY_NAMES` does not
+/// contain. This catches that case by a different, source-independent
+/// pattern observed in the same live data: every grouping row's subtitle was
+/// exactly `"<N> Results"` (`"7 Results"`, `"32 Results"`, `"19 Results"`),
+/// while every real hit's subtitle was something else (an artist name, an
+/// album title). **This pattern is also unverified for TIDAL/Qobuz** -- it
+/// is an inference from one source, not a second confirmed fact — but unlike
+/// guessing at a wire *filter* shape (see `LmsAdapter::assert_library_id_exists`'s
+/// own history in this same issue), a false miss here only fails to exclude
+/// a row `is_category` didn't already catch: it cannot mint a *worse* ref
+/// than the title check alone would have, only sometimes a few more of the
+/// same already-accepted risk. So it is included as a strictly-additive
+/// second layer rather than withheld pending verification.
+fn looks_like_a_result_count_grouping(item: &BrowseItem) -> bool {
+    let Some(subtitle) = item.subtitle.as_deref() else {
+        return false;
+    };
+    let Some(count) = subtitle.strip_suffix(" Results") else {
+        return false;
+    };
+    count.parse::<u64>().is_ok()
+}
+
+/// Whether an item is a grouping/category row rather than addressable
+/// content, by either signal above. This is what `hifi_search`'s ref-minting
+/// (`src/mcp/tools/library.rs`) consults; `is_category` alone remains what
+/// `try_navigate_to_playable` uses, unchanged, since this function's second
+/// check is new to #396 and was never exercised by that existing path.
+pub(crate) fn is_ungrounded_grouping(item: &BrowseItem) -> bool {
+    is_category(item) || looks_like_a_result_count_grouping(item)
+}
+
 /// Strip "roon:" prefix from zone/output IDs.
 /// MCP and aggregator use prefixed IDs (e.g., "roon:zone_123"), but Roon API expects bare IDs.
 fn strip_roon_prefix(id: &str) -> &str {

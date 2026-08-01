@@ -315,6 +315,67 @@ async fn a_category_grouping_row_never_gets_a_ref() {
     core.stop().await;
 }
 
+/// **The dissent's own follow-up (D2):** `is_category`'s title list is
+/// verified live only for Library results; TIDAL/Qobuz may group under
+/// different labels it does not contain. `is_ungrounded_grouping`'s second,
+/// source-independent signal (a subtitle shaped like `"<N> Results"`) is
+/// meant to catch exactly that case. This proves the second layer alone —
+/// with a title (`"Streaming Picks"`) `CATEGORY_NAMES` does not contain —
+/// still keeps the row from getting a ref.
+#[tokio::test]
+async fn a_grouping_row_with_an_unlisted_title_is_still_caught_by_its_subtitle_shape() {
+    let mut library = mock_servers::roon_core::FakeLibrary::standard();
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![
+            mock_servers::roon_core::album("Kind of Blue", "Miles Davis", &["So What"]),
+            // A title CATEGORY_NAMES does not list, imagining a TIDAL/Qobuz-
+            // style grouping label -- only the subtitle shape marks it. The
+            // query term lives in the title (so the fake's substring-match
+            // search includes this row); the subtitle is the exact
+            // "<N> Results" shape the second check looks for -- real Roon's
+            // observed shape was the count and the word alone, no trailing
+            // text, which is what `looks_like_a_result_count_grouping`'s
+            // exact-suffix check requires.
+            mock_servers::roon_core::FakeItem::list("Streaming Picks: kind of blue")
+                .with_subtitle("12 Results"),
+        ],
+    );
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let search = handle_search(&state, search_args("kind of blue")).await;
+    let results = search_results_of(&search);
+
+    let unlisted_row = results
+        .iter()
+        .find(|r| {
+            r.get("title") == Some(&Value::String("Streaming Picks: kind of blue".to_string()))
+        })
+        .expect("the unlisted-title grouping row must be among the results");
+    assert_eq!(
+        unlisted_row.get("ref"),
+        None,
+        "a grouping row must be caught by its subtitle shape even when its title \
+         is not in CATEGORY_NAMES: {unlisted_row:?}"
+    );
+
+    // And a real hit whose subtitle merely *contains* something count-shaped
+    // is not swept up by the same check -- it must actually END with " Results".
+    let kob = results
+        .iter()
+        .find(|r| r.get("title") == Some(&Value::String("Kind of Blue".to_string())))
+        .expect("Kind of Blue must be among the results");
+    assert!(
+        kob.get("ref").and_then(Value::as_str).is_some(),
+        "real content must still get a ref: {kob:?}"
+    );
+
+    core.stop().await;
+}
+
 /// The straight-line path: search mints a `ref`, `hifi_play_ref` resolves it
 /// to the same action `play_item` would reach, and the Core was actually
 /// asked to invoke Play Now on the album `hifi_search` found.
