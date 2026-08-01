@@ -201,7 +201,12 @@ pub async fn handle_set_pipeline(
         }
     };
 
-    match result {
+    // `SettingOutcome` covers `Ignored`/`Suppressed`/`Ambiguous` — a daemon that acknowledged the
+    // write without moving the authoritative field, or refused it, or left it undeterminable.
+    // `into_applied_result` collapses those to an `Err` naming the reason, so this cannot report
+    // "Set X to Y" for a setting that did not actually change — the same collapse
+    // `hqp_apply_named_setting`/`hqp_apply_legacy_setting` (`src/api/mod.rs`) already use.
+    match result.and_then(crate::adapters::hqplayer::SettingOutcome::into_applied_result) {
         // No `observed` — same reason as load_profile.
         Ok(()) => Ok(env.text_result(format!("Set {} to {}", args.setting, args.value))),
         Err(e) => env.failed(format!("Failed to set {}: {}", args.setting, e)),

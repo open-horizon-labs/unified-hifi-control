@@ -36,11 +36,14 @@
 //! it should reach has the whole surface (`play`, `pause`, `next`, `previous`,
 //! `set_volume`, `volume_up`/`down`, `seek`).
 //!
-//! #398 recognises the prefix and reports the gap honestly ([`HqPlayer`] routes
-//! to `Refused`, and the tools classify it as `not_implemented` tracked by #328).
-//! It does **not** wire it: the zone id is `hqplayer:<instance_name>`, so routing
-//! needs `HqpInstanceManager` resolution and there is no HQPlayer zone in any test
-//! fixture.
+//! #398 recognised the prefix and reported the gap honestly ([`HqPlayer`] routed
+//! to `Refused`, and the tools classified it as `not_implemented` tracked by
+//! #328). **#328 wires it.** The zone id is `hqplayer:<instance_name>`, so
+//! transport and volume resolve it through `HqpInstanceManager` rather than
+//! through a single shared adapter — see
+//! `crate::mcp::tools::transport::handle_hqplayer_control`, the one place that
+//! resolution happens. Library operations stay refused: HQPlayer's XML control
+//! protocol has no verified content surface, tracked separately by #209.
 //!
 //! [`HqPlayer`]: ZoneTarget::HqPlayer
 //!
@@ -52,12 +55,12 @@
 //! | zone id        | transport ([`Self::for_transport`]) | volume ([`Self::for_volume`]) | library ([`Self::for_library`]) |
 //! |----------------|-------------------------------------|-------------------------------|---------------------------------|
 //! | `roon:x`       | Roon                                | Roon                          | Roon                            |
-//! | `lms:x`        | LMS                                 | LMS                           | LMS                             |
-//! | `openhome:x`   | OpenHome                            | OpenHome (#398 wired it)      | **refused**                     |
-//! | `upnp:x`       | UPnP                                | UPnP (#398 wired it)          | **refused**                     |
-//! | `hqplayer:x`   | **refused**                         | **refused**                   | **refused**                     |
-//! | `x` (bare)     | **refused** (#398)                  | **refused** (#398)            | **refused** (#398)              |
-//! | `sonos:x`      | **refused** (#398)                  | **refused**                   | **refused** (#398)              |
+//! | `lms:x`        | LMS                                  | LMS                           | LMS                             |
+//! | `openhome:x`   | OpenHome                             | OpenHome (#398 wired it)      | **refused**                     |
+//! | `upnp:x`       | UPnP                                 | UPnP (#398 wired it)          | **refused**                     |
+//! | `hqplayer:x`   | HQPlayer (#328 wired it)             | HQPlayer (#328 wired it)      | **refused**                     |
+//! | `x` (bare)     | **refused** (#398)                   | **refused** (#398)            | **refused** (#398)              |
+//! | `sonos:x`      | **refused** (#398)                   | **refused**                   | **refused** (#398)              |
 //!
 //! A single `is_lms()`-style predicate cannot express that. Any attempt to unify
 //! these into one rule changes behavior; `tests/mcp_contract.rs`
@@ -177,6 +180,13 @@ pub enum TransportRoute {
     Lms,
     OpenHome,
     Upnp,
+    /// `hqplayer:<instance_name>` — resolved through `HqpInstanceManager`, not a
+    /// single shared adapter like the other four. #328 wired this; the resolution
+    /// and dispatch live in `crate::mcp::tools::transport::handle_hqplayer_control`,
+    /// the one caller that acts on this variant. It exists here so
+    /// [`crate::mcp::capabilities`] can ask "is this routed" without duplicating
+    /// that lookup.
+    HqPlayer,
     /// No transport path for this zone id. Carries the target so the caller can
     /// tell "not wired for this provider" from "not a zone id UHC understands".
     Refused(ZoneTarget),
@@ -186,13 +196,16 @@ pub enum TransportRoute {
 ///
 /// #398 added the OpenHome and UPnP arms: both adapters implement `vol_abs` and
 /// `vol_rel` and `POST /{openhome,upnp}/control` has exposed them over HTTP all
-/// along — only this path declined to call them.
+/// along — only this path declined to call them. #328 added `HqPlayer`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumeRoute {
     Roon,
     Lms,
     OpenHome,
     Upnp,
+    /// `hqplayer:<instance_name>`, decimal-dB, clamped to the zone's observed
+    /// range. See [`TransportRoute::HqPlayer`].
+    HqPlayer,
     /// No volume path for this zone id.
     Refused(ZoneTarget),
 }
@@ -268,8 +281,9 @@ impl ZoneTarget {
             Self::Lms => TransportRoute::Lms,
             Self::OpenHome => TransportRoute::OpenHome,
             Self::Upnp => TransportRoute::Upnp,
-            // Recognised, and genuinely not wired. #328.
-            Self::HqPlayer => TransportRoute::Refused(self),
+            // #328: HqpInstanceManager resolution, dispatched by
+            // `tools::transport::handle_hqplayer_control`.
+            Self::HqPlayer => TransportRoute::HqPlayer,
             // #398: was Roon for both of these.
             Self::Unprefixed | Self::Unknown => TransportRoute::Refused(self),
         }
@@ -283,7 +297,8 @@ impl ZoneTarget {
             // #398 wired both: the adapters implement vol_abs/vol_rel.
             Self::OpenHome => VolumeRoute::OpenHome,
             Self::Upnp => VolumeRoute::Upnp,
-            Self::HqPlayer => VolumeRoute::Refused(self),
+            // #328: decimal-dB, dispatched by the same hqplayer control path.
+            Self::HqPlayer => VolumeRoute::HqPlayer,
             Self::Unprefixed | Self::Unknown => VolumeRoute::Refused(self),
         }
     }
@@ -471,11 +486,10 @@ mod tests {
             ZoneTarget::classify("upnp:x").for_transport(),
             TransportRoute::Upnp
         );
-        // Recognised but not wired — and it must carry which provider it was, or
-        // the refusal cannot say #328.
+        // #328 wired this: HqpInstanceManager resolution, not a refusal.
         assert_eq!(
             ZoneTarget::classify("hqplayer:x").for_transport(),
-            TransportRoute::Refused(ZoneTarget::HqPlayer)
+            TransportRoute::HqPlayer
         );
     }
 
@@ -494,6 +508,12 @@ mod tests {
         assert_eq!(
             ZoneTarget::classify("upnp:x").for_volume(),
             VolumeRoute::Upnp
+        );
+        // #328 wired this too, on the same HqpInstanceManager resolution as
+        // transport.
+        assert_eq!(
+            ZoneTarget::classify("hqplayer:x").for_volume(),
+            VolumeRoute::HqPlayer
         );
     }
 
