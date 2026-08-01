@@ -151,6 +151,10 @@ serial_test = "3"
 syn = { version = "2", features = ["full", "parsing", "visit"] }
 walkdir = "2"
 tempfile = "3"
+# WebSocket *server* for tests/mock_servers/roon_core.rs (the Roon Core protocol fake).
+# Pinned to the same version roon-api uses as its client, so the fake and the real
+# client library share one framing implementation and no new crate is compiled.
+tokio-tungstenite = "0.21"
 
 [profile.release]
 lto = true
