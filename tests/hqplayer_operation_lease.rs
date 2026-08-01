@@ -5,8 +5,10 @@
 #[allow(dead_code, unused_imports, unused_variables)]
 mod mock_servers;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{io::Cursor, io::Write};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -116,6 +118,23 @@ struct ProfileWeb {
     task: tokio::task::JoinHandle<()>,
 }
 
+fn profile_backup(applied: bool) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    writer.start_file("hqplayerd.xml", options).unwrap();
+    let working = if applied {
+        br#"<hqplayerd><engine profile="raw-a"/></hqplayerd>"#.as_slice()
+    } else {
+        br#"<hqplayerd><engine profile="default"/></hqplayerd>"#.as_slice()
+    };
+    writer.write_all(working).unwrap();
+    writer.start_file("data/cfgs/raw-a.xml", options).unwrap();
+    writer
+        .write_all(br#"<hqplayerd><engine profile="raw-a"/></hqplayerd>"#)
+        .unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
 impl ProfileWeb {
     async fn start(pause_post: bool, drop_post_response: bool) -> Self {
         Self::start_with_post_status(pause_post, drop_post_response, 200).await
@@ -133,15 +152,24 @@ impl ProfileWeb {
         let post_seen = Arc::new(Notify::new());
         let release_post = Arc::new(Notify::new());
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let applied = Arc::new(AtomicBool::new(false));
+        let before_backup = Arc::new(profile_backup(false));
+        let after_backup = Arc::new(profile_backup(true));
         let task = {
             let post_seen = post_seen.clone();
             let release_post = release_post.clone();
             let requests = requests.clone();
+            let applied = applied.clone();
+            let before_backup = before_backup.clone();
+            let after_backup = after_backup.clone();
             tokio::spawn(async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     let post_seen = post_seen.clone();
                     let release_post = release_post.clone();
                     let requests = requests.clone();
+                    let applied = applied.clone();
+                    let before_backup = before_backup.clone();
+                    let after_backup = after_backup.clone();
                     tokio::spawn(async move {
                         let mut head = Vec::new();
                         loop {
@@ -161,35 +189,51 @@ impl ProfileWeb {
                             .lock()
                             .expect("profile request log lock")
                             .push(first_line.clone());
-                        if first_line.starts_with("POST ") {
+                        if first_line.starts_with("POST /restore ") {
                             post_seen.notify_one();
                             if pause_post {
                                 release_post.notified().await;
                             }
+                            // A response failure is deliberately independent of application. The
+                            // adapter must reconcile it through the fresh backup readback.
+                            applied.store(true, Ordering::Release);
                             if drop_post_response {
                                 return;
                             }
                         }
-                        let body = if first_line.starts_with("GET ") {
-                            r#"<html><body><form>
+                        let (body, content_type): (Vec<u8>, &str) =
+                            if first_line.starts_with("GET /backup/settings.zip ") {
+                                let archive = if applied.load(Ordering::Acquire) {
+                                    after_backup.as_ref()
+                                } else {
+                                    before_backup.as_ref()
+                                };
+                                (archive.clone(), "application/zip")
+                            } else if first_line.starts_with("GET /config/profile/load ") {
+                                (
+                                    r#"<html><body><form>
                             <input type="hidden" name="_xsrf" value="token"/>
                             <select name="profile"><option value="raw-a">Raw A</option></select>
                             </form></body></html>"#
-                        } else {
-                            "ok"
-                        };
-                        let status = if first_line.starts_with("POST ") {
+                                        .as_bytes()
+                                        .to_vec(),
+                                    "text/html",
+                                )
+                            } else {
+                                (b"ok".to_vec(), "text/html")
+                            };
+                        let status = if first_line.starts_with("POST /restore ") {
                             post_status
                         } else {
                             200
                         };
                         let response = format!(
-                            "HTTP/1.1 {status} Test\r\nContent-Type: text/html\r\nContent-Length: \
-                             {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
+                            "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: \
+                             {}\r\nConnection: close\r\n\r\n",
+                            body.len()
                         );
                         let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.write_all(&body).await;
                         let _ = socket.flush().await;
                     });
                 }
@@ -563,10 +607,10 @@ async fn timing_out_an_operation_releases_queued_reconfiguration() {
     second.stop();
 }
 
-/// A persistent profile load changes the native setting universe. Its lazy form GET, POST, cache
-/// invalidation, and native enumeration refresh therefore share one endpoint lease.
+/// A persistent profile load changes the native setting universe. Its backup, restore, readback,
+/// cache invalidation, and native enumeration refresh therefore share one endpoint lease.
 #[tokio::test]
-async fn profile_post_and_native_refresh_stay_on_one_endpoint() {
+async fn profile_restore_and_native_refresh_stay_on_one_endpoint() {
     let first = WireServer::start(
         Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
         WirePolicy::default(),
@@ -625,34 +669,29 @@ async fn profile_post_and_native_refresh_stay_on_one_endpoint() {
     configure_started.notified().await;
     assert!(
         !reconfigure.is_finished(),
-        "configure must remain queued while endpoint A's profile POST is unresolved"
+        "configure must remain queued while endpoint A's profile restore is unresolved"
     );
     assert_eq!(adapter.endpoint_generation().await, endpoint_before);
     let filters_before = first.stats().element_count("GetFilters");
     first_web.release_post.notify_one();
 
-    let load_error = load
-        .await
+    load.await
         .expect("profile task joins")
-        .expect_err("recovery cannot prove which profile became active");
-    assert!(
-        load_error.to_string().contains("outcome is ambiguous"),
-        "the recovered but unverified load must be explicit: {load_error}"
-    );
+        .expect("fresh backup readback verifies the applied profile");
     reconfigure
         .await
         .expect("configure follows profile refresh");
     assert_eq!(
         first_web.count("GET "),
-        2,
-        "the second GET is the fresh persistent-form recovery check"
+        3,
+        "backup capture, applied readback, and fresh profile-list recovery stay on endpoint A"
     );
     assert_eq!(first_web.count("POST "), 1);
     assert_eq!(second_web.count("GET "), 0);
     assert_eq!(second_web.count("POST "), 0);
     assert!(
         first.stats().element_count("GetFilters") > filters_before,
-        "the ambiguous profile load must force a native enumeration refresh on endpoint A"
+        "the verified profile load must force a native enumeration refresh on endpoint A"
     );
     assert_eq!(second.stats().element_count("GetFilters"), 0);
     assert_eq!(
@@ -667,10 +706,9 @@ async fn profile_post_and_native_refresh_stay_on_one_endpoint() {
     second_web.stop();
 }
 
-/// Once the profile POST has been dispatched, losing its response cannot truthfully be called a
-/// definite failure: the daemon may already have replaced the complete setting universe.
+/// Once a restore has been dispatched, losing its response is reconciled against a fresh backup.
 #[tokio::test]
-async fn lost_profile_post_response_is_reported_as_ambiguous() {
+async fn lost_restore_response_is_reconciled_by_persistent_readback() {
     let native = WireServer::start(
         Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
         WirePolicy::default(),
@@ -689,25 +727,21 @@ async fn lost_profile_post_response_is_reported_as_ambiguous() {
         .await;
     adapter.set_timeouts(fast_timeouts()).await;
 
-    let error = adapter
+    adapter
         .load_profile("raw-a")
         .await
-        .expect_err("a dropped POST response cannot be reported as success");
-    assert!(
-        error.to_string().contains("outcome is ambiguous"),
-        "the error must preserve possible application, got: {error}"
-    );
-    assert_eq!(web.count("GET "), 1);
+        .expect("a dropped response is success only after matching backup readback");
+    assert_eq!(web.count("GET "), 3);
     assert_eq!(web.count("POST "), 1);
 
     native.stop();
     web.stop();
 }
 
-/// A server-side failure is not proof that a mutating profile request was rejected. The daemon may
-/// have applied it and failed while rendering the response, so the API must preserve ambiguity.
+/// A server-side restore response is not proof of rejection. Matching persistent readback is the
+/// authoritative outcome.
 #[tokio::test]
-async fn profile_post_server_error_is_reported_as_ambiguous() {
+async fn restore_server_error_is_reconciled_by_persistent_readback() {
     let native = WireServer::start(
         Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
         WirePolicy::default(),
@@ -732,27 +766,23 @@ async fn profile_post_server_error_is_reported_as_ambiguous() {
         .expect("precondition: native setting caches are populated");
     let filters_before = native.stats().element_count("GetFilters");
 
-    let error = adapter
+    adapter
         .load_profile("raw-a")
         .await
-        .expect_err("HTTP 500 after a profile POST cannot establish rejection");
-    assert!(
-        error.to_string().contains("outcome is ambiguous"),
-        "the error must preserve possible application, got: {error}"
-    );
-    assert_eq!(web.count("GET "), 1);
+        .expect("HTTP 500 does not override matching persistent readback");
+    assert_eq!(web.count("GET "), 3);
     assert_eq!(web.count("POST "), 1);
     assert!(
-        adapter.get_cached_profiles().await.is_empty(),
-        "an ambiguous 5xx response invalidates the persistent profile cache"
+        !adapter.get_cached_profiles().await.is_empty(),
+        "verified recovery refreshes the persistent profile cache"
     );
     adapter
         .get_pipeline_status()
         .await
-        .expect("native settings recover after ambiguous profile invalidation");
+        .expect("native settings remain readable after verified profile recovery");
     assert!(
         native.stats().element_count("GetFilters") > filters_before,
-        "an ambiguous 5xx response invalidates and refills the native setting cache"
+        "a verified restore invalidates and refills the native setting cache"
     );
 
     native.stop();
@@ -900,10 +930,10 @@ async fn pipeline_read_restarts_when_its_native_session_changes() {
     native.stop();
 }
 
-/// Once a profile POST is dispatched, an ambiguous response invalidates every possibly replaced
-/// cache. The next read must refill rather than confidently publish the previous profile's values.
+/// A verified restore invalidates every replaced cache, refills the native universe, and refreshes
+/// the persistent profile list even when the restore response itself was lost.
 #[tokio::test]
-async fn ambiguous_profile_post_invalidates_native_and_persistent_caches() {
+async fn verified_restore_refills_native_and_persistent_caches() {
     let native = WireServer::start(
         Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
         WirePolicy::default(),
@@ -935,10 +965,10 @@ async fn ambiguous_profile_post_invalidates_native_and_persistent_caches() {
     adapter
         .load_profile("raw-a")
         .await
-        .expect_err("the dropped POST response is ambiguous");
+        .expect("matching backup readback reconciles the dropped restore response");
     assert!(
-        adapter.get_cached_profiles().await.is_empty(),
-        "a possibly consumed form token and profile list must not survive ambiguity"
+        !adapter.get_cached_profiles().await.is_empty(),
+        "successful recovery publishes a freshly fetched persistent profile list"
     );
 
     adapter

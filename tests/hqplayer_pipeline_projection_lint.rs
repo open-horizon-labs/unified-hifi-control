@@ -1,6 +1,6 @@
 //! AST-level test: the HQPlayer pipeline projection may not read the cache it is projecting.
 //!
-//! `read_coherent_pipeline` joins `State`'s **list indices** to cached chain-scoped enumerations. That
+//! `read_coherent_pipeline_under_operation` joins `State`'s **list indices** to cached chain-scoped enumerations. That
 //! join is only meaningful if the lists it resolves through are the ones the verification step
 //! proved coherent with that `State`, and the only way to guarantee it is for the verification step
 //! to *hand back the snapshot it verified*. A proof that returns a `bool` and leaves the caller to
@@ -27,7 +27,7 @@
 //! // ... project from `snapshot`, and from nothing else
 //! ```
 //!
-//! Expressed as: **`read_coherent_pipeline` acquires no data-bearing lock of its own.** Every value it
+//! Expressed as: **`read_coherent_pipeline_under_operation` acquires no data-bearing lock of its own.** Every value it
 //! projects is either something it read from the daemon in this call or something a helper returned
 //! to it already verified. The endpoint operation lease is deliberately exempt: it carries no
 //! projected data and prevents configure/profile mutation from replacing the endpoint while this
@@ -45,7 +45,7 @@ use syn::{Expr, ExprIf, ExprMethodCall, File, ImplItemFn};
 
 /// The function whose shape is pinned, and the file it lives in.
 const SUBJECT_FILE: &str = "src/adapters/hqplayer.rs";
-const SUBJECT_FN: &str = "read_coherent_pipeline";
+const SUBJECT_FN: &str = "read_coherent_pipeline_under_operation";
 
 /// Lock-acquisition method names, matching the ones `await_in_lock_lint` already recognises.
 fn is_lock_acquisition(method: &str) -> bool {

@@ -953,14 +953,10 @@ fn every_required_evidence_topic_maps_to_a_claim() {
 // Retirement checks — the superseded documents
 // ===========================================================================================
 
-/// HQP-C-062: the daemon accepts `SetJunkFilter` and UHC's adapter exposes no setter for it.
-///
-/// The wire half of that pair is proven by a conformance test; the *adapter-surface* half was not proven
-/// by anything, and CodeRabbit was right that one citation cannot carry both. This is the missing half:
-/// a **structural inspection** of the adapter's Rust declarations for a junk-filter setter — `syn` parses
-/// the file and every function and method signature is visited, so no formatting or qualifier hides one.
-/// If #329 adds the setter, this test fails and the ledger row must be updated — which is the behaviour
-/// wanted, because the claim would then be false.
+/// HQP-C-062 is enforced with a structural inspection of the adapter's Rust declarations for a
+/// junk-filter setter. `syn` parses the file and visits every function and method signature, so no
+/// formatting or qualifier can hide the capability. The check now runs in the positive direction:
+/// removing the verified #329 setter must make the ledger fail.
 /// Whether `src` **declares** a function or method named `name`, determined structurally.
 ///
 /// A text scan for `fn <name>` is evadable and was: `pub  async  fn   set_junk_filter` with ordinary
@@ -1023,14 +1019,13 @@ fn declares_fn(src: &str, name: &str) -> bool {
 }
 
 #[test]
-fn the_adapter_exposes_no_junk_filter_setter() {
+fn the_adapter_exposes_the_verified_junk_filter_setter() {
     let adapter = read(&repo_root().join("src/adapters/hqplayer.rs"));
     let found = declares_fn(&adapter, "set_junk_filter");
     assert!(
-        !found,
-        "HQP-C-062 records that UHC exposes no junk-filter setter, and the adapter now has one: \
-         The daemon capability is real (HQP-C-051) — if it is now offered, update ledger row \
-         HQP-C-062 rather than this test"
+        found,
+        "HQP-C-062 records that UHC exposes the verified junk-filter setter; removing it would \
+         make the adapter and MCP capability claim false"
     );
 }
 

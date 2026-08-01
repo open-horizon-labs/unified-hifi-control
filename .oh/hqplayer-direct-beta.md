@@ -4,6 +4,58 @@
 **Parent epics:** #392 (MCP), #313 (HQPlayer) · **Base branch:** `feat/issue-328-direct-hqplayer-zone`
 (PR #391), itself stacked on `feat/issue-329-hqplayer-immediate-command` (PR #382).
 
+## Consolidated implementation update — PR #428 (2026-08-01)
+
+This section supersedes the earlier narrow/default-instance assumptions below. The user explicitly
+approved completing the #329, #330 and #209 slices in the consolidated beta PR, including additive
+MCP schema changes. PR #428 is current with `v3` and now contains:
+
+* the required UTF-8 XML declaration for HQPlayer Embedded 6 native requests;
+* normal `hqplayer:` zones with now-playing, transport, seek and decimal-dB volume across web,
+  knob and MCP, with recoverable outages retaining the configured zone instead of flickering it;
+* verified semantic immediate controls for mode, rate, 1x/Nx filter, shaper, junk filter, matrix
+  profile, convolution, adaptive volume, repeat and random;
+* exact per-instance MCP targeting and coherent status/options snapshots; profile reads are fresh
+  and report web-lane errors instead of silently returning `[]`;
+* transactional named-profile persistence: fresh ZIP backup, active-configuration bracketing,
+  bounded/safe archive validation, one restore dispatch, restart-aware readback, and verified
+  rollback on divergence;
+* private QNAP state (`umask 077`) and scoped shutdown without killing an unrelated port-8088
+  process; and
+* zero actionable RustSec vulnerabilities after dependency upgrades (seven allowed transitive
+  maintenance/unsound/yanked warnings remain recorded by `cargo audit`).
+
+The post-merge audit found and corrected stale repository contracts rather than waiving them:
+the profile-operation fakes now exercise backup → restore → readback, the lifecycle suite encodes
+no-flicker recovery, the HQPlayer evidence ledger records the implemented junk-filter setter, the
+coherent-pipeline AST lint follows the under-operation implementation, and the approved MCP fixture
+includes the new status/options vocabulary.
+
+### Verification contract at the push candidate
+
+| Gate | Result |
+|---|---|
+| `cargo test --all-features --quiet` | all test binaries green; the opt-in live/restart suites remain intentionally ignored |
+| `cargo test --test mcp_contract --quiet` | 104 passed |
+| `cargo test --test mcp_hqplayer_control --quiet` | 48 passed |
+| `cargo test --test hqplayer_direct_zone --quiet` | 65 passed |
+| `cargo test --test hqplayer_conformance --quiet` | 298 passed |
+| `cargo test --test hqplayer_operation_lease --quiet` | 54 passed |
+| `cargo clippy --all-features -- -D warnings` | clean |
+| `cargo fmt --check` | clean |
+| `cargo test --test api_contract --quiet` | 2 passed; public HTTP route contract unchanged |
+| `cargo audit` | 0 vulnerabilities; 7 allowed warnings |
+
+### Remaining qualification boundary
+
+The branch is a locally verified beta candidate, not a claim that unobserved HQPlayer operations
+work. The fresh x86_64 QNAP package must be installed on `192.168.1.2`, then exercised through UHC
+against the user's HQPlayer Embedded 6.0.2 daemon at `192.168.1.61:4321`. Playlist/library CRUD,
+binary album-art interludes, the optional 4322 metering channel, and unverified read-only native
+families are not fabricated from HQPTuner command names; they remain follow-up protocol evidence
+work rather than false beta capabilities. PR #428 remains unmerged pending CI and user live-test
+approval.
+
 ### Scope reset (read before the rest of this document)
 
 The user explicitly narrowed this program's scope after #401 and #350 were filed:

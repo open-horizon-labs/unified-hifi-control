@@ -1185,14 +1185,22 @@ async fn unavailable_startup_and_daemon_restart_recover_without_stale_state() {
 
     first_server.shutdown().await;
     for _ in 0..100 {
-        if aggregator.get_zone("hqplayer:rig").await.is_none() {
+        if !adapter.get_status().await.connected {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(!adapter.get_status().await.connected);
+    let retained = aggregator
+        .get_zone("hqplayer:rig")
+        .await
+        .expect("a recoverable restart retains the configured direct zone");
     assert!(
-        aggregator.get_zone("hqplayer:rig").await.is_none(),
-        "the pre-restart snapshot must not remain presented as reachable"
+        retained
+            .now_playing
+            .as_ref()
+            .is_some_and(|now| now.title == "Alice in Wonderland"),
+        "the retained zone is explicitly last-known state while adapter status is disconnected"
     );
 
     let second_model = DaemonModel::with_profile(VERIFIED_PROFILE);

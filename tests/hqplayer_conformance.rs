@@ -8026,21 +8026,12 @@ async fn a_chain_that_moves_on_both_the_read_and_the_retry_is_reported_rather_th
     h.stop();
 }
 
-/// A profile load replaces the daemon's settings wholesale — filters, shapers and rates can all
-/// change — so the enumerations cached from before it are describing a configuration that no longer
-/// exists. `refresh_lists` deliberately leaves an existing cache alone when it cannot publish a
-/// coherent replacement, which is right for a *transient* read and wrong here: what it preserves is
-/// the pre-load lists, and the next read then finds them non-empty, skips its required fill, and
-/// resolves the new profile's `State` indices through the old profile's options.
-///
-/// The chain check does not save it. That check compares **rates**, and a profile that changes
-/// filters or shapers while leaving the rate list alone passes it — so the stale answer is not just
-/// published, it is published confidently.
-///
-/// **Label: client-red.** Found by CodeRabbit at `d4acddf`, and it falsified a comment I had just
-/// written claiming a failed post-load refresh "leaves the cache empty rather than stale".
+/// The persistent profile lane must acquire a fresh settings backup before mutating anything. This
+/// older fake only serves the profile form; it deliberately has no `/backup/settings.zip` or
+/// `/restore` implementation. The safe #330 implementation must refuse before dispatch and leave
+/// the still-valid native cache alone.
 #[tokio::test]
-async fn a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles_lists_in_place() {
+async fn a_profile_load_without_a_fresh_backup_refuses_before_mutation() {
     // This test is what made the shared-config coupling bite: supplying credentials leaked them to
     // every adapter built afterwards, and `tier1_checks_every_family_adr_003_requires` then attempted
     // a config read against a web server that had already stopped, recording `config_form` as neither
@@ -8087,52 +8078,31 @@ async fn a_profile_load_whose_refresh_fails_does_not_leave_the_previous_profiles
         "precondition: the pre-load shapers are cached, got {stale:?}"
     );
 
-    // The POST is accepted; the recovery refresh that follows it cannot complete. Armed only now,
-    // after the cache above filled successfully — otherwise the test would be about a daemon that
-    // never worked rather than one whose profile outcome cannot be verified.
-    h.model.arm(|f| {
-        // One rejection breaks the eager post-load refresh; two more cover the read path's bounded
-        // retry. On the broken implementation only the first is consumed because the stale cache
-        // makes the read skip both fills. On the fixed implementation the cache is empty, so the
-        // read must either establish fresh lists or fail explicitly rather than publish the old ones.
-        for _ in 0..3 {
-            f.reject_next.push((
-                "GetShapers".to_string(),
-                "post-profile refresh refused".to_string(),
-            ));
-        }
-    });
     let load_error = h
         .adapter
         .load_profile("raw-a")
         .await
-        .expect_err("a POST without coherent native recovery cannot be reported as success");
+        .expect_err("a persistent write without a fresh backup must be refused");
     assert!(
-        load_error.to_string().contains("ambiguous"),
-        "the failure must preserve that the profile may have applied: {load_error}"
+        load_error
+            .to_string()
+            .contains("fetch fresh HQPlayer settings backup"),
+        "the refusal must identify the failed pre-mutation safety check: {load_error}"
     );
 
-    match h.adapter.get_pipeline_status().await {
-        Err(e) => assert!(
-            e.to_string().contains("lists"),
-            "the read must say the setting lists could not be established. Got: {e}"
-        ),
-        Ok(published) => {
-            let offered: Vec<&str> = published
-                .settings
-                .shaper
-                .options
-                .iter()
-                .map(|o| o.value.as_str())
-                .collect();
-            panic!(
-                "after a profile load, the previous profile's options must never be published as \
-                 the current ones — and the rate-based chain check cannot catch this, because a \
-                 profile can change filters and shapers while leaving rates alone. Offered \
-                 {offered:?}"
-            );
-        }
-    }
+    let published = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("a refused preflight leaves the unchanged native state readable");
+    let offered: Vec<&str> = published
+        .settings
+        .shaper
+        .options
+        .iter()
+        .map(|o| o.value.as_str())
+        .collect();
+    assert_eq!(offered, stale);
     h.stop();
     web.stop();
 }

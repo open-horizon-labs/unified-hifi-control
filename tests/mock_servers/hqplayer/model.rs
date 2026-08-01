@@ -932,6 +932,11 @@ impl Responder for DaemonModel {
                 let doc = inner.enumeration("GetInfo");
                 inner.wrap(&doc)
             }
+            // Embedded 6 exposes the active configuration through the native lane. The
+            // conformance daemon models the ordinary working configuration; named profile
+            // snapshots are represented by the web backup fixture rather than by a second
+            // mutable native state machine.
+            "ConfigurationGet" => inner.wrap("<ConfigurationGet value=\"\"/>"),
             "State" => inner.render_state(),
             "Status" => inner.render_status(),
 

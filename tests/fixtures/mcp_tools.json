@@ -80,7 +80,7 @@
     }
   },
   "hifi_hqplayer_set_pipeline": {
-    "description": "Change an immediate HQPlayer setting on an exact instance: mode, samplerate, filter1x, filterNx, shaper/dither, junk_filter, convolution, adaptive_volume, repeat, or random. This does not persist a profile.",
+    "description": "Change an immediate HQPlayer setting on an exact instance: mode, samplerate, filter1x, filterNx, shaper/dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, or random. Call hifi_hqplayer_status first for current values and choices. This does not persist a profile.",
     "inputSchema": {
       "properties": {
         "setting": {

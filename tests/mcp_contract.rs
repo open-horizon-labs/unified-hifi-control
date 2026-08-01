@@ -54,7 +54,9 @@ use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp;
-use unified_hifi_control::mcp::types::{McpPipelineStatus, McpPlayResult, McpSearchResult};
+use unified_hifi_control::mcp::types::{
+    McpHqpOptions, McpHqpSelection, McpPipelineStatus, McpPlayResult, McpSearchResult,
+};
 
 use mock_servers::{MockHqpServer, MockLmsServer, MockOpenHomeDevice, MockUpnpRenderer};
 
@@ -2444,6 +2446,27 @@ async fn no_tool_returns_an_unclassified_field() {
         .expect("McpPipelineStatus must serialize"),
         &mut returned,
     );
+    let selection = || McpHqpSelection {
+        current: String::new(),
+        choices: Vec::new(),
+    };
+    collect_keys(
+        &serde_json::to_value(McpHqpOptions {
+            mode: selection(),
+            samplerate: selection(),
+            filter1x: selection(),
+            filter_nx: selection(),
+            shaper: selection(),
+            junk_filter: selection(),
+            matrix_profile: selection(),
+            convolution: false,
+            adaptive_volume: false,
+            repeat: String::new(),
+            random: false,
+        })
+        .expect("McpHqpOptions must serialize"),
+        &mut returned,
+    );
     // #395: hifi_play's success payload. Same reasoning — its success path needs a
     // live music library, which no mock provides, so serialize the production type
     // rather than trusting a comment.
@@ -2762,6 +2785,11 @@ const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
         "hifi_hqplayer_profiles/empty",
         "[]",
         "Error: Failed to list profiles: Web credentials not configured",
+    ),
+    (
+        "hifi_hqplayer_status/disconnected",
+        "{\n  \"connected\": false,\n  \"host\": null,\n  \"pipeline\": null\n}",
+        "{\n  \"connected\": false,\n  \"host\": null,\n  \"pipeline\": null,\n  \"options\": null,\n  \"options_unavailable_reason\": null\n}",
     ),
 ];
 

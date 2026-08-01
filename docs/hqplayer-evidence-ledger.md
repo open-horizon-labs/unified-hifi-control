@@ -216,13 +216,13 @@ withdrawn.
 | HQP-C-048 | **Self-generated session-authentication keys for port 4321 were rejected** in the inspected precedent, so a client must not attempt to mint one | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…:1190` row D4 · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | none:an authenticated-4321 capture against a daemon configured to require it, recording what the daemon accepts | open | #332 |
 | HQP-C-049 | The native surface on L1 needed **no** session authentication: UDP 4321 discovery, TCP 4321 control, TCP 4322, UPnP 1900 and web 8088 all answered, and discovery advertised **no alternate control port** | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:get_info_reports_the_verified_daemon_identity | settled | — |
 
-### Junk filter, and one capability the adapter does not expose
+### Junk filter control
 
 | ID | Claim | Class | Provenance | Proof | Status | Owner |
 |---|---|---|---|---|---|---|
 | HQP-C-050 | The 20 kHz filter is `filter_junk`, an **int index** into `GetJunkFilters` — not a boolean `filter_20k` — and the wire element is `SetJunkFilter`. Commands evidenced elsewhere: SetJunkFilter (HQP-C-051; the cited test covers the read side only) | E1-upstream-verified | UHC-SALVAGE reports via `.oh/issue-322-…` · read-via-report · hqplayerd 6.0.4 (Opal) · 2026-07-29 · idle | test:the_junk_filter_is_read_as_a_list_index_not_a_boolean | settled | — |
-| HQP-C-051 | `SetJunkFilter` round-tripped `filter_junk 0→1→0` with `result="OK"` on L1 — the daemon capability is real, and **no hermetic test covers it**: the observation is live-only | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | none:a conformance expectation that drives the raw `SetJunkFilter` command and verifies the readback; the fake already implements it (`model.rs:994`) so only the expectation is missing | open | #329 |
-| HQP-C-062 | UHC's adapter exposes **no** `set_junk_filter`, so no surface can reach that daemon capability | E6-documentary | `src/adapters/hqplayer.rs` at this head · direct · n/a · 2026-07-30 · n/a | test:tests/hqplayer_ledger_lint.rs::the_adapter_exposes_no_junk_filter_setter | open | #329 |
+| HQP-C-051 | `SetJunkFilter` round-tripped `filter_junk 0→1→0` with `result="OK"` on L1; the adapter resolves a semantic name against a fresh `GetJunkFilters` list and verifies the resulting `State.filter_junk` index | E0-uhc-live | PR #337 comment 5135836825 · read-via-pr · Embedded 6.0.2 / engine 6.0.4 · 2026-07-30 · idle | test:the_junk_filter_can_be_selected_by_the_name_in_the_live_enumeration | settled | — |
+| HQP-C-062 | UHC exposes semantic junk-filter control through `HqpAdapter::set_junk_filter` and MCP `hifi_hqplayer_set_pipeline(setting='junk_filter')`; the setting is no longer an unreachable daemon capability | E6-documentary | `src/adapters/hqplayer.rs`, `src/mcp/tools/hqplayer.rs` at this head · direct · n/a · 2026-08-01 · n/a | test:tests/hqplayer_ledger_lint.rs::the_adapter_exposes_the_verified_junk_filter_setter | settled | — |
 
 ### Licensing and provenance
 
@@ -475,36 +475,23 @@ native port and the daemon rejected it.
 session authentication, recording what the daemon accepts. L1 needed none (HQP-C-049), so UHC has no
 first-hand evidence either way.
 
-### HQP-C-051 — the daemon capability is observed live and untested here
+### HQP-C-051 — the live daemon capability now has hermetic client coverage
 
 `SetJunkFilter` moved `filter_junk 0→1→0` with `result="OK"` on L1. That is first-hand evidence and it
-stands. What it does **not** have is a hermetic proof, and this row previously cited
-`the_junk_filter_is_read_as_a_list_index_not_a_boolean` as though it did. **It does not:** that test mutates
-the fake's state externally and asserts the adapter *reads* `filter_junk == 2`. It never sends the command,
-never checks a `result`, and never exercises a transition. CodeRabbit caught the mismatch — the fifth
-finding in this PR where wording outran its cited proof, and the first found in the place I had asked them
-to look.
+stands. The row previously cited `the_junk_filter_is_read_as_a_list_index_not_a_boolean` as though that
+were a write proof; it only covered the read side. The new semantic setter test closes that gap.
 
-The row therefore carries an explicit `none:` proof with the acquisition plan, and **the lint refuses to let
-it be `settled`** on that basis (`a_claim_proved_only_by_a_future_live_row_is_not_settled`). The daemon-side
-fact is observed; the client-side coverage is absent, and the two are now visibly different things.
+The adapter now drives that command by semantic name, re-resolves the daemon's current enumeration, and
+verifies the `State` readback. `the_junk_filter_can_be_selected_by_the_name_in_the_live_enumeration`
+provides the hermetic proof that was previously missing, while the L1 capture remains the first-hand daemon
+evidence.
 
-**What would settle it:** a conformance expectation driving the raw `SetJunkFilter` command and verifying
-the readback. The fake already implements the command (`tests/mock_servers/hqplayer/model.rs:994`), so only
-the expectation is missing — which is why this is a coverage gap rather than a capability gap.
+### HQP-C-062 — `SetJunkFilter` is exposed by UHC
 
-### HQP-C-062 — `SetJunkFilter` works and UHC does not expose it
-
-The daemon accepted the raw element and round-tripped the value on L1 (HQP-C-051, open — observed live,
-not covered by a hermetic test). The adapter
-has no `set_junk_filter`, so the capability is unavailable to any UHC surface. This is a gap, not a
-defect — and it is now **executable**: `the_adapter_exposes_no_junk_filter_setter` **parses** the adapter with `syn` and visits every function and method signature, so
-if #329 adds the setter the check fails and this row must be updated rather than quietly outliving its
-own truth. The two halves were one row until CodeRabbit pointed out that a single wire-behaviour test
-cannot support a claim about the adapter's surface.
-
-**What would settle it:** #329 deciding whether the junk filter belongs in the live-settings surface.
-The protocol half is already settled (HQP-C-050, HQP-C-051).
+The daemon accepted the raw element and round-tripped the value on L1 (HQP-C-051, settled). The adapter now
+exposes `set_junk_filter`, and MCP routes `junk_filter` to it using the same semantic-name and verified
+readback path. The structural lint remains executable in the positive direction: removing the setter now
+fails the ledger instead of an added setter making an obsolete negative claim fail.
 
 ### HQP-C-053 — the notices file this PR must not create
 
