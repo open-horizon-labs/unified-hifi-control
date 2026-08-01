@@ -69,7 +69,20 @@ adapter.
 | play_item | an `item_key` resolves through the item's action list to `Play Now`; the `roon:` prefix is stripped before it reaches the Core |
 | search_and_play | navigates into a search hit to find a playable action; `play` / `queue` invoke different actions; a missing action reports what *is* available |
 | Errors on demand | `InvalidItemKey` and `InvalidLevels`, correlated to the right request id and session key, including with several requests in flight and responses arriving out of order; and an *unrecognised* error name, to pin what happens when the fork's four literals are wrong |
+| Same-session concurrency (#416) | three browses, then three loads, in flight under **one** `multi_session_key` and answered in reverse order — each caller must get its own result. Also that one session key is one Core-side level stack, which correlation does not change |
 | Drift | every request name the adapter sends is a closed set; anything else is recorded as unhandled and answered `InvalidRequest` |
+
+**Forcing responses out of order.** `set_delay` delays everything; `set_delay_for_item_key`
+delays one browse; `set_delay_for_load_level` (added by #416) delays one `load`, which
+carries no item key. Delays are applied before the handler runs, one task per request,
+so the Core's *answers* stay per-request correct while their *arrival* order is
+whatever the test chooses — which is the only way to tell "correlated by request" from
+"resolved whoever was waiting".
+
+**This is the fake that earned itself.** #408 shipped a test asserting the
+cross-delivery defect was present and told its successor to invert it; #416 did, and
+the invert stays green only because the adapter now correlates on `request_id`. If you
+add a mock, add the assertion that would have caught the bug — not the mock alone.
 
 ### Does NOT cover — do not assume otherwise
 
