@@ -68,15 +68,15 @@ use serde::{Deserialize, Serialize};
 /// Control playback
 #[mcp_tool(
     name = "hifi_control",
-    description = "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume"
+    description = "Control playback and volume. Common actions: play, pause, playpause, next, previous, volume_set, volume_up, volume_down. HQPlayer also supports stop, seek, and mute."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiControlTool {
     /// The zone ID to control
     pub zone_id: String,
-    /// Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down
+    /// Common action: play, pause, playpause, next, previous, volume_set, volume_up, or volume_down. HQPlayer also accepts stop, seek, and mute.
     pub action: String,
-    /// For volume actions: 0-100 for normalized providers, or decimal dB for HQPlayer zones; relative amounts use the provider's corresponding scale.
+    /// For seek, the position in seconds. For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
 }
