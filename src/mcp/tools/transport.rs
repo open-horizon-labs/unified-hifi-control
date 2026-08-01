@@ -83,7 +83,12 @@ pub async fn handle_control(
                 .control(&args.zone_id, backend_action, None)
                 .await
         }
-        TransportRoute::Upnp => state.upnp.control(&args.zone_id, backend_action, None).await,
+        TransportRoute::Upnp => {
+            state
+                .upnp
+                .control(&args.zone_id, backend_action, None)
+                .await
+        }
         TransportRoute::Roon => state.roon.control(&args.zone_id, backend_action).await,
     };
 
@@ -117,7 +122,12 @@ async fn set_volume(
     relative: bool,
 ) -> Result<CallToolResult, CallToolError> {
     let result = match ZoneTarget::classify(zone_id).for_volume() {
-        VolumeRoute::Lms => state.lms.change_volume(zone_id, value as f32, relative).await,
+        VolumeRoute::Lms => {
+            state
+                .lms
+                .change_volume(zone_id, value as f32, relative)
+                .await
+        }
         VolumeRoute::Roon => {
             state
                 .roon

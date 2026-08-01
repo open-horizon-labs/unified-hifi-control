@@ -89,8 +89,7 @@ fn assert_matches_fixture(name: &str, actual: &Value) {
     );
 
     if std::env::var("UPDATE_MCP_FIXTURES").as_deref() == Ok("1") {
-        std::fs::create_dir_all(path.parent().expect("fixture dir"))
-            .expect("create fixture dir");
+        std::fs::create_dir_all(path.parent().expect("fixture dir")).expect("create fixture dir");
         std::fs::write(&path, &rendered).expect("write fixture");
         eprintln!("updated fixture: {}", path.display());
         return;
@@ -475,7 +474,9 @@ async fn tools_list_matches_fixture() {
         // tool would show up as one added key and one removed key with identical
         // bodies, which reads as additive when it is not.
         let mut body = tool.clone();
-        body.as_object_mut().expect("tool must be an object").remove("name");
+        body.as_object_mut()
+            .expect("tool must be an object")
+            .remove("name");
         assert!(
             by_name.insert(name.clone(), body).is_none(),
             "duplicate tool name in tools/list: {name}"
@@ -859,9 +860,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
     let tools = response
         .pointer("/result/tools")
         .and_then(Value::as_array)
-        .unwrap_or_else(|| {
-            panic!("recovered request must return the tool list, got: {response}")
-        });
+        .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
         10,
@@ -1106,7 +1105,10 @@ async fn hifi_hqplayer_profiles_returns_an_array() {
     let app = TestApp::new().await;
 
     let text = result_text(&app.call_tool("hifi_hqplayer_profiles", json!({})).await);
-    assert_eq!(text, "[]", "hifi_hqplayer_profiles must return a JSON array");
+    assert_eq!(
+        text, "[]",
+        "hifi_hqplayer_profiles must return a JSON array"
+    );
 }
 
 #[tokio::test]
@@ -1116,8 +1118,11 @@ async fn hifi_hqplayer_load_profile_reports_failure_prefix() {
     let app = TestApp::new().await;
 
     let text = result_text(
-        &app.call_tool("hifi_hqplayer_load_profile", json!({ "profile": "4x-Sinc-L" }))
-            .await,
+        &app.call_tool(
+            "hifi_hqplayer_load_profile",
+            json!({ "profile": "4x-Sinc-L" }),
+        )
+        .await,
     );
     assert!(
         text.starts_with("Error: Failed to load profile: "),
@@ -1276,7 +1281,10 @@ async fn hifi_search_and_hifi_play_report_errors_with_their_own_prefixes() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
-    let text = result_text(&app.call_tool("hifi_search", json!({ "query": "Eagles" })).await);
+    let text = result_text(
+        &app.call_tool("hifi_search", json!({ "query": "Eagles" }))
+            .await,
+    );
     assert_eq!(
         text, "Error: Search error: Browse service not available - not connected to Roon",
         "hifi_search must prefix failures with 'Search error'"
@@ -1316,18 +1324,29 @@ async fn transport_routing_including_the_roon_default_is_pinned() {
 
     let cases: &[(&str, &str, &str)] = &[
         ("lms:aa:bb:cc:dd:ee:ff", "not configured", "explicit lms:"),
-        ("openhome:abc", "Device not found: abc", "explicit openhome:"),
+        (
+            "openhome:abc",
+            "Device not found: abc",
+            "explicit openhome:",
+        ),
         ("upnp:abc", "Renderer not found: abc", "explicit upnp:"),
         ("roon:abc", "Not connected to Roon", "explicit roon:"),
         // Today's defaults. Both belong to #398, not #394.
         ("1601a5d4bare", "Not connected to Roon", "bare id -> Roon"),
-        ("sonos:abc", "Not connected to Roon", "unknown prefix -> Roon"),
+        (
+            "sonos:abc",
+            "Not connected to Roon",
+            "unknown prefix -> Roon",
+        ),
     ];
 
     for (zone_id, expected_fragment, label) in cases {
         let text = result_text(
-            &app.call_tool("hifi_control", json!({ "zone_id": zone_id, "action": "play" }))
-                .await,
+            &app.call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "play" }),
+            )
+            .await,
         );
         assert!(
             text.contains(expected_fragment),
@@ -1495,7 +1514,10 @@ impl LmsHarness {
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert!(found, "LMS player never reached the aggregator as {zone_id}");
+        assert!(
+            found,
+            "LMS player never reached the aggregator as {zone_id}"
+        );
 
         Self {
             app,
@@ -1607,7 +1629,10 @@ async fn lms_control_result_reports_action_and_current_state() {
 
     let text = result_text(
         &h.app
-            .call_tool("hifi_control", json!({ "zone_id": zone_id, "action": "play" }))
+            .call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "play" }),
+            )
             .await,
     );
 
@@ -1699,10 +1724,7 @@ async fn openhome_and_upnp_prefixes_reach_their_own_adapters() {
 
     // The mock devices are live and serving their descriptions.
     let client = reqwest::Client::new();
-    for url in [
-        openhome_mock.description_url(),
-        upnp_mock.description_url(),
-    ] {
+    for url in [openhome_mock.description_url(), upnp_mock.description_url()] {
         let body = client
             .get(&url)
             .send()
@@ -1772,59 +1794,89 @@ use FieldRole::{Consumed, DisplayOnly};
 /// Today's truth, including its defects. `#394` freezes this; it fixes nothing.
 const FIELD_ROLES: &[(&str, FieldRole)] = &[
     // Zone identity closes the loop: every zone-scoped tool takes it.
-    ("zone_id", Consumed("hifi_now_playing/hifi_control/hifi_play.zone_id")),
-    ("zone_name", DisplayOnly(
-        "human label; every tool addresses a zone by zone_id, never by name",
-    )),
-    ("state", DisplayOnly(
-        "playback state readout; hifi_control.action is the write path",
-    )),
-    ("volume", DisplayOnly(
-        "current level readout; hifi_control.value is the write path",
-    )),
-    ("is_muted", DisplayOnly(
-        "mute readout with no corresponding write: hifi_control has no mute action",
-    )),
-    ("title", DisplayOnly(
-        "hifi_search returns {title, subtitle} and no key, so the only route from \
+    (
+        "zone_id",
+        Consumed("hifi_now_playing/hifi_control/hifi_play.zone_id"),
+    ),
+    (
+        "zone_name",
+        DisplayOnly("human label; every tool addresses a zone by zone_id, never by name"),
+    ),
+    (
+        "state",
+        DisplayOnly("playback state readout; hifi_control.action is the write path"),
+    ),
+    (
+        "volume",
+        DisplayOnly("current level readout; hifi_control.value is the write path"),
+    ),
+    (
+        "is_muted",
+        DisplayOnly("mute readout with no corresponding write: hifi_control has no mute action"),
+    ),
+    (
+        "title",
+        DisplayOnly(
+            "hifi_search returns {title, subtitle} and no key, so the only route from \
          'found it' to 'playing it' is handing the title back to hifi_play, which \
          re-searches and takes the first match. That is #392's keystone finding and \
          #396's job — NOT an endorsed design. Listed to freeze today's behavior.",
-    )),
-    ("artist", DisplayOnly(
-        "now-playing readout; hifi_play takes a free-text query, not a field",
-    )),
-    ("album", DisplayOnly(
-        "now-playing readout; hifi_play takes a free-text query, not a field",
-    )),
-    ("subtitle", DisplayOnly(
-        "search-result label, same defect as `title`; see #396",
-    )),
+        ),
+    ),
+    (
+        "artist",
+        DisplayOnly("now-playing readout; hifi_play takes a free-text query, not a field"),
+    ),
+    (
+        "album",
+        DisplayOnly("now-playing readout; hifi_play takes a free-text query, not a field"),
+    ),
+    (
+        "subtitle",
+        DisplayOnly("search-result label, same defect as `title`; see #396"),
+    ),
     // hifi_status / hifi_hqplayer_status readouts.
-    ("connected", DisplayOnly(
-        "boolean health readout; nothing takes a connection state as input",
-    )),
-    ("host", DisplayOnly(
-        "diagnostic address; configuring a host is an HTTP/settings concern, not an MCP tool",
-    )),
-    ("core_name", DisplayOnly(
-        "Roon core label for the operator; no tool selects a core",
-    )),
-    ("roon", DisplayOnly(
-        "hifi_status grouping key, not a value a client passes anywhere",
-    )),
-    ("hqplayer", DisplayOnly(
-        "hifi_status grouping key, not a value a client passes anywhere",
-    )),
-    ("pipeline", DisplayOnly(
-        "hifi_hqplayer_status grouping key wrapping the pipeline readout",
-    )),
-    ("filter", DisplayOnly(
-        "pipeline readout; hifi_hqplayer_set_pipeline writes it via \
+    (
+        "connected",
+        DisplayOnly("boolean health readout; nothing takes a connection state as input"),
+    ),
+    (
+        "host",
+        DisplayOnly(
+            "diagnostic address; configuring a host is an HTTP/settings concern, not an MCP tool",
+        ),
+    ),
+    (
+        "core_name",
+        DisplayOnly("Roon core label for the operator; no tool selects a core"),
+    ),
+    (
+        "roon",
+        DisplayOnly("hifi_status grouping key, not a value a client passes anywhere"),
+    ),
+    (
+        "hqplayer",
+        DisplayOnly("hifi_status grouping key, not a value a client passes anywhere"),
+    ),
+    (
+        "pipeline",
+        DisplayOnly("hifi_hqplayer_status grouping key wrapping the pipeline readout"),
+    ),
+    (
+        "filter",
+        DisplayOnly(
+            "pipeline readout; hifi_hqplayer_set_pipeline writes it via \
          setting='filter1x'/'filterNx', which is a different name",
-    )),
-    ("shaper", Consumed("hifi_hqplayer_set_pipeline.setting='shaper'")),
-    ("rate", Consumed("hifi_hqplayer_set_pipeline.setting='rate'")),
+        ),
+    ),
+    (
+        "shaper",
+        Consumed("hifi_hqplayer_set_pipeline.setting='shaper'"),
+    ),
+    (
+        "rate",
+        Consumed("hifi_hqplayer_set_pipeline.setting='rate'"),
+    ),
 ];
 
 /// Collect every key name reachable in a JSON value, at any depth.
