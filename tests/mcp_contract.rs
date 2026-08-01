@@ -5021,9 +5021,23 @@ async fn unknown_or_stale_resource_uri_is_a_proper_error() {
         let error = response
             .get("error")
             .unwrap_or_else(|| panic!("{uri}: must be refused, got {response}"));
+        assert_eq!(
+            error.get("code").and_then(Value::as_i64),
+            Some(-32002),
+            "{uri}: expected the MCP-conventional resource-not-found code: {error}"
+        );
+        assert_eq!(
+            error.pointer("/data/uri").and_then(Value::as_str),
+            Some(uri),
+            "{uri}: the offending uri must be echoed in the error data: {error}"
+        );
         assert!(
-            error.get("code").and_then(Value::as_i64).is_some(),
-            "{uri}: error must carry a JSON-RPC code: {error}"
+            error
+                .pointer("/data/hint")
+                .and_then(Value::as_str)
+                .is_some_and(|h| h.contains("resources/list")),
+            "{uri}: a stale/unknown resource must point at resources/list to recover, \
+             the way hifi_now_playing's UnknownTarget refusal names hifi_zones: {error}"
         );
         assert!(
             response.get("result").is_none(),

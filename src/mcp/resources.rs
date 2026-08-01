@@ -122,7 +122,11 @@ fn text_resource(uri: &str, payload: &impl Serialize) -> ReadResourceContent {
 }
 
 /// The MCP-conventional "Resource not found" error (`-32002`), carrying the
-/// offending URI so a client can tell which of possibly several requests failed.
+/// offending URI and a discovery hint, so a client can tell which of possibly
+/// several requests failed and how to recover — the resource-side equivalent of
+/// [`crate::mcp::envelope::Refusal::UnknownTarget`]'s `discover_with`, which
+/// names `hifi_zones` for the same underlying fact (an unrecognised or stale
+/// zone id) when a tool hits it instead of a resource read.
 ///
 /// `RpcError` (the type every `ServerHandler` resource method returns) has no
 /// built-in constructor for this code — only `SdkError`, a different type used
@@ -132,7 +136,10 @@ fn resource_not_found(uri: &str) -> RpcError {
     RpcError {
         code: -32002,
         message: "Resource not found".to_string(),
-        data: Some(serde_json::json!({ "uri": uri })),
+        data: Some(serde_json::json!({
+            "uri": uri,
+            "hint": "call resources/list for the current set of valid URIs",
+        })),
     }
 }
 
