@@ -1035,8 +1035,7 @@ async fn resource_methods_dispatch_now_that_resources_is_declared() {
             json!({ "jsonrpc": "2.0", "id": 10, "method": "resources/list", "params": {} }),
         )
         .await;
-    let list_response =
-        list_response.expect("resources/list must return a JSON-RPC response");
+    let list_response = list_response.expect("resources/list must return a JSON-RPC response");
     assert!(
         list_response.get("error").is_none(),
         "resources/list must no longer be refused: {list_response}"
