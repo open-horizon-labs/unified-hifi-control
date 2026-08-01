@@ -95,11 +95,13 @@ fn canonical_setting(setting: &str) -> Option<&'static str> {
     }
 }
 
-pub async fn handle_status(state: &AppState) -> Result<CallToolResult, CallToolError> {
+/// Shared by [`handle_status`] and the `hifi://hqplayer/status` resource
+/// ([`crate::mcp::resources`]), so the two cannot disagree.
+pub async fn hqp_status_payload(state: &AppState) -> McpHqpStatus {
     let status = state.hqplayer.get_status().await;
     let pipeline = state.hqplayer.get_pipeline_status().await.ok();
 
-    let mcp_status = McpHqpStatus {
+    McpHqpStatus {
         connected: status.connected,
         host: status.host,
         pipeline: pipeline.map(|p| McpPipelineStatus {
@@ -108,18 +110,31 @@ pub async fn handle_status(state: &AppState) -> Result<CallToolResult, CallToolE
             shaper: p.status.active_shaper,
             rate: p.status.active_rate,
         }),
-    };
+    }
+}
+
+/// Shared by [`handle_profiles`] and the `hifi://hqplayer/profiles` resource
+/// ([`crate::mcp::resources`]), so the two cannot disagree.
+pub async fn hqp_profiles_payload(state: &AppState) -> Vec<String> {
+    state
+        .hqplayer
+        .get_cached_profiles()
+        .await
+        .into_iter()
+        .map(|p| p.title)
+        .collect()
+}
+
+pub async fn handle_status(state: &AppState) -> Result<CallToolResult, CallToolError> {
     Ok(Envelope::read("hifi_hqplayer_status", "get_status")
         .scope(Scope::provider_only(Provider::HqPlayer))
-        .json_result(&mcp_status))
+        .json_result(&hqp_status_payload(state).await))
 }
 
 pub async fn handle_profiles(state: &AppState) -> Result<CallToolResult, CallToolError> {
-    let profiles = state.hqplayer.get_cached_profiles().await;
-    let profile_names: Vec<String> = profiles.into_iter().map(|p| p.title).collect();
     Ok(Envelope::read("hifi_hqplayer_profiles", "list_profiles")
         .scope(Scope::provider_only(Provider::HqPlayer))
-        .json_result(&profile_names))
+        .json_result(&hqp_profiles_payload(state).await))
 }
 
 pub async fn handle_load_profile(
