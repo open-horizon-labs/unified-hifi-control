@@ -369,12 +369,22 @@ enum ResultRouting {
 /// deliberately the same shape so the two cannot drift:
 ///
 /// - **`req_id` is authoritative.** `Browse::browse`/`Browse::load` return the
-///   request id UHC stores as its map key (fork `src/browse.rs:126-154`), `Moo`
+///   request id UHC stores as its map key (fork `src/browse.rs:126-154`) and `Moo`
 ///   allocates those ids from one monotonic per-connection counter (fork
-///   `src/moo.rs:124-135`), and the response carries it back in its `Request-Id`
-///   header. So it names exactly one submitted request. It is also unique across
-///   both maps, but the type system already prevents a `BrowseResult` from
-///   reaching a `pending_loads` waiter, so each kind searches only its own map.
+///   `src/moo.rs:124-135`), so an id names exactly one submitted request. It is
+///   also unique across both maps, but the type system already prevents a
+///   `BrowseResult` from reaching a `pending_loads` waiter, so each kind searches
+///   only its own map.
+///
+///   That the id *in the arriving message* is one of those ids is not a claim
+///   about Roon's wire protocol - it is structural. `Browse::parse_msg` returns
+///   `Parsed::None` unless `msg["request_id"]` is a key in the fork's own
+///   `session_keys` map (fork `src/browse.rs:157-162`), which holds exactly the
+///   ids `browse()`/`load()` handed back. So the existence of a
+///   `Parsed::BrowseResult` at all proves its id was issued for a browse or a
+///   load. Which is why `NoWaiter` needs no further explanation: if UHC's map does
+///   not hold that id, UHC removed it - resolved already, or timed out and cleaned
+///   up - and dropping the result is right.
 ///
 /// - **The session key is still checked**, because that counter restarts at 0 on
 ///   every reconnect (fork `src/moo.rs:92`): a result arriving on a fresh

@@ -656,7 +656,9 @@ pub struct BrowseItemResponse {
 ///   `session_key` so a client can choose to continue in it. Anything building a
 ///   multi-client navigation surface on this route - #399's MCP browse handle - must
 ///   mint one key per client session and keep concurrent use of a single key out of
-///   reach, not merely undocumented.
+///   reach, not merely undocumented. If a design genuinely needs two clients at one
+///   position, the missing piece is serialising requests per key; that is a separate
+///   change and it does not replace this one.
 ///
 /// The parameter is kept rather than removed: it is the only way to walk a hierarchy
 /// across requests, and removing it would be an API change requiring explicit
