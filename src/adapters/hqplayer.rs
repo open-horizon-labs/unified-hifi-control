@@ -4427,7 +4427,7 @@ impl HqpAdapter {
         writer.write_event(Event::Empty(elem)).unwrap();
 
         format!(
-            "<?xml version=\"1.0\"?>{}",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>{}",
             String::from_utf8(writer.into_inner().into_inner()).unwrap()
         )
     }
@@ -8419,6 +8419,22 @@ fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod wire_framing_tests {
+    use super::*;
+
+    /// hqplayerd 6.x treats the XML declaration as part of the control protocol
+    /// framing. In particular, the Embedded daemon resets a TCP connection that
+    /// sends a declaration without an explicit UTF-8 encoding.
+    #[test]
+    fn native_requests_use_the_hqplayer_utf8_xml_declaration() {
+        assert_eq!(
+            HqpAdapter::build_request("GetInfo", &[]),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><GetInfo/>"
+        );
+    }
 }
 
 #[cfg(test)]
