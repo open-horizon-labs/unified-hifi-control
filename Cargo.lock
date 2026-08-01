@@ -4607,6 +4607,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-test",
+ "tokio-tungstenite 0.21.0",
  "tokio-util",
  "tower",
  "tower-http",

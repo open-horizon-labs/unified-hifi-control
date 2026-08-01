@@ -11,7 +11,7 @@ use roon_api::{
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
     transport::{self, volume, Control, Transport, Zone as RoonZone},
-    CoreEvent, Info, Parsed, RoonApi, Services, Svc,
+    CoreEvent, Info, Parsed, RoonApi, RoonApiError, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -119,6 +119,378 @@ type BrowseRequest = oneshot::Sender<Result<BrowseResult>>;
 
 /// Pending load request - stores the oneshot sender to deliver the result
 type LoadRequest = oneshot::Sender<Result<LoadResult>>;
+
+// =============================================================================
+// Core-reported browse rejections (issue #405)
+// =============================================================================
+//
+// Roon Core answers an unusable browse or load request with a named error
+// instead of a result. The pinned fork surfaces that as
+// `Parsed::Error(RoonApiError::Browse*)`, carrying both the originating
+// `req_id` and the request's `multi_session_key` (see the fork's
+// `src/browse.rs:174-188`).
+//
+// Before #405 the event loop dropped those messages, so the waiting caller sat
+// out the full `BROWSE_TIMEOUT` and then reported "Browse request timed out" -
+// the same thing an unreachable Core produces. The types below carry the
+// Core's actual answer back to the caller, promptly and distinguishably.
+//
+// Two things about the delivery path, both established by reading the pinned
+// fork and neither observable from here, so they are recorded rather than
+// assumed:
+//
+// - Services are tried in order with a `break` on the first that claims a
+//   message (fork `src/lib.rs:597-631`), and Transport is tried before Browse.
+//   `Transport::parse_msg` gates every push on its own subscription ids, so it
+//   returns an empty `Vec` for a browse message and declines to claim it
+//   (fork `src/transport.rs:451-540`). If that ever changes, browse errors get
+//   swallowed inside the dependency and nothing here can see it.
+// - `Browse::parse_msg` matches four literal error names against `msg["name"]`
+//   (fork `src/browse.rs:174-188`). A Core that spells one differently yields
+//   `Parsed::None`, which the fork drops, and the caller times out as it did
+//   before - with this module's tests still green. That half is wire-level and
+//   is #408's to pin.
+
+/// Which browse/load rejection Roon Core reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoonBrowseErrorKind {
+    /// The `item_key` is not valid in the browse session it was used in: it has
+    /// expired, the session was reset, or it was minted somewhere else.
+    /// Recoverable - re-acquire the key (search or browse again) and retry.
+    ///
+    /// The recovery instruction in [`RoonBrowseErrorKind::explain`] is written
+    /// for a caller that holds a key - `play_item` and `/roon/browse`. `search`
+    /// mints and consumes its own keys internally, so a rejection there reaches
+    /// a client that never held one; retrying the search is still the right
+    /// move, but a caller-facing surface may want to reword it (#395, #396).
+    InvalidItemKey,
+    /// The `level` / `pop_levels` in the request do not exist in this session.
+    /// Recoverable - browse again from a level the caller still holds.
+    InvalidLevels,
+    /// The `zone_or_output_id` in the request is unknown to the Core. Not
+    /// fixed by retrying: the caller has to name a zone that exists.
+    ZoneNotFound,
+    /// The Core reported an unexpected failure for this request.
+    UnexpectedError,
+}
+
+impl RoonBrowseErrorKind {
+    /// Stable machine-readable tag for logs and callers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidItemKey => "invalid_item_key",
+            Self::InvalidLevels => "invalid_levels",
+            Self::ZoneNotFound => "zone_not_found",
+            Self::UnexpectedError => "unexpected_error",
+        }
+    }
+
+    /// True when the caller can recover by re-acquiring its reference and
+    /// retrying immediately, rather than by waiting for the Core.
+    pub fn is_recoverable(self) -> bool {
+        matches!(self, Self::InvalidItemKey | Self::InvalidLevels)
+    }
+
+    /// Human-readable explanation, including the recovery instruction where
+    /// there is one. Deliberately never contains the word "timeout" - callers
+    /// and operators must be able to tell these apart at a glance.
+    fn explain(self) -> &'static str {
+        match self {
+            Self::InvalidItemKey => {
+                "Roon Core rejected the item key: it is no longer valid in this \
+                 browse session - search or browse again to get a fresh key"
+            }
+            Self::InvalidLevels => {
+                "Roon Core rejected the browse level: this browse session is not \
+                 at that level - browse again from a level you still hold"
+            }
+            Self::ZoneNotFound => {
+                "Roon Core does not recognise the zone or output in this browse \
+                 request"
+            }
+            Self::UnexpectedError => {
+                "Roon Core reported an unexpected error for this browse request"
+            }
+        }
+    }
+}
+
+/// A browse or load request that Roon Core answered with a rejection.
+///
+/// Distinct from a timeout: the Core answered, and it answered "no". Returned
+/// inside the `anyhow::Error` that `browse`, `load`, `search`, `play_item` and
+/// `search_and_play` already return, so no signature changes; recover it with
+/// [`RoonBrowseError::from_error`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoonBrowseError {
+    /// What the Core rejected.
+    pub kind: RoonBrowseErrorKind,
+    /// The `multi_session_key` the rejected request ran in, as reported by the
+    /// Core. `None` only if the request carried no session key.
+    pub session_key: Option<String>,
+}
+
+impl RoonBrowseError {
+    fn new(kind: RoonBrowseErrorKind, session_key: Option<&str>) -> Self {
+        Self {
+            kind,
+            session_key: session_key.map(str::to_string),
+        }
+    }
+
+    /// Recover the typed rejection from an error returned by the browse-backed
+    /// adapter methods. `None` means the failure was something else - a
+    /// timeout, a lost Core, or Browse not being connected - so callers can
+    /// keep those classes apart without matching on message text.
+    pub fn from_error(err: &anyhow::Error) -> Option<&Self> {
+        err.downcast_ref::<Self>()
+    }
+}
+
+impl std::error::Error for RoonBrowseError {}
+
+impl std::fmt::Display for RoonBrowseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind.explain())?;
+        if let Some(session_key) = &self.session_key {
+            write!(f, " (browse session '{}')", session_key)?;
+        }
+        Ok(())
+    }
+}
+
+/// Where a Core rejection ended up. Reported for logging and asserted by the
+/// correlation tests; the caller-visible effect is the resolved oneshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorRouting {
+    /// Delivered to the pending browse holding this `req_id`.
+    Browse,
+    /// Delivered to the pending load holding this `req_id`.
+    Load,
+    /// Delivered to the pending image request holding this `req_id`.
+    Image,
+    /// The waiter was found and removed, but its receiver was already gone.
+    ReceiverGone,
+    /// No request with this `req_id` is pending - it was already resolved, or
+    /// the caller timed out and cleaned up. Dropping the rejection is correct.
+    NoWaiter,
+    /// A request with this `req_id` is pending but carries a different session
+    /// or image key, so it was left alone to hit its own timeout rather than
+    /// being resolved with someone else's rejection.
+    KeyMismatch,
+}
+
+/// Deliver a Core rejection to a waiting browse or load request.
+/// Returns whether the waiter was still listening.
+fn deliver_browse_rejection<T>(
+    sender: oneshot::Sender<Result<T>>,
+    kind: RoonBrowseErrorKind,
+    session_key: Option<&str>,
+) -> bool {
+    sender
+        .send(Err(anyhow::Error::new(RoonBrowseError::new(
+            kind,
+            session_key,
+        ))))
+        .is_ok()
+}
+
+// =============================================================================
+// Browse/load result correlation (issue #416)
+// =============================================================================
+//
+// #405 made `req_id` primary for the *rejection* arms and left the success arms
+// scanning `pending_browses` / `pending_loads` for the first entry whose session
+// key matched. A session key names a browse *session*, not a request - `search()`
+// reuses one across six requests and `/roon/browse` lets a caller supply its own -
+// so with two requests in flight under one key, first-match-wins handed a caller
+// the other's list as a success. #416 applies #405's argument to those arms.
+//
+// The `req_id` is available here without a fork change, which #405's PR did not
+// realise: the fork's event channel is
+// `Receiver<(CoreEvent, Option<(serde_json::Value, Parsed)>)>` and for browse
+// results it forwards the *raw MOO message* next to the parsed value (fork
+// `src/lib.rs:620-630`). That message carries `request_id` - the fork's own
+// `Browse::parse_msg` reads `msg["request_id"]` off it to find the session key
+// (fork `src/browse.rs:157`). UHC was discarding it with `if let Some((_,
+// parsed)) = msg`.
+
+/// The MOO `request_id` of the raw message a [`Parsed`] value was decoded from.
+///
+/// `None` means the message cannot be correlated - see
+/// [`ResultRouting::Uncorrelated`] for what that costs and why guessing is worse.
+///
+/// Only the string form is accepted, because that is the only form that can reach
+/// here: MOO carries the id in a `Request-Id` header, which the fork copies in as a
+/// string (fork `src/moo.rs:354-355`), and both `Browse::parse_msg` and
+/// `Image::parse_msg` do `msg["request_id"].as_str().unwrap().parse::<usize>()`
+/// before producing anything - so a non-string id panics inside the dependency long
+/// before it gets here. Accepting a numeric id would be unreachable code pretending
+/// to be robustness.
+fn moo_request_id(raw_msg: &serde_json::Value) -> Option<usize> {
+    raw_msg
+        .get("request_id")
+        .and_then(|value| value.as_str())
+        .and_then(|id| id.parse::<usize>().ok())
+}
+
+/// Where a browse/load result ended up. Reported for logging and asserted by the
+/// correlation tests; the caller-visible effect is the resolved oneshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultRouting {
+    /// Delivered to the request holding this `req_id`.
+    Delivered,
+    /// The waiter was found and removed, but its receiver was already gone.
+    ReceiverGone,
+    /// No request with this `req_id` is pending - it was already resolved, or the
+    /// caller timed out and cleaned up. Dropping the result is correct.
+    NoWaiter,
+    /// A request with this `req_id` is pending but carries a different session
+    /// key, so it was left alone to hit its own timeout rather than being
+    /// resolved with someone else's result.
+    KeyMismatch,
+    /// The message carried no usable `request_id`, so nothing can say which
+    /// request it answers. The waiter is left to its own `BROWSE_TIMEOUT`.
+    ///
+    /// Unreachable with the pinned fork - a `Parsed::BrowseResult` only exists
+    /// because `Browse::parse_msg` already parsed `msg["request_id"]` as a
+    /// `usize`, and the fork forwards that same message. It is a variant rather
+    /// than an assumption because the alternative, falling back to the
+    /// session-key scan, is precisely the silent cross-delivery #416 removes. A
+    /// fork that started nulling the raw message for browse - as it already does
+    /// for images (fork `src/lib.rs:634-639`) - would then reintroduce the bug
+    /// quietly. This makes it a loud 10s timeout with a `warn` instead.
+    Uncorrelated,
+}
+
+/// Route a browse or load *result* to the exact request waiting on it.
+///
+/// Same rule as [`RoonState::route_browse_rejection`], for the same reasons, and
+/// deliberately the same shape so the two cannot drift:
+///
+/// - **`req_id` is authoritative.** `Browse::browse`/`Browse::load` return the
+///   request id UHC stores as its map key (fork `src/browse.rs:126-154`) and `Moo`
+///   allocates those ids from one monotonic per-connection counter (fork
+///   `src/moo.rs:124-135`), so an id names exactly one submitted request. It is
+///   also unique across both maps, but the type system already prevents a
+///   `BrowseResult` from reaching a `pending_loads` waiter, so each kind searches
+///   only its own map.
+///
+///   That the id *in the arriving message* is one of those ids is not a claim
+///   about Roon's wire protocol - it is structural. `Browse::parse_msg` returns
+///   `Parsed::None` unless `msg["request_id"]` is a key in the fork's own
+///   `session_keys` map (fork `src/browse.rs:157-162`), which holds exactly the
+///   ids `browse()`/`load()` handed back. So the existence of a
+///   `Parsed::BrowseResult` at all proves its id was issued for a browse or a
+///   load. Which is why `NoWaiter` needs no further explanation: if UHC's map does
+///   not hold that id, UHC removed it - resolved already, or timed out and cleaned
+///   up - and dropping the result is right.
+///
+/// - **The session key is still checked**, because request ids are unique only
+///   within one connection: every `Moo` starts its counter at 0 (fork
+///   `src/moo.rs:92`). On a mismatch the waiter is left alone and falls back to
+///   `BROWSE_TIMEOUT`, because being resolved with another caller's *success* is
+///   the worst outcome available here. Keep this check. It costs one string
+///   comparison and nothing near this code says request ids are only
+///   per-connection unique.
+///
+///   **What makes it reachable is not the reconnect story #405 attached to it.**
+///   That story - a stale entry still holding an id a fresh connection reissues -
+///   is hard to reach on this path: `CoreEvent::Lost` clears all three pending
+///   maps and drops the Browse service, `run_roon_loop` clears them again on the
+///   way out, and even if an entry survived, the colliding `insert` would
+///   overwrite it (resolving that caller promptly with "cancelled") so the map
+///   would hold the *new* request's key by the time a result arrived. The case
+///   that does not depend on a race is **more than one live connection**: the fork
+///   keeps its Moos in a `Vec` and will register with every Core that answers
+///   discovery, each with its own counter from 0, while UHC's `Registered` arm
+///   keeps only the last Core's Browse service. Two Cores on one LAN therefore
+///   means two overlapping id spaces on one channel. Not observed - recorded
+///   because it is the reason to keep the guard, and it is a better reason than
+///   the one it replaces. #405's suggestion of stamping entries with a connection
+///   generation would close it properly.
+///
+/// Resolution is exactly-once: the entry is removed before the send, and every
+/// mutation of these maps happens synchronously under the one state `RwLock`, so a
+/// caller's timeout cleanup and this routing interleave but never overlap. A
+/// `KeyMismatch` deliberately does not remove - that entry belongs to a caller
+/// still inside its own timeout, whose cleanup owns it.
+fn route_pending_result<T>(
+    pending: &mut HashMap<usize, (Option<String>, oneshot::Sender<Result<T>>)>,
+    req_id: Option<usize>,
+    session_key: Option<&str>,
+    result: T,
+) -> ResultRouting {
+    let Some(req_id) = req_id else {
+        return ResultRouting::Uncorrelated;
+    };
+
+    let matches = matches!(
+        pending.get(&req_id),
+        Some((pending_key, _)) if pending_key.as_deref() == session_key
+    );
+    if matches {
+        if let Some((_, sender)) = pending.remove(&req_id) {
+            return if sender.send(Ok(result)).is_ok() {
+                ResultRouting::Delivered
+            } else {
+                ResultRouting::ReceiverGone
+            };
+        }
+    }
+
+    if pending.contains_key(&req_id) {
+        return ResultRouting::KeyMismatch;
+    }
+
+    ResultRouting::NoWaiter
+}
+
+/// Log what became of a browse/load result. `KeyMismatch` and `Uncorrelated` are
+/// `warn` because each one costs a caller the full `BROWSE_TIMEOUT`, and before
+/// #416 both were invisible.
+fn log_result_routing(
+    routing: ResultRouting,
+    what: &str,
+    req_id: Option<usize>,
+    session_key: Option<&str>,
+) {
+    match routing {
+        ResultRouting::Delivered => tracing::debug!(
+            "Roon {} result delivered to req_id {:?} (session {:?})",
+            what,
+            req_id,
+            session_key
+        ),
+        ResultRouting::ReceiverGone => tracing::debug!(
+            "Roon {} result arrived after its caller gave up: req_id {:?} (session {:?})",
+            what,
+            req_id,
+            session_key
+        ),
+        ResultRouting::NoWaiter => tracing::debug!(
+            "Roon {} result with nothing waiting on it (already resolved or timed \
+             out): req_id {:?} (session {:?})",
+            what,
+            req_id,
+            session_key
+        ),
+        ResultRouting::KeyMismatch => tracing::warn!(
+            "Roon {} result not routed - req_id {:?} is pending under a different \
+             session key, so it was left for its own timeout (result was for \
+             session {:?})",
+            what,
+            req_id,
+            session_key
+        ),
+        ResultRouting::Uncorrelated => tracing::warn!(
+            "Roon {} result carried no request id, so it could not be correlated \
+             and was dropped; the caller will time out (session {:?})",
+            what,
+            session_key
+        ),
+    }
+}
 
 /// Image data returned from Roon
 #[derive(Debug, Clone)]
@@ -246,6 +618,149 @@ struct RoonState {
     pending_loads: HashMap<usize, (Option<String>, LoadRequest)>,
 }
 
+impl RoonState {
+    /// Route a Core browse/load rejection to the exact request waiting on it.
+    ///
+    /// Correlation is by `req_id`, cross-checked against the session key:
+    ///
+    /// - `req_id` is authoritative. The fork hands back the same request id
+    ///   that `Browse::browse`/`Browse::load` returned when the request was
+    ///   submitted (fork `src/browse.rs:126-154`, read back off the wire at
+    ///   `:157`), and `Moo` allocates request ids from one monotonic
+    ///   per-connection counter (fork `src/moo.rs:124-135`). So a `req_id`
+    ///   names exactly one submitted request, and `pending_browses` and
+    ///   `pending_loads` cannot both hold it. That is strictly better than the
+    ///   session-key scan the success arms are forced into: a session key is
+    ///   shared by every request in a browse session (`search()` reuses one
+    ///   across six requests, and `/roon/browse` lets a caller supply its own),
+    ///   so scanning for it cannot say *which* request was refused - nor even
+    ///   whether it was a browse or a load.
+    ///
+    /// - The session key is checked because that counter restarts at 0 on every
+    ///   reconnect (fork `src/moo.rs:92`): a rejection arriving on a fresh
+    ///   connection can carry a request id that an older, not-yet-timed-out
+    ///   entry still occupies. On a mismatch the waiter is left alone and falls
+    ///   back to `BROWSE_TIMEOUT` - the pre-#405 behavior - because resolving
+    ///   the wrong caller is worse than resolving them late. Do not remove this
+    ///   check as redundant: `req_id` uniqueness is per-connection only, and
+    ///   nothing near this code says so.
+    ///
+    /// The pair is not a unique key, and this narrows the reconnect window
+    /// rather than closing it. Session keys are not unique either - a caller
+    /// that reuses one across a reconnect (`/roon/browse` accepts a
+    /// caller-supplied `session_key`) can produce a stale entry and a fresh
+    /// request that agree on both. Both callers get an error either way, and
+    /// neither is ever told a wrong *success*; today both simply time out. If a
+    /// long-lived browse tree is ever built on one session key (#399), stamp the
+    /// pending entries with a connection generation instead.
+    ///
+    /// Resolution is exactly-once because every path removes the entry before
+    /// sending *and* every mutation of these maps is synchronous while the one
+    /// state `RwLock` is held - so a caller's timeout cleanup and this routing
+    /// can interleave but never overlap. A repeated rejection finds nothing; a
+    /// caller that timed out first leaves nothing to find. A `KeyMismatch`
+    /// deliberately does **not** remove: that entry belongs to a caller still
+    /// inside its `BROWSE_TIMEOUT`, whose own cleanup owns it. Removing it here
+    /// would be the strand, not the fix.
+    ///
+    /// Both maps are searched for an entry where *both* the request id and the
+    /// session key match before any mismatch is reported. A mismatched entry in
+    /// one map must not hide a matching entry in the other - that too is only
+    /// reachable through a reconnect id collision, but reporting a mismatch
+    /// early would cost a legitimate waiter its prompt answer.
+    fn route_browse_rejection(
+        &mut self,
+        req_id: usize,
+        session_key: Option<&str>,
+        kind: RoonBrowseErrorKind,
+    ) -> ErrorRouting {
+        let browse_matches = matches!(
+            self.pending_browses.get(&req_id),
+            Some((pending_key, _)) if pending_key.as_deref() == session_key
+        );
+        if browse_matches {
+            if let Some((_, sender)) = self.pending_browses.remove(&req_id) {
+                return if deliver_browse_rejection(sender, kind, session_key) {
+                    ErrorRouting::Browse
+                } else {
+                    ErrorRouting::ReceiverGone
+                };
+            }
+        }
+
+        let load_matches = matches!(
+            self.pending_loads.get(&req_id),
+            Some((pending_key, _)) if pending_key.as_deref() == session_key
+        );
+        if load_matches {
+            if let Some((_, sender)) = self.pending_loads.remove(&req_id) {
+                return if deliver_browse_rejection(sender, kind, session_key) {
+                    ErrorRouting::Load
+                } else {
+                    ErrorRouting::ReceiverGone
+                };
+            }
+        }
+
+        if self.pending_browses.contains_key(&req_id) || self.pending_loads.contains_key(&req_id) {
+            return ErrorRouting::KeyMismatch;
+        }
+
+        ErrorRouting::NoWaiter
+    }
+
+    /// Route a browse result to the browse request that asked for it (issue #416).
+    ///
+    /// See [`route_pending_result`] for the correlation rule and why it matches
+    /// [`RoonState::route_browse_rejection`]'s.
+    fn route_browse_result(
+        &mut self,
+        req_id: Option<usize>,
+        session_key: Option<&str>,
+        result: BrowseResult,
+    ) -> ResultRouting {
+        route_pending_result(&mut self.pending_browses, req_id, session_key, result)
+    }
+
+    /// Route a load result to the load request that asked for it (issue #416).
+    fn route_load_result(
+        &mut self,
+        req_id: Option<usize>,
+        session_key: Option<&str>,
+        result: LoadResult,
+    ) -> ResultRouting {
+        route_pending_result(&mut self.pending_loads, req_id, session_key, result)
+    }
+
+    /// Route a Core image rejection to the request waiting on it.
+    ///
+    /// Same rule as [`RoonState::route_browse_rejection`], with the image key
+    /// standing in for the session key. `get_image` reads `None` as "Image not
+    /// found", so the caller gets an answer instead of a 10s timeout.
+    ///
+    /// Accepted lossiness: `pending_images` senders carry `Option<ImageData>`,
+    /// so `ImageNotFound` and `ImageUnexpectedError` both arrive at the caller
+    /// as "Image not found". The distinction survives only in the log line the
+    /// event loop writes. Widening `ImageRequest` to a `Result` would carry it
+    /// through, and is not worth the churn for cover art.
+    fn route_image_rejection(&mut self, req_id: usize, image_key: &str) -> ErrorRouting {
+        if let Some((pending_key, _)) = self.pending_images.get(&req_id) {
+            if pending_key != image_key {
+                return ErrorRouting::KeyMismatch;
+            }
+            if let Some((_, sender)) = self.pending_images.remove(&req_id) {
+                return if sender.send(None).is_ok() {
+                    ErrorRouting::Image
+                } else {
+                    ErrorRouting::ReceiverGone
+                };
+            }
+        }
+
+        ErrorRouting::NoWaiter
+    }
+}
+
 /// Roon adapter
 #[derive(Clone)]
 pub struct RoonAdapter {
@@ -332,6 +847,50 @@ impl RoonAdapter {
         });
 
         Ok(())
+    }
+
+    /// Test seam (issue #408): run the Roon event loop against a Core at a known
+    /// address, skipping SOOD multicast discovery.
+    ///
+    /// **Not for production use** — `AdapterLogic::run` is the production entry
+    /// point and always discovers. This exists so `tests/roon_protocol.rs` can
+    /// drive the *real* event loop (including the pending-browse/load correlation
+    /// maps) against `tests/mock_servers/roon_core.rs`. Driving the real loop is
+    /// the whole point: a test that reimplemented the loop would assert nothing
+    /// about this file.
+    ///
+    /// SOOD-based discovery against a fake was rejected deliberately: it needs UDP
+    /// multicast, which is process-global, cannot be scoped to one test, and is why
+    /// this repo's `/hqp/discover` tests already pass in CI while failing on a
+    /// developer machine.
+    ///
+    /// Returns when the Core is lost or `stop()` is called.
+    #[doc(hidden)]
+    pub async fn run_event_loop_against_core_for_tests(
+        &self,
+        ip: std::net::IpAddr,
+        port: &str,
+    ) -> Result<()> {
+        let base_url = self
+            .base_url
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| "http://test.invalid".to_string());
+        let shutdown = self.shutdown.read().await.clone();
+
+        run_roon_loop(
+            self.state.clone(),
+            self.bus.clone(),
+            base_url,
+            shutdown,
+            self.knob_store.clone(),
+            CoreConnect::Direct {
+                ip,
+                port: port.to_string(),
+            },
+        )
+        .await
     }
 
     /// Stop the Roon adapter (internal - use Startable trait)
@@ -601,6 +1160,15 @@ impl RoonAdapter {
         let req_id = match req_id {
             Some(id) => {
                 let mut state = self.state.write().await;
+                // This `insert` overwrites any entry already holding `id`, dropping
+                // that caller's sender - which resolves it promptly with "Browse
+                // request cancelled" instead of leaving it to a 10s timeout. That
+                // needs two overlapping request-id spaces to happen at all (see
+                // `route_pending_result`), and the outcome is an improvement on what
+                // the evicted caller had, so it is left alone. Do not "fix" it by
+                // symmetry with `pending_images`, where the same shape is a real
+                // defect because there two callers collide whenever they want the
+                // same image key.
                 state
                     .pending_browses
                     .insert(id, (Some(session_key.clone()), tx));
@@ -1301,6 +1869,7 @@ impl AdapterLogic for RoonAdapter {
             base_url,
             ctx.shutdown,
             self.knob_store.clone(),
+            CoreConnect::Discovery,
         )
         .await
     }
@@ -1460,6 +2029,17 @@ fn roon_zone_to_bus_zone(zone: &Zone) -> BusZone {
     }
 }
 
+/// How the event loop obtains its connection to a Roon Core.
+///
+/// Production always uses [`CoreConnect::Discovery`]; `Direct` exists only for
+/// `RoonAdapter::run_event_loop_against_core_for_tests` (issue #408).
+enum CoreConnect {
+    /// SOOD multicast discovery, then WebSocket to whatever answers.
+    Discovery,
+    /// WebSocket straight to a known address, no discovery.
+    Direct { ip: std::net::IpAddr, port: String },
+}
+
 /// Main Roon event loop
 async fn run_roon_loop(
     state: Arc<RwLock<RoonState>>,
@@ -1467,6 +2047,7 @@ async fn run_roon_loop(
     base_url: String,
     shutdown: CancellationToken,
     knob_store: Option<KnobStore>,
+    connect: CoreConnect,
 ) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
 
@@ -1518,15 +2099,35 @@ async fn run_roon_loop(
     let state_path_clone = state_path_str.clone();
     let get_roon_state = move || RoonApi::load_roon_state(&state_path_clone);
 
-    // Start discovery
-    let (mut handles, mut core_rx) = roon
-        .start_discovery(Box::new(get_roon_state), provided, Some(services))
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Failed to start Roon discovery"))?;
-
-    tracing::info!(
-        "Roon discovery started, waiting for core (authorize in Roon → Settings → Extensions)..."
-    );
+    // Start discovery (or, for tests, connect straight to a known Core)
+    let (mut handles, mut core_rx) = match connect {
+        CoreConnect::Discovery => {
+            let started = roon
+                .start_discovery(Box::new(get_roon_state), provided, Some(services))
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Failed to start Roon discovery"))?;
+            tracing::info!(
+                "Roon discovery started, waiting for core (authorize in Roon → Settings → Extensions)..."
+            );
+            started
+        }
+        CoreConnect::Direct { ip, ref port } => {
+            let connected = roon
+                .ws_connect(
+                    Box::new(get_roon_state),
+                    provided,
+                    Some(services),
+                    &ip,
+                    port,
+                )
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Failed to connect to Roon Core at {}:{}", ip, port)
+                })?;
+            tracing::info!("Connected directly to Roon Core at {}:{}", ip, port);
+            connected
+        }
+    };
 
     // Event processing task
     let state_for_events = state.clone();
@@ -1662,7 +2263,10 @@ async fn run_roon_loop(
             }
 
             // Handle parsed messages
-            if let Some((_, parsed)) = msg {
+            // `raw_msg` is the MOO message the `Parsed` value was decoded from. It
+            // carries the `request_id` the browse/load result arms correlate on
+            // (issue #416); before them it was discarded here.
+            if let Some((raw_msg, parsed)) = msg {
                 match parsed {
                     Parsed::RoonState(roon_state) => {
                         // Persist pairing state to data directory
@@ -1806,6 +2410,32 @@ async fn run_roon_loop(
                             });
                         }
                     }
+                    // Issue #416 checked these two arms and deliberately left them
+                    // scanning, because `pending_images` shares the *shape* of the
+                    // browse defect without sharing the defect:
+                    //
+                    // - The `req_id` is not available here. For image responses the
+                    //   fork replaces the raw message with `Value::Null` before
+                    //   sending (fork `src/lib.rs:634-639`), so unlike the browse
+                    //   arms there is nothing to read a `request_id` off. Correcting
+                    //   these would need a fork change.
+                    // - It cannot cross-deliver anyway. `Image::get_image`
+                    //   deduplicates in-flight requests by image key (fork
+                    //   `src/image.rs:77-110`): a second request for a key already in
+                    //   flight is handed the *first* request's `req_id` rather than
+                    //   being sent. So `pending_images` cannot hold two entries with
+                    //   one image key, and the scan below can only ever match the
+                    //   one request that asked for this key. The correlation key is
+                    //   the content's identity here, which is exactly what a session
+                    //   key is not.
+                    //
+                    // What that dedup *does* cost is a lost waiter, not a wrong
+                    // result: two concurrent `get_image` calls for one key resolve
+                    // to the same `req_id`, so the second `pending_images.insert`
+                    // evicts the first caller's sender and that caller gets "Image
+                    // request cancelled" while the second gets the image. Different
+                    // defect, different fix (fan-out per key), out of #416's scope -
+                    // recorded here rather than silently left.
                     Parsed::Jpeg((image_key, data)) => {
                         tracing::debug!(
                             "Received JPEG image: {} ({} bytes)",
@@ -1862,28 +2492,25 @@ async fn run_roon_loop(
                             }
                         }
                     }
+                    // Issue #416: correlate on the `req_id` in the raw MOO message,
+                    // with the session key as the reconnect guard - the same rule
+                    // as the Parsed::Error arm below, deliberately. `Parsed`
+                    // itself carries no req_id for results, so this arm reads it
+                    // off `raw_msg`; scanning for the first pending request whose
+                    // session key matched is what silently handed one caller
+                    // another's list.
                     Parsed::BrowseResult(result, session_key) => {
                         tracing::debug!(
                             "Roon BrowseResult action={:?}, session_key={:?}",
                             result.action,
                             session_key
                         );
-                        let mut s = state_for_events.write().await;
-                        if let Some(req_id) = s
-                            .pending_browses
-                            .iter()
-                            .find(|(_, (key, _))| key == &session_key)
-                            .map(|(k, _)| *k)
-                        {
-                            if let Some((_key, sender)) = s.pending_browses.remove(&req_id) {
-                                if sender.send(Ok(result)).is_err() {
-                                    tracing::debug!(
-                                        "Browse request cancelled (receiver dropped): {:?}",
-                                        session_key
-                                    );
-                                }
-                            }
-                        }
+                        let req_id = moo_request_id(&raw_msg);
+                        let routing = {
+                            let mut s = state_for_events.write().await;
+                            s.route_browse_result(req_id, session_key.as_deref(), result)
+                        };
+                        log_result_routing(routing, "browse", req_id, session_key.as_deref());
                     }
                     Parsed::LoadResult(result, session_key) => {
                         tracing::debug!(
@@ -1891,20 +2518,75 @@ async fn run_roon_loop(
                             result.items.len(),
                             session_key
                         );
-                        let mut s = state_for_events.write().await;
-                        if let Some(req_id) = s
-                            .pending_loads
-                            .iter()
-                            .find(|(_, (key, _))| key == &session_key)
-                            .map(|(k, _)| *k)
-                        {
-                            if let Some((_key, sender)) = s.pending_loads.remove(&req_id) {
-                                if sender.send(Ok(result)).is_err() {
-                                    tracing::debug!(
-                                        "Load request cancelled (receiver dropped): {:?}",
-                                        session_key
-                                    );
+                        let req_id = moo_request_id(&raw_msg);
+                        let routing = {
+                            let mut s = state_for_events.write().await;
+                            s.route_load_result(req_id, session_key.as_deref(), result)
+                        };
+                        log_result_routing(routing, "load", req_id, session_key.as_deref());
+                    }
+                    // Issue #405: the Core answered with a rejection rather than
+                    // a result. Route it to the request that is waiting on it -
+                    // dropping it here is what made a stale item key look like
+                    // an unreachable Core, ten seconds late.
+                    //
+                    // Matched exhaustively on purpose: no wildcard, so a fork
+                    // bump that adds a variant fails to compile here instead of
+                    // silently resuming the swallow this arm exists to end. If
+                    // you are here because of that error, route the new variant.
+                    Parsed::Error(err) => {
+                        let routing = {
+                            let mut s = state_for_events.write().await;
+                            match &err {
+                                RoonApiError::BrowseInvalidItemKey((req_id, session_key)) => s
+                                    .route_browse_rejection(
+                                        *req_id,
+                                        session_key.as_deref(),
+                                        RoonBrowseErrorKind::InvalidItemKey,
+                                    ),
+                                RoonApiError::BrowseInvalidLevels((req_id, session_key)) => s
+                                    .route_browse_rejection(
+                                        *req_id,
+                                        session_key.as_deref(),
+                                        RoonBrowseErrorKind::InvalidLevels,
+                                    ),
+                                RoonApiError::BrowseZoneNotFound((req_id, session_key)) => s
+                                    .route_browse_rejection(
+                                        *req_id,
+                                        session_key.as_deref(),
+                                        RoonBrowseErrorKind::ZoneNotFound,
+                                    ),
+                                RoonApiError::BrowseUnexpectedError((req_id, session_key)) => s
+                                    .route_browse_rejection(
+                                        *req_id,
+                                        session_key.as_deref(),
+                                        RoonBrowseErrorKind::UnexpectedError,
+                                    ),
+                                RoonApiError::ImageNotFound((req_id, image_key))
+                                | RoonApiError::ImageUnexpectedError((req_id, image_key)) => {
+                                    s.route_image_rejection(*req_id, image_key)
                                 }
+                            }
+                        };
+
+                        match routing {
+                            ErrorRouting::NoWaiter => tracing::debug!(
+                                "Roon reported an error with nothing waiting on it \
+                                 (already resolved or timed out): {}",
+                                err
+                            ),
+                            ErrorRouting::KeyMismatch => tracing::warn!(
+                                "Roon error not routed - a pending request holds that \
+                                 request id under a different session/image key, so it \
+                                 was left for its own timeout: {}",
+                                err
+                            ),
+                            ErrorRouting::ReceiverGone => tracing::debug!(
+                                "Roon error arrived after its caller gave up: {}",
+                                err
+                            ),
+                            ErrorRouting::Browse | ErrorRouting::Load | ErrorRouting::Image => {
+                                tracing::debug!("Roon error routed to its {:?} request: {}", routing, err)
                             }
                         }
                     }
@@ -2051,5 +2733,650 @@ mod tests {
             bus_zone.volume_control.is_none(),
             "should be None when output has no volume"
         );
+    }
+
+    // =========================================================================
+    // Core-reported browse rejections (issue #405)
+    // =========================================================================
+    //
+    // Test strategy: these unit-scope the correlation logic. They do NOT drive
+    // a Roon protocol mock - `tests/mock_servers/roon.rs` holds state and
+    // speaks no protocol, and building a protocol-level Roon fake is #408's
+    // job. Duplicating it here would conflict with that work. What is scoped
+    // here is exactly the concurrency-sensitive part: which waiter a rejection
+    // resolves when several requests are in flight, and what happens to the
+    // ones it must not touch.
+    //
+    // Coverage boundary, stated so the next agent does not over-trust it: the
+    // tests exercise the real routing functions, the real `oneshot` channels
+    // and the real `BROWSE_TIMEOUT`. They do not exercise the fork's
+    // `parse_msg`, nor the three-line result match in `browse()`/`load()` that
+    // hands the oneshot payload back to the caller. In particular, nothing here
+    // proves that a real Core's error names match the four literals the fork
+    // matches on - if they did not, these tests would stay green and the
+    // ten-second hang would be live. That half is #408's.
+    //
+    // Which evidence supports which claim, since it is easy to conflate:
+    // `a_rejected_item_key_resolves_far_inside_the_browse_timeout` is the
+    // promptness proof; `browse_rejection_resolves_only_the_matching_waiter`
+    // and `a_mismatched_entry_in_one_map_does_not_hide_a_match_in_the_other`
+    // are the correlation proofs. A fast suite alone would not have caught an
+    // implementation that promptly resolved the *wrong* waiter.
+
+    use std::time::Instant;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    /// Queue a pending browse the way `browse()` does, returning its receiver.
+    fn pending_browse(
+        state: &mut RoonState,
+        req_id: usize,
+        session_key: &str,
+    ) -> oneshot::Receiver<Result<BrowseResult>> {
+        let (tx, rx) = oneshot::channel();
+        state
+            .pending_browses
+            .insert(req_id, (Some(session_key.to_string()), tx));
+        rx
+    }
+
+    /// Queue a pending load the way `load()` does, returning its receiver.
+    fn pending_load(
+        state: &mut RoonState,
+        req_id: usize,
+        session_key: &str,
+    ) -> oneshot::Receiver<Result<LoadResult>> {
+        let (tx, rx) = oneshot::channel();
+        state
+            .pending_loads
+            .insert(req_id, (Some(session_key.to_string()), tx));
+        rx
+    }
+
+    /// Queue a pending image request the way `get_image()` does.
+    fn pending_image(
+        state: &mut RoonState,
+        req_id: usize,
+        image_key: &str,
+    ) -> oneshot::Receiver<Option<ImageData>> {
+        let (tx, rx) = oneshot::channel();
+        state
+            .pending_images
+            .insert(req_id, (image_key.to_string(), tx));
+        rx
+    }
+
+    /// The rejection a receiver was resolved with, or a description of why it
+    /// was not resolved.
+    fn rejection_kind<T>(rx: &mut oneshot::Receiver<Result<T>>) -> RoonBrowseErrorKind {
+        match rx.try_recv() {
+            Ok(Err(err)) => match RoonBrowseError::from_error(&err) {
+                Some(rejection) => rejection.kind,
+                None => unreachable!("resolved with an untyped error: {err}"),
+            },
+            Ok(Ok(_)) => unreachable!("resolved with a success result"),
+            Err(TryRecvError::Empty) => unreachable!("waiter was never resolved"),
+            Err(TryRecvError::Closed) => unreachable!("waiter's sender was dropped"),
+        }
+    }
+
+    fn assert_still_waiting<T>(rx: &mut oneshot::Receiver<Result<T>>, what: &str) {
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "{what} must still be waiting - it was resolved or its sender dropped"
+        );
+    }
+
+    #[test]
+    fn browse_rejection_resolves_only_the_matching_waiter() {
+        // Several browse and load requests in flight, as the adapter routinely
+        // has during search() and play_item(). One is rejected by the Core.
+        let mut state = RoonState::default();
+        let mut first = pending_browse(&mut state, 11, "search_a");
+        let mut rejected = pending_browse(&mut state, 12, "search_b");
+        let mut third = pending_browse(&mut state, 13, "search_c");
+        let mut load_a = pending_load(&mut state, 14, "search_a");
+        let mut load_b = pending_load(&mut state, 15, "search_b");
+
+        let routing =
+            state.route_browse_rejection(12, Some("search_b"), RoonBrowseErrorKind::InvalidItemKey);
+
+        assert_eq!(routing, ErrorRouting::Browse);
+        assert_eq!(
+            rejection_kind(&mut rejected),
+            RoonBrowseErrorKind::InvalidItemKey
+        );
+        assert_still_waiting(&mut first, "browse 11");
+        assert_still_waiting(&mut third, "browse 13");
+        assert_still_waiting(&mut load_a, "load 14");
+        // load 15 shares the rejected request's session key: proof that
+        // correlation is by req_id, not by scanning for a session key.
+        assert_still_waiting(&mut load_b, "load 15");
+
+        // Only the resolved entry leaves the map; nothing is stranded.
+        assert!(!state.pending_browses.contains_key(&12));
+        assert_eq!(state.pending_browses.len(), 2);
+        assert_eq!(state.pending_loads.len(), 2);
+    }
+
+    #[test]
+    fn load_rejection_resolves_the_load_not_a_browse_sharing_its_session() {
+        // The positive invariant: the refused request is identified by req_id,
+        // so a sibling sharing its session key in the *other* map is untouched.
+        // (Correlating by session key instead could not even tell a browse from
+        // a load here - it would have to pick a map to scan first.)
+        let mut state = RoonState::default();
+        let mut browse = pending_browse(&mut state, 20, "play_item_1");
+        let mut load = pending_load(&mut state, 21, "play_item_1");
+
+        let routing = state.route_browse_rejection(
+            21,
+            Some("play_item_1"),
+            RoonBrowseErrorKind::InvalidItemKey,
+        );
+
+        assert_eq!(routing, ErrorRouting::Load);
+        assert_eq!(
+            rejection_kind(&mut load),
+            RoonBrowseErrorKind::InvalidItemKey
+        );
+        assert_still_waiting(&mut browse, "browse 20");
+        assert!(state.pending_browses.contains_key(&20));
+        assert!(!state.pending_loads.contains_key(&21));
+    }
+
+    #[test]
+    fn rejection_with_a_mismatched_session_key_leaves_the_waiter_alone() {
+        // `Moo` restarts its request-id counter at 0 on every reconnect, so a
+        // rejection on a new connection can carry a req_id that a stale, not
+        // yet timed-out waiter still occupies. Resolving it would be a
+        // mis-correlation; the waiter is left to its existing timeout instead.
+        let mut state = RoonState::default();
+        let mut stale = pending_browse(&mut state, 7, "browse_old");
+
+        let routing = state.route_browse_rejection(
+            7,
+            Some("browse_new"),
+            RoonBrowseErrorKind::InvalidItemKey,
+        );
+
+        assert_eq!(routing, ErrorRouting::KeyMismatch);
+        assert_still_waiting(&mut stale, "browse 7");
+        assert!(
+            state.pending_browses.contains_key(&7),
+            "the waiter must stay in the map so its own timeout still cleans up"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_entry_in_one_map_does_not_hide_a_match_in_the_other() {
+        // Only reachable through a reconnect id collision: a stale browse from
+        // the old connection holds req_id 8, and the new connection issues a
+        // load that also gets req_id 8. Reporting the browse's key mismatch
+        // early would cost the load its prompt answer for no safety gain.
+        let mut state = RoonState::default();
+        let mut stale_browse = pending_browse(&mut state, 8, "browse_old");
+        let mut live_load = pending_load(&mut state, 8, "load_new");
+
+        let routing =
+            state.route_browse_rejection(8, Some("load_new"), RoonBrowseErrorKind::InvalidItemKey);
+
+        assert_eq!(routing, ErrorRouting::Load);
+        assert_eq!(
+            rejection_kind(&mut live_load),
+            RoonBrowseErrorKind::InvalidItemKey
+        );
+        assert_still_waiting(&mut stale_browse, "the stale browse");
+        assert!(state.pending_browses.contains_key(&8));
+        assert!(!state.pending_loads.contains_key(&8));
+    }
+
+    #[test]
+    fn rejection_for_an_unknown_req_id_is_a_noop() {
+        let mut state = RoonState::default();
+        let mut other = pending_browse(&mut state, 30, "browse_x");
+
+        let routing = state.route_browse_rejection(
+            999,
+            Some("browse_x"),
+            RoonBrowseErrorKind::UnexpectedError,
+        );
+
+        assert_eq!(routing, ErrorRouting::NoWaiter);
+        assert_still_waiting(&mut other, "browse 30");
+        assert_eq!(state.pending_browses.len(), 1);
+    }
+
+    #[test]
+    fn a_second_rejection_for_the_same_req_id_cannot_double_resolve() {
+        let mut state = RoonState::default();
+        let mut rx = pending_browse(&mut state, 40, "browse_y");
+
+        let first =
+            state.route_browse_rejection(40, Some("browse_y"), RoonBrowseErrorKind::InvalidItemKey);
+        let second =
+            state.route_browse_rejection(40, Some("browse_y"), RoonBrowseErrorKind::InvalidItemKey);
+
+        assert_eq!(first, ErrorRouting::Browse);
+        assert_eq!(second, ErrorRouting::NoWaiter);
+        assert_eq!(rejection_kind(&mut rx), RoonBrowseErrorKind::InvalidItemKey);
+        assert!(state.pending_browses.is_empty());
+    }
+
+    #[test]
+    fn rejection_after_the_caller_timed_out_is_a_noop() {
+        // `browse()` removes its own entry when BROWSE_TIMEOUT fires. A
+        // rejection arriving afterwards must not panic or resurrect anything.
+        let mut state = RoonState::default();
+        let _rx = pending_browse(&mut state, 50, "browse_z");
+        state.pending_browses.remove(&50);
+
+        let routing =
+            state.route_browse_rejection(50, Some("browse_z"), RoonBrowseErrorKind::InvalidLevels);
+
+        assert_eq!(routing, ErrorRouting::NoWaiter);
+        assert!(state.pending_browses.is_empty());
+    }
+
+    #[test]
+    fn rejection_with_a_dropped_receiver_still_clears_the_entry() {
+        let mut state = RoonState::default();
+        let rx = pending_browse(&mut state, 60, "browse_w");
+        drop(rx);
+
+        let routing =
+            state.route_browse_rejection(60, Some("browse_w"), RoonBrowseErrorKind::InvalidItemKey);
+
+        assert_eq!(routing, ErrorRouting::ReceiverGone);
+        assert!(
+            state.pending_browses.is_empty(),
+            "a gone receiver must not leave a stranded map entry"
+        );
+    }
+
+    #[test]
+    fn every_browse_rejection_kind_is_routed() {
+        // Routing only InvalidItemKey would leave the other three Core
+        // rejections hanging their callers for the full timeout.
+        for kind in [
+            RoonBrowseErrorKind::InvalidItemKey,
+            RoonBrowseErrorKind::InvalidLevels,
+            RoonBrowseErrorKind::ZoneNotFound,
+            RoonBrowseErrorKind::UnexpectedError,
+        ] {
+            let mut state = RoonState::default();
+            let mut rx = pending_browse(&mut state, 70, "browse_all");
+
+            let routing = state.route_browse_rejection(70, Some("browse_all"), kind);
+
+            assert_eq!(
+                routing,
+                ErrorRouting::Browse,
+                "kind {kind:?} was not routed"
+            );
+            assert_eq!(rejection_kind(&mut rx), kind);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_item_key_resolves_far_inside_the_browse_timeout() {
+        // The point of the issue: promptness. Awaited exactly as `browse()`
+        // awaits it, with the real BROWSE_TIMEOUT.
+        let mut state = RoonState::default();
+        let rx = pending_browse(&mut state, 80, "browse_prompt");
+
+        let started = Instant::now();
+        let routing = state.route_browse_rejection(
+            80,
+            Some("browse_prompt"),
+            RoonBrowseErrorKind::InvalidItemKey,
+        );
+        let result = tokio::time::timeout(BROWSE_TIMEOUT, rx).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(routing, ErrorRouting::Browse);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a rejected item key must not wait out BROWSE_TIMEOUT ({BROWSE_TIMEOUT:?}); \
+             took {elapsed:?}"
+        );
+        let Ok(Ok(Err(err))) = result else {
+            unreachable!("expected a typed rejection inside the timeout");
+        };
+        let Some(rejection) = RoonBrowseError::from_error(&err) else {
+            unreachable!("expected a RoonBrowseError, got: {err}");
+        };
+        assert_eq!(rejection.kind, RoonBrowseErrorKind::InvalidItemKey);
+        assert_eq!(rejection.session_key.as_deref(), Some("browse_prompt"));
+    }
+
+    #[test]
+    fn image_rejection_resolves_the_matching_image_request() {
+        let mut state = RoonState::default();
+        let mut wanted = pending_image(&mut state, 90, "image_a");
+        let mut other = pending_image(&mut state, 91, "image_b");
+
+        let routing = state.route_image_rejection(90, "image_a");
+
+        assert_eq!(routing, ErrorRouting::Image);
+        // `get_image` reads None as "Image not found".
+        assert!(matches!(wanted.try_recv(), Ok(None)));
+        assert!(matches!(other.try_recv(), Err(TryRecvError::Empty)));
+        assert!(!state.pending_images.contains_key(&90));
+        assert!(state.pending_images.contains_key(&91));
+    }
+
+    #[test]
+    fn image_rejection_with_a_mismatched_key_leaves_the_waiter_alone() {
+        let mut state = RoonState::default();
+        let mut rx = pending_image(&mut state, 92, "image_a");
+
+        let routing = state.route_image_rejection(92, "image_somewhere_else");
+
+        assert_eq!(routing, ErrorRouting::KeyMismatch);
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(state.pending_images.contains_key(&92));
+    }
+
+    #[test]
+    fn a_rejection_is_distinguishable_from_a_timeout_and_a_lost_core() {
+        // The three failure classes the issue insists must stay apart.
+        let rejected = anyhow::Error::new(RoonBrowseError::new(
+            RoonBrowseErrorKind::InvalidItemKey,
+            Some("browse_1"),
+        ));
+        let timed_out = anyhow::anyhow!("Browse request timed out");
+        let not_connected = anyhow::anyhow!("Browse service not available - not connected to Roon");
+
+        let Some(rejection) = RoonBrowseError::from_error(&rejected) else {
+            unreachable!("a rejection must be recoverable from the anyhow error");
+        };
+        assert_eq!(rejection.kind, RoonBrowseErrorKind::InvalidItemKey);
+        assert!(rejection.kind.is_recoverable());
+        assert!(RoonBrowseError::from_error(&timed_out).is_none());
+        assert!(RoonBrowseError::from_error(&not_connected).is_none());
+
+        // And the message a caller sees says what to do, without ever reading
+        // like a timeout.
+        let message = rejected.to_string();
+        assert!(message.contains("search or browse again"), "{message}");
+        assert!(!message.contains("timed out"), "{message}");
+        assert!(message.contains("browse_1"), "{message}");
+    }
+
+    #[test]
+    fn only_reference_rejections_are_marked_recoverable() {
+        assert!(RoonBrowseErrorKind::InvalidItemKey.is_recoverable());
+        assert!(RoonBrowseErrorKind::InvalidLevels.is_recoverable());
+        assert!(!RoonBrowseErrorKind::ZoneNotFound.is_recoverable());
+        assert!(!RoonBrowseErrorKind::UnexpectedError.is_recoverable());
+        assert_eq!(
+            RoonBrowseErrorKind::InvalidItemKey.as_str(),
+            "invalid_item_key"
+        );
+    }
+
+    // =========================================================================
+    // Browse/load result correlation (issue #416)
+    // =========================================================================
+    //
+    // These are the white-box half of #416. They could not precede the functions
+    // they call, so the *red* proof for this issue is behavioural and lives in
+    // `tests/roon_protocol.rs`: `concurrent_browses_in_one_session_each_receive_
+    // their_own_result` and `concurrent_loads_in_one_session_each_receive_their_
+    // own_page` failed in 8 of 8 trials against the previous commit, driving the
+    // real event loop through #408's protocol fake. What these add is the cases a
+    // fake cannot reach on demand - a reconnect req_id collision, a result after
+    // the caller timed out, a message with no request id - each deterministic.
+    //
+    // Same coverage boundary as #405's tests above: the real routing functions,
+    // the real oneshot channels, not the fork's `parse_msg`. The one claim that is
+    // neither tested here nor testable here is that `moo_request_id` reads the id
+    // the fork actually put there; `tests/roon_protocol.rs` covers that end to end
+    // by getting three concurrent answers right through the real wire.
+
+    fn browse_result(title: &str) -> BrowseResult {
+        use roon_api::browse::{Action, List};
+        BrowseResult {
+            action: Action::List,
+            item: None,
+            list: Some(List {
+                title: title.to_string(),
+                ..Default::default()
+            }),
+            message: None,
+            is_error: None,
+        }
+    }
+
+    fn load_result(title: &str) -> LoadResult {
+        use roon_api::browse::List;
+        LoadResult {
+            items: Vec::new(),
+            offset: 0,
+            list: List {
+                title: title.to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// The MOO message shape the fork forwards alongside a browse/load result:
+    /// `request_id` as a *string*, as `Moo::parse` writes it.
+    fn raw_msg_with_request_id(req_id: usize) -> serde_json::Value {
+        serde_json::json!({ "request_id": req_id.to_string(), "verb": "COMPLETE" })
+    }
+
+    fn delivered_title<T>(
+        rx: &mut oneshot::Receiver<Result<T>>,
+        title_of: fn(&T) -> String,
+    ) -> String {
+        match rx.try_recv() {
+            Ok(Ok(value)) => title_of(&value),
+            Ok(Err(err)) => unreachable!("resolved with an error: {err}"),
+            Err(TryRecvError::Empty) => unreachable!("waiter was never resolved"),
+            Err(TryRecvError::Closed) => unreachable!("waiter's sender was dropped"),
+        }
+    }
+
+    fn browse_title(result: &BrowseResult) -> String {
+        result
+            .list
+            .as_ref()
+            .map(|list| list.title.clone())
+            .unwrap_or_default()
+    }
+
+    fn load_title(result: &LoadResult) -> String {
+        result.list.title.clone()
+    }
+
+    #[test]
+    fn a_browse_result_resolves_only_the_request_that_asked_for_it() {
+        // The defect, in one assertion: three browses share one session key, as
+        // `/roon/browse` lets any two callers do and as #399's nav handle would.
+        // The scan this replaced could resolve any of them.
+        let mut state = RoonState::default();
+        let mut first = pending_browse(&mut state, 11, "shared");
+        let mut second = pending_browse(&mut state, 12, "shared");
+        let mut third = pending_browse(&mut state, 13, "shared");
+        let mut load_in_same_session = pending_load(&mut state, 14, "shared");
+
+        let routing = state.route_browse_result(Some(12), Some("shared"), browse_result("TIDAL"));
+
+        assert_eq!(routing, ResultRouting::Delivered);
+        assert_eq!(delivered_title(&mut second, browse_title), "TIDAL");
+        assert_still_waiting(&mut first, "browse 11");
+        assert_still_waiting(&mut third, "browse 13");
+        assert_still_waiting(&mut load_in_same_session, "load 14");
+        assert_eq!(state.pending_browses.len(), 2);
+        assert_eq!(state.pending_loads.len(), 1);
+    }
+
+    #[test]
+    fn a_load_result_resolves_only_the_request_that_asked_for_it() {
+        let mut state = RoonState::default();
+        let mut first = pending_load(&mut state, 21, "shared");
+        let mut second = pending_load(&mut state, 22, "shared");
+        let mut browse_in_same_session = pending_browse(&mut state, 23, "shared");
+
+        let routing = state.route_load_result(Some(21), Some("shared"), load_result("Artists"));
+
+        assert_eq!(routing, ResultRouting::Delivered);
+        assert_eq!(delivered_title(&mut first, load_title), "Artists");
+        assert_still_waiting(&mut second, "load 22");
+        assert_still_waiting(&mut browse_in_same_session, "browse 23");
+        assert!(!state.pending_loads.contains_key(&21));
+    }
+
+    #[test]
+    fn a_browse_result_never_reaches_a_load_waiting_on_the_same_req_id() {
+        // `req_id` is unique per connection, so this needs a reconnect collision
+        // to arise at all. It is pinned because the *type* is what prevents it -
+        // a `BrowseResult` cannot be sent to a `LoadRequest` - and a future
+        // refactor that unified the two maps would lose that protection silently.
+        let mut state = RoonState::default();
+        let mut load = pending_load(&mut state, 31, "shared");
+
+        let routing = state.route_browse_result(Some(31), Some("shared"), browse_result("Library"));
+
+        assert_eq!(routing, ResultRouting::NoWaiter);
+        assert_still_waiting(&mut load, "load 31");
+        assert!(state.pending_loads.contains_key(&31));
+    }
+
+    #[test]
+    fn a_result_with_a_mismatched_session_key_leaves_the_waiter_alone() {
+        // #405's reconnect guard, applied to the success path: `Moo` restarts its
+        // request-id counter at 0 on every reconnect, so a result on a fresh
+        // connection can carry a req_id a stale, not-yet-timed-out waiter still
+        // occupies. Being resolved with someone else's *success* is the worst
+        // outcome available, so the waiter is left to its own timeout.
+        let mut state = RoonState::default();
+        let mut stale = pending_browse(&mut state, 41, "browse_old");
+
+        let routing =
+            state.route_browse_result(Some(41), Some("browse_new"), browse_result("TIDAL"));
+
+        assert_eq!(routing, ResultRouting::KeyMismatch);
+        assert_still_waiting(&mut stale, "browse 41");
+        assert!(
+            state.pending_browses.contains_key(&41),
+            "the waiter must stay in the map so its own timeout still cleans up"
+        );
+    }
+
+    #[test]
+    fn a_result_for_an_unknown_req_id_is_a_noop() {
+        let mut state = RoonState::default();
+        let mut other = pending_browse(&mut state, 51, "shared");
+
+        let routing = state.route_browse_result(Some(999), Some("shared"), browse_result("Qobuz"));
+
+        assert_eq!(routing, ResultRouting::NoWaiter);
+        assert_still_waiting(&mut other, "browse 51");
+        assert_eq!(state.pending_browses.len(), 1);
+    }
+
+    #[test]
+    fn a_second_result_for_the_same_req_id_cannot_double_resolve() {
+        let mut state = RoonState::default();
+        let mut rx = pending_browse(&mut state, 61, "shared");
+
+        let first = state.route_browse_result(Some(61), Some("shared"), browse_result("Library"));
+        let second = state.route_browse_result(Some(61), Some("shared"), browse_result("TIDAL"));
+
+        assert_eq!(first, ResultRouting::Delivered);
+        assert_eq!(second, ResultRouting::NoWaiter);
+        assert_eq!(delivered_title(&mut rx, browse_title), "Library");
+        assert!(state.pending_browses.is_empty());
+    }
+
+    #[test]
+    fn a_result_after_the_caller_timed_out_is_a_noop() {
+        let mut state = RoonState::default();
+        let _rx = pending_load(&mut state, 71, "shared");
+        state.pending_loads.remove(&71);
+
+        let routing = state.route_load_result(Some(71), Some("shared"), load_result("Albums"));
+
+        assert_eq!(routing, ResultRouting::NoWaiter);
+        assert!(state.pending_loads.is_empty());
+    }
+
+    #[test]
+    fn a_result_with_a_dropped_receiver_still_clears_the_entry() {
+        let mut state = RoonState::default();
+        let rx = pending_browse(&mut state, 81, "shared");
+        drop(rx);
+
+        let routing = state.route_browse_result(Some(81), Some("shared"), browse_result("Library"));
+
+        assert_eq!(routing, ResultRouting::ReceiverGone);
+        assert!(
+            state.pending_browses.is_empty(),
+            "a gone receiver must not leave a stranded map entry"
+        );
+    }
+
+    #[test]
+    fn a_result_with_no_request_id_is_left_to_time_out_rather_than_guessed_at() {
+        // Unreachable with the pinned fork - `Browse::parse_msg` parses
+        // `msg["request_id"]` before it can produce a result, and the fork
+        // forwards that same message. Pinned because the tempting fallback,
+        // scanning by session key, is exactly the defect #416 removes: it would
+        // resolve *a* waiter rather than *the* waiter, silently.
+        let mut state = RoonState::default();
+        let mut rx = pending_browse(&mut state, 91, "shared");
+
+        let routing = state.route_browse_result(None, Some("shared"), browse_result("Library"));
+
+        assert_eq!(routing, ResultRouting::Uncorrelated);
+        assert_still_waiting(&mut rx, "browse 91");
+        assert!(state.pending_browses.contains_key(&91));
+    }
+
+    #[test]
+    fn the_request_id_is_read_off_the_raw_moo_message() {
+        // MOO carries the id in a `Request-Id` header, which the fork copies into
+        // the message as a *string* (`src/moo.rs:354-355`). A numeric one cannot
+        // reach here - the fork's own `parse_msg` would have panicked on
+        // `as_str().unwrap()` first - so it is treated as uncorrelatable rather
+        // than quietly accepted.
+        assert_eq!(moo_request_id(&raw_msg_with_request_id(7)), Some(7));
+        assert_eq!(moo_request_id(&serde_json::json!({})), None);
+        assert_eq!(
+            moo_request_id(&serde_json::json!({ "request_id": "not-a-number" })),
+            None
+        );
+        assert_eq!(
+            moo_request_id(&serde_json::json!({ "request_id": 7 })),
+            None,
+            "a numeric request_id is not the shape the fork produces"
+        );
+        assert_eq!(moo_request_id(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn out_of_order_results_each_reach_their_own_waiter() {
+        // Three in flight under one session key, answered in reverse order. The
+        // integration test in `tests/roon_protocol.rs` proves this over the real
+        // wire; this states it as an invariant of the routing function itself,
+        // without the 8-trial probabilistic dance.
+        let mut state = RoonState::default();
+        let mut first = pending_browse(&mut state, 101, "shared");
+        let mut second = pending_browse(&mut state, 102, "shared");
+        let mut third = pending_browse(&mut state, 103, "shared");
+
+        for (req_id, title) in [(103, "Qobuz"), (102, "TIDAL"), (101, "Library")] {
+            assert_eq!(
+                state.route_browse_result(Some(req_id), Some("shared"), browse_result(title)),
+                ResultRouting::Delivered
+            );
+        }
+
+        assert_eq!(delivered_title(&mut first, browse_title), "Library");
+        assert_eq!(delivered_title(&mut second, browse_title), "TIDAL");
+        assert_eq!(delivered_title(&mut third, browse_title), "Qobuz");
+        assert!(state.pending_browses.is_empty());
     }
 }

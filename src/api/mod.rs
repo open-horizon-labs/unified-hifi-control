@@ -501,14 +501,34 @@ pub async fn roon_play_handler(
             Json(serde_json::json!({ "message": message })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => roon_browse_failure(&e, None),
     }
+}
+
+/// Turn a Roon browse/load failure into an HTTP response, keeping the failure
+/// classes apart (issue #405).
+///
+/// A reference the Core refused is a client-fixable condition that now arrives
+/// immediately, so it answers 404 with the Core's own explanation and the
+/// recovery instruction. Everything else - a timed-out or unreachable Core, a
+/// Core-side fault - keeps the 500 it has always had. Browse-not-connected is
+/// still checked before the request is issued and still answers 503.
+fn roon_browse_failure(err: &anyhow::Error, prefix: Option<&str>) -> axum::response::Response {
+    use crate::adapters::roon::{RoonBrowseError, RoonBrowseErrorKind};
+
+    let status = match RoonBrowseError::from_error(err).map(|rejection| rejection.kind) {
+        Some(RoonBrowseErrorKind::InvalidItemKey | RoonBrowseErrorKind::ZoneNotFound) => {
+            StatusCode::NOT_FOUND
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    let error = match prefix {
+        Some(prefix) => format!("{}: {}", prefix, err),
+        None => err.to_string(),
+    };
+
+    (status, Json(ErrorResponse { error })).into_response()
 }
 
 /// Play item request body
@@ -549,13 +569,7 @@ pub async fn roon_play_item_handler(
             Json(serde_json::json!({ "message": message })),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => roon_browse_failure(&e, None),
     }
 }
 
@@ -570,7 +584,10 @@ pub struct BrowseRequest {
     pub pop_all: bool,
     #[serde(default)]
     pub input: Option<String>,
-    /// Session key for maintaining browse state across requests
+    /// Session key for maintaining browse state across requests.
+    ///
+    /// See [`roon_browse_handler`] for what supplying one does and does not
+    /// guarantee when two clients use the same value at the same time (#416).
     #[serde(default)]
     pub session_key: Option<String>,
 }
@@ -607,6 +624,39 @@ pub struct BrowseItemResponse {
 }
 
 /// POST /roon/browse - Browse the Roon library hierarchy
+///
+/// # What a caller-supplied `session_key` guarantees (#416)
+///
+/// It **is** the identity of a browse *position*: Roon keeps a stack of levels per
+/// `multi_session_key`, so passing the same key back is how a client stays where it
+/// was and how `pop_all` returns it to the root. Reusing it is the intended use.
+///
+/// It is **not** a lock, a lease, or a request identifier, and nothing here or in
+/// the adapter rejects two clients that pick the same value:
+///
+/// * **Results are correlated per request, not per session.** Since #416 a browse or
+///   load result is routed to the request that asked for it, by the MOO `request_id`
+///   the Core echoes back. Two clients sharing a key can no longer be handed each
+///   other's lists - which they silently could before, since the adapter resolved
+///   whichever pending request in that session it found first.
+/// * **The Core-side level stack is still shared.** Correlation makes each *answer*
+///   honest; it cannot make two clients' navigation coherent. Concurrent browses
+///   under one key all push onto the same stack, so a client's next `load` may page
+///   the level the other client just entered, and a `pop_all` resets both. Pinned by
+///   `a_shared_session_key_is_one_level_stack_however_well_results_correlate` in
+///   `tests/roon_protocol.rs`.
+/// * **Therefore: one navigating client, one session key.** Omit `session_key` and a
+///   fresh one is minted for that request alone; the response reports it as
+///   `session_key` so a client can choose to continue in it. Anything building a
+///   multi-client navigation surface on this route - #399's MCP browse handle - must
+///   mint one key per client session and keep concurrent use of a single key out of
+///   reach, not merely undocumented. If a design genuinely needs two clients at one
+///   position, the missing piece is serialising requests per key; that is a separate
+///   change and it does not replace this one.
+///
+/// The parameter is kept rather than removed: it is the only way to walk a hierarchy
+/// across requests, and removing it would be an API change requiring explicit
+/// approval.
 pub async fn roon_browse_handler(
     State(state): State<AppState>,
     Json(req): Json<BrowseRequest>,
@@ -646,15 +696,7 @@ pub async fn roon_browse_handler(
     // Browse to the level
     let browse_result = match state.roon.browse(opts).await {
         Ok(result) => result,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
-            )
-                .into_response()
-        }
+        Err(e) => return roon_browse_failure(&e, None),
     };
 
     // Load items at this level
@@ -686,15 +728,7 @@ pub async fn roon_browse_handler(
                         }
                     })
                     .collect(),
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse {
-                            error: format!("Browse load error: {}", e),
-                        }),
-                    )
-                        .into_response();
-                }
+                Err(e) => return roon_browse_failure(&e, Some("Browse load error")),
             }
         } else {
             vec![]
