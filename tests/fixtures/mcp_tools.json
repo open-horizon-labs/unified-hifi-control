@@ -50,6 +50,11 @@
         "profile": {
           "description": "Configuration name to load (get from hifi_hqplayer_profiles)",
           "type": "string"
+        },
+        "zone_id": {
+          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "nullable": true,
+          "type": "string"
         }
       },
       "required": [
@@ -64,20 +69,31 @@
     },
     "description": "List available HQPlayer Embedded configurations",
     "inputSchema": {
-      "properties": {},
+      "properties": {
+        "zone_id": {
+          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
       "type": "object"
     }
   },
   "hifi_hqplayer_set_pipeline": {
-    "description": "Change an HQPlayer pipeline setting (mode, samplerate, filter1x, filterNx, shaper, dither)",
+    "description": "Change an immediate HQPlayer setting on an exact instance: mode, samplerate, filter1x, filterNx, shaper/dither, junk_filter, convolution, adaptive_volume, repeat, or random. This does not persist a profile.",
     "inputSchema": {
       "properties": {
         "setting": {
-          "description": "Setting to change: mode, samplerate, filter1x, filterNx, shaper, dither",
+          "description": "Immediate setting to change; this does not persist an HQPlayer profile.",
           "type": "string"
         },
         "value": {
           "description": "New value for the setting",
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "nullable": true,
           "type": "string"
         }
       },
@@ -94,7 +110,13 @@
     },
     "description": "Get HQPlayer Embedded status and current pipeline settings",
     "inputSchema": {
-      "properties": {},
+      "properties": {
+        "zone_id": {
+          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
       "type": "object"
     }
   },

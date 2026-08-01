@@ -1485,6 +1485,20 @@ pub struct PipelineStatus {
     pub settings: PipelineSettings,
 }
 
+/// One discover-before-set view of HQPlayer's advanced controls.
+///
+/// Every field is gathered while holding the endpoint operation lease and is fenced to the same
+/// native transport generation. This prevents callers from combining a pipeline read from one
+/// daemon session with junk-filter or matrix choices from a replacement session.
+#[derive(Debug, Clone)]
+pub struct HqpAdvancedOptionsSnapshot {
+    pub pipeline: PipelineStatus,
+    pub state: HqpState,
+    pub junk_filters: Vec<ListItem>,
+    pub matrix_profiles: Vec<MatrixProfile>,
+    pub current_matrix_profile: Option<MatrixProfile>,
+}
+
 /// One HQPlayer native observation whose state, runtime enumerations, transport identity and
 /// volume capability have passed the same generation fence. This is intentionally private: the
 /// legacy HTTP pipeline payload remains [`PipelineStatus`], while the managed adaptive producer
@@ -6598,6 +6612,55 @@ impl HqpAdapter {
         Ok(self.read_coherent_pipeline().await?.legacy)
     }
 
+    /// Read the pipeline and every additional advanced-control choice as one endpoint operation.
+    pub async fn get_advanced_options_snapshot(&self) -> Result<HqpAdvancedOptionsSnapshot> {
+        let _operation_guard = self.operation_lock.lock().await;
+        let snapshot = self.read_coherent_pipeline_under_operation().await?;
+        let generation = snapshot.transport_generation;
+
+        let junk_xml = Self::build_request("GetJunkFilters", &[]);
+        let junk_response = self
+            .send_command_on_transport(&junk_xml, generation)
+            .await
+            .context("HQPlayer junk-filter choices became unavailable during the coherent read")?;
+        let junk_filters = Self::parse_items(&junk_response, "JunkFiltersItem", |item| ListItem {
+            index: Self::parse_attr_u32(item, "index"),
+            name: Self::parse_attr(item, "name").unwrap_or_default(),
+            value: Self::parse_attr_i32(item, "value"),
+        });
+
+        let matrix_xml = Self::build_request("MatrixListProfiles", &[]);
+        let matrix_response = self
+            .send_command_on_transport(&matrix_xml, generation)
+            .await
+            .context(
+                "HQPlayer matrix-profile choices became unavailable during the coherent read",
+            )?;
+        let matrix_profiles =
+            Self::parse_items(&matrix_response, "MatrixProfile", |item| MatrixProfile {
+                index: Self::parse_attr_u32(item, "index"),
+                name: Self::parse_attr(item, "name").unwrap_or_default(),
+            });
+        let current_matrix_profile = matrix_profiles
+            .iter()
+            .find(|profile| profile.name == snapshot.state.matrix_profile)
+            .cloned();
+
+        // A failed closing fence is a failure of the whole snapshot. Returning partial choices
+        // here would make a transport replacement indistinguishable from a daemon with no choices.
+        self.send_command_on_transport(&Self::build_request("State", &[]), generation)
+            .await
+            .context("HQPlayer session changed before the advanced-control snapshot completed")?;
+
+        Ok(HqpAdvancedOptionsSnapshot {
+            pipeline: snapshot.legacy,
+            state: snapshot.state,
+            junk_filters,
+            matrix_profiles,
+            current_matrix_profile,
+        })
+    }
+
     /// Read the one native observation from which both the legacy pipeline payload and the
     /// adaptive producer document are derived.
     ///
@@ -6606,6 +6669,10 @@ impl HqpAdapter {
     /// daemon moments even if the legacy response still looked plausible.
     async fn read_coherent_pipeline(&self) -> Result<CoherentPipelineSnapshot> {
         let _operation_guard = self.operation_lock.lock().await;
+        self.read_coherent_pipeline_under_operation().await
+    }
+
+    async fn read_coherent_pipeline_under_operation(&self) -> Result<CoherentPipelineSnapshot> {
         // `State` reports settings as **list indices**, and an index means nothing apart from the list
         // it came from. So this read has one job beyond fetching: to establish that the `State` it
         // publishes and the lists it resolves that state through describe **the same loaded chain**,

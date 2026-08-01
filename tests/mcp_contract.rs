@@ -700,12 +700,15 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
         ],
     ),
     ("hifi_status", &[]),
-    ("hifi_hqplayer_status", &[]),
-    ("hifi_hqplayer_profiles", &[]),
-    ("hifi_hqplayer_load_profile", &[("profile", true)]),
+    ("hifi_hqplayer_status", &[("zone_id", false)]),
+    ("hifi_hqplayer_profiles", &[("zone_id", false)]),
+    (
+        "hifi_hqplayer_load_profile",
+        &[("profile", true), ("zone_id", false)],
+    ),
     (
         "hifi_hqplayer_set_pipeline",
-        &[("setting", true), ("value", true)],
+        &[("setting", true), ("value", true), ("zone_id", false)],
     ),
 ];
 
@@ -1099,21 +1102,27 @@ async fn hifi_hqplayer_status_shape_is_pinned() {
 
     assert_eq!(
         parsed,
-        json!({ "connected": false, "host": null, "pipeline": null }),
+        json!({
+            "connected": false,
+            "host": null,
+            "pipeline": null,
+            "options": null,
+            "options_unavailable_reason": null
+        }),
         "hifi_hqplayer_status payload drifted"
     );
 }
 
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn hifi_hqplayer_profiles_returns_an_array() {
+async fn hifi_hqplayer_profiles_surfaces_a_fresh_read_failure() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
     let text = result_text(&app.call_tool("hifi_hqplayer_profiles", json!({})).await);
     assert_eq!(
-        text, "[]",
-        "hifi_hqplayer_profiles must return a JSON array"
+        text, "Error: Failed to list profiles: Web credentials not configured",
+        "an empty cache must not masquerade as an authoritative empty profile list"
     );
 }
 
@@ -1159,6 +1168,10 @@ async fn hqplayer_set_pipeline_alias_table_is_pinned() {
         "filternx",
         "shaper",
         "dither",
+        "junk",
+        "junk_filter",
+        "matrix",
+        "matrix_profile",
     ] {
         let text = result_text(
             &app.call_tool(
@@ -1170,6 +1183,27 @@ async fn hqplayer_set_pipeline_alias_table_is_pinned() {
         assert!(
             text.starts_with(&format!("Error: Failed to set {setting}: ")),
             "alias {setting:?} must be recognised and reach the adapter, got {text:?}"
+        );
+    }
+
+    for (setting, value) in [
+        ("convolution", "true"),
+        ("adaptive", "on"),
+        ("adaptive_volume", "1"),
+        ("repeat", "all"),
+        ("random", "true"),
+        ("shuffle", "enabled"),
+    ] {
+        let text = result_text(
+            &app.call_tool(
+                "hifi_hqplayer_set_pipeline",
+                json!({ "setting": setting, "value": value }),
+            )
+            .await,
+        );
+        assert!(
+            text.starts_with(&format!("Error: Failed to set {setting}: ")),
+            "immediate-control alias {setting:?} must be recognised, got {text:?}"
         );
     }
 
@@ -1210,7 +1244,7 @@ async fn hqplayer_set_pipeline_alias_table_is_pinned() {
     );
     assert_eq!(
         text,
-        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither",
+        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, random",
         "the refusal must enumerate the valid settings"
     );
 }
@@ -1900,6 +1934,59 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
         DisplayOnly("hifi_hqplayer_status grouping key wrapping the pipeline readout"),
     ),
     (
+        "options",
+        DisplayOnly("discover-before-set grouping key for HQPlayer advanced controls"),
+    ),
+    (
+        "options_unavailable_reason",
+        DisplayOnly("actionable diagnostic when a connected HQPlayer cannot provide one coherent options snapshot"),
+    ),
+    (
+        "current",
+        Consumed("hifi_hqplayer_set_pipeline.value"),
+    ),
+    (
+        "choices",
+        Consumed("hifi_hqplayer_set_pipeline.value"),
+    ),
+    ("mode", Consumed("hifi_hqplayer_set_pipeline.setting='mode'")),
+    (
+        "samplerate",
+        Consumed("hifi_hqplayer_set_pipeline.setting='samplerate'"),
+    ),
+    (
+        "filter1x",
+        Consumed("hifi_hqplayer_set_pipeline.setting='filter1x'"),
+    ),
+    (
+        "filterNx",
+        Consumed("hifi_hqplayer_set_pipeline.setting='filterNx'"),
+    ),
+    (
+        "junk_filter",
+        Consumed("hifi_hqplayer_set_pipeline.setting='junk_filter'"),
+    ),
+    (
+        "matrix_profile",
+        Consumed("hifi_hqplayer_set_pipeline.setting='matrix_profile'"),
+    ),
+    (
+        "convolution",
+        Consumed("hifi_hqplayer_set_pipeline.setting='convolution'"),
+    ),
+    (
+        "adaptive_volume",
+        Consumed("hifi_hqplayer_set_pipeline.setting='adaptive_volume'"),
+    ),
+    (
+        "repeat",
+        Consumed("hifi_hqplayer_set_pipeline.setting='repeat'"),
+    ),
+    (
+        "random",
+        Consumed("hifi_hqplayer_set_pipeline.setting='random'"),
+    ),
+    (
         "filter",
         DisplayOnly(
             "pipeline readout; hifi_hqplayer_set_pipeline writes it via \
@@ -2551,6 +2638,18 @@ const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
         "Error: Unknown action 'frobnicate'. Valid actions: play, pause, playpause, next, \
          previous, prev, volume_set, volume_up, volume_down.",
     ),
+    // #209 exposes the native immediate controls the adapter now verifies. The
+    // refusal must teach clients the expanded setting vocabulary.
+    (
+        "hifi_hqplayer_set_pipeline/unknown_setting",
+        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither",
+        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, random",
+    ),
+    (
+        "hifi_hqplayer_profiles/empty",
+        "[]",
+        "Error: Failed to list profiles: Web credentials not configured",
+    ),
 ];
 
 /// The exact text every tool returns: byte-identical to the pre-envelope fixture
@@ -2793,7 +2892,11 @@ const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
     ),
     ("hifi_status/disconnected", "ok", None),
     ("hifi_hqplayer_status/disconnected", "ok", None),
-    ("hifi_hqplayer_profiles/empty", "ok", None),
+    (
+        "hifi_hqplayer_profiles/empty",
+        "error",
+        Some("backend_error"),
+    ),
     (
         "hifi_hqplayer_load_profile/disconnected",
         "error",
@@ -3016,7 +3119,6 @@ async fn envelope_data_parses_equal_to_the_text_payload() {
         "hifi_zones/empty",
         "hifi_status/disconnected",
         "hifi_hqplayer_status/disconnected",
-        "hifi_hqplayer_profiles/empty",
     ];
 
     let cases = all_cases(&app).await;

@@ -3808,7 +3808,20 @@ fn the_sanitiser_emits_a_document_that_still_reparses() {
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Text(t)) => {
-                text.push_str(&t.unescape().expect("text must unescape after sanitising"));
+                let decoded = t
+                    .xml10_content()
+                    .expect("text must decode after sanitising");
+                text.push_str(
+                    &quick_xml::escape::unescape(&decoded)
+                        .expect("text must unescape after sanitising"),
+                );
+            }
+            Ok(quick_xml::events::Event::GeneralRef(reference)) => {
+                let encoded = format!("&{};", reference.decode().expect("reference must decode"));
+                text.push_str(
+                    &quick_xml::escape::unescape(&encoded)
+                        .expect("reference must unescape after sanitising"),
+                );
             }
             Ok(quick_xml::events::Event::Eof) => break,
             Ok(_) => {}
@@ -6301,7 +6314,7 @@ fn the_sanitiser_escapes_attribute_values_so_the_artifact_still_reparses() {
                     });
                     values.push((
                         String::from_utf8_lossy(a.key.as_ref()).into_owned(),
-                        a.unescape_value()
+                        a.normalized_value(quick_xml::XmlVersion::Explicit1_0)
                             .unwrap_or_else(|e| {
                                 panic!("sanitised value no longer unescapes: {e}\nfrom: {clean}")
                             })
@@ -6352,7 +6365,7 @@ fn the_sanitiser_normalizes_entity_spelling_but_preserves_attribute_meaning() {
                     .filter_map(Result::ok)
                     .find(|a| a.key.as_ref() == b"song")
                     .expect("song attribute")
-                    .unescape_value()
+                    .normalized_value(quick_xml::XmlVersion::Explicit1_0)
                     .expect("normalized value reparses")
                     .into_owned();
             }

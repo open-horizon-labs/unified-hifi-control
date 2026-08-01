@@ -253,7 +253,7 @@ pub fn child_attrs(document: &str, child: &str) -> Vec<Vec<(String, String)>> {
                             .map(|a| {
                                 let name = String::from_utf8_lossy(a.key.as_ref()).into_owned();
                                 let value = a
-                                    .unescape_value()
+                                    .normalized_value(quick_xml::XmlVersion::Explicit1_0)
                                     .map(|v| v.into_owned())
                                     .unwrap_or_else(|_| {
                                         framing::decode_entities(&String::from_utf8_lossy(&a.value))
@@ -292,12 +292,12 @@ fn element_attrs(fragment: &str) -> Vec<(String, String)> {
                     .filter_map(Result::ok)
                     .map(|a| {
                         let name = String::from_utf8_lossy(a.key.as_ref()).into_owned();
-                        let value =
-                            a.unescape_value()
-                                .map(|v| v.into_owned())
-                                .unwrap_or_else(|_| {
-                                    framing::decode_entities(&String::from_utf8_lossy(&a.value))
-                                });
+                        let value = a
+                            .normalized_value(quick_xml::XmlVersion::Explicit1_0)
+                            .map(|v| v.into_owned())
+                            .unwrap_or_else(|_| {
+                                framing::decode_entities(&String::from_utf8_lossy(&a.value))
+                            });
                         (name, value)
                     })
                     .collect();
@@ -389,7 +389,15 @@ pub fn sanitize(document: &str) -> String {
             }
             Ok(quick_xml::events::Event::Text(t)) => {
                 if suppress_depth == 0 {
-                    let text = t.unescape().map(|v| v.into_owned()).unwrap_or_default();
+                    let text = t
+                        .xml10_content()
+                        .ok()
+                        .and_then(|decoded| {
+                            quick_xml::escape::unescape(&decoded)
+                                .ok()
+                                .map(|value| value.into_owned())
+                        })
+                        .unwrap_or_default();
                     // Belt and braces: text that itself looks like a credential line goes too.
                     if is_sensitive(&text) {
                         out.push_str("<!-- redacted: sensitive text -->");
@@ -399,6 +407,13 @@ pub fn sanitize(document: &str) -> String {
                         // evidence — sanitised output that no longer reparses is not evidence.
                         out.push_str(&quick_xml::escape::escape(&text));
                     }
+                }
+            }
+            Ok(quick_xml::events::Event::GeneralRef(reference)) => {
+                if suppress_depth == 0 {
+                    out.push('&');
+                    out.push_str(&reference.decode().unwrap_or_default());
+                    out.push(';');
                 }
             }
             Ok(quick_xml::events::Event::Eof) | Err(_) => break,
@@ -445,7 +460,7 @@ fn render_start(e: &quick_xml::events::BytesStart<'_>) -> String {
     for a in e.attributes().filter_map(Result::ok) {
         let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
         let value = a
-            .unescape_value()
+            .normalized_value(quick_xml::XmlVersion::Explicit1_0)
             .map(|v| v.into_owned())
             .unwrap_or_else(|_| framing::decode_entities(&String::from_utf8_lossy(&a.value)));
         if is_sensitive(&key) || is_sensitive(&value) {

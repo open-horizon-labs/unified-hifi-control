@@ -100,7 +100,7 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
                     .map(|a| {
                         (
                             String::from_utf8_lossy(a.key.as_ref()).to_lowercase(),
-                            a.unescape_value()
+                            a.normalized_value(quick_xml::XmlVersion::Explicit1_0)
                                 .map(|v| v.into_owned())
                                 .unwrap_or_default(),
                         )
@@ -148,8 +148,13 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
                 // The only element text kept anywhere: an option's label, inside the profile select.
                 if let Some(value) = pending_option.take() {
                     let label = t
-                        .unescape()
-                        .map(|v| v.trim().to_string())
+                        .xml10_content()
+                        .ok()
+                        .and_then(|decoded| {
+                            quick_xml::escape::unescape(&decoded)
+                                .ok()
+                                .map(|value| value.trim().to_string())
+                        })
                         .unwrap_or_default();
                     let title = if label.is_empty() {
                         value.clone()

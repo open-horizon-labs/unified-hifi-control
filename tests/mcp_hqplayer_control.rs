@@ -207,12 +207,12 @@ impl Rig {
         }
     }
 
-    /// Attach a managed instance named `rig` to a wire daemon and run it to a published zone.
-    async fn attach(&self, server: &WireServer) -> Arc<HqpAdapter> {
+    /// Attach a named managed instance to a wire daemon and run it to a published zone.
+    async fn attach_named(&self, name: &str, server: &WireServer) -> Arc<HqpAdapter> {
         let adapter = self
             .manager
             .add_instance(
-                "rig".to_string(),
+                name.to_string(),
                 "127.0.0.1".to_string(),
                 Some(server.port()),
                 None,
@@ -224,6 +224,11 @@ impl Rig {
         adapter.set_recovery_config(fast_recovery()).await;
         self.manager.start().await.expect("start managed lifecycle");
         adapter
+    }
+
+    /// Attach the conventional `rig` instance used by the direct-zone tests.
+    async fn attach(&self, server: &WireServer) -> Arc<HqpAdapter> {
+        self.attach_named("rig", server).await
     }
 
     /// Attach a wire daemon as the **default** instance — the one MCP's single-instance
@@ -657,13 +662,10 @@ async fn mcp_mute_routes_to_the_hqplayer_instance_and_is_reported_from_the_floor
 }
 
 // =============================================================================
-// coverage — HQPlayer-specific management tools (status/profiles/pipeline), default instance
+// routing — HQPlayer-specific management tools, exact managed instance
 // =============================================================================
 
-/// **Client expectation.** `hifi_hqplayer_status`, `hifi_hqplayer_profiles`, and
-/// `hifi_hqplayer_set_pipeline` reach the daemon on the manager's default instance — the only
-/// instance these tools can name, since none of them takes a zone/instance parameter (adding one
-/// would be a schema change). Not RED: this already works, and had zero test coverage.
+/// **Client expectation.** Omitting `zone_id` preserves the original default-instance behavior.
 #[tokio::test]
 async fn mcp_hqplayer_status_profiles_and_pipeline_tools_reach_the_default_instance() {
     let model = playing_daemon();
@@ -684,10 +686,10 @@ async fn mcp_hqplayer_status_profiles_and_pipeline_tools_reach_the_default_insta
     assert_eq!(status_json["connected"], true, "status={status_json}");
 
     let profiles = rig.call_tool("hifi_hqplayer_profiles", json!({})).await;
-    let profiles_json: Value = serde_json::from_str(&text_of(&profiles)).expect("profiles JSON");
+    let profiles_text = text_of(&profiles);
     assert!(
-        profiles_json.as_array().is_some(),
-        "profiles must be a JSON array: {profiles_json}"
+        profiles_text.contains("Web credentials not configured"),
+        "a fresh MCP read must query the selected instance and report why its web lane is unavailable, not return a fabricated empty list: {profiles_text}"
     );
 
     let before = model.request_count("SetFilter");
@@ -709,6 +711,182 @@ async fn mcp_hqplayer_status_profiles_and_pipeline_tools_reach_the_default_insta
 
     rig.shutdown().await;
     server.stop();
+}
+
+/// **Client expectation.** A zone returned by `hifi_zones` is a complete target for every
+/// HQPlayer MCP operation, not just transport and volume. In particular, a pipeline write naming
+/// `hqplayer:rig` must not leak to the manager's default instance.
+///
+/// **RED before #209:** all four `hifi_hqplayer_*` tools had no `zone_id` schema and read/wrote
+/// `state.hqplayer`, the default compatibility adapter, unconditionally.
+#[tokio::test]
+async fn mcp_advanced_hqplayer_tools_target_the_named_instance_not_default() {
+    let default_model = playing_daemon();
+    default_model.external_change(|s| s.filter_nx_index = 0);
+    let rig_model = playing_daemon();
+    rig_model.external_change(|s| s.filter_nx_index = 1);
+    let default_server = start_daemon(&default_model).await;
+    let rig_server = start_daemon(&rig_model).await;
+    let rig = Rig::new().await;
+    rig.attach_default(&default_server).await;
+    rig.attach_named("rig", &rig_server).await;
+    rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+
+    let default_status = rig.call_tool("hifi_hqplayer_status", json!({})).await;
+    let named_status = rig
+        .call_tool("hifi_hqplayer_status", json!({"zone_id": "hqplayer:rig"}))
+        .await;
+    let default_json: Value =
+        serde_json::from_str(&text_of(&default_status)).expect("default status JSON");
+    let named_json: Value =
+        serde_json::from_str(&text_of(&named_status)).expect("named status JSON");
+    assert_ne!(
+        default_json["pipeline"]["filter"], named_json["pipeline"]["filter"],
+        "the named status must be read from hqplayer:rig, not the default daemon"
+    );
+    let options = &named_json["options"];
+    for setting in [
+        "mode",
+        "samplerate",
+        "filter1x",
+        "filterNx",
+        "shaper",
+        "junk_filter",
+        "matrix_profile",
+    ] {
+        assert!(
+            options[setting]["current"].is_string(),
+            "status must expose the semantic current value for {setting}: {options}"
+        );
+        assert!(
+            options[setting]["choices"]
+                .as_array()
+                .is_some_and(|choices| !choices.is_empty()),
+            "status must expose discover-before-set choices for {setting}: {options}"
+        );
+    }
+    for setting in ["convolution", "adaptive_volume", "random"] {
+        assert!(
+            options[setting].is_boolean(),
+            "status must expose current {setting}: {options}"
+        );
+    }
+    assert!(
+        options["repeat"].is_string(),
+        "status must expose repeat as off/one/all: {options}"
+    );
+
+    let default_before = default_model.request_count("SetFilter");
+    let rig_before = rig_model.request_count("SetFilter");
+    let result = rig
+        .call_tool(
+            "hifi_hqplayer_set_pipeline",
+            json!({
+                "zone_id": "hqplayer:rig",
+                "setting": "filter1x",
+                "value": "poly-sinc-xtr"
+            }),
+        )
+        .await;
+    assert!(
+        !text_of(&result).starts_with("Error"),
+        "named pipeline write must succeed: {}",
+        text_of(&result)
+    );
+    assert_eq!(
+        default_model.request_count("SetFilter"),
+        default_before,
+        "the default daemon must not receive a write targeted at hqplayer:rig"
+    );
+    assert!(
+        rig_model.request_count("SetFilter") > rig_before,
+        "the named daemon must receive the SetFilter write"
+    );
+
+    rig.shutdown().await;
+    default_server.stop();
+    rig_server.stop();
+}
+
+/// **Client expectation.** A malformed or missing HQPlayer instance fails explicitly instead of
+/// silently falling back to the default adapter.
+#[tokio::test]
+async fn mcp_advanced_hqplayer_tools_refuse_foreign_and_missing_zone_targets() {
+    let rig = Rig::new().await;
+
+    for (zone_id, expected) in [
+        ("roon:office", "must start with 'hqplayer:'"),
+        ("hqplayer:", "must name an instance"),
+        (
+            "hqplayer:ghost",
+            "HQPlayer instance 'ghost' is not configured",
+        ),
+    ] {
+        let result = rig
+            .call_tool(
+                "hifi_hqplayer_set_pipeline",
+                json!({"zone_id": zone_id, "setting": "mode", "value": "PCM"}),
+            )
+            .await;
+        assert!(
+            text_of(&result).contains(expected),
+            "target {zone_id:?} must fail explicitly; got {}",
+            text_of(&result)
+        );
+    }
+
+    rig.shutdown().await;
+}
+
+/// **Client expectation.** Immediate controls proven by the native adapter are available through
+/// the same exact-instance MCP path as the original pipeline fields. These are session controls,
+/// not persistent profile edits; playlist/library operations remain outside this claim.
+#[tokio::test]
+async fn mcp_new_immediate_controls_reach_only_the_named_instance() {
+    let default_model = playing_daemon();
+    let rig_model = playing_daemon();
+    let default_server = start_daemon(&default_model).await;
+    let rig_server = start_daemon(&rig_model).await;
+    let rig = Rig::new().await;
+    rig.attach_default(&default_server).await;
+    rig.attach_named("rig", &rig_server).await;
+    rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+
+    for (setting, value, element) in [
+        ("junk_filter", "20 kHz", "SetJunkFilter"),
+        ("convolution", "true", "SetConvolution"),
+        ("adaptive_volume", "true", "SetAdaptiveVolume"),
+        ("repeat", "all", "SetRepeat"),
+        ("random", "true", "SetRandom"),
+        ("matrix_profile", "Speakers", "MatrixSetProfile"),
+    ] {
+        let default_before = default_model.request_count(element);
+        let named_before = rig_model.request_count(element);
+        let result = rig
+            .call_tool(
+                "hifi_hqplayer_set_pipeline",
+                json!({"zone_id": "hqplayer:rig", "setting": setting, "value": value}),
+            )
+            .await;
+        assert!(
+            !text_of(&result).starts_with("Error"),
+            "{setting} must be accepted for the named instance: {}",
+            text_of(&result)
+        );
+        assert_eq!(
+            default_model.request_count(element),
+            default_before,
+            "{setting} must not leak to the default daemon"
+        );
+        assert!(
+            rig_model.request_count(element) > named_before,
+            "{setting} must emit {element} on the named daemon"
+        );
+    }
+
+    rig.shutdown().await;
+    default_server.stop();
+    rig_server.stop();
 }
 
 // =============================================================================
