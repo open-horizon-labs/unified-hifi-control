@@ -861,28 +861,108 @@ pub struct HqpSettingRequest {
     pub value: u32,
 }
 
+/// Apply one legacy numeric setting, resolving the number to a name at this boundary.
+///
+/// Shared by `POST /hqplayer/setting` and the numeric arm of `POST /hqp/pipeline` so there is exactly
+/// one place a list position is interpreted, and it is a place with the daemon's current enumeration
+/// in hand. `samplerate` is the exception by contract: its number is **Hz**, not a position.
+async fn hqp_apply_legacy_setting(
+    state: &AppState,
+    setting: &str,
+    value: u32,
+) -> anyhow::Result<()> {
+    use crate::adapters::hqplayer::LegacySettingTarget;
+
+    let hqp = &state.hqplayer;
+    let outcome = match setting {
+        "mode" => {
+            hqp.apply_legacy_index(LegacySettingTarget::Mode, value)
+                .await?
+        }
+        "filter" => {
+            // Both sides to the same filter, in **one** `SetFilter`. Two one-sided writes could
+            // half-apply — the first lands, the second is rejected or lost — leaving the daemon on a
+            // pair nobody asked for; a single request carrying both indices cannot.
+            hqp.apply_legacy_index(LegacySettingTarget::FilterPair, value)
+                .await?
+        }
+        "filter1x" => {
+            hqp.apply_legacy_index(LegacySettingTarget::Filter1x, value)
+                .await?
+        }
+        "filterNx" | "filternx" => {
+            hqp.apply_legacy_index(LegacySettingTarget::FilterNx, value)
+                .await?
+        }
+        "shaper" | "dither" => {
+            hqp.apply_legacy_index(LegacySettingTarget::Shaper, value)
+                .await?
+        }
+        // By contract this number is Hz, not a list position.
+        "samplerate" | "rate" => hqp.set_rate(value).await?,
+        other => return Err(anyhow::anyhow!("Unknown setting: {}", other)),
+    };
+    outcome.into_applied_result()
+}
+
+/// Apply one setting given as a semantic name, which is the modern contract.
+async fn hqp_apply_named_setting(
+    state: &AppState,
+    setting: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let hqp = &state.hqplayer;
+    let outcome = match setting {
+        "mode" => hqp.set_mode(value).await?,
+        "filter1x" => hqp.set_filter_1x(value).await?,
+        "filterNx" | "filternx" => hqp.set_filter_nx(value).await?,
+        "shaper" | "dither" => hqp.set_shaper(value).await?,
+        "samplerate" | "rate" => {
+            let hz: u32 = value.parse().map_err(|_| {
+                anyhow::anyhow!("Invalid rate value (expected Hz like 48000, 96000): {value}")
+            })?;
+            hqp.set_rate(hz).await?
+        }
+        other => return Err(anyhow::anyhow!("Unknown setting: {}", other)),
+    };
+    outcome.into_applied_result()
+}
+
 /// POST /hqplayer/setting - Change HQPlayer pipeline setting (legacy endpoint)
+///
+/// The request contract carries `value: u32` and is frozen, so this is the **compatibility boundary**:
+/// the number is resolved into the semantic name the daemon's current enumeration gives that position,
+/// and the name is what goes inward. Nothing downstream ever sees the number, and a position the
+/// current list does not have is an error here rather than an index forwarded to the wire.
 pub async fn hqp_setting_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpSettingRequest>,
 ) -> impl IntoResponse {
-    // Legacy endpoint - convert numeric value to string for name-based lookups
-    let value_str = req.value.to_string();
-    let result = match req.name.as_str() {
-        "mode" => state.hqplayer.set_mode(&value_str).await,
-        "filter" => {
-            // Sets both 1x and Nx to the same filter - propagate first error if any
-            match state.hqplayer.set_filter_1x(&value_str).await {
-                Ok(()) => state.hqplayer.set_filter_nx(&value_str).await,
-                Err(e) => Err(e),
-            }
-        }
-        "filter1x" => state.hqplayer.set_filter_1x(&value_str).await,
-        "filterNx" | "filternx" => state.hqplayer.set_filter_nx(&value_str).await,
-        "shaper" => state.hqplayer.set_shaper(&value_str).await,
-        "samplerate" | "rate" => state.hqplayer.set_rate(req.value).await,
-        _ => Err(anyhow::anyhow!("Unknown setting: {}", req.name)),
-    };
+    // This endpoint's accepted names, exactly as it has always accepted them. The numeric applier
+    // below is shared with `POST /hqp/pipeline`, which additionally accepts `dither` — sharing the
+    // applier must not quietly widen *this* route, so the gate is here and the error text is the one
+    // it already answered with.
+    const ACCEPTED: [&str; 8] = [
+        "mode",
+        "filter",
+        "filter1x",
+        "filterNx",
+        "filternx",
+        "shaper",
+        "samplerate",
+        "rate",
+    ];
+    if !ACCEPTED.contains(&req.name.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Unknown setting: {}", req.name),
+            }),
+        )
+            .into_response();
+    }
+
+    let result = hqp_apply_legacy_setting(&state, &req.name, req.value).await;
 
     match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
@@ -908,28 +988,6 @@ pub async fn hqp_pipeline_update_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpPipelineRequest>,
 ) -> impl IntoResponse {
-    // Convert value to string - all settings now use name-based lookups
-    let value_str: String = match &req.value {
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => s.clone(),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Invalid value type".to_string(),
-                }),
-            )
-                .into_response()
-        }
-    };
-
-    // For samplerate, we still need the numeric Hz value
-    let rate_value: u32 = match &req.value {
-        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as u32,
-        serde_json::Value::String(s) => s.parse::<u32>().unwrap_or(0),
-        _ => 0,
-    };
-
     let valid_settings = [
         "mode",
         "samplerate",
@@ -948,14 +1006,32 @@ pub async fn hqp_pipeline_update_handler(
             .into_response();
     }
 
-    let result = match req.setting.as_str() {
-        "mode" => state.hqplayer.set_mode(&value_str).await,
-        "filter1x" => state.hqplayer.set_filter_1x(&value_str).await,
-        "filterNx" | "filternx" => state.hqplayer.set_filter_nx(&value_str).await,
-        "shaper" => state.hqplayer.set_shaper(&value_str).await,
-        "samplerate" => state.hqplayer.set_rate(rate_value).await,
-        "dither" => state.hqplayer.set_shaper(&value_str).await, // dither uses same API
-        _ => Err(anyhow::anyhow!("Unknown setting: {}", req.setting)),
+    // The request contract accepts a string or a number, and the two mean different things. A string
+    // is a semantic name and travels inward unchanged. A **number** is a list position for every
+    // family except `samplerate`, whose number is Hz — so it is resolved to a name here, at the
+    // boundary, against the enumeration the daemon is serving now. Stringifying the number and
+    // letting a resolver parse it back out was the fallback HQP-C-063 records: it made a stale or
+    // guessed position select whatever now sits there.
+    let result = match &req.value {
+        serde_json::Value::Number(n) => match n.as_u64() {
+            Some(v) if v <= u64::from(u32::MAX) => {
+                hqp_apply_legacy_setting(&state, &req.setting, v as u32).await
+            }
+            _ => Err(anyhow::anyhow!(
+                "Invalid numeric value for {}: {n}",
+                req.setting
+            )),
+        },
+        serde_json::Value::String(s) => hqp_apply_named_setting(&state, &req.setting, s).await,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid value type".to_string(),
+                }),
+            )
+                .into_response()
+        }
     };
 
     match result {
@@ -1032,11 +1108,8 @@ pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl 
             .into_response();
     }
 
-    let profiles = state.hqplayer.get_matrix_profiles().await;
-    let current = state.hqplayer.get_matrix_profile().await;
-
-    match (profiles, current) {
-        (Ok(profiles), Ok(current)) => (
+    match state.hqplayer.get_matrix_profiles_and_current().await {
+        Ok((profiles, current)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "profiles": profiles,
@@ -1044,7 +1117,7 @@ pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl 
             })),
         )
             .into_response(),
-        (Err(e), _) | (_, Err(e)) => (
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: e.to_string(),
@@ -1065,7 +1138,12 @@ pub async fn hqp_set_matrix_profile_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpMatrixProfileRequest>,
 ) -> impl IntoResponse {
-    match state.hqplayer.set_matrix_profile(req.profile).await {
+    match state
+        .hqplayer
+        .set_matrix_profile(req.profile)
+        .await
+        .and_then(|o| o.into_applied_result())
+    {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1483,6 +1561,20 @@ pub async fn hqp_configure_handler(
     // Save to instance manager for persistence
     state.hqp_instances.save_to_config().await;
 
+    // An enabled fresh installation may have skipped the HQPlayer lifecycle at process startup
+    // because no endpoint existed yet. Start the idempotent manager after configuration rather than
+    // requiring a process restart, while still honoring the adapter's explicit enabled setting.
+    if state.coordinator.is_enabled("hqplayer").await {
+        match state.hqp_instances.start().await {
+            Ok(()) => state.coordinator.set_running("hqplayer", true).await,
+            Err(error) => {
+                tracing::warn!(
+                    "HQPlayer managed lifecycle could not start after configuration: {error}"
+                )
+            }
+        }
+    }
+
     // Test connection by attempting to get pipeline status (this establishes connection)
     let connected = match state.hqplayer.get_pipeline_status().await {
         Ok(_) => true,
@@ -1694,6 +1786,15 @@ pub async fn hqp_add_instance_handler(
         )
         .await;
 
+    if state.coordinator.is_enabled("hqplayer").await {
+        match state.hqp_instances.start().await {
+            Ok(()) => state.coordinator.set_running("hqplayer", true).await,
+            Err(error) => tracing::warn!(
+                "HQPlayer managed lifecycle could not start after adding an instance: {error}"
+            ),
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1814,11 +1915,8 @@ pub async fn hqp_instance_matrix_profiles_handler(
         }
     };
 
-    let profiles = adapter.get_matrix_profiles().await;
-    let current = adapter.get_matrix_profile().await;
-
-    match (profiles, current) {
-        (Ok(profiles), Ok(current)) => (
+    match adapter.get_matrix_profiles_and_current().await {
+        Ok((profiles, current)) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "instance": name,
@@ -1827,7 +1925,7 @@ pub async fn hqp_instance_matrix_profiles_handler(
             })),
         )
             .into_response(),
-        (Err(e), _) | (_, Err(e)) => (
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: e.to_string(),
@@ -1862,7 +1960,11 @@ pub async fn hqp_instance_set_matrix_profile_handler(
         }
     };
 
-    match adapter.set_matrix_profile(req.value).await {
+    match adapter
+        .set_matrix_profile(req.value)
+        .await
+        .and_then(|o| o.into_applied_result())
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"ok": true, "instance": name, "value": req.value})),
@@ -2196,11 +2298,14 @@ pub async fn api_settings_post_handler(
                 if adapter.can_start().await {
                     if let Err(e) = adapter.start().await {
                         tracing::warn!("Failed to start adapter {}: {}", name, e);
+                    } else {
+                        coord.set_running(name, true).await;
                     }
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
                 adapter.stop().await;
+                coord.set_running(name, false).await;
             }
         }
     }

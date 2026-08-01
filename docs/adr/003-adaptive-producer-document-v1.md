@@ -1,0 +1,187 @@
+# ADR 003: Adaptive-control producer document v1
+
+## Status
+
+Accepted (specification only — no producer publishes it yet)
+
+**Date:** 2026-07-30
+**Issue:** [#323](https://github.com/open-horizon-labs/unified-hifi-control/issues/323)
+**Epic:** #312 · **Program:** #353
+**Specification:** [docs/architecture/adaptive-producer-contract-v1.md](../architecture/adaptive-producer-contract-v1.md)
+
+## Context
+
+UHC needs one versioned description of a producer's controllable state so that web, MCP,
+device and HTTP surfaces stop each encoding backend knowledge. Today those facts are
+duplicated across `src/adapters/hqplayer.rs`, the web UI, MCP tool descriptions and
+firmware-facing manifests.
+
+This is a one-way door. Once #324 publishes documents on the bus, #326 matches layouts
+against them and #327 persists bindings to their semantic ids, the shape is expensive to
+change. It is cheap to change now.
+
+Two things made the decision harder than "pick a JSON shape":
+
+1. **A control has more than one legitimate value.** Direct audits recorded on #323 found
+   that observed runtime state, persisted configuration, staged intent, intent held for an
+   unloaded chain, and the editor's effective projection are all real, and that a model
+   with one scalar per setting destroys data. The worked case: a disabled fixed-volume
+   feature retains its level in a commented configuration element, and a verifier that
+   re-reads only the field it wrote reports success after deleting it.
+2. **Staged intent is concurrency control, not UI state.** An audit found a lost-update
+   race where an apply passed live pending dictionaries into an async operation and the
+   completion cleared the whole store, deleting edits another surface staged mid-flight.
+
+## Decision
+
+Define v1 as a **Rust domain model that is normative**, with serde defining the wire form,
+and hand-authored canonical JSON fixtures plus a compatibility engine acting as the
+contract tests.
+
+Load-bearing choices, each with the alternative it displaced:
+
+| Decision | Alternative rejected | Why |
+|---|---|---|
+| Five value lanes with explicit grounding and provenance | one `value` per control | one scalar cannot express a retained dormant value, and writing it destroys one |
+| Divergence is published data | producer reconciles and publishes a winner | hiding the conflict makes it undiagnosable from any surface |
+| `grounded + empty` distinct from `ungrounded` | `null` for both | a default selection would read as unreadable, and a write-back would overwrite it |
+| Two revisions (`control_plane`, `state`) | one monotonic revision | a polling producer would churn control identity and make every draft look stale |
+| `Staleness` precedence epoch ▸ control plane ▸ state | consumers compare revisions | with two counters, a consumer comparing the wrong pair acts on a stale catalog |
+| Constraints as bounded pure data (8 deep, 128 nodes) | serialized predicate functions | shipping producer code to a browser, an ESP32 and an MCP client is unauditable and unbounded |
+| The bounds enforced at **admission**, refusing the document | checked wherever a caller calls `Expr::validate` | an admitted document is evaluated by every surface that renders it, so a bound nothing checks at the door is not a bound |
+| Visibility fails open, permission fails closed | one degradation rule | fail-open is right for what the user sees and wrong for what the system accepts |
+| Change-set generations; retire only what you detached | clear pending on success | reproduces the recorded lost-update race |
+| `stage()` reopens the three executing states and **refuses** the closed ones | reopen every non-`draft` state, or accept the entry and leave `state` alone | accepting silently lets a change set reporting `applied` hold unapplied intent; reopening destroys the audit fact that it already completed, and with it retry-as-a-new-plan |
+| Fifteen command outcomes incl. `indeterminate` | success/failure | a dropped transport after a write is possibly-applied, which is neither |
+| Append-only outcome history | current outcome only | otherwise "never applied" and "applied then replaced" are indistinguishable |
+| Vocabularies as enums with an `Unrecognized` arm | plain string enums, or open strings | exhaustive `match` *and* forward compatibility; open strings lose the compiler's help |
+| Presentation keys, never prose | inline labels and help text | keeps a wording change from being a contract change, and keeps catalog licensing under #343 |
+| Shared module, `serde`/`serde_json`/`std` only | `#[cfg(feature = "server")]` | WASM and MCP consumers need the same types; #312 exists to remove duplication |
+
+## Options considered
+
+**A — Promote HQPlayer's existing `PipelineStatus` JSON to v1.** Fastest. Rejected:
+`SelectOption.value` carries backend list indices, which the epic forbids as durable
+identity, and its one-scalar-per-setting shape is exactly the model the audits ruled out.
+
+**B — JSON Schema as the normative artifact, `serde_json::Value` in Rust.** Good for
+non-Rust consumers. Rejected: the risky parts of this contract are closed vocabularies
+(outcomes, apply lanes, availability reasons, constraint operators) where `match`
+exhaustiveness is free enforcement in a crate that already denies `unwrap`, `expect` and
+`panic`. Schema and code would drift by default.
+
+**C — Rust model normative, fixtures as contract tests. (Selected.)** Compatibility becomes
+executable: unsupported majors, unknown minors, unknown kinds, unknown operators and
+unknown additive fields each have a test pinning the required behaviour.
+
+**D — Extract a standalone `uhc-adaptive-contract` crate.** The right end state, and
+deferred rather than rejected. Converting this single-package repository into a workspace
+touches `Cargo.toml`, `build.rs`, `Dioxus.toml`, the Dockerfiles and CI, and puts the
+`dx build` fullstack path at risk during a contract-definition issue. Kept mechanical by
+`tests/adaptive_dependency_lint.rs`, which forbids transport and state dependencies in
+`src/adaptive/`.
+
+**E — Trait/RPC-first typed action registry.** Rejected: an ESP32, an MCP client and a
+browser cannot consume a Rust trait. A document would be invented anyway, derived from
+adapter code — re-coupling surfaces to backends, which is what the epic removes.
+
+## Consequences
+
+### Accepted
+
+* **Size, stated plainly.** `src/adaptive/` is 3542 lines, of which 2159 are non-blank
+  non-comment — so about 39% is documentation of *why*. Tests add 2743 lines and fixtures
+  1966. For scale, `src/adapters/hqplayer.rs` is 2622 lines for one backend's live protocol.
+
+  The acceptance criteria mandate the *concepts*; this implementation chose the fullest
+  representation of each, and that was a judgment call rather than a forced move.
+  `constraint.rs` is the clearest case: at 625 lines it is a fifth of the module, and a
+  three-operator vocabulary with the same degradation rules would have satisfied every
+  criterion in roughly 250. The extra operators exist because they were cheap to add while
+  the serializer was being written, which is a reason to write code, not to ship it.
+
+  `every_vocabulary_member_has_a_worked_example` proves representability, not necessity: it
+  can always be satisfied by extending a fixture, so it bounds *reachability*, not size.
+
+* **#325 validates need; it does not license removal.** An earlier draft of this ADR
+  granted a "v1.1 deletion gate" that let #325 remove unused constructs. That was wrong on
+  two counts and has been withdrawn: #325 is blocked by #324, so the exception could not
+  have closed when #324 shipped as it claimed, and removal within a major version directly
+  contradicts the additive-only policy in §8 of the specification — a compatibility rule
+  cannot carry a private exception for its own author.
+
+  What #325 can legitimately do when it maps a real engine:
+
+  1. **Validate need.** Report which constructs a real producer populates. That evidence is
+     useful even when it changes nothing.
+  2. **Deprecate additively.** Mark a control, choice or field `deprecated` with a reason.
+     Deprecated things keep rendering and keep applying; nothing breaks.
+  3. **Argue for v2.** If the evidence says the shape is wrong rather than merely
+     over-provisioned, that is a major-version conversation, not a patch.
+
+  The one genuinely time-bounded window is **before any contract is released outside this
+  repository**. Until #324 publishes documents on the bus and a non-UHC consumer depends on
+  them, a breaking change costs a coordinated edit rather than a compatibility break. If
+  #325's evidence justifies reshaping v1, it should be taken then and stamped as v2 — not
+  smuggled in as a v1.1 that quietly removes surface consumers were told was stable.
+
+  Constructs most likely to attract that evidence: the `compensating` / `compensated` /
+  `recovery_required` / `divergent` outcomes, multi-revision plan boundaries, the
+  `in_range` / `is_grounded` / `not_eq` / `any` operators, and `held` values on producers
+  with no settings interface.
+
+  **Rule for the window while it is open (added by #324).** "The window is open" was too
+  loose to govern anything: #324 declared it open and then added to v1 in the same
+  document. What actually governs, stated so the next issue does not have to re-derive it:
+
+  1. An **addition** is permitted when an acceptance criterion of an issue in the #312
+     graph forces it. Nothing else is.
+  2. A **removal** or a semantic change to an existing member is not permitted, window or
+     no window. §8 of the specification is additive-only and a compatibility rule cannot
+     carry a private exception for its own authors.
+  3. Every addition taken under (1) is recorded here with the criterion that forced it.
+
+  Additions taken so far:
+
+  | Addition | Forced by | Issue |
+  |---|---|---|
+  | `ReasonCode::ControlRemoved` | "`IntentIncoherence::UnknownControl` is treated as a distinct, user-visible state … users should see *this control no longer exists*, not the generic *needs producer validation*" | #324 |
+  | `tests/fixtures/adaptive/control_removed_after_advance.json` | "add a fixture and test for a change set whose base predates a control-plane advance that **removed** a targeted control" — and then required by `every_vocabulary_member_has_a_worked_example` once the reason code existed | #324 |
+
+  Neither is free. A canonical fixture path is additive-only per §8, so registering a sixth
+  one narrows the window it was added under. That is the cost of rule (1) and it is why
+  rule (1) is bounded by an acceptance criterion rather than by judgment.
+* Non-Rust consumers get canonical fixtures and normative prose now; a generated JSON
+  Schema is owed to the first issue that needs it (#314 or #326).
+* Consumers must handle an `Unrecognized` arm for every vocabulary. That is the cost of
+  additive evolution being real rather than promised.
+* Two revisions are more for a consumer to track than one. Mitigated by `Staleness`
+  computing precedence so no consumer compares revisions itself.
+
+### Risks
+
+* **Generality is inferred from one backend's failure modes.** Every lane and outcome
+  traces to an HQPlayer/HQPTuner audit. Roon has no persisted-configuration lane at all;
+  Home Assistant has availability but no restart-required class. The model may be
+  simultaneously over-specified for HQPlayer and under-specified for the next producer.
+  Falsifiable only by #325. Mitigated by documenting which lanes are expected to be
+  ungrounded per producer family, so absence is not read as breakage.
+* **Adoption.** The web UI already reads `/hqp/pipeline` directly and it works. If #324
+  exposes the document additively without a migration plan, no surface moves and the
+  document is written but never read. Owned by #324; #323 cannot decide it, because
+  deprecating a route needs explicit API approval.
+* **Additive-only evolution may not survive the first real producer.** Mitigated by making
+  the refusal path a tested, day-one path rather than a promise.
+
+### Not consequences
+
+No public API surface changes. No routes added, removed or modified;
+`tests/fixtures/api_routes.txt` is unchanged and `api-change-approved` was neither
+requested nor applied. Nothing is wired into a route, adapter or the aggregator, so a
+deployed binary's runtime behaviour is unchanged and rollback is a plain revert with no
+data migration.
+
+## Notes
+
+Generated from `/solution-space` → `/review` → `/dissent` on 2026-07-30. Gate reports are
+recorded on PR #362. Session: `.oh/adaptive-producer-contract.md`.

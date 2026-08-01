@@ -1,0 +1,157 @@
+{
+  "schema_version": "1.7",
+  "producer": {
+    "producer_id": "future:producer-1",
+    "producer_type": "some_future_backend",
+    "epoch": 2,
+    "trust_tier": "experimental"
+  },
+  "target": {
+    "role": "spatial_processor",
+    "zone_id": "upnp:renderer-9"
+  },
+  "revisions": {
+    "control_plane": 3,
+    "state": 77
+  },
+  "lanes": [
+    {
+      "lane": "native",
+      "state": "connected",
+      "last_success": "2026-07-30T11:10:00Z",
+      "round_trip_ms": 12
+    },
+    {
+      "lane": "mesh_sync",
+      "state": "degraded"
+    }
+  ],
+  "controls": [
+    {
+      "id": "future.spatial.render_mode",
+      "kind": "enumeration",
+      "label_key": "control.spatial.render_mode",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "binaural" },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 77 },
+          "confidence": 0.92
+        }
+      ],
+      "choices": {
+        "authority": "runtime",
+        "source": "live_protocol",
+        "choices": [
+          { "id": "binaural", "engine_name": "Binaural" },
+          { "id": "ambisonic", "engine_name": "Ambisonic" }
+        ]
+      },
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "live_immediate",
+        "disruption": "none",
+        "risk": "safe",
+        "verification": { "verify_lane": "observed" }
+      },
+      "telemetry_topic": "spatial/render_mode"
+    },
+    {
+      "id": "future.spatial.head_tracking",
+      "kind": "continuous_vector",
+      "label_key": "control.spatial.head_tracking",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": {
+            "type": "quaternion",
+            "value": { "w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0 }
+          },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 77 }
+        }
+      ],
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "live_immediate",
+        "disruption": "none",
+        "risk": "safe",
+        "verification": { "verify_lane": "observed" }
+      }
+    },
+    {
+      "id": "future.spatial.room_profile",
+      "kind": "enumeration",
+      "label_key": "control.spatial.room_profile",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "studio" },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 77 }
+        }
+      ],
+      "availability": {
+        "state": "quarantined",
+        "reasons": [
+          {
+            "code": "pending_calibration",
+            "scope": "observed",
+            "display_text_key": "reason.awaiting_calibration"
+          }
+        ]
+      }
+    }
+  ],
+  "constraints": [
+    {
+      "id": "future.constraint.head_tracking_requires_binaural",
+      "applies_to": ["future.spatial.head_tracking"],
+      "when": {
+        "op": "matches_regex",
+        "control": "future.spatial.render_mode",
+        "lane": "effective",
+        "pattern": "^ambi"
+      },
+      "effect": "invalidates",
+      "reason": {
+        "code": "unknown_constraint",
+        "scope": "draft",
+        "display_text_key": "reason.head_tracking_needs_binaural"
+      }
+    },
+    {
+      "id": "future.constraint.nested_unknown_operand",
+      "applies_to": ["future.spatial.room_profile"],
+      "when": {
+        "op": "all",
+        "of": [
+          {
+            "op": "eq",
+            "control": "future.spatial.render_mode",
+            "lane": "effective",
+            "value": { "type": "choice", "value": "binaural" }
+          },
+          {
+            "op": "within_tolerance",
+            "control": "future.spatial.head_tracking",
+            "lane": "observed",
+            "tolerance": 0.05
+          }
+        ]
+      },
+      "effect": "makes_inert",
+      "reason": {
+        "code": "unknown_constraint",
+        "scope": "draft",
+        "display_text_key": "reason.tolerance_check_unavailable"
+      }
+    }
+  ],
+  "policy_hints": {
+    "prefers_batched_reads": true
+  }
+}

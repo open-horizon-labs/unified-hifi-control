@@ -1,0 +1,14 @@
+<!--
+  provenance:
+    source: docs/hqplayer-protocol-reference.md (hqp-control v5.2.30 sources)
+    daemon: hqplayerd 5.x (unavailable for verification)
+    status: UNVERIFIED
+    date: 2026-07-29
+    playback: unknown
+    notes: DERIVED FROM SOURCES ONLY. Same three modes as 6.0.4 per the v5.2.30 reference. Not authoritative.
+-->
+<GetModes>
+<ModesItem index="0" name="[source]" value="-1"/>
+<ModesItem index="1" name="PCM" value="0"/>
+<ModesItem index="2" name="SDM" value="1"/>
+</GetModes>

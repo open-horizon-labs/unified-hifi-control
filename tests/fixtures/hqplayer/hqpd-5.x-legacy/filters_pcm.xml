@@ -1,0 +1,17 @@
+<!--
+  provenance:
+    source: docs/hqplayer-protocol-reference.md (hqp-control v5.2.30 sources)
+    daemon: hqplayerd 5.x (unavailable for verification)
+    status: UNVERIFIED
+    date: 2026-07-29
+    playback: unknown
+    notes: DERIVED FROM SOURCES ONLY. Deliberately reorders and renumbers the same filter NAMES so a version-regression expectation can prove name-based resolution does not depend on list position. poly-sinc-lp sits at index 2 here versus index 6 in the 6.0.4 profile, while keeping enum ID 29. Not authoritative.
+-->
+<GetFilters>
+<FiltersItem index="0" name="none" value="0" arg="0"/>
+<FiltersItem index="1" name="IIR" value="1" arg="0"/>
+<FiltersItem index="2" name="poly-sinc-lp" value="29" arg="0"/>
+<FiltersItem index="3" name="poly-sinc-lp-2s" value="6" arg="0"/>
+<FiltersItem index="4" name="poly-sinc-gauss-long" value="40" arg="0"/>
+<FiltersItem index="5" name="poly-sinc-xtr" value="61" arg="0"/>
+</GetFilters>
