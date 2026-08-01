@@ -1,5 +1,6 @@
 //! Audio source adapters (Roon, HQPlayer, LMS, OpenHome, UPnP)
 
+pub mod didl;
 pub mod handle;
 pub mod hqplayer;
 pub mod lms;

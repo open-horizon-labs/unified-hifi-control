@@ -27,6 +27,20 @@ pub struct MockUpnpState {
     pub state: String, // PLAYING, PAUSED_PLAYBACK, STOPPED
     pub volume: u32,   // 0-100
     pub muted: bool,
+    /// Current track, as `GetPositionInfo` would report it. `None` means the
+    /// renderer reports an empty `TrackMetaData`, which real devices do when
+    /// stopped or when they carry no metadata at all.
+    pub track: Option<MockUpnpTrack>,
+}
+
+/// Track metadata the mock renderer will serialise into DIDL-Lite.
+#[derive(Debug, Clone)]
+pub struct MockUpnpTrack {
+    pub uri: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub album_art_uri: String,
 }
 
 impl Default for MockUpnpState {
@@ -39,6 +53,7 @@ impl Default for MockUpnpState {
             state: "STOPPED".to_string(),
             volume: 50,
             muted: false,
+            track: None,
         }
     }
 }
@@ -108,6 +123,23 @@ impl MockUpnpRenderer {
     /// Set mute
     pub async fn set_muted(&self, muted: bool) {
         self.state.write().await.muted = muted;
+    }
+
+    /// Set the current track, reported via `GetPositionInfo`'s `TrackMetaData`.
+    pub async fn set_track(&self, uri: &str, title: &str, artist: &str, album: &str, art: &str) {
+        self.state.write().await.track = Some(MockUpnpTrack {
+            uri: uri.to_string(),
+            title: title.to_string(),
+            artist: artist.to_string(),
+            album: album.to_string(),
+            album_art_uri: art.to_string(),
+        });
+    }
+
+    /// Report no track metadata, as a renderer does when stopped or when it
+    /// simply carries none.
+    pub async fn clear_track(&self) {
+        self.state.write().await.track = None;
     }
 
     /// Stop the mock server
@@ -183,6 +215,54 @@ async fn handle_av_transport(
   </s:Body>
 </s:Envelope>"#,
             state_guard.state
+        )
+    } else if action.contains("GetPositionInfo") {
+        // TrackMetaData carries DIDL-Lite XML-escaped inside the SOAP envelope,
+        // exactly as real renderers send it. albumArtURI carries the
+        // dlna:profileID attribute that the DLNA convention puts there.
+        let (track_uri, metadata) = match &state_guard.track {
+            Some(t) => {
+                let didl = format!(
+                    concat!(
+                        r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" "#,
+                        r#"xmlns:dc="http://purl.org/dc/elements/1.1/" "#,
+                        r#"xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">"#,
+                        r#"<item id="1" parentID="0" restricted="1">"#,
+                        "<dc:title>{}</dc:title>",
+                        "<upnp:artist>{}</upnp:artist>",
+                        "<upnp:album>{}</upnp:album>",
+                        r#"<upnp:albumArtURI dlna:profileID="JPEG_TN">{}</upnp:albumArtURI>"#,
+                        "</item></DIDL-Lite>"
+                    ),
+                    t.title, t.artist, t.album, t.album_art_uri
+                );
+                let escaped = didl
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;");
+                (t.uri.clone(), escaped)
+            }
+            None => (String::new(), String::new()),
+        };
+
+        format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+      <Track>1</Track>
+      <TrackDuration>0:03:21</TrackDuration>
+      <TrackMetaData>{}</TrackMetaData>
+      <TrackURI>{}</TrackURI>
+      <RelTime>0:00:12</RelTime>
+      <AbsTime>0:00:12</AbsTime>
+      <RelCount>2147483647</RelCount>
+      <AbsCount>2147483647</AbsCount>
+    </u:GetPositionInfoResponse>
+  </s:Body>
+</s:Envelope>"#,
+            metadata, track_uri
         )
     } else if action.contains("Play") || action.contains("Pause") || action.contains("Stop") {
         // Control action - return success
