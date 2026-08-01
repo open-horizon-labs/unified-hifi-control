@@ -1568,20 +1568,39 @@ async fn a_shared_session_key_is_one_level_stack_however_well_results_correlate(
     .map(|r| r.expect("browse").list.map(|l| l.title).unwrap_or_default())
     .collect();
 
-    // Each caller was told the truth about its own request...
+    // Each caller was told the truth about its own request - which is order
+    // independent, because each future asked for `keys[i]` and must be handed
+    // `keys[i]`'s list whatever order the answers arrived in.
     assert_eq!(got, vec!["Library", "TIDAL", "Qobuz"]);
 
-    // ...onto a single stack, in the order the Core happened to process them.
+    // ...onto a single stack. Which of the three landed last is the Core's
+    // scheduling business, so this asserts the shape and not the sequence: three
+    // concurrent browses from one root produced one four-level stack, not three
+    // independent two-level ones. (An earlier draft pinned the exact order the
+    // delays happened to produce, which would have flaked on a loaded machine for
+    // no extra claim.)
+    let levels = core.session_levels(session).await;
     assert_eq!(
-        core.session_levels(session).await,
-        vec!["Explore", "Qobuz", "TIDAL", "Library"],
-        "one session key is one level stack; three concurrent browses all push onto it"
+        levels.len(),
+        4,
+        "one session key is one level stack; three concurrent browses all push onto \
+         it, got {levels:?}"
+    );
+    assert_eq!(levels[0], "Explore", "stack {levels:?}");
+    let mut pushed = levels[1..].to_vec();
+    pushed.sort();
+    assert_eq!(
+        pushed,
+        vec!["Library", "Qobuz", "TIDAL"],
+        "stack {levels:?}"
     );
 
-    // So the session's own idea of "here" is the last push, not any caller's.
+    // So the session's own idea of "here" is whichever push landed last, not the
+    // one any particular caller made.
     let here = adapter.load(load_all(session)).await.unwrap();
     assert_eq!(
-        here.list.title, "Library",
+        Some(&here.list.title),
+        levels.last(),
         "a following load pages the level that landed last, whoever asked for it"
     );
 
