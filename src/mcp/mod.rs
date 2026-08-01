@@ -382,8 +382,24 @@ impl ServerHandler for HifiMcpHandler {
                                 };
                                 let json = serde_json::to_string_pretty(&np)
                                     .unwrap_or_else(|_| "{}".to_string());
+                                // Deliberately **not** labelled "Current state", unlike the
+                                // backend-neutral arm below. A direct HQPlayer zone is refreshed
+                                // only by its producer's status poll (2 s by default), and the
+                                // adapter's transport commands are fire-and-forget — so this read
+                                // is the poll from *before* the command, every time. Calling it
+                                // the current state told the assistant its own pause had not
+                                // taken effect, and the observable consequence was a reported
+                                // failure or a second pause.
+                                //
+                                // The gap cannot be closed here: a surface may not read the
+                                // adapter for state (`docs/ARCHITECTURE.md`,
+                                // `tests/architecture_lint.rs`). So the claim is dropped rather
+                                // than a fresher observation invented, and the caller is told
+                                // where the post-command state comes from.
                                 Ok(Self::text_result(format!(
-                                    "Action '{}' executed.\n\nCurrent state:\n{}",
+                                    "Action '{}' executed.\n\nZone state as last observed *before* \
+                                     this command (a direct HQPlayer zone refreshes on its poll \
+                                     interval; call hifi_now_playing for the state after it):\n{}",
                                     args.action, json
                                 )))
                             } else {
@@ -484,6 +500,23 @@ impl ServerHandler for HifiMcpHandler {
             }
 
             HifiTools::HifiSearchTool(args) => {
+                // A direct HQPlayer zone has no library and no browse tree, so it cannot be search
+                // context. Refused rather than passed through, because the `else` below hands
+                // `zone_id` to Roon verbatim as its `zone_or_output_id` — the same
+                // recognise-one-prefix-then-fall-through-to-Roon shape #391 fixed in
+                // `knob_control_handler` and this issue fixed in `hifi_control`.
+                if args
+                    .zone_id
+                    .as_ref()
+                    .is_some_and(|z| z.starts_with("hqplayer:"))
+                {
+                    return Self::error_result(
+                        "Search is not available for a direct HQPlayer zone: HQPlayer plays what \
+                         it is fed and exposes no library to search. Omit zone_id to search Roon, \
+                         or pass an lms:/roon: zone_id."
+                            .into(),
+                    );
+                }
                 // Route based on zone_id prefix
                 if args.zone_id.as_ref().is_some_and(|z| z.starts_with("lms:")) {
                     // LMS search - uses globalsearch for all providers (library, TIDAL, Qobuz, etc.)
@@ -557,6 +590,21 @@ impl ServerHandler for HifiMcpHandler {
             }
 
             HifiTools::HifiPlayTool(args) => {
+                // Same refusal as `hifi_search`, and it matters more here because this tool is a
+                // mutation. The `else` below passes `zone_id` straight into
+                // `roon.search_and_play(query, zone_id, …)`, so an `hqplayer:` id an assistant
+                // took from `hifi_zones` became a foreign `zone_or_output_id` offered to a live
+                // Roon core. Naming the limitation lets the assistant pick a zone that can
+                // actually serve the request instead of reading a Roon error it cannot act on.
+                if args.zone_id.starts_with("hqplayer:") {
+                    return Self::error_result(format!(
+                        "{} is a direct HQPlayer zone: HQPlayer has no library to search from and \
+                         no queue this bridge can build, so it cannot be a hifi_play target. Use \
+                         hifi_control for its transport, volume, seek and mute, or pick an \
+                         lms:/roon: zone to play into.",
+                        args.zone_id
+                    ));
+                }
                 // Route based on zone_id prefix
                 if args.zone_id.starts_with("lms:") {
                     use crate::adapters::lms::LmsPlayAction;

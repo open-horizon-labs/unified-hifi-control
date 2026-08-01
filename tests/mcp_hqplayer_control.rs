@@ -710,3 +710,114 @@ async fn mcp_hqplayer_status_profiles_and_pipeline_tools_reach_the_default_insta
     rig.shutdown().await;
     server.stop();
 }
+
+// =============================================================================
+// review — defects found by the Opus stacked review, pinned so they stay fixed
+// =============================================================================
+
+/// **Client expectation.** An assistant that got `hqplayer:rig` from `hifi_zones` and then asked
+/// `hifi_play` to play something on it must be told that this zone has no library to search — not
+/// handed a Roon error, and above all not have its request dispatched to Roon at all.
+///
+/// This is the *same* defect #391 closed in `knob_control_handler` and #401 closed in
+/// `hifi_control`: a zone-id switch that recognises one prefix and lets everything else fall
+/// through to Roon. `hifi_play` passes `args.zone_id` verbatim into
+/// `roon.search_and_play(query, zone_id, …)`, so an `hqplayer:` id becomes Roon's
+/// `zone_or_output_id`. On a Roon-plus-HQPlayer install that is a foreign zone id offered to a live
+/// Roon core; here Roon is disconnected, which is what makes "did it reach Roon" observable from
+/// the response text.
+///
+/// `hifi_search` carries the same id into Roon's search as context, for the same reason.
+///
+/// **RED before this fix:** both answered with a Roon failure, proving the call had been routed to
+/// Roon rather than refused.
+#[tokio::test]
+async fn mcp_play_and_search_do_not_hand_an_hqplayer_zone_id_to_roon() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+
+    for (tool, args) in [
+        (
+            "hifi_play",
+            json!({"zone_id":"hqplayer:rig","query":"Kind of Blue"}),
+        ),
+        (
+            "hifi_search",
+            json!({"zone_id":"hqplayer:rig","query":"Kind of Blue"}),
+        ),
+    ] {
+        let text = text_of(&rig.call_tool(tool, args).await);
+        let lower = text.to_lowercase();
+        // A call that was dispatched to Roon comes back as that backend's own failure, wrapped by
+        // this surface's `Play error:` / `Search error:` prefix. A call that was refused before
+        // dispatch cannot produce either. (Suggesting a `roon:` zone in the refusal is fine and
+        // deliberate, so the test keys on the failure shape rather than on the word "Roon".)
+        assert!(
+            !lower.contains("not connected")
+                && !lower.contains("play error")
+                && !lower.contains("search error"),
+            "`{tool}` with an `hqplayer:` zone id reached Roon; the response is a backend \
+             failure rather than a refusal:\n{text}"
+        );
+        assert!(
+            lower.contains("hqplayer"),
+            "`{tool}` must name the actual limitation so the assistant can choose another zone; \
+             got:\n{text}"
+        );
+    }
+
+    rig.shutdown().await;
+    server.stop();
+}
+
+/// **Client expectation.** `hifi_control` must not present an observation that predates the
+/// command as the zone's *current* state.
+///
+/// A direct HQPlayer zone is refreshed only by the producer's status poll (2 s by default), and the
+/// transport commands are fire-and-forget — `adapter.pause()` sends `Pause` and returns. So the
+/// `aggregator.get_zone` this arm performs immediately afterwards returns the poll from *before*
+/// the command, and labelling it "Current state" tells the assistant the pause did not take effect.
+/// The observable consequence is an assistant that reports failure, or pauses twice.
+///
+/// The surface may not read the adapter to close the gap (`docs/ARCHITECTURE.md`,
+/// `tests/architecture_lint.rs`), so the fix is to stop making the claim rather than to invent a
+/// fresher observation.
+///
+/// **RED before this fix:** the daemon is paused, `Pause` is in its request log, and the tool
+/// answers `Current state:` followed by `"state": "playing"`.
+#[tokio::test]
+async fn mcp_control_does_not_report_a_pre_command_observation_as_current() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+
+    let text = text_of(
+        &rig.call_tool(
+            "hifi_control",
+            json!({"zone_id":"hqplayer:rig","action":"pause"}),
+        )
+        .await,
+    );
+
+    // The command really did land, so any claim about "now" that says `playing` is false.
+    assert_eq!(
+        model.request_count("Pause"),
+        1,
+        "the pause must have landed"
+    );
+    assert_eq!(model.state().playback, 1, "the daemon is paused");
+
+    assert!(
+        !(text.contains("Current state") && text.contains("\"state\": \"playing\"")),
+        "the daemon is paused; presenting the pre-command poll as the zone's *current* state \
+         tells the assistant the pause did not take effect:\n{text}"
+    );
+
+    rig.shutdown().await;
+    server.stop();
+}
