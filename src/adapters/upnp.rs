@@ -37,6 +37,33 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const STALE_THRESHOLD: Duration = Duration::from_secs(90);
 const SOAP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Transport actions [`UPnPAdapter::control`] refuses outright.
+///
+/// # Why this is a const and not just two match arms
+///
+/// `AVTransport:1` — the service this adapter already speaks — *does* define
+/// `Next` and `Previous` actions. A pure renderer holds no playlist, so most
+/// devices would reject the call, but that is the device's answer to give and
+/// UHC's refusal pre-empts it. So this is a UHC choice, not a protocol limit, and
+/// `crate::mcp::capabilities` reads this list to report the `transport_skip`
+/// capability as *not yet implemented* rather than as a provider limitation.
+///
+/// The match arm in `control` is driven by this same list, so the capability
+/// report cannot drift from the behavior: implementing skip means removing the
+/// entries, and the reported capability flips with them.
+pub const REFUSED_TRANSPORT_ACTIONS: &[&str] = &["next", "previous", "prev"];
+
+/// The refusal sentence for a skip action, unchanged from before it was derived
+/// from [`REFUSED_TRANSPORT_ACTIONS`].
+fn refused_transport_action_message(action: &str) -> String {
+    let what = if action == "next" {
+        "Next track"
+    } else {
+        "Previous track"
+    };
+    format!("{} not supported by pure UPnP renderers", what)
+}
+
 /// Strip "upnp:" prefix from renderer UUIDs.
 /// MCP and aggregator use prefixed IDs, but UPnP API expects bare UUIDs.
 fn strip_upnp_prefix(id: &str) -> &str {
@@ -904,11 +931,10 @@ impl UPnPAdapter {
                 )
                 .await?;
             }
-            "next" => {
-                anyhow::bail!("Next track not supported by pure UPnP renderers");
-            }
-            "previous" | "prev" => {
-                anyhow::bail!("Previous track not supported by pure UPnP renderers");
+            // Driven by REFUSED_TRANSPORT_ACTIONS so the capability report and
+            // this refusal cannot disagree. Same strings as before.
+            refused if REFUSED_TRANSPORT_ACTIONS.contains(&refused) => {
+                anyhow::bail!("{}", refused_transport_action_message(refused));
             }
             "vol_abs" | "volume" => {
                 let url = rc_url

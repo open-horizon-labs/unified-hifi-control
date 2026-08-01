@@ -457,8 +457,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        10,
-        "expected 10 tools with HQPlayer enabled, got {}: {:?}",
+        11,
+        "expected 11 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -516,6 +516,9 @@ async fn tools_list_order_is_pinned() {
             "hifi_hqplayer_profiles",
             "hifi_hqplayer_load_profile",
             "hifi_hqplayer_set_pipeline",
+            // Appended by #398. Every line above it is untouched, which is what
+            // makes the diff additive.
+            "hifi_capabilities",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -556,8 +559,9 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
             "hifi_search",
             "hifi_play",
             "hifi_status",
+            "hifi_capabilities",
         ],
-        "HQPlayer disabled must yield exactly the six non-HQPlayer tools, in order"
+        "HQPlayer disabled must yield exactly the seven non-HQPlayer tools, in order"
     );
 }
 
@@ -676,6 +680,8 @@ async fn initialize_negotiates_down_for_older_clients() {
 const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
     ("hifi_zones", &[]),
     ("hifi_now_playing", &[("zone_id", true)]),
+    // #398. Optional: omitting it reports every zone and every provider.
+    ("hifi_capabilities", &[("zone_id", false)]),
     (
         "hifi_control",
         &[("zone_id", true), ("action", true), ("value", false)],
@@ -863,7 +869,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        10,
+        11,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }
@@ -1311,14 +1317,18 @@ async fn hifi_search_and_hifi_play_report_errors_with_their_own_prefixes() {
 // error text identifies which adapter a call actually reached. That makes routing
 // observable end to end, without mocks and without reading the source.
 
-/// Transport routing: `lms:` / `openhome:` / `upnp:` go to their adapters and
-/// EVERYTHING ELSE goes to Roon — including bare ids and unrecognised prefixes.
+/// Transport routing: every recognised prefix reaches its own adapter, and
+/// nothing else reaches any adapter.
 ///
-/// The Roon default is a known defect (#398). #394 freezes it rather than fixing
-/// it, so a green run here means "unchanged", never "correct".
+/// **Behavior change (#398).** #394's version of this test pinned the Roon
+/// default it froze: a bare id and `sonos:abc` both expected `"Not connected to
+/// Roon"`, with a note that a green run meant "unchanged, never correct". Both now
+/// expect a refusal that names the zone id, and `hqplayer:` — which used to land
+/// in the same Roon default, for a zone type `hifi_zones` actually returns — now
+/// names HQPlayer.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn transport_routing_including_the_roon_default_is_pinned() {
+async fn transport_routing_reaches_each_adapter_and_refuses_the_rest() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
@@ -1331,12 +1341,17 @@ async fn transport_routing_including_the_roon_default_is_pinned() {
         ),
         ("upnp:abc", "Renderer not found: abc", "explicit upnp:"),
         ("roon:abc", "Not connected to Roon", "explicit roon:"),
-        // Today's defaults. Both belong to #398, not #394.
-        ("1601a5d4bare", "Not connected to Roon", "bare id -> Roon"),
+        // #398. Each names the fault instead of Roon's adapter.
         (
-            "sonos:abc",
-            "Not connected to Roon",
-            "unknown prefix -> Roon",
+            "1601a5d4bare",
+            "has no provider prefix",
+            "bare id -> refused",
+        ),
+        ("sonos:abc", "names no adapter", "unknown prefix -> refused"),
+        (
+            "hqplayer:desktop",
+            "hqplayer zones are not controllable from MCP yet",
+            "hqplayer: -> named, tracked by #328",
         ),
     ];
 
@@ -1350,27 +1365,33 @@ async fn transport_routing_including_the_roon_default_is_pinned() {
         );
         assert!(
             text.contains(expected_fragment),
-            "{label} ({zone_id}): expected the error to contain {expected_fragment:?}, \
-             which identifies the adapter reached; got {text:?}"
+            "{label} ({zone_id}): expected the error to contain {expected_fragment:?}; \
+             got {text:?}"
         );
     }
 }
 
-/// Volume routing is a *different* rule from transport routing, and the
-/// difference is load-bearing: `sonos:abc` is refused for volume but routed to
-/// Roon for transport. Unifying these into one predicate would change behavior.
+/// Volume routing is still a *different* rule from transport routing, but the
+/// difference has moved.
+///
+/// **Behavior change (#398).** It used to be that OpenHome and UPnP reached their
+/// own adapters for transport and were refused for volume. Now volume reaches all
+/// four, and the surviving asymmetry is that the *library* rule is narrower than
+/// either — asserted in `library_routing_reaches_roon_and_lms_only`.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn volume_routing_differs_from_transport_routing() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
-    let volume_supported: &[(&str, &str)] = &[
+    let volume_reaches_an_adapter: &[(&str, &str)] = &[
         ("lms:aa:bb:cc:dd:ee:ff", "not configured"),
         ("roon:abc", "Not connected to Roon"),
-        ("1601a5d4bare", "Not connected to Roon"),
+        // #398 wired these two.
+        ("openhome:abc", "Device not found: abc"),
+        ("upnp:abc", "Renderer not found: abc"),
     ];
-    for (zone_id, expected_fragment) in volume_supported {
+    for (zone_id, expected_fragment) in volume_reaches_an_adapter {
         let text = result_text(
             &app.call_tool(
                 "hifi_control",
@@ -1380,11 +1401,17 @@ async fn volume_routing_differs_from_transport_routing() {
         );
         assert!(
             text.contains(expected_fragment),
-            "{zone_id}: volume must reach an adapter; got {text:?}"
+            "{zone_id}: volume must reach its own adapter; got {text:?}"
         );
     }
 
-    for zone_id in ["openhome:abc", "upnp:abc", "sonos:abc"] {
+    // What volume refuses is now exactly what transport refuses: ids UHC cannot
+    // place, plus the one recognised provider with nothing wired.
+    for (zone_id, expected_fragment) in [
+        ("1601a5d4bare", "has no provider prefix"),
+        ("sonos:abc", "names no adapter"),
+        ("hqplayer:desktop", "not controllable from MCP yet"),
+    ] {
         let text = result_text(
             &app.call_tool(
                 "hifi_control",
@@ -1392,18 +1419,25 @@ async fn volume_routing_differs_from_transport_routing() {
             )
             .await,
         );
-        assert_eq!(
-            text, "Error: Volume control not supported for this zone type",
-            "{zone_id}: volume must be refused, not silently routed"
+        assert!(
+            text.contains(expected_fragment),
+            "{zone_id}: volume must be refused by name, not silently routed; got {text:?}"
         );
     }
 }
 
-/// Search and play route on `lms:` only; everything else, including an absent
-/// `zone_id`, goes to Roon.
+/// Search and play route on `roon:` and `lms:`. Everything else is refused.
+///
+/// **Behavior change (#398).** `openhome:`, `upnp:`, `hqplayer:` and unplaceable
+/// ids all reached Roon's library before — searching a library those zones cannot
+/// play from, then failing inside Roon, so a model learned that Roon was broken
+/// rather than that the zone has no library.
+///
+/// An absent `zone_id` still routes to Roon, and that is asserted here as well as
+/// in its own test, because this is the test a reader checks for the routing rule.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn search_and_play_routing_is_pinned() {
+async fn library_routing_reaches_roon_and_lms_only() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
@@ -1411,7 +1445,7 @@ async fn search_and_play_routing_is_pinned() {
     // so match case-insensitively on the part that names the adapter.
     let roon = "not connected to roon";
 
-    // hifi_search's zone_id is optional. Absent -> Roon.
+    // hifi_search's zone_id is optional. Absent -> Roon. Unchanged by #398.
     let text = result_text(&app.call_tool("hifi_search", json!({ "query": "q" })).await);
     assert!(
         text.to_lowercase().contains(roon),
@@ -1420,27 +1454,24 @@ async fn search_and_play_routing_is_pinned() {
 
     for (zone_id, expected_fragment) in [
         ("lms:aa:bb:cc:dd:ee:ff", "not configured"),
-        ("openhome:abc", roon),
-        ("upnp:abc", roon),
-        ("sonos:abc", roon),
+        ("roon:abc", roon),
+        // #398: refused, each naming its own reason rather than Roon's failure.
+        ("openhome:abc", "have no library path from mcp"),
+        ("upnp:abc", "have no library path from mcp"),
+        ("hqplayer:desktop", "have no library path from mcp"),
+        ("1601a5d4bare", "has no provider prefix"),
+        ("sonos:abc", "names no adapter"),
     ] {
-        let text = result_text(
-            &app.call_tool("hifi_search", json!({ "query": "q", "zone_id": zone_id }))
-                .await,
-        );
-        assert!(
-            text.to_lowercase().contains(expected_fragment),
-            "search {zone_id}: expected {expected_fragment:?}, got {text:?}"
-        );
-
-        let text = result_text(
-            &app.call_tool("hifi_play", json!({ "query": "q", "zone_id": zone_id }))
-                .await,
-        );
-        assert!(
-            text.to_lowercase().contains(expected_fragment),
-            "play {zone_id}: expected {expected_fragment:?}, got {text:?}"
-        );
+        for tool in ["hifi_search", "hifi_play"] {
+            let text = result_text(
+                &app.call_tool(tool, json!({ "query": "q", "zone_id": zone_id }))
+                    .await,
+            );
+            assert!(
+                text.to_lowercase().contains(expected_fragment),
+                "{tool} {zone_id}: expected {expected_fragment:?}, got {text:?}"
+            );
+        }
     }
 }
 
@@ -2036,6 +2067,57 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
     ("source", Consumed("hifi_search.source / hifi_play.source")),
     ("profile", Consumed("hifi_hqplayer_load_profile.profile")),
     ("setting", Consumed("hifi_hqplayer_set_pipeline.setting")),
+    // -------------------------------------------------------------------------
+    // hifi_capabilities (#398). The payload is two sections because capability
+    // state is a function of provider, not of zone.
+    // -------------------------------------------------------------------------
+    (
+        "zones",
+        DisplayOnly(
+            "wrapper listing each zone with the provider whose capability table applies to \
+         it. The zone_id inside it is consumed by every zone-scoped tool; the wrapper is \
+         the join key between the two sections.",
+        ),
+    ),
+    (
+        "providers",
+        DisplayOnly(
+            "wrapper holding one capability table per provider. Deduplicated out of `zones` \
+         on purpose: repeating 18 identical entries per zone would imply a per-zone \
+         precision UHC does not have.",
+        ),
+    ),
+    (
+        "capabilities",
+        DisplayOnly("wrapper for one provider's capability entries, in vocabulary order"),
+    ),
+    (
+        "capability",
+        DisplayOnly(
+            "the capability's name (transport, browse, queue_reorder, ...). Not a tool input: \
+         a client acts by calling the tool that performs it, and `support` is what tells it \
+         whether to bother. The vocabulary is pinned in EXPECTED_CAPABILITIES.",
+        ),
+    ),
+    (
+        "support",
+        DisplayOnly(
+            "supported / unsupported / not_implemented. Named `support` rather than `state` \
+         because `state` already means a zone's playback state everywhere else in this \
+         surface, and one field name meaning two things is how a client parses the wrong \
+         one. A model branches on it before acting rather than after failing.",
+        ),
+    ),
+    (
+        "has_volume_control",
+        DisplayOnly(
+            "whether the aggregator currently holds a volume control for this zone. An \
+         OBSERVATION, not a capability: false means either 'this output has no volume \
+         control' or 'no volume has been read yet', and UHC cannot tell those apart. \
+         Reported beside the per-provider volume capability so a client can weigh both, \
+         rather than resolved by guessing — see src/mcp/capabilities.rs.",
+        ),
+    ),
 ];
 
 /// Collect every key name reachable in a JSON value, at any depth.
@@ -2066,9 +2148,14 @@ async fn no_tool_returns_an_unclassified_field() {
     // zone and now-playing payloads are fully populated rather than empty.
     let structured_calls: Vec<(&str, Value)> = vec![
         ("hifi_zones", json!({})),
-        ("hifi_now_playing", json!({ "zone_id": zone_id })),
+        ("hifi_now_playing", json!({ "zone_id": zone_id.clone() })),
         ("hifi_status", json!({})),
         ("hifi_hqplayer_status", json!({})),
+        // #398. Driven both ways: the all-zones form is the only call that emits
+        // every provider's table, and the single-zone form is the only one that
+        // emits `has_volume_control` for a zone the aggregator actually holds.
+        ("hifi_capabilities", json!({})),
+        ("hifi_capabilities", json!({ "zone_id": zone_id })),
     ];
 
     let mut returned = std::collections::BTreeSet::new();
@@ -2088,15 +2175,18 @@ async fn no_tool_returns_an_unclassified_field() {
         }
     }
 
-    // Envelope shapes the four calls above cannot reach: every refusal variant's
+    // Envelope shapes the reads above cannot reach: every refusal variant's
     // fields, every `params` key, and the write path's `observed`. Driven rather
     // than listed, so a renamed field is caught instead of quietly reclassified.
     for (tool, args) in [
         // One call per Refusal variant.
         ("hifi_now_playing", json!({ "zone_id": "roon:nope" })), // unknown_target
         (
-            "hifi_control", // not_implemented
-            json!({ "zone_id": "openhome:abc", "action": "volume_set", "value": 1 }),
+            // not_implemented, and since #398 this is the only path that produces
+            // one: an `hqplayer:` zone, which hifi_zones lists and hifi_control
+            // cannot reach. It used to be OpenHome volume, which is now wired.
+            "hifi_control",
+            json!({ "zone_id": "hqplayer:desktop", "action": "play" }),
         ),
         (
             "hifi_play", // provider_limitation
@@ -2264,7 +2354,8 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
         "hifi_control",
         || json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "volume_set" }),
     ),
-    // hifi_control — volume refused for zone types the MCP volume path skips.
+    // hifi_control — volume. #398 wired both of these, so their text is now the
+    // adapter's own answer. See TEXT_CORRECTIONS.
     (
         "hifi_control/volume_openhome",
         "hifi_control",
@@ -2275,7 +2366,8 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
         "hifi_control",
         || json!({ "zone_id": "upnp:abc", "action": "volume_set", "value": 30 }),
     ),
-    // hifi_control — volume refused for a prefix that names no adapter at all.
+    // hifi_control — volume for a prefix that names no adapter at all. #398
+    // replaced the zone-type claim with one that names the prefix.
     (
         "hifi_control/volume_unknown_prefix",
         "hifi_control",
@@ -2287,16 +2379,17 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
         "hifi_control",
         || json!({ "zone_id": UNKNOWN_ROON_ZONE, "action": "volume_up" }),
     ),
-    // hifi_control — an action no adapter knows, passed straight through by
-    // `other => other`.
+    // hifi_control — an action no adapter knows.
     //
-    // NOTE the label: the OpenHome adapter resolves the device *before* matching
-    // the action, so offline this never reaches action dispatch and the text is
-    // "Device not found". Calling this case "unknown_action" would be coverage
-    // wearing a label it has not earned. What the pass-through actually does to
-    // `operation` is asserted against the LMS mock instead
-    // (`envelope_reports_normalized_actions_and_resolved_volume` and the LMS
-    // round-trip), where a device does resolve.
+    // **The label has inverted and is deliberately not renamed.** It was accurate
+    // for #395: the OpenHome adapter resolved the device before matching the
+    // action, so offline the call never reached action dispatch and the text was
+    // "Device not found". #398 closed the action set, so the action is now
+    // rejected *before* the zone is even classified — the label's premise is the
+    // opposite of the truth. Renaming the key would mean rewriting
+    // `mcp_tool_text.json`, and keeping that file untouched is the stronger
+    // guarantee: the correction is recorded in TEXT_CORRECTIONS with both the old
+    // and new strings, where a reader can see exactly what changed.
     (
         "hifi_control/unknown_action_never_reaches_dispatch",
         "hifi_control",
@@ -2358,36 +2451,195 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
         "hifi_hqplayer_set_pipeline",
         || json!({ "setting": "samplerate", "value": "not-a-number" }),
     ),
+    // Added by #398, so its expected text is in TEXT_ADDITIONS rather than in the
+    // pre-envelope fixture. It is the only case producing a `not_implemented`
+    // refusal now that OpenHome/UPnP volume is wired, so
+    // `every_refusal_reason_is_actually_produced` depends on it.
+    (
+        "hifi_control/hqplayer_zone_not_wired",
+        "hifi_control",
+        || json!({ "zone_id": "hqplayer:desktop", "action": "play" }),
+    ),
 ];
 
-/// The exact text every tool returns, pinned against a fixture generated before
-/// the envelope existed.
+/// Cases #398 adds, with their expected text.
 ///
-/// This is #395's central guarantee. A diff here means the envelope replaced
-/// text rather than accompanying it — which is the bug, not a stale fixture.
+/// A third category alongside the fixture and [`TEXT_CORRECTIONS`], for the same
+/// reason: `mcp_tool_text.json` is not edited, so a case that postdates it needs
+/// its expected value stated somewhere a reader can see. Every string a tool
+/// returns is therefore accounted for in exactly one of the three places.
+const TEXT_ADDITIONS: &[(&str, &str)] = &[(
+    "hifi_control/hqplayer_zone_not_wired",
+    "Error: hqplayer zones are not controllable from MCP yet: HqpAdapter implements play, \
+     pause, stop, next, previous, seek, set_volume and volume_up/down \
+     (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones \
+     lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them. \
+     hifi_capabilities reports what each provider supports.",
+)];
+
+/// Every string #398 changes, with the value it replaces.
+///
+/// # Why this table exists instead of a regenerated fixture
+///
+/// #398's acceptance criteria require correcting prose that #395 froze — the
+/// refusal `"Volume control not supported for this zone type"` is a false claim
+/// about two providers, and `other => other` produced a refusal that never named
+/// the action. So four strings change, and the honest way to record that is not to
+/// rerun `UPDATE_MCP_FIXTURES=1` and let a green suite imply nothing happened.
+///
+/// Instead `tests/fixtures/mcp_tool_text.json` stays **byte-for-byte untouched**
+/// (`git log --follow` on it still shows the two #395 commits and nothing else),
+/// and every change is listed here with `before` **and** `after`.
+/// [`tool_text_matches_the_fixture_except_for_398s_listed_corrections`] asserts
+/// both halves: that each `before` equals the untouched fixture value — so this
+/// table cannot quietly claim to be correcting something else — and that each
+/// `after` is what the server now returns.
+///
+/// `(fixture key, the string #395 froze, the string #398 replaces it with)`
+const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
+    // #398 wires the MCP volume path to the OpenHome and UPnP adapters, which
+    // implement vol_abs/vol_rel and have been reachable over HTTP all along. The
+    // old string claimed a provider limitation that does not exist.
+    (
+        "hifi_control/volume_openhome",
+        "Error: Volume control not supported for this zone type",
+        "Error: Volume error: Device not found: abc",
+    ),
+    (
+        "hifi_control/volume_upnp",
+        "Error: Volume control not supported for this zone type",
+        "Error: Volume error: Renderer not found: abc",
+    ),
+    // The same string was also used for a zone id whose prefix names no adapter,
+    // where it blamed "this zone type" for a fault in the client's zone id. #395
+    // recorded that its envelope deliberately contradicted the prose, and left the
+    // prose to #398.
+    (
+        "hifi_control/volume_unknown_prefix",
+        "Error: Volume control not supported for this zone type",
+        "Error: Zone id 'sonos:abc' uses the prefix 'sonos:', which names no adapter. \
+         Accepted prefixes: roon:, lms:, openhome:, upnp:, hqplayer:. Call hifi_zones for \
+         valid zone ids.",
+    ),
+    // `other => other` forwarded any action string to the adapter, so offline the
+    // client was told about a device rather than about its typo.
+    (
+        "hifi_control/unknown_action_never_reaches_dispatch",
+        "Error: Control error: Device not found: abc",
+        "Error: Unknown action 'frobnicate'. Valid actions: play, pause, playpause, next, \
+         previous, prev, volume_set, volume_up, volume_down.",
+    ),
+];
+
+/// The exact text every tool returns: byte-identical to the pre-envelope fixture
+/// except for the four strings #398 corrects, each listed with what it replaced.
+///
+/// #395's central guarantee was that the envelope *accompanied* the text rather
+/// than replacing it, and that still holds — every string here is either the
+/// fixture's or a [`TEXT_CORRECTIONS`] entry, and there is no third possibility.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn tool_text_is_byte_identical_to_the_pre_envelope_fixture() {
+async fn tool_text_matches_the_fixture_except_for_398s_listed_corrections() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
-    let mut captured = serde_json::Map::new();
-    for (label, tool, args) in TOOL_TEXT_CASES {
-        let result = app.call_tool(tool, args()).await;
-        captured.insert(label.to_string(), json!(result_text(&result)));
+    let fixture: Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture_path("mcp_tool_text.json"))
+            .expect("the pre-envelope text fixture must exist"),
+    )
+    .expect("the text fixture must be JSON");
+
+    // Half one: each correction's `before` is really what the fixture says. This
+    // is what stops the table from being a place to launder an unrelated change.
+    for (label, before, _) in TEXT_CORRECTIONS {
+        assert_eq!(
+            fixture.get(label).and_then(Value::as_str),
+            Some(*before),
+            "{label}: TEXT_CORRECTIONS claims to replace {before:?}, but the untouched \
+             fixture does not say that. Either the fixture was edited — it must not be — \
+             or this entry is describing a change that is not the one being made."
+        );
     }
 
-    // Every tool must appear, or the fixture is a partial guarantee dressed up
-    // as a total one.
+    // Half two: every case returns the fixture's string, its correction's, or the
+    // value declared for a case #398 added. Exactly one of three, never a fourth.
+    for (label, tool, args) in TOOL_TEXT_CASES {
+        let actual = result_text(&app.call_tool(tool, args()).await);
+        let correction = TEXT_CORRECTIONS
+            .iter()
+            .find(|(l, _, _)| l == label)
+            .map(|(_, _, after)| *after);
+        let addition = TEXT_ADDITIONS
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, text)| *text);
+        assert!(
+            !(correction.is_some() && addition.is_some()),
+            "{label}: a case cannot be both corrected and added"
+        );
+        match (correction, addition) {
+            (Some(after), _) => assert_eq!(
+                actual, after,
+                "{label}: #398 corrects this string, and it does not match the correction"
+            ),
+            (_, Some(expected)) => assert_eq!(
+                actual, expected,
+                "{label}: #398 adds this case, and its text does not match TEXT_ADDITIONS"
+            ),
+            (None, None) => assert_eq!(
+                actual,
+                fixture
+                    .get(label)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("{label} is missing from the text fixture")),
+                "{label}: this string is NOT one #398 corrects, so it must be byte-identical \
+                 to the pre-envelope fixture. If the change is intended, add it to \
+                 TEXT_CORRECTIONS with the string it replaces — do not regenerate the fixture."
+            ),
+        }
+    }
+
+    // No stale corrections: a table entry for a case that no longer differs reads
+    // as a change still being made when it is not.
+    let case_labels: std::collections::BTreeSet<&str> =
+        TOOL_TEXT_CASES.iter().map(|(label, _, _)| *label).collect();
+    for (label, before, after) in TEXT_CORRECTIONS {
+        assert!(
+            case_labels.contains(label),
+            "TEXT_CORRECTIONS lists {label}, which TOOL_TEXT_CASES does not exercise"
+        );
+        assert_ne!(before, after, "{label}: a correction that changes nothing");
+    }
+    // An "addition" that the fixture already covers is a correction in disguise.
+    for (label, _) in TEXT_ADDITIONS {
+        assert!(
+            case_labels.contains(label),
+            "TEXT_ADDITIONS lists {label}, which TOOL_TEXT_CASES does not exercise"
+        );
+        assert!(
+            fixture.get(label).is_none(),
+            "{label} is in the pre-envelope fixture, so it is not an addition — if its text \
+             changed, record it in TEXT_CORRECTIONS with the string it replaces"
+        );
+    }
+
+    // The ten tools that predate #398 keep their text pinned. `hifi_capabilities`
+    // is deliberately absent: its text is a long derived payload, and byte-pinning
+    // it here would duplicate the AGENTS.md matrix block, which is a byte
+    // comparison against a committed file of exactly this data
+    // (`agents_md_capability_matrix_matches_the_derived_data`).
     let covered: std::collections::BTreeSet<&str> =
         TOOL_TEXT_CASES.iter().map(|(_, tool, _)| *tool).collect();
     assert_eq!(
         covered.len(),
         10,
-        "all 10 tools must have their text pinned; covered: {covered:?}"
+        "the ten pre-#398 tools must have their text pinned; covered: {covered:?}"
     );
-
-    assert_matches_fixture("mcp_tool_text.json", &Value::Object(captured));
+    assert!(
+        !covered.contains("hifi_capabilities"),
+        "if hifi_capabilities is added here, the fixture has to be regenerated — pin it \
+         through the AGENTS.md matrix instead"
+    );
 }
 
 /// Exactly one content block per tool result.
@@ -2472,17 +2724,14 @@ const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
         "invalid",
         Some("invalid_parameter"),
     ),
-    // The two rows this issue exists for: one frozen string, two truths.
+    // #398 wired both, so the refusal is gone and the adapter's own failure is
+    // what a client now sees. Was `unsupported` / `not_implemented` in #395.
     (
         "hifi_control/volume_openhome",
-        "unsupported",
-        Some("not_implemented"),
+        "error",
+        Some("backend_error"),
     ),
-    (
-        "hifi_control/volume_upnp",
-        "unsupported",
-        Some("not_implemented"),
-    ),
+    ("hifi_control/volume_upnp", "error", Some("backend_error")),
     (
         "hifi_control/volume_unknown_prefix",
         "invalid",
@@ -2493,10 +2742,12 @@ const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
         "error",
         Some("backend_error"),
     ),
+    // #398 closed the action set, so this is now the client's fault to fix rather
+    // than a backend failure it never caused. Was `error` / `backend_error`.
     (
         "hifi_control/unknown_action_never_reaches_dispatch",
-        "error",
-        Some("backend_error"),
+        "invalid",
+        Some("invalid_parameter"),
     ),
     (
         "hifi_search/roon_disconnected",
@@ -2540,6 +2791,13 @@ const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
         "hifi_hqplayer_set_pipeline/invalid_rate",
         "invalid",
         Some("invalid_parameter"),
+    ),
+    // The only `not_implemented` left once OpenHome/UPnP volume is wired: a zone
+    // type hifi_zones advertises that hifi_control cannot reach.
+    (
+        "hifi_control/hqplayer_zone_not_wired",
+        "unsupported",
+        Some("not_implemented"),
     ),
 ];
 
@@ -3000,25 +3258,39 @@ async fn invalid_refusals_name_the_parameter_and_its_accepted_values() {
     }
 }
 
-/// OpenHome and UPnP volume is a UHC gap, not a provider limitation — and the
-/// envelope says so even though the frozen prose does not.
+/// OpenHome and UPnP volume: was ❌ in AGENTS.md, `not_implemented` in #395, and
+/// is implemented as of #398.
 ///
-/// Both adapters implement volume (`src/adapters/openhome.rs` and
-/// `src/adapters/upnp.rs`, action `vol_abs`/`vol_rel`) and both expose it over
-/// HTTP (`POST /openhome/control`, `POST /upnp/control`). Only the MCP volume
-/// path declines to call it. Classifying that as `provider_limitation` is exactly
-/// the mislabelling #392 rule 3 forbids, and it is what AGENTS.md's capability
-/// matrix currently implies.
+/// **Behavior change, and this test is where it is recorded.** #395 asserted the
+/// frozen prose `"Volume control not supported for this zone type"` and an
+/// envelope classifying it `not_implemented` tracked by #398. Both adapters
+/// implement `vol_abs`/`vol_rel` and both expose it over HTTP
+/// (`POST /openhome/control`, `POST /upnp/control`) — only the MCP path declined.
+/// #398 wires it, so the refusal is gone: the call reaches the adapter and the
+/// adapter answers about the device it could not find.
 ///
-/// If #398 later proves a genuine provider limit for one of these, this test is
-/// the place to change it — deliberately, with the evidence in the commit.
+/// The `not_implemented` classification is deliberately not softened into a
+/// weaker assertion here — it is *deleted*, because the gap it described is
+/// closed. `tests::openhome_and_upnp_volume_is_wired_and_reported_supported`
+/// asserts the capability report agrees.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn openhome_and_upnp_volume_is_reported_as_a_uhc_gap_not_a_provider_limit() {
+async fn openhome_and_upnp_volume_reaches_the_adapter_since_398() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
-    for (zone_id, provider) in [("openhome:abc", "openhome"), ("upnp:abc", "upnp")] {
+    for (zone_id, provider, expected) in [
+        (
+            "openhome:abc",
+            "openhome",
+            "Error: Volume error: Device not found: abc",
+        ),
+        (
+            "upnp:abc",
+            "upnp",
+            "Error: Volume error: Renderer not found: abc",
+        ),
+    ] {
         let result = app
             .call_tool(
                 "hifi_control",
@@ -3026,24 +3298,23 @@ async fn openhome_and_upnp_volume_is_reported_as_a_uhc_gap_not_a_provider_limit(
             )
             .await;
 
-        // The text is untouched.
         assert_eq!(
             result_text(&result),
-            "Error: Volume control not supported for this zone type",
-            "{zone_id}: the frozen prose must not change"
+            expected,
+            "{zone_id}: volume must reach its own adapter and report the adapter's answer"
         );
 
         let env = envelope(&result, zone_id);
-        let refusal = env.get("refusal").expect("a refusal is expected");
+        // A backend failure, not a refusal: UHC tried.
         assert_eq!(
-            refusal.get("reason"),
-            Some(&json!("not_implemented")),
-            "{zone_id}: the adapter implements volume, so this is UHC's gap: {refusal}"
+            env.get("outcome"),
+            Some(&json!("error")),
+            "{zone_id}: the call was attempted, so this is an error and not a refusal: {env}"
         );
         assert_eq!(
-            refusal.get("tracked_by"),
-            Some(&json!("#398")),
-            "{zone_id}: 'not yet' must name the issue that makes it checkable"
+            env.pointer("/refusal/reason"),
+            Some(&json!("backend_error")),
+            "{zone_id}: nothing about the provider is being claimed any more: {env}"
         );
         assert_eq!(
             env.get("scope").and_then(|s| s.get("provider")),
@@ -3053,15 +3324,14 @@ async fn openhome_and_upnp_volume_is_reported_as_a_uhc_gap_not_a_provider_limit(
     }
 }
 
-/// A zone id whose prefix names no adapter blames the zone id, not a provider.
+/// A zone id whose prefix names no adapter blames the zone id, not a provider —
+/// and since #398 the prose says so too.
 ///
-/// Same frozen string as the case above, different envelope. UHC never
-/// identified a provider for `sonos:abc`, so it cannot claim one lacks volume —
-/// and telling a model "this zone does not support volume" would teach it never
-/// to retry, when the actual fix is a valid zone id.
-///
-/// This is the one place in #395 where the envelope's outcome deliberately
-/// contradicts the accompanying prose. #398 corrects the prose.
+/// **Behavior change.** #395 pinned the misleading string `"Volume control not
+/// supported for this zone type"` for `sonos:abc` and recorded that its envelope
+/// deliberately contradicted it, because #395 froze prose and #398 owned
+/// correcting it. This is that correction: one message, and it names the prefix it
+/// did not recognise.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn unknown_zone_prefix_volume_blames_the_zone_id_not_the_provider() {
@@ -3075,10 +3345,14 @@ async fn unknown_zone_prefix_volume_blames_the_zone_id_not_the_provider() {
         )
         .await;
 
-    assert_eq!(
-        result_text(&result),
-        "Error: Volume control not supported for this zone type",
-        "the frozen prose must not change"
+    let text = result_text(&result);
+    assert!(
+        text.contains("'sonos:'") && text.contains("names no adapter"),
+        "the prose must name the prefix it did not recognise, not blame the zone type: {text}"
+    );
+    assert!(
+        !text.contains("not supported for this zone type"),
+        "the false claim #395 froze must be gone: {text}"
     );
 
     let env = envelope(&result, "sonos");
@@ -3091,8 +3365,9 @@ async fn unknown_zone_prefix_volume_blames_the_zone_id_not_the_provider() {
     assert_eq!(refusal.get("parameter"), Some(&json!("zone_id")));
     assert_eq!(
         refusal.get("accepted"),
-        Some(&json!(["roon:", "lms:", "openhome:", "upnp:"])),
-        "the refusal must enumerate the prefixes that name an adapter: {refusal}"
+        Some(&json!(["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"])),
+        "the refusal must enumerate every prefix that names an adapter — five, since \
+         hifi_zones returns hqplayer: ids: {refusal}"
     );
 
     // And it must NOT claim anything about a provider.
@@ -3103,25 +3378,24 @@ async fn unknown_zone_prefix_volume_blames_the_zone_id_not_the_provider() {
     );
 }
 
-/// An unrecognised zone prefix reports `provider: "unknown"`, never the adapter
-/// the call was silently defaulted to.
+/// An unplaceable zone prefix reports `provider: "unknown"` and reaches no
+/// adapter.
 ///
-/// `sonos:abc` classifies as `ZoneTarget::Unknown` and transport still sends it to
-/// Roon — today's silent default, #398's to fix. An earlier draft of this PR
-/// derived `scope.provider` from the *route*, so it reported `roon`, teaching a
-/// model two false things: that a Sonos zone is a Roon zone, and that Roon is at
-/// fault. #392 rule 3 forbids making a provider look responsible for a UHC
-/// decision.
+/// **Behavior change.** #395's version of this test pinned the *honesty of the
+/// report while the Roon default still happened*: `provider: "unknown"` beside a
+/// Roon-shaped failure detail, with an assertion that the Roon default remained
+/// visible "until #398 removes it". #398 removes it. So the assertion inverts:
+/// the detail must no longer mention Roon at all, because Roon is no longer
+/// involved.
 ///
-/// So `provider: "unknown"` beside a Roon-shaped failure detail is the readable
-/// fingerprint of the default, rather than an authoritative-looking lie.
+/// The bare-id half of the old test asserted `provider: "roon"` for `bareid`. That
+/// was the load-bearing default, and it is gone too.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn an_unrecognised_prefix_never_claims_the_adapter_it_was_defaulted_to() {
+async fn an_unplaceable_prefix_reaches_no_adapter_at_all() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
-    // Transport, search and play all default an unknown prefix to Roon.
     let cases: &[(&str, Value)] = &[
         (
             "hifi_control",
@@ -3132,6 +3406,7 @@ async fn an_unrecognised_prefix_never_claims_the_adapter_it_was_defaulted_to() {
             json!({ "query": "q", "zone_id": "sonos:abc" }),
         ),
         ("hifi_play", json!({ "query": "q", "zone_id": "sonos:abc" })),
+        ("hifi_capabilities", json!({ "zone_id": "sonos:abc" })),
     ];
 
     for (tool, args) in cases {
@@ -3141,26 +3416,26 @@ async fn an_unrecognised_prefix_never_claims_the_adapter_it_was_defaulted_to() {
         assert_eq!(
             env.get("scope").and_then(|s| s.get("provider")),
             Some(&json!("unknown")),
-            "{tool}: an unidentified provider must not be reported as the adapter the \
-             call was defaulted to: {env}"
+            "{tool}: an unidentified provider must not be reported as any adapter: {env}"
         );
 
-        // And the default is still happening — this test pins the honesty of the
-        // report, not a fix. #398 owns the fix.
         let detail = env
-            .get("refusal")
-            .and_then(|r| r.get("detail"))
+            .pointer("/refusal/detail")
             .and_then(Value::as_str)
             .unwrap_or("");
         assert!(
-            detail.to_lowercase().contains("roon"),
-            "{tool}: the Roon default is expected to remain visible in the detail \
-             until #398 removes it; got {detail:?}"
+            !detail.to_lowercase().contains("roon"),
+            "{tool}: Roon is no longer involved, so the detail must not mention it: {detail:?}"
+        );
+        assert!(
+            !result_text(&result).contains("Not connected to Roon"),
+            "{tool}: the call must not have reached the Roon adapter"
         );
     }
 
-    // A bare id is a *documented* default rather than a silent one, so it does
-    // report roon. Pinned to make the difference deliberate.
+    // A bare id used to report `provider: "roon"` — the documented default that
+    // #398 removed. It now reports the same `unknown` as an invented prefix,
+    // because UHC identified nothing in either case.
     let result = app
         .call_tool(
             "hifi_control",
@@ -3171,9 +3446,9 @@ async fn an_unrecognised_prefix_never_claims_the_adapter_it_was_defaulted_to() {
         envelope(&result, "bareid")
             .get("scope")
             .and_then(|s| s.get("provider")),
-        Some(&json!("roon")),
-        "a bare id classifies as Roon by a rule stated in routing.rs, unlike an \
-         unrecognised prefix"
+        Some(&json!("unknown")),
+        "a bare id no longer claims Roon; the two unplaceable shapes differ only in the \
+         sentence they get"
     );
 }
 
@@ -3578,4 +3853,827 @@ async fn populated_zone_payload_keeps_declaration_order_in_the_text() {
     );
 
     h.stop().await;
+}
+
+// =============================================================================
+// 13. Capability discovery, explicit routing, and the AGENTS.md matrix (#398)
+// =============================================================================
+//
+// Written before any of #398's implementation existed, and every assertion in
+// this section failed on the first run. `git log --follow tests/mcp_contract.rs`
+// shows a test-only commit for this section preceding the src commit.
+//
+// Three things are pinned here, in the order they matter:
+//
+// 1. `hifi_capabilities` answers with three states per capability, and the two
+//    states that are not "supported" are never confused with each other.
+// 2. An unknown or unprefixed zone id is refused by name instead of being
+//    forwarded to Roon, and an unrecognised `hifi_control` action is refused
+//    instead of being forwarded to an adapter.
+// 3. AGENTS.md's capability matrix is the derived data, rendered — not a
+//    hand-maintained table that happens to agree with it.
+
+/// The capability vocabulary, restated here rather than imported.
+///
+/// This is a contract test, so the expected value must not come from the code
+/// under test: importing `Capability::ALL` would make this assert that the
+/// vocabulary equals itself, and deleting a capability from production would
+/// pass. The cost is that adding one requires an edit here, which is the point.
+const EXPECTED_CAPABILITIES: &[&str] = &[
+    "transport",
+    "transport_skip",
+    "volume",
+    "search",
+    "play_by_query",
+    "play_by_ref",
+    "browse",
+    "queue_read",
+    "queue_jump",
+    "queue_reorder",
+    "queue_remove",
+    "queue_clear",
+    "play_next",
+    "repeat_mode",
+    "shuffle_mode",
+    "saved_playlists",
+    "favorites",
+    "multiroom_sync",
+];
+
+/// Every provider a zone id can name — five, not four.
+///
+/// `hqplayer:` is in `PrefixedZoneId`'s own valid-prefix list
+/// (`src/bus/events.rs`) and `HqpAdapter` publishes `ZoneDiscovered` with it, so
+/// HQPlayer zones appear in `hifi_zones`. A capability report that omitted them
+/// would understate the surface in exactly the way #392 rule 3 forbids.
+const EXPECTED_PROVIDERS: &[&str] = &["roon", "lms", "openhome", "upnp", "hqplayer"];
+
+/// The three states, spelled as they appear on the wire.
+const SUPPORTED: &str = "supported";
+const UNSUPPORTED: &str = "unsupported";
+const NOT_IMPLEMENTED: &str = "not_implemented";
+
+/// Parse `hifi_capabilities`' payload out of a tool result's text.
+fn capability_payload(result: &Value) -> Value {
+    let text = result_text(result);
+    serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("hifi_capabilities must return JSON: {e}\n{text}"))
+}
+
+/// The capability entries for one provider, keyed by capability name.
+fn capabilities_of(payload: &Value, provider: &str) -> std::collections::BTreeMap<String, Value> {
+    payload
+        .get("providers")
+        .and_then(Value::as_array)
+        .expect("payload must carry a providers array")
+        .iter()
+        .find(|p| p.get("provider").and_then(Value::as_str) == Some(provider))
+        .unwrap_or_else(|| panic!("no capability entry for provider {provider:?}"))
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .expect("each provider must carry a capabilities array")
+        .iter()
+        .map(|entry| {
+            let name = entry
+                .get("capability")
+                .and_then(Value::as_str)
+                .expect("each capability entry must name its capability")
+                .to_string();
+            (name, entry.clone())
+        })
+        .collect()
+}
+
+fn support_of(entry: &Value) -> &str {
+    entry
+        .get("support")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("capability entry has no support state: {entry}"))
+}
+
+/// The tool is advertised, and it answers with every provider and every
+/// capability in the vocabulary, each carrying one of exactly three states.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_capabilities_reports_three_states_for_every_provider() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let advertised = tool_names(
+        app.list_tools()
+            .await
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tools array"),
+    );
+    assert!(
+        advertised.iter().any(|n| n == "hifi_capabilities"),
+        "hifi_capabilities must be advertised in tools/list; got {advertised:?}"
+    );
+
+    let payload = capability_payload(&app.call_tool("hifi_capabilities", json!({})).await);
+
+    let providers: Vec<&str> = payload
+        .get("providers")
+        .and_then(Value::as_array)
+        .expect("providers array")
+        .iter()
+        .filter_map(|p| p.get("provider").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        providers, EXPECTED_PROVIDERS,
+        "every zone prefix UHC recognises must have a capability column, in a stable order"
+    );
+
+    for provider in EXPECTED_PROVIDERS {
+        let caps = capabilities_of(&payload, provider);
+        let names: Vec<&str> = caps.keys().map(String::as_str).collect();
+        let mut expected: Vec<&str> = EXPECTED_CAPABILITIES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            names, expected,
+            "{provider}: the capability vocabulary drifted from EXPECTED_CAPABILITIES"
+        );
+
+        for (name, entry) in &caps {
+            let support = support_of(entry);
+            assert!(
+                [SUPPORTED, UNSUPPORTED, NOT_IMPLEMENTED].contains(&support),
+                "{provider}/{name}: {support:?} is not one of the three states"
+            );
+
+            // The two non-supported states must be distinguishable by more than
+            // their name: `not_implemented` is a claim an operator can check.
+            if support == NOT_IMPLEMENTED {
+                let tracked = entry
+                    .get("tracked_by")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("{provider}/{name}: not_implemented needs tracked_by")
+                    });
+                assert!(
+                    tracked.starts_with('#') && tracked[1..].chars().all(|c| c.is_ascii_digit()),
+                    "{provider}/{name}: tracked_by must be a UHC issue reference, got {tracked:?}"
+                );
+            } else {
+                assert!(
+                    entry.get("tracked_by").is_none(),
+                    "{provider}/{name}: only not_implemented may carry tracked_by"
+                );
+            }
+
+            // Every refusal states its evidence, so the claim is auditable
+            // rather than trusted. This is the guardrail against a generated
+            // matrix being as unchallengeable as the hand-written one that
+            // produced AGENTS.md's error.
+            if support != SUPPORTED {
+                let detail = entry
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("{provider}/{name}: a refusal must carry detail"));
+                assert!(
+                    detail.len() > 40,
+                    "{provider}/{name}: detail must name a checkable fact, got {detail:?}"
+                );
+            }
+        }
+    }
+}
+
+/// **The criterion this issue exists for.** LMS's protocol supports browse and
+/// genuine queue mutation, so neither may ever read as a provider limitation.
+///
+/// Backed by the live Lyrion 9.1.2 inventories in #402 and #403: `browselibrary
+/// items` and the native taggedlist queries for browse; `playlist move`,
+/// `playlist delete`, `playlist clear` and `playlist index` for mutation.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_never_reports_a_uhc_gap_as_a_provider_limitation() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    let payload = capability_payload(&app.call_tool("hifi_capabilities", json!({})).await);
+    let caps = capabilities_of(&payload, "lms");
+
+    // Not one capability in the vocabulary is beyond LMS's protocol.
+    let claimed_limits: Vec<&String> = caps
+        .iter()
+        .filter(|(_, entry)| support_of(entry) == UNSUPPORTED)
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        claimed_limits.is_empty(),
+        "LMS is reported as protocol-incapable of {claimed_limits:?}. Verified against live \
+         Lyrion 9.1.2 in #402/#403: every capability in this vocabulary is reachable over \
+         slim.request. A UHC gap wearing a provider limit's clothing is the exact defect \
+         #398 exists to end."
+    );
+
+    // The named cases, spelled out so a regression names itself.
+    for capability in [
+        "browse",
+        "queue_read",
+        "queue_jump",
+        "queue_reorder",
+        "queue_remove",
+        "queue_clear",
+        "play_next",
+        "repeat_mode",
+        "shuffle_mode",
+        "saved_playlists",
+        "favorites",
+        "multiroom_sync",
+    ] {
+        let entry = caps
+            .get(capability)
+            .unwrap_or_else(|| panic!("lms/{capability} missing"));
+        assert_eq!(
+            support_of(entry),
+            NOT_IMPLEMENTED,
+            "lms/{capability} must read as not-yet-implemented until its issue lands"
+        );
+    }
+}
+
+/// OpenHome and UPnP volume was ❌ in AGENTS.md and `not_implemented` in #395.
+/// Both adapters implement `vol_abs`/`vol_rel`, so #398 wires the MCP path and
+/// the honest answer is now `supported` — reached, not refused.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn openhome_and_upnp_volume_is_wired_and_reported_supported() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    let payload = capability_payload(&app.call_tool("hifi_capabilities", json!({})).await);
+
+    for provider in ["openhome", "upnp"] {
+        let caps = capabilities_of(&payload, provider);
+        assert_eq!(
+            support_of(&caps["volume"]),
+            SUPPORTED,
+            "{provider}/volume: the adapter implements vol_abs/vol_rel and #398 wires MCP to it"
+        );
+    }
+
+    // And the wiring is real: the call reaches the adapter, which refuses the
+    // unknown device in its own words instead of MCP refusing the zone type.
+    for (zone_id, expected) in [
+        ("openhome:abc", "Error: Volume error: Device not found: abc"),
+        ("upnp:abc", "Error: Volume error: Renderer not found: abc"),
+    ] {
+        let text = result_text(
+            &app.call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "volume_set", "value": 30 }),
+            )
+            .await,
+        );
+        assert_eq!(
+            text, expected,
+            "{zone_id}: volume must reach its own adapter now, not be refused by MCP"
+        );
+    }
+}
+
+/// OpenHome and UPnP `control` take an integer, so a fractional volume is
+/// rounded — and `params.value` reports the integer that was **sent**.
+///
+/// Found by this PR's own execute-gate dissent. The first implementation used
+/// `value as i32`, which truncates: `volume_up value=0.5` became `0`, a silent
+/// no-op on exactly the two providers this issue just wired. Rounding is not a
+/// complete fix — a delta below 0.5 still resolves to 0 — so the resolved value is
+/// reported rather than the requested one, and a client can see it happen.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn openhome_and_upnp_volume_reports_the_integer_it_actually_sends() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    for zone_id in ["openhome:abc", "upnp:abc"] {
+        // A fractional absolute level is rounded, not truncated.
+        let result = app
+            .call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "volume_set", "value": 30.7 }),
+            )
+            .await;
+        assert_eq!(
+            envelope(&result, zone_id).pointer("/params/value"),
+            Some(&json!(31)),
+            "{zone_id}: params.value must report the integer sent to the adapter, not the \
+             float requested — truncation here would report 30 and send 30"
+        );
+
+        // The rounding a client most needs to see: a small relative nudge that
+        // truncation would have thrown away entirely.
+        let result = app
+            .call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "volume_up", "value": 0.5 }),
+            )
+            .await;
+        assert_eq!(
+            envelope(&result, zone_id).pointer("/params/value"),
+            Some(&json!(1)),
+            "{zone_id}: a 0.5 nudge must round to 1 rather than truncating to a silent no-op"
+        );
+    }
+
+    // Roon and LMS take a float, so nothing is resolved away and the value is
+    // reported as given. The asymmetry is real and is why params.value is not
+    // simply an echo.
+    let result = app
+        .call_tool(
+            "hifi_control",
+            json!({ "zone_id": "roon:abc", "action": "volume_set", "value": 30.7 }),
+        )
+        .await;
+    assert_eq!(
+        envelope(&result, "roon").pointer("/params/value"),
+        Some(&json!(30.7)),
+        "the Roon adapter takes an f32, so no rounding happens and none may be reported"
+    );
+}
+
+/// Every `supported` cell is proved by a call that reaches that provider's own
+/// adapter, identified by the adapter's own refusal wording.
+///
+/// This is the criterion "a test fails if a capability is advertised as
+/// supported for a provider whose call path does not exist" — as an executed
+/// call, not as a type-level claim. A `Supported` produced by a routing arm that
+/// points at the wrong adapter passes the type check and fails here.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn every_supported_capability_reaches_that_providers_own_adapter() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    let payload = capability_payload(&app.call_tool("hifi_capabilities", json!({})).await);
+
+    // Each adapter's own refusal for an id it does not know. Distinct per
+    // adapter, which is what makes the call path observable end to end.
+    fn fingerprint(provider: &str) -> &'static str {
+        match provider {
+            "roon" => "Not connected to Roon",
+            "lms" => "LMS host not configured",
+            "openhome" => "Device not found",
+            "upnp" => "Renderer not found",
+            other => panic!("no adapter fingerprint for {other}"),
+        }
+    }
+
+    // How to exercise each routable capability, and the zone id to use.
+    fn probe(provider: &str, capability: &str) -> Option<(&'static str, Value)> {
+        let zone_id = format!("{provider}:abc");
+        match capability {
+            "transport" => Some((
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "play" }),
+            )),
+            "transport_skip" => Some((
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "next" }),
+            )),
+            "volume" => Some((
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "volume_set", "value": 30 }),
+            )),
+            "search" => Some(("hifi_search", json!({ "query": "q", "zone_id": zone_id }))),
+            "play_by_query" => Some(("hifi_play", json!({ "query": "q", "zone_id": zone_id }))),
+            _ => None,
+        }
+    }
+
+    let mut proved = 0usize;
+    for provider in EXPECTED_PROVIDERS {
+        // HQPlayer zones are recognised but nothing is wired, so there is no
+        // supported cell to prove; that is asserted separately.
+        if *provider == "hqplayer" {
+            continue;
+        }
+        for (capability, entry) in capabilities_of(&payload, provider) {
+            if support_of(&entry) != SUPPORTED {
+                continue;
+            }
+            let (tool, args) = probe(provider, &capability).unwrap_or_else(|| {
+                panic!(
+                    "{provider}/{capability} is reported supported but this test has no way to \
+                     exercise it. Either it is not really wired, or the probe table needs an \
+                     entry — do not delete the assertion."
+                )
+            });
+            let text = result_text(&app.call_tool(tool, args).await);
+            let expected = fingerprint(provider);
+            assert!(
+                text.to_lowercase().contains(&expected.to_lowercase()),
+                "{provider}/{capability} is reported supported, but calling {tool} produced \
+                 {text:?}, which does not name the {provider} adapter ({expected:?}). A \
+                 supported capability whose call path lands elsewhere is a false claim."
+            );
+            proved += 1;
+        }
+    }
+    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2 = 15.
+    // Asserted exactly, not as a floor: a floor would pass while a cell silently
+    // stopped being reported as supported, which is the direction that hides a
+    // capability rather than inventing one.
+    assert_eq!(
+        proved, 15,
+        "{proved} supported cells were proved end to end, expected 15. If a capability was          deliberately wired or unwired, change this number in the same commit."
+    );
+}
+
+/// An unprefixed zone id no longer means Roon.
+///
+/// **Behavior change.** Every zone id UHC publishes carries a prefix
+/// (`src/bus/events.rs`), so a bare id can only come from outside `hifi_zones` —
+/// and routing it to Roon is #360's named anti-pattern. The refusal names the
+/// prefixes so a client recovers in one call.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn an_unprefixed_zone_id_is_refused_by_name_instead_of_routed_to_roon() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let calls: &[(&str, Value)] = &[
+        (
+            "hifi_control",
+            json!({ "zone_id": "1601a5d4bare", "action": "play" }),
+        ),
+        (
+            "hifi_control",
+            json!({ "zone_id": "1601a5d4bare", "action": "volume_set", "value": 30 }),
+        ),
+        (
+            "hifi_search",
+            json!({ "query": "q", "zone_id": "1601a5d4bare" }),
+        ),
+        (
+            "hifi_play",
+            json!({ "query": "q", "zone_id": "1601a5d4bare" }),
+        ),
+        ("hifi_capabilities", json!({ "zone_id": "1601a5d4bare" })),
+    ];
+
+    for (tool, args) in calls {
+        let result = app.call_tool(tool, args.clone()).await;
+        let text = result_text(&result);
+        // Every adapter names itself when it refuses an id it does not know, so
+        // the absence of Roon's own wording is the proof that Roon was not asked.
+        // The word "Roon" itself *does* appear, in the repair hint — which is the
+        // point of the change, not a leak of the old behavior.
+        assert!(
+            !text.contains("Not connected to Roon"),
+            "{tool}: a bare zone id must not reach the Roon adapter any more; got {text:?}"
+        );
+        assert!(
+            text.contains("no provider prefix"),
+            "{tool}: the refusal must say the id has no provider prefix; got {text:?}"
+        );
+        assert!(
+            text.contains("'roon:1601a5d4bare'"),
+            "{tool}: a client that had a working bare Roon id must be told the exact id to \
+             use instead — this is what makes the behavior change recoverable in one call; \
+             got {text:?}"
+        );
+        for prefix in ["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"] {
+            assert!(
+                text.contains(prefix),
+                "{tool}: the refusal must name the accepted prefix {prefix:?}; got {text:?}"
+            );
+        }
+
+        let env = envelope(&result, tool);
+        assert_eq!(
+            env.get("outcome").and_then(Value::as_str),
+            Some("invalid"),
+            "{tool}: a malformed zone id is the client's to fix, so `invalid`, not \
+             `unsupported`: {env}"
+        );
+        assert_eq!(
+            env.pointer("/refusal/parameter").and_then(Value::as_str),
+            Some("zone_id"),
+            "{tool}: the refusal must name zone_id: {env}"
+        );
+        assert_eq!(
+            env.pointer("/scope/provider").and_then(Value::as_str),
+            Some("unknown"),
+            "{tool}: UHC identified no provider, so it must claim none: {env}"
+        );
+    }
+}
+
+/// An unrecognised prefix is refused too, and it says which prefix it did not
+/// recognise.
+///
+/// **Behavior change** for transport, search and play, which forwarded these to
+/// Roon. Volume already refused them, with a sentence that blamed the zone type.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn an_unrecognised_zone_prefix_is_refused_instead_of_routed_to_roon() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let calls: &[(&str, Value)] = &[
+        (
+            "hifi_control",
+            json!({ "zone_id": "sonos:abc", "action": "play" }),
+        ),
+        (
+            "hifi_control",
+            json!({ "zone_id": "sonos:abc", "action": "volume_set", "value": 30 }),
+        ),
+        (
+            "hifi_search",
+            json!({ "query": "q", "zone_id": "sonos:abc" }),
+        ),
+        ("hifi_play", json!({ "query": "q", "zone_id": "sonos:abc" })),
+        ("hifi_capabilities", json!({ "zone_id": "sonos:abc" })),
+    ];
+
+    for (tool, args) in calls {
+        let result = app.call_tool(tool, args.clone()).await;
+        let text = result_text(&result);
+        assert!(
+            !text.contains("Not connected to Roon"),
+            "{tool}: an unrecognised prefix must not reach the Roon adapter; got {text:?}"
+        );
+        assert!(
+            text.contains("sonos:"),
+            "{tool}: the refusal must quote the prefix it did not recognise; got {text:?}"
+        );
+        assert!(
+            text.contains("hqplayer:"),
+            "{tool}: the refusal must name every accepted prefix; got {text:?}"
+        );
+    }
+}
+
+/// HQPlayer zones are listed by `hifi_zones` and were being forwarded to Roon.
+/// They are now recognised, and reported as a UHC gap with a tracking issue.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hqplayer_zones_are_recognised_and_reported_as_not_wired() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    for args in [
+        json!({ "zone_id": "hqplayer:desktop", "action": "play" }),
+        json!({ "zone_id": "hqplayer:desktop", "action": "volume_set", "value": 30 }),
+    ] {
+        let result = app.call_tool("hifi_control", args).await;
+        let text = result_text(&result);
+        assert!(
+            !text.contains("Not connected to Roon"),
+            "an hqplayer: zone must not be forwarded to the Roon adapter; got {text:?}"
+        );
+
+        let env = envelope(&result, "hifi_control");
+        assert_eq!(
+            env.get("outcome").and_then(Value::as_str),
+            Some("unsupported"),
+            "the zone id is valid and the operation is not wired: {env}"
+        );
+        assert_eq!(
+            env.pointer("/refusal/reason").and_then(Value::as_str),
+            Some("not_implemented"),
+            "HQPlayer's adapter has play/pause/next/volume, so this is UHC's gap: {env}"
+        );
+        assert_eq!(
+            env.pointer("/refusal/tracked_by").and_then(Value::as_str),
+            Some("#328"),
+            "the gap must name the issue that closes it: {env}"
+        );
+        assert_eq!(
+            env.pointer("/scope/provider").and_then(Value::as_str),
+            Some("hqplayer"),
+            "the prefix identifies the provider even though nothing is wired: {env}"
+        );
+    }
+}
+
+/// `hifi_control` no longer forwards an action it does not know.
+///
+/// **Behavior change.** `other => other` sent anything through to the adapter,
+/// so a typo surfaced as whatever that backend said — or, offline, as a device
+/// lookup failure that never mentioned the action at all.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn an_unknown_hifi_control_action_is_refused_with_the_valid_action_list() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // A well-formed zone id, so nothing but the action can be at fault.
+    let result = app
+        .call_tool(
+            "hifi_control",
+            json!({ "zone_id": "openhome:abc", "action": "frobnicate" }),
+        )
+        .await;
+    let text = result_text(&result);
+    assert!(
+        text.contains("frobnicate"),
+        "the refusal must quote the action it rejected; got {text:?}"
+    );
+    assert!(
+        !text.contains("Device not found"),
+        "the action must be rejected before the adapter is asked; got {text:?}"
+    );
+    for action in [
+        "play",
+        "pause",
+        "playpause",
+        "next",
+        "previous",
+        "volume_set",
+        "volume_up",
+        "volume_down",
+    ] {
+        assert!(
+            text.contains(action),
+            "the refusal must list the valid action {action:?}; got {text:?}"
+        );
+    }
+
+    let env = envelope(&result, "hifi_control");
+    assert_eq!(
+        env.get("outcome").and_then(Value::as_str),
+        Some("invalid"),
+        "an unknown action is the client's to fix: {env}"
+    );
+    assert_eq!(
+        env.pointer("/refusal/parameter").and_then(Value::as_str),
+        Some("action"),
+        "the refusal must name the action parameter: {env}"
+    );
+    // `operation` was an open set precisely because of `other => other`.
+    assert_eq!(
+        env.get("operation").and_then(Value::as_str),
+        Some("unknown_action"),
+        "an unrecognised action must not be echoed into `operation` as if it were one: {env}"
+    );
+}
+
+/// `hifi_search` with **no** `zone_id` still routes to Roon. Unchanged, and
+/// pinned so the additive claim covers it.
+///
+/// `None` is not a zone id: there is nothing to route by, LMS `globalsearch`
+/// requires a player, and the tool's own description documents the default.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn an_absent_zone_id_still_routes_search_to_roon() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let result = app.call_tool("hifi_search", json!({ "query": "q" })).await;
+    let text = result_text(&result);
+    assert!(
+        text.to_lowercase().contains("not connected to roon"),
+        "an absent zone_id must keep routing to Roon; got {text:?}"
+    );
+    assert_eq!(
+        envelope(&result, "hifi_search")
+            .pointer("/scope/provider")
+            .and_then(Value::as_str),
+        Some("roon"),
+        "and it must say so, because this default is documented rather than silent"
+    );
+}
+
+/// Render AGENTS.md's capability matrix **from `hifi_capabilities`' own wire
+/// payload**.
+///
+/// Deliberately not from `mcp::capabilities`' internals. Checking a doc against
+/// an internal function proves the doc agrees with a source; checking it against
+/// the wire proves the doc agrees with *what a client is actually told*, which is
+/// the claim AGENTS.md is making. It also means there is one renderer, here, and
+/// no second copy of the table anywhere.
+fn render_capability_matrix(payload: &Value) -> String {
+    let providers: Vec<String> = payload
+        .get("providers")
+        .and_then(Value::as_array)
+        .expect("providers array")
+        .iter()
+        .filter_map(|p| p.get("provider").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+
+    // Header. Capability rows, provider columns — 18 x 5 reads far better tall
+    // than wide, and the vocabulary is the part that grows.
+    let mut out = String::from("| Capability |");
+    for provider in &providers {
+        out.push_str(&format!(" {provider} |"));
+    }
+    out.push_str("\n|---|");
+    for _ in &providers {
+        out.push_str("---|");
+    }
+    out.push('\n');
+
+    // One footnote per distinct non-supported cell, so the table states its
+    // evidence instead of asserting a symbol.
+    let mut footnotes: Vec<String> = Vec::new();
+
+    let tables: Vec<std::collections::BTreeMap<String, Value>> = providers
+        .iter()
+        .map(|p| capabilities_of(payload, p))
+        .collect();
+
+    for capability in EXPECTED_CAPABILITIES {
+        out.push_str(&format!("| `{capability}` |"));
+        for (provider, caps) in providers.iter().zip(&tables) {
+            let entry = caps
+                .get(*capability)
+                .unwrap_or_else(|| panic!("{provider}/{capability} missing from the payload"));
+            let cell = match support_of(entry) {
+                SUPPORTED => "✅".to_string(),
+                UNSUPPORTED => {
+                    footnotes.push(format!(
+                        "- ⛔ **{provider} / `{capability}`** — {}",
+                        entry
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                    ));
+                    "⛔".to_string()
+                }
+                NOT_IMPLEMENTED => {
+                    let tracked = entry
+                        .get("tracked_by")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    footnotes.push(format!(
+                        "- 🚧 **{provider} / `{capability}`** ({tracked}) — {}",
+                        entry
+                            .get("detail")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                    ));
+                    format!("🚧 {tracked}")
+                }
+                other => panic!("{provider}/{capability}: unknown state {other:?}"),
+            };
+            out.push_str(&format!(" {cell} |"));
+        }
+        out.push('\n');
+    }
+
+    out.push_str(
+        "\n✅ supported · ⛔ the provider's protocol cannot do it · 🚧 the provider can, ",
+    );
+    out.push_str("UHC has not wired it (issue that will)\n\n");
+    out.push_str("Every non-supported cell states the fact it rests on, so the claim can be ");
+    out.push_str("checked rather than trusted:\n\n");
+    for note in footnotes {
+        out.push_str(&note);
+        out.push('\n');
+    }
+    out
+}
+
+/// AGENTS.md's capability matrix is generated from the derived data, and this
+/// test fails on drift.
+///
+/// #398 exists because a hand-written ❌ in that table went unchallenged for as
+/// long as it took someone to read the adapters. Regenerate with:
+///
+/// ```sh
+/// UPDATE_AGENTS_MATRIX=1 cargo test --test mcp_contract agents_md
+/// ```
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn agents_md_capability_matrix_matches_the_derived_data() {
+    const BEGIN: &str = "<!-- BEGIN GENERATED CAPABILITY MATRIX (#398) -->";
+    const END: &str = "<!-- END GENERATED CAPABILITY MATRIX (#398) -->";
+
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    let payload = capability_payload(&app.call_tool("hifi_capabilities", json!({})).await);
+    let rendered = render_capability_matrix(&payload);
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("AGENTS.md");
+    let doc = std::fs::read_to_string(&path).expect("AGENTS.md must be readable");
+
+    let start = doc
+        .find(BEGIN)
+        .unwrap_or_else(|| panic!("AGENTS.md must contain {BEGIN}"));
+    let end = doc
+        .find(END)
+        .unwrap_or_else(|| panic!("AGENTS.md must contain {END}"));
+    assert!(start < end, "AGENTS.md matrix markers are out of order");
+
+    let current = &doc[start + BEGIN.len()..end];
+    let expected = format!("\n\n{}\n", rendered.trim_end());
+
+    if current != expected {
+        if std::env::var("UPDATE_AGENTS_MATRIX").as_deref() == Ok("1") {
+            let updated = format!("{}{BEGIN}{expected}{}", &doc[..start], &doc[end..]);
+            std::fs::write(&path, updated).expect("AGENTS.md must be writable");
+            return;
+        }
+        panic!(
+            "AGENTS.md's capability matrix has drifted from what hifi_capabilities reports.\n\n\
+             This table is generated. Do not hand-edit it — a hand-written cell is what \
+             produced the ❌ against OpenHome/UPnP volume that #398 was filed to correct.\n\n\
+             Regenerate with UPDATE_AGENTS_MATRIX=1 cargo test --test mcp_contract agents_md\n\n\
+             --- AGENTS.md has ---\n{current}\n--- the derived data renders ---\n{expected}"
+        );
+    }
 }

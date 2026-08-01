@@ -11,36 +11,51 @@
 //!    default the delta to 5, and `volume_down` negates it. The sign is the kind
 //!    of thing a careless edit inverts silently.
 //!
-//! Volume also uses a *different* routing rule from transport — see
-//! [`crate::mcp::routing`]. `sonos:x` is refused for volume but routed to Roon
-//! for transport. That asymmetry is deliberate today and load-bearing for #398.
+//! # #398: the action set is closed, and nothing is defaulted to Roon
 //!
-//! # The envelope makes both lookup tables observable, and corrects the prose
+//! Three things changed here, and all three are behavior changes:
 //!
-//! `operation` reports the *normalized* action, so `prev` surfaces as `previous`
-//! and `playpause` as `play_pause`; `params.value` reports the *resolved* delta,
-//! so `volume_down` with no value surfaces as `-5.0`. Neither fact was visible to
-//! a client before.
+//! - **The action match no longer ends in `other => other`.** It forwarded any
+//!   string to an adapter, so a typo surfaced as whatever that backend said — or,
+//!   with the device offline, as a device-lookup failure that never mentioned the
+//!   action at all. An action outside
+//!   [`CONTROL_ACTIONS`](crate::mcp::routing::CONTROL_ACTIONS) is now refused with
+//!   that list, before the zone is even classified: the action check is free and
+//!   independent of the zone, so it names the fault a client can fix first.
+//! - **Volume reaches OpenHome and UPnP.** Both adapters implement
+//!   `vol_abs`/`vol_rel` and `POST /{openhome,upnp}/control` has exposed them all
+//!   along; only this path declined. The refusal that stood here —
+//!   `"Volume control not supported for this zone type"` — was a false claim about
+//!   two providers, and #395's envelope already flagged it `not_implemented`
+//!   tracked by #398. It is now simply implemented.
+//! - **An unplaceable zone id is refused instead of routed to Roon**, for both
+//!   transport and volume, and an `hqplayer:` zone is refused *as HQPlayer* with
+//!   #328 attached instead of being sent to Roon.
 //!
-//! Volume refusals are where the envelope deliberately says something the frozen
-//! text does not. One string — `"Volume control not supported for this zone
-//! type"` — covers two unrelated situations, and #395 requires them to be
-//! distinguishable:
+//! `operation` still reports the *normalized* action, so `prev` surfaces as
+//! `previous` and `playpause` as `play_pause`; `params.value` still reports the
+//! *resolved* delta, so `volume_down` with no value surfaces as `-5.0`. On the two
+//! providers #398 wired it also reports the **integer** that was sent, because
+//! their `control` takes one — see [`set_volume`].
 //!
-//! | zone id | envelope | why |
-//! |---|---|---|
-//! | `openhome:x`, `upnp:x` | `unsupported` / `not_implemented` | the adapter implements volume and `POST /openhome/control` exposes it; only this MCP path declines to call it. A UHC gap, not a provider limit. |
-//! | `sonos:x` | `invalid` / `invalid_parameter(zone_id)` | UHC never identified a provider, so it cannot claim one lacks volume. The client's zone id is the problem. |
+//! Volume still uses a *different* routing rule from transport — see
+//! [`crate::mcp::routing`]. The asymmetry has moved rather than gone: it used to
+//! be OpenHome/UPnP, and now it is only that the library rule is narrower than
+//! both.
 //!
-//! The second row is the one place in this issue where the envelope's `outcome`
-//! contradicts the accompanying prose. That is intentional: #395 freezes the
-//! prose and #398 corrects it, and until then teaching the client the right
-//! lesson beats matching a misleading sentence.
+//! # Where a refusal's classification comes from
+//!
+//! Not from here. [`crate::mcp::capabilities`] owns whether a gap is the
+//! provider's limit or UHC's, and this module asks it — so `hifi_control`'s
+//! refusal and `hifi_capabilities`' report cannot describe the same gap two
+//! different ways.
 
 use crate::api::AppState;
+use crate::mcp::capabilities::{support, Capability};
 use crate::mcp::envelope::{Envelope, Observed, Refusal, Scope};
 use crate::mcp::routing::{
-    TransportRoute, VolumeRoute, ZoneTarget, ACCEPTED_ZONE_PREFIXES, TRANSPORT_ACTIONS,
+    unplaceable_zone_refusal, unplaceable_zone_text, TransportRoute, VolumeRoute, ZoneTarget,
+    CONTROL_ACTIONS, TRANSPORT_ACTIONS,
 };
 use rust_mcp_sdk::{
     macros::{mcp_tool, JsonSchema},
@@ -71,6 +86,13 @@ pub async fn handle_control(
     state: &AppState,
     args: HifiControlTool,
 ) -> Result<CallToolResult, CallToolError> {
+    // The action is checked first, and before the zone is classified. It is a
+    // closed set with no I/O behind it, so this is the cheapest fault to name —
+    // and naming it does not depend on the zone id being right.
+    if !CONTROL_ACTIONS.contains(&args.action.as_str()) {
+        return unknown_action(state, &args.zone_id, &args.action).await;
+    }
+
     // Map MCP actions to backend actions. Volume actions divert to the volume
     // path, which routes differently from transport.
     let backend_action = match args.action.as_str() {
@@ -117,19 +139,29 @@ pub async fn handle_control(
             // Negated: the same relative call, opposite direction.
             return set_volume(state, &args.zone_id, -delta, true).await;
         }
-        // Anything unrecognised is passed through for the adapter to reject, so
-        // the refusal comes from whoever actually knows the action set. This is
-        // why `operation` is not a closed set; #398 closes it.
-        other => other,
+        // Unreachable: CONTROL_ACTIONS gates this whole match, and
+        // `routing::tests::control_actions_cover_the_documented_set` proves the
+        // two lists agree. Refused rather than forwarded, because forwarding is
+        // exactly what #398 removed.
+        _ => return unknown_action(state, &args.zone_id, &args.action).await,
     };
 
     let target = ZoneTarget::classify(&args.zone_id);
-    let route = target.for_transport();
     // `operation` is the normalized backend action, so `prev` reports as
     // `previous` and `playpause` as `play_pause`.
     let env = Envelope::write("hifi_control", backend_action)
         .param("zone_id", &*args.zone_id)
         .param("action", &*args.action);
+
+    let route = target.for_transport();
+    if let TransportRoute::Refused(refused) = route {
+        let capability = if backend_action == "next" || backend_action == "previous" {
+            Capability::TransportSkip
+        } else {
+            Capability::Transport
+        };
+        return refuse_zone(state, env, &args.zone_id, refused, capability).await;
+    }
 
     let result = match route {
         TransportRoute::Lms => state.lms.control(&args.zone_id, backend_action, None).await,
@@ -146,6 +178,9 @@ pub async fn handle_control(
                 .await
         }
         TransportRoute::Roon => state.roon.control(&args.zone_id, backend_action).await,
+        // Handled above; kept exhaustive rather than caught by a wildcard so a
+        // new route variant fails to compile instead of falling through.
+        TransportRoute::Refused(_) => unreachable_refused(),
     };
 
     // One aggregator snapshot serves both `scope.zone_name` and `observed`, so
@@ -155,8 +190,8 @@ pub async fn handle_control(
     // its refusal path needs a scope before any command runs.
     let observed = Observed::from_aggregator(state, &args.zone_id).await;
     let scope = Scope {
-        // Identification, not route: `sonos:x` reports `unknown` even though the
-        // call above went to Roon. See ZoneTarget::provider.
+        // Identification, not route. Since #398 the two agree for every id that
+        // reaches an adapter, because nothing unplaceable does any more.
         provider: target.provider(),
         zone_id: Some(args.zone_id.clone()),
         zone_name: observed.as_ref().map(|o| o.zone.zone_name.clone()),
@@ -188,11 +223,41 @@ pub async fn handle_control(
     }
 }
 
+/// Refuse an action outside [`CONTROL_ACTIONS`].
+///
+/// `operation` is the literal `"unknown_action"` rather than the string the client
+/// sent. Before #398, `other => other` put the unrecognised action straight into
+/// `operation`, which made that field an open set and let an envelope report a verb
+/// UHC does not have as though it were one.
+async fn unknown_action(
+    state: &AppState,
+    zone_id: &str,
+    action: &str,
+) -> Result<CallToolResult, CallToolError> {
+    Envelope::write("hifi_control", "unknown_action")
+        .param("zone_id", zone_id)
+        .param("action", action)
+        .scope(Scope::for_zone(state, zone_id, ZoneTarget::classify(zone_id).provider()).await)
+        .refused(
+            format!(
+                "Unknown action '{action}'. Valid actions: {}.",
+                CONTROL_ACTIONS.join(", ")
+            ),
+            Refusal::invalid_parameter(
+                "action",
+                CONTROL_ACTIONS,
+                "hifi_control's action set is closed. Until #398 an unrecognised action was \
+                 forwarded to the backend, which then answered about whatever it thought you \
+                 meant; now it is refused here, with the whole set.",
+            ),
+        )
+}
+
 /// Volume, absolute or relative.
 ///
-/// Refuses zone types with no volume control rather than defaulting them to
-/// Roon the way transport does. See this module's docs for why the two refusal
-/// cases get different envelopes behind one frozen string.
+/// Since #398 this reaches all four zone-controlling adapters. What it refuses is a
+/// zone id it cannot place, and an `hqplayer:` zone — the latter named as
+/// HQPlayer's gap rather than as a nonexistent provider's limit.
 async fn set_volume(
     state: &AppState,
     zone_id: &str,
@@ -207,11 +272,29 @@ async fn set_volume(
         "volume_absolute"
     };
 
-    // `value` is the *resolved* level or delta: the defaulted 5 and the negation
-    // applied by `volume_down` are both visible here and nowhere else.
-    let env = Envelope::write("hifi_control", operation)
-        .param("zone_id", zone_id)
-        .param("value", value);
+    // OpenHome and UPnP `control` take an integer, so the value UHC sends them is
+    // rounded — and `params.value` reports what was **sent**, not what was asked
+    // for. That is what #395's `params` contract means ("the parameters as the
+    // server resolved them"), and it is the only place a client can see that its
+    // fractional value was changed.
+    //
+    // `round`, not the `as i32` truncation this path shipped with for one commit:
+    // truncation turns `volume_up value=0.5` into a silent no-op, which is
+    // precisely the class of quiet lie this issue exists to remove. Rounding
+    // still loses a delta below 0.5 in absolute terms — stated rather than hidden,
+    // because `params.value` will report the `0` that was sent.
+    let integer_volume = value.round() as i32;
+    let env = Envelope::write("hifi_control", operation).param("zone_id", zone_id);
+    let env = match route {
+        VolumeRoute::OpenHome | VolumeRoute::Upnp => env.param("value", integer_volume),
+        // Nothing is sent on a refusal, so the client's resolved request is the
+        // honest value to report.
+        VolumeRoute::Lms | VolumeRoute::Roon | VolumeRoute::Refused(_) => env.param("value", value),
+    };
+
+    if let VolumeRoute::Refused(refused) = route {
+        return refuse_zone(state, env, zone_id, refused, Capability::Volume).await;
+    }
 
     let result = match route {
         VolumeRoute::Lms => {
@@ -226,45 +309,24 @@ async fn set_volume(
                 .change_volume(zone_id, value as f32, relative)
                 .await
         }
-        VolumeRoute::Unsupported => {
-            let env = env.scope(Scope::for_zone(state, zone_id, target.provider()).await);
-            let text = "Volume control not supported for this zone type";
-
-            return match target {
-                // The adapter implements volume and HTTP exposes it; only this
-                // path does not call it. Saying "the provider cannot" here would
-                // be exactly the mislabelling #392 rule 3 forbids.
-                ZoneTarget::OpenHome | ZoneTarget::Upnp => env.refused(
-                    text,
-                    Refusal::NotImplemented {
-                        operation: operation.to_string(),
-                        tracked_by: "#398",
-                        alternatives: TRANSPORT_ACTIONS
-                            .iter()
-                            .map(|a| format!("hifi_control action={a}"))
-                            .collect(),
-                        detail: format!(
-                            "UHC's MCP volume path does not call the {} adapter. The adapter \
-                             itself implements volume and POST /{}/control exposes it, so this \
-                             is a UHC gap, not a provider limitation.",
-                            provider_label(target),
-                            provider_label(target),
-                        ),
-                    },
-                ),
-                // No provider was ever identified, so no claim about a provider
-                // can be made. The zone id is the problem.
-                _ => env.refused(
-                    text,
-                    Refusal::invalid_parameter(
-                        "zone_id",
-                        ACCEPTED_ZONE_PREFIXES,
-                        "This zone id's prefix names no adapter, so UHC cannot say whether \
-                         volume is available. Call hifi_zones for valid ids.",
-                    ),
-                ),
-            };
+        // #398. Both adapters clamp to 0-100 themselves — `vol_abs` clamps the
+        // level, `vol_rel` clamps the sum — and both take an integer, which is
+        // what the HTTP path has always passed them (`POST /openhome/control`
+        // deserializes `value` as an integer). So this reaches the adapter
+        // identically to how the web UI does.
+        VolumeRoute::OpenHome => {
+            state
+                .openhome
+                .control(zone_id, volume_action(relative), Some(integer_volume))
+                .await
         }
+        VolumeRoute::Upnp => {
+            state
+                .upnp
+                .control(zone_id, volume_action(relative), Some(integer_volume))
+                .await
+        }
+        VolumeRoute::Refused(_) => unreachable_refused(),
     };
 
     let env = env.scope(Scope::for_zone(state, zone_id, target.provider()).await);
@@ -285,13 +347,84 @@ async fn set_volume(
     }
 }
 
-/// The lowercase provider label used in refusal detail and HTTP route names.
-fn provider_label(target: ZoneTarget) -> &'static str {
-    match target {
-        ZoneTarget::OpenHome => "openhome",
-        ZoneTarget::Upnp => "upnp",
-        ZoneTarget::Lms => "lms",
-        ZoneTarget::Roon => "roon",
-        ZoneTarget::Unknown => "unknown",
+/// The OpenHome/UPnP `control` action name for a volume write.
+///
+/// Both adapters spell absolute volume `vol_abs` (with `volume` as a synonym) and
+/// relative `vol_rel`.
+fn volume_action(relative: bool) -> &'static str {
+    if relative {
+        "vol_rel"
+    } else {
+        "vol_abs"
     }
+}
+
+/// Refuse a zone id that has no path for this capability.
+///
+/// Two cases, and the difference is the whole point of #398:
+///
+/// - **A recognised provider with nothing wired** (`hqplayer:`) is `unsupported`
+///   with the classification [`crate::mcp::capabilities`] gives it, so the refusal
+///   and the capability report agree by construction.
+/// - **An id UHC cannot place** is `invalid`: no provider was identified, so no
+///   claim about a provider can be made, and the client's zone id is what needs
+///   fixing.
+async fn refuse_zone(
+    state: &AppState,
+    env: Envelope,
+    zone_id: &str,
+    target: ZoneTarget,
+    capability: Capability,
+) -> Result<CallToolResult, CallToolError> {
+    let env = env.scope(Scope::for_zone(state, zone_id, target.provider()).await);
+
+    match target.prefix() {
+        // A real provider. Ask the capability model, never restate it here.
+        Some(_) => {
+            let state_of = support(target, capability);
+            let alternatives = TRANSPORT_ACTIONS
+                .iter()
+                .map(|a| format!("hifi_control action={a}"))
+                .collect();
+            match state_of.refusal(capability, alternatives) {
+                Some(refusal) => {
+                    let detail = state_of.evidence().unwrap_or_default();
+                    env.refused(
+                        format!(
+                            "{} zones are not controllable from MCP yet: {detail} \
+                             hifi_capabilities reports what each provider supports.",
+                            target.label()
+                        ),
+                        refusal,
+                    )
+                }
+                // Unreachable: a route only refuses where the capability model
+                // records a gap, and
+                // `every_supported_capability_reaches_that_providers_own_adapter`
+                // proves the converse. Reported as a backend error rather than
+                // invented as a provider limit.
+                None => env.failed(format!(
+                    "No control path for {zone_id}, though {} reports this capability as \
+                     supported. This is a UHC routing bug.",
+                    target.label()
+                )),
+            }
+        }
+        // Not placeable at all.
+        None => env.refused(
+            unplaceable_zone_text(zone_id, target),
+            unplaceable_zone_refusal(target),
+        ),
+    }
+}
+
+/// The `Refused` arms are handled before the dispatch match, and the compiler
+/// cannot see that. Returning an error rather than panicking keeps `src/lib.rs`'s
+/// crate-wide `deny(clippy::panic)` intact and, if the invariant ever breaks,
+/// produces a diagnosable message instead of a crashed request.
+fn unreachable_refused() -> anyhow::Result<()> {
+    anyhow::bail!(
+        "internal routing error: a refused zone reached command dispatch. This is a UHC bug; \
+         hifi_capabilities reports the intended routing."
+    )
 }

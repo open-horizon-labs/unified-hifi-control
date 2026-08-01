@@ -186,33 +186,148 @@ MCP (Model Context Protocol) enables AI assistants (Claude, ChatGPT, BoltAI, etc
 
 ### Current Capabilities
 
-Three states, not two (per epic #392): ✅ supported, ⛔ the provider's protocol
-cannot do it, 🚧 the provider can but UHC has not wired it to MCP. Collapsing the
-last two into "unsupported" makes UHC's gaps look like provider limitations, which
-is how LMS came to be understated in earlier drafts of this table.
+**This table is generated. Do not hand-edit it.**
 
-| Feature | Roon | LMS | OpenHome | UPnP |
-|---------|------|-----|----------|------|
-| Discovery (zones) | ✅ | ✅ | ✅ | ✅ |
-| Transport (play/pause/next) | ✅ | ✅ | ✅ | ✅ |
-| Volume control | ✅ | ✅ | 🚧 | 🚧 |
-| Search | ✅ | ✅ | ⛔ | ⛔ |
-| Play by query | ✅ | ✅ | ⛔ | ⛔ |
-| Queue building | ✅ | ✅ | ⛔ | ⛔ |
+It is rendered from `hifi_capabilities`' own wire payload by
+`tests/mcp_contract.rs::agents_md_capability_matrix_matches_the_derived_data`,
+which fails on any drift. Regenerate with:
 
-**OpenHome/UPnP volume was ❌ in this table and that was wrong.** Both adapters
-implement it — `control()` handles `vol_abs`/`volume` and `vol_rel` against
-OpenHome's `Volume:1` service and UPnP's `RenderingControl` `SetVolume` — and both
-are reachable in production, because `POST /openhome/control` and
-`POST /upnp/control` pass `action` and `value` straight through
-(`src/api/mod.rs:1278`, `:1345`). Only the MCP volume path declines to call them
-(`src/mcp/routing.rs`, `VolumeRoute::Unsupported`). MCP therefore reports these as
-`not_implemented` with `tracked_by: "#398"`, not as a provider limitation — see
-`src/mcp/tools/transport.rs` and
-`tests/mcp_contract.rs::openhome_and_upnp_volume_is_reported_as_a_uhc_gap_not_a_provider_limit`.
+```sh
+UPDATE_AGENTS_MATRIX=1 cargo test --test mcp_contract agents_md
+```
 
-This table is still hand-maintained. #398 derives it from the routing layer so it
-cannot drift again.
+Three states, not two (per epic #392). Collapsing the last two into "unsupported"
+makes UHC's gaps look like provider limitations, and that is not hypothetical: a
+hand-written `❌` in this very table claimed OpenHome and UPnP could not do volume,
+when both adapters implement `vol_abs`/`vol_rel` and `POST /openhome/control` had
+been exposing it over HTTP the whole time. Only the MCP path declined. #398 wired
+it, and made the table derived so the same error cannot be typed again.
+
+Two things this table does **not** claim:
+
+- **It is per provider, not per device.** A fixed-volume Roon output reports
+  `volume` as supported. UHC cannot currently distinguish "this output has no
+  volume control" from "no volume has been read yet", so `hifi_capabilities` reports
+  the aggregator's `has_volume_control` observation separately rather than guessing.
+- **Every ⛔ for OpenHome and UPnP rests on specification knowledge, not on a call
+  to a device.** Each cell says so in its own footnote. LMS's cells come from a live
+  Lyrion 9.1.2 inventory (#402/#403) and are the strongest rows here.
+
+<!-- BEGIN GENERATED CAPABILITY MATRIX (#398) -->
+
+| Capability | roon | lms | openhome | upnp | hqplayer |
+|---|---|---|---|---|---|
+| `transport` | ✅ | ✅ | ✅ | ✅ | 🚧 #328 |
+| `transport_skip` | ✅ | ✅ | ✅ | 🚧 #392 | 🚧 #328 |
+| `volume` | ✅ | ✅ | ✅ | ✅ | 🚧 #328 |
+| `search` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 |
+| `play_by_query` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 |
+| `play_by_ref` | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #209 |
+| `browse` | 🚧 #399 | 🚧 #402 | ⛔ | ⛔ | 🚧 #209 |
+| `queue_read` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 |
+| `queue_jump` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 |
+| `queue_reorder` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 |
+| `queue_remove` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 |
+| `queue_clear` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 |
+| `play_next` | 🚧 #399 | 🚧 #403 | 🚧 #392 | 🚧 #396 | 🚧 #209 |
+| `repeat_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | 🚧 #209 |
+| `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | 🚧 #209 |
+| `saved_playlists` | 🚧 #399 | 🚧 #403 | ⛔ | ⛔ | 🚧 #209 |
+| `favorites` | 🚧 #399 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 |
+| `multiroom_sync` | 🚧 #360 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 |
+
+✅ supported · ⛔ the provider's protocol cannot do it · 🚧 the provider can, UHC has not wired it (issue that will)
+
+Every non-supported cell states the fact it rests on, so the claim can be checked rather than trusted:
+
+- 🚧 **hqplayer / `transport`** (#328) — HqpAdapter implements play, pause, stop, next, previous, seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them.
+- 🚧 **upnp / `transport_skip`** (#392) — AVTransport:1 -- the service this adapter already speaks -- defines Next and Previous actions, and UHC's adapter refuses them before issuing either (src/adapters/upnp.rs, REFUSED_TRANSPORT_ACTIONS). A renderer with no playlist would reject the call, but that is the device's answer to give, not UHC's to assume.
+- 🚧 **hqplayer / `transport_skip`** (#328) — HqpAdapter implements play, pause, stop, next, previous, seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them.
+- 🚧 **hqplayer / `volume`** (#328) — HqpAdapter implements play, pause, stop, next, previous, seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them.
+- ⛔ **openhome / `search`** — UHC discovers OpenHome zones by their av-openhome-org Product, Transport and Volume services (src/adapters/openhome.rs) and the OpenHome service set has no library: content is resolved by a control point against a separate media server. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `search`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `search`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- ⛔ **openhome / `play_by_query`** — UHC discovers OpenHome zones by their av-openhome-org Product, Transport and Volume services (src/adapters/openhome.rs) and the OpenHome service set has no library: content is resolved by a control point against a separate media server. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `play_by_query`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `play_by_query`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **roon / `play_by_ref`** (#396) — RoonAdapter::browse/load/play_item exist and are exposed over HTTP; MCP mints no reference for a search hit to act on.
+- 🚧 **lms / `play_by_ref`** (#396) — the native taggedlist queries return durable entity ids (track_id/album_id/artist_id) that playlistcontrol accepts, verified live; MCP discards them and hands back a title. Note the XMLBrowser paths (globalsearch, favorites) return positional breadcrumbs instead, which is #396's safety problem, not a capability gap.
+- 🚧 **openhome / `play_by_ref`** (#396) — the protocol can play a specific item -- UPnP AVTransport:1 takes SetAVTransportURI and SetNextAVTransportURI, OpenHome Playlist:1 takes Insert(AfterId, Uri, Metadata) -- so what is missing is UHC's ability to name one, not the device's ability to play it. Reported as a UHC gap rather than a provider limit, because a reference minted against a media server would work. Verified from the UPnP AV and OpenHome service definitions, not from a device.
+- 🚧 **upnp / `play_by_ref`** (#396) — the protocol can play a specific item -- UPnP AVTransport:1 takes SetAVTransportURI and SetNextAVTransportURI, OpenHome Playlist:1 takes Insert(AfterId, Uri, Metadata) -- so what is missing is UHC's ability to name one, not the device's ability to play it. Reported as a UHC gap rather than a provider limit, because a reference minted against a media server would work. Verified from the UPnP AV and OpenHome service definitions, not from a device.
+- 🚧 **hqplayer / `play_by_ref`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **roon / `browse`** (#399) — RoonAdapter::browse() and load() exist and POST /roon/browse exposes them; only the MCP projection is missing.
+- 🚧 **lms / `browse`** (#402) — browselibrary items and the native albums/artists/genres/years/playlists/mediafolder queries walk the whole hierarchy with native <start> <n> paging -- all verified live on Lyrion 9.1.2. The adapter never calls any of them.
+- ⛔ **openhome / `browse`** — UHC discovers OpenHome zones by their av-openhome-org Product, Transport and Volume services (src/adapters/openhome.rs) and the OpenHome service set has no library: content is resolved by a control point against a separate media server. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `browse`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `browse`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **roon / `queue_read`** (#400) — the pinned roon-api fork exposes subscribe_queue(zone, max_items), which nothing in UHC calls.
+- 🚧 **lms / `queue_read`** (#400) — status <player> <start> <n> returns the whole current playlist with playlist_cur_index; verified live.
+- 🚧 **openhome / `queue_read`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `queue_read`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `queue_read`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **roon / `queue_jump`** (#400) — the pinned roon-api fork exposes play_from_here(zone, queue_item_id), which nothing in UHC calls.
+- 🚧 **lms / `queue_jump`** (#400) — playlist index <n> jumps to a queue position; verified live.
+- 🚧 **openhome / `queue_jump`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `queue_jump`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `queue_jump`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- ⛔ **roon / `queue_reorder`** — The Roon API's transport service exposes a queue subscription and play_from_here and no mutation at all -- no move, remove or clear. The pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing further.
+- 🚧 **lms / `queue_reorder`** (#400) — playlist move <from> <to> reorders the queue; verified live. Roon cannot do this and LMS can, which is why this capability exists in the vocabulary at all.
+- 🚧 **openhome / `queue_reorder`** (#392) — OpenHome's Playlist:1 has no Move action, but Insert takes an AfterId, so a reorder is DeleteId plus Insert -- composite rather than atomic, and reachable. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `queue_reorder`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `queue_reorder`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- ⛔ **roon / `queue_remove`** — The Roon API's transport service exposes a queue subscription and play_from_here and no mutation at all -- no move, remove or clear. The pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing further.
+- 🚧 **lms / `queue_remove`** (#400) — playlist delete <index> removes one queued item; verified live.
+- 🚧 **openhome / `queue_remove`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `queue_remove`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `queue_remove`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- ⛔ **roon / `queue_clear`** — The Roon API's transport service exposes a queue subscription and play_from_here and no mutation at all -- no move, remove or clear. The pinned roon-api fork (ohc/main) exposes subscribe_queue and play_from_here and nothing further.
+- 🚧 **lms / `queue_clear`** (#400) — playlist clear empties the queue; verified live.
+- 🚧 **openhome / `queue_clear`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `queue_clear`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `queue_clear`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **roon / `play_next`** (#399) — Roon's browse item actions include Play Next alongside Play Now and Queue; UHC's PlayAction models only Play, Queue and Radio, so this arrives with browse rather than with the queue.
+- 🚧 **lms / `play_next`** (#403) — playlistcontrol cmd:insert places an item immediately after the current one, verified live -- and LmsPlayAction::Insert is already modelled in the adapter and simply unreachable from MCP.
+- 🚧 **openhome / `play_next`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
+- 🚧 **upnp / `play_next`** (#396) — the protocol can play a specific item -- UPnP AVTransport:1 takes SetAVTransportURI and SetNextAVTransportURI, OpenHome Playlist:1 takes Insert(AfterId, Uri, Metadata) -- so what is missing is UHC's ability to name one, not the device's ability to play it. Reported as a UHC gap rather than a provider limit, because a reference minted against a media server would work. Verified from the UPnP AV and OpenHome service definitions, not from a device.
+- 🚧 **hqplayer / `play_next`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **roon / `repeat_mode`** (#360) — the Roon API's transport service takes loop settings (disabled/loop/loop_one); UHC drives none of them from any surface.
+- 🚧 **lms / `repeat_mode`** (#403) — playlist repeat <0|1|2> and playlist repeat ? read and write it; verified live. Note the mode lives on the sync master, so setting it changes every member.
+- 🚧 **openhome / `repeat_mode`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
+- 🚧 **upnp / `repeat_mode`** (#392) — AVTransport:1's SetPlayMode takes REPEAT_ONE and REPEAT_ALL, so repeat is a protocol feature UHC does not use. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `repeat_mode`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **roon / `shuffle_mode`** (#360) — the Roon API's transport service takes a shuffle setting; UHC drives it from no surface.
+- 🚧 **lms / `shuffle_mode`** (#403) — playlist shuffle <0|1|2> and playlist shuffle ? read and write it; verified live. Setting it reshuffles the queue, so it is also a queue mutation.
+- 🚧 **openhome / `shuffle_mode`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
+- 🚧 **upnp / `shuffle_mode`** (#392) — AVTransport:1's SetPlayMode takes SHUFFLE and RANDOM, so shuffle is a protocol feature UHC does not use. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `shuffle_mode`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **roon / `saved_playlists`** (#399) — Roon exposes Playlists as a browse hierarchy, so this arrives with browse rather than as its own protocol feature.
+- 🚧 **lms / `saved_playlists`** (#403) — playlists / playlists tracks / playlistcontrol cmd:load playlist_id / playlists new / rename / delete all exist and were verified live. playlist save additionally needs a configured playlistdir, which is unset on a stock install -- so its own answer is three-state at the server level, which is why #403 probes pref playlistdir ?.
+- ⛔ **openhome / `saved_playlists`** — the av-openhome-org service set has no playlist storage: Playlist:1 is the live queue (Read/Insert/DeleteId/DeleteAll) with no save or recall action, and stored playlists live on whatever media server the control point uses. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `saved_playlists`** — AVTransport:1 and RenderingControl:1 store nothing; a MediaRenderer has no playlist storage. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `saved_playlists`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **roon / `favorites`** (#399) — Roon exposes My Favorites and tags as browse hierarchies, so this arrives with browse.
+- 🚧 **lms / `favorites`** (#403) — favorites items / favorites playlist play / add / delete / exists all work; verified live. Note LMS favorites have no durable id -- only a url -- so a ref must be minted over the url.
+- 🚧 **openhome / `favorites`** (#392) — OpenHome devices carry stored presets (Radio:1 presets, and a Pins service on newer firmware). UHC discovers neither. Reported as a gap rather than a limit because the per-firmware reach is unverified here.
+- ⛔ **upnp / `favorites`** — AVTransport:1 and RenderingControl:1 store nothing; a MediaRenderer has no favourites. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `favorites`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+- 🚧 **roon / `multiroom_sync`** (#360) — the Roon API's transport service groups and ungroups outputs; UHC exposes no grouping on any surface.
+- 🚧 **lms / `multiroom_sync`** (#403) — sync <playerid>, sync -, sync ? and the server-scoped syncgroups ? all work; verified live. Joining is destructive to the target zone's queue, which is why #403 gates it behind confirmation.
+- 🚧 **openhome / `multiroom_sync`** (#392) — OpenHome's Sender:1 and Receiver:1 services are Songcast multiroom -- exactly this capability. UHC discovers neither. Verified from the OpenHome service definitions, not from a device.
+- ⛔ **upnp / `multiroom_sync`** — UPnP AV defines no synchronised-playback service; multiroom on UPnP renderers is vendor-specific and outside the two services UHC speaks. Verified from the UPnP AV service definitions, not from a device.
+- 🚧 **hqplayer / `multiroom_sync`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
+<!-- END GENERATED CAPABILITY MATRIX (#398) -->
+
+`hqplayer:` is a fifth zone prefix: `PrefixedZoneId` lists it and `HqpAdapter`
+publishes `ZoneDiscovered` with it, so HQPlayer zones appear in `hifi_zones`. Until
+#398 the MCP routing layer had no arm for it and sent every one of them to Roon.
+#398 recognises the prefix and reports the gap; wiring it is #328.
+
+Two rows the earlier hand-written table had are deliberately absent, rather than
+lost. **Discovery** is not per-provider: `hifi_zones` reads the aggregator, which
+holds every zone type identically, so there is nothing for a three-state value to
+distinguish. **Queue building** was `hifi_play action='queue'` — the same call path
+as `play_by_query`, so it is that row; genuine queue *mutation* is the five
+`queue_*` rows, which is where LMS's advantage over Roon becomes visible.
 
 ### Structured results
 

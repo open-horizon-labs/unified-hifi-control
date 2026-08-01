@@ -18,6 +18,7 @@
 //! fixture pins it. Appending leaves the existing entries untouched, so the diff
 //! reads as additive. Inserting mid-list shifts everything below it.
 
+pub mod capabilities;
 pub mod hqplayer;
 pub mod library;
 pub mod status;
@@ -27,6 +28,7 @@ pub mod zones;
 use rust_mcp_sdk::schema::Tool;
 use rust_mcp_sdk::tool_box;
 
+pub use capabilities::HifiCapabilitiesTool;
 pub use hqplayer::{
     HifiHqplayerLoadProfileTool, HifiHqplayerProfilesTool, HifiHqplayerSetPipelineTool,
     HifiHqplayerStatusTool,
@@ -54,7 +56,10 @@ tool_box!(
         HifiHqplayerStatusTool,
         HifiHqplayerProfilesTool,
         HifiHqplayerLoadProfileTool,
-        HifiHqplayerSetPipelineTool
+        HifiHqplayerSetPipelineTool,
+        // Appended by #398. Appending is the whole rule: the ten above keep
+        // their positions, so `tools/list` reads as an additive diff.
+        HifiCapabilitiesTool
     ]
 );
 
@@ -79,6 +84,7 @@ pub fn static_name(name: &str) -> Option<&'static str> {
         "hifi_hqplayer_profiles" => "hifi_hqplayer_profiles",
         "hifi_hqplayer_load_profile" => "hifi_hqplayer_load_profile",
         "hifi_hqplayer_set_pipeline" => "hifi_hqplayer_set_pipeline",
+        "hifi_capabilities" => "hifi_capabilities",
         _ => return None,
     })
 }
@@ -96,6 +102,7 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
     match tool {
         "hifi_zones" | "hifi_status" | "hifi_hqplayer_status" | "hifi_hqplayer_profiles" => &[],
         "hifi_now_playing" => &["zone_id"],
+        "hifi_capabilities" => &["zone_id"],
         "hifi_control" => &["zone_id", "action", "value"],
         "hifi_search" => &["query", "zone_id", "source"],
         "hifi_play" => &["query", "zone_id", "source", "action"],
@@ -142,8 +149,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn advertises_ten_tools_when_hqplayer_is_enabled() {
-        assert_eq!(list_tools(true).len(), 10);
+    fn advertises_eleven_tools_when_hqplayer_is_enabled() {
+        assert_eq!(list_tools(true).len(), 11);
     }
 
     /// The filter must remove exactly the four HQPlayer tools and nothing else.
@@ -152,7 +159,7 @@ mod tests {
         let enabled: Vec<String> = list_tools(true).into_iter().map(|t| t.name).collect();
         let disabled: Vec<String> = list_tools(false).into_iter().map(|t| t.name).collect();
 
-        assert_eq!(disabled.len(), 6);
+        assert_eq!(disabled.len(), 7);
         assert!(disabled.iter().all(|n| !n.starts_with("hifi_hqplayer")));
 
         let removed: Vec<&String> = enabled.iter().filter(|n| !disabled.contains(n)).collect();
