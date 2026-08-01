@@ -34,7 +34,9 @@
 //!
 //! `operation` still reports the *normalized* action, so `prev` surfaces as
 //! `previous` and `playpause` as `play_pause`; `params.value` still reports the
-//! *resolved* delta, so `volume_down` with no value surfaces as `-5.0`.
+//! *resolved* delta, so `volume_down` with no value surfaces as `-5.0`. On the two
+//! providers #398 wired it also reports the **integer** that was sent, because
+//! their `control` takes one — see [`set_volume`].
 //!
 //! Volume still uses a *different* routing rule from transport — see
 //! [`crate::mcp::routing`]. The asymmetry has moved rather than gone: it used to
@@ -270,11 +272,25 @@ async fn set_volume(
         "volume_absolute"
     };
 
-    // `value` is the *resolved* level or delta: the defaulted 5 and the negation
-    // applied by `volume_down` are both visible here and nowhere else.
-    let env = Envelope::write("hifi_control", operation)
-        .param("zone_id", zone_id)
-        .param("value", value);
+    // OpenHome and UPnP `control` take an integer, so the value UHC sends them is
+    // rounded — and `params.value` reports what was **sent**, not what was asked
+    // for. That is what #395's `params` contract means ("the parameters as the
+    // server resolved them"), and it is the only place a client can see that its
+    // fractional value was changed.
+    //
+    // `round`, not the `as i32` truncation this path shipped with for one commit:
+    // truncation turns `volume_up value=0.5` into a silent no-op, which is
+    // precisely the class of quiet lie this issue exists to remove. Rounding
+    // still loses a delta below 0.5 in absolute terms — stated rather than hidden,
+    // because `params.value` will report the `0` that was sent.
+    let integer_volume = value.round() as i32;
+    let env = Envelope::write("hifi_control", operation).param("zone_id", zone_id);
+    let env = match route {
+        VolumeRoute::OpenHome | VolumeRoute::Upnp => env.param("value", integer_volume),
+        // Nothing is sent on a refusal, so the client's resolved request is the
+        // honest value to report.
+        VolumeRoute::Lms | VolumeRoute::Roon | VolumeRoute::Refused(_) => env.param("value", value),
+    };
 
     if let VolumeRoute::Refused(refused) = route {
         return refuse_zone(state, env, zone_id, refused, Capability::Volume).await;
@@ -293,21 +309,21 @@ async fn set_volume(
                 .change_volume(zone_id, value as f32, relative)
                 .await
         }
-        // #398. `control` takes an integer, and both adapters clamp to 0-100
-        // themselves — `vol_abs` clamps the level, `vol_rel` clamps the sum. The
-        // cast is the same one the HTTP path has always done
-        // (`POST /openhome/control` deserializes `value` as an integer), so this
-        // reaches the adapter identically to how the web UI does.
+        // #398. Both adapters clamp to 0-100 themselves — `vol_abs` clamps the
+        // level, `vol_rel` clamps the sum — and both take an integer, which is
+        // what the HTTP path has always passed them (`POST /openhome/control`
+        // deserializes `value` as an integer). So this reaches the adapter
+        // identically to how the web UI does.
         VolumeRoute::OpenHome => {
             state
                 .openhome
-                .control(zone_id, volume_action(relative), Some(value as i32))
+                .control(zone_id, volume_action(relative), Some(integer_volume))
                 .await
         }
         VolumeRoute::Upnp => {
             state
                 .upnp
-                .control(zone_id, volume_action(relative), Some(value as i32))
+                .control(zone_id, volume_action(relative), Some(integer_volume))
                 .await
         }
         VolumeRoute::Refused(_) => unreachable_refused(),

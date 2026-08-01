@@ -4133,6 +4133,66 @@ async fn openhome_and_upnp_volume_is_wired_and_reported_supported() {
     }
 }
 
+/// OpenHome and UPnP `control` take an integer, so a fractional volume is
+/// rounded — and `params.value` reports the integer that was **sent**.
+///
+/// Found by this PR's own execute-gate dissent. The first implementation used
+/// `value as i32`, which truncates: `volume_up value=0.5` became `0`, a silent
+/// no-op on exactly the two providers this issue just wired. Rounding is not a
+/// complete fix — a delta below 0.5 still resolves to 0 — so the resolved value is
+/// reported rather than the requested one, and a client can see it happen.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn openhome_and_upnp_volume_reports_the_integer_it_actually_sends() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    for zone_id in ["openhome:abc", "upnp:abc"] {
+        // A fractional absolute level is rounded, not truncated.
+        let result = app
+            .call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "volume_set", "value": 30.7 }),
+            )
+            .await;
+        assert_eq!(
+            envelope(&result, zone_id).pointer("/params/value"),
+            Some(&json!(31)),
+            "{zone_id}: params.value must report the integer sent to the adapter, not the \
+             float requested — truncation here would report 30 and send 30"
+        );
+
+        // The rounding a client most needs to see: a small relative nudge that
+        // truncation would have thrown away entirely.
+        let result = app
+            .call_tool(
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "volume_up", "value": 0.5 }),
+            )
+            .await;
+        assert_eq!(
+            envelope(&result, zone_id).pointer("/params/value"),
+            Some(&json!(1)),
+            "{zone_id}: a 0.5 nudge must round to 1 rather than truncating to a silent no-op"
+        );
+    }
+
+    // Roon and LMS take a float, so nothing is resolved away and the value is
+    // reported as given. The asymmetry is real and is why params.value is not
+    // simply an echo.
+    let result = app
+        .call_tool(
+            "hifi_control",
+            json!({ "zone_id": "roon:abc", "action": "volume_set", "value": 30.7 }),
+        )
+        .await;
+    assert_eq!(
+        envelope(&result, "roon").pointer("/params/value"),
+        Some(&json!(30.7)),
+        "the Roon adapter takes an f32, so no rounding happens and none may be reported"
+    );
+}
+
 /// Every `supported` cell is proved by a call that reaches that provider's own
 /// adapter, identified by the adapter's own refusal wording.
 ///
