@@ -18,6 +18,7 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
+use crate::adapters::didl;
 use crate::adapters::handle::{AdapterHandle, RetryConfig};
 use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
@@ -67,15 +68,11 @@ pub struct OpenHomeDevice {
     pub last_track_uri: Option<String>,
 }
 
-/// Track metadata from OpenHome device
-#[derive(Debug, Clone, Serialize)]
-pub struct TrackInfo {
-    pub title: String,
-    pub artist: String,
-    pub album: String,
-    pub album_art_uri: Option<String>,
-    pub genre: Option<String>,
-}
+/// Track metadata from an OpenHome device.
+///
+/// Re-exported from [`crate::adapters::didl`], which owns DIDL-Lite parsing for
+/// both this adapter and the UPnP one so the two cannot drift apart.
+pub use crate::adapters::didl::TrackInfo;
 
 /// OpenHome adapter status
 #[derive(Debug, Clone, Serialize)]
@@ -459,7 +456,7 @@ impl OpenHomeAdapter {
         .await;
 
         if let Ok(response) = transport_state {
-            if let Some(new_state) = Self::extract_xml_value(&response, "Value") {
+            if let Some(new_state) = didl::extract_xml_value(&response, "Value") {
                 let new_state = new_state.to_lowercase();
                 let mut s = state.write().await;
                 if let Some(device) = s.devices.get_mut(uuid) {
@@ -486,7 +483,7 @@ impl OpenHomeAdapter {
         .await;
 
         if let Ok(response) = volume {
-            if let Some(vol_str) = Self::extract_xml_value(&response, "Value") {
+            if let Some(vol_str) = didl::extract_xml_value(&response, "Value") {
                 if let Ok(vol) = vol_str.parse::<i32>() {
                     let mut s = state.write().await;
                     if let Some(device) = s.devices.get_mut(uuid) {
@@ -507,7 +504,7 @@ impl OpenHomeAdapter {
         .await;
 
         if let Ok(response) = mute {
-            if let Some(mute_str) = Self::extract_xml_value(&response, "Value") {
+            if let Some(mute_str) = didl::extract_xml_value(&response, "Value") {
                 let is_muted = mute_str == "true" || mute_str == "1";
                 let mut s = state.write().await;
                 if let Some(device) = s.devices.get_mut(uuid) {
@@ -530,10 +527,10 @@ impl OpenHomeAdapter {
         if let Ok(response) = characteristics {
             let mut s = state.write().await;
             if let Some(device) = s.devices.get_mut(uuid) {
-                if let Some(max_str) = Self::extract_xml_value(&response, "VolumeMax") {
+                if let Some(max_str) = didl::extract_xml_value(&response, "VolumeMax") {
                     device.volume_max = max_str.parse().ok();
                 }
-                if let Some(steps_str) = Self::extract_xml_value(&response, "VolumeSteps") {
+                if let Some(steps_str) = didl::extract_xml_value(&response, "VolumeSteps") {
                     device.volume_steps = steps_str.parse().ok();
                 }
             }
@@ -550,8 +547,8 @@ impl OpenHomeAdapter {
         .await;
 
         if let Ok(response) = track {
-            let uri = Self::extract_xml_value(&response, "Uri");
-            let metadata = Self::extract_xml_value(&response, "Metadata");
+            let uri = didl::extract_xml_value(&response, "Uri");
+            let metadata = didl::extract_xml_value(&response, "Metadata");
 
             let mut s = state.write().await;
             if let Some(device) = s.devices.get_mut(uuid) {
@@ -561,8 +558,8 @@ impl OpenHomeAdapter {
 
                     if let Some(meta) = metadata {
                         // Decode HTML entities and parse DIDL-Lite
-                        let decoded = html_decode(&meta);
-                        if let Some(track_info) = Self::parse_didl_lite(&decoded) {
+                        let decoded = didl::html_decode(&meta);
+                        if let Some(track_info) = didl::parse_didl_lite(&decoded) {
                             let title = Some(track_info.title.clone());
                             let artist = Some(track_info.artist.clone());
                             let album = Some(track_info.album.clone());
@@ -623,41 +620,6 @@ impl OpenHomeAdapter {
             .await?;
 
         Ok(response.text().await?)
-    }
-
-    fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
-        let start_tag = format!("<{}>", tag);
-        let end_tag = format!("</{}>", tag);
-
-        let start = xml.find(&start_tag)? + start_tag.len();
-        let end = xml[start..].find(&end_tag)? + start;
-
-        Some(xml[start..end].to_string())
-    }
-
-    fn parse_didl_lite(xml: &str) -> Option<TrackInfo> {
-        // Simple extraction from DIDL-Lite
-        let title = Self::extract_xml_value(xml, "dc:title")
-            .or_else(|| Self::extract_xml_value(xml, "title"))
-            .unwrap_or_default();
-
-        let artist = Self::extract_xml_value(xml, "upnp:artist")
-            .or_else(|| Self::extract_xml_value(xml, "dc:creator"))
-            .unwrap_or_default();
-
-        let album = Self::extract_xml_value(xml, "upnp:album").unwrap_or_default();
-
-        let album_art_uri = Self::extract_xml_value(xml, "upnp:albumArtURI");
-
-        let genre = Self::extract_xml_value(xml, "upnp:genre");
-
-        Some(TrackInfo {
-            title,
-            artist,
-            album,
-            album_art_uri,
-            genre,
-        })
     }
 
     /// Stop discovery (internal - use Startable trait)
@@ -930,14 +892,6 @@ pub struct ImageData {
     pub data: Vec<u8>,
 }
 
-/// Decode HTML entities
-fn html_decode(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-}
 
 /// Convert an OpenHome device to a unified Zone representation
 fn openhome_device_to_zone(device: &OpenHomeDevice) -> Zone {
@@ -1076,69 +1030,3 @@ impl AdapterLogic for OpenHomeAdapter {
 // Startable trait implementation via macro
 crate::impl_startable!(OpenHomeAdapter, "openhome");
 
-#[cfg(test)]
-mod didl_pin_tests {
-    use super::*;
-
-    /// A realistic DIDL-Lite payload as a renderer returns it, with attributes
-    /// on the tags that carry them in practice.
-    const REAL_DIDL: &str = r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><item id="1" parentID="0" restricted="1"><dc:title>Hoppipolla</dc:title><upnp:artist>Sigur Ros</upnp:artist><upnp:album>Takk...</upnp:album><upnp:genre>Post-rock</upnp:genre><upnp:albumArtURI dlna:profileID="JPEG_TN">http://10.0.0.5/art/42.jpg</upnp:albumArtURI></item></DIDL-Lite>"#;
-
-    /// The same payload with a bare albumArtURI tag (no attributes).
-    const BARE_DIDL: &str = r#"<DIDL-Lite><item><dc:title>Hoppipolla</dc:title><upnp:artist>Sigur Ros</upnp:artist><upnp:album>Takk...</upnp:album><upnp:albumArtURI>http://10.0.0.5/art/42.jpg</upnp:albumArtURI></item></DIDL-Lite>"#;
-
-    #[test]
-    fn html_decode_unescapes_in_the_right_order() {
-        // &amp; must be replaced last, or "&amp;lt;" would wrongly become "<".
-        assert_eq!(html_decode("&lt;a&gt;"), "<a>");
-        assert_eq!(html_decode("Simon &amp; Garfunkel"), "Simon & Garfunkel");
-        assert_eq!(html_decode("&amp;lt;"), "&lt;");
-        assert_eq!(html_decode("&quot;x&quot; &apos;y&apos;"), "\"x\" 'y'");
-    }
-
-    #[test]
-    fn parse_didl_lite_reads_bare_tags() {
-        let t = OpenHomeAdapter::parse_didl_lite(BARE_DIDL).expect("returns Some");
-        assert_eq!(t.title, "Hoppipolla");
-        assert_eq!(t.artist, "Sigur Ros");
-        assert_eq!(t.album, "Takk...");
-        assert_eq!(
-            t.album_art_uri.as_deref(),
-            Some("http://10.0.0.5/art/42.jpg")
-        );
-    }
-
-    #[test]
-    fn parse_didl_lite_never_returns_none_even_for_garbage() {
-        // Pinning current behavior: every field defaults rather than failing.
-        let t = OpenHomeAdapter::parse_didl_lite("not xml at all").expect("returns Some");
-        assert_eq!(t.title, "");
-        assert_eq!(t.artist, "");
-        assert_eq!(t.album, "");
-        assert!(t.album_art_uri.is_none());
-    }
-
-    #[test]
-    fn parse_didl_lite_falls_back_to_dc_creator_and_plain_title() {
-        let xml = r#"<item><title>Bare Title</title><dc:creator>Fallback Artist</dc:creator></item>"#;
-        let t = OpenHomeAdapter::parse_didl_lite(xml).expect("returns Some");
-        assert_eq!(t.title, "Bare Title");
-        assert_eq!(t.artist, "Fallback Artist");
-    }
-
-    /// The limitation this test documents is why UPnP/OpenHome art can silently
-    /// go missing on real devices: the extractor matches a literal `<tag>`, so a
-    /// tag carrying attributes is invisible to it.
-    #[test]
-    fn parse_didl_lite_misses_tags_that_carry_attributes() {
-        let t = OpenHomeAdapter::parse_didl_lite(REAL_DIDL).expect("returns Some");
-        // Attribute-free tags are found...
-        assert_eq!(t.title, "Hoppipolla");
-        assert_eq!(t.artist, "Sigur Ros");
-        // ...but albumArtURI carries dlna:profileID and is therefore missed.
-        assert_eq!(
-            t.album_art_uri, None,
-            "documents current behavior: attribute-bearing tags are not matched"
-        );
-    }
-}
