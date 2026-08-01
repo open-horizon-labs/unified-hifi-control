@@ -2641,6 +2641,100 @@ mod tests {
     use super::*;
 
     // -------------------------------------------------------------------------
+    // LMS JSON type tolerance (#407)
+    //
+    // Every shape asserted here was observed on one live Lyrion 9.1.2 server:
+    //   number   `track_id: 1`, `mixer muting ?` -> 1, `connected ?` -> 1
+    //   string   `mute: "0"` / `"1"`, `mixer volume ?` -> "42",
+    //            `power ?` -> "1", `playlist_cur_index: "0"`
+    //   null     `mixer muting ?` -> null before the pref is ever written
+    //   absent   `mute` omitted from players_loop when the pref is unset
+    //
+    // `.as_i64()` alone yields None on the string form. That is how a parse bug
+    // becomes an empty result rather than an error - the shape of defect #407.1.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn lms_i64_reads_numbers_and_strings() {
+        assert_eq!(lms_i64(Some(&json!(42))), Some(42));
+        assert_eq!(lms_i64(Some(&json!("42"))), Some(42));
+        assert_eq!(lms_i64(Some(&json!(-42))), Some(-42));
+        assert_eq!(lms_i64(Some(&json!("-42"))), Some(-42));
+        // `mixer muting ?` returns a float-shaped value on some queries, and
+        // `sleep ?` returns e.g. 899.967221021652.
+        assert_eq!(lms_i64(Some(&json!(1.0))), Some(1));
+        assert_eq!(lms_i64(Some(&json!(" 7 "))), Some(7));
+        assert_eq!(lms_i64(Some(&json!(Value::Null))), None);
+        assert_eq!(lms_i64(None), None);
+        assert_eq!(lms_i64(Some(&json!("not a number"))), None);
+    }
+
+    #[test]
+    fn lms_flag_treats_absent_and_null_as_false() {
+        assert!(!lms_flag(None));
+        assert!(!lms_flag(Some(&Value::Null)));
+        assert!(!lms_flag(Some(&json!(0))));
+        assert!(!lms_flag(Some(&json!("0"))));
+        assert!(lms_flag(Some(&json!(1))));
+        // The shape live 9.1.2 actually returned for the `mute` pref.
+        assert!(lms_flag(Some(&json!("1"))));
+        assert!(!lms_flag(Some(&json!("garbage"))));
+    }
+
+    #[test]
+    fn loop_entity_id_prefers_typed_key_and_falls_back_to_id() {
+        // What live LMS emits: `<type>_id`, and no `id` key at all.
+        let album = json!({"album_id": 1, "album": "Ember Light"});
+        assert_eq!(loop_entity_id(&album, "album"), Some(1));
+
+        let contributor = json!({"contributor_id": 3, "contributor": "Ember Valley Quartet"});
+        assert_eq!(loop_entity_id(&contributor, "contributor"), Some(3));
+
+        let track = json!({"track_id": 8, "track": "Ember Coda"});
+        assert_eq!(loop_entity_id(&track, "track"), Some(8));
+
+        // The typed key wins when both are present.
+        let both = json!({"album_id": 5, "id": 99});
+        assert_eq!(loop_entity_id(&both, "album"), Some(5));
+
+        // Version fallback: a hypothetical server emitting only `id`.
+        let legacy = json!({"id": 7, "album": "Whatever"});
+        assert_eq!(loop_entity_id(&legacy, "album"), Some(7));
+
+        // String form, and non-positive or missing ids are not addressable -
+        // playlistcontrol cannot act on them.
+        assert_eq!(loop_entity_id(&json!({"album_id": "12"}), "album"), Some(12));
+        assert_eq!(loop_entity_id(&json!({"album_id": 0}), "album"), None);
+        assert_eq!(loop_entity_id(&json!({"album_id": -1}), "album"), None);
+        assert_eq!(loop_entity_id(&json!({"album": "no id"}), "album"), None);
+    }
+
+    #[test]
+    fn describe_command_names_the_player_and_the_command() {
+        let described = describe_command(
+            Some("02:00:00:00:00:11"),
+            &[json!("players"), json!(0), json!(100), json!("playerprefs:mute")],
+        );
+        assert_eq!(described, "02:00:00:00:00:11 players 0 100 playerprefs:mute");
+
+        // Server-scoped calls pass no player id; the message must still be clear.
+        let server = describe_command(None, &[json!("search"), json!(0), json!(10)]);
+        assert_eq!(server, "<server> search 0 10");
+    }
+
+    #[test]
+    fn truncate_for_log_bounds_runaway_bodies() {
+        assert_eq!(truncate_for_log("short"), "short");
+        let long = "x".repeat(500);
+        let truncated = truncate_for_log(&long);
+        assert_eq!(truncated.chars().count(), 201, "200 chars plus an ellipsis");
+        assert!(truncated.ends_with('…'));
+        // Must not split a multi-byte character.
+        let unicode = "é".repeat(500);
+        assert_eq!(truncate_for_log(&unicode).chars().count(), 201);
+    }
+
+    // -------------------------------------------------------------------------
     // CLI Event Parsing Tests (TDD)
     // -------------------------------------------------------------------------
 
