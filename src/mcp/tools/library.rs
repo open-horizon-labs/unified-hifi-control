@@ -105,8 +105,8 @@ pub async fn handle_search(
     };
 
     let env = match args.zone_id.as_deref() {
-        Some(zone_id) => env.scope(Scope::for_zone(state, zone_id, route.provider()).await),
-        None => env.scope(Scope::provider_only(route.provider())),
+        Some(zone_id) => env.scope(Scope::for_zone(state, zone_id, target.provider()).await),
+        None => env.scope(Scope::provider_only(target.provider())),
     };
 
     match route {
@@ -207,7 +207,7 @@ pub async fn handle_play(
                     .param("query", &*args.query)
                     .param("zone_id", &*args.zone_id)
                     .param("action", "radio")
-                    .scope(Scope::for_zone(state, &args.zone_id, route.provider()).await)
+                    .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await)
                     .refused(
                         "Radio mode not supported for LMS. Use 'play' or 'queue'.",
                         Refusal::ProviderLimitation {
@@ -231,7 +231,7 @@ pub async fn handle_play(
                 .param("query", &*args.query)
                 .param("zone_id", &*args.zone_id)
                 .param("action", lms_action_name(action))
-                .scope(Scope::for_zone(state, &args.zone_id, route.provider()).await);
+                .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
 
             match state
                 .lms
@@ -252,7 +252,7 @@ pub async fn handle_play(
                 .param("zone_id", &*args.zone_id)
                 .param("action", roon_action_name(action))
                 .param("source", roon_source_name(source))
-                .scope(Scope::for_zone(state, &args.zone_id, route.provider()).await);
+                .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
 
             match state
                 .roon

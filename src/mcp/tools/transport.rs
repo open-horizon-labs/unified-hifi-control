@@ -116,7 +116,8 @@ pub async fn handle_control(
         other => other,
     };
 
-    let route = ZoneTarget::classify(&args.zone_id).for_transport();
+    let target = ZoneTarget::classify(&args.zone_id);
+    let route = target.for_transport();
     // `operation` is the normalized backend action, so `prev` reports as
     // `previous` and `playpause` as `play_pause`.
     let env = Envelope::write("hifi_control", backend_action)
@@ -136,10 +137,15 @@ pub async fn handle_control(
     };
 
     // One aggregator snapshot serves both `scope.zone_name` and `observed`, so
-    // the two cannot describe different moments.
+    // the two cannot describe different moments. It is taken after the command,
+    // which is what makes it a read-back rather than a guess — `set_volume` does
+    // the same for the same reason, at the cost of a second read there because
+    // its refusal path needs a scope before any command runs.
     let observed = Observed::from_aggregator(state, &args.zone_id).await;
     let scope = Scope {
-        provider: route.provider(),
+        // Identification, not route: `sonos:x` reports `unknown` even though the
+        // call above went to Roon. See ZoneTarget::provider.
+        provider: target.provider(),
         zone_id: Some(args.zone_id.clone()),
         zone_name: observed.as_ref().map(|o| o.zone.zone_name.clone()),
     };
@@ -241,13 +247,7 @@ async fn set_volume(
         }
     };
 
-    let scope = Scope::for_zone(
-        state,
-        zone_id,
-        route.provider().unwrap_or_else(|| target.provider()),
-    )
-    .await;
-    let env = env.scope(scope);
+    let env = env.scope(Scope::for_zone(state, zone_id, target.provider()).await);
 
     match result {
         Ok(()) => {

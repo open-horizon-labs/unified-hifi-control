@@ -120,10 +120,27 @@ pub enum Outcome {
 // Scope
 // =============================================================================
 
-/// Which backend a call was routed to.
+/// The backend UHC **identified** for a call.
 ///
 /// Values match the zone-id prefixes so a client can correlate them without a
 /// lookup table.
+///
+/// # Identification, not routing
+///
+/// This is derived from [`ZoneTarget`](crate::mcp::routing::ZoneTarget) — what
+/// UHC could work out about the zone id — and **not** from the route the call
+/// then took. The two differ for an unrecognised prefix: `sonos:abc` is
+/// identified as [`Self::Unknown`] while transport, search and play still send it
+/// to Roon (today's silent default, #398's to fix).
+///
+/// Reporting `roon` there would be worse than saying nothing. A model would learn
+/// that a Sonos zone is a Roon zone and that Roon is at fault for the failure,
+/// when the actual remedy is a valid zone id. #392 rule 3 forbids making a
+/// provider look responsible for a UHC decision, and a field literally named
+/// `provider` is the last place to bend that.
+///
+/// So `provider: "unknown"` next to a Roon-shaped failure detail is the legible
+/// fingerprint of the silent default, sitting where #398 can find it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
@@ -135,12 +152,9 @@ pub enum Provider {
     Upnp,
     #[serde(rename = "hqplayer")]
     HqPlayer,
-    /// The zone id's prefix names no adapter.
+    /// The zone id's prefix names no adapter, so UHC identified nothing.
     ///
-    /// Today transport, search and play still route these to Roon, so `provider`
-    /// on those paths reports `roon` — it reports the route actually taken, not
-    /// the prefix. This variant appears where the call was refused before a route
-    /// was chosen. #398 removes the silent default.
+    /// No claim is made about such a zone's capabilities, because none can be.
     Unknown,
 }
 
@@ -510,6 +524,18 @@ impl Envelope {
         let text = text.to_string();
         let refusal = Refusal::backend_error(text.clone());
         self.refused(text, refusal)
+    }
+
+    /// A result that keeps the SDK's own `isError: true` framing while gaining an
+    /// envelope.
+    ///
+    /// The only place this is needed is argument-parse failure, which happens
+    /// before any tool runs — see [`crate::mcp::handler`]. Returning
+    /// `Err(CallToolError)` there produces `content: [text], isError: true` and no
+    /// structured payload; this reproduces that content byte for byte, `isError`
+    /// included, and attaches the envelope.
+    pub fn errored_result(self, error: CallToolError) -> CallToolResult {
+        self.attach(CallToolResult::with_error(error))
     }
 }
 

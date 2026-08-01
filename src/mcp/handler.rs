@@ -5,6 +5,7 @@
 //! with the resource methods.
 
 use crate::api::{load_app_settings, AppState};
+use crate::mcp::envelope::{Envelope, Refusal};
 use crate::mcp::tools::{self, HifiTools};
 use async_trait::async_trait;
 use rust_mcp_sdk::{
@@ -52,7 +53,29 @@ impl ServerHandler for HifiMcpHandler {
         params: CallToolRequestParams,
         _runtime: Arc<dyn McpServer>,
     ) -> Result<CallToolResult, CallToolError> {
-        let tool: HifiTools = HifiTools::try_from(params).map_err(CallToolError::new)?;
+        // Argument parsing happens before any tool runs, and its failures are the
+        // commonest `invalid` a real client produces — a required parameter left
+        // out. The SDK turns them into `content: [text], isError: true`, which a
+        // client cannot tell apart from a tool's own result, so #395's envelope
+        // has to reach them too. `requested_tool_name` is captured first because
+        // `try_from` consumes `params`.
+        let requested = params.name.clone();
+        let tool: HifiTools = match HifiTools::try_from(params) {
+            Ok(tool) => tool,
+            Err(e) => {
+                let error = CallToolError::new(e);
+                return Ok(match tools::static_name(&requested) {
+                    // A known tool with bad arguments: the client can fix this,
+                    // and the envelope says which parameter and how.
+                    Some(name) => invalid_arguments_envelope(name, &error).errored_result(error),
+                    // An unknown tool name has no tool to scope an envelope to,
+                    // and inventing one would claim a surface that does not exist.
+                    // Deliberately left bare; asserted in the contract tests so
+                    // the line is a decision rather than an oversight.
+                    None => CallToolResult::with_error(error),
+                });
+            }
+        };
         let state = &self.state;
 
         match tool {
@@ -77,5 +100,37 @@ impl ServerHandler for HifiMcpHandler {
                 tools::hqplayer::handle_set_pipeline(state, args).await
             }
         }
+    }
+}
+
+/// The envelope for a call whose arguments did not deserialize.
+///
+/// The parameter name has to be recovered from the deserializer's message
+/// (`"missing field \`zone_id\`"`, `"invalid type: ..."`) because that is all the
+/// SDK surfaces — `try_from` returns a `serde` error, not a structured field path.
+/// So the parameter is reported when it can be identified against the tool's
+/// declared inputs and omitted when it cannot, rather than guessed at.
+fn invalid_arguments_envelope(tool: &'static str, error: &CallToolError) -> Envelope {
+    let message = error.to_string();
+    let parameter = tools::static_param(tool, &message);
+
+    let env = Envelope::write(tool, "parse_arguments");
+    match parameter {
+        Some(parameter) => env.refuse(Refusal::InvalidParameter {
+            parameter,
+            accepted: vec![format!("see the {tool} inputSchema in tools/list")],
+            detail: format!(
+                "The arguments for {tool} did not deserialize: {message}. Fix {parameter} \
+                 and call again."
+            ),
+        }),
+        None => env.refuse(Refusal::InvalidParameter {
+            parameter: "arguments",
+            accepted: vec![format!("see the {tool} inputSchema in tools/list")],
+            detail: format!(
+                "The arguments for {tool} did not deserialize: {message}. UHC could not \
+                 identify which parameter from the deserializer's message."
+            ),
+        }),
     }
 }

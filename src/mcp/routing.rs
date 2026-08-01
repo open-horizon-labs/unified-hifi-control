@@ -125,6 +125,14 @@ pub enum LibraryRoute {
 ///
 /// Derived from the same list [`ZoneTarget::classify`] matches on, so a new
 /// adapter cannot be added without this following.
+///
+/// # The bare unprefixed form is deliberately omitted
+///
+/// A zone id with no `:` at all also works today — `classify` sends it to Roon.
+/// It is left out because #398 is removing that default, and because pointing a
+/// client at a form that is about to stop working is worse than pointing it at
+/// four that will keep working. Every value listed here does work; the list is
+/// deliberately incomplete rather than wrong.
 pub const ACCEPTED_ZONE_PREFIXES: &[&str] = &["roon:", "lms:", "openhome:", "upnp:"];
 
 /// The `hifi_control` actions every adapter's transport path accepts.
@@ -166,54 +174,26 @@ impl ZoneTarget {
         }
     }
 
-    /// The provider name for an envelope [`Scope`](crate::mcp::envelope::Scope)
-    /// when no route was chosen — i.e. on a refusal that happened before dispatch.
+    /// The provider for an envelope [`Scope`](crate::mcp::envelope::Scope).
     ///
-    /// Where a route *was* chosen, ask the route instead
-    /// ([`TransportRoute::provider`] and friends), because the route is what
-    /// actually happened: `sonos:x` classifies as `Unknown` but transport still
-    /// sends it to Roon, and the envelope must report the truth rather than the
-    /// prefix.
+    /// **The single source of `scope.provider`, for every tool and every path.**
+    ///
+    /// Deliberately derived from identification rather than from the route taken.
+    /// An earlier draft asked the *route* — so `sonos:x` reported `roon`, because
+    /// that is where transport sends it. The execute-gate dissent blocked that:
+    /// it turns the silent Roon default into a positive claim that a Sonos zone
+    /// is a Roon zone, in the one field #398 is about to build a capability
+    /// matrix on. `Unknown` reports `unknown`, and the Roon-shaped failure detail
+    /// beside it is what makes the default visible instead of authoritative.
     pub fn provider(self) -> Provider {
         match self {
             Self::Lms => Provider::Lms,
             Self::OpenHome => Provider::OpenHome,
             Self::Upnp => Provider::Upnp,
+            // Includes the bare-id case. That default is documented in this
+            // module rather than silent, unlike the Unknown one.
             Self::Roon => Provider::Roon,
             Self::Unknown => Provider::Unknown,
-        }
-    }
-}
-
-impl TransportRoute {
-    /// The adapter this route reaches. Reports `roon` for unrecognised prefixes,
-    /// because that is where they actually go today.
-    pub fn provider(self) -> Provider {
-        match self {
-            Self::Lms => Provider::Lms,
-            Self::OpenHome => Provider::OpenHome,
-            Self::Upnp => Provider::Upnp,
-            Self::Roon => Provider::Roon,
-        }
-    }
-}
-
-impl VolumeRoute {
-    /// The adapter this route reaches, or `None` when volume is refused.
-    pub fn provider(self) -> Option<Provider> {
-        match self {
-            Self::Lms => Some(Provider::Lms),
-            Self::Roon => Some(Provider::Roon),
-            Self::Unsupported => None,
-        }
-    }
-}
-
-impl LibraryRoute {
-    pub fn provider(self) -> Provider {
-        match self {
-            Self::Lms => Provider::Lms,
-            Self::Roon => Provider::Roon,
         }
     }
 }

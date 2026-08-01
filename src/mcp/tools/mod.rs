@@ -58,6 +58,67 @@ tool_box!(
     ]
 );
 
+/// Every tool name, as a `'static` string.
+///
+/// `HifiTools::tools()` yields owned `String`s, but the envelope's `tool` field is
+/// `&'static str` — so a call that fails *before* dispatch (see
+/// [`crate::mcp::handler`]) needs this to name the tool it was aimed at.
+///
+/// A hand-written match rather than a derived list because there is nothing to
+/// derive it from at compile time; [`tests::static_names_match_the_advertised_tools`]
+/// checks it against `list_tools(true)`, so it cannot drift.
+pub fn static_name(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "hifi_zones" => "hifi_zones",
+        "hifi_now_playing" => "hifi_now_playing",
+        "hifi_control" => "hifi_control",
+        "hifi_search" => "hifi_search",
+        "hifi_play" => "hifi_play",
+        "hifi_status" => "hifi_status",
+        "hifi_hqplayer_status" => "hifi_hqplayer_status",
+        "hifi_hqplayer_profiles" => "hifi_hqplayer_profiles",
+        "hifi_hqplayer_load_profile" => "hifi_hqplayer_load_profile",
+        "hifi_hqplayer_set_pipeline" => "hifi_hqplayer_set_pipeline",
+        _ => return None,
+    })
+}
+
+/// The input parameters each tool declares, as `'static` strings.
+///
+/// Needed for the same reason as [`static_name`]: an envelope refusal names the
+/// offending parameter as `&'static str`, and a pre-dispatch failure has no typed
+/// arguments to read one from.
+///
+/// [`tests::declared_params_match_the_advertised_input_schemas`] checks this
+/// against the `inputSchema` properties in `tools/list`, so it cannot drift from
+/// what is advertised.
+pub fn declared_params(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "hifi_zones" | "hifi_status" | "hifi_hqplayer_status" | "hifi_hqplayer_profiles" => &[],
+        "hifi_now_playing" => &["zone_id"],
+        "hifi_control" => &["zone_id", "action", "value"],
+        "hifi_search" => &["query", "zone_id", "source"],
+        "hifi_play" => &["query", "zone_id", "source", "action"],
+        "hifi_hqplayer_load_profile" => &["profile"],
+        "hifi_hqplayer_set_pipeline" => &["setting", "value"],
+        _ => &[],
+    }
+}
+
+/// Which declared parameter a deserializer message is about, if it can be told.
+///
+/// `serde`'s messages are prose (`"missing field \`zone_id\`"`), so this looks for
+/// a declared parameter name in the text rather than parsing a field path the SDK
+/// does not provide. `None` when nothing matches — reported as such rather than
+/// guessed, because naming the wrong parameter sends a client to fix the wrong
+/// thing.
+pub fn static_param(tool: &str, message: &str) -> Option<&'static str> {
+    declared_params(tool)
+        .iter()
+        .copied()
+        .find(|param| message.contains(param))
+}
+
 /// The tools to advertise in `tools/list`.
 ///
 /// HQPlayer tools are hidden when the adapter is disabled, because AGENTS.md
@@ -104,5 +165,69 @@ mod tests {
             .filter(|n| !n.starts_with("hifi_hqplayer"))
             .collect();
         assert_eq!(surviving, disabled.iter().collect::<Vec<_>>());
+    }
+
+    /// [`static_name`] must recognise exactly the advertised tools — no more, no
+    /// fewer. A tool added to `tool_box!` and forgotten here would silently lose
+    /// its envelope on argument-parse failures.
+    #[test]
+    fn static_names_match_the_advertised_tools() {
+        for tool in list_tools(true) {
+            assert_eq!(
+                static_name(&tool.name),
+                Some(tool.name.as_str()),
+                "static_name does not recognise the advertised tool {:?}; add it, or a \
+                 malformed call to it loses its envelope",
+                tool.name
+            );
+        }
+        assert_eq!(static_name("hifi_frobnicate"), None);
+        assert_eq!(static_name(""), None);
+    }
+
+    /// [`declared_params`] must match the `inputSchema` properties every tool
+    /// advertises. Derived from `list_tools`, not restated, so a renamed parameter
+    /// fails here instead of producing a refusal that blames a field the client
+    /// cannot set.
+    #[test]
+    fn declared_params_match_the_advertised_input_schemas() {
+        for tool in list_tools(true) {
+            let advertised: std::collections::BTreeSet<String> = tool
+                .input_schema
+                .properties
+                .as_ref()
+                .map(|props| props.keys().cloned().collect())
+                .unwrap_or_default();
+            let declared: std::collections::BTreeSet<String> = declared_params(&tool.name)
+                .iter()
+                .map(|p| (*p).to_string())
+                .collect();
+            assert_eq!(
+                declared, advertised,
+                "declared_params({:?}) disagrees with the advertised inputSchema",
+                tool.name
+            );
+        }
+    }
+
+    /// The parameter is identified when the message names it, and reported as
+    /// unidentified rather than guessed when it does not.
+    #[test]
+    fn static_param_identifies_only_what_the_message_names() {
+        assert_eq!(
+            static_param("hifi_control", "missing field `zone_id`"),
+            Some("zone_id")
+        );
+        assert_eq!(
+            static_param("hifi_hqplayer_set_pipeline", "missing field `setting`"),
+            Some("setting")
+        );
+        // Nothing declared by this tool appears in the message.
+        assert_eq!(
+            static_param("hifi_control", "invalid type: expected a map"),
+            None
+        );
+        // A parameter another tool declares must not be borrowed.
+        assert_eq!(static_param("hifi_now_playing", "missing field `query`"), None);
     }
 }

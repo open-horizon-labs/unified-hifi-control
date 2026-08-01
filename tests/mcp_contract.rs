@@ -2484,6 +2484,11 @@ async fn every_tool_returns_an_envelope_with_the_expected_outcome() {
                     .get("detail")
                     .and_then(Value::as_str)
                     .unwrap_or_else(|| panic!("{label}: every refusal needs a detail: {refusal}"));
+                // A length proxy, with the same weakness FIELD_ROLES's own reason
+                // check admits to: it can be gamed by padding. Kept because it
+                // does real work catching a detail that is just the reason code
+                // spelled out, but it is not a quality gate. If you are here
+                // because this failed, write a better sentence, not a longer one.
                 assert!(
                     detail.len() > 20,
                     "{label}: a refusal detail must explain itself, not restate the code: \
@@ -2816,11 +2821,18 @@ async fn invalid_refusals_name_the_parameter_and_its_accepted_values() {
             .find(|(name, _)| *name == tool)
             .map(|(_, params)| params.iter().map(|(p, _)| *p).collect())
             .unwrap_or_default();
-        assert!(
-            declared.contains(&parameter),
-            "{label}: refusal blames {parameter:?}, which {tool} does not declare \
-             (declared: {declared:?})"
-        );
+
+        // `arguments` is the documented sentinel for "the argument object as a
+        // whole", used only when a pre-dispatch deserializer message names no
+        // declared parameter. It is not a tool input, and pretending otherwise
+        // would be the dishonesty this test exists to prevent.
+        if parameter != "arguments" {
+            assert!(
+                declared.contains(&parameter),
+                "{label}: refusal blames {parameter:?}, which {tool} does not declare \
+                 (declared: {declared:?})"
+            );
+        }
 
         // Either an accepted-values list, or a tool that enumerates them.
         let has_accepted = refusal
@@ -2942,6 +2954,173 @@ async fn unknown_zone_prefix_volume_blames_the_zone_id_not_the_provider() {
     );
 }
 
+/// An unrecognised zone prefix reports `provider: "unknown"`, never the adapter
+/// the call was silently defaulted to.
+///
+/// `sonos:abc` classifies as `ZoneTarget::Unknown` and transport still sends it to
+/// Roon — today's silent default, #398's to fix. An earlier draft of this PR
+/// derived `scope.provider` from the *route*, so it reported `roon`, teaching a
+/// model two false things: that a Sonos zone is a Roon zone, and that Roon is at
+/// fault. #392 rule 3 forbids making a provider look responsible for a UHC
+/// decision.
+///
+/// So `provider: "unknown"` beside a Roon-shaped failure detail is the readable
+/// fingerprint of the default, rather than an authoritative-looking lie.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn an_unrecognised_prefix_never_claims_the_adapter_it_was_defaulted_to() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // Transport, search and play all default an unknown prefix to Roon.
+    let cases: &[(&str, Value)] = &[
+        ("hifi_control", json!({ "zone_id": "sonos:abc", "action": "play" })),
+        ("hifi_search", json!({ "query": "q", "zone_id": "sonos:abc" })),
+        ("hifi_play", json!({ "query": "q", "zone_id": "sonos:abc" })),
+    ];
+
+    for (tool, args) in cases {
+        let result = app.call_tool(tool, args.clone()).await;
+        let env = envelope(&result, tool);
+
+        assert_eq!(
+            env.get("scope").and_then(|s| s.get("provider")),
+            Some(&json!("unknown")),
+            "{tool}: an unidentified provider must not be reported as the adapter the \
+             call was defaulted to: {env}"
+        );
+
+        // And the default is still happening — this test pins the honesty of the
+        // report, not a fix. #398 owns the fix.
+        let detail = env
+            .get("refusal")
+            .and_then(|r| r.get("detail"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            detail.to_lowercase().contains("roon"),
+            "{tool}: the Roon default is expected to remain visible in the detail \
+             until #398 removes it; got {detail:?}"
+        );
+    }
+
+    // A bare id is a *documented* default rather than a silent one, so it does
+    // report roon. Pinned to make the difference deliberate.
+    let result = app
+        .call_tool("hifi_control", json!({ "zone_id": "bareid", "action": "play" }))
+        .await;
+    assert_eq!(
+        envelope(&result, "bareid")
+            .get("scope")
+            .and_then(|s| s.get("provider")),
+        Some(&json!("roon")),
+        "a bare id classifies as Roon by a rule stated in routing.rs, unlike an \
+         unrecognised prefix"
+    );
+}
+
+/// A call whose arguments do not deserialize still gets an envelope — and an
+/// unknown tool name deliberately does not.
+///
+/// A required parameter left out is the commonest `invalid` a real client
+/// produces, and it fails in `handle_call_tool_request` before any tool runs. The
+/// SDK turns it into `content: [text], isError: true`, which a client cannot
+/// distinguish from a tool's own result, so #395's guarantee has to cover it. The
+/// execute-gate dissent blocked on this.
+///
+/// An unknown tool name is the other side of the line: there is no tool to scope
+/// an envelope to, and inventing one would claim a surface that does not exist.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn argument_parse_failures_get_an_envelope_and_unknown_tools_do_not() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    let (session_id, _) = app.initialize().await;
+
+    async fn call(
+        app: &TestApp,
+        session_id: &str,
+        id: i32,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        let (_, response) = app
+            .post(
+                Some(session_id),
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": { "name": name, "arguments": arguments }
+                }),
+            )
+            .await;
+        response
+            .and_then(|r| r.get("result").cloned())
+            .unwrap_or_else(|| panic!("{name} must return a result"))
+    }
+
+    // A known tool, a required parameter omitted.
+    let result = call(
+        &app,
+        &session_id,
+        90,
+        "hifi_control",
+        json!({ "action": "play" }),
+    )
+    .await;
+    assert_eq!(
+        result_text(&result),
+        "missing field `zone_id`",
+        "the SDK's own text must be preserved byte for byte"
+    );
+    assert_eq!(
+        result.get("isError"),
+        Some(&json!(true)),
+        "isError must survive: it is the only place the surface uses it"
+    );
+    let env = envelope(&result, "missing zone_id");
+    assert_eq!(env.get("tool"), Some(&json!("hifi_control")));
+    assert_eq!(env.get("outcome"), Some(&json!("invalid")));
+    let refusal = env.get("refusal").expect("a refusal is expected");
+    assert_eq!(refusal.get("reason"), Some(&json!("invalid_parameter")));
+    assert_eq!(
+        refusal.get("parameter"),
+        Some(&json!("zone_id")),
+        "the offending parameter must be named, per #395's acceptance criteria: {refusal}"
+    );
+
+    // A wrong type, where the deserializer message may not name the field.
+    let result = call(
+        &app,
+        &session_id,
+        91,
+        "hifi_control",
+        json!({ "zone_id": "roon:x", "action": "play", "value": "loud" }),
+    )
+    .await;
+    let env = envelope(&result, "bad value type");
+    assert_eq!(env.get("outcome"), Some(&json!("invalid")));
+    let parameter = env
+        .get("refusal")
+        .and_then(|r| r.get("parameter"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        parameter == "value" || parameter == "arguments",
+        "either the parameter is identified, or the sentinel says it could not be — \
+         never a guess: got {parameter:?}"
+    );
+
+    // An unknown tool name: text preserved, no envelope, on purpose.
+    let result = call(&app, &session_id, 92, "hifi_frobnicate", json!({})).await;
+    assert_eq!(result_text(&result), "Unknown tool: hifi_frobnicate");
+    assert_eq!(result.get("isError"), Some(&json!(true)));
+    assert!(
+        result.get("structuredContent").is_none(),
+        "an unknown tool has no tool to scope an envelope to; a present envelope here \
+         would claim a surface that does not exist: {result}"
+    );
+}
+
 /// `scope.zone_name` is read back from the aggregator, never echoed, and its
 /// absence next to a present `zone_id` is how a client tells a typo from a real
 /// zone.
@@ -3051,15 +3230,26 @@ async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
     h.stop().await;
 }
 
-/// A relative volume write reports the resolved delta and the level the
-/// aggregator holds afterwards.
+/// A volume write reports the resolved level and reads the zone back.
 ///
-/// `"Volume adjusted"` is #221's other example of prose that states nothing. The
-/// envelope turns it into: accepted, on this zone, by this delta, and here is the
-/// level now.
+/// `"Volume set"` is #221's other example of prose that states nothing. The
+/// envelope turns it into: accepted, on this zone, at this level, with a zone
+/// snapshot attached.
+///
+/// # What this deliberately does not assert
+///
+/// It does not check `observed.zone.volume` against the level just set. LMS state
+/// reaches the aggregator by polling, so the snapshot may well predate the
+/// command — asserting the new level would be asserting the verification #395
+/// forbids inventing, and would make this test flaky the moment poll timing
+/// shifted. `as_of_ms` is there so the client draws that conclusion itself.
+///
+/// An earlier name for this test claimed "the resulting level", which the body
+/// never checked. That is the same mislabelled-coverage defect the design gate's
+/// dissent found elsewhere, so the name now says what the body does.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn lms_volume_write_reports_the_resolved_delta_and_the_resulting_level() {
+async fn lms_volume_write_reports_the_resolved_level_and_reads_the_zone_back() {
     let h = LmsHarness::start().await;
     let zone_id = h.zone_id();
 
@@ -3091,6 +3281,56 @@ async fn lms_volume_write_reports_the_resolved_delta_and_the_resulting_level() {
     );
 
     h.stop().await;
+}
+
+/// `params` reports what the server *resolved*, which means it drops a parameter
+/// the server discarded.
+///
+/// `hifi_search` on an LMS zone throws `source` away — globalsearch covers every
+/// installed provider, so there is nothing to apply it to. Echoing it back would
+/// claim UHC honored it. Omitting it is right, but silent, so it is pinned here:
+/// the omission is a decision a reader can find, not an accident. The Roon route
+/// reports the resolved source for the same reason in the opposite direction —
+/// an unrecognised `source` is quietly read as `library`, and reporting the
+/// resolution is the only way a client learns that.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn params_omits_a_parameter_the_server_discarded_and_reports_one_it_resolved() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    // LMS route: `source` sent, discarded, and therefore absent.
+    let result = app
+        .call_tool(
+            "hifi_search",
+            json!({ "query": "q", "zone_id": "lms:aa:bb:cc:dd:ee:ff", "source": "tidal" }),
+        )
+        .await;
+    let params = envelope(&result, "lms search")
+        .get("params")
+        .cloned()
+        .expect("params must be present");
+    assert!(
+        params.get("source").is_none(),
+        "LMS discards `source`; reporting it would claim the server honored it: {params}"
+    );
+
+    // Roon route: an unrecognised `source` silently becomes `library`, and the
+    // envelope says so.
+    let result = app
+        .call_tool(
+            "hifi_search",
+            json!({ "query": "q", "source": "spotify" }),
+        )
+        .await;
+    assert_eq!(
+        envelope(&result, "roon search")
+            .get("params")
+            .and_then(|p| p.get("source")),
+        Some(&json!("library")),
+        "an unrecognised source falls back to library, and the client must be able \
+         to see that happened"
+    );
 }
 
 /// A fully-populated multi-tool response survives the SSE framing.
