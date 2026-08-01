@@ -391,6 +391,40 @@ impl TestApp {
             .cloned()
             .unwrap_or_else(|| panic!("tools/call {name} returned no result: {response}"))
     }
+
+    /// `resources/list` against an initialized session. Returns the `result`
+    /// object.
+    async fn list_resources(&self) -> Value {
+        let (session_id, _) = self.initialize().await;
+        let (_, response) = self
+            .post(
+                Some(&session_id),
+                json!({ "jsonrpc": "2.0", "id": 20, "method": "resources/list", "params": {} }),
+            )
+            .await;
+        let response = response.expect("resources/list must return a JSON-RPC response");
+        response
+            .get("result")
+            .cloned()
+            .unwrap_or_else(|| panic!("resources/list returned no result: {response}"))
+    }
+
+    /// `resources/read` against an initialized session. Returns the full
+    /// JSON-RPC response (not just `result`), so a caller can inspect `error`
+    /// for the unknown/stale-uri cases without a separate code path.
+    async fn read_resource(&self, uri: &str) -> Value {
+        let (session_id, _) = self.initialize().await;
+        let (_, response) = self
+            .post(
+                Some(&session_id),
+                json!({
+                    "jsonrpc": "2.0", "id": 21, "method": "resources/read",
+                    "params": { "uri": uri }
+                }),
+            )
+            .await;
+        response.expect("resources/read must return a JSON-RPC response")
+    }
 }
 
 /// Extract the first `data:` payload from an SSE body, or parse the body as
@@ -626,14 +660,31 @@ fn declared_protocol_version_and_capabilities_are_pinned() {
     );
 
     // Capabilities gate request dispatch in the SDK, so the declared set decides
-    // which methods are reachable at all. #397 adds `resources`; #394 must not.
+    // which methods are reachable at all.
     assert!(
         details.capabilities.tools.is_some(),
         "tools capability must be declared"
     );
-    assert!(
-        details.capabilities.resources.is_none(),
-        "#394 must not declare a resources capability — that is #397's work"
+
+    // #397: `resources` is now declared, but only the sub-features actually
+    // implemented. `listChanged` is wired off the aggregator's own zone-discovery
+    // bus events (best-effort: undelivered with no open stream, since
+    // `event_store: None` gives no replay). `subscribe` is deliberately omitted —
+    // the SDK has no subscription registry and no replay, so advertising it would
+    // oblige honoring something this server cannot.
+    let resources = details
+        .capabilities
+        .resources
+        .as_ref()
+        .expect("#397 must declare a resources capability");
+    assert_eq!(
+        resources.list_changed,
+        Some(true),
+        "listChanged must be advertised: it is implemented"
+    );
+    assert_eq!(
+        resources.subscribe, None,
+        "subscribe must not be advertised: the SDK cannot honor it (no registry, no replay)"
     );
     assert!(
         details.capabilities.prompts.is_none(),
@@ -947,68 +998,131 @@ async fn get_and_delete_are_wired_and_session_aware() {
 // 4. Capabilities gate: what the server refuses today
 // =============================================================================
 
-/// `create_mcp_extension` declares only `tools`, and rust-mcp-sdk 0.8.3 gates
-/// request dispatch on the *declared* capability before any handler runs
-/// (`ServerCapabilities::can_handle_request`, which rejects all five resource
-/// methods when `resources.is_none()`). So the resource methods are not merely
-/// unimplemented — they return a concrete JSON-RPC error, and that error is part
-/// of today's surface.
+/// Before #397, `create_mcp_extension` declared only `tools`, and rust-mcp-sdk
+/// 0.8.3 gates request dispatch on the *declared* capability before any handler
+/// runs (`ServerCapabilities::can_handle_request`, which rejects all five
+/// resource methods when `resources.is_none()`). #397 declares `resources`, so
+/// the same three methods that used to be refused with a capability error now
+/// dispatch to real handlers.
 ///
-/// Pinned here so #397 shows up as a visible diff (refusal -> success) rather
-/// than as a silent change from one behavior to another. The SDK gate keys only
-/// on the *presence* of `resources`; it never inspects `subscribe` or
-/// `listChanged`.
-///
-/// This test records current behavior. It does not endorse it, and #394 must not
-/// declare a `resources` capability — that is #397's work.
+/// This is the visible diff #397's PR body calls out: refusal -> success, on the
+/// same three methods `tests/mcp_contract.rs` pinned in FOUNDATION (#394). The
+/// SDK gate keys only on the *presence* of `resources`; it never inspects
+/// `subscribe` or `listChanged`, which is why `resources/templates/list`
+/// dispatches too even though no template is ever advertised — see
+/// `crate::mcp::resources` for why live enumeration was chosen over templates.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn resource_methods_are_refused_while_only_tools_is_declared() {
+async fn resource_methods_dispatch_now_that_resources_is_declared() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
     let (session_id, init) = app.initialize().await;
 
-    // Precondition: the declared capability set contains tools and not resources.
+    // Precondition: the declared capability set contains both tools and
+    // resources.
     assert!(
         init.pointer("/capabilities/tools").is_some(),
         "tools capability must be declared: {init}"
     );
     assert!(
-        init.pointer("/capabilities/resources").is_none(),
-        "#394 must not declare a resources capability — that is #397's work: {init}"
+        init.pointer("/capabilities/resources").is_some(),
+        "#397 must declare a resources capability: {init}"
     );
 
-    for (id, method, params) in [
-        (10, "resources/list", json!({})),
-        (11, "resources/read", json!({ "uri": "hifi://zones" })),
-        (12, "resources/templates/list", json!({})),
-    ] {
-        let (_, response) = app
-            .post(
-                Some(&session_id),
-                json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-            )
-            .await;
-        let response =
-            response.unwrap_or_else(|| panic!("{method} must return a JSON-RPC response"));
+    let (_, list_response) = app
+        .post(
+            Some(&session_id),
+            json!({ "jsonrpc": "2.0", "id": 10, "method": "resources/list", "params": {} }),
+        )
+        .await;
+    let list_response =
+        list_response.expect("resources/list must return a JSON-RPC response");
+    assert!(
+        list_response.get("error").is_none(),
+        "resources/list must no longer be refused: {list_response}"
+    );
+    assert!(
+        list_response
+            .pointer("/result/resources")
+            .and_then(Value::as_array)
+            .is_some(),
+        "resources/list must return a resources array: {list_response}"
+    );
 
-        let error = response
-            .get("error")
-            .unwrap_or_else(|| panic!("{method} must be refused today, got: {response}"));
-        assert_eq!(
-            error.get("code").and_then(Value::as_i64),
-            Some(-32603),
-            "{method}: expected the capability gate's internal-error code, got {error}"
-        );
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(
-            message.contains("does not support resources"),
-            "{method}: the refusal must name the missing capability, got {message:?}"
-        );
-    }
+    let (_, read_response) = app
+        .post(
+            Some(&session_id),
+            json!({
+                "jsonrpc": "2.0", "id": 11, "method": "resources/read",
+                "params": { "uri": "hifi://zones" }
+            }),
+        )
+        .await;
+    let read_response = read_response.expect("resources/read must return a JSON-RPC response");
+    assert!(
+        read_response.get("error").is_none(),
+        "resources/read on a known uri must no longer be refused: {read_response}"
+    );
+    assert!(
+        read_response
+            .pointer("/result/contents")
+            .and_then(Value::as_array)
+            .is_some(),
+        "resources/read must return contents: {read_response}"
+    );
+
+    // No templates are advertised (#397 chose live enumeration over templates),
+    // so this returns an empty list rather than the SDK's generic refusal.
+    let (_, templates_response) = app
+        .post(
+            Some(&session_id),
+            json!({ "jsonrpc": "2.0", "id": 12, "method": "resources/templates/list", "params": {} }),
+        )
+        .await;
+    let templates_response =
+        templates_response.expect("resources/templates/list must return a JSON-RPC response");
+    assert_eq!(
+        templates_response.pointer("/result/resourceTemplates"),
+        Some(&json!([])),
+        "no resource templates are implemented, so this must be an empty list, not an \
+         error: {templates_response}"
+    );
+}
+
+/// `subscribe` is declared absent, and the SDK's own default handler (a plain
+/// `method_not_found`) is what actually answers a client that tries anyway —
+/// UHC does not claim to implement something the SDK cannot honor (no
+/// subscription registry, no replay).
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn resources_subscribe_is_not_advertised_and_not_implemented() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+    let (session_id, init) = app.initialize().await;
+
+    assert!(
+        init.pointer("/capabilities/resources/subscribe").is_none(),
+        "subscribe must not be advertised: {init}"
+    );
+
+    let (_, response) = app
+        .post(
+            Some(&session_id),
+            json!({
+                "jsonrpc": "2.0", "id": 13, "method": "resources/subscribe",
+                "params": { "uri": "hifi://zones" }
+            }),
+        )
+        .await;
+    let response = response.expect("resources/subscribe must return a JSON-RPC response");
+    let error = response
+        .get("error")
+        .unwrap_or_else(|| panic!("resources/subscribe must be refused, got: {response}"));
+    assert_eq!(
+        error.get("code").and_then(Value::as_i64),
+        Some(-32601),
+        "expected a plain method-not-found, not a capability-gate error: {error}"
+    );
 }
 
 // =============================================================================
@@ -4674,6 +4788,247 @@ async fn agents_md_capability_matrix_matches_the_derived_data() {
              produced the ❌ against OpenHome/UPnP volume that #398 was filed to correct.\n\n\
              Regenerate with UPDATE_AGENTS_MATRIX=1 cargo test --test mcp_contract agents_md\n\n\
              --- AGENTS.md has ---\n{current}\n--- the derived data renders ---\n{expected}"
+        );
+    }
+}
+
+// =============================================================================
+// 8. Resources (#397)
+// =============================================================================
+//
+// `resources/list` and `resources/read` project the same read-only state the
+// `read_only_hint` tools already expose, addressable by URI instead of by tool
+// call. The two hard requirements the tests below check: a resource's payload
+// can never disagree with its equivalent tool's (no second source of truth),
+// and a client can never get a panic or an empty success for a URI that does
+// not (or no longer) exists.
+
+/// The minimum resource set the issue's acceptance criteria name: all zones,
+/// bridge status, and — adapter enabled — the two HQPlayer resources. Per-zone
+/// now-playing resources are asserted live, separately, in
+/// `a_newly_discovered_zone_is_addressable_without_a_restart` and
+/// `now_playing_resource_agrees_with_hifi_now_playing_tool_for_a_live_zone`.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn resources_list_includes_the_minimum_set_when_hqplayer_enabled() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let result = app.list_resources().await;
+    let resources = result
+        .get("resources")
+        .and_then(Value::as_array)
+        .expect("resources/list result must contain a resources array");
+    let uris: Vec<&str> = resources
+        .iter()
+        .filter_map(|r| r.get("uri").and_then(Value::as_str))
+        .collect();
+
+    for expected in [
+        "hifi://zones",
+        "hifi://status",
+        "hifi://hqplayer/status",
+        "hifi://hqplayer/profiles",
+    ] {
+        assert!(
+            uris.contains(&expected),
+            "resources/list must include {expected}, got {uris:?}"
+        );
+    }
+}
+
+/// The HQPlayer-tool filter (`hqplayer_tools_filtered_when_adapter_disabled`)
+/// has a resource equivalent: the two HQPlayer resources must not be listed
+/// when the adapter is disabled in settings, and nothing else may change.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hqplayer_resources_are_absent_when_adapter_disabled() {
+    let _settings = SettingsFixture::with_hqplayer(false);
+    let app = TestApp::new().await;
+
+    let result = app.list_resources().await;
+    let resources = result
+        .get("resources")
+        .and_then(Value::as_array)
+        .expect("resources/list result must contain a resources array");
+    let uris: Vec<&str> = resources
+        .iter()
+        .filter_map(|r| r.get("uri").and_then(Value::as_str))
+        .collect();
+
+    assert_eq!(
+        uris,
+        vec!["hifi://zones", "hifi://status"],
+        "HQPlayer disabled must yield exactly the two non-HQPlayer resources, in order"
+    );
+}
+
+/// `hifi://zones` must carry exactly what `hifi_zones` returns for the same
+/// state — the tool/resource agreement the acceptance criteria require.
+/// Trivially true with no zones connected; the live-zone case is asserted in
+/// `now_playing_resource_agrees_with_hifi_now_playing_tool_for_a_live_zone`,
+/// which would fail if the two payloads were ever computed differently.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn zones_resource_agrees_with_hifi_zones_tool() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    let tool_text = result_text(&app.call_tool("hifi_zones", json!({})).await);
+    let tool_value: Value = serde_json::from_str(&tool_text).expect("hifi_zones must return JSON");
+
+    let read = app.read_resource("hifi://zones").await;
+    let resource_text = read
+        .pointer("/result/contents/0/text")
+        .and_then(Value::as_str)
+        .expect("hifi://zones must return text contents");
+    let resource_value: Value =
+        serde_json::from_str(resource_text).expect("hifi://zones contents must be JSON");
+
+    assert_eq!(
+        tool_value, resource_value,
+        "hifi://zones must carry exactly the hifi_zones tool's payload"
+    );
+}
+
+/// A live zone through a real mock LMS server and adapter — the strongest form
+/// of the tool/resource agreement test, because it fails if the resource path
+/// and the tool path ever compute the now-playing payload differently for a
+/// zone that actually has state (title, artist, album).
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn now_playing_resource_agrees_with_hifi_now_playing_tool_for_a_live_zone() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    let tool_text = result_text(
+        &h.app
+            .call_tool("hifi_now_playing", json!({ "zone_id": zone_id }))
+            .await,
+    );
+    let tool_value: Value =
+        serde_json::from_str(&tool_text).expect("hifi_now_playing must return JSON");
+    assert_eq!(
+        tool_value.get("title").and_then(Value::as_str),
+        Some("So What"),
+        "sanity: the mock's now-playing must reach the tool at all: {tool_value}"
+    );
+
+    let uri = format!("hifi://zones/{zone_id}");
+    let read = h.app.read_resource(&uri).await;
+    let resource_text = read
+        .pointer("/result/contents/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{uri} must return text contents: {read}"));
+    let resource_value: Value =
+        serde_json::from_str(resource_text).expect("resource contents must be JSON");
+
+    assert_eq!(
+        tool_value, resource_value,
+        "hifi://zones/{{zone_id}} must carry exactly the hifi_now_playing tool's payload"
+    );
+
+    h.stop().await;
+}
+
+/// The design's central claim: a zone discovered *after* a client's last
+/// `resources/list` is addressable on the very next call, with no restart,
+/// because per-zone resources are enumerated live from `ZoneAggregator` rather
+/// than fixed at startup or behind a resource template.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn a_newly_discovered_zone_is_addressable_without_a_restart() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let bus = create_bus();
+    let state = build_state_with_bus(bus.clone(), None).await;
+
+    let aggregator = state.aggregator.clone();
+    let aggregator_task = tokio::spawn(async move { aggregator.run().await });
+
+    let app = TestApp::with_state(state.clone());
+
+    let before = app.list_resources().await;
+    let before_uris: Vec<String> = before
+        .get("resources")
+        .and_then(Value::as_array)
+        .expect("resources array")
+        .iter()
+        .filter_map(|r| r.get("uri").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !before_uris.iter().any(|u| u.starts_with("hifi://zones/")),
+        "no zone-specific resource must exist before any zone is discovered: {before_uris:?}"
+    );
+
+    let zone_id = "roon:injected-zone".to_string();
+    bus.publish(unified_hifi_control::bus::BusEvent::ZoneDiscovered {
+        zone: unified_hifi_control::bus::Zone {
+            zone_id: zone_id.clone(),
+            zone_name: "Injected Zone".to_string(),
+            state: unified_hifi_control::bus::PlaybackState::Stopped,
+            volume_control: None,
+            now_playing: None,
+            source: "roon".to_string(),
+            is_controllable: true,
+            is_seekable: false,
+            last_updated: 0,
+            is_play_allowed: true,
+            is_pause_allowed: true,
+            is_next_allowed: true,
+            is_previous_allowed: true,
+        },
+    });
+
+    let mut found = false;
+    for _ in 0..100 {
+        if state.aggregator.get_zone(&zone_id).await.is_some() {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(found, "the injected zone never reached the aggregator");
+
+    let after = app.list_resources().await;
+    let after_uris: Vec<String> = after
+        .get("resources")
+        .and_then(Value::as_array)
+        .expect("resources array")
+        .iter()
+        .filter_map(|r| r.get("uri").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let expected_uri = format!("hifi://zones/{zone_id}");
+    assert!(
+        after_uris.contains(&expected_uri),
+        "the newly discovered zone must be addressable with no restart: {after_uris:?}"
+    );
+
+    aggregator_task.abort();
+}
+
+/// An unknown scheme, and a zone id the aggregator has never held, must both
+/// yield a proper JSON-RPC error — never a panic, and never an empty success a
+/// client could mistake for "this resource has no content".
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn unknown_or_stale_resource_uri_is_a_proper_error() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let app = TestApp::new().await;
+
+    for uri in ["hifi://nonsense", "hifi://zones/does-not-exist"] {
+        let response = app.read_resource(uri).await;
+        let error = response
+            .get("error")
+            .unwrap_or_else(|| panic!("{uri}: must be refused, got {response}"));
+        assert!(
+            error.get("code").and_then(Value::as_i64).is_some(),
+            "{uri}: error must carry a JSON-RPC code: {error}"
+        );
+        assert!(
+            response.get("result").is_none(),
+            "{uri}: must not also carry a result: {response}"
         );
     }
 }
