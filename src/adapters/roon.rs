@@ -386,14 +386,29 @@ enum ResultRouting {
 ///   not hold that id, UHC removed it - resolved already, or timed out and cleaned
 ///   up - and dropping the result is right.
 ///
-/// - **The session key is still checked**, because that counter restarts at 0 on
-///   every reconnect (fork `src/moo.rs:92`): a result arriving on a fresh
-///   connection can carry a request id that an older, not-yet-timed-out entry
-///   still occupies. On a mismatch the waiter is left alone and falls back to
-///   `BROWSE_TIMEOUT`, because resolving the wrong caller is worse than resolving
-///   them late. The pair is not a unique key and this narrows the reconnect window
-///   rather than closing it; #405's note on stamping entries with a connection
-///   generation applies here unchanged.
+/// - **The session key is still checked**, because request ids are unique only
+///   within one connection: every `Moo` starts its counter at 0 (fork
+///   `src/moo.rs:92`). On a mismatch the waiter is left alone and falls back to
+///   `BROWSE_TIMEOUT`, because being resolved with another caller's *success* is
+///   the worst outcome available here. Keep this check. It costs one string
+///   comparison and nothing near this code says request ids are only
+///   per-connection unique.
+///
+///   **What makes it reachable is not the reconnect story #405 attached to it.**
+///   That story - a stale entry still holding an id a fresh connection reissues -
+///   is hard to reach on this path: `CoreEvent::Lost` clears all three pending
+///   maps and drops the Browse service, `run_roon_loop` clears them again on the
+///   way out, and even if an entry survived, the colliding `insert` would
+///   overwrite it (resolving that caller promptly with "cancelled") so the map
+///   would hold the *new* request's key by the time a result arrived. The case
+///   that does not depend on a race is **more than one live connection**: the fork
+///   keeps its Moos in a `Vec` and will register with every Core that answers
+///   discovery, each with its own counter from 0, while UHC's `Registered` arm
+///   keeps only the last Core's Browse service. Two Cores on one LAN therefore
+///   means two overlapping id spaces on one channel. Not observed - recorded
+///   because it is the reason to keep the guard, and it is a better reason than
+///   the one it replaces. #405's suggestion of stamping entries with a connection
+///   generation would close it properly.
 ///
 /// Resolution is exactly-once: the entry is removed before the send, and every
 /// mutation of these maps happens synchronously under the one state `RwLock`, so a
@@ -1145,6 +1160,15 @@ impl RoonAdapter {
         let req_id = match req_id {
             Some(id) => {
                 let mut state = self.state.write().await;
+                // This `insert` overwrites any entry already holding `id`, dropping
+                // that caller's sender - which resolves it promptly with "Browse
+                // request cancelled" instead of leaving it to a 10s timeout. That
+                // needs two overlapping request-id spaces to happen at all (see
+                // `route_pending_result`), and the outcome is an improvement on what
+                // the evicted caller had, so it is left alone. Do not "fix" it by
+                // symmetry with `pending_images`, where the same shape is a real
+                // defect because there two callers collide whenever they want the
+                // same image key.
                 state
                     .pending_browses
                     .insert(id, (Some(session_key.clone()), tx));
