@@ -1713,26 +1713,43 @@ impl RoonAdapter {
         );
 
         let bare_zone_id = strip_roon_prefix(zone_id);
-
-        // A freshly-minted session's stack is always empty, so `pop_all` and
-        // "start from nothing" are equivalent here -- `false` changes nothing
-        // observable and keeps this call's own protocol trace identical to
-        // before this method was split out of `resolve_item_key`.
-        self.resolve_item_key(&session_key, item_key, bare_zone_id, action, false)
+        self.resolve_item_key(&session_key, item_key, bare_zone_id, action)
             .await
     }
 
     /// Resolve a `hifi_play_ref` (#396): play an item_key **inside the session
     /// that minted it**, rather than a fresh, unrelated one.
     ///
-    /// This is `play_item`'s exact resolution logic with one change:
-    /// `multi_session_key` is the caller-supplied minting session, and the
-    /// first browse sets `pop_all: true` to reset that session's stack to the
-    /// root before entering the item. That reset matters when a client holds
-    /// two refs minted by the same search (they share one `multi_session_key`,
-    /// see `search_with_session`): without it, resolving the second ref would
-    /// inherit wherever the first resolution's navigation left the stack,
-    /// rather than starting from the state the ref was actually minted in.
+    /// # `pop_all` was here, and it broke this against a real Core
+    ///
+    /// An earlier version of this method reset the shared session's browse
+    /// stack with `pop_all: true` before entering `item_key`, on the theory
+    /// (borrowed from `tests/mock_servers/roon_core.rs`'s model, which does
+    /// not actually enforce this) that two refs minted by one search sharing
+    /// one `multi_session_key` needed that reset to resolve independently.
+    /// Verified live against a real Core (nuc14, Roon 2.70) that this is
+    /// wrong on both counts:
+    ///
+    /// 1. **Combining `pop_all: true` with `item_key` in one browse request
+    ///    hangs** -- the Core never answers, and the caller waits out the
+    ///    full `BROWSE_TIMEOUT`. This is exactly the failure #396 shipped
+    ///    with and #401-adjacent live testing caught.
+    /// 2. **Sending them as two separate requests does not help**: `pop_all`
+    ///    invalidates every item_key minted at the levels it discards, so
+    ///    the *very key being resolved* becomes `InvalidItemKey` immediately
+    ///    after the reset.
+    /// 3. **The reset was solving a problem that does not exist.** Without
+    ///    any `pop_all`, resolving one ref from a search, navigating it all
+    ///    the way down to its action list, and then resolving a *second*,
+    ///    unrelated ref minted by the same search (sharing the same session
+    ///    key) still succeeds immediately -- verified live, twice, at
+    ///    different navigation depths. Item keys minted by one search
+    ///    remain independently resolvable regardless of where else that
+    ///    session has since navigated, as long as nothing pops it.
+    ///
+    /// So this is now `play_item`'s exact resolution logic, unchanged, with
+    /// only `multi_session_key` swapped for the caller-supplied minting
+    /// session instead of a fresh one.
     pub async fn play_ref(
         &self,
         item_key: &str,
@@ -1748,20 +1765,23 @@ impl RoonAdapter {
         }
 
         let bare_zone_id = strip_roon_prefix(zone_id);
-        self.resolve_item_key(multi_session_key, item_key, bare_zone_id, action, true)
+        self.resolve_item_key(multi_session_key, item_key, bare_zone_id, action)
             .await
     }
 
     /// Shared body of [`Self::play_item`] and [`Self::play_ref`]: browse into
     /// `item_key` within `session_key`, find (or navigate to) a playable
     /// action, and invoke it.
+    ///
+    /// Deliberately never sends `pop_all` -- see [`Self::play_ref`]'s doc
+    /// comment for why combining it with `item_key`, or even sequencing it
+    /// beforehand, breaks against a real Core.
     async fn resolve_item_key(
         &self,
         session_key: &str,
         item_key: &str,
         bare_zone_id: &str,
         action: PlayAction,
-        pop_all: bool,
     ) -> Result<String> {
         let session_key = session_key.to_string();
         let bare_zone_id = bare_zone_id.to_string();
@@ -1770,7 +1790,6 @@ impl RoonAdapter {
             multi_session_key: Some(session_key.clone()),
             item_key: Some(item_key.to_string()),
             zone_or_output_id: Some(bare_zone_id.clone()),
-            pop_all,
             ..Default::default()
         })
         .await?;

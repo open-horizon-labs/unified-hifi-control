@@ -540,14 +540,19 @@ pub async fn handle_play_ref(
     let target = ZoneTarget::classify(&args.zone_id);
     let route = target.for_library();
 
-    // `operation` starts as whatever was requested (unvalidated) so an early
-    // refusal -- before the ref is even resolved, and so before either
-    // provider's accepted action set applies -- still reports something
-    // meaningful. `play_ref_roon`/`play_ref_lms` overwrite it with the
-    // validated, provider-specific action once one is known, matching
-    // `hifi_play`'s own convention (`roon_action_name`/`lms_action_name`).
-    let requested_action = args.action.as_deref().unwrap_or("play");
-    let mut env = Envelope::write("hifi_play_ref", requested_action)
+    // `operation` starts as the constant `"play_ref"` -- matching
+    // `hifi_play`'s own zone-refused path (`Envelope::write("hifi_play",
+    // "play")`, unconditionally, never `args.action`) -- because at this
+    // point `action` has not been validated against either provider's
+    // accepted set, so echoing it verbatim would let unvalidated client
+    // input (garbage, or a value that's valid for the *other* provider) flow
+    // straight into a field clients are told to branch on. `play_ref_roon`/
+    // `play_ref_lms` overwrite it once an action is actually known: the
+    // validated name on success (matching `hifi_play`'s
+    // `roon_action_name`/`lms_action_name` convention), or the normalized
+    // sentinel `"invalid_action"` on refusal (matching `hifi_control`'s
+    // `unknown_action` convention, `src/mcp/tools/transport.rs`).
+    let mut env = Envelope::write("hifi_play_ref", "play_ref")
         .param("ref", &*args.r#ref)
         .param("zone_id", &*args.zone_id)
         .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
@@ -629,7 +634,7 @@ pub async fn handle_play_ref(
 
 async fn play_ref_roon(
     state: &AppState,
-    env: Envelope,
+    mut env: Envelope,
     args: &HifiPlayRefTool,
     target: RoonRefTarget,
     _title: String,
@@ -643,6 +648,13 @@ async fn play_ref_roon(
                 Refusal::InvalidParameter { detail, .. } => detail.clone(),
                 _ => String::new(),
             };
+            // A normalized sentinel, not an echo of the raw (unrecognised)
+            // request -- matching `hifi_control`'s own `unknown_action`
+            // convention for the same class of refusal
+            // (`src/mcp/tools/transport.rs`). A client branching on
+            // `operation` must never see arbitrary client input reflected
+            // back as if it were a real value.
+            env.operation = "invalid_action".to_string();
             return env.refused(detail, refusal);
         }
     };
@@ -671,7 +683,7 @@ async fn play_ref_roon(
 
 async fn play_ref_lms(
     state: &AppState,
-    env: Envelope,
+    mut env: Envelope,
     args: &HifiPlayRefTool,
     target: crate::adapters::lms::LmsPlayTarget,
     title: String,
@@ -685,6 +697,9 @@ async fn play_ref_lms(
                 Refusal::InvalidParameter { detail, .. } => detail.clone(),
                 _ => String::new(),
             };
+            // See play_ref_roon's identical comment: a normalized sentinel,
+            // matching hifi_control's `unknown_action` convention.
+            env.operation = "invalid_action".to_string();
             return env.refused(detail, refusal);
         }
     };

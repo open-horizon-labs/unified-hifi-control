@@ -381,6 +381,60 @@ async fn two_refs_from_one_search_each_resolve_independently() {
     core.stop().await;
 }
 
+/// **Live-rig regression** (#396 ship-gate re-review): an earlier version of
+/// `RoonAdapter::play_ref` reset the minting session's browse stack with
+/// `pop_all: true` before entering the ref's `item_key`, in the same browse
+/// request. That hangs against a real Core (verified live: nuc14, Roon 2.70)
+/// -- the Core never answers, and the caller waits out the full
+/// `BROWSE_TIMEOUT`. `hifi_search` worked, `hifi_play_ref` on the very same
+/// zone and query did not; the two paths' Roon calls had to be diffed to find
+/// where they diverged, which is exactly what this test pins so it cannot
+/// happen silently again.
+///
+/// This asserts the *structural* claim directly, independent of timing:
+/// `play_ref` must never send a browse request combining `pop_all: true` with
+/// a present `item_key`. `FakeRoonCore` answers that combination with a fast,
+/// loud `InvalidItemKey` (see `tests/mock_servers/roon_core.rs::handle_browse`)
+/// rather than reproducing the real hang, precisely so a regression here
+/// fails in milliseconds, not after a real 10-second timeout.
+#[tokio::test]
+async fn play_ref_never_combines_pop_all_with_an_item_key() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let search = handle_search(&state, search_args("kind of blue")).await;
+    let ref_token = search_results_of(&search)[0]
+        .get("ref")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let started = Instant::now();
+    let played = handle_play_ref(&state, play_ref_args(&ref_token, "roon:zone_fake_1", None)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "resolution must be fast; a regression to the pop_all+item_key combination \
+         degrades to a ~10s BROWSE_TIMEOUT wait even against the fake"
+    );
+    assert_eq!(
+        outcome_of(&played),
+        "accepted",
+        "text was: {}",
+        text_of(&played)
+    );
+
+    assert!(
+        core.illegal_pop_all_with_item_key_attempts()
+            .await
+            .is_empty(),
+        "play_ref must never combine pop_all:true with a present item_key in one \
+         browse request -- this hangs against a real Roon Core"
+    );
+
+    core.stop().await;
+}
+
 /// `action=queue` reaches Queue, not Play Now -- proving the action parameter
 /// actually threads through `play_ref`, not just the default.
 #[tokio::test]
@@ -452,6 +506,13 @@ async fn roon_play_ref_refuses_next_instead_of_silently_defaulting() {
         refusal_reason_of(&played).as_deref(),
         Some("invalid_parameter")
     );
+    // `operation` must be a normalized sentinel, not an echo of the raw
+    // (invalid) request -- matching hifi_control's own `unknown_action`
+    // convention (src/mcp/tools/transport.rs) for the same class of refusal.
+    // A client branching on `operation` should never see arbitrary,
+    // unvalidated client input reflected back as if it were a recognized
+    // value.
+    assert_eq!(operation_of(&played), "invalid_action");
     // And nothing new was invoked on the Core -- the refusal happened before
     // dispatch, not after a failed attempt.
     assert_eq!(
@@ -499,6 +560,10 @@ async fn a_roon_ref_used_against_an_lms_zone_is_refused() {
         refusal_reason_of(&played).as_deref(),
         Some("invalid_parameter")
     );
+    // Cross-provider mismatch is caught before either provider's action set
+    // is even consulted, so `operation` is the tool-shaped constant, not a
+    // half-validated action name from either side.
+    assert_eq!(operation_of(&played), "play_ref");
     let text = text_of(&played);
     assert!(text.to_lowercase().contains("roon"), "got {text:?}");
     assert!(text.to_lowercase().contains("lms"), "got {text:?}");
@@ -542,6 +607,9 @@ async fn an_unknown_ref_is_refused_and_names_hifi_search_as_the_recovery() {
         refusal_reason_of(&played).as_deref(),
         Some("unknown_target")
     );
+    // An unresolvable ref means no provider action set was ever consulted,
+    // so `operation` stays the tool-shaped constant.
+    assert_eq!(operation_of(&played), "play_ref");
     let structured = structured_of(&played);
     let discover_with = structured
         .get("refusal")
