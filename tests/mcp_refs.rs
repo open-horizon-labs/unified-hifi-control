@@ -721,6 +721,83 @@ async fn lms_stale_library_ref_is_refused_without_mutating_the_queue() {
     lms_stop(&state).await;
 }
 
+/// **The dissent's own finding, checked empirically rather than left as a
+/// hypothesis.** `assert_library_id_exists` re-validates a `Library` ref by
+/// searching the *title captured at mint time* and checking whether the
+/// target id appears among the (at most 50) results that search returns. If
+/// many albums share the exact same title -- a box set re-release, a
+/// self-titled album by different artists, a generic "Live" -- and the
+/// target is not among the first 50 the mock (or a real server) happens to
+/// return, does a genuinely still-valid id get wrongly refused?
+///
+/// This seeds 60 albums sharing one identical title ("Common Album", more
+/// than `search_library`'s hardcoded limit of 50) with distinct artists, and
+/// mints a ref for the 60th one specifically -- disambiguated at mint time by
+/// artist, which the mock's search also matches on -- so it lands last in the
+/// mock's insertion-order-preserving results and therefore *outside* a
+/// `skip(0).take(50)` window keyed only on the shared title. If this test
+/// fails, the dissent's D1 finding is confirmed as a real, shipped bug and
+/// `assert_library_id_exists` needs a wider limit (or a different query
+/// shape, e.g. a combined title+id filter) before this is safe to rely on
+/// for large libraries. If it passes, the current limit was enough for this
+/// specific shape and the risk is bounded to libraries with more than 50
+/// exact-title-duplicates -- worth knowing either way, not merely asserting.
+#[tokio::test]
+async fn lms_a_valid_ref_beyond_the_validation_search_limit_still_resolves() {
+    let mock = MockLmsServer::start().await;
+    mock.add_player(LMS_PLAYER, "Living Room").await;
+
+    let mut albums: Vec<(i64, String, String)> = Vec::new();
+    for i in 1..=60i64 {
+        albums.push((100 + i, "Common Album".to_string(), format!("Artist {i}")));
+    }
+    let albums_ref: Vec<(i64, &str, &str)> = albums
+        .iter()
+        .map(|(id, t, a)| (*id, t.as_str(), a.as_str()))
+        .collect();
+    mock.set_library_albums(albums_ref).await;
+
+    let lms = connected_lms(&mock).await;
+    let state = app_state_with_lms(lms).await;
+    let zone_id = format!("lms:{LMS_PLAYER}");
+
+    // Mint a ref for the 60th album specifically, disambiguated by artist --
+    // its title alone ("Common Album") matches all 60.
+    let search = handle_search(
+        &state,
+        HifiSearchTool {
+            query: "Artist 60".to_string(),
+            zone_id: Some(zone_id.clone()),
+            source: None,
+        },
+    )
+    .await;
+    let results = search_results_of(&search);
+    assert_eq!(
+        results.len(),
+        1,
+        "expected an exact artist match, got {results:?}"
+    );
+    let ref_token = results[0]
+        .get("ref")
+        .and_then(Value::as_str)
+        .expect("ref")
+        .to_string();
+
+    let played = handle_play_ref(&state, play_ref_args(&ref_token, &zone_id, None)).await;
+    assert_eq!(
+        outcome_of(&played),
+        "accepted",
+        "a still-valid id must not be refused merely because a broader re-validation \
+         search (by its shared title) would not have surfaced it within its own limit; \
+         text was: {}",
+        text_of(&played)
+    );
+
+    mock.stop().await;
+    lms_stop(&state).await;
+}
+
 async fn lms_stop(state: &AppState) {
     state.lms.stop().await;
 }

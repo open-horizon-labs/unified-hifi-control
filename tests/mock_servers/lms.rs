@@ -408,10 +408,23 @@ async fn handle_jsonrpc(
         // #396: this is what lets an MCP-level test mint a durable `Library`
         // ref without needing a full #417 globalsearch fix.
         "search" => {
+            // `["search", offset, count, "term:<query>"]` -- offset/count are
+            // real LMS pagination params, honored here (not merely accepted
+            // and ignored) so a test can prove what happens when more than
+            // `count` items match a term, the same as a real server would
+            // truncate. See #396's dissent: `assert_library_id_exists`
+            // re-searches by title with a fixed count, so whether matches
+            // beyond that count are reachable is exactly what this models.
+            let offset = commands.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
+            let count = commands
+                .get(2)
+                .and_then(Value::as_u64)
+                .map(|c| c as usize)
+                .unwrap_or(usize::MAX);
             let query = filter_value(commands, "term")
                 .unwrap_or_default()
                 .to_lowercase();
-            let albums_loop: Vec<Value> = state
+            let matches: Vec<&MockLibraryItem> = state
                 .library
                 .get("album")
                 .into_iter()
@@ -420,6 +433,11 @@ async fn handle_jsonrpc(
                     item.title.to_lowercase().contains(&query)
                         || item.artist.to_lowercase().contains(&query)
                 })
+                .collect();
+            let page: Vec<Value> = matches
+                .into_iter()
+                .skip(offset)
+                .take(count)
                 .map(|item| {
                     json!({
                         "album_id": item.id,
@@ -428,10 +446,10 @@ async fn handle_jsonrpc(
                     })
                 })
                 .collect();
-            if albums_loop.is_empty() {
+            if page.is_empty() {
                 json!({})
             } else {
-                json!({ "albums_loop": albums_loop })
+                json!({ "albums_loop": page })
             }
         }
         // The existence check `LmsAdapter::assert_library_id_exists` (#396)

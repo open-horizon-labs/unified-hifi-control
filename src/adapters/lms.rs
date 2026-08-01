@@ -226,6 +226,17 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
 /// Multiplier for poll interval when subscription is active (15x base interval)
 const SUBSCRIPTION_INTERVAL_MULTIPLIER: u64 = 15;
 
+/// How many results [`LmsAdapter::assert_library_id_exists`] (#396) requests
+/// when re-validating a `Library` ref by its mint-time title.
+///
+/// Sized well above any plausible count of library entries sharing one exact
+/// title, so the search-by-title re-validation actually surfaces the target
+/// id rather than missing it purely because too many other entries share the
+/// same title. See that method's own doc comment for why this number exists
+/// at all, and `tests/mcp_refs.rs::lms_a_valid_ref_beyond_the_validation_search_limit_still_resolves`
+/// for the test that found the original value (50) was not generous enough.
+const LIBRARY_VALIDATION_SEARCH_LIMIT: usize = 500;
+
 /// Get the poll interval from LMS_POLL_INTERVAL env var, or use default
 fn get_poll_interval() -> Duration {
     std::env::var("LMS_POLL_INTERVAL")
@@ -1689,7 +1700,10 @@ impl LmsAdapter {
             )
         })?;
 
-        self.play_target(&target, player_id, action).await?;
+        // No validation: `target` was just produced by the search a few
+        // lines up, in this same call -- there is no time gap for the id to
+        // have gone stale in, unlike a ref resolved later.
+        self.play_target(&target, player_id, action, None).await?;
 
         // Build response message
         let action_verb = match action {
@@ -1738,24 +1752,33 @@ impl LmsAdapter {
     ///
     /// # Validate before mutate
     ///
-    /// A stale [`LmsPlayTarget::Library`] id is checked against the live
-    /// database *before* the mutating command runs, because
-    /// `playlistcontrol cmd:load` with an id that no longer exists clears the
-    /// queue and *then* fails — a wipe reported as a failure is still a wipe.
+    /// A [`LmsPlayTarget::Library`] id is checked against the live database
+    /// *before* the mutating command runs whenever `validate_title` is
+    /// `Some` — because `playlistcontrol cmd:load` with an id that no longer
+    /// exists clears the queue and *then* fails, and a wipe reported as a
+    /// failure is still a wipe. Pass `Some(title)` (the title captured when
+    /// the target was found — a ref's mint-time title, in `hifi_play_ref`'s
+    /// case) for any caller resolving a target across a time gap; pass
+    /// `None` when the target was *just* produced by a search this same call
+    /// made (`search_and_play`'s own path), where there is no gap for the id
+    /// to have gone stale in and the validation would be pure overhead on
+    /// every ordinary play.
     ///
-    /// **`Url` targets are not pre-validated.** LMS exposes no cheap existence
-    /// check for an arbitrary streaming or plugin URL, and `playlist load
-    /// <bad-url>` returns a normal `{}` while emptying the queue regardless of
-    /// whether it is checked first. This is a known, stated gap, not a
-    /// silently-accepted one — see the issue for why ref minting still
-    /// prefers `Url` over [`LmsPlayTarget::GlobalSearchItem`] in spite of it:
-    /// an unresolvable URL is at least a real failure mode, where a positional
-    /// breadcrumb is a *silent* one.
+    /// **`Url` targets are not pre-validated**, `validate_title` or not. LMS
+    /// exposes no cheap existence check for an arbitrary streaming or plugin
+    /// URL, and `playlist load <bad-url>` returns a normal `{}` while
+    /// emptying the queue regardless of whether it is checked first. This is
+    /// a known, stated gap, not a silently-accepted one — see the issue for
+    /// why ref minting still prefers `Url` over
+    /// [`LmsPlayTarget::GlobalSearchItem`] in spite of it: an unresolvable
+    /// URL is at least a real failure mode, where a positional breadcrumb is
+    /// a *silent* one.
     pub async fn play_target(
         &self,
         target: &LmsPlayTarget,
         player_id: &str,
         action: LmsPlayAction,
+        validate_title: Option<&str>,
     ) -> Result<()> {
         let player_id = strip_lms_prefix(player_id);
 
@@ -1795,7 +1818,9 @@ impl LmsAdapter {
                     .await?;
             }
             LmsPlayTarget::Library { kind, id } => {
-                self.assert_library_id_exists(player_id, *kind, *id).await?;
+                if let Some(title) = validate_title {
+                    self.assert_library_id_exists(*kind, *id, title).await?;
+                }
 
                 let id_param = match kind {
                     LmsSearchResultType::Album => format!("album_id:{}", id),
@@ -1819,46 +1844,80 @@ impl LmsAdapter {
     /// Confirm a [`LmsPlayTarget::Library`] id still exists before a mutating
     /// `playlistcontrol` call touches the queue.
     ///
-    /// Uses the dedicated taggedlist query for `kind` (`albums`/`artists`/
-    /// `titles`), filtered by the same `<kind>_id` tag that query's own result
-    /// rows are keyed by (`album_id`, `artist_id`, `track_id`) — the shape
-    /// LMS's published CLI reference documents for these three queries.
-    /// **Unverified against a live server**: this repo has already found one
-    /// LMS CLI naming surprise 9.1.2 disagreed with the published docs on
-    /// (`contributors_loop[].contributor_id`, not `artist_id` — see
-    /// `search_library`'s doc comment), so treat this filter's exact tag name
-    /// with the same caution until it is checked against a real instance.
+    /// # Why this reuses `search_library` rather than a dedicated query
+    ///
+    /// An earlier version of this method queried the dedicated taggedlist
+    /// command for `kind` (`albums`/`artists`/`titles`), filtered by
+    /// `<kind>_id`, and treated `count >= 1` as "exists". That shape is
+    /// unverified against a live server, and unverified is not merely
+    /// "untested" here: if LMS ignores an unrecognised filter tag rather than
+    /// erroring on it — this repo has already observed LMS silently ignoring
+    /// unrecognised tagged parameters elsewhere, see the `mute` pref comment
+    /// in `get_players` — the query would return the *unfiltered* count of
+    /// every album/artist/track on the server, which is essentially always
+    /// `>= 1`. That is a **fail-open** bug: validation would always report
+    /// "exists" regardless of the actual id, silently defeating the entire
+    /// point of validating before a mutating call. A wrong filter name would
+    /// have made this method worse than not having it.
+    ///
+    /// This version instead reuses [`Self::search_library`] — parsing already
+    /// verified against a recorded live Lyrion 9.1.2 response (#407,
+    /// `tests/fixtures/lms/`) — searching by the title captured when the
+    /// target was found, and checking whether any returned entity of the
+    /// right kind has the target id. A wrong assumption here fails **closed**
+    /// instead: if the title no longer matches anything (or the entity is
+    /// gone), no result carries the target id, and this refuses exactly as it
+    /// should. The trade a wrong assumption could still make is a false
+    /// negative — refusing a still-valid id because the title changed since
+    /// mint time — which is the safe direction to be wrong in.
+    ///
+    /// # A second false-negative source, found and closed during review
+    ///
+    /// Searching by title only surfaces a *bounded* number of matches
+    /// ([`LIBRARY_VALIDATION_SEARCH_LIMIT`]). If more entries than that share
+    /// the exact title captured at mint time (a box set re-release, a
+    /// self-titled album by different artists, a generic "Live"), a
+    /// still-valid id outside that window is wrongly refused —
+    /// `tests/mcp_refs.rs::lms_a_valid_ref_beyond_the_validation_search_limit_still_resolves`
+    /// reproduces this directly (it failed against the original limit of 50
+    /// before this constant was raised). The limit is generous enough that a
+    /// real collision is implausible, but "implausible" is not "impossible";
+    /// this is a known, bounded, fail-*closed* residual risk, not a claim
+    /// that no library can ever trigger it.
+    ///
+    /// # This is not free, and that cost is unmeasured
+    ///
+    /// This method runs unconditionally before every `hifi_play_ref`
+    /// resolution of a `Library` target (`play_target` passes
+    /// `validate_title: Some` for that path) — a full-text `search` over up
+    /// to [`LIBRARY_VALIDATION_SEARCH_LIMIT`] rows, on every such call, not
+    /// only when a ref is actually stale. That is a real latency cost on top
+    /// of the eventual `playlistcontrol` call, and this project ships to
+    /// NAS- and SBC-class hardware (see the Synology/QNAP build targets in
+    /// CI) where a large-library full-text search is not necessarily cheap.
+    /// No benchmark exists for this yet; if `hifi_play_ref` on LMS turns out
+    /// noticeably slower than `hifi_play`'s own query path, this method is
+    /// the place to look first.
     async fn assert_library_id_exists(
         &self,
-        player_id: &str,
         kind: LmsSearchResultType,
         id: i64,
+        title: &str,
     ) -> Result<()> {
-        let (query, id_tag) = match kind {
-            LmsSearchResultType::Album => ("albums", "album_id"),
-            LmsSearchResultType::Artist => ("artists", "artist_id"),
-            LmsSearchResultType::Track => ("titles", "track_id"),
-        };
-        let result = self
-            .rpc
-            .execute(
-                Some(player_id),
-                vec![
-                    json!(query),
-                    json!(0),
-                    json!(1),
-                    json!(format!("{}:{}", id_tag, id)),
-                ],
-            )
+        let candidates = self
+            .search_library(title, LIBRARY_VALIDATION_SEARCH_LIMIT)
             .await?;
-        let count = result.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-        if count < 1 {
+        let exists = candidates
+            .iter()
+            .any(|c| c.result_type == kind && c.id == id);
+        if !exists {
             anyhow::bail!(
-                "{} id {} no longer exists in the LMS library (rescanned since this ref \
-                 was minted?); refusing rather than issuing playlistcontrol, which would \
-                 clear the queue and then fail",
+                "{} id {} (title {:?}) no longer exists in the LMS library (rescanned \
+                 since this ref was minted, or renamed?); refusing rather than issuing \
+                 playlistcontrol, which would clear the queue and then fail",
                 kind,
-                id
+                id,
+                title
             );
         }
         Ok(())

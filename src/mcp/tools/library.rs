@@ -692,7 +692,16 @@ async fn play_ref_lms(
     env.operation = action_name.to_string();
     let action = LmsPlayAction::parse(Some(action_name));
 
-    match state.lms.play_target(&target, &args.zone_id, action).await {
+    // `Some(&title)`: this target was resolved from a ref minted earlier in
+    // a possibly-different conversation turn, so it is validated against the
+    // live library before the mutating command runs (`LmsAdapter::play_target`'s
+    // own docs explain why, and why it is keyed off `title` rather than a
+    // dedicated existence query).
+    match state
+        .lms
+        .play_target(&target, &args.zone_id, action, Some(&title))
+        .await
+    {
         Ok(()) => {
             let action_verb = match action {
                 LmsPlayAction::Play => "Playing",
