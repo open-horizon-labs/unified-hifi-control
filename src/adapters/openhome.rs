@@ -1075,3 +1075,70 @@ impl AdapterLogic for OpenHomeAdapter {
 
 // Startable trait implementation via macro
 crate::impl_startable!(OpenHomeAdapter, "openhome");
+
+#[cfg(test)]
+mod didl_pin_tests {
+    use super::*;
+
+    /// A realistic DIDL-Lite payload as a renderer returns it, with attributes
+    /// on the tags that carry them in practice.
+    const REAL_DIDL: &str = r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><item id="1" parentID="0" restricted="1"><dc:title>Hoppipolla</dc:title><upnp:artist>Sigur Ros</upnp:artist><upnp:album>Takk...</upnp:album><upnp:genre>Post-rock</upnp:genre><upnp:albumArtURI dlna:profileID="JPEG_TN">http://10.0.0.5/art/42.jpg</upnp:albumArtURI></item></DIDL-Lite>"#;
+
+    /// The same payload with a bare albumArtURI tag (no attributes).
+    const BARE_DIDL: &str = r#"<DIDL-Lite><item><dc:title>Hoppipolla</dc:title><upnp:artist>Sigur Ros</upnp:artist><upnp:album>Takk...</upnp:album><upnp:albumArtURI>http://10.0.0.5/art/42.jpg</upnp:albumArtURI></item></DIDL-Lite>"#;
+
+    #[test]
+    fn html_decode_unescapes_in_the_right_order() {
+        // &amp; must be replaced last, or "&amp;lt;" would wrongly become "<".
+        assert_eq!(html_decode("&lt;a&gt;"), "<a>");
+        assert_eq!(html_decode("Simon &amp; Garfunkel"), "Simon & Garfunkel");
+        assert_eq!(html_decode("&amp;lt;"), "&lt;");
+        assert_eq!(html_decode("&quot;x&quot; &apos;y&apos;"), "\"x\" 'y'");
+    }
+
+    #[test]
+    fn parse_didl_lite_reads_bare_tags() {
+        let t = OpenHomeAdapter::parse_didl_lite(BARE_DIDL).expect("returns Some");
+        assert_eq!(t.title, "Hoppipolla");
+        assert_eq!(t.artist, "Sigur Ros");
+        assert_eq!(t.album, "Takk...");
+        assert_eq!(
+            t.album_art_uri.as_deref(),
+            Some("http://10.0.0.5/art/42.jpg")
+        );
+    }
+
+    #[test]
+    fn parse_didl_lite_never_returns_none_even_for_garbage() {
+        // Pinning current behavior: every field defaults rather than failing.
+        let t = OpenHomeAdapter::parse_didl_lite("not xml at all").expect("returns Some");
+        assert_eq!(t.title, "");
+        assert_eq!(t.artist, "");
+        assert_eq!(t.album, "");
+        assert!(t.album_art_uri.is_none());
+    }
+
+    #[test]
+    fn parse_didl_lite_falls_back_to_dc_creator_and_plain_title() {
+        let xml = r#"<item><title>Bare Title</title><dc:creator>Fallback Artist</dc:creator></item>"#;
+        let t = OpenHomeAdapter::parse_didl_lite(xml).expect("returns Some");
+        assert_eq!(t.title, "Bare Title");
+        assert_eq!(t.artist, "Fallback Artist");
+    }
+
+    /// The limitation this test documents is why UPnP/OpenHome art can silently
+    /// go missing on real devices: the extractor matches a literal `<tag>`, so a
+    /// tag carrying attributes is invisible to it.
+    #[test]
+    fn parse_didl_lite_misses_tags_that_carry_attributes() {
+        let t = OpenHomeAdapter::parse_didl_lite(REAL_DIDL).expect("returns Some");
+        // Attribute-free tags are found...
+        assert_eq!(t.title, "Hoppipolla");
+        assert_eq!(t.artist, "Sigur Ros");
+        // ...but albumArtURI carries dlna:profileID and is therefore missed.
+        assert_eq!(
+            t.album_art_uri, None,
+            "documents current behavior: attribute-bearing tags are not matched"
+        );
+    }
+}
