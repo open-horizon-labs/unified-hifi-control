@@ -338,6 +338,14 @@ live verification needs either this rig's daemon-side fault fixed, or a differen
 **Status:** artifact built and smoke-tested; **not published** — awaiting explicit maintainer
 approval per #350's own hard constraint · **Updated:** 2026-07-31
 
+> **Provenance below is stale — the artifact must be rebuilt before Beta A can be re-qualified.**
+> The Opus stacked review (see [`hqplayer-stack-opus-review.md`](hqplayer-stack-opus-review.md))
+> landed a fix on the base branch (`71c02a6`, PR #391) and two on this one, and this branch was then
+> rebased. Both the source SHA and the base SHA in the table are pre-review, so the recorded SHA-256
+> no longer identifies the code here. Nothing was published, so this is a rebuild rather than a
+> withdrawal: re-run the build and the smoke test, then replace the rows below. The install/run and
+> rollback instructions further down are unaffected.
+
 ### Provenance
 
 | Field | Value |
