@@ -2893,11 +2893,11 @@ impl HqpAdapter {
                         .lock()
                         .await
                         .on_failure(tokio::time::Instant::now());
-                    // A handshake failure already leaves a clean disconnected session. A failure
-                    // after reachability normally passes through send_command/mark_disconnected;
-                    // this closes any remaining partially-used socket without publishing a false
-                    // disconnect edge for a session that never became reachable.
-                    self.disconnect().await;
+                    // A managed observation failure is recoverable. Clear any remaining
+                    // partially-used socket, but do not remove the configured direct zone while
+                    // this same worker is about to retry it. Final shutdown and explicit instance
+                    // removal still use `disconnect`, which publishes ZoneRemoved.
+                    self.mark_disconnected().await;
                     delay
                 }
             };
@@ -3606,7 +3606,7 @@ impl HqpAdapter {
 
     /// Mark connection as broken (called on communication errors)
     async fn mark_disconnected(&self) {
-        let (was_connected, host, instance_name) = {
+        let (was_connected, host) = {
             let mut state = self.state.write().await;
             let was_connected = state.connected;
             state.connected = false;
@@ -3614,11 +3614,7 @@ impl HqpAdapter {
             state.last_state = None;
             state.volume_range = None;
             Self::clear_chain_cache(&mut state);
-            (
-                was_connected,
-                state.host.clone(),
-                state.instance_name.clone(),
-            )
+            (was_connected, state.host.clone())
         };
         {
             let mut conn = self.connection.lock().await;
@@ -3635,9 +3631,10 @@ impl HqpAdapter {
                 return;
             };
             tracing::warn!("HQPlayer connection lost to {}", h);
-            // Emit ZoneRemoved for this HQPlayer instance
-            let zone_id = PrefixedZoneId::hqplayer(instance_name.as_deref().unwrap_or(h));
-            self.bus.publish(BusEvent::ZoneRemoved { zone_id });
+            // A broken native conversation is recoverable lifecycle state, not removal of the
+            // configured instance. Keep the last direct-zone observation in the aggregator while
+            // reconnecting so ordinary knob/web clients do not lose their selected zone. Explicit
+            // disconnect/reconfigure/instance removal still publishes ZoneRemoved in `disconnect`.
             self.bus
                 .publish(BusEvent::HqpDisconnected { host: h.clone() });
         }
@@ -4712,6 +4709,19 @@ impl HqpAdapter {
         }))
     }
 
+    async fn get_junk_filters_with_generation(&self) -> Result<(Vec<ListItem>, u64)> {
+        let xml = Self::build_request("GetJunkFilters", &[]);
+        let (response, generation) = self.send_command_with_generation(&xml).await?;
+        Ok((
+            Self::parse_items(&response, "JunkFiltersItem", |item| ListItem {
+                index: Self::parse_attr_u32(item, "index"),
+                name: Self::parse_attr(item, "name").unwrap_or_default(),
+                value: Self::parse_attr_i32(item, "value"),
+            }),
+            generation,
+        ))
+    }
+
     /// Get available sample rates
     pub async fn get_rates(&self) -> Result<Vec<RateItem>> {
         let xml = Self::build_request("GetRates", &[]);
@@ -4866,6 +4876,19 @@ impl HqpAdapter {
         resolve: Self::resolve_rate,
         selected: |s| SemanticSelection::Position(s.rate),
         describe: Self::rate_at,
+    };
+
+    /// The 20 kHz/junk-filter family. Unlike filters and shapers this enumeration is not
+    /// chain-relative, but it is still an index domain and therefore needs the same semantic
+    /// name-to-position proof before and after a write.
+    const JUNK_FILTER: SemanticFamily<ListItem, str> = SemanticFamily {
+        what: "junk filter",
+        paired: false,
+        refuses_source_mode: false,
+        fingerprint: Self::list_fingerprint,
+        resolve: Self::resolve_junk_filter,
+        selected: |s| SemanticSelection::Position(s.filter_junk),
+        describe: Self::list_name_at,
     };
 
     /// **Run a semantic setter and prove the semantic value, not the position it travelled as.**
@@ -5660,6 +5683,116 @@ impl HqpAdapter {
                     requested
                 )
             })
+    }
+
+    fn resolve_junk_filter(items: &[ListItem], requested: &str) -> Result<u32> {
+        items
+            .iter()
+            .find(|item| item.name == requested)
+            .or_else(|| {
+                items
+                    .iter()
+                    .find(|item| item.name.eq_ignore_ascii_case(requested))
+            })
+            .map(|item| item.index)
+            .ok_or_else(|| {
+                anyhow!("Junk filter '{requested}' is not in the list this daemon serves")
+            })
+    }
+
+    /// Select the live 20 kHz/junk filter by its daemon-provided name.
+    pub async fn set_junk_filter(&self, name: &str) -> Result<SettingOutcome> {
+        let _operation_guard = self.operation_lock.lock().await;
+        self.proven_setting_under_operation(
+            &Self::JUNK_FILTER,
+            name,
+            None,
+            || self.get_junk_filters_with_generation(),
+            |index, generation| async move {
+                let state = self.get_state_on_transport(generation).await?;
+                if state.filter_junk == index {
+                    return Ok(SettingOutcome::AlreadySet);
+                }
+                let xml = Self::build_request("SetJunkFilter", &[("value", &index.to_string())]);
+                self.write_setting_on_transport(generation, &xml, "junk filter", index, |state| {
+                    Some(state.filter_junk)
+                })
+                .await
+            },
+        )
+        .await
+    }
+
+    async fn set_scalar_state_value<T, F>(
+        &self,
+        element: &str,
+        what: &str,
+        wire_value: String,
+        expected: T,
+        observe: F,
+    ) -> Result<SettingOutcome>
+    where
+        T: PartialEq + std::fmt::Display,
+        F: Fn(&HqpState) -> Option<T>,
+    {
+        let _operation_guard = self.operation_lock.lock().await;
+        let (state, generation) = self.get_state_with_generation().await?;
+        if observe(&state).as_ref() == Some(&expected) {
+            return Ok(SettingOutcome::AlreadySet);
+        }
+        let xml = Self::build_request(element, &[("value", &wire_value)]);
+        self.write_setting_on_transport(generation, &xml, what, expected, observe)
+            .await
+    }
+
+    /// Enable or disable the standalone convolution engine for the current session.
+    pub async fn set_convolution(&self, enabled: bool) -> Result<SettingOutcome> {
+        self.set_scalar_state_value(
+            "SetConvolution",
+            "convolution",
+            u8::from(enabled).to_string(),
+            enabled,
+            |state| Some(state.convolution),
+        )
+        .await
+    }
+
+    /// Enable or disable adaptive volume for the current session.
+    ///
+    /// `SetAdaptiveVolume` uniquely returns a bare acknowledgement without `result`; State readback
+    /// remains the authority for whether it applied.
+    pub async fn set_adaptive_volume(&self, enabled: bool) -> Result<SettingOutcome> {
+        self.set_scalar_state_value(
+            "SetAdaptiveVolume",
+            "adaptive volume",
+            u8::from(enabled).to_string(),
+            enabled,
+            |state| Some(state.adaptive),
+        )
+        .await
+    }
+
+    /// Set repeat mode: 0 off, 1 current track, 2 all.
+    pub async fn set_repeat(&self, mode: u8) -> Result<SettingOutcome> {
+        if mode > 2 {
+            return Err(anyhow!("Repeat mode must be 0, 1, or 2"));
+        }
+        self.set_scalar_state_value("SetRepeat", "repeat", mode.to_string(), mode, |state| {
+            Some(state.repeat)
+        })
+        .await
+    }
+
+    /// Enable or disable random playback for the current session.
+    pub async fn set_random(&self, enabled: bool) -> Result<SettingOutcome> {
+        self.set_scalar_state_value(
+            "SetRandom",
+            "random",
+            u8::from(enabled).to_string(),
+            enabled,
+            |state| Some(state.random),
+        )
+        .await
     }
 
     /// Set the shaper (the modulator, under an SDM chain) by semantic name.

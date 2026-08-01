@@ -910,6 +910,88 @@ async fn a_transient_volume_read_failure_retains_the_last_observed_capability() 
     server.stop();
 }
 
+/// **Client expectation.** A recoverable native transport failure makes commands temporarily
+/// unavailable; it does not delete the configured zone from `/zones`. Knobs persist this zone id and
+/// ordinary clients have no adaptive LastKnown lane, so publishing `ZoneRemoved` here causes visible
+/// picker flicker and can clear the client's selection before the lifecycle reconnects.
+#[tokio::test]
+async fn a_recoverable_native_failure_does_not_remove_the_direct_zone() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|zone| zone.state == PlaybackState::Playing)
+        .await;
+
+    let mut events = rig.bus.subscribe();
+    while events.try_recv().is_ok() {}
+    let polls_before = server.stats().element_count("Status");
+    server.set_policy(WirePolicy {
+        silent_for_element: Some("Status".to_string()),
+        ..WirePolicy::default()
+    });
+
+    for _ in 0..100 {
+        if server.stats().element_count("Status") > polls_before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(650)).await;
+
+    let mut removed = false;
+    while let Ok(event) = events.try_recv() {
+        if matches!(
+            event,
+            BusEvent::ZoneRemoved { ref zone_id } if zone_id.as_str() == "hqplayer:rig"
+        ) {
+            removed = true;
+        }
+    }
+    assert!(!removed, "a transient outage must not publish ZoneRemoved");
+    assert!(
+        rig.aggregator.get_zone("hqplayer:rig").await.is_some(),
+        "the last-known direct zone must remain visible while recovery retries"
+    );
+
+    server.set_policy(WirePolicy::default());
+    rig.zone_when(|zone| zone.state == PlaybackState::Playing)
+        .await;
+    rig.shutdown().await;
+    server.stop();
+}
+
+#[tokio::test]
+async fn an_explicit_disconnect_still_removes_the_direct_zone() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    let adapter = rig.attach(&server).await;
+    rig.zone_when(|zone| zone.state == PlaybackState::Playing)
+        .await;
+
+    let mut events = rig.bus.subscribe();
+    adapter.disconnect().await;
+    let removed = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                events.recv().await.expect("bus remains open"),
+                BusEvent::ZoneRemoved { ref zone_id } if zone_id.as_str() == "hqplayer:rig"
+            ) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        removed.is_ok(),
+        "explicit disconnect must publish ZoneRemoved"
+    );
+
+    rig.shutdown().await;
+    server.stop();
+}
+
 /// **Client expectation.** The zone id a knob has stored survives a daemon restart. A knob that
 /// reconnects to a renamed zone silently controls nothing.
 #[tokio::test]

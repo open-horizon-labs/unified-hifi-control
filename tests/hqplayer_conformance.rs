@@ -1698,6 +1698,69 @@ async fn the_junk_filter_is_read_as_a_list_index_not_a_boolean() {
     h.stop();
 }
 
+#[tokio::test]
+async fn the_junk_filter_can_be_selected_by_the_name_in_the_live_enumeration() {
+    let h = Harness::verified().await;
+    let junk = corpus::document(VERIFIED_PROFILE, "junkfilters");
+    let item = corpus::enum_entries(&junk, "JunkFiltersItem")
+        .into_iter()
+        .find(|item| item.index != h.model.state().filter_junk_index)
+        .expect("verified fixture offers another junk filter");
+
+    h.adapter
+        .set_junk_filter(&item.name)
+        .await
+        .applied()
+        .expect("SetJunkFilter");
+
+    assert_eq!(h.model.state().filter_junk_index, item.index);
+    let sent = h.model.last_request("SetJunkFilter").expect("setter sent");
+    assert_eq!(request_attr(&sent, "value"), Some(item.index.to_string()));
+    h.stop();
+}
+
+#[tokio::test]
+async fn boolean_and_playback_mode_setters_are_verified_through_state() {
+    let h = Harness::verified().await;
+
+    h.adapter
+        .set_convolution(true)
+        .await
+        .applied()
+        .expect("SetConvolution");
+    h.adapter
+        .set_adaptive_volume(true)
+        .await
+        .applied()
+        .expect("SetAdaptiveVolume's bare reply is still verified by State");
+    h.adapter.set_repeat(2).await.applied().expect("SetRepeat");
+    h.adapter
+        .set_random(true)
+        .await
+        .applied()
+        .expect("SetRandom");
+
+    let state = h.adapter.get_state().await.expect("closing State");
+    assert!(state.convolution);
+    assert!(state.adaptive);
+    assert_eq!(state.repeat, 2);
+    assert!(state.random);
+    h.stop();
+}
+
+#[tokio::test]
+async fn repeat_rejects_values_outside_the_documented_state_domain_without_writing() {
+    let h = Harness::verified().await;
+    let error = h
+        .adapter
+        .set_repeat(3)
+        .await
+        .expect_err("repeat is 0, 1, or 2");
+    assert!(error.to_string().contains("0, 1, or 2"), "{error:#}");
+    assert_eq!(h.model.request_count("SetRepeat"), 0);
+    h.stop();
+}
+
 // =============================================================================
 // AC5 - semantic name to native index, from observed list/state pairs
 // =============================================================================

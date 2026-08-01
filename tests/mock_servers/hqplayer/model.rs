@@ -1105,6 +1105,19 @@ impl Responder for DaemonModel {
                 inner.wrap("<SetAdaptiveVolume/>")
             }
 
+            "SetRepeat" => match request_u32(request, "value") {
+                Some(mode @ 0..=2) => inner.apply(
+                    "SetRepeat",
+                    Box::new(move |state| state.repeat = mode as u8),
+                ),
+                _ => inner.error("SetRepeat", "invalid repeat mode"),
+            },
+
+            "SetRandom" => {
+                let on = request_attr(request, "value").as_deref() == Some("1");
+                inner.apply("SetRandom", Box::new(move |state| state.random = on))
+            }
+
             "Volume" => {
                 if !inner.state.volume_range.enabled {
                     // Verified: a fixed-volume daemon answers result="Error" with no reason text
