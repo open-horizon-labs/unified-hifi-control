@@ -4596,6 +4596,7 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             "lms" => "LMS host not configured",
             "openhome" => "Device not found",
             "upnp" => "Renderer not found",
+            "hqplayer" => "HQPlayer instance 'abc' is not configured",
             other => panic!("no adapter fingerprint for {other}"),
         }
     }
@@ -4618,17 +4619,20 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             )),
             "search" => Some(("hifi_search", json!({ "query": "q", "zone_id": zone_id }))),
             "play_by_query" => Some(("hifi_play", json!({ "query": "q", "zone_id": zone_id }))),
+            "repeat_mode" => Some((
+                "hifi_hqplayer_set_pipeline",
+                json!({ "zone_id": zone_id, "setting": "repeat", "value": "off" }),
+            )),
+            "shuffle_mode" => Some((
+                "hifi_hqplayer_set_pipeline",
+                json!({ "zone_id": zone_id, "setting": "random", "value": "false" }),
+            )),
             _ => None,
         }
     }
 
     let mut proved = 0usize;
     for provider in EXPECTED_PROVIDERS {
-        // HQPlayer zones are recognised but nothing is wired, so there is no
-        // supported cell to prove; that is asserted separately.
-        if *provider == "hqplayer" {
-            continue;
-        }
         for (capability, entry) in capabilities_of(&payload, provider) {
             if support_of(&entry) != SUPPORTED {
                 continue;
@@ -4651,13 +4655,14 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             proved += 1;
         }
     }
-    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2 = 15.
+    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2 +
+    // HQPlayer 5 (transport, skip, volume, repeat, shuffle) = 20.
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 15,
-        "{proved} supported cells were proved end to end, expected 15. If a capability was          deliberately wired or unwired, change this number in the same commit."
+        proved, 20,
+        "{proved} supported cells were proved end to end, expected 20. If a capability was          deliberately wired or unwired, change this number in the same commit."
     );
 }
 

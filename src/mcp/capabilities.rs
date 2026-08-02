@@ -331,6 +331,7 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
             (target, target.for_library()),
             (ZoneTarget::Roon, LibraryRoute::Roon) | (ZoneTarget::Lms, LibraryRoute::Lms)
         ),
+        Capability::RepeatMode | Capability::ShuffleMode => target == ZoneTarget::HqPlayer,
         // Nothing else has an MCP call path at all yet.
         _ => false,
     };
@@ -594,8 +595,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::HqPlayer, Capability::QueueRemove, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::QueueClear, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::PlayNext, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
-    (ZoneTarget::HqPlayer, Capability::RepeatMode, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
-    (ZoneTarget::HqPlayer, Capability::ShuffleMode, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::SavedPlaylists, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::Favorites, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::MultiroomSync, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
@@ -881,6 +880,18 @@ mod tests {
                 support(ZoneTarget::HqPlayer, capability),
                 Support::Supported,
                 "hqplayer/{}: #328 wired this through HqpInstanceManager resolution",
+                capability.name()
+            );
+        }
+    }
+
+    #[test]
+    fn hqplayer_repeat_and_shuffle_are_supported_by_the_pipeline_tool() {
+        for capability in [Capability::RepeatMode, Capability::ShuffleMode] {
+            assert_eq!(
+                support(ZoneTarget::HqPlayer, capability),
+                Support::Supported,
+                "hqplayer/{}: hifi_hqplayer_set_pipeline has a live-verified route",
                 capability.name()
             );
         }

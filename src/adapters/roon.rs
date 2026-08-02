@@ -852,6 +852,10 @@ struct PendingRoonCommand {
 enum RoonObservationExpectation {
     Playback(PlaybackState),
     TrackChanged(Option<(String, String, String, Option<String>)>),
+    PreviousApplied {
+        track: Option<(String, String, String, Option<String>)>,
+        seek_position: Option<f64>,
+    },
     Volume(f32),
 }
 
@@ -860,15 +864,22 @@ impl RoonObservationExpectation {
         match self {
             Self::Playback(expected) => zone.state == *expected,
             Self::TrackChanged(previous) => {
-                let observed = zone.now_playing.as_ref().map(|now_playing| {
-                    (
-                        now_playing.title.clone(),
-                        now_playing.artist.clone(),
-                        now_playing.album.clone(),
-                        now_playing.image_key.clone(),
-                    )
-                });
+                let observed = roon_track_identity(zone);
                 observed.is_some() && &observed != previous
+            }
+            Self::PreviousApplied {
+                track,
+                seek_position,
+            } => {
+                let observed_track = roon_track_identity(zone);
+                if observed_track.is_some() && &observed_track != track {
+                    return true;
+                }
+
+                matches!(
+                    (seek_position, zone.now_playing.as_ref().and_then(|np| np.seek_position)),
+                    (Some(before), Some(after)) if *before > 2.0 && after <= 2.0
+                )
             }
             Self::Volume(expected) => zone
                 .volume_control
@@ -876,6 +887,17 @@ impl RoonObservationExpectation {
                 .is_some_and(|volume| (volume.value - expected).abs() <= 0.01),
         }
     }
+}
+
+fn roon_track_identity(zone: &BusZone) -> Option<(String, String, String, Option<String>)> {
+    zone.now_playing.as_ref().map(|now_playing| {
+        (
+            now_playing.title.clone(),
+            now_playing.artist.clone(),
+            now_playing.album.clone(),
+            now_playing.image_key.clone(),
+        )
+    })
 }
 
 impl RoonRuntimeBridge {
@@ -2418,7 +2440,7 @@ async fn roon_expectation(
             };
             Ok(RoonObservationExpectation::Playback(expected))
         }
-        RuntimeCommand::Control(Command::Next | Command::Previous) => {
+        RuntimeCommand::Control(Command::Next) => {
             let previous = zone.now_playing.map(|now_playing| {
                 (
                     now_playing.title,
@@ -2428,6 +2450,24 @@ async fn roon_expectation(
                 )
             });
             Ok(RoonObservationExpectation::TrackChanged(previous))
+        }
+        RuntimeCommand::Control(Command::Previous) => {
+            let track = zone.now_playing.as_ref().map(|now_playing| {
+                (
+                    now_playing.title.clone(),
+                    now_playing.artist.clone(),
+                    now_playing.album.clone(),
+                    now_playing.image_key.clone(),
+                )
+            });
+            let seek_position = zone
+                .now_playing
+                .as_ref()
+                .and_then(|now_playing| now_playing.seek_position.map(|position| position as f64));
+            Ok(RoonObservationExpectation::PreviousApplied {
+                track,
+                seek_position,
+            })
         }
         RuntimeCommand::Control(Command::VolumeAbsolute {
             value,
@@ -3377,6 +3417,51 @@ mod tests {
             bus_zone.volume_control.is_none(),
             "should be None when output has no volume"
         );
+    }
+
+    fn test_bus_zone_with_track(title: &str, seek_position: f64) -> BusZone {
+        let mut zone =
+            roon_zone_to_bus_zone(&make_test_zone("output", Some(5.0), Some(0.0), Some(100.0)));
+        zone.now_playing = Some(BusNowPlaying {
+            title: title.to_string(),
+            artist: "John Coltrane".to_string(),
+            album: "Blue Train".to_string(),
+            image_key: Some("cover".to_string()),
+            seek_position: Some(seek_position),
+            duration: Some(645.0),
+            metadata: None,
+        });
+        zone
+    }
+
+    #[test]
+    fn roon_previous_confirms_same_track_restart_or_track_change() {
+        let previous = RoonObservationExpectation::PreviousApplied {
+            track: Some((
+                "Blue Train".to_string(),
+                "John Coltrane".to_string(),
+                "Blue Train".to_string(),
+                Some("cover".to_string()),
+            )),
+            seek_position: Some(37.0),
+        };
+
+        assert!(previous.matches(&test_bus_zone_with_track("Blue Train", 0.0)));
+        assert!(!previous.matches(&test_bus_zone_with_track("Blue Train", 20.0)));
+        assert!(previous.matches(&test_bus_zone_with_track("Moment's Notice", 0.0)));
+    }
+
+    #[test]
+    fn roon_next_still_requires_a_track_identity_change() {
+        let next = RoonObservationExpectation::TrackChanged(Some((
+            "Blue Train".to_string(),
+            "John Coltrane".to_string(),
+            "Blue Train".to_string(),
+            Some("cover".to_string()),
+        )));
+
+        assert!(!next.matches(&test_bus_zone_with_track("Blue Train", 0.0)));
+        assert!(next.matches(&test_bus_zone_with_track("Moment's Notice", 0.0)));
     }
 
     /// A Roon control has no synchronous state readback.  Its confirmation must
