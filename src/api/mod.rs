@@ -7,7 +7,7 @@ use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
 use crate::adapters::Startable;
 use crate::aggregator::ZoneAggregator;
-use crate::bus::SharedBus;
+use crate::bus::{BusEvent, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -2147,6 +2147,22 @@ pub async fn api_settings_get_handler() -> impl IntoResponse {
     Json(load_app_settings())
 }
 
+/// Stop an adapter and tell the aggregator to flush its zones.
+///
+/// `Startable::stop` alone leaves `ZoneAggregator`'s zone map untouched.
+/// The aggregator already handles `BusEvent::AdapterStopping` correctly --
+/// removes every zone prefixed `"{adapter}:"`, publishes `ZonesFlushed` --
+/// but until this fix nothing ever published that event, so a disabled
+/// adapter's zones stayed listed in `/zones`, `hifi_zones`, and (since #397)
+/// MCP resources, forever (issue #429).
+async fn stop_adapter_and_flush_zones(adapter: &Arc<dyn Startable>, bus: &SharedBus) {
+    bus.publish(BusEvent::AdapterStopping {
+        adapter: adapter.name().to_string(),
+        reason: Some("disabled via settings".to_string()),
+    });
+    adapter.stop().await;
+}
+
 /// POST /api/settings - Update app settings with dynamic adapter enable/disable
 pub async fn api_settings_post_handler(
     State(state): State<AppState>,
@@ -2206,7 +2222,7 @@ pub async fn api_settings_post_handler(
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
-                adapter.stop().await;
+                stop_adapter_and_flush_zones(adapter, &state.bus).await;
             }
         }
     }
@@ -2217,8 +2233,162 @@ pub async fn api_settings_post_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::{create_bus, PlaybackState, Zone};
     use serial_test::serial;
     use std::env;
+    use std::time::Duration;
+
+    struct FakeAdapter(&'static str);
+
+    #[async_trait::async_trait]
+    impl Startable for FakeAdapter {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        async fn start(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) {}
+    }
+
+    fn fake_zone(zone_id: &str, source: &str) -> Zone {
+        Zone {
+            zone_id: zone_id.to_string(),
+            zone_name: "Test Zone".to_string(),
+            state: PlaybackState::Stopped,
+            volume_control: None,
+            now_playing: None,
+            source: source.to_string(),
+            is_controllable: true,
+            is_seekable: false,
+            last_updated: 0,
+            is_play_allowed: true,
+            is_pause_allowed: true,
+            is_next_allowed: true,
+            is_previous_allowed: true,
+        }
+    }
+
+    /// Issue #429: disabling an adapter must remove its zones, not just stop
+    /// it. This exercises the real path end to end -- a live `ZoneAggregator`
+    /// consuming from a real bus -- rather than only asserting that an event
+    /// was published, since `ZoneAggregator`'s own handling of
+    /// `AdapterStopping` had no test anywhere in the codebase either.
+    #[tokio::test]
+    async fn stopping_an_adapter_flushes_its_zones_from_the_aggregator() {
+        let bus = create_bus();
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let agg_for_task = aggregator.clone();
+        tokio::spawn(async move { agg_for_task.run().await });
+
+        // Give the aggregator's subscription a moment to attach before the
+        // first publish -- otherwise this event can race the subscribe.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        bus.publish(BusEvent::ZoneDiscovered {
+            zone: fake_zone("lms:aa:bb:cc:dd:ee:ff", "lms"),
+        });
+        bus.publish(BusEvent::ZoneDiscovered {
+            zone: fake_zone("roon:untouched", "roon"),
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            aggregator.get_zones().await.len(),
+            2,
+            "both zones should be present before the adapter stops"
+        );
+
+        let adapter: Arc<dyn Startable> = Arc::new(FakeAdapter("lms"));
+        stop_adapter_and_flush_zones(&adapter, &bus).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let remaining = aggregator.get_zones().await;
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the lms zone should have been flushed, got {remaining:?}"
+        );
+        assert_eq!(remaining[0].zone_id, "roon:untouched");
+    }
+
+    async fn app_state_with_startable(startable: Arc<dyn Startable>) -> AppState {
+        let bus = create_bus();
+        let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
+        let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
+        let hqplayer = hqp_instances.get_default().await;
+        let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
+        let lms = Arc::new(LmsAdapter::new(bus.clone()));
+        let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
+        let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
+
+        AppState::new(
+            roon,
+            hqplayer,
+            hqp_instances,
+            hqp_zone_links,
+            lms,
+            openhome,
+            upnp,
+            KnobStore::new(),
+            bus,
+            aggregator,
+            coordinator,
+            vec![startable],
+            Instant::now(),
+            CancellationToken::new(),
+        )
+    }
+
+    /// Issue #429, proving the wiring itself: calling the real
+    /// `POST /api/settings` handler to disable an adapter must remove its
+    /// zones. Unlike `stopping_an_adapter_flushes_its_zones_from_the_aggregator`
+    /// above (which calls `stop_adapter_and_flush_zones` directly and would
+    /// stay green even if the handler stopped calling it), this goes through
+    /// `api_settings_post_handler` itself.
+    #[tokio::test]
+    #[serial]
+    async fn disabling_an_adapter_via_the_real_endpoint_flushes_its_zones() {
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-issue-429-adapter-stopping");
+
+        // Seed "old" settings with the adapter already enabled, so the
+        // handler's before/after comparison sees a disable, not a no-op.
+        let mut seed = AppSettings::default();
+        seed.adapters.lms = true;
+        assert!(save_app_settings(&seed), "failed to seed test settings");
+
+        let adapter: Arc<dyn Startable> = Arc::new(FakeAdapter("lms"));
+        let state = app_state_with_startable(adapter).await;
+        let agg_for_task = state.aggregator.clone();
+        tokio::spawn(async move { agg_for_task.run().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        state.bus.publish(BusEvent::ZoneDiscovered {
+            zone: fake_zone("lms:aa:bb:cc:dd:ee:ff", "lms"),
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            state.aggregator.get_zones().await.len(),
+            1,
+            "zone should be present before disabling"
+        );
+
+        let mut disabled = AppSettings::default();
+        disabled.adapters.lms = false;
+        let response = api_settings_post_handler(State(state.clone()), Json(disabled)).await;
+        let _ = response; // the endpoint's own `{"ok": true}` body isn't the assertion here
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let remaining = state.aggregator.get_zones().await;
+        assert_eq!(
+            remaining.len(),
+            0,
+            "disabling lms via the real endpoint should flush its zone, got {remaining:?}"
+        );
+
+        env::remove_var("UHC_CONFIG_DIR");
+    }
 
     #[test]
     #[serial]
