@@ -49,6 +49,11 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     /// Count of active SSE connections (for shutdown diagnostics)
     pub sse_connections: Arc<AtomicUsize>,
+    /// The MCP ref table (#396): opaque tokens `hifi_search` mints and
+    /// `hifi_play_ref` resolves. Constructed here rather than taken as a
+    /// constructor parameter -- like `sse_connections` above -- so every
+    /// existing `AppState::new` call site is untouched by this addition.
+    pub mcp_refs: crate::mcp::refs::RefTable,
 }
 
 impl AppState {
@@ -85,6 +90,7 @@ impl AppState {
             start_time,
             shutdown,
             sse_connections: Arc::new(AtomicUsize::new(0)),
+            mcp_refs: crate::mcp::refs::RefTable::new(),
         }
     }
 

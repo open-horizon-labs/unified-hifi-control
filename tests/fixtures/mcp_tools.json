@@ -117,7 +117,7 @@
     }
   },
   "hifi_play": {
-    "description": "Search and play music. Searches and plays, queues, or starts radio from the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; LMS searches all providers.",
+    "description": "Search and play music. Searches and plays, queues, or starts radio from the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; LMS searches all providers. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead.",
     "inputSchema": {
       "properties": {
         "action": {
@@ -146,11 +146,39 @@
       "type": "object"
     }
   },
+  "hifi_play_ref": {
+    "annotations": {
+      "readOnlyHint": false
+    },
+    "description": "Play, queue, or play-next a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Use this instead of hifi_play when you need the exact result you found (e.g. the third one, or one of two same-titled albums), rather than whatever hifi_play's own search matches first. Refs are short-lived: hold one only within the current conversation. If this call is refused because the ref is unknown or expired, call hifi_search again for a fresh one — never guess or reuse an old one. zone_id must belong to the same provider (Roon or LMS) the ref was minted for.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "What to do: \"play\" (default), \"queue\", \"radio\" (Roon only), or \"next\" (LMS play-next only).",
+          "nullable": true,
+          "type": "string"
+        },
+        "ref": {
+          "description": "The opaque `ref` from a hifi_search result. Do not construct, guess, or edit one.",
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Zone ID to play on (get from hifi_zones). Must be the same provider the ref was minted for.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ref",
+        "zone_id"
+      ],
+      "type": "object"
+    }
+  },
   "hifi_search": {
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins (zone_id recommended as different players may have different sources configured).",
+    "description": "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins (zone_id recommended as different players may have different sources configured). Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play, queue, or start radio from that exact result instead of hifi_play's first-match search. A result with no `ref` has no safe way to be addressed later — use hifi_play's query for it.",
     "inputSchema": {
       "properties": {
         "query": {

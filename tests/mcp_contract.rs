@@ -491,8 +491,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        11,
-        "expected 11 tools with HQPlayer enabled, got {}: {:?}",
+        12,
+        "expected 12 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -553,6 +553,8 @@ async fn tools_list_order_is_pinned() {
             // Appended by #398. Every line above it is untouched, which is what
             // makes the diff additive.
             "hifi_capabilities",
+            // Appended by #396.
+            "hifi_play_ref",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -594,8 +596,9 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
             "hifi_play",
             "hifi_status",
             "hifi_capabilities",
+            "hifi_play_ref",
         ],
-        "HQPlayer disabled must yield exactly the seven non-HQPlayer tools, in order"
+        "HQPlayer disabled must yield exactly the eight non-HQPlayer tools, in order"
     );
 }
 
@@ -757,6 +760,12 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
     (
         "hifi_hqplayer_set_pipeline",
         &[("setting", true), ("value", true)],
+    ),
+    // #396. `ref` is required; `zone_id` is required (must match the ref's
+    // provider); `action` is optional and defaults to "play".
+    (
+        "hifi_play_ref",
+        &[("ref", true), ("zone_id", true), ("action", false)],
     ),
 ];
 
@@ -920,7 +929,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        11,
+        12,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }
@@ -1961,10 +1970,11 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
     (
         "title",
         DisplayOnly(
-            "hifi_search returns {title, subtitle} and no key, so the only route from \
-         'found it' to 'playing it' is handing the title back to hifi_play, which \
-         re-searches and takes the first match. That is #392's keystone finding and \
-         #396's job — NOT an endorsed design. Listed to freeze today's behavior.",
+            "human-readable label for a hifi_search result. #396 added `ref` as the \
+         addressable handle a client actually acts on; title/subtitle remain \
+         display-only — hifi_play's query path still re-searches and takes the first \
+         match, unchanged by this issue. This entry is now historical: it used to be \
+         the only route from 'found it' to 'playing it' before #396 added `ref`.",
         ),
     ),
     (
@@ -1977,7 +1987,15 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
     ),
     (
         "subtitle",
-        DisplayOnly("search-result label, same defect as `title`; see #396"),
+        DisplayOnly("search-result label, same display-only role as `title`; see #396"),
+    ),
+    (
+        "ref",
+        Consumed(
+            "hifi_play_ref.ref — the opaque token #396 added to hifi_search results. \
+         `None` (omitted) when a result has no durable-enough handle to address later; \
+         see McpSearchResult's own docs.",
+        ),
     ),
     // hifi_status / hifi_hqplayer_status readouts.
     (
@@ -2337,6 +2355,9 @@ async fn no_tool_returns_an_unclassified_field() {
         &serde_json::to_value(McpSearchResult {
             title: String::new(),
             subtitle: None,
+            // #396: `Some` here so the new field is collected and must be
+            // classified below, exactly like `title`/`subtitle` above.
+            r#ref: Some(String::new()),
         })
         .expect("McpSearchResult must serialize"),
         &mut returned,
