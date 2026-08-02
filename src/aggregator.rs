@@ -1,12 +1,18 @@
 //! ZoneAggregator - Single source of truth for zone state
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::adapters::hqplayer::{
     HqpAdvancedOptionsSnapshot, HqpNativeObservation, HqpNativeObservationSink, HqpProfile,
+};
+#[cfg(test)]
+use crate::bus::runtime::ProjectionSource;
+use crate::bus::runtime::{
+    ProjectionCommit, ProjectionCommitter, ProjectionEntry, ProjectionFreshness, ProjectionKind,
+    ProjectionPayload, ProjectionUpdate,
 };
 use crate::bus::{BusEvent, NowPlaying, SharedBus, Zone};
 
@@ -35,16 +41,33 @@ pub struct HqpSnapshot {
 /// - Flushes zones when adapter stops
 /// - Provides query interface for API layer
 pub struct ZoneAggregator {
-    zones: Arc<RwLock<HashMap<String, Zone>>>,
-    hqplayer_snapshots: Arc<RwLock<HashMap<String, HqpSnapshot>>>,
+    state: Arc<RwLock<AggregateState>>,
     bus: SharedBus,
+}
+
+/// Every canonical projection value shares one lock and revision domain. This lets a coherent
+/// provider observation update a direct zone and its provider-native state without exposing a
+/// torn pair to readers.
+#[derive(Default)]
+struct AggregateState {
+    zones: HashMap<String, Zone>,
+    hqplayer_snapshots: HashMap<String, HqpSnapshot>,
+    projection_revision: u64,
+    source_cursors: HashMap<String, ProjectionCursor>,
+    projection_entries: BTreeMap<String, (u64, ProjectionPayload)>,
+}
+
+#[derive(Clone, Copy)]
+struct ProjectionCursor {
+    epoch: u64,
+    sequence: u64,
+    freshness: ProjectionFreshness,
 }
 
 impl ZoneAggregator {
     pub fn new(bus: SharedBus) -> Self {
         Self {
-            zones: Arc::new(RwLock::new(HashMap::new())),
-            hqplayer_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            state: Arc::new(RwLock::new(AggregateState::default())),
             bus,
         }
     }
@@ -94,7 +117,11 @@ impl ZoneAggregator {
             match event {
                 BusEvent::ZoneDiscovered { zone } => {
                     debug!("Zone discovered: {}", zone.zone_id);
-                    self.zones.write().await.insert(zone.zone_id.clone(), zone);
+                    self.state
+                        .write()
+                        .await
+                        .zones
+                        .insert(zone.zone_id.clone(), zone);
                 }
 
                 BusEvent::ZoneUpdated {
@@ -103,7 +130,7 @@ impl ZoneAggregator {
                     state,
                 } => {
                     debug!("Zone updated: {}", zone_id);
-                    if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
+                    if let Some(zone) = self.state.write().await.zones.get_mut(zone_id.as_str()) {
                         zone.zone_name = display_name;
                         zone.state = state.as_str().into();
                     }
@@ -111,7 +138,7 @@ impl ZoneAggregator {
 
                 BusEvent::ZoneRemoved { zone_id } => {
                     debug!("Zone removed: {}", zone_id);
-                    self.zones.write().await.remove(zone_id.as_str());
+                    self.state.write().await.zones.remove(zone_id.as_str());
                 }
 
                 BusEvent::NowPlayingChanged {
@@ -122,7 +149,7 @@ impl ZoneAggregator {
                     image_key,
                 } => {
                     debug!("Now playing changed: {}", zone_id);
-                    if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
+                    if let Some(zone) = self.state.write().await.zones.get_mut(zone_id.as_str()) {
                         // Preserve seek_position and duration from existing now_playing
                         let (seek_position, duration) = zone
                             .now_playing
@@ -154,8 +181,8 @@ impl ZoneAggregator {
                     // Find zone containing this output and update volume_control
                     // All adapters must use prefixed output_ids (e.g., "lms:xx:xx:xx", "roon:output-id")
                     // The lint test `bus_events_use_prefixed_output_ids` enforces this.
-                    let mut zones = self.zones.write().await;
-                    for zone in zones.values_mut() {
+                    let mut aggregate = self.state.write().await;
+                    for zone in aggregate.zones.values_mut() {
                         let matches = zone
                             .volume_control
                             .as_ref()
@@ -175,7 +202,7 @@ impl ZoneAggregator {
 
                 BusEvent::SeekPositionChanged { zone_id, position } => {
                     debug!("Seek position changed: {} = {}", zone_id, position);
-                    if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
+                    if let Some(zone) = self.state.write().await.zones.get_mut(zone_id.as_str()) {
                         if let Some(ref mut np) = zone.now_playing {
                             np.seek_position = Some(position as f64);
                         }
@@ -187,16 +214,17 @@ impl ZoneAggregator {
                     let prefix = format!("{}:", adapter);
 
                     // Remove all zones with this prefix
-                    let mut zones = self.zones.write().await;
+                    let mut aggregate = self.state.write().await;
 
-                    let zone_ids: Vec<String> = zones
+                    let zone_ids: Vec<String> = aggregate
+                        .zones
                         .keys()
                         .filter(|k| k.starts_with(&prefix))
                         .cloned()
                         .collect();
 
                     for zone_id in &zone_ids {
-                        zones.remove(zone_id);
+                        aggregate.zones.remove(zone_id);
                     }
 
                     // Publish flush acknowledgment
@@ -222,15 +250,16 @@ impl ZoneAggregator {
 
     /// Get all zones
     pub async fn get_zones(&self) -> Vec<Zone> {
-        self.zones.read().await.values().cloned().collect()
+        self.state.read().await.zones.values().cloned().collect()
     }
 
     /// Get zones for a specific adapter
     pub async fn get_zones_by_adapter(&self, adapter: &str) -> Vec<Zone> {
         let prefix = format!("{}:", adapter);
-        self.zones
+        self.state
             .read()
             .await
+            .zones
             .values()
             .filter(|z| z.zone_id.starts_with(&prefix))
             .cloned()
@@ -239,37 +268,40 @@ impl ZoneAggregator {
 
     /// Get a specific zone
     pub async fn get_zone(&self, zone_id: &str) -> Option<Zone> {
-        self.zones.read().await.get(zone_id).cloned()
+        self.state.read().await.zones.get(zone_id).cloned()
     }
 
     /// Get now playing for a zone
     pub async fn get_now_playing(&self, zone_id: &str) -> Option<NowPlaying> {
-        self.zones
+        self.state
             .read()
             .await
+            .zones
             .get(zone_id)
             .and_then(|z| z.now_playing.clone())
     }
 
     /// Get zone count
     pub async fn zone_count(&self) -> usize {
-        self.zones.read().await.len()
+        self.state.read().await.zones.len()
     }
 
     /// Return the aggregator-owned state for one configured HQPlayer instance.
     pub async fn get_hqplayer_snapshot(&self, instance_name: &str) -> Option<HqpSnapshot> {
-        self.hqplayer_snapshots
+        self.state
             .read()
             .await
+            .hqplayer_snapshots
             .get(instance_name)
             .cloned()
     }
 
     /// Return every aggregator-owned HQPlayer instance snapshot.
     pub async fn get_hqplayer_snapshots(&self) -> Vec<HqpSnapshot> {
-        self.hqplayer_snapshots
+        self.state
             .read()
             .await
+            .hqplayer_snapshots
             .values()
             .cloned()
             .collect()
@@ -281,8 +313,8 @@ impl ZoneAggregator {
         instance_name: &str,
         advanced: HqpAdvancedOptionsSnapshot,
     ) -> bool {
-        let mut snapshots = self.hqplayer_snapshots.write().await;
-        let Some(snapshot) = snapshots.get_mut(instance_name) else {
+        let mut snapshots = self.state.write().await;
+        let Some(snapshot) = snapshots.hqplayer_snapshots.get_mut(instance_name) else {
             return false;
         };
         if snapshot.observation.execution_target != advanced.execution_target {
@@ -300,8 +332,8 @@ impl ZoneAggregator {
         instance_name: &str,
         result: Result<Vec<HqpProfile>, String>,
     ) -> bool {
-        let mut snapshots = self.hqplayer_snapshots.write().await;
-        let Some(snapshot) = snapshots.get_mut(instance_name) else {
+        let mut snapshots = self.state.write().await;
+        let Some(snapshot) = snapshots.hqplayer_snapshots.get_mut(instance_name) else {
             return false;
         };
         match result {
@@ -316,6 +348,85 @@ impl ZoneAggregator {
         snapshot.revision = snapshot.revision.saturating_add(1);
         true
     }
+
+    /// The reliable projection actor commits through this method; it is deliberately the only
+    /// owner of projection revisions, cursors, and entries. The runtime is only ingress plus a
+    /// command ledger, so it cannot race this aggregate with a second authoritative view.
+    async fn commit_reliable_projection(&self, update: ProjectionUpdate) -> ProjectionCommit {
+        let source_identity = update.source.identity();
+        let mut aggregate = self.state.write().await;
+
+        if let Some(cursor) = aggregate.source_cursors.get_mut(&source_identity) {
+            if update.source.epoch < cursor.epoch
+                || (update.source.epoch == cursor.epoch && update.sequence <= cursor.sequence)
+            {
+                return ProjectionCommit::StaleIgnored {
+                    current_epoch: cursor.epoch,
+                    current_sequence: cursor.sequence,
+                };
+            }
+            if update.source.epoch == cursor.epoch
+                && update.sequence > cursor.sequence.saturating_add(1)
+                && update.kind == ProjectionKind::Delta
+            {
+                let expected_sequence = cursor.sequence.saturating_add(1);
+                cursor.freshness = ProjectionFreshness::Reconciling;
+                return ProjectionCommit::GapDetected {
+                    expected_sequence,
+                    received_sequence: update.sequence,
+                };
+            }
+        }
+
+        aggregate.projection_revision = aggregate.projection_revision.saturating_add(1);
+        let revision = aggregate.projection_revision;
+        aggregate.source_cursors.insert(
+            source_identity,
+            ProjectionCursor {
+                epoch: update.source.epoch,
+                sequence: update.sequence,
+                freshness: ProjectionFreshness::Fresh,
+            },
+        );
+        for ProjectionEntry { key, payload } in update.entries {
+            if let ProjectionPayload::Zone(zone) = &payload {
+                aggregate
+                    .zones
+                    .insert(zone.zone_id.clone(), (**zone).clone());
+            }
+            aggregate
+                .projection_entries
+                .insert(key, (revision, payload));
+        }
+        ProjectionCommit::Committed { revision }
+    }
+
+    #[cfg(test)]
+    async fn projection_revision(&self) -> u64 {
+        self.state.read().await.projection_revision
+    }
+
+    #[cfg(test)]
+    async fn projection_entry(&self, key: &str) -> Option<(u64, ProjectionPayload)> {
+        self.state.read().await.projection_entries.get(key).cloned()
+    }
+
+    #[cfg(test)]
+    async fn projection_freshness(&self, source: &ProjectionSource) -> Option<ProjectionFreshness> {
+        self.state
+            .read()
+            .await
+            .source_cursors
+            .get(&source.identity())
+            .map(|cursor| cursor.freshness)
+    }
+}
+
+#[async_trait::async_trait]
+impl ProjectionCommitter for ZoneAggregator {
+    async fn commit_projection(&self, update: ProjectionUpdate) -> ProjectionCommit {
+        self.commit_reliable_projection(update).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -325,7 +436,8 @@ impl HqpNativeObservationSink for ZoneAggregator {
     }
 
     async fn observed(&self, observation: HqpNativeObservation) -> anyhow::Result<()> {
-        let mut snapshots = self.hqplayer_snapshots.write().await;
+        let mut aggregate = self.state.write().await;
+        let snapshots = &mut aggregate.hqplayer_snapshots;
         if snapshots
             .get(&observation.instance_name)
             .is_some_and(|current| current.observation.producer_epoch > observation.producer_epoch)
@@ -399,7 +511,13 @@ impl HqpNativeObservationSink for ZoneAggregator {
         instance_name: &str,
         observed_at: std::time::SystemTime,
     ) -> anyhow::Result<()> {
-        if let Some(snapshot) = self.hqplayer_snapshots.write().await.get_mut(instance_name) {
+        if let Some(snapshot) = self
+            .state
+            .write()
+            .await
+            .hqplayer_snapshots
+            .get_mut(instance_name)
+        {
             snapshot.presence = HqpSnapshotPresence::LastKnown;
             snapshot.revision = snapshot.revision.saturating_add(1);
             snapshot.last_failure_at = Some(observed_at);
@@ -412,7 +530,8 @@ impl HqpNativeObservationSink for ZoneAggregator {
         instance_name: &str,
         producer_epoch: u64,
     ) -> anyhow::Result<()> {
-        let mut snapshots = self.hqplayer_snapshots.write().await;
+        let mut aggregate = self.state.write().await;
+        let snapshots = &mut aggregate.hqplayer_snapshots;
         if snapshots
             .get(instance_name)
             .is_some_and(|snapshot| snapshot.observation.producer_epoch == producer_epoch)
@@ -423,7 +542,7 @@ impl HqpNativeObservationSink for ZoneAggregator {
     }
 
     async fn manager_stopped(&self) -> anyhow::Result<()> {
-        for snapshot in self.hqplayer_snapshots.write().await.values_mut() {
+        for snapshot in self.state.write().await.hqplayer_snapshots.values_mut() {
             snapshot.presence = HqpSnapshotPresence::LastKnown;
             snapshot.revision = snapshot.revision.saturating_add(1);
         }
@@ -502,6 +621,150 @@ mod tests {
                 choices: vec!["0".to_string(), "11289600".to_string()],
             },
         }
+    }
+
+    fn projected_zone(zone_id: &str) -> Zone {
+        Zone {
+            zone_id: zone_id.to_string(),
+            zone_name: zone_id.to_string(),
+            state: crate::bus::PlaybackState::Stopped,
+            volume_control: None,
+            now_playing: None,
+            source: "hqplayer".to_string(),
+            is_controllable: true,
+            is_seekable: true,
+            last_updated: 0,
+            is_play_allowed: true,
+            is_pause_allowed: true,
+            is_next_allowed: true,
+            is_previous_allowed: true,
+        }
+    }
+
+    fn source(epoch: u64) -> ProjectionSource {
+        ProjectionSource {
+            adapter: "hqplayer".to_string(),
+            instance: Some("main".to_string()),
+            epoch,
+        }
+    }
+
+    fn projection(
+        source: ProjectionSource,
+        sequence: u64,
+        kind: ProjectionKind,
+        entries: Vec<ProjectionEntry>,
+    ) -> ProjectionUpdate {
+        ProjectionUpdate {
+            source,
+            sequence,
+            kind,
+            caused_by: None,
+            entries,
+        }
+    }
+
+    #[tokio::test]
+    async fn reliable_projection_commits_zones_and_entries_in_one_aggregate_revision() {
+        let aggregator = ZoneAggregator::new(crate::bus::create_bus());
+        let update = projection(
+            source(1),
+            1,
+            ProjectionKind::Snapshot,
+            vec![
+                ProjectionEntry {
+                    key: "zone:hqplayer:main".to_string(),
+                    payload: ProjectionPayload::Zone(Box::new(projected_zone("hqplayer:main"))),
+                },
+                ProjectionEntry {
+                    key: "provider:hqplayer:main".to_string(),
+                    payload: ProjectionPayload::Marker("native snapshot".to_string()),
+                },
+            ],
+        );
+
+        assert_eq!(
+            ProjectionCommitter::commit_projection(&aggregator, update).await,
+            ProjectionCommit::Committed { revision: 1 }
+        );
+        assert_eq!(aggregator.projection_revision().await, 1);
+        assert_eq!(
+            aggregator
+                .projection_entry("zone:hqplayer:main")
+                .await
+                .map(|(revision, _)| revision),
+            Some(1)
+        );
+        assert_eq!(
+            aggregator
+                .projection_entry("provider:hqplayer:main")
+                .await
+                .map(|(revision, _)| revision),
+            Some(1)
+        );
+        assert!(aggregator.get_zone("hqplayer:main").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reliable_projection_rejects_stale_data_and_requires_snapshot_after_delta_gap() {
+        let aggregator = ZoneAggregator::new(crate::bus::create_bus());
+        let current = source(3);
+        assert_eq!(
+            ProjectionCommitter::commit_projection(
+                &aggregator,
+                projection(
+                    current.clone(),
+                    2,
+                    ProjectionKind::Snapshot,
+                    vec![ProjectionEntry {
+                        key: "provider:hqplayer:main".to_string(),
+                        payload: ProjectionPayload::Marker("seq2".to_string()),
+                    }],
+                ),
+            )
+            .await,
+            ProjectionCommit::Committed { revision: 1 }
+        );
+        assert_eq!(
+            ProjectionCommitter::commit_projection(
+                &aggregator,
+                projection(current.clone(), 1, ProjectionKind::Delta, Vec::new()),
+            )
+            .await,
+            ProjectionCommit::StaleIgnored {
+                current_epoch: 3,
+                current_sequence: 2,
+            }
+        );
+        assert_eq!(
+            ProjectionCommitter::commit_projection(
+                &aggregator,
+                projection(current.clone(), 4, ProjectionKind::Delta, Vec::new()),
+            )
+            .await,
+            ProjectionCommit::GapDetected {
+                expected_sequence: 3,
+                received_sequence: 4,
+            }
+        );
+        assert_eq!(
+            aggregator.projection_freshness(&current).await,
+            Some(ProjectionFreshness::Reconciling)
+        );
+        assert_eq!(aggregator.projection_revision().await, 1);
+
+        assert_eq!(
+            ProjectionCommitter::commit_projection(
+                &aggregator,
+                projection(current.clone(), 4, ProjectionKind::Snapshot, Vec::new()),
+            )
+            .await,
+            ProjectionCommit::Committed { revision: 2 }
+        );
+        assert_eq!(
+            aggregator.projection_freshness(&current).await,
+            Some(ProjectionFreshness::Fresh)
+        );
     }
 
     #[tokio::test]

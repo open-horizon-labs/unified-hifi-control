@@ -5,10 +5,11 @@
 //! module gives future adapter migrations a private, lossless boundary without changing a public
 //! HTTP/MCP route or the existing `BusEvent` wire enum.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
+use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{timeout_at, Instant};
 
@@ -440,9 +441,7 @@ impl CommandGateway {
         };
         match timeout_at(request.deadlines.dispatch_by, endpoint.sender.reserve()).await {
             Ok(Ok(permit)) => {
-                match permit.send(work) {
-                    () => {}
-                }
+                let () = permit.send(work);
                 self.inner
                     .schedule_dispatch_expiry(id, request.deadlines.dispatch_by);
             }
@@ -467,7 +466,7 @@ pub(crate) struct ProjectionSource {
 }
 
 impl ProjectionSource {
-    fn identity(&self) -> String {
+    pub(crate) fn identity(&self) -> String {
         match &self.instance {
             Some(instance) => format!("{}/{}", self.adapter, instance),
             None => self.adapter.clone(),
@@ -528,13 +527,21 @@ pub(crate) enum ProjectionCommit {
     },
 }
 
+/// The single canonical projection owner. The reliable runtime serializes ingress and command
+/// correlation, but it deliberately does not store projection data, revisions, or source cursors.
+/// That prevents it from becoming a second state authority beside `ZoneAggregator`.
+#[async_trait]
+pub(crate) trait ProjectionCommitter: Send + Sync {
+    async fn commit_projection(&self, update: ProjectionUpdate) -> ProjectionCommit;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectionFreshness {
     Fresh,
     Reconciling,
 }
 
-/// A post-commit egress hint. Consumers must reread [`ProjectionView`], never treat this as state.
+/// A post-commit egress hint. Consumers must reread the aggregator, never treat this as state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeNotification {
     ProjectionCommitted {
@@ -585,12 +592,17 @@ struct ProjectionSubmission {
 pub(crate) struct ProjectionActor {
     submissions: mpsc::Receiver<ProjectionSubmission>,
     inner: Arc<RuntimeState>,
+    committer: Arc<dyn ProjectionCommitter>,
 }
 
 impl ProjectionActor {
     pub(crate) async fn run(mut self) {
         while let Some(submission) = self.submissions.recv().await {
-            let commit = self.inner.apply_projection(submission.update);
+            let source = submission.update.source.clone();
+            let caused_by = submission.update.caused_by;
+            let commit = self.committer.commit_projection(submission.update).await;
+            self.inner
+                .record_projection_outcome(&source, caused_by, &commit);
             if submission.reply.send(commit).is_err() {
                 tracing::trace!("projection submitter dropped before commit acknowledgement");
             }
@@ -598,33 +610,16 @@ impl ProjectionActor {
     }
 }
 
-/// Read-only state owned by the projection actor.
+/// Post-commit notification seam. Its events are hints only; all state reads remain owned by the
+/// projection committer (currently `ZoneAggregator`).
 #[derive(Clone)]
 pub(crate) struct ProjectionView {
     inner: Arc<RuntimeState>,
 }
 
 impl ProjectionView {
-    pub(crate) fn revision(&self) -> u64 {
-        lock(&self.inner.data).projection_revision
-    }
-
-    pub(crate) fn entry(&self, key: &str) -> Option<(u64, ProjectionPayload)> {
-        lock(&self.inner.data).projection_entries.get(key).cloned()
-    }
-
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<RuntimeNotification> {
         self.inner.notifications.subscribe()
-    }
-
-    pub(crate) fn source_freshness(
-        &self,
-        source: &ProjectionSource,
-    ) -> Option<ProjectionFreshness> {
-        lock(&self.inner.data)
-            .source_cursors
-            .get(&source.identity())
-            .map(|cursor| cursor.freshness)
     }
 }
 
@@ -638,7 +633,11 @@ pub(crate) struct RuntimeParts {
 }
 
 /// Construct the bounded reliable lanes. Neither capacity may be zero.
-pub(crate) fn build_runtime(command_capacity: usize, projection_capacity: usize) -> RuntimeParts {
+pub(crate) fn build_runtime(
+    committer: Arc<dyn ProjectionCommitter>,
+    command_capacity: usize,
+    projection_capacity: usize,
+) -> RuntimeParts {
     assert!(command_capacity > 0, "command capacity must be non-zero");
     assert!(
         projection_capacity > 0,
@@ -665,6 +664,7 @@ pub(crate) fn build_runtime(command_capacity: usize, projection_capacity: usize)
         projection_actor: ProjectionActor {
             submissions: receiver,
             inner: inner.clone(),
+            committer,
         },
         projection_view: ProjectionView { inner },
     }
@@ -680,16 +680,6 @@ struct RuntimeState {
 struct RuntimeData {
     commands: HashMap<CommandId, CommandRecord>,
     correlations: HashMap<String, CommandId>,
-    projection_revision: u64,
-    source_cursors: HashMap<String, SourceCursor>,
-    projection_entries: BTreeMap<String, (u64, ProjectionPayload)>,
-}
-
-#[derive(Clone, Copy)]
-struct SourceCursor {
-    epoch: u64,
-    sequence: u64,
-    freshness: ProjectionFreshness,
 }
 
 impl RuntimeState {
@@ -826,90 +816,58 @@ impl RuntimeState {
         });
     }
 
-    fn apply_projection(&self, update: ProjectionUpdate) -> ProjectionCommit {
-        let identity = update.source.identity();
-        let (commit, notification, command_update) = {
-            let mut data = lock(&self.data);
-            if let Some(cursor) = data.source_cursors.get_mut(&identity) {
-                if update.source.epoch < cursor.epoch
-                    || (update.source.epoch == cursor.epoch && update.sequence <= cursor.sequence)
-                {
-                    return ProjectionCommit::StaleIgnored {
-                        current_epoch: cursor.epoch,
-                        current_sequence: cursor.sequence,
-                    };
-                }
-                if update.source.epoch == cursor.epoch
-                    && update.sequence > cursor.sequence.saturating_add(1)
-                    && update.kind == ProjectionKind::Delta
-                {
-                    let expected_sequence = cursor.sequence.saturating_add(1);
-                    cursor.freshness = ProjectionFreshness::Reconciling;
-                    drop(data);
-                    self.notify(RuntimeNotification::ProjectionGapDetected {
-                        source: identity,
-                        expected_sequence,
-                        received_sequence: update.sequence,
-                    });
-                    return ProjectionCommit::GapDetected {
-                        expected_sequence,
-                        received_sequence: update.sequence,
-                    };
-                }
-            }
-            data.projection_revision = data.projection_revision.saturating_add(1);
-            let revision = data.projection_revision;
-            data.source_cursors.insert(
-                identity.clone(),
-                SourceCursor {
-                    epoch: update.source.epoch,
-                    sequence: update.sequence,
-                    freshness: ProjectionFreshness::Fresh,
-                },
-            );
-            for entry in update.entries {
-                data.projection_entries
-                    .insert(entry.key, (revision, entry.payload));
-            }
-            let command_update = update.caused_by.and_then(|id| {
-                let record = data.commands.get_mut(&id)?;
-                if !source_matches_target(&update.source, &record.target) {
-                    return None;
-                }
-                match record.status {
-                    CommandStatus::AwaitingProjection
-                    | CommandStatus::Dispatched
-                    | CommandStatus::Indeterminate => {
-                        let status = CommandStatus::Confirmed {
-                            projection_revision: revision,
-                        };
-                        record.status = status.clone();
-                        if record.updates.send(status.clone()).is_err() {
-                            tracing::trace!(
-                                command_id = id.get(),
-                                "confirmed command has no active status watcher"
-                            );
-                        }
-                        Some((id, status))
+    fn record_projection_outcome(
+        &self,
+        source: &ProjectionSource,
+        caused_by: Option<CommandId>,
+        commit: &ProjectionCommit,
+    ) {
+        match commit {
+            ProjectionCommit::Committed { revision } => {
+                let command_update = caused_by.and_then(|id| {
+                    let mut data = lock(&self.data);
+                    let record = data.commands.get_mut(&id)?;
+                    if !source_matches_target(source, &record.target) {
+                        return None;
                     }
-                    _ => None,
+                    match record.status {
+                        CommandStatus::AwaitingProjection
+                        | CommandStatus::Dispatched
+                        | CommandStatus::Indeterminate => {
+                            let status = CommandStatus::Confirmed {
+                                projection_revision: *revision,
+                            };
+                            record.status = status.clone();
+                            if record.updates.send(status.clone()).is_err() {
+                                tracing::trace!(
+                                    command_id = id.get(),
+                                    "confirmed command has no active status watcher"
+                                );
+                            }
+                            Some((id, status))
+                        }
+                        _ => None,
+                    }
+                });
+                self.notify(RuntimeNotification::ProjectionCommitted {
+                    revision: *revision,
+                    source: source.identity(),
+                    caused_by,
+                });
+                if let Some((id, status)) = command_update {
+                    self.notify(RuntimeNotification::CommandStateChanged { id, status });
                 }
-            });
-            (
-                ProjectionCommit::Committed { revision },
-                RuntimeNotification::ProjectionCommitted {
-                    revision,
-                    source: identity,
-                    caused_by: update.caused_by,
-                },
-                command_update,
-            )
-        };
-        self.notify(notification);
-        if let Some((id, status)) = command_update {
-            self.notify(RuntimeNotification::CommandStateChanged { id, status });
+            }
+            ProjectionCommit::GapDetected {
+                expected_sequence,
+                received_sequence,
+            } => self.notify(RuntimeNotification::ProjectionGapDetected {
+                source: source.identity(),
+                expected_sequence: *expected_sequence,
+                received_sequence: *received_sequence,
+            }),
+            ProjectionCommit::StaleIgnored { .. } => {}
         }
-        commit
     }
 
     fn notify(&self, event: RuntimeNotification) {
@@ -947,6 +905,27 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Runtime tests intentionally use a minimal external committer. Projection state itself is
+    /// covered by `ZoneAggregator` tests: keeping this fake state-free prevents the runtime from
+    /// regaining a second projection authority through its test harness.
+    #[derive(Default)]
+    struct TestCommitter {
+        next_revision: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ProjectionCommitter for TestCommitter {
+        async fn commit_projection(&self, _update: ProjectionUpdate) -> ProjectionCommit {
+            ProjectionCommit::Committed {
+                revision: self.next_revision.fetch_add(1, Ordering::Relaxed) + 1,
+            }
+        }
+    }
+
+    fn test_runtime() -> RuntimeParts {
+        build_runtime(Arc::new(TestCommitter::default()), 4, 4)
+    }
+
     fn request(target: PrefixedZoneId, correlation: Option<&str>) -> CommandRequest {
         let now = Instant::now();
         CommandRequest {
@@ -980,7 +959,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_endpoint_receives_once_and_provider_fallback_does_not() {
-        let parts = build_runtime(4, 4);
+        let parts = test_runtime();
         let mut provider = match parts.commands.register_provider("hqplayer", 1) {
             Ok(endpoint) => endpoint,
             Err(error) => panic!("provider endpoint: {error:?}"),
@@ -1011,7 +990,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn work_expiring_before_dispatch_is_never_permitted_to_execute() {
-        let parts = build_runtime(4, 4);
+        let parts = test_runtime();
         let mut endpoint = match parts.commands.register_provider("roon", 1) {
             Ok(endpoint) => endpoint,
             Err(error) => panic!("endpoint: {error:?}"),
@@ -1043,7 +1022,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_correlation_observes_one_operation_not_two_native_dispatches() {
-        let parts = build_runtime(4, 4);
+        let parts = test_runtime();
         let mut endpoint = match parts.commands.register_provider("lms", 2) {
             Ok(endpoint) => endpoint,
             Err(error) => panic!("endpoint: {error:?}"),
@@ -1071,7 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_acceptance_requires_a_correlated_projection_commit_to_confirm() {
-        let parts = build_runtime(4, 4);
+        let parts = test_runtime();
         let mut endpoint = match parts.commands.register_provider("roon", 1) {
             Ok(endpoint) => endpoint,
             Err(error) => panic!("endpoint: {error:?}"),
@@ -1125,46 +1104,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn stale_source_observation_cannot_overwrite_newer_projection() {
-        let parts = build_runtime(4, 4);
-        let actor = tokio::spawn(parts.projection_actor.run());
-        let source = ProjectionSource {
-            adapter: "lms".to_string(),
-            instance: Some("server-a".to_string()),
-            epoch: 7,
-        };
-        let committed = parts
-            .projection_ingress
-            .submit(projection(source.clone(), 2, None))
-            .await;
-        assert_eq!(committed, Ok(ProjectionCommit::Committed { revision: 1 }));
-        let stale = parts
-            .projection_ingress
-            .submit(projection(source, 1, None))
-            .await;
-        assert_eq!(
-            stale,
-            Ok(ProjectionCommit::StaleIgnored {
-                current_epoch: 7,
-                current_sequence: 2,
-            })
-        );
-        assert_eq!(parts.projection_view.revision(), 1);
-        assert_eq!(
-            parts.projection_view.entry("zone:one"),
-            Some((1, ProjectionPayload::Marker("observed".to_string())))
-        );
-        drop(parts.projection_ingress);
-        match actor.await {
-            Ok(()) => {}
-            Err(error) => panic!("projection actor join: {error}"),
-        }
-    }
-
     #[tokio::test(start_paused = true)]
     async fn confirmation_timeout_is_indeterminate_and_late_observation_resolves_it() {
-        let parts = build_runtime(4, 4);
+        let parts = test_runtime();
         let mut endpoint = match parts
             .commands
             .register_zone(PrefixedZoneId::hqplayer("main"), 1)
@@ -1226,7 +1168,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_commit_notification_is_only_a_reread_hint() {
-        let parts = build_runtime(4, 4);
+        let parts = test_runtime();
         let mut notifications = parts.projection_view.subscribe();
         let actor = tokio::spawn(parts.projection_actor.run());
         let commit = parts
@@ -1250,7 +1192,6 @@ mod tests {
             event,
             RuntimeNotification::ProjectionCommitted { revision: 1, .. }
         ));
-        assert_eq!(parts.projection_view.revision(), 1);
         drop(parts.projection_ingress);
         match actor.await {
             Ok(()) => {}
@@ -1260,7 +1201,7 @@ mod tests {
 
     #[tokio::test]
     async fn unrelated_source_cannot_confirm_a_command() {
-        let parts = build_runtime(4, 4);
+        let parts = test_runtime();
         let mut endpoint = parts
             .commands
             .register_provider("roon", 1)
@@ -1299,53 +1240,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delta_gap_marks_source_reconciling_until_a_snapshot_commits() {
-        let parts = build_runtime(4, 4);
-        let actor = tokio::spawn(parts.projection_actor.run());
-        let source = ProjectionSource {
-            adapter: "lms".to_string(),
-            instance: Some("server-a".to_string()),
-            epoch: 3,
-        };
-        parts
-            .projection_ingress
-            .submit(projection(source.clone(), 1, None))
-            .await
-            .expect("initial snapshot");
-        let mut gap = projection(source.clone(), 3, None);
-        gap.kind = ProjectionKind::Delta;
-        assert_eq!(
-            parts.projection_ingress.submit(gap).await,
-            Ok(ProjectionCommit::GapDetected {
-                expected_sequence: 2,
-                received_sequence: 3,
-            })
-        );
-        assert_eq!(
-            parts.projection_view.source_freshness(&source),
-            Some(ProjectionFreshness::Reconciling)
-        );
-        assert_eq!(parts.projection_view.revision(), 1);
-
-        assert_eq!(
-            parts
-                .projection_ingress
-                .submit(projection(source.clone(), 4, None))
-                .await,
-            Ok(ProjectionCommit::Committed { revision: 2 })
-        );
-        assert_eq!(
-            parts.projection_view.source_freshness(&source),
-            Some(ProjectionFreshness::Fresh)
-        );
-
-        drop(parts.projection_ingress);
-        actor.await.expect("projection actor");
-    }
-
-    #[tokio::test]
     async fn reconfiguration_is_busy_only_for_the_same_endpoint() {
-        let parts = build_runtime(4, 4);
+        let parts = test_runtime();
         let hqp_main = parts
             .commands
             .register_zone(PrefixedZoneId::hqplayer("main"), 2)
