@@ -35,11 +35,9 @@ src/api/mod.rs|hqp_remove_instance_handler|direct-field-access|hqp_instances
 src/api/mod.rs|hqp_status_handler|direct-field-access|hqplayer
 src/api/mod.rs|lms_config_handler|direct-field-access|lms
 src/api/mod.rs|lms_configure_handler|direct-field-access|lms
-src/api/mod.rs|lms_control_handler|direct-field-access|lms
 src/api/mod.rs|lms_player_handler|direct-field-access|lms
 src/api/mod.rs|lms_players_handler|direct-field-access|lms
 src/api/mod.rs|lms_status_handler|direct-field-access|lms
-src/api/mod.rs|lms_volume_handler|direct-field-access|lms
 src/api/mod.rs|new|concrete-adapter-type|HqpAdapter
 src/api/mod.rs|new|concrete-adapter-type|HqpInstanceManager
 src/api/mod.rs|new|concrete-adapter-type|LmsAdapter
@@ -72,13 +70,10 @@ src/api/mod.rs|upnp_control_handler|direct-field-access|upnp
 src/api/mod.rs|upnp_now_playing_handler|direct-field-access|upnp
 src/api/mod.rs|upnp_status_handler|direct-field-access|upnp
 src/api/mod.rs|upnp_zones_handler|direct-field-access|upnp
-src/knobs/routes.rs|control_lms|direct-field-access|lms
 src/knobs/routes.rs|control_openhome|direct-field-access|openhome
 src/knobs/routes.rs|control_roon|direct-field-access|roon
 src/knobs/routes.rs|control_upnp|direct-field-access|upnp
 src/mcp/tools/hqplayer.rs|<module-use>|concrete-adapter-import|HqpAdapter
-src/mcp/tools/hqplayer.rs|hqp_status_payload_for_adapter|concrete-adapter-type|HqpAdapter
-src/mcp/tools/hqplayer.rs|hqp_status_payload|direct-field-access|hqplayer
 src/mcp/tools/hqplayer.rs|resolve_target|direct-field-access|hqp_instances
 src/mcp/tools/hqplayer.rs|resolve_target|direct-field-access|hqplayer
 src/mcp/tools/hqplayer.rs|target_failure|concrete-adapter-type|HqpAdapter
@@ -91,11 +86,9 @@ src/mcp/tools/library.rs|play_ref_lms|direct-field-access|lms
 src/mcp/tools/library.rs|play_ref_roon|direct-field-access|roon
 src/mcp/tools/status.rs|status_payload|direct-field-access|hqplayer
 src/mcp/tools/status.rs|status_payload|direct-field-access|roon
-src/mcp/tools/transport.rs|handle_control|direct-field-access|lms
 src/mcp/tools/transport.rs|handle_control|direct-field-access|openhome
 src/mcp/tools/transport.rs|handle_control|direct-field-access|roon
 src/mcp/tools/transport.rs|handle_control|direct-field-access|upnp
-src/mcp/tools/transport.rs|set_volume|direct-field-access|lms
 src/mcp/tools/transport.rs|set_volume|direct-field-access|openhome
 src/mcp/tools/transport.rs|set_volume|direct-field-access|roon
 src/mcp/tools/transport.rs|set_volume|direct-field-access|upnp

@@ -279,7 +279,12 @@ mod server {
 
         // LMS adapters (polling + CLI subscription with shared state)
         // Issue #165: Split into two adapters with independent retry
-        let (lms, lms_cli) = adapters::lms::create_lms_adapters(bus.clone());
+        let lms_runtime_bridge = Arc::new(adapters::lms::LmsRuntimeBridge::new(
+            reliable_runtime.projection_ingress.clone(),
+            reliable_commands.clone(),
+        ));
+        let (lms, lms_cli) =
+            adapters::lms::create_lms_adapters_with_runtime(bus.clone(), Some(lms_runtime_bridge));
         if let Some(ref lms_config) = config.lms {
             lms.configure(
                 lms_config.host.clone(),

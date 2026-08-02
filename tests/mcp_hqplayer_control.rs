@@ -678,6 +678,45 @@ async fn mcp_mute_routes_to_the_hqplayer_instance_and_is_reported_from_the_floor
 // routing — HQPlayer-specific management tools, exact managed instance
 // =============================================================================
 
+/// **Client expectation.** A native connection is not visible until its coherent observation has
+/// committed. This pins the split-brain race that CI exposed: adapter-private state briefly became
+/// connected before `hqplayer:default` existed in the aggregator, so status said connected while
+/// the immediately following profile command said the zone was unpublished.
+#[tokio::test]
+async fn mcp_status_does_not_publish_adapter_private_connection_state() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    let adapter = rig
+        .manager
+        .add_instance(
+            "default".to_string(),
+            "127.0.0.1".to_string(),
+            Some(server.port()),
+            None,
+            None,
+            None,
+        )
+        .await;
+    adapter.set_timeouts(fast_timeouts()).await;
+    adapter.connect().await.expect("native connection");
+    assert!(
+        adapter.get_status().await.connected,
+        "the fixture must establish the private/aggregate race window"
+    );
+    assert!(
+        rig.aggregator.get_zone("hqplayer:default").await.is_none(),
+        "no coherent observation was published"
+    );
+
+    let status = rig.call_tool("hifi_hqplayer_status", json!({})).await;
+    let status_json: Value = serde_json::from_str(&text_of(&status)).expect("status JSON");
+    assert_eq!(status_json["connected"], false, "status={status_json}");
+
+    rig.shutdown().await;
+    server.stop();
+}
+
 /// **Client expectation.** Omitting `zone_id` preserves the original default-instance behavior.
 #[tokio::test]
 async fn mcp_hqplayer_status_profiles_and_pipeline_tools_reach_the_default_instance() {

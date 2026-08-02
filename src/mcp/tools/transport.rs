@@ -51,7 +51,8 @@
 //! refusal and `hifi_capabilities`' report cannot describe the same gap two
 //! different ways.
 
-use crate::api::AppState;
+use crate::api::{dispatch_lms_runtime_command, lms_runtime_command_from_action, AppState};
+use crate::bus::Command;
 use crate::knobs::routes::{dispatch_hqplayer_action, HqpDispatchError};
 use crate::mcp::capabilities::{support, Capability};
 use crate::mcp::envelope::{Envelope, Observed, Provider, Refusal, Scope};
@@ -176,7 +177,10 @@ pub async fn handle_control(
     }
 
     let result = match route {
-        TransportRoute::Lms => state.lms.control(&args.zone_id, backend_action, None).await,
+        TransportRoute::Lms => match lms_runtime_command_from_action(backend_action, None) {
+            Ok(command) => dispatch_lms_runtime_command(state, &args.zone_id, command).await,
+            Err(error) => Err(error),
+        },
         TransportRoute::OpenHome => {
             state
                 .openhome
@@ -432,10 +436,18 @@ async fn set_volume(
 
     let result = match route {
         VolumeRoute::Lms => {
-            state
-                .lms
-                .change_volume(zone_id, value as f32, relative)
-                .await
+            let command = if relative {
+                Command::VolumeRelative {
+                    delta: value as f32,
+                    output_id: None,
+                }
+            } else {
+                Command::VolumeAbsolute {
+                    value: value as f32,
+                    output_id: None,
+                }
+            };
+            dispatch_lms_runtime_command(state, zone_id, command).await
         }
         VolumeRoute::Roon => {
             state

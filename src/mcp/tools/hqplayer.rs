@@ -209,20 +209,23 @@ fn target_failure(
     }
 }
 
-async fn hqp_status_payload_for_adapter(
-    state: &AppState,
-    instance: &str,
-    adapter: &HqpAdapter,
-) -> McpHqpStatus {
-    let status = match state.aggregator.get_hqplayer_snapshot(instance).await {
-        Some(snapshot) => {
-            let mut connection = snapshot.observation.connection;
-            connection.connected =
-                snapshot.presence == crate::aggregator::HqpSnapshotPresence::Live;
-            connection
-        }
-        None => adapter.get_status().await,
+async fn hqp_status_payload_for_adapter(state: &AppState, instance: &str) -> McpHqpStatus {
+    let Some(snapshot) = state.aggregator.get_hqplayer_snapshot(instance).await else {
+        // Adapter-private connection state can become true before its first coherent observation
+        // commits. Returning that private state creates a split-brain window where a caller sees
+        // "connected" but the same caller's next bus command is correctly refused because no zone
+        // exists yet. The aggregator is the readable authority, so unpublished means not yet
+        // connected from every surface's point of view.
+        return McpHqpStatus {
+            connected: false,
+            host: None,
+            pipeline: None,
+            options: None,
+            options_unavailable_reason: None,
+        };
     };
+    let mut status = snapshot.observation.connection;
+    status.connected = snapshot.presence == crate::aggregator::HqpSnapshotPresence::Live;
     let (pipeline, options, options_unavailable_reason) =
         match crate::api::refresh_hqp_advanced_aggregate(state, instance).await {
             Ok(snapshot) => {
@@ -299,7 +302,7 @@ async fn hqp_status_payload_for_adapter(
 
 /// Shared default-instance payload for the tool and `hifi://hqplayer/status` resource.
 pub async fn hqp_status_payload(state: &AppState) -> McpHqpStatus {
-    hqp_status_payload_for_adapter(state, "default", &state.hqplayer).await
+    hqp_status_payload_for_adapter(state, "default").await
 }
 
 pub async fn handle_status(
@@ -309,11 +312,11 @@ pub async fn handle_status(
     let env = Envelope::read("hifi_hqplayer_status", "get_status")
         .param_opt("zone_id", args.zone_id.as_deref());
     let target = resolve_target(state, args.zone_id.as_deref()).await;
-    let (instance, adapter, env) = match target_failure(env, target) {
+    let (instance, _adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
         Err(result) => return result,
     };
-    Ok(env.json_result(&hqp_status_payload_for_adapter(state, &instance, &adapter).await))
+    Ok(env.json_result(&hqp_status_payload_for_adapter(state, &instance).await))
 }
 
 /// Fetch the default instance's profiles for the tool and MCP resource from one implementation.

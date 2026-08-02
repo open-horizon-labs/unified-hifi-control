@@ -38,12 +38,17 @@ use axum::{
     Router,
 };
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use unified_hifi_control::adapters::hqplayer::{HqpInstanceManager, HqpZoneLinkService};
-use unified_hifi_control::adapters::lms::LmsAdapter;
+use unified_hifi_control::adapters::lms::{
+    create_lms_adapters_with_runtime, LmsAdapter, LmsRuntimeBridge,
+};
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
 use unified_hifi_control::adapters::roon::RoonAdapter;
 use unified_hifi_control::adapters::upnp::UPnPAdapter;
@@ -51,6 +56,7 @@ use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
+use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp;
@@ -1654,6 +1660,7 @@ struct LmsHarness {
     player_id: &'static str,
     _settings: SettingsFixture,
     _aggregator: tokio::task::JoinHandle<()>,
+    _projection: tokio::task::JoinHandle<()>,
 }
 
 impl LmsHarness {
@@ -1676,7 +1683,13 @@ impl LmsHarness {
             .await;
 
         let bus = create_bus();
-        let lms = Arc::new(LmsAdapter::new(bus.clone()));
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let runtime = build_runtime(aggregator.clone(), 16, 32);
+        let bridge = Arc::new(LmsRuntimeBridge::new(
+            runtime.projection_ingress.clone(),
+            runtime.commands.clone(),
+        ));
+        let (lms, _lms_cli) = create_lms_adapters_with_runtime(bus.clone(), Some(bridge));
         lms.configure(
             mock.addr().ip().to_string(),
             Some(mock.addr().port()),
@@ -1685,11 +1698,39 @@ impl LmsHarness {
         )
         .await;
 
-        let state = build_state_with_bus(bus, Some(lms.clone())).await;
+        let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
+        let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
+        let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
+            bus.clone(),
+            aggregator.clone(),
+        ));
+        let hqplayer = hqp_instances.get_default().await;
+        let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
+        let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
+        let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
+        let startable_adapters: Vec<Arc<dyn Startable>> = vec![lms.clone()];
+        let state = AppState::new(
+            roon,
+            hqplayer,
+            hqp_instances,
+            hqp_zone_links,
+            lms.clone(),
+            openhome,
+            upnp,
+            KnobStore::new(),
+            bus.clone(),
+            aggregator.clone(),
+            coordinator,
+            startable_adapters,
+            Instant::now(),
+            CancellationToken::new(),
+        )
+        .with_reliable_commands(runtime.commands.clone());
 
-        // The aggregator only learns about zones by consuming bus events.
-        let aggregator = state.aggregator.clone();
+        // Match production ordering: both consumers are alive before the adapter can publish.
         let aggregator_task = tokio::spawn(async move { aggregator.run().await });
+        tokio::task::yield_now().await;
+        let projection_task = tokio::spawn(runtime.projection_actor.run());
 
         lms.start().await.expect("LMS adapter must start");
 
@@ -1723,6 +1764,7 @@ impl LmsHarness {
             player_id: Self::PLAYER_ID,
             _settings: settings,
             _aggregator: aggregator_task,
+            _projection: projection_task,
         }
     }
 
@@ -1732,6 +1774,7 @@ impl LmsHarness {
     async fn stop(self) {
         self.lms.stop().await;
         self._aggregator.abort();
+        self._projection.abort();
         self.mock.stop().await;
     }
 }
@@ -1816,6 +1859,33 @@ async fn lms_round_trip_pins_the_action_map_and_the_volume_sign() {
     h.stop().await;
 }
 
+/// The LMS server inventory is authoritative for player lifetime. Polling must retire a missing
+/// player through the reliable projection lane; a post-commit compatibility event may notify
+/// clients, but cannot be the mutation that removes it from the aggregator.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_poll_removes_a_missing_player_from_the_canonical_projection() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+    h.mock.remove_player(h.player_id).await;
+
+    let mut last = Value::Null;
+    for _ in 0..60 {
+        let text = result_text(&h.app.call_tool("hifi_zones", json!({})).await);
+        last = serde_json::from_str(&text).expect("hifi_zones JSON");
+        let still_present = last
+            .as_array()
+            .is_some_and(|zones| zones.iter().any(|zone| zone["zone_id"] == zone_id));
+        if !still_present {
+            h.stop().await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    panic!("removed LMS player remained in the aggregator: {last}");
+}
+
 /// `hifi_control` returns the action name plus the zone's post-command state.
 /// The prose framing is what a model reads back to the user.
 #[tokio::test]
@@ -1872,12 +1942,22 @@ async fn hqplayer_round_trip_reports_a_live_connection() {
         .connect()
         .await
         .expect("HQPlayer must connect to the mock");
+    state
+        .hqp_instances
+        .refresh_instance("default")
+        .await
+        .expect("the coherent observation must reach the aggregator");
 
     let app = TestApp::with_state(state.clone());
 
     let mut connected = false;
     for _ in 0..50 {
-        if state.hqplayer.get_status().await.connected {
+        if state
+            .aggregator
+            .get_hqplayer_snapshot("default")
+            .await
+            .is_some_and(|snapshot| snapshot.observation.connection.connected)
+        {
             connected = true;
             break;
         }
@@ -3891,13 +3971,13 @@ async fn scope_zone_name_is_absent_for_a_zone_the_aggregator_does_not_hold() {
 // mock a full round-trip can be driven through (see #394's notes on why Roon and
 // OpenHome/UPnP cannot be).
 
-/// A write reports `accepted`, never `ok`, and carries a read-back from the
+/// A write preserves the public `accepted` outcome and carries its confirmed read-back from the
 /// aggregator.
 ///
 /// The two halves of #221 in one assertion: the model is told the command was
-/// accepted (so it stops retrying) and is shown the state (so it does not need a
-/// follow-up call), with `as_of_ms` so it can judge staleness rather than being
-/// handed a conclusion the server cannot support.
+/// accepted (so it stops retrying) and is shown the causally linked state (so it does not need a
+/// follow-up call). Internally the command does not return until that projection commits; the
+/// stable envelope vocabulary remains unchanged.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
@@ -3916,7 +3996,7 @@ async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
     assert_eq!(
         env.get("outcome"),
         Some(&json!("accepted")),
-        "a write must report accepted — nothing here confirms the effect: {env}"
+        "the stable public write outcome remains accepted: {env}"
     );
     assert!(
         env.get("refusal").is_none(),
@@ -3966,6 +4046,11 @@ async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
         "observed.zone and the text's state block must be the same JSON value"
     );
     assert_eq!(from_text.get("zone_id"), Some(&json!(zone_id)));
+    assert_eq!(
+        from_text.get("state"),
+        Some(&json!("playing")),
+        "the endpoint must return the exact post-command LMS readback"
+    );
 
     h.stop().await;
 }
@@ -3976,17 +4061,8 @@ async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
 /// envelope turns it into: accepted, on this zone, at this level, with a zone
 /// snapshot attached.
 ///
-/// # What this deliberately does not assert
-///
-/// It does not check `observed.zone.volume` against the level just set. LMS state
-/// reaches the aggregator by polling, so the snapshot may well predate the
-/// command — asserting the new level would be asserting the verification #395
-/// forbids inventing, and would make this test flaky the moment poll timing
-/// shifted. `as_of_ms` is there so the client draws that conclusion itself.
-///
-/// An earlier name for this test claimed "the resulting level", which the body
-/// never checked. That is the same mislabelled-coverage defect the design gate's
-/// dissent found elsewhere, so the name now says what the body does.
+/// The reliable LMS endpoint now makes the result stronger than the former polling path: it reads
+/// the exact player after the write and correlates that full Zone commit before returning.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn lms_volume_write_reports_the_resolved_level_and_reads_the_zone_back() {
@@ -4015,9 +4091,12 @@ async fn lms_volume_write_reports_the_resolved_level_and_reads_the_zone_back() {
         env.get("scope").and_then(|s| s.get("provider")),
         Some(&json!("lms"))
     );
-    assert!(
-        env.get("observed").is_some(),
-        "the volume path must read state back too, not just transport: {env}"
+    assert_eq!(
+        env.get("observed")
+            .and_then(|observed| observed.get("zone"))
+            .and_then(|zone| zone.get("volume")),
+        Some(&json!(55.0)),
+        "the volume path must return its verified post-command projection: {env}"
     );
 
     h.stop().await;
@@ -5277,12 +5356,22 @@ async fn hqplayer_status_resource_agrees_with_the_tool_for_a_live_connection() {
         .connect()
         .await
         .expect("HQPlayer must connect to the mock");
+    state
+        .hqp_instances
+        .refresh_instance("default")
+        .await
+        .expect("the coherent observation must reach the aggregator");
 
     let app = TestApp::with_state(state.clone());
 
     let mut connected = false;
     for _ in 0..50 {
-        if state.hqplayer.get_status().await.connected {
+        if state
+            .aggregator
+            .get_hqplayer_snapshot("default")
+            .await
+            .is_some_and(|snapshot| snapshot.observation.connection.connected)
+        {
             connected = true;
             break;
         }

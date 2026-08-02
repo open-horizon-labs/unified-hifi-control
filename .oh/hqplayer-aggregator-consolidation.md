@@ -204,3 +204,24 @@ remain before publication of the next beta artifact.
   additionally requires recovered profile inventory. The correlated confirmation marker is last.
 - Deterministic adapter-boundary debt was ratcheted for every removed HTTP/MCP bypass; public route
   and MCP text contracts remain unchanged.
+
+## Reliable LMS transport and dual-ingestion reconciliation (2026-08-02)
+
+- LMS retains its proven independent HTTP-poller and CLI-subscription retry loops, but both now
+  publish complete player Zones through one serialized `lms` projection source. They no longer ask
+  the aggregator to reconstruct canonical state from competing partial broadcast events.
+- One provider-scoped reliable command endpoint owns LMS transport and volume writes. After native
+  JSON-RPC acceptance it reads the exact player through `players` plus `status`; only the correlated
+  full-Zone commit confirms the command.
+- Production HTTP control/volume, knob control, and MCP transport/volume paths submit through that
+  endpoint without changing their public request or response contracts.
+- LMS player removal is now a canonical projection operation. The polling cache also retires ids no
+  longer present in the authoritative server inventory; the prior cache never removed them, making
+  its existing removal branch unreachable.
+- The AST debt baseline dropped five LMS command bypasses. A production-equivalent mock-LMS MCP
+  harness now composes the same runtime and proves command mapping, verified readback, and canonical
+  player removal.
+- CI exposed a separate HQPlayer split-brain race: MCP status could read private adapter connection
+  state before the aggregator had published the zone. Status now reads the aggregator exclusively,
+  with a deterministic regression test, and the debt baseline dropped the two corresponding HQP
+  dependencies.

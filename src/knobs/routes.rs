@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
-use crate::api::AppState;
+use crate::api::{dispatch_lms_runtime_command, lms_runtime_command_from_action, AppState};
 use crate::bus::runtime::{
     CommandDeadlines, CommandLane, CommandRequest, CommandStatus, HqpRuntimeCommand, RuntimeCommand,
 };
@@ -1047,73 +1047,40 @@ async fn control_lms(
     action: &str,
     value: Option<&serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let lms_action = match action {
-        "play" => "play",
-        "pause" => "pause",
-        "play_pause" | "playpause" => "pause", // LMS uses pause to toggle
-        "next" => "next",
-        "previous" | "prev" => "prev",
-        "stop" => "stop",
+    let command = match action {
         "vol_up" | "volume_up" => {
-            // Use provided value, or look up zone's actual step from aggregator
-            let step = match value.and_then(|v| v.as_f64()) {
-                Some(v) => v as f32,
-                None => get_zone_step(state, &format!("lms:{}", player_id)).await,
-            };
-            state
-                .lms
-                .change_volume(player_id, step, true)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
+            let delta = value
+                .and_then(|v| v.as_f64())
+                .map(|value| value as f32)
+                .unwrap_or(get_zone_step(state, &format!("lms:{player_id}")).await);
+            Command::VolumeRelative {
+                delta,
+                output_id: None,
+            }
         }
         "vol_down" | "volume_down" => {
-            // Use provided value, or look up zone's actual step from aggregator
-            let step = match value.and_then(|v| v.as_f64()) {
-                Some(v) => v as f32,
-                None => get_zone_step(state, &format!("lms:{}", player_id)).await,
-            };
-            state
-                .lms
-                .change_volume(player_id, -step, true)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
+            let delta = -value
+                .and_then(|v| v.as_f64())
+                .map(|value| value as f32)
+                .unwrap_or(get_zone_step(state, &format!("lms:{player_id}")).await);
+            Command::VolumeRelative {
+                delta,
+                output_id: None,
+            }
         }
-        "vol_abs" | "volume" => {
-            // Use as_f64() which handles both JSON integers and floats
-            let vol = value.and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
-            state
-                .lms
-                .change_volume(player_id, vol, false)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
-        }
-        _ => {
-            return Err((
+        _ => lms_runtime_command_from_action(
+            action,
+            value.and_then(|v| v.as_f64()).map(|v| v as f32),
+        )
+        .map_err(|_| {
+            (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("Unknown action: {}", action)})),
-            ));
-        }
+            )
+        })?,
     };
 
-    match state.lms.control(player_id, lms_action, None).await {
+    match dispatch_lms_runtime_command(state, player_id, command).await {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

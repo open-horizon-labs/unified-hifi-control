@@ -396,6 +396,11 @@ impl ZoneAggregator {
                         .zones
                         .insert(zone.zone_id.clone(), (**zone).clone());
                 }
+                ProjectionPayload::ZoneRemoved { zone_id } => {
+                    if aggregate.zones.remove(&zone_id.to_string()).is_some() {
+                        removed_zones.push(zone_id.clone());
+                    }
+                }
                 ProjectionPayload::HqpObservation(observation) => {
                     let snapshots = &mut aggregate.hqplayer_snapshots;
                     if snapshots

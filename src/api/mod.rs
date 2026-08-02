@@ -9,8 +9,11 @@ use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
 use crate::adapters::Startable;
 use crate::aggregator::{HqpSnapshotPresence, ZoneAggregator};
-use crate::bus::runtime::{CommandGateway, HqpRuntimeCommand};
-use crate::bus::{BusEvent, SharedBus};
+use crate::bus::runtime::{
+    CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
+    HqpRuntimeCommand, RuntimeCommand,
+};
+use crate::bus::{BusEvent, Command, PrefixedZoneId, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -178,6 +181,79 @@ impl AppState {
         } else {
             Ok(raw_image)
         }
+    }
+}
+
+/// Route an LMS transport/volume action through the private reliable runtime without altering any
+/// public HTTP or MCP payload.  The command becomes successful only after the LMS endpoint has
+/// committed its exact-player readback to the aggregator.
+pub(crate) async fn dispatch_lms_runtime_command(
+    state: &AppState,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    let target = PrefixedZoneId::lms(zone_id.strip_prefix("lms:").unwrap_or(zone_id));
+    let Some(gateway) = state.reliable_commands.as_ref() else {
+        // Compatibility-only construction used by older embedders and contract fixtures. There is
+        // no direct adapter fallback: preserve the established actionable error while refusing
+        // native I/O outside the reliable runtime.
+        return Err(anyhow::anyhow!("LMS host not configured"));
+    };
+    if !gateway.has_endpoint(&target) {
+        return Err(anyhow::anyhow!("LMS command endpoint is not available"));
+    }
+    let now = tokio::time::Instant::now();
+    let mut ticket = gateway
+        .submit(CommandRequest {
+            target,
+            command: RuntimeCommand::Control(command),
+            correlation_id: None,
+            lane: CommandLane::Interactive,
+            deadlines: CommandDeadlines {
+                dispatch_by: now + Duration::from_secs(3),
+                confirm_by: now + Duration::from_secs(15),
+            },
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("LMS command admission failed: {error:?}"))?;
+    match ticket.wait_for_observable_result().await {
+        CommandStatus::Confirmed { .. } => Ok(()),
+        CommandStatus::Failed { detail } | CommandStatus::NotDispatched { detail } => {
+            Err(anyhow::anyhow!(detail))
+        }
+        CommandStatus::Indeterminate => Err(anyhow::anyhow!(
+            "LMS accepted the command but did not publish a verified readback in time"
+        )),
+        CommandStatus::Queued | CommandStatus::Dispatched | CommandStatus::AwaitingProjection => {
+            Err(anyhow::anyhow!(
+                "LMS command stopped without a terminal result"
+            ))
+        }
+    }
+}
+
+/// Normalize the stable legacy LMS action vocabulary before it crosses the private runtime seam.
+/// Kept here so HTTP, knob, and MCP surfaces cannot drift into subtly different native commands.
+pub(crate) fn lms_runtime_command_from_action(
+    action: &str,
+    value: Option<f32>,
+) -> anyhow::Result<Command> {
+    match action {
+        "play" => Ok(Command::Play),
+        "pause" => Ok(Command::Pause),
+        "play_pause" | "playpause" => Ok(Command::PlayPause),
+        "stop" => Ok(Command::Stop),
+        "next" => Ok(Command::Next),
+        "previous" | "prev" => Ok(Command::Previous),
+        "volume" | "vol_abs" => Ok(Command::VolumeAbsolute {
+            value: value.unwrap_or(50.0),
+            output_id: None,
+        }),
+        "vol_rel" => Ok(Command::VolumeRelative {
+            delta: value.unwrap_or(0.0),
+            output_id: None,
+        }),
+        _ => Err(anyhow::anyhow!("Unknown command: {action}")),
     }
 }
 
@@ -1341,11 +1417,12 @@ pub async fn lms_control_handler(
     State(state): State<AppState>,
     Json(req): Json<LmsControlRequest>,
 ) -> impl IntoResponse {
-    match state
-        .lms
-        .control(&req.player_id, &req.action, req.value)
-        .await
-    {
+    let result =
+        match lms_runtime_command_from_action(&req.action, req.value.map(|value| value as f32)) {
+            Ok(command) => dispatch_lms_runtime_command(&state, &req.player_id, command).await,
+            Err(error) => Err(error),
+        };
+    match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1371,11 +1448,18 @@ pub async fn lms_volume_handler(
     State(state): State<AppState>,
     Json(req): Json<LmsVolumeRequest>,
 ) -> impl IntoResponse {
-    match state
-        .lms
-        .change_volume(&req.player_id, req.value, req.relative)
-        .await
-    {
+    let command = if req.relative {
+        Command::VolumeRelative {
+            delta: req.value,
+            output_id: None,
+        }
+    } else {
+        Command::VolumeAbsolute {
+            value: req.value,
+            output_id: None,
+        }
+    };
+    match dispatch_lms_runtime_command(&state, &req.player_id, command).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

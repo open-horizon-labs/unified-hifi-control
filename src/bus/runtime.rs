@@ -528,6 +528,12 @@ impl ProjectionSource {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectionPayload {
     Zone(Box<Zone>),
+    /// A provider has authoritatively retired one zone.  Like [`Self::Zone`], this stays on the
+    /// private reliable ingress so observers never mutate the aggregator through lossy broadcast
+    /// events.  The aggregator emits the compatibility notification only after the removal commits.
+    ZoneRemoved {
+        zone_id: PrefixedZoneId,
+    },
     /// One generation-fenced HQPlayer observation.  This stays on the private projection lane:
     /// the legacy HTTP payload is still projected by the aggregator from this native fact.
     HqpObservation(Box<HqpNativeObservation>),
