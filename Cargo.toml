@@ -32,7 +32,6 @@ server = [
     "dep:mime_guess",
     "dep:http-body-util",
     "dep:rust-mcp-sdk",
-    "dep:zip",
 ]
 web = ["dioxus/web"]
 
@@ -95,8 +94,7 @@ roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git", bra
 # TODO: Switch back to upstream after TheAppgineer/rust-roon-api#1 and #2 are merged
 
 # HTTP client (server only)
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "multipart", "rustls-tls"], optional = true }
-zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"], optional = true }
 
 # Logging subscriber (server only - needs tokio)
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }

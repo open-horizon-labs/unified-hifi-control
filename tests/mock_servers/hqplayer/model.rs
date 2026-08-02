@@ -177,6 +177,8 @@ pub enum FilterFieldReporting {
 /// The daemon's observable state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DaemonState {
+    /// Named persistent configuration reported by `ConfigurationGet`; empty is the base config.
+    pub active_configuration: String,
     /// 0 stopped, 1 paused, 2 playing, 3 stop requested.
     pub playback: u8,
     /// The **configured** `ModesItem` list index: 0 `[source]`, 1 PCM, 2 SDM.
@@ -213,6 +215,7 @@ pub struct DaemonState {
 impl Default for DaemonState {
     fn default() -> Self {
         Self {
+            active_configuration: String::new(),
             playback: 0,
             mode_index: 1, // PCM
             // Consistent with the configured mode: a configured PCM mode pins the PCM chain.
@@ -932,11 +935,10 @@ impl Responder for DaemonModel {
                 let doc = inner.enumeration("GetInfo");
                 inner.wrap(&doc)
             }
-            // Embedded 6 exposes the active configuration through the native lane. The
-            // conformance daemon models the ordinary working configuration; named profile
-            // snapshots are represented by the web backup fixture rather than by a second
-            // mutable native state machine.
-            "ConfigurationGet" => inner.wrap("<ConfigurationGet value=\"\"/>"),
+            "ConfigurationGet" => inner.wrap(&format!(
+                "<ConfigurationGet value=\"{}\"/>",
+                xml_escape(&inner.state.active_configuration)
+            )),
             "State" => inner.render_state(),
             "Status" => inner.render_status(),
 

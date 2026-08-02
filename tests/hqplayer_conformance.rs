@@ -1599,8 +1599,9 @@ async fn a_volume_step_moves_the_level_by_the_advertised_step() {
 // * What #322 does owe this lane is an executable record of the verified response-family semantics:
 //   which fields the read side carries, and the fact that the write side's HTTP 200 carries no
 //   outcome at all. Both are properties of the documents, so the corpus is where they belong.
-// * The restore transport itself - multipart upload, daemon self-restart, `/backup` readback
-//   polling - is issue #330's, and nothing here implements or presumes it.
+// * The archive-restore fixture remains historical evidence that HTTP 200 is not an outcome. The
+//   production profile path does not use archive backup/restore; it submits the browser form and
+//   verifies the active name with native `ConfigurationGet` (HQP-C-065).
 
 #[test]
 fn the_persistent_config_form_carries_the_verified_field_names() {
@@ -2090,6 +2091,64 @@ async fn tier1_live_read_only_verification_when_opted_in() {
         report.divergences.len(),
         report.unverified
     );
+}
+
+/// Opt-in **tier-2 persistent profile verification** against a disposable named profile.
+///
+/// This is intentionally a separate gate from tier 1: it submits HQPlayer's authenticated browser
+/// profile form and may restart the daemon. The operator must prepare a profile whose
+/// settings are safe to load, then name it explicitly with `UHC_HQP_TIER2_PROFILE`. Merely setting
+/// the tier-1 host can therefore never turn a read-only qualification into a write.
+///
+/// The test exercises the public adapter operation end to end. A raw HTTP 200 is not success:
+/// `load_profile` must verify the named configuration through native `ConfigurationGet` and recover
+/// a coherent native session.
+#[tokio::test]
+async fn tier2_live_persistent_profile_verification_when_opted_in() {
+    let Ok(profile) = std::env::var("UHC_HQP_TIER2_PROFILE") else {
+        eprintln!(
+            "skipping tier-2 persistent verification: set UHC_HQP_TIER2_PROFILE only for a \
+             disposable named profile that is safe to load"
+        );
+        return;
+    };
+    let host = std::env::var("UHC_HQP_CONFORMANCE_HOST")
+        .expect("UHC_HQP_TIER2_PROFILE requires UHC_HQP_CONFORMANCE_HOST");
+    let port = tier1_port("UHC_HQP_CONFORMANCE_PORT", 4321).unwrap_or_else(|e| panic!("{e}"));
+    let web_port =
+        tier1_port("UHC_HQP_CONFORMANCE_WEB_PORT", 8088).unwrap_or_else(|e| panic!("{e}"));
+    let (user, pass) = tier1_credentials(
+        std::env::var("UHC_HQP_CONFORMANCE_WEB_USER").ok(),
+        std::env::var("UHC_HQP_CONFORMANCE_WEB_PASS").ok(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        user.is_some(),
+        "tier-2 persistent verification requires both web credential variables"
+    );
+
+    isolate_config_dir();
+    let adapter = HqpAdapter::new(create_bus());
+    adapter
+        .configure(host.clone(), Some(port), Some(web_port), user, pass)
+        .await;
+    adapter
+        .connect()
+        .await
+        .unwrap_or_else(|e| panic!("connect to HQPlayer at {host}:{port}: {e:#}"));
+    let profiles = adapter
+        .fetch_profiles()
+        .await
+        .unwrap_or_else(|e| panic!("fetch disposable HQPlayer profile: {e:#}"));
+    assert!(
+        profiles.iter().any(|candidate| candidate.value == profile),
+        "disposable profile {profile:?} is not present; observed {profiles:?}"
+    );
+
+    adapter
+        .load_profile(&profile)
+        .await
+        .unwrap_or_else(|e| panic!("load and verify disposable profile {profile:?}: {e:#}"));
 }
 
 // =============================================================================
@@ -8087,12 +8146,11 @@ async fn a_chain_that_moves_on_both_the_read_and_the_retry_is_reported_rather_th
     h.stop();
 }
 
-/// The persistent profile lane must acquire a fresh settings backup before mutating anything. This
-/// older fake only serves the profile form; it deliberately has no `/backup/settings.zip` or
-/// `/restore` implementation. The safe #330 implementation must refuse before dispatch and leave
-/// the still-valid native cache alone.
+/// A browser-form HTTP response is only dispatch evidence. Without a matching native
+/// `ConfigurationGet`, the adapter must refuse to report success and discard caches that the
+/// possibly-applied profile could have invalidated.
 #[tokio::test]
-async fn a_profile_load_without_a_fresh_backup_refuses_before_mutation() {
+async fn a_profile_form_post_without_native_confirmation_never_reports_success() {
     // This test is what made the shared-config coupling bite: supplying credentials leaked them to
     // every adapter built afterwards, and `tier1_checks_every_family_adr_003_requires` then attempted
     // a config read against a web server that had already stopped, recording `config_form` as neither
@@ -8141,29 +8199,18 @@ async fn a_profile_load_without_a_fresh_backup_refuses_before_mutation() {
 
     let load_error = h
         .adapter
-        .load_profile("raw-a")
+        .load_profile("semantic-z")
         .await
-        .expect_err("a persistent write without a fresh backup must be refused");
+        .expect_err("HTTP success without matching ConfigurationGet is not success");
+    let load_error = format!("{load_error:#}");
     assert!(
-        load_error
-            .to_string()
-            .contains("fetch fresh HQPlayer settings backup"),
-        "the refusal must identify the failed pre-mutation safety check: {load_error}"
+        load_error.contains("active configuration did not become \"semantic-z\""),
+        "the refusal must identify the failed native verification: {load_error}"
     );
-
-    let published = h
-        .adapter
-        .get_pipeline_status()
-        .await
-        .expect("a refused preflight leaves the unchanged native state readable");
-    let offered: Vec<&str> = published
-        .settings
-        .shaper
-        .options
-        .iter()
-        .map(|o| o.value.as_str())
-        .collect();
-    assert_eq!(offered, stale);
+    assert!(
+        h.adapter.get_cached_profiles().await.is_empty(),
+        "post-dispatch ambiguity invalidates the form cache"
+    );
     h.stop();
     web.stop();
 }

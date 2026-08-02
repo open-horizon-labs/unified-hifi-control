@@ -17,16 +17,16 @@ MCP schema changes. PR #428 is current with `v3` and now contains:
   profile, convolution, adaptive volume, repeat and random;
 * exact per-instance MCP targeting and coherent status/options snapshots; profile reads are fresh
   and report web-lane errors instead of silently returning `[]`;
-* transactional named-profile persistence: fresh ZIP backup, active-configuration bracketing,
-  bounded/safe archive validation, one restore dispatch, restart-aware readback, and verified
-  rollback on divergence;
+* browser-compatible named-profile persistence: fresh hidden fields, URL-encoded form submission,
+  Digest retry with browser `Origin`/`Referer`, restart-aware native `ConfigurationGet` verification,
+  and coherent cache recovery; UHC never invokes Embedded's unsafe archive backup/restore lane;
 * private QNAP state (`umask 077`) and scoped shutdown without killing an unrelated port-8088
   process; and
 * zero actionable RustSec vulnerabilities after dependency upgrades (seven allowed transitive
   maintenance/unsound/yanked warnings remain recorded by `cargo audit`).
 
 The post-merge audit found and corrected stale repository contracts rather than waiving them:
-the profile-operation fakes now exercise backup → restore → readback, the lifecycle suite encodes
+the profile-operation fakes now exercise browser form → native readback, the lifecycle suite encodes
 no-flicker recovery, the HQPlayer evidence ledger records the implemented junk-filter setter, the
 coherent-pipeline AST lint follows the under-operation implementation, and the approved MCP fixture
 includes the new status/options vocabulary.

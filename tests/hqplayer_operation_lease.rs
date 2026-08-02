@@ -5,10 +5,8 @@
 #[allow(dead_code, unused_imports, unused_variables)]
 mod mock_servers;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use std::{io::Cursor, io::Write};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -118,29 +116,17 @@ struct ProfileWeb {
     task: tokio::task::JoinHandle<()>,
 }
 
-fn profile_backup(applied: bool) -> Vec<u8> {
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options = zip::write::SimpleFileOptions::default();
-    writer.start_file("hqplayerd.xml", options).unwrap();
-    let working = if applied {
-        br#"<hqplayerd><engine profile="raw-a"/></hqplayerd>"#.as_slice()
-    } else {
-        br#"<hqplayerd><engine profile="default"/></hqplayerd>"#.as_slice()
-    };
-    writer.write_all(working).unwrap();
-    writer.start_file("data/cfgs/raw-a.xml", options).unwrap();
-    writer
-        .write_all(br#"<hqplayerd><engine profile="raw-a"/></hqplayerd>"#)
-        .unwrap();
-    writer.finish().unwrap().into_inner()
-}
-
 impl ProfileWeb {
-    async fn start(pause_post: bool, drop_post_response: bool) -> Self {
-        Self::start_with_post_status(pause_post, drop_post_response, 200).await
+    async fn start(
+        native: Option<DaemonModel>,
+        pause_post: bool,
+        drop_post_response: bool,
+    ) -> Self {
+        Self::start_with_post_status(native, pause_post, drop_post_response, 200).await
     }
 
     async fn start_with_post_status(
+        native: Option<DaemonModel>,
         pause_post: bool,
         drop_post_response: bool,
         post_status: u16,
@@ -152,24 +138,17 @@ impl ProfileWeb {
         let post_seen = Arc::new(Notify::new());
         let release_post = Arc::new(Notify::new());
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let applied = Arc::new(AtomicBool::new(false));
-        let before_backup = Arc::new(profile_backup(false));
-        let after_backup = Arc::new(profile_backup(true));
         let task = {
             let post_seen = post_seen.clone();
             let release_post = release_post.clone();
             let requests = requests.clone();
-            let applied = applied.clone();
-            let before_backup = before_backup.clone();
-            let after_backup = after_backup.clone();
+            let native = native.clone();
             tokio::spawn(async move {
                 while let Ok((mut socket, _)) = listener.accept().await {
                     let post_seen = post_seen.clone();
                     let release_post = release_post.clone();
                     let requests = requests.clone();
-                    let applied = applied.clone();
-                    let before_backup = before_backup.clone();
-                    let after_backup = after_backup.clone();
+                    let native = native.clone();
                     tokio::spawn(async move {
                         let mut head = Vec::new();
                         loop {
@@ -189,27 +168,22 @@ impl ProfileWeb {
                             .lock()
                             .expect("profile request log lock")
                             .push(first_line.clone());
-                        if first_line.starts_with("POST /restore ") {
+                        if first_line.starts_with("POST /config/profile/load ") {
                             post_seen.notify_one();
                             if pause_post {
                                 release_post.notified().await;
                             }
-                            // A response failure is deliberately independent of application. The
-                            // adapter must reconcile it through the fresh backup readback.
-                            applied.store(true, Ordering::Release);
+                            if let Some(native) = native {
+                                native.external_change(|state| {
+                                    state.active_configuration = "raw-a".to_string();
+                                });
+                            }
                             if drop_post_response {
                                 return;
                             }
                         }
                         let (body, content_type): (Vec<u8>, &str) =
-                            if first_line.starts_with("GET /backup/settings.zip ") {
-                                let archive = if applied.load(Ordering::Acquire) {
-                                    after_backup.as_ref()
-                                } else {
-                                    before_backup.as_ref()
-                                };
-                                (archive.clone(), "application/zip")
-                            } else if first_line.starts_with("GET /config/profile/load ") {
+                            if first_line.starts_with("GET /config/profile/load ") {
                                 (
                                     r#"<html><body><form>
                             <input type="hidden" name="_xsrf" value="token"/>
@@ -222,7 +196,7 @@ impl ProfileWeb {
                             } else {
                                 (b"ok".to_vec(), "text/html")
                             };
-                        let status = if first_line.starts_with("POST /restore ") {
+                        let status = if first_line.starts_with("POST /config/profile/load ") {
                             post_status
                         } else {
                             200
@@ -607,22 +581,16 @@ async fn timing_out_an_operation_releases_queued_reconfiguration() {
     second.stop();
 }
 
-/// A persistent profile load changes the native setting universe. Its backup, restore, readback,
-/// cache invalidation, and native enumeration refresh therefore share one endpoint lease.
+/// A persistent profile load changes the native setting universe. Its form dispatch, native
+/// readback, cache invalidation, and enumeration refresh therefore share one endpoint lease.
 #[tokio::test]
-async fn profile_restore_and_native_refresh_stay_on_one_endpoint() {
-    let first = WireServer::start(
-        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
-        WirePolicy::default(),
-    )
-    .await;
-    let second = WireServer::start(
-        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
-        WirePolicy::default(),
-    )
-    .await;
-    let first_web = ProfileWeb::start(true, false).await;
-    let second_web = ProfileWeb::start(false, false).await;
+async fn profile_form_and_native_refresh_stay_on_one_endpoint() {
+    let first_model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    let first = WireServer::start(Arc::new(first_model.clone()), WirePolicy::default()).await;
+    let second_model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    let second = WireServer::start(Arc::new(second_model.clone()), WirePolicy::default()).await;
+    let first_web = ProfileWeb::start(Some(first_model), true, false).await;
+    let second_web = ProfileWeb::start(Some(second_model), false, false).await;
     let adapter = Arc::new(HqpAdapter::new(create_bus()));
     adapter
         .configure(
@@ -669,7 +637,7 @@ async fn profile_restore_and_native_refresh_stay_on_one_endpoint() {
     configure_started.notified().await;
     assert!(
         !reconfigure.is_finished(),
-        "configure must remain queued while endpoint A's profile restore is unresolved"
+        "configure must remain queued while endpoint A's profile load is unresolved"
     );
     assert_eq!(adapter.endpoint_generation().await, endpoint_before);
     let filters_before = first.stats().element_count("GetFilters");
@@ -677,14 +645,14 @@ async fn profile_restore_and_native_refresh_stay_on_one_endpoint() {
 
     load.await
         .expect("profile task joins")
-        .expect("fresh backup readback verifies the applied profile");
+        .expect("native ConfigurationGet verifies the applied profile");
     reconfigure
         .await
         .expect("configure follows profile refresh");
     assert_eq!(
         first_web.count("GET "),
-        3,
-        "backup capture, applied readback, and fresh profile-list recovery stay on endpoint A"
+        2,
+        "initial form capture and fresh profile-list recovery stay on endpoint A"
     );
     assert_eq!(first_web.count("POST "), 1);
     assert_eq!(second_web.count("GET "), 0);
@@ -706,15 +674,12 @@ async fn profile_restore_and_native_refresh_stay_on_one_endpoint() {
     second_web.stop();
 }
 
-/// Once a restore has been dispatched, losing its response is reconciled against a fresh backup.
+/// Once the browser form has been dispatched, losing its response is reconciled natively.
 #[tokio::test]
-async fn lost_restore_response_is_reconciled_by_persistent_readback() {
-    let native = WireServer::start(
-        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
-        WirePolicy::default(),
-    )
-    .await;
-    let web = ProfileWeb::start(false, true).await;
+async fn lost_profile_form_response_is_reconciled_by_native_readback() {
+    let model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    let native = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
+    let web = ProfileWeb::start(Some(model), false, true).await;
     let adapter = Arc::new(HqpAdapter::new(create_bus()));
     adapter
         .configure(
@@ -730,24 +695,20 @@ async fn lost_restore_response_is_reconciled_by_persistent_readback() {
     adapter
         .load_profile("raw-a")
         .await
-        .expect("a dropped response is success only after matching backup readback");
-    assert_eq!(web.count("GET "), 3);
+        .expect("a dropped response is success only after native readback matches");
+    assert_eq!(web.count("GET "), 2);
     assert_eq!(web.count("POST "), 1);
 
     native.stop();
     web.stop();
 }
 
-/// A server-side restore response is not proof of rejection. Matching persistent readback is the
-/// authoritative outcome.
+/// A server-side form response is not proof of rejection. Native readback is authoritative.
 #[tokio::test]
-async fn restore_server_error_is_reconciled_by_persistent_readback() {
-    let native = WireServer::start(
-        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
-        WirePolicy::default(),
-    )
-    .await;
-    let web = ProfileWeb::start_with_post_status(false, false, 500).await;
+async fn profile_form_server_error_is_reconciled_by_native_readback() {
+    let model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    let native = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
+    let web = ProfileWeb::start_with_post_status(Some(model), false, false, 500).await;
     let adapter = HqpAdapter::new(create_bus());
     adapter
         .configure(
@@ -769,8 +730,8 @@ async fn restore_server_error_is_reconciled_by_persistent_readback() {
     adapter
         .load_profile("raw-a")
         .await
-        .expect("HTTP 500 does not override matching persistent readback");
-    assert_eq!(web.count("GET "), 3);
+        .expect("HTTP 500 does not override matching native readback");
+    assert_eq!(web.count("GET "), 2);
     assert_eq!(web.count("POST "), 1);
     assert!(
         !adapter.get_cached_profiles().await.is_empty(),
@@ -930,16 +891,13 @@ async fn pipeline_read_restarts_when_its_native_session_changes() {
     native.stop();
 }
 
-/// A verified restore invalidates every replaced cache, refills the native universe, and refreshes
-/// the persistent profile list even when the restore response itself was lost.
+/// A verified profile load invalidates every replaced cache, refills the native universe, and
+/// refreshes the profile list even when the form response itself was lost.
 #[tokio::test]
-async fn verified_restore_refills_native_and_persistent_caches() {
-    let native = WireServer::start(
-        Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
-        WirePolicy::default(),
-    )
-    .await;
-    let web = ProfileWeb::start(false, true).await;
+async fn verified_profile_load_refills_native_and_persistent_caches() {
+    let model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    let native = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
+    let web = ProfileWeb::start(Some(model), false, true).await;
     let adapter = HqpAdapter::new(create_bus());
     adapter
         .configure(
@@ -965,7 +923,7 @@ async fn verified_restore_refills_native_and_persistent_caches() {
     adapter
         .load_profile("raw-a")
         .await
-        .expect("matching backup readback reconciles the dropped restore response");
+        .expect("matching native readback reconciles the dropped form response");
     assert!(
         !adapter.get_cached_profiles().await.is_empty(),
         "successful recovery publishes a freshly fetched persistent profile list"
@@ -993,8 +951,8 @@ async fn changing_only_the_web_endpoint_clears_persistent_lane_caches() {
         WirePolicy::default(),
     )
     .await;
-    let first_web = ProfileWeb::start(false, false).await;
-    let second_web = ProfileWeb::start(false, false).await;
+    let first_web = ProfileWeb::start(None, false, false).await;
+    let second_web = ProfileWeb::start(None, false, false).await;
     let adapter = HqpAdapter::new(create_bus());
     adapter
         .configure(
@@ -1038,7 +996,7 @@ async fn changing_only_web_credentials_clears_persistent_lane_caches() {
         WirePolicy::default(),
     )
     .await;
-    let web = ProfileWeb::start(false, false).await;
+    let web = ProfileWeb::start(None, false, false).await;
     let adapter = HqpAdapter::new(create_bus());
     adapter
         .configure(

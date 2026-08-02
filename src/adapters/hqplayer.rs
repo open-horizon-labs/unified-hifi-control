@@ -21,7 +21,6 @@
 //! - `result="OK"` is not proof a setting applied. See `verify_applied`.
 
 mod lifecycle;
-mod persistence;
 pub use lifecycle::{HqpRecoveryConfig, HqpWorkerPhase, HqpWorkerStatus};
 
 use anyhow::{anyhow, Context, Result};
@@ -48,7 +47,7 @@ use crate::bus::{
     BusEvent, NowPlaying as BusNowPlaying, PlaybackState, PrefixedZoneId, SharedBus, TrackMetadata,
     VolumeControl as BusVolumeControl, VolumeScale, Zone as BusZone,
 };
-use crate::config::{get_config_file_path, get_config_subdir, read_config_file};
+use crate::config::{get_config_file_path, read_config_file};
 use lifecycle::{supervise_worker, RecoveryState, SharedRecoveryState, SharedWorkerPhase};
 
 const HQP_CONFIG_FILE: &str = "hqp-config.json";
@@ -652,8 +651,6 @@ const DEFAULT_WEB_PORT: u16 = 8088;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROFILE_PATH: &str = "/config/profile/load";
-const BACKUP_PATH: &str = "/backup/settings.zip";
-const RESTORE_PATH: &str = "/restore";
 /// Maximum reconnection attempts before giving up
 const MAX_RECONNECT_ATTEMPTS: u32 = 2;
 /// Delay between reconnection attempts (HQPlayer can be overwhelmed by rapid connections)
@@ -959,7 +956,7 @@ mod secure_state_file_tests {
 }
 
 #[cfg(test)]
-mod persistent_http_tests {
+mod profile_form_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -991,73 +988,28 @@ mod persistent_http_tests {
     }
 
     #[tokio::test]
-    async fn persistent_lane_uses_the_verified_backup_and_multipart_restore_routes() {
+    async fn profile_load_replays_the_browser_form_contract_after_digest_challenge() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
-            let (mut get, _) = listener.accept().await.unwrap();
-            let get_request = read_request(&mut get).await;
-            get.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nZIP-BLOB",
-            )
-            .await
-            .unwrap();
-
-            let (mut post, _) = listener.accept().await.unwrap();
-            let post_request = read_request(&mut post).await;
-            post.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await
-                .unwrap();
-            (get_request, post_request)
-        });
-
-        let adapter = HqpAdapter::new(crate::bus::create_bus());
-        {
-            let mut state = adapter.state.write().await;
-            state.host = Some("127.0.0.1".to_string());
-            state.web_port = port;
-            state.web_username = Some("user".to_string());
-            state.web_password = Some("password".to_string());
-        }
-        assert_eq!(
-            adapter.web_get_bytes(BACKUP_PATH).await.unwrap(),
-            b"ZIP-BLOB"
-        );
-        assert!(adapter
-            .dispatch_restore(b"RESTORE-ZIP")
-            .await
-            .unwrap()
-            .status()
-            .is_success());
-
-        let (get, post) = server.await.unwrap();
-        let get = String::from_utf8_lossy(&get);
-        assert!(
-            get.starts_with("GET /backup/settings.zip HTTP/1.1"),
-            "{get}"
-        );
-        let post = String::from_utf8_lossy(&post);
-        assert!(post.starts_with("POST /restore HTTP/1.1"), "{post}");
-        assert!(post.contains("name=\"scope\""), "{post}");
-        assert!(post.contains("system"), "{post}");
-        assert!(post.contains("filename=\"settings.zip\""), "{post}");
-        assert!(post.contains("RESTORE-ZIP"), "{post}");
-    }
-
-    #[tokio::test]
-    async fn restarting_daemon_html_is_not_accepted_as_a_backup_archive() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let _ = read_request(&mut socket).await;
-            socket
+            let (mut first, _) = listener.accept().await.unwrap();
+            let first_request = read_request(&mut first).await;
+            first
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 20\r\nConnection: close\r\n\r\n<html>restarting</html>",
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"HQPlayer\", nonce=\"live-nonce\", qop=\"auth\", algorithm=MD5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .await
                 .unwrap();
+
+            let (mut retry, _) = listener.accept().await.unwrap();
+            let retry_request = read_request(&mut retry).await;
+            retry
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            (first_request, retry_request)
         });
+
         let adapter = HqpAdapter::new(crate::bus::create_bus());
         {
             let mut state = adapter.state.write().await;
@@ -1066,15 +1018,51 @@ mod persistent_http_tests {
             state.web_username = Some("user".to_string());
             state.web_password = Some("password".to_string());
         }
-        let error = adapter
-            .web_get_bytes(BACKUP_PATH)
+        let hidden_fields = HashMap::from([
+            ("z-last".to_string(), "tail".to_string()),
+            ("csrf".to_string(), "token & value".to_string()),
+        ]);
+        let response = adapter
+            .dispatch_profile_load("Living Room & Headphones", &hidden_fields)
             .await
-            .expect_err("HTML is restart evidence, never a backup");
+            .unwrap();
+        assert!(response.status().is_success());
+
+        let (first, retry) = server.await.unwrap();
+        let first = String::from_utf8_lossy(&first);
         assert!(
-            error.to_string().contains("still be restarting"),
-            "{error:#}"
+            first.starts_with("POST /config/profile/load HTTP/1.1"),
+            "{first}"
         );
-        server.await.unwrap();
+
+        let retry = String::from_utf8_lossy(&retry);
+        let retry_lower = retry.to_ascii_lowercase();
+        assert!(
+            retry.starts_with("POST /config/profile/load HTTP/1.1"),
+            "{retry}"
+        );
+        assert!(
+            retry_lower.contains("content-type: application/x-www-form-urlencoded"),
+            "{retry}"
+        );
+        assert!(
+            retry_lower.contains(&format!("origin: http://127.0.0.1:{port}")),
+            "{retry}"
+        );
+        assert!(
+            retry_lower.contains(&format!(
+                "referer: http://127.0.0.1:{port}/config/profile/load"
+            )),
+            "{retry}"
+        );
+        assert!(
+            retry_lower.contains("authorization: digest username=\"user\""),
+            "{retry}"
+        );
+        assert!(
+            retry.ends_with("csrf=token+%26+value&z-last=tail&profile=Living+Room+%26+Headphones"),
+            "{retry}"
+        );
     }
 }
 
@@ -7294,68 +7282,53 @@ impl HqpAdapter {
         Ok(response.text().await?)
     }
 
-    /// Fetch an authenticated binary artifact from the fixed HQPlayer web lane.
-    async fn web_get_bytes(&self, path: &str) -> Result<Vec<u8>> {
+    /// Submit the daemon's own named-profile form exactly as a browser does.
+    ///
+    /// This is deliberately distinct from the archive restore lane. On HQPlayer Embedded running
+    /// as root, `GET /backup/settings.zip` has been observed spawning a system-scope copy of `/`;
+    /// profile selection must never trigger that route. The older Node client also established that
+    /// the form contract includes the freshly-read hidden fields plus browser `Origin` and
+    /// `Referer` headers. Preserve that wire shape instead of treating `profile=<name>` as the whole
+    /// protocol.
+    async fn dispatch_profile_load(
+        &self,
+        profile: &str,
+        hidden_fields: &HashMap<String, String>,
+    ) -> Result<reqwest::Response> {
         let base_url = self.web_base_url().await?;
-        let url = format!("{base_url}{path}");
-        let mut request = self.http_client.get(&url);
-        if let Some(auth) = self.build_digest_header("GET", path).await {
-            request = request.header("Authorization", auth);
-        }
-        let mut response = request.send().await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            let challenge = response
-                .headers()
-                .get("www-authenticate")
-                .and_then(|value| value.to_str().ok())
-                .filter(|value| value.to_ascii_lowercase().starts_with("digest"))
-                .ok_or_else(|| anyhow!("Authentication failed"))?
-                .to_string();
-            self.parse_digest_challenge(&challenge).await;
-            let mut retry = self.http_client.get(&url);
-            if let Some(auth) = self.build_digest_header("GET", path).await {
-                retry = retry.header("Authorization", auth);
+        let url = format!("{base_url}{PROFILE_PATH}");
+        let body = {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            let mut hidden: Vec<(&String, &String)> = hidden_fields.iter().collect();
+            hidden.sort_by(|(left, _), (right, _)| left.cmp(right));
+            for (name, value) in hidden {
+                serializer.append_pair(name, value);
             }
-            response = retry.send().await?;
-        }
-        if !response.status().is_success() {
-            return Err(anyhow!("Request failed: {}", response.status()));
-        }
-        if path == BACKUP_PATH
-            && response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.to_ascii_lowercase().contains("text/html"))
-        {
-            return Err(anyhow!(
-                "HQPlayer backup endpoint returned HTML instead of a settings ZIP; the daemon may \
-                 still be restarting, so no persistent write is safe yet"
-            ));
-        }
-        Ok(response.bytes().await?.to_vec())
-    }
-
-    /// Dispatch one restore archive. The caller owns outcome reconciliation: a transport error or
-    /// HTTP status after dispatch is never evidence that HQPlayer did not apply the archive.
-    async fn dispatch_restore(&self, archive: &[u8]) -> Result<reqwest::Response> {
-        let base_url = self.web_base_url().await?;
-        let url = format!("{base_url}{RESTORE_PATH}");
-        let form = || -> Result<reqwest::multipart::Form> {
-            Ok(reqwest::multipart::Form::new()
-                .text("scope", "system")
-                .part(
-                    "cfgfile",
-                    reqwest::multipart::Part::bytes(archive.to_vec())
-                        .file_name("settings.zip")
-                        .mime_str("application/zip")?,
-                ))
+            serializer.append_pair("profile", profile);
+            serializer.finish()
         };
-        let mut request = self.http_client.post(&url).multipart(form()?);
-        if let Some(auth) = self.build_digest_header("POST", RESTORE_PATH).await {
-            request = request.header("Authorization", auth);
-        }
-        let mut response = request.send().await?;
+        let referer = format!("{base_url}{PROFILE_PATH}");
+
+        let send = |auth: Option<String>| {
+            let mut request = self
+                .http_client
+                .post(&url)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .header(reqwest::header::ORIGIN, &base_url)
+                .header(reqwest::header::REFERER, &referer)
+                .body(body.clone());
+            if let Some(auth) = auth {
+                request = request.header(reqwest::header::AUTHORIZATION, auth);
+            }
+            request
+        };
+
+        let mut response = send(self.build_digest_header("POST", PROFILE_PATH).await)
+            .send()
+            .await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             let challenge = response
                 .headers()
@@ -7365,74 +7338,42 @@ impl HqpAdapter {
                 .ok_or_else(|| anyhow!("Authentication failed"))?
                 .to_string();
             self.parse_digest_challenge(&challenge).await;
-            let mut retry = self.http_client.post(&url).multipart(form()?);
-            if let Some(auth) = self.build_digest_header("POST", RESTORE_PATH).await {
-                retry = retry.header("Authorization", auth);
-            }
-            response = retry.send().await?;
+            response = send(self.build_digest_header("POST", PROFILE_PATH).await)
+                .send()
+                .await?;
         }
         Ok(response)
     }
 
-    async fn wait_for_persistent_readback(&self, expected: &[u8]) -> Result<bool> {
+    /// Wait through a profile-triggered daemon restart and report the last active configuration.
+    async fn wait_for_active_configuration(&self, expected: &str) -> Result<String> {
         let timeouts = self.timeouts().await;
         let attempts = timeouts.max_attempts.max(12);
+        let mut last_observed = None;
         let mut last_error = None;
-        let mut observed_divergence = false;
         for attempt in 0..attempts {
             if attempt > 0 {
                 tokio::time::sleep(timeouts.reconnect_delay).await;
             }
-            match self.web_get_bytes(BACKUP_PATH).await.and_then(|archive| {
-                let actual = persistence::working_config(&archive, None)?;
-                persistence::semantically_equal(&actual, expected)
-            }) {
-                Ok(true) => return Ok(true),
-                Ok(false) => observed_divergence = true,
+            match self.active_configuration_under_operation().await {
+                Ok(active) if active == expected => return Ok(active),
+                Ok(active) => last_observed = Some(active),
                 Err(error) => last_error = Some(error),
             }
         }
-        if observed_divergence {
-            return Ok(false);
-        }
         Err(anyhow!(
-            "HQPlayer persistent readback did not become available after restart{}",
+            "HQPlayer active configuration did not become {expected:?}; last observed {}{}",
+            last_observed
+                .map(|value| format!("{value:?}"))
+                .unwrap_or_else(|| "nothing".to_string()),
             last_error
-                .map(|error| format!(": {error}"))
+                .map(|error| format!("; last read failed: {error}"))
                 .unwrap_or_default()
         ))
     }
 
-    fn persist_rollback_archive(&self, archive: &[u8]) -> Result<PathBuf> {
-        let instance = self
-            .state
-            .try_read()
-            .ok()
-            .and_then(|state| state.instance_name.clone().or_else(|| state.host.clone()))
-            .unwrap_or_else(|| "default".to_string());
-        let safe_instance: String = instance
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let dir = get_config_subdir().join("hqplayer-backups");
-        let stamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let final_path = dir.join(format!("{safe_instance}-{stamp}.settings.zip"));
-        secure_atomic_write(&final_path, archive)
-            .with_context(|| format!("durably retain rollback archive {}", final_path.display()))?;
-        Ok(final_path)
-    }
-
-    /// Ask the native protocol which root-level XML member a fresh backup represents.
-    /// Empty means `[default]`; a named value must resolve exactly and is never guessed.
+    /// Ask the native protocol which named configuration is active.
+    /// Empty means the base configuration; a named value is returned exactly.
     async fn active_configuration_under_operation(&self) -> Result<String> {
         let xml = Self::build_request("ConfigurationGet", &[]);
         let response = self.send_command(&xml).await?;
@@ -7575,13 +7516,13 @@ impl HqpAdapter {
         self.state.read().await.profiles.clone()
     }
 
-    /// Load a named daemon profile through the safe persistent lane.
+    /// Load a named daemon profile through its browser form and verify it natively.
     ///
-    /// HQPlayer's native profile-load form can restart the daemon and then serve an empty backup,
-    /// while its response body carries no outcome. We therefore take a fresh validated backup,
-    /// durably retain it, copy the selected snapshot onto the reliable `[default]` working member,
-    /// restore exactly once, and decide success only from a fresh backup readback. A divergence is
-    /// rolled back with the retained archive and that rollback is itself verified.
+    /// The response body carries no outcome and the daemon may restart before completing it, so
+    /// neither HTTP 200 nor a dropped response is success or failure. `ConfigurationGet` is the
+    /// authority: return only after it names the requested profile and the native enumerations have
+    /// recovered coherently. This path intentionally does not touch `/backup/settings.zip`; on a
+    /// root-run Embedded host that endpoint can attempt to archive the entire system.
     pub async fn load_profile(&self, profile_value: &str) -> Result<()> {
         let _operation_guard = self.operation_lock.lock().await;
         if profile_value.is_empty() || profile_value.to_lowercase() == "default" {
@@ -7592,81 +7533,54 @@ impl HqpAdapter {
             return Err(anyhow!("Web credentials not configured"));
         }
 
+        let profiles = self.fetch_profiles_under_operation().await?;
+        if !profiles
+            .iter()
+            .any(|profile| profile.value == profile_value)
+        {
+            return Err(anyhow!(
+                "HQPlayer profile {profile_value:?} is not available"
+            ));
+        }
         let active_before = self
             .active_configuration_under_operation()
             .await
-            .context("read active HQPlayer configuration before persistent mutation")?;
-        let backup = self
-            .web_get_bytes(BACKUP_PATH)
+            .context("read active HQPlayer configuration before profile load")?;
+        if active_before == profile_value {
+            return Ok(());
+        }
+        let hidden_fields = self.state.read().await.hidden_fields.clone();
+        let dispatch = self
+            .dispatch_profile_load(profile_value, &hidden_fields)
+            .await;
+        self.invalidate_profile_dependent_cache().await;
+        let dispatch_detail = match dispatch {
+            Ok(response) => format!("HTTP {}", response.status()),
+            Err(error) => format!("transport error: {error}"),
+        };
+        self.wait_for_active_configuration(profile_value)
             .await
-            .context("fetch fresh HQPlayer settings backup")?;
-        let active_profile = self
-            .active_configuration_under_operation()
-            .await
-            .context("re-read active HQPlayer configuration after backup")?;
-        if active_before != active_profile {
+            .with_context(|| {
+                format!(
+                    "HQPlayer profile {profile_value:?} was dispatched ({dispatch_detail}) but \
+                     could not be verified"
+                )
+            })?;
+        if !self.refresh_lists().await {
             return Err(anyhow!(
-                "HQPlayer active configuration changed from {active_before:?} to \
-                 {active_profile:?} while its backup was being captured; refusing a torn \
-                 persistent mutation"
+                "HQPlayer profile {profile_value:?} is active, but native settings did not recover \
+                 coherently after its restart"
             ));
         }
-        let plan =
-            persistence::prepare_profile_restore(&backup, profile_value, Some(&active_profile))?;
-        self.persist_rollback_archive(&backup)?;
-
-        if persistence::semantically_equal(&plan.rollback_xml, &plan.intended_xml)? {
-            return Ok(());
-        }
-
-        let dispatch = self.dispatch_restore(&plan.restore_archive).await;
-        self.invalidate_profile_dependent_cache().await;
-        let applied = self.wait_for_persistent_readback(&plan.intended_xml).await;
-        if matches!(applied, Ok(true)) {
-            if !self.refresh_lists().await {
-                return Err(anyhow!(
-                    "HQPlayer profile {profile_value:?} was verified persistently, but native \
-                     settings did not recover coherently after restart"
-                ));
-            }
-            self.fetch_profiles_under_operation()
-                .await
-                .map_err(|error| {
-                    anyhow!(
-                    "HQPlayer profile {profile_value:?} was verified persistently, but its web \
-                     control lane did not recover coherently ({error})"
-                )
-                })?;
-            return Ok(());
-        }
-
-        // A dropped restore response is not evidence that it was unapplied. Only after the target
-        // readback failed do we send a different, known-good rollback archive; the original mutation
-        // is never blindly retried.
-        let dispatch_detail = dispatch
-            .as_ref()
-            .map(|response| format!("HTTP {}", response.status()))
-            .unwrap_or_else(|error| format!("transport error: {error}"));
-        let rollback_dispatch = self.dispatch_restore(&plan.rollback_archive).await;
-        let rollback_verified = self.wait_for_persistent_readback(&plan.rollback_xml).await;
-        self.invalidate_profile_dependent_cache().await;
-        let _ = self.refresh_lists().await;
-        match rollback_verified {
-            Ok(true) => Err(anyhow!(
-                "HQPlayer profile {profile_value:?} did not produce the intended persistent \
-                 configuration ({dispatch_detail}); the known-good backup was restored and verified"
-            )),
-            outcome => Err(anyhow!(
-                "HQPlayer profile {profile_value:?} did not produce the intended persistent \
-                 configuration ({dispatch_detail}); rollback outcome is ambiguous (dispatch: {}; \
-                 readback: {:?})",
-                rollback_dispatch
-                    .as_ref()
-                    .map(|response| format!("HTTP {}", response.status()))
-                    .unwrap_or_else(|error| format!("transport error: {error}")),
-                outcome
-            )),
-        }
+        self.fetch_profiles_under_operation()
+            .await
+            .map_err(|error| {
+                anyhow!(
+                "HQPlayer profile {profile_value:?} is active, but its web control lane did not \
+                 recover coherently ({error})"
+            )
+            })?;
+        Ok(())
     }
 
     /// Check if this is HQPlayer Embedded (supports profiles)
