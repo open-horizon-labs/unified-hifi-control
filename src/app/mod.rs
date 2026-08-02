@@ -18,6 +18,9 @@ use settings_context::use_settings_provider;
 use sse::use_sse_provider;
 use theme::use_theme_provider;
 
+/// Secure origin required by the browser's Web Serial firmware flasher.
+pub const KNOB_FLASHER_URL: &str = "https://roon-knob.muness.com/";
+
 /// MCP connection details injected by the server during SSR.
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpEndpoint {

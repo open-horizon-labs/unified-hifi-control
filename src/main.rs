@@ -15,7 +15,7 @@ mod server {
 
     use anyhow::Result;
     use axum::{
-        response::{Html, IntoResponse, Redirect},
+        response::{IntoResponse, Redirect},
         routing::{delete, get, post, put},
         Router,
     };
@@ -27,29 +27,6 @@ mod server {
     use tokio_util::sync::CancellationToken;
     use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-    /// Flash page - redirects to external web flasher
-    async fn flash_page() -> impl IntoResponse {
-        Html(
-            r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Flash Knob - Unified Hi-Fi Control</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-</head>
-<body class="container">
-    <h1>Flash Knob Firmware</h1>
-    <article>
-        <p><strong>HTTPS Required</strong></p>
-        <p>Browser-based flashing requires HTTPS. Use the official web flasher:</p>
-        <p><a href="https://roon-knob.muness.com/" target="_blank" rel="noopener" role="button">Open Web Flasher</a></p>
-    </article>
-</body>
-</html>"#,
-        )
-    }
 
     /// Legacy redirect: /control -> /ui/zones
     async fn control_redirect() -> impl IntoResponse {
@@ -528,8 +505,8 @@ mod server {
             )
             // Protocol route: /zones returns JSON (for knob, iOS, etc.)
             .route("/zones", get(knobs::knob_zones_handler))
-            // Legacy SSR routes (flash page not yet migrated)
-            .route("/knobs/flash", get(flash_page))
+            // Legacy/bookmarked path also goes directly to the secure Web Serial origin.
+            .route("/knobs/flash", get(api::knob_flasher_redirect_handler))
             // Legacy redirects
             .route("/control", get(control_redirect))
             .route("/admin", get(settings_redirect))

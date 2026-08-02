@@ -383,7 +383,11 @@ pub fn Knobs() -> Element {
                             onclick: fetch_firmware,
                             "Fetch Latest from GitHub"
                         }
-                        a { class: "link inline-flex min-h-11 items-center", href: "/knobs/flash", "Flash a new knob" }
+                        a {
+                            class: "link inline-flex min-h-11 items-center",
+                            href: crate::app::KNOB_FLASHER_URL,
+                            "Flash a new knob"
+                        }
                         if let Some((is_err, ref msg)) = fw_message() {
                             if is_err {
                                 span { class: "status-err", "{msg}" }

@@ -21,7 +21,7 @@ use axum::{
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Redirect,
     },
     Json,
 };
@@ -182,6 +182,11 @@ impl AppState {
             Ok(raw_image)
         }
     }
+}
+
+/// Send legacy/bookmarked flash-page requests straight to the secure Web Serial origin.
+pub async fn knob_flasher_redirect_handler() -> Redirect {
+    Redirect::permanent(crate::app::KNOB_FLASHER_URL)
 }
 
 /// Route an LMS transport/volume action through the private reliable runtime without altering any
