@@ -15,7 +15,7 @@ use mock_servers::hqplayer::corpus::{self, VERIFIED_PROFILE};
 use mock_servers::hqplayer::model::DaemonModel;
 use mock_servers::hqplayer::wire::{ReplyGate, WirePolicy, WireServer};
 use unified_hifi_control::adapters::hqplayer::{
-    HqpAdapter, HqpTimeouts, LegacySettingTarget, SettingOutcome,
+    HqpAdapter, HqpProfileTimeouts, HqpTimeouts, LegacySettingTarget, SettingOutcome,
 };
 use unified_hifi_control::bus::create_bus;
 
@@ -131,6 +131,27 @@ impl ProfileWeb {
         drop_post_response: bool,
         post_status: u16,
     ) -> Self {
+        Self::start_with_post_behavior(
+            native,
+            pause_post,
+            drop_post_response,
+            post_status,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    async fn start_with_post_delay(native: Option<DaemonModel>, delay: Duration) -> Self {
+        Self::start_with_post_behavior(native, false, false, 200, delay).await
+    }
+
+    async fn start_with_post_behavior(
+        native: Option<DaemonModel>,
+        pause_post: bool,
+        drop_post_response: bool,
+        post_status: u16,
+        post_delay: Duration,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind profile web fake");
@@ -172,6 +193,9 @@ impl ProfileWeb {
                             post_seen.notify_one();
                             if pause_post {
                                 release_post.notified().await;
+                            }
+                            if !post_delay.is_zero() {
+                                tokio::time::sleep(post_delay).await;
                             }
                             if let Some(native) = native {
                                 native.external_change(|state| {
@@ -234,6 +258,87 @@ impl ProfileWeb {
     fn stop(self) {
         self.task.abort();
     }
+}
+
+/// The ordinary web client remains deliberately short, but a profile POST can restart HQPlayer
+/// before it answers. It needs its own request policy rather than inheriting the 3s ordinary-web
+/// deadline. The delay is intentionally just over that production boundary.
+#[tokio::test]
+async fn profile_post_can_outlive_the_fast_web_deadline() {
+    let model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    let native = WireServer::start(Arc::new(model.clone()), WirePolicy::default()).await;
+    let web = ProfileWeb::start_with_post_delay(Some(model), Duration::from_millis(3_100)).await;
+    let adapter = HqpAdapter::new(create_bus());
+    adapter
+        .configure(
+            "127.0.0.1".to_string(),
+            Some(native.port()),
+            Some(web.port),
+            Some("test".to_string()),
+            Some("test".to_string()),
+        )
+        .await;
+    adapter
+        .set_profile_timeouts(HqpProfileTimeouts {
+            request: Duration::from_secs(5),
+            settle_deadline: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(10),
+        })
+        .await;
+
+    adapter
+        .load_profile("raw-a")
+        .await
+        .expect("the dedicated profile request policy outlives the 3s ordinary-web timeout");
+    assert_eq!(web.count("POST "), 1);
+
+    native.stop();
+    web.stop();
+}
+
+/// After the profile form has entered its write path, an unavailable readback is neither a clean
+/// failure nor success. The public Result contract stays unchanged, but its error must name the
+/// bounded, indeterminate outcome rather than silently inheriting retry count from native I/O.
+#[tokio::test]
+async fn profile_that_never_settles_times_out_at_the_absolute_deadline() {
+    let native_model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    let native = WireServer::start(Arc::new(native_model), WirePolicy::default()).await;
+    // Deliberately omit the model from this web server: POST succeeds but never changes the active
+    // native configuration, so `ConfigurationGet` can never prove the requested profile.
+    let web = ProfileWeb::start(None, false, false).await;
+    let adapter = HqpAdapter::new(create_bus());
+    adapter
+        .configure(
+            "127.0.0.1".to_string(),
+            Some(native.port()),
+            Some(web.port),
+            Some("test".to_string()),
+            Some("test".to_string()),
+        )
+        .await;
+    adapter
+        .set_profile_timeouts(HqpProfileTimeouts {
+            request: Duration::from_secs(1),
+            settle_deadline: Duration::from_millis(120),
+            poll_interval: Duration::from_millis(10),
+        })
+        .await;
+
+    let started = tokio::time::Instant::now();
+    let error = adapter
+        .load_profile("raw-a")
+        .await
+        .expect_err("a profile that never becomes active is indeterminate, not successful");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "profile verification must honor its absolute deadline, not native retry count"
+    );
+    let message = format!("{error:#}");
+    assert!(message.contains("indeterminate"), "got: {message}");
+    assert!(message.contains("deadline"), "got: {message}");
+
+    native.stop();
+    web.stop();
 }
 
 /// A semantic setter is one operation even though the protocol exposes it as several requests.

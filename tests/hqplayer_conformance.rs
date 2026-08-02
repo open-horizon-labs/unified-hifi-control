@@ -38,7 +38,8 @@ use tokio::sync::Notify;
 
 use unified_hifi_control::adapters::hqplayer::{
     framing, HqpAdapter, HqpInstanceManager, HqpNativeExecutionTarget, HqpNativeSetting,
-    HqpRejected, HqpTimeouts, NativeSettingReadback, NativeSettingReceipt, SettingOutcome,
+    HqpProfileTimeouts, HqpRejected, HqpTimeouts, NativeSettingReadback, NativeSettingReceipt,
+    SettingOutcome,
 };
 use unified_hifi_control::bus::create_bus;
 
@@ -8165,6 +8166,13 @@ async fn a_profile_form_post_without_native_confirmation_never_reports_success()
         },
     )
     .await;
+    h.adapter
+        .set_profile_timeouts(HqpProfileTimeouts {
+            request: Duration::from_millis(100),
+            settle_deadline: Duration::from_millis(100),
+            poll_interval: Duration::from_millis(10),
+        })
+        .await;
     h.adapter.connect().await.expect("connect");
     configure_without_persisting(
         &h.adapter,
@@ -8204,7 +8212,8 @@ async fn a_profile_form_post_without_native_confirmation_never_reports_success()
         .expect_err("HTTP success without matching ConfigurationGet is not success");
     let load_error = format!("{load_error:#}");
     assert!(
-        load_error.contains("active configuration did not become \"semantic-z\""),
+        load_error.contains("profile load is indeterminate")
+            && load_error.contains("active configuration became \"semantic-z\""),
         "the refusal must identify the failed native verification: {load_error}"
     );
     assert!(

@@ -646,6 +646,38 @@ impl Default for HqpTimeouts {
     }
 }
 
+/// Timeout policy for a persistent HQPlayer profile mutation.
+///
+/// Profile selection is not a fast control request: Embedded can stop and restart its native and
+/// browser control planes after accepting the form POST. Reusing [`HqpTimeouts`] made the browser
+/// POST inherit the ordinary 3-second web deadline and made verification duration an accidental
+/// product of native retry count. Keep those policies independent: native/ordinary-web operations
+/// remain responsive, while a profile transaction has one explicit request budget and one absolute
+/// convergence deadline.
+///
+/// This is an internal test seam, not a serialized setting or HTTP contract. Production defaults
+/// are deliberately conservative for a daemon restart; callers still receive the existing `Result`
+/// from `load_profile`, with an indeterminate error if the post-dispatch deadline expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HqpProfileTimeouts {
+    /// Maximum duration of one profile-lane HTTP request (form inventory, dispatch, or recovery).
+    pub request: Duration,
+    /// Total time from profile-form dispatch to confirmed native `ConfigurationGet` readback.
+    pub settle_deadline: Duration,
+    /// Delay between native readback attempts while the daemon restarts.
+    pub poll_interval: Duration,
+}
+
+impl Default for HqpProfileTimeouts {
+    fn default() -> Self {
+        Self {
+            request: Duration::from_secs(30),
+            settle_deadline: Duration::from_secs(120),
+            poll_interval: Duration::from_secs(1),
+        }
+    }
+}
+
 const DEFAULT_PORT: u16 = 4321;
 const DEFAULT_WEB_PORT: u16 = 8088;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2078,6 +2110,9 @@ struct HqpAdapterState {
     cookies: HashMap<String, String>,
     /// Injectable timeout/retry policy. Defaults to the shipped constants.
     timeouts: HqpTimeouts,
+    /// Dedicated persistent-profile policy. It must never inherit the fast native/ordinary-web
+    /// request ceiling because a successful profile POST commonly overlaps a daemon restart.
+    profile_timeouts: HqpProfileTimeouts,
     /// Long-lived producer recovery policy. Separate from per-command retry semantics.
     recovery_config: HqpRecoveryConfig,
 }
@@ -2124,6 +2159,7 @@ impl Default for HqpAdapterState {
             digest_auth: None,
             cookies: HashMap::new(),
             timeouts: HqpTimeouts::default(),
+            profile_timeouts: HqpProfileTimeouts::default(),
             recovery_config: HqpRecoveryConfig::default(),
         }
     }
@@ -2152,6 +2188,10 @@ pub struct HqpAdapter {
     /// Set synchronously when an in-flight native future is cancelled.
     transport_poisoned: Arc<std::sync::atomic::AtomicBool>,
     http_client: Client,
+    /// Browser client reserved for persistent profile transactions. It deliberately has a longer
+    /// request deadline than [`Self::http_client`], so a profile restart cannot redefine latency of
+    /// ordinary browser reads.
+    profile_http_client: Client,
     bus: SharedBus,
     /// Unsolicited documents skipped while awaiting command replies. Diagnostics for tier-1 live
     /// verification: against a well-behaved daemon this should stay at zero, so a non-zero count on
@@ -2244,6 +2284,15 @@ impl HqpAdapter {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to create HTTP client");
+        #[allow(clippy::expect_used)] // HTTP client creation only fails if TLS setup fails
+        let profile_http_client = Client::builder()
+            // The per-operation wrapper in `profile_web_request` / `send_profile_request` is the
+            // authority. This only prevents an accidentally unwrapped request from living forever;
+            // it must not silently cap a caller that deliberately raises the profile policy.
+            .timeout(Duration::from_secs(300))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("Failed to create HQPlayer profile HTTP client");
         let adapter = Self {
             state: Arc::new(RwLock::new(HqpAdapterState::default())),
             connection: Arc::new(Mutex::new(None)),
@@ -2252,6 +2301,7 @@ impl HqpAdapter {
             conversation_lock: Arc::new(Mutex::new(())),
             transport_poisoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             http_client,
+            profile_http_client,
             bus,
             unsolicited_skipped: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
@@ -2444,6 +2494,18 @@ impl HqpAdapter {
     /// serialized payload.
     pub async fn set_timeouts(&self, timeouts: HqpTimeouts) {
         self.state.write().await.timeouts = timeouts;
+    }
+
+    /// Current persistent-profile timeout policy.
+    pub async fn profile_timeouts(&self) -> HqpProfileTimeouts {
+        self.state.read().await.profile_timeouts
+    }
+
+    /// Override the persistent-profile timeout policy for deterministic tests.
+    ///
+    /// This changes neither the ordinary web client's fixed fast deadline nor any public payload.
+    pub async fn set_profile_timeouts(&self, timeouts: HqpProfileTimeouts) {
+        self.state.write().await.profile_timeouts = timeouts;
     }
 
     async fn recovery_config(&self) -> HqpRecoveryConfig {
@@ -7276,15 +7338,46 @@ impl HqpAdapter {
         });
     }
 
-    /// Make authenticated web request
+    /// Make an authenticated ordinary-browser request under the fixed fast policy.
     async fn web_request(&self, path: &str, method: &str, body: Option<&str>) -> Result<String> {
+        self.web_request_with_client(&self.http_client, path, method, body)
+            .await
+    }
+
+    /// Make an authenticated persistent-profile browser request under its operation-specific
+    /// request budget. This wraps body collection as well as connection/write/read, so a peer that
+    /// sends only headers cannot escape the profile request deadline.
+    async fn profile_web_request(
+        &self,
+        path: &str,
+        method: &str,
+        body: Option<&str>,
+    ) -> Result<String> {
+        let request_timeout = self.profile_timeouts().await.request;
+        timeout(
+            request_timeout,
+            self.web_request_with_client(&self.profile_http_client, path, method, body),
+        )
+        .await
+        .map_err(|_| anyhow!("HQPlayer profile web request timed out after {request_timeout:?}"))?
+    }
+
+    /// Common Digest-auth request implementation. Its caller supplies the operation-lane client
+    /// and, when needed, an outer whole-request deadline.
+    async fn web_request_with_client(
+        &self,
+        http_client: &Client,
+        path: &str,
+        method: &str,
+        body: Option<&str>,
+    ) -> Result<String> {
         let base_url = self.web_base_url().await?;
         let url = format!("{}{}", base_url, path);
 
         // First attempt
         let mut request = match method {
-            "POST" => self.http_client.post(&url),
-            _ => self.http_client.get(&url),
+            "POST" => http_client.post(&url),
+            _ => http_client.get(&url),
         };
 
         if let Some(auth_header) = self.build_digest_header(method, path).await {
@@ -7308,8 +7401,8 @@ impl HqpAdapter {
 
                         // Retry with auth
                         let mut request = match method {
-                            "POST" => self.http_client.post(&url),
-                            _ => self.http_client.get(&url),
+                            "POST" => http_client.post(&url),
+                            _ => http_client.get(&url),
                         };
 
                         if let Some(auth_header) = self.build_digest_header(method, path).await {
@@ -7338,6 +7431,20 @@ impl HqpAdapter {
         }
 
         Ok(response.text().await?)
+    }
+
+    /// Send one profile form request inside its dedicated whole-request budget.
+    async fn send_profile_request(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response> {
+        let request_timeout = self.profile_timeouts().await.request;
+        timeout(request_timeout, request.send())
+            .await
+            .map_err(|_| {
+                anyhow!("HQPlayer profile web request timed out after {request_timeout:?}")
+            })?
+            .map_err(Into::into)
     }
 
     /// Submit the daemon's own named-profile form exactly as a browser does.
@@ -7369,7 +7476,7 @@ impl HqpAdapter {
 
         let send = |auth: Option<String>| {
             let mut request = self
-                .http_client
+                .profile_http_client
                 .post(&url)
                 .header(
                     reqwest::header::CONTENT_TYPE,
@@ -7384,8 +7491,8 @@ impl HqpAdapter {
             request
         };
 
-        let mut response = send(self.build_digest_header("POST", PROFILE_PATH).await)
-            .send()
+        let mut response = self
+            .send_profile_request(send(self.build_digest_header("POST", PROFILE_PATH).await))
             .await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             let challenge = response
@@ -7396,31 +7503,50 @@ impl HqpAdapter {
                 .ok_or_else(|| anyhow!("Authentication failed"))?
                 .to_string();
             self.parse_digest_challenge(&challenge).await;
-            response = send(self.build_digest_header("POST", PROFILE_PATH).await)
-                .send()
+            response = self
+                .send_profile_request(send(self.build_digest_header("POST", PROFILE_PATH).await))
                 .await?;
         }
         Ok(response)
     }
 
     /// Wait through a profile-triggered daemon restart and report the last active configuration.
+    ///
+    /// The profile policy is an absolute budget, not "N native retries". A native query may itself
+    /// reconnect and retry, so counting polls did not bound total wall time and coupled a persistent
+    /// mutation to fast command recovery policy. Each poll is additionally bounded by the remaining
+    /// budget, so one silent `ConfigurationGet` cannot overrun the deadline.
     async fn wait_for_active_configuration(&self, expected: &str) -> Result<String> {
-        let timeouts = self.timeouts().await;
-        let attempts = timeouts.max_attempts.max(12);
+        let policy = self.profile_timeouts().await;
+        let deadline = tokio::time::Instant::now() + policy.settle_deadline;
         let mut last_observed = None;
         let mut last_error = None;
-        for attempt in 0..attempts {
-            if attempt > 0 {
-                tokio::time::sleep(timeouts.reconnect_delay).await;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            match self.active_configuration_under_operation().await {
-                Ok(active) if active == expected => return Ok(active),
-                Ok(active) => last_observed = Some(active),
-                Err(error) => last_error = Some(error),
+            match timeout(remaining, self.active_configuration_under_operation()).await {
+                Err(_) => {
+                    last_error = Some(anyhow!(
+                        "ConfigurationGet did not finish before the profile verification deadline"
+                    ));
+                    break;
+                }
+                Ok(Ok(active)) if active == expected => return Ok(active),
+                Ok(Ok(active)) => last_observed = Some(active),
+                Ok(Err(error)) => last_error = Some(error),
             }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(policy.poll_interval.min(remaining)).await;
         }
         Err(anyhow!(
-            "HQPlayer active configuration did not become {expected:?}; last observed {}{}",
+            "HQPlayer profile load is indeterminate: verification deadline of {:?} elapsed before \
+             active configuration became {expected:?}; last observed {}{}",
+            policy.settle_deadline,
             last_observed
                 .map(|value| format!("{value:?}"))
                 .unwrap_or_else(|| "nothing".to_string()),
@@ -7539,11 +7665,29 @@ impl HqpAdapter {
         if !self.has_web_credentials().await {
             return Err(anyhow!("Web credentials not configured"));
         }
-
         let html = self.web_request(PROFILE_PATH, "GET", None).await?;
+        self.cache_profiles_from_html(&html).await
+    }
 
-        let hidden_fields = Self::parse_hidden_inputs(&html);
-        let profiles = Self::parse_profiles_from_html(&html);
+    /// Profile mutation variant of [`Self::fetch_profiles_under_operation`]. Its request must be
+    /// allowed to survive the daemon restart, while ordinary profile inventory remains on the fast
+    /// browser client above.
+    async fn fetch_profiles_under_profile_operation(&self) -> Result<Vec<HqpProfile>> {
+        if !self.has_web_credentials().await {
+            return Err(anyhow!("Web credentials not configured"));
+        }
+
+        let html = self.profile_web_request(PROFILE_PATH, "GET", None).await?;
+        self.cache_profiles_from_html(&html).await
+    }
+
+    async fn cache_profiles_from_html(&self, html: &str) -> Result<Vec<HqpProfile>> {
+        if !self.has_web_credentials().await {
+            return Err(anyhow!("Web credentials not configured"));
+        }
+
+        let hidden_fields = Self::parse_hidden_inputs(html);
+        let profiles = Self::parse_profiles_from_html(html);
 
         // Cache for later use
         {
@@ -7591,7 +7735,7 @@ impl HqpAdapter {
             return Err(anyhow!("Web credentials not configured"));
         }
 
-        let profiles = self.fetch_profiles_under_operation().await?;
+        let profiles = self.fetch_profiles_under_profile_operation().await?;
         if !profiles
             .iter()
             .any(|profile| profile.value == profile_value)
@@ -7630,7 +7774,7 @@ impl HqpAdapter {
                  coherently after its restart"
             ));
         }
-        self.fetch_profiles_under_operation()
+        self.fetch_profiles_under_profile_operation()
             .await
             .map_err(|error| {
                 anyhow!(
