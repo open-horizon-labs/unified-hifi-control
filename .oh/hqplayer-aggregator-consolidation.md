@@ -37,6 +37,17 @@ lane health/freshness, coherent observations, and verified receipts.
   reduce it and no new dependency may be added.
 - Runtime prerequisite: #440 must separate reliable critical delivery and projection commits from
   lossy post-commit notification before generic and specialized call sites migrate.
+- #440 foundation now exists as a bounded private runtime: provider/exact-zone endpoints,
+  correlation de-duplication, dispatch/confirmation deadlines, accepted-versus-confirmed command
+  state, source epoch/sequence admission, gap/reconciliation state, atomic revision commits, and
+  post-commit reread hints. Ten deterministic runtime tests cover routing, deadlines, cross-source
+  confirmation, gaps, late confirmation, and per-instance HQPlayer reconfiguration isolation.
+- The legacy broadcast aggregator no longer dies permanently on `RecvError::Lagged`; it logs and
+  consumes the next recovery snapshot while providers migrate to the reliable projection lane.
+- HQPlayer named-profile mutations now have a dedicated HTTP request budget and absolute 120-second
+  convergence deadline instead of inheriting the three-second fast-web timeout and retry-count
+  duration. A post-dispatch convergence timeout is explicitly indeterminate. Operation-lock/lane
+  separation remains part of composing the runtime endpoint, not falsely claimed by this slice.
 
 ### UI expansion pre-flight
 

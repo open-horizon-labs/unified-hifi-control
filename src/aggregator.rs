@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::adapters::hqplayer::{
     HqpAdvancedOptionsSnapshot, HqpNativeObservation, HqpNativeObservationSink, HqpProfile,
@@ -73,7 +73,24 @@ impl ZoneAggregator {
 
         info!("ZoneAggregator started");
 
-        while let Ok(event) = rx.recv().await {
+        loop {
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // `broadcast` is a lossy notification channel. A lagged receiver is still
+                    // subscribed and can admit the next complete adapter observation; stopping
+                    // here would turn one burst into a permanently stale aggregate projection.
+                    warn!(
+                        skipped,
+                        "ZoneAggregator lagged behind the event bus; waiting for a recovery snapshot"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    info!("ZoneAggregator event bus closed");
+                    break;
+                }
+            };
             match event {
                 BusEvent::ZoneDiscovered { zone } => {
                     debug!("Zone discovered: {}", zone.zone_id);
@@ -559,5 +576,61 @@ mod tests {
             .await
             .unwrap();
         assert!(aggregator.get_hqplayer_snapshot("main").await.is_none());
+    }
+
+    /// A broadcast receiver reports `Lagged` before the next retained message; it has not closed.
+    /// The aggregator must keep receiving so a subsequent complete adapter snapshot can repair the
+    /// lossy notification gap instead of leaving every future zone update permanently invisible.
+    #[tokio::test]
+    async fn lagged_event_receiver_recovers_and_admits_the_next_zone_snapshot() {
+        let bus = std::sync::Arc::new(crate::bus::EventBus::new(1));
+        let aggregator = std::sync::Arc::new(ZoneAggregator::new(bus.clone()));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let running = {
+            let aggregator = aggregator.clone();
+            tokio::spawn(async move { aggregator.run_with_ready(ready_tx).await })
+        };
+        ready_rx
+            .await
+            .expect("aggregator subscribed before publication");
+
+        // These synchronous sends run before this task yields, so the capacity-one receiver must
+        // observe `Lagged` before it can consume the final, retained discovery snapshot.
+        bus.publish(BusEvent::HealthCheck { timestamp: 1 });
+        bus.publish(BusEvent::HealthCheck { timestamp: 2 });
+        bus.publish(BusEvent::ZoneDiscovered {
+            zone: Zone {
+                zone_id: "lms:after-lag".to_string(),
+                zone_name: "Recovered after lag".to_string(),
+                state: crate::bus::PlaybackState::Stopped,
+                volume_control: None,
+                now_playing: None,
+                source: "lms".to_string(),
+                is_controllable: true,
+                is_seekable: false,
+                last_updated: 0,
+                is_play_allowed: true,
+                is_pause_allowed: false,
+                is_next_allowed: false,
+                is_previous_allowed: false,
+            },
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if aggregator.get_zone("lms:after-lag").await.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aggregator must process the retained event after a lag notification");
+
+        bus.publish(BusEvent::ShuttingDown { reason: None });
+        tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("aggregator exits when the bus is explicitly shut down")
+            .expect("aggregator task did not panic");
     }
 }
