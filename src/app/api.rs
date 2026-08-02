@@ -97,6 +97,10 @@ pub struct NowPlaying {
     pub is_playing: bool,
     pub volume: Option<f32>,
     pub volume_type: Option<String>,
+    #[serde(default)]
+    pub volume_min: Option<f32>,
+    #[serde(default)]
+    pub volume_max: Option<f32>,
     /// Volume step size (e.g., 0.5 for Roon, 2.5 for LMS)
     pub volume_step: Option<f32>,
     pub is_previous_allowed: bool,

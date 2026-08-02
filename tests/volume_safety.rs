@@ -259,22 +259,52 @@ fn the_hqplayer_volume_path_never_substitutes_a_numeric_level() {
 
 #[test]
 fn the_hqplayer_volume_path_clamps_to_the_zones_observed_bounds() {
-    let body = hqp_command_from_published_zone_body();
+    let surface = hqp_command_from_published_zone_body();
 
-    // Both the absolute and the relative arm must clamp, and must clamp to values read off the
-    // published zone rather than to constants. `vc` is that zone's volume control.
-    let clamps: Vec<&str> = body.lines().filter(|l| l.contains(".clamp(")).collect();
-    assert!(
-        clamps.len() >= 2,
-        "both the absolute and the relative volume arms must clamp; found {} clamp(s) in \
-         dispatch_hqplayer_action",
-        clamps.len()
+    // Absolute requests can be clamped immediately to the aggregator's observed range.
+    let surface_clamps: Vec<&str> = surface
+        .lines()
+        .filter(|line| line.contains(".clamp("))
+        .collect();
+    assert_eq!(
+        surface_clamps.len(),
+        1,
+        "the absolute HQPlayer volume arm must have exactly one surface clamp"
     );
-    for line in &clamps {
+    assert!(
+        surface_clamps[0].contains("vc.min") && surface_clamps[0].contains("vc.max"),
+        "the absolute volume clamp must use the zone's observed bounds: {}",
+        surface_clamps[0].trim()
+    );
+
+    // Relative requests cannot safely resolve against the published value: simultaneous knob
+    // turns may all have observed the same revision. They must remain relative until the adapter's
+    // serialized native endpoint reads the current State and VolumeRange, then clamps there.
+    assert!(
+        surface.contains("Ok(Command::VolumeRelative"),
+        "relative HQPlayer volume must remain semantic until serialized native execution"
+    );
+    let adapter = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/adapters/hqplayer.rs"),
+    )
+    .expect("read the HQPlayer adapter");
+    let start = adapter
+        .find("async fn adjust_volume_db_verified(")
+        .expect("the serialized relative-volume endpoint must exist");
+    let rest = &adapter[start..];
+    let end = rest
+        .find("\n    /// Resolve Play/Pause")
+        .expect("the function following relative-volume execution must still follow it");
+    let relative = &rest[..end];
+    for marker in [
+        "operation_lock.lock().await",
+        "get_volume_range_with_generation().await",
+        "get_state_on_transport(generation).await",
+        ".clamp(range.min_db, range.max_db)",
+    ] {
         assert!(
-            line.contains("vc.min") && line.contains("vc.max"),
-            "a volume clamp must use the zone's observed bounds, not constants: {}",
-            line.trim()
+            relative.contains(marker),
+            "serialized relative-volume safety lost `{marker}`"
         );
     }
 }

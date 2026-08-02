@@ -130,14 +130,17 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
                         if value == "[default]" {
                             obs.offers_default = true;
                             pending_option = None;
-                        } else if value.is_empty() {
-                            // Nothing to record either way.
+                        } else if value.is_empty() && self_closing {
+                            // An unnamed self-closing option has no label capable of identifying it
+                            // as the base configuration.
                         } else if self_closing {
                             // No text node is coming, so record it now with its value as its label —
                             // the same fallback the `Text` handler applies to an empty label.
                             obs.named_profiles.push((value.clone(), value));
                             pending_option = None;
                         } else {
+                            // Keep an empty value until its text arrives. HQPlayer 6.0.4 renders the
+                            // unnamed base as `<option value="">[default]</option>`.
                             pending_option = Some(value);
                         }
                     }
@@ -156,6 +159,13 @@ pub fn project_config_form(page: &str) -> ConfigFormObs {
                                 .map(|value| value.trim().to_string())
                         })
                         .unwrap_or_default();
+                    if value.is_empty() && label == "[default]" {
+                        obs.offers_default = true;
+                        continue;
+                    }
+                    if value.is_empty() {
+                        continue;
+                    }
                     let title = if label.is_empty() {
                         value.clone()
                     } else {

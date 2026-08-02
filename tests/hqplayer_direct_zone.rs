@@ -1096,6 +1096,104 @@ async fn decimal_db_survives_the_whole_round_trip() {
     server.stop();
 }
 
+/// Relative commands may arrive before the previous command's projection is visible to the HTTP
+/// tasks. They must be resolved by the serialized native endpoint, not independently against one
+/// stale aggregator snapshot, or three successful knob turns collapse into one audible step.
+#[tokio::test]
+async fn concurrent_relative_volume_commands_each_apply_one_serialized_step() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|z| z.volume_control.is_some()).await;
+
+    let body = || json!({"zone_id":"hqplayer:rig","action":"vol_down"});
+    let (one, two, three) = tokio::join!(
+        rig.post_control(body()),
+        rig.post_control(body()),
+        rig.post_control(body()),
+    );
+    for (status, response) in [one, two, three] {
+        assert_eq!(status, StatusCode::OK, "body={response}");
+    }
+
+    let zone = rig
+        .zone_when(|z| {
+            z.volume_control
+                .as_ref()
+                .is_some_and(|v| (v.value - -25.0).abs() < 1e-6)
+        })
+        .await;
+    assert_eq!(zone.volume_control.expect("volume").value, -25.0);
+
+    rig.shutdown().await;
+    server.stop();
+}
+
+/// `play_pause` is state-relative just like a volume step. Two simultaneous requests starting from
+/// playing must pause and then resume; resolving both at the HTTP boundary turns both into Pause and
+/// leaves the endpoint in the wrong state while reporting two successes.
+#[tokio::test]
+async fn concurrent_play_pause_commands_resolve_in_serialized_native_order() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+
+    let body = || json!({"zone_id":"hqplayer:rig","action":"play_pause"});
+    let (one, two) = tokio::join!(rig.post_control(body()), rig.post_control(body()));
+    for (status, response) in [one, two] {
+        assert_eq!(status, StatusCode::OK, "body={response}");
+    }
+    rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+    assert_eq!(model.request_count("Pause"), 1);
+    assert_eq!(model.request_count("Play"), 1);
+
+    rig.shutdown().await;
+    server.stop();
+}
+
+/// HQPlayer Embedded 6.0.4 can apply an absolute level and then report an unrelated empty-playlist
+/// error on the subscribed connection. The reliable command path must read the authoritative state,
+/// confirm the projection, and return success instead of leaving the aggregator stale.
+#[tokio::test]
+async fn absolute_volume_applied_despite_an_error_reply_is_confirmed_from_state() {
+    let model = playing_daemon();
+    model.external_change(|s| {
+        s.playback = 0;
+        s.track = 0;
+        s.length = 0;
+        s.metadata = None;
+    });
+    model.arm(|faults| {
+        faults.apply_but_report_error.push((
+            "Volume".to_string(),
+            "clPlaylist::GetTrackFile(): trackn > last".to_string(),
+        ));
+    });
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|z| z.volume_control.is_some()).await;
+
+    let (status, body) = rig
+        .post_control(json!({"zone_id":"hqplayer:rig","action":"vol_abs","value":-31.5}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    let zone = rig
+        .zone_when(|z| {
+            z.volume_control
+                .as_ref()
+                .is_some_and(|v| (v.value - -31.5).abs() < 1e-6)
+        })
+        .await;
+    assert_eq!(zone.volume_control.expect("volume").value, -31.5);
+
+    rig.shutdown().await;
+    server.stop();
+}
+
 /// **Client expectation, and the safety-critical one.** A volume command whose level is missing or
 /// unparseable is **refused**. It is never turned into a number.
 ///

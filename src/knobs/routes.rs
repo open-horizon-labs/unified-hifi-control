@@ -819,10 +819,9 @@ fn hqp_command_from_published_zone(
             message: format!("{} is not available in the zone's current state", action),
             code: "ACTION_NOT_ALLOWED",
         }),
-        "play_pause" | "playpause" => match zone.state {
-            crate::bus::PlaybackState::Playing => Ok(Command::Pause),
-            _ => Ok(Command::Play),
-        },
+        // Resolve at the serialized native endpoint. Concurrent requests can otherwise all observe
+        // one published state and collapse several toggles into the same Play or Pause command.
+        "play_pause" | "playpause" => Ok(Command::PlayPause),
         "seek" => {
             if !zone.is_seekable {
                 return Err(HqpDispatchError::BadRequest {
@@ -858,10 +857,11 @@ fn hqp_command_from_published_zone(
                 .filter(|step| step.is_finite() && *step > 0.0)
                 .unwrap_or(f64::from(vc.step));
             let delta = if action.contains("down") { -step } else { step };
-            Ok(Command::VolumeAbsolute {
-                value: quantise_db(
-                    (f64::from(vc.value) + delta).clamp(f64::from(vc.min), f64::from(vc.max)),
-                ) as f32,
+            Ok(Command::VolumeRelative {
+                // The endpoint resolves this delta against native State after it reaches the head
+                // of the serialized queue. Resolving it here against `vc.value` collapses concurrent
+                // knob turns that all observed the same pre-command projection into one step.
+                delta: quantise_db(delta) as f32,
                 output_id: None,
             })
         }

@@ -6609,6 +6609,30 @@ fn a_self_closing_profile_option_is_still_a_named_profile() {
     );
 }
 
+/// HQPlayer Embedded 6.0.4 spells the base configuration as an empty value whose visible label is
+/// `[default]`. The evidence projection must recognise that real form without turning the unnamed
+/// base into a named, loadable profile.
+#[test]
+fn an_empty_value_default_option_is_the_unnamed_base_configuration() {
+    let page = concat!(
+        "<select name=\"profile\">",
+        "<option value=\"\">[default]</option>",
+        "<option value=\"Night\">Night listening</option>",
+        "</select>"
+    );
+
+    let obs = tier1::project_config_form(page);
+    assert!(
+        obs.offers_default,
+        "the live daemon's base option is present"
+    );
+    assert_eq!(
+        obs.named_profiles,
+        vec![("Night".to_string(), "Night listening".to_string())],
+        "the empty base identity must not become a named profile"
+    );
+}
+
 /// An option outside the profile select must still be ignored — the fix must not widen what is kept.
 ///
 /// The projection is an allowlist: element text is kept *only* as an option label inside the profile
@@ -7541,6 +7565,33 @@ async fn a_rejected_matrix_profile_write_reports_the_daemon_reason() {
         err.to_string().contains("profile in use"),
         "the daemon's own reason must survive to the caller, got: {err}"
     );
+    h.stop();
+}
+
+/// HQPlayer Embedded 6.0.4 can apply `MatrixSetProfile` and still answer `result="Error"` when its
+/// playlist is empty. The same-session authoritative `State` wins over that unrelated playlist
+/// complaint; otherwise a successful profile change is surfaced as a failure and the aggregator is
+/// left stale until its lifecycle poll.
+#[tokio::test]
+async fn a_matrix_profile_applied_despite_an_error_reply_is_verified_as_applied() {
+    let h = Harness::verified().await;
+    h.model.arm(|f| {
+        f.apply_but_report_error.push((
+            "MatrixSetProfile".to_string(),
+            "clPlaylist::GetTrackFile(): trackn > last".to_string(),
+        ))
+    });
+
+    let outcome = h
+        .adapter
+        .set_matrix_profile(1)
+        .await
+        .expect("same-session State resolves the misleading reply");
+    assert!(
+        outcome.is_applied(),
+        "verified state is the final authority"
+    );
+    assert_eq!(h.model.state().matrix_profile, "Speakers");
     h.stop();
 }
 

@@ -250,6 +250,12 @@ type Change = Box<dyn FnOnce(&mut DaemonState) + Send>;
 pub struct Faults {
     /// `(element, reason)` — answer `result="Error"` once and apply nothing.
     pub reject_next: Vec<(String, String)>,
+    /// `(element, reason)` — apply the request once, but answer `result="Error"`.
+    ///
+    /// HQPlayer Embedded 6.0.4 does this on a subscribed connection with an empty playlist for at
+    /// least `Volume` and `MatrixSetProfile`: the reply complains about the absent track while the
+    /// following authoritative `State` already carries the requested value.
+    pub apply_but_report_error: Vec<(String, String)>,
     /// Elements that answer `result="OK"` but never apply.
     pub accept_but_ignore: Vec<String>,
     /// `(element, polls)` — answer `OK` now, apply after this many `State`/`Status` reads.
@@ -278,6 +284,7 @@ impl std::fmt::Debug for Faults {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Faults")
             .field("reject_next", &self.reject_next)
+            .field("apply_but_report_error", &self.apply_but_report_error)
             .field("accept_but_ignore", &self.accept_but_ignore)
             .field("apply_after_polls", &self.apply_after_polls)
             .field("matrix_current_override", &self.matrix_current_override)
@@ -849,6 +856,15 @@ impl Inner {
         Some(self.faults.reject_next.remove(at).1)
     }
 
+    fn take_post_apply_error(&mut self, element: &str) -> Option<String> {
+        let at = self
+            .faults
+            .apply_but_report_error
+            .iter()
+            .position(|(el, _)| el == element)?;
+        Some(self.faults.apply_but_report_error.remove(at).1)
+    }
+
     fn ignores(&self, element: &str) -> bool {
         self.faults.accept_but_ignore.iter().any(|el| el == element)
     }
@@ -929,6 +945,7 @@ impl Responder for DaemonModel {
         if let Some(reason) = inner.take_rejection(&element) {
             return Some(inner.error(&element, &reason));
         }
+        let post_apply_error = inner.take_post_apply_error(&element);
 
         let reply = match element.as_str() {
             "GetInfo" => {
@@ -1238,6 +1255,9 @@ impl Responder for DaemonModel {
             inner.clamp_to_loaded_chain();
         }
 
-        Some(reply)
+        Some(match post_apply_error {
+            Some(reason) => inner.error(&element, &reason),
+            None => reply,
+        })
     }
 }

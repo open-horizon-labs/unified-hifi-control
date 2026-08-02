@@ -791,11 +791,10 @@ pub struct HqpState {
 /// decides which of them counts as success on its surface. There are five, below, plus a sixth case
 /// that is deliberately not one of them:
 ///
-/// An explicit `result="Error"` stays an `Err` — [`HqpAdapter::check_result`] raises it inside
-/// `send_command` as a typed [`HqpRejected`], so it carries the daemon's own reason and is
-/// distinguishable from every variant here by being an `Err` at all. It is not a variant because a
-/// rejection is not an outcome of a *setting*: nothing was set, nothing is unknown, and there is
-/// nothing to read back.
+/// An explicit `result="Error"` normally stays an `Err`. HQPlayer Embedded 6.0.4 has one measured
+/// exception: on an empty subscribed playlist it can apply a setting and then return an unrelated
+/// playlist error. The semantic setting path therefore consults same-session authoritative `State`;
+/// only an exact requested value can overrule the error reply.
 ///
 /// # What this does not cover, and why
 ///
@@ -6066,7 +6065,28 @@ impl HqpAdapter {
                 },
             },
             NativeSettingDelivery::DaemonRejected(rejected) => {
-                NativeSettingReceipt::DaemonRejected(rejected)
+                // HQPlayer Embedded 6.0.4 can apply a setting on its subscribed connection and then
+                // answer `result="Error"` because the playlist is empty. Preserve genuine rejection
+                // semantics unless the exact same native session's authoritative State proves the
+                // requested value. This is deliberately narrower than treating Error as provisional.
+                let readback = self
+                    .verify_applied_on_transport(expected_generation, what, expected, observe)
+                    .await
+                    .unwrap_or_else(|error| NativeSettingReadback::Unavailable {
+                        reason: format!(
+                            "the daemon reported an error and same-session verification failed ({error})"
+                        ),
+                    });
+                if readback == NativeSettingReadback::Verified {
+                    NativeSettingReceipt::PossibleAttempt {
+                        reason: format!(
+                            "the daemon reported {rejected}, but authoritative same-session State verified the requested value"
+                        ),
+                        readback,
+                    }
+                } else {
+                    NativeSettingReceipt::DaemonRejected(rejected)
+                }
             }
             NativeSettingDelivery::DaemonAcknowledged => {
                 let readback = self
@@ -7020,6 +7040,63 @@ impl HqpAdapter {
         // `-0.5`. Pinned by `a_whole_db_volume_is_not_turned_into_a_fraction_on_the_wire`.
         let xml = Self::build_request("Volume", &[("value", &format!("{db}"))]);
         self.send_command(&xml).await?;
+        Ok(())
+    }
+
+    /// Set an absolute dB level for the reliable runtime and prove it from same-session `State`.
+    ///
+    /// The legacy public setter above retains its established contract. Runtime callers need the
+    /// stronger seam because HQPlayer 6.0.4 can apply `Volume` and still return a playlist error on
+    /// an empty subscribed connection. Hundredths of a dB remove floating representation noise
+    /// while retaining more precision than any observed HQPlayer step.
+    async fn set_volume_db_verified(&self, db: f64) -> Result<SettingOutcome> {
+        let _operation_guard = self.operation_lock.lock().await;
+        let (state, generation) = self.get_state_with_generation().await?;
+        self.write_volume_db_verified_on_transport(db, &state, generation)
+            .await
+    }
+
+    async fn write_volume_db_verified_on_transport(
+        &self,
+        db: f64,
+        state: &HqpState,
+        generation: u64,
+    ) -> Result<SettingOutcome> {
+        let expected = (db * 100.0).round() as i64;
+        if (state.volume_db * 100.0).round() as i64 == expected {
+            return Ok(SettingOutcome::AlreadySet);
+        }
+        let xml = Self::build_request("Volume", &[("value", &format!("{db}"))]);
+        self.write_setting_on_transport(generation, &xml, "volume", expected, |state| {
+            Some((state.volume_db * 100.0).round() as i64)
+        })
+        .await
+    }
+
+    /// Resolve a relative level only after this operation reaches the serialized native endpoint.
+    async fn adjust_volume_db_verified(&self, delta: f64) -> Result<SettingOutcome> {
+        let _operation_guard = self.operation_lock.lock().await;
+        let (range, generation) = self.get_volume_range_with_generation().await?;
+        if !range.enabled || !Self::volume_range_is_usable(&range) {
+            return Err(anyhow!("HQPlayer does not expose a usable volume range"));
+        }
+        let state = self.get_state_on_transport(generation).await?;
+        let target =
+            ((state.volume_db + delta).clamp(range.min_db, range.max_db) * 100.0).round() / 100.0;
+        self.write_volume_db_verified_on_transport(target, &state, generation)
+            .await
+    }
+
+    /// Resolve Play/Pause after reaching the serialized endpoint, on one native session.
+    async fn play_pause_serialized(&self) -> Result<()> {
+        let _operation_guard = self.operation_lock.lock().await;
+        let (state, generation) = self.get_state_with_generation().await?;
+        let xml = if state.state == 2 {
+            Self::build_request("Pause", &[])
+        } else {
+            Self::build_request("Play", &[("last", "0")])
+        };
+        self.send_command_on_transport(&xml, generation).await?;
         Ok(())
     }
 
@@ -9311,6 +9388,10 @@ async fn execute_hqplayer_runtime_command(
     command: &RuntimeCommand,
 ) -> Result<HqpRuntimeReadback> {
     match command {
+        RuntimeCommand::Control(Command::PlayPause) => adapter
+            .play_pause_serialized()
+            .await
+            .map(|()| HqpRuntimeReadback::Interactive),
         RuntimeCommand::Control(Command::Play) => adapter
             .play()
             .await
@@ -9342,8 +9423,19 @@ async fn execute_hqplayer_runtime_command(
             // widening noise before formatting HQPlayer's decimal-dB wire value.
             let db = (f64::from(*value) * 100.0).round() / 100.0;
             adapter
-                .set_volume_db(db)
-                .await
+                .set_volume_db_verified(db)
+                .await?
+                .into_applied_result()
+                .map(|()| HqpRuntimeReadback::Interactive)
+        }
+        RuntimeCommand::Control(Command::VolumeRelative { delta, output_id })
+            if output_id.is_none() =>
+        {
+            let db = (f64::from(*delta) * 100.0).round() / 100.0;
+            adapter
+                .adjust_volume_db_verified(db)
+                .await?
+                .into_applied_result()
                 .map(|()| HqpRuntimeReadback::Interactive)
         }
         RuntimeCommand::Control(Command::Mute {
@@ -9375,8 +9467,7 @@ async fn execute_hqplayer_runtime_command(
             .await
             .map(|_| HqpRuntimeReadback::Profile),
         RuntimeCommand::Control(
-            Command::PlayPause
-            | Command::VolumeAbsolute { .. }
+            Command::VolumeAbsolute { .. }
             | Command::VolumeRelative { .. }
             | Command::Mute { .. }
             | Command::MuteToggle { .. }

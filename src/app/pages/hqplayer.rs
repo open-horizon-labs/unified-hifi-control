@@ -69,6 +69,30 @@ struct ControlRequest {
     value: Option<f64>,
 }
 
+/// Refresh the advanced projection with latest-request-wins ordering.
+///
+/// A Dioxus `Resource::restart` can leave two browser requests in flight. HQPlayer profile and
+/// advanced-state reads are comparatively slow, so an older response can arrive after the response
+/// triggered by a successful mutation and snap the control back to stale state. Keep the ordering at
+/// the UI boundary: only the newest requested projection may be rendered.
+fn refresh_advanced_projection(
+    mut snapshot: Signal<Option<HqpMatrixProfilesResponse>>,
+    mut requested_revision: Signal<u64>,
+) {
+    let revision = requested_revision.peek().saturating_add(1);
+    requested_revision.set(revision);
+    spawn(async move {
+        let Ok(next) =
+            api::fetch_json::<HqpMatrixProfilesResponse>("/hqplayer/matrix/profiles").await
+        else {
+            return;
+        };
+        if *requested_revision.peek() == revision {
+            snapshot.set(Some(next));
+        }
+    });
+}
+
 /// HQPlayer page component.
 #[component]
 pub fn HqPlayer() -> Element {
@@ -110,12 +134,11 @@ pub fn HqPlayer() -> Element {
             .ok()
     });
 
-    // Load matrix profiles
-    let mut matrix = use_resource(|| async {
-        api::fetch_json::<HqpMatrixProfilesResponse>("/hqplayer/matrix/profiles")
-            .await
-            .ok()
-    });
+    // Advanced state is intentionally not a restartable Resource: slow overlapping HQPlayer reads
+    // need an explicit revision fence so an older response cannot overwrite a newer mutation.
+    let matrix = use_signal(|| None::<HqpMatrixProfilesResponse>);
+    let matrix_revision = use_signal(|| 0u64);
+    use_effect(move || refresh_advanced_projection(matrix, matrix_revision));
 
     // Load zones resource
     let mut zones =
@@ -210,6 +233,7 @@ pub fn HqPlayer() -> Element {
         if sse.should_refresh_hqp() {
             status.restart();
             pipeline.restart();
+            refresh_advanced_projection(matrix, matrix_revision);
         }
         if sse.should_refresh_zones() {
             zones.restart();
@@ -251,7 +275,7 @@ pub fn HqPlayer() -> Element {
                     status.restart();
                     pipeline.restart();
                     profiles.restart();
-                    matrix.restart();
+                    refresh_advanced_projection(matrix, matrix_revision);
                 }
                 Err(e) => {
                     config_status.set(Some(format!("Error: {}", e)));
@@ -292,7 +316,7 @@ pub fn HqPlayer() -> Element {
                 // Server now returns fresh state after setting, so HQPlayer has processed
                 // the change before we refresh
                 pipeline.restart();
-                matrix.restart();
+                refresh_advanced_projection(matrix, matrix_revision);
             }
             hqp_loading.set(false);
         });
@@ -312,7 +336,7 @@ pub fn HqPlayer() -> Element {
                 hqp_error.set(Some(format!("Profile load failed: {e}")));
             } else {
                 pipeline.restart();
-                matrix.restart();
+                refresh_advanced_projection(matrix, matrix_revision);
             }
             hqp_loading.set(false);
         });
@@ -333,7 +357,7 @@ pub fn HqPlayer() -> Element {
             if let Err(e) = api::post_json_no_response("/hqplayer/matrix/profile", &req).await {
                 hqp_error.set(Some(format!("Matrix profile failed: {e}")));
             } else {
-                matrix.restart();
+                refresh_advanced_projection(matrix, matrix_revision);
             }
             hqp_loading.set(false);
         });
@@ -361,7 +385,7 @@ pub fn HqPlayer() -> Element {
     let current_status = status.read().clone().flatten();
     let current_pipeline = pipeline.read().clone().flatten();
     let profiles_list = profiles.read().clone().flatten().unwrap_or_default();
-    let matrix_data = matrix.read().clone().flatten();
+    let matrix_data = matrix.read().clone();
     let zones_list = zones_list_signal();
     let links_list = links_signal();
     let instances_list = instances
@@ -513,6 +537,7 @@ fn LinkedZoneCard(
     let is_playing = np.map(|n| n.is_playing).unwrap_or(false);
 
     let volume = np.and_then(|n| n.volume);
+    let volume_min = np.and_then(|n| n.volume_min);
     let volume_type = np.and_then(|n| n.volume_type.clone());
     let volume_step = np.and_then(|n| n.volume_step);
     let seek_position = np.and_then(|n| n.seek_position).unwrap_or(0).max(0) as u32;
@@ -520,6 +545,19 @@ fn LinkedZoneCard(
     let can_seek = length > 0;
     let can_previous = np.map(|n| n.is_previous_allowed).unwrap_or(false);
     let can_next = np.map(|n| n.is_next_allowed).unwrap_or(false);
+    let at_volume_floor = match (volume, volume_min) {
+        (Some(value), Some(minimum)) => value <= minimum + 0.01,
+        _ => false,
+    };
+    let mut last_audible_volume = use_signal(|| None::<f32>);
+    use_effect(move || {
+        if !at_volume_floor {
+            if let Some(value) = volume {
+                last_audible_volume.set(Some(value));
+            }
+        }
+    });
+    let can_restore_volume = at_volume_floor && last_audible_volume.peek().is_some();
 
     // Album art
     let base_image_url = np.and_then(|n| n.image_url.clone()).unwrap_or_default();
@@ -621,12 +659,25 @@ fn LinkedZoneCard(
                         }
                         button {
                             class: "btn btn-ghost btn-sm",
-                            "aria-label": "Mute to minimum volume",
-                            title: "Mute to HQPlayer's minimum volume",
-                            onclick: move |_| on_control.call((zone_id_mute.clone(), "mute".to_string(), None)),
+                            "aria-label": if at_volume_floor { "Restore volume" } else { "Mute to minimum volume" },
+                            title: if at_volume_floor { "Restore the last audible volume" } else { "Mute to HQPlayer's minimum volume" },
+                            disabled: at_volume_floor && !can_restore_volume,
+                            onclick: move |_| {
+                                if at_volume_floor {
+                                    if let Some(value) = last_audible_volume() {
+                                        on_control.call((zone_id_mute.clone(), "vol_abs".to_string(), Some(f64::from(value))));
+                                    }
+                                } else {
+                                    on_control.call((zone_id_mute.clone(), "mute".to_string(), None));
+                                }
+                            },
                             svg { class: "w-4 h-4", fill: "none", stroke: "currentColor", stroke_width: "2", view_box: "0 0 24 24",
                                 path { d: "M11 5 6 9H3v6h3l5 4V5Z" }
-                                path { d: "m19 9-6 6m0-6 6 6" }
+                                if at_volume_floor {
+                                    path { d: "m15 9 3 3-3 3" }
+                                } else {
+                                    path { d: "m19 9-6 6m0-6 6 6" }
+                                }
                             }
                         }
 

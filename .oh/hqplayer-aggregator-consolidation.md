@@ -261,3 +261,51 @@ remain before publication of the next beta artifact.
   track. A changed identity still clears metadata, preventing details from leaking across tracks.
 - The HQPlayer source-domain regression waits for the metadata-bearing projection it asserts. The
   exact test passed ten consecutive focused runs and the complete 65-test direct-zone binary.
+
+## Installed QNAP beta qualification and corrections (2026-08-02)
+
+- Exercised the installed PR package through its browser UI, public HTTP/knob routes, MCP tools and
+  resources, aggregator projections, and direct native readback from HQPlayer Embedded 6.0.4.
+  Desktop and 375-by-812 mobile layouts rendered without horizontal overflow; the mobile navigation
+  collapsed as intended.
+- Verified live mutation and restoration of volume, mode, rate, 1x/Nx filters, modulator, matrix,
+  junk filter, adaptive volume, repeat and random. Stop succeeded, play against the empty playlist
+  was truthfully refused, and convolution was truthfully refused after native readback showed that
+  the daemon ignored the accepted write.
+- Exercised all advertised MCP HQPlayer read/control surfaces and resources. Their structured
+  envelopes and aggregator-backed state agreed with HTTP. HQPlayer content search/play remains the
+  explicit #209 gap rather than a falsely advertised operation.
+- Regression-checked a Roon zone through the same reliable bus by moving its volume 25 -> 24 -> 25
+  and observing the aggregator after each command. The installed environment exposes no live LMS,
+  OpenHome or UPnP endpoint, so those provider paths remain covered hermetically rather than claimed
+  as live-tested here.
+- Found HQPlayer 6.0.4's empty-playlist quirk: `Volume` and `MatrixSetProfile` may apply and then
+  return an unrelated playlist error. Semantic setters now let only exact, authoritative,
+  same-session State readback overrule that error; a genuine rejection remains a rejection.
+- Found that overlapping slow advanced-control refreshes could let an older response visually undo
+  a newer browser mutation. The page now revision-fences the advanced projection so latest request
+  wins, and refreshes after both mutations and HQPlayer SSE notifications.
+- Added a usable mute recovery path. The HQPlayer zone remembers the last audible level and changes
+  the floor-state button to Restore volume. A page loaded at the floor without a known prior level
+  disables restore rather than inventing a dangerous dB value.
+- Found that simultaneous relative-volume and play/pause requests were resolved against one stale
+  public snapshot. They now remain semantic commands until the exact instance's serialized endpoint
+  reads native State (and VolumeRange for volume), resolves each request in order, clamps at the
+  native boundary, performs the write, and confirms the aggregator projection. This preserves the
+  aggregator as public truth without collapsing rapid knob turns or toggles.
+- Corrected Tier-1 browser-form evidence parsing for HQPlayer's empty-valued `[default]` profile
+  option. The live form contains only this unnamed base configuration, so the browser correctly has
+  no named profile selector yet. A named-profile create/load/delete test remains for the corrected
+  package because it should not mutate the live daemon merely to compensate for the old package.
+- A read-only Tier-1 capture reached every native family in 42-46 ms with no unsolicited frames and
+  wrote `/tmp/hqp-live-tier1.json`. The merge gate still truthfully fails against the abbreviated
+  checked-in Opal proof corpus (roughly 144 enum/index divergences); runtime discovery nevertheless
+  published the daemon's full 77 filters, 36 modulators, 8 junk filters, 7 SDM rates and 2 matrix
+  profiles. The proof-corpus drift is not being hidden by weakening the gate.
+
+New deterministic regressions cover applied-despite-error matrix and volume writes, three concurrent
+relative-volume steps, two concurrent play/pause toggles, empty-valued default profile parsing, and
+the adapter-owned native clamp. Focused results: HQPlayer conformance 302/302, direct-zone 68/68,
+MCP HQPlayer 49/49, client harness 83/83, HQPlayer ledger/lint 40/40, and MCP contract 105/105.
+All architecture/boundary/debt lints, formatting, diff checks, and all-feature library Clippy with
+warnings denied pass. The complete all-feature suite is the publication gate for this correction.
