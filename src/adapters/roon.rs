@@ -140,10 +140,17 @@ fn looks_like_a_result_count_grouping(item: &BrowseItem) -> bool {
     let Some(subtitle) = item.subtitle.as_deref() else {
         return false;
     };
-    let Some(count) = subtitle.strip_suffix(" Results") else {
+    // Case and singular/plural tolerant: verified live only for Library's
+    // exact "<N> Results" shape (see #431), and TIDAL/Qobuz may reasonably
+    // format the same fact as "<N> result", "<n> RESULTS", or with
+    // incidental surrounding whitespace. Still requires the two-token
+    // "<count> <word>" shape, so this cannot start matching real content
+    // whose subtitle merely contains the word "results" or starts with a
+    // digit -- see `result_count_grouping_does_not_swallow_real_subtitles`.
+    let Some((count, word)) = subtitle.trim().split_once(' ') else {
         return false;
     };
-    count.parse::<u64>().is_ok()
+    count.parse::<u64>().is_ok() && matches!(word.to_lowercase().as_str(), "results" | "result")
 }
 
 /// Whether an item is a grouping/category row rather than addressable
@@ -3538,5 +3545,60 @@ mod tests {
         assert_eq!(delivered_title(&mut second, browse_title), "TIDAL");
         assert_eq!(delivered_title(&mut third, browse_title), "Qobuz");
         assert!(state.pending_browses.is_empty());
+    }
+
+    fn grouping_row(subtitle: &str) -> BrowseItem {
+        BrowseItem {
+            title: "whatever category label this source uses".to_string(),
+            subtitle: Some(subtitle.to_string()),
+            image_key: None,
+            item_key: Some("some_key".to_string()),
+            hint: Some(ItemHint::List),
+            input_prompt: None,
+        }
+    }
+
+    /// Issue #431: `is_category`'s title list is verified only for Library
+    /// results; `looks_like_a_result_count_grouping`'s subtitle-shape check
+    /// is the fallback for TIDAL/Qobuz, which may format their own grouping
+    /// rows differently. Broadened to accept case and singular/plural
+    /// variation, since none of these were exercised by the one live Library
+    /// search this was built against -- still unverified against a real
+    /// TIDAL/Qobuz result (tracked on #431), but no longer needlessly narrow
+    /// to the exact casing and pluralization of the one confirmed shape.
+    #[test]
+    fn result_count_grouping_tolerates_case_and_pluralization_variants() {
+        for subtitle in [
+            "32 Results",  // the exact shape verified live against nuc14
+            "1 Result",    // singular -- untested live, but plausible grammar
+            "7 results",   // lowercase -- untested live, but plausible casing
+            "19 RESULTS",  // shouting case, same reasoning
+            " 5 Results ", // incidental whitespace
+        ] {
+            assert!(
+                looks_like_a_result_count_grouping(&grouping_row(subtitle)),
+                "subtitle {subtitle:?} should be recognised as a grouping row"
+            );
+        }
+    }
+
+    /// The broadened check must not start swallowing real content whose
+    /// subtitle happens to end in a number-ish word, or #396's whole point
+    /// (never silently misplay) fails in the other direction.
+    #[test]
+    fn result_count_grouping_does_not_swallow_real_subtitles() {
+        for subtitle in [
+            "Miles Davis",       // an artist name
+            "Kind of Blue",      // an album title
+            "32 Bit Adventures", // a real album title that merely starts with a number
+            "Results May Vary",  // a real album title containing the word, wrong shape
+            "results",           // the word alone, no count
+            "32",                // a count alone, no word
+        ] {
+            assert!(
+                !looks_like_a_result_count_grouping(&grouping_row(subtitle)),
+                "subtitle {subtitle:?} should NOT be recognised as a grouping row"
+            );
+        }
     }
 }
