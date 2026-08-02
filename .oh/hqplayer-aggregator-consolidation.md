@@ -24,7 +24,19 @@ lane health/freshness, coherent observations, and verified receipts.
 ## Execute
 
 **Updated:** 2026-08-02
-**Status:** complete — remaining HQPlayer native controls are exposed and live-browser verified
+**Status:** in progress — extending the consolidated HQPlayer branch to the bus-only adapter boundary
+
+### Bus/aggregator boundary extension
+
+- Aim: keep this as one HQPlayer beta branch while making the in-app bus the only adapter I/O
+  boundary and the existing aggregator the only readable state authority.
+- Pre-flight: preserve every public route/payload, retain verified HQPlayer readback, preserve LMS's
+  proven independent CLI/poll retry behavior, and do not merge without approval.
+- First guardrail: the syntax-based architecture lint from #436 is now incorporated into this
+  branch. Its exact combined baseline contains 117 existing dependencies; every migration must
+  reduce it and no new dependency may be added.
+- Runtime prerequisite: #440 must separate reliable critical delivery and projection commits from
+  lossy post-commit notification before generic and specialized call sites migrate.
 
 ### UI expansion pre-flight
 
