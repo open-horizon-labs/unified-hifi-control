@@ -519,7 +519,13 @@ impl Envelope {
         text: impl std::fmt::Display,
         refusal: Refusal,
     ) -> Result<CallToolResult, CallToolError> {
-        Ok(self.refuse(refusal).text_result(format!("Error: {}", text)))
+        let mut result = self.refuse(refusal).text_result(format!("Error: {}", text));
+        // MCP treats an omitted `isError` as a successful tool call. The envelope's
+        // `outcome` gives clients the detailed classification, but it cannot replace
+        // this protocol signal: hosts and models inspect `isError` before interpreting
+        // tool-specific structured content.
+        result.is_error = Some(true);
+        Ok(result)
     }
 
     /// A backend failure whose `detail` is the same sentence as the text. The

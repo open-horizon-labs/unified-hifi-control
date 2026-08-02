@@ -69,26 +69,72 @@ struct ControlRequest {
     value: Option<f64>,
 }
 
-/// Refresh the advanced projection with latest-request-wins ordering.
-///
-/// A Dioxus `Resource::restart` can leave two browser requests in flight. HQPlayer profile and
-/// advanced-state reads are comparatively slow, so an older response can arrive after the response
-/// triggered by a successful mutation and snap the control back to stale state. Keep the ordering at
-/// the UI boundary: only the newest requested projection may be rendered.
+/// Gate slow advanced-state reads so rerenders or mutation bursts cannot overlap requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CoalescingRefresh {
+    initial_requested: bool,
+    in_flight: bool,
+    dirty: bool,
+}
+
+impl CoalescingRefresh {
+    /// `use_effect` may run after unrelated renders. Only the first mounted-page invocation is an
+    /// initial read; later explicit mutations still use [`Self::request`].
+    fn request_initial(&mut self) -> bool {
+        if self.initial_requested {
+            return false;
+        }
+        self.initial_requested = true;
+        self.request()
+    }
+
+    /// Returns true when the caller owns the single fetch loop.
+    fn request(&mut self) -> bool {
+        if self.in_flight {
+            self.dirty = true;
+            false
+        } else {
+            self.in_flight = true;
+            true
+        }
+    }
+
+    /// Returns true when one coalesced follow-up read is required.
+    fn complete(&mut self) -> bool {
+        if self.dirty {
+            self.dirty = false;
+            true
+        } else {
+            self.in_flight = false;
+            false
+        }
+    }
+}
+
 fn refresh_advanced_projection(
     mut snapshot: Signal<Option<HqpMatrixProfilesResponse>>,
-    mut requested_revision: Signal<u64>,
+    mut refresh: Signal<CoalescingRefresh>,
+    initial: bool,
 ) {
-    let revision = requested_revision.peek().saturating_add(1);
-    requested_revision.set(revision);
+    let should_start = if initial {
+        refresh.write().request_initial()
+    } else {
+        refresh.write().request()
+    };
+    if !should_start {
+        return;
+    }
+
     spawn(async move {
-        let Ok(next) =
-            api::fetch_json::<HqpMatrixProfilesResponse>("/hqplayer/matrix/profiles").await
-        else {
-            return;
-        };
-        if *requested_revision.peek() == revision {
-            snapshot.set(Some(next));
+        loop {
+            if let Ok(next) =
+                api::fetch_json::<HqpMatrixProfilesResponse>("/hqplayer/matrix/profiles").await
+            {
+                snapshot.set(Some(next));
+            }
+            if !refresh.write().complete() {
+                break;
+            }
         }
     });
 }
@@ -134,11 +180,11 @@ pub fn HqPlayer() -> Element {
             .ok()
     });
 
-    // Advanced state is intentionally not a restartable Resource: slow overlapping HQPlayer reads
-    // need an explicit revision fence so an older response cannot overwrite a newer mutation.
+    // Advanced state is intentionally not a restartable Resource: its slow read is coalesced so
+    // rerenders or mutation bursts cannot starve rendering or exhaust the browser's request pool.
     let matrix = use_signal(|| None::<HqpMatrixProfilesResponse>);
-    let matrix_revision = use_signal(|| 0u64);
-    use_effect(move || refresh_advanced_projection(matrix, matrix_revision));
+    let matrix_refresh = use_signal(CoalescingRefresh::default);
+    use_effect(move || refresh_advanced_projection(matrix, matrix_refresh, true));
 
     // Load zones resource
     let mut zones =
@@ -233,7 +279,11 @@ pub fn HqPlayer() -> Element {
         if sse.should_refresh_hqp() {
             status.restart();
             pipeline.restart();
-            refresh_advanced_projection(matrix, matrix_revision);
+            // Do not refresh the advanced endpoint from its own compatibility events. That read
+            // publishes HqpStateChanged/HqpPipelineChanged after committing its aggregator
+            // snapshot, so feeding either event back into the same read creates an endless native
+            // refresh loop. Advanced state is loaded on page entry and explicitly after every
+            // successful mutation/configuration change below.
         }
         if sse.should_refresh_zones() {
             zones.restart();
@@ -275,7 +325,7 @@ pub fn HqPlayer() -> Element {
                     status.restart();
                     pipeline.restart();
                     profiles.restart();
-                    refresh_advanced_projection(matrix, matrix_revision);
+                    refresh_advanced_projection(matrix, matrix_refresh, false);
                 }
                 Err(e) => {
                     config_status.set(Some(format!("Error: {}", e)));
@@ -316,7 +366,7 @@ pub fn HqPlayer() -> Element {
                 // Server now returns fresh state after setting, so HQPlayer has processed
                 // the change before we refresh
                 pipeline.restart();
-                refresh_advanced_projection(matrix, matrix_revision);
+                refresh_advanced_projection(matrix, matrix_refresh, false);
             }
             hqp_loading.set(false);
         });
@@ -336,7 +386,7 @@ pub fn HqPlayer() -> Element {
                 hqp_error.set(Some(format!("Profile load failed: {e}")));
             } else {
                 pipeline.restart();
-                refresh_advanced_projection(matrix, matrix_revision);
+                refresh_advanced_projection(matrix, matrix_refresh, false);
             }
             hqp_loading.set(false);
         });
@@ -357,7 +407,7 @@ pub fn HqPlayer() -> Element {
             if let Err(e) = api::post_json_no_response("/hqplayer/matrix/profile", &req).await {
                 hqp_error.set(Some(format!("Matrix profile failed: {e}")));
             } else {
-                refresh_advanced_projection(matrix, matrix_revision);
+                refresh_advanced_projection(matrix, matrix_refresh, false);
             }
             hqp_loading.set(false);
         });
@@ -513,6 +563,40 @@ pub fn HqPlayer() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CoalescingRefresh;
+
+    #[test]
+    fn advanced_refreshes_never_overlap_and_coalesce_bursts() {
+        let mut refresh = CoalescingRefresh::default();
+
+        assert!(
+            refresh.request_initial(),
+            "the mounted page starts one initial fetch"
+        );
+        assert!(
+            !refresh.request_initial(),
+            "rerenders cannot restart the initial fetch"
+        );
+        assert!(!refresh.request(), "an in-flight fetch is not duplicated");
+        assert!(
+            !refresh.request(),
+            "a burst still queues only one follow-up"
+        );
+        assert!(
+            refresh.complete(),
+            "one dirty follow-up starts after completion"
+        );
+        assert!(!refresh.complete(), "the clean follow-up settles the gate");
+        assert!(
+            !refresh.request_initial(),
+            "settling cannot turn a rerender into another initial fetch"
+        );
+        assert!(refresh.request(), "a later event can start a fresh fetch");
     }
 }
 

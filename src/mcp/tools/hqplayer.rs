@@ -12,7 +12,8 @@
 //! snapshot suite. `tests/mcp_contract.rs::hqplayer_set_pipeline_alias_table_is_pinned`
 //! checks every alias individually.
 
-use crate::adapters::hqplayer::HqpAdapter;
+use crate::adapters::hqplayer::{HqpAdapter, HqpAdvancedOptionsSnapshot};
+use crate::aggregator::HqpSnapshot;
 use crate::api::AppState;
 use crate::bus::runtime::HqpRuntimeCommand;
 use crate::mcp::envelope::{Envelope, Provider, Refusal, Scope};
@@ -209,6 +210,86 @@ fn target_failure(
     }
 }
 
+fn hqp_status_payload_from_snapshot(
+    snapshot: &HqpSnapshot,
+    advanced: Option<HqpAdvancedOptionsSnapshot>,
+    options_unavailable_reason: Option<String>,
+) -> McpHqpStatus {
+    let mut status = snapshot.observation.connection.clone();
+    status.connected = snapshot.presence == crate::aggregator::HqpSnapshotPresence::Live;
+    let (pipeline, options) = match advanced {
+        Some(snapshot) => {
+            let pipeline = snapshot.pipeline;
+            let state = snapshot.state;
+            let selection =
+                |setting: &crate::adapters::hqplayer::PipelineSetting| McpHqpSelection {
+                    current: setting.selected.value.clone(),
+                    choices: setting
+                        .options
+                        .iter()
+                        .map(|option| option.value.clone())
+                        .collect(),
+                };
+            let options = McpHqpOptions {
+                mode: selection(&pipeline.settings.mode),
+                samplerate: selection(&pipeline.settings.samplerate),
+                filter1x: selection(&pipeline.settings.filter1x),
+                filter_nx: selection(&pipeline.settings.filter_nx),
+                shaper: selection(&pipeline.settings.shaper),
+                junk_filter: McpHqpSelection {
+                    current: snapshot
+                        .junk_filters
+                        .iter()
+                        .find(|item| item.index == state.filter_junk)
+                        .map(|item| item.name.clone())
+                        .unwrap_or_default(),
+                    choices: snapshot
+                        .junk_filters
+                        .into_iter()
+                        .map(|item| item.name)
+                        .collect(),
+                },
+                matrix_profile: McpHqpSelection {
+                    current: snapshot
+                        .current_matrix_profile
+                        .map(|profile| profile.name)
+                        .unwrap_or_default(),
+                    choices: snapshot
+                        .matrix_profiles
+                        .into_iter()
+                        .map(|profile| profile.name)
+                        .collect(),
+                },
+                convolution: state.convolution,
+                adaptive_volume: state.adaptive,
+                repeat: match state.repeat {
+                    0 => "off",
+                    1 => "one",
+                    2 => "all",
+                    _ => "unknown",
+                }
+                .to_string(),
+                random: state.random,
+            };
+            (Some(pipeline), Some(options))
+        }
+        None => (None, None),
+    };
+
+    McpHqpStatus {
+        connected: status.connected,
+        host: status.host,
+        pipeline: pipeline.map(|p| McpPipelineStatus {
+            state: p.status.state,
+            filter: p.status.active_filter,
+            shaper: p.status.active_shaper,
+            rate: p.status.active_rate,
+        }),
+        options,
+        options_unavailable_reason,
+    }
+}
+
 async fn hqp_status_payload_for_adapter(state: &AppState, instance: &str) -> McpHqpStatus {
     let Some(snapshot) = state.aggregator.get_hqplayer_snapshot(instance).await else {
         // Adapter-private connection state can become true before its first coherent observation
@@ -224,80 +305,25 @@ async fn hqp_status_payload_for_adapter(state: &AppState, instance: &str) -> Mcp
             options_unavailable_reason: None,
         };
     };
-    let mut status = snapshot.observation.connection;
-    status.connected = snapshot.presence == crate::aggregator::HqpSnapshotPresence::Live;
-    let (pipeline, options, options_unavailable_reason) =
-        match crate::api::refresh_hqp_advanced_aggregate(state, instance).await {
-            Ok(snapshot) => {
-                let pipeline = snapshot.pipeline;
-                let state = snapshot.state;
-                let selection =
-                    |setting: &crate::adapters::hqplayer::PipelineSetting| McpHqpSelection {
-                        current: setting.selected.value.clone(),
-                        choices: setting
-                            .options
-                            .iter()
-                            .map(|option| option.value.clone())
-                            .collect(),
-                    };
-                let options = McpHqpOptions {
-                    mode: selection(&pipeline.settings.mode),
-                    samplerate: selection(&pipeline.settings.samplerate),
-                    filter1x: selection(&pipeline.settings.filter1x),
-                    filter_nx: selection(&pipeline.settings.filter_nx),
-                    shaper: selection(&pipeline.settings.shaper),
-                    junk_filter: McpHqpSelection {
-                        current: snapshot
-                            .junk_filters
-                            .iter()
-                            .find(|item| item.index == state.filter_junk)
-                            .map(|item| item.name.clone())
-                            .unwrap_or_default(),
-                        choices: snapshot
-                            .junk_filters
-                            .into_iter()
-                            .map(|item| item.name)
-                            .collect(),
-                    },
-                    matrix_profile: McpHqpSelection {
-                        current: snapshot
-                            .current_matrix_profile
-                            .map(|profile| profile.name)
-                            .unwrap_or_default(),
-                        choices: snapshot
-                            .matrix_profiles
-                            .into_iter()
-                            .map(|profile| profile.name)
-                            .collect(),
-                    },
-                    convolution: state.convolution,
-                    adaptive_volume: state.adaptive,
-                    repeat: match state.repeat {
-                        0 => "off",
-                        1 => "one",
-                        2 => "all",
-                        _ => "unknown",
-                    }
-                    .to_string(),
-                    random: state.random,
-                };
-                (Some(pipeline), Some(options), None)
-            }
-            Err(error) => (None, None, status.connected.then(|| error.to_string())),
-        };
-
-    McpHqpStatus {
-        connected: status.connected,
-        host: status.host,
-        pipeline: pipeline.map(|p| McpPipelineStatus {
-            state: p.status.state,
-            filter: p.status.active_filter,
-            shaper: p.status.active_shaper,
-            rate: p.status.active_rate,
-        }),
-        options,
-        options_unavailable_reason,
+    match crate::api::refresh_hqp_advanced_aggregate(state, instance).await {
+        Ok(advanced) => hqp_status_payload_from_snapshot(&snapshot, Some(advanced), None),
+        Err(error) => hqp_status_payload_from_snapshot(
+            &snapshot,
+            None,
+            (snapshot.presence == crate::aggregator::HqpSnapshotPresence::Live)
+                .then(|| error.to_string()),
+        ),
     }
+}
+
+/// Project the state committed by a successful HQPlayer command without issuing
+/// another adapter read. Reliable command dispatch does not return until this
+/// aggregate exists, so this is both the cheapest and the authoritative evidence
+/// to attach to the write result.
+async fn hqp_mutation_payload(state: &AppState, instance: &str) -> Option<McpHqpStatus> {
+    let snapshot = state.aggregator.get_hqplayer_snapshot(instance).await?;
+    let advanced = snapshot.advanced.clone();
+    Some(hqp_status_payload_from_snapshot(&snapshot, advanced, None))
 }
 
 /// Shared default-instance payload for the tool and `hifi://hqplayer/status` resource.
@@ -380,7 +406,13 @@ pub async fn handle_load_profile(
     )
     .await
     {
-        Ok(()) => Ok(env.text_result(format!("Loaded profile: {}", args.profile))),
+        Ok(()) => {
+            let env = match hqp_mutation_payload(state, &instance).await {
+                Some(payload) => env.data(&payload),
+                None => env,
+            };
+            Ok(env.text_result(format!("Loaded profile: {}", args.profile)))
+        }
         Err(e) => env.failed(format!("Failed to load profile: {}", e.message())),
     }
 }
@@ -521,7 +553,13 @@ pub async fn handle_set_pipeline(
     )
     .await
     {
-        Ok(()) => Ok(env.text_result(format!("Set {} to {}", args.setting, args.value))),
+        Ok(()) => {
+            let env = match hqp_mutation_payload(state, &instance).await {
+                Some(payload) => env.data(&payload),
+                None => env,
+            };
+            Ok(env.text_result(format!("Set {} to {}", args.setting, args.value)))
+        }
         Err(e) => env.failed(format!("Failed to set {}: {}", args.setting, e.message())),
     }
 }

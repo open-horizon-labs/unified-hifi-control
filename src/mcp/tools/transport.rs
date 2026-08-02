@@ -325,10 +325,17 @@ pub(crate) async fn handle_hqplayer_control(
     )
     .await
     {
-        Ok(()) => Ok(env.text_result(format!(
-            "Action '{}' executed and verified state was published.",
-            args.action
-        ))),
+        Ok(()) => {
+            // The HQPlayer dispatcher returns only after its correlated native
+            // readback has committed. Return that aggregator-owned zone in the
+            // same shape as every other provider, instead of merely claiming in
+            // prose that a verified projection exists.
+            let observed = Observed::from_aggregator(state, &args.zone_id).await;
+            Ok(env.observed(observed).text_result(format!(
+                "Action '{}' executed and verified state was published.",
+                args.action
+            )))
+        }
         Err(HqpDispatchError::NotFound(message)) => env.failed(message),
         Err(HqpDispatchError::BadRequest { message, .. }) => env.refused(
             message,

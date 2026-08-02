@@ -314,6 +314,14 @@ fn text_of(result: &CallToolResult) -> String {
         .unwrap_or_default()
 }
 
+fn envelope_of(result: &CallToolResult) -> Value {
+    result
+        .structured_content
+        .clone()
+        .map(Value::Object)
+        .expect("every advertised UHC tool result carries the MCP envelope")
+}
+
 /// A daemon mid-playback with a loaded, seekable track and a working decimal-dB control.
 fn playing_daemon() -> DaemonModel {
     let model = DaemonModel::with_profile(VERIFIED_PROFILE);
@@ -413,6 +421,70 @@ async fn mcp_transport_reaches_the_selected_hqplayer_instance_and_not_roon() {
 
     rig.shutdown().await;
     server.stop();
+}
+
+/// A successful direct-zone command does not merely say that verified state was published: the
+/// same MCP result carries the aggregator projection that makes the claim inspectable.
+#[tokio::test]
+async fn mcp_hqplayer_transport_success_carries_the_aggregator_readback() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+
+    let result = rig
+        .call_tool(
+            "hifi_control",
+            json!({"zone_id": "hqplayer:rig", "action": "pause"}),
+        )
+        .await;
+    let envelope = envelope_of(&result);
+
+    assert_eq!(envelope["outcome"], "accepted");
+    assert_eq!(envelope["observed"]["read_from"], "aggregator");
+    assert_eq!(envelope["observed"]["zone"]["zone_id"], "hqplayer:rig");
+    assert_eq!(envelope["observed"]["zone"]["state"], "paused");
+    assert!(
+        envelope["observed"]["as_of_ms"]
+            .as_u64()
+            .is_some_and(|timestamp| timestamp > 0),
+        "the readback needs its aggregator timestamp: {envelope}"
+    );
+
+    rig.shutdown().await;
+    server.stop();
+}
+
+/// MCP distinguishes a tool failure from a successful tool result at the protocol layer. The
+/// structured outcome remains the detailed classification; `isError` is the client/LLM signal.
+#[tokio::test]
+async fn mcp_hqplayer_refusals_set_the_call_tool_error_flag() {
+    let rig = Rig::new().await;
+
+    for (label, args, outcome) in [
+        (
+            "invalid action",
+            json!({"zone_id": "hqplayer:missing", "action": "frobnicate"}),
+            "invalid",
+        ),
+        (
+            "missing instance",
+            json!({"zone_id": "hqplayer:missing", "action": "play"}),
+            "error",
+        ),
+    ] {
+        let result = rig.call_tool("hifi_control", args).await;
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "{label} must be failure-framed for an MCP client: {}",
+            text_of(&result)
+        );
+        assert_eq!(envelope_of(&result)["outcome"], outcome);
+    }
+
+    rig.shutdown().await;
 }
 
 /// **Client expectation.** Every transport verb the direct zone advertises routes through MCP, not
@@ -858,6 +930,40 @@ async fn mcp_advanced_hqplayer_tools_target_the_named_instance_not_default() {
     rig.shutdown().await;
     default_server.stop();
     rig_server.stop();
+}
+
+/// A successful pipeline write returns the post-command HQPlayer projection as structured data.
+/// The command path already waits for a correlated aggregator commit; omitting that payload forces
+/// an MCP client to issue a second status call and makes the success prose impossible to check.
+#[tokio::test]
+async fn mcp_hqplayer_pipeline_success_carries_post_command_status_data() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+
+    let result = rig
+        .call_tool(
+            "hifi_hqplayer_set_pipeline",
+            json!({
+                "zone_id": "hqplayer:rig",
+                "setting": "random",
+                "value": "true"
+            }),
+        )
+        .await;
+    let envelope = envelope_of(&result);
+
+    assert_eq!(envelope["outcome"], "accepted");
+    assert_eq!(envelope["data"]["connected"], true);
+    assert_eq!(
+        envelope["data"]["options"]["random"], true,
+        "data must be the post-command HQPlayer projection: {envelope}"
+    );
+
+    rig.shutdown().await;
+    server.stop();
 }
 
 /// **Client expectation.** A malformed or missing HQPlayer instance fails explicitly instead of
