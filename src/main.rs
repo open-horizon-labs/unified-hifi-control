@@ -7,7 +7,7 @@
 mod server {
     use unified_hifi_control::{
         adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
-        mdns, producers,
+        mdns,
     };
 
     // Import load_app_settings for checking adapter enabled state
@@ -214,30 +214,17 @@ mod server {
             knob_store.clone(),
         ));
 
-        // The adaptive handle must exist before a producing adapter is constructed, but its actor
-        // must not run until the public socket is bound below. This preserves bind-before-startup
-        // while allowing HQPlayer's manager to own the handle for its whole lifecycle.
-        let producer_shutdown_token = CancellationToken::new();
-        let (adaptive_handle, producer_actor, adaptive_view) =
-            producers::AdaptiveRuntime::build(producer_shutdown_token.clone(), 1024);
-        let hqp_adaptive_publisher = Arc::new(producers::hqplayer::HqpAdaptivePublisher::new(
-            adaptive_handle,
-        ));
+        // Construct the one state owner before any adapter can publish. Its bus subscription still
+        // starts below, before adapters start, so broadcast zone events cannot race startup.
+        let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
 
         // HQPlayer instance manager (multi-instance support, no settings toggle)
         let hqp_instances = Arc::new(
             adapters::hqplayer::HqpInstanceManager::new_with_native_sink(
                 bus.clone(),
-                hqp_adaptive_publisher.clone(),
+                zone_aggregator.clone(),
             ),
         );
-        let (hqp_command_handle, hqp_command_actor) =
-            producers::hqplayer_command_service::HqpImmediateCommandActor::build(
-                adaptive_view,
-                hqp_adaptive_publisher,
-                hqp_instances.clone(),
-                32,
-            );
         hqp_instances.load_from_config().await;
         let instance_count = hqp_instances.instance_count().await;
         if instance_count > 0 {
@@ -307,7 +294,6 @@ mod server {
         // Subscribe the authoritative aggregator before any producer can publish its initial
         // discovery snapshot. The bus is broadcast-only and does not replay messages to subscribers
         // created after adapter startup.
-        let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
         let (aggregator_ready_tx, aggregator_ready_rx) = tokio::sync::oneshot::channel();
         let aggregator_for_spawn = zone_aggregator.clone();
         tokio::spawn(async move {
@@ -336,19 +322,8 @@ mod server {
         let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
         let listener = tokio::net::TcpListener::bind(addr).await?;
 
-        // SSE closes as soon as graceful HTTP shutdown begins. Adaptive ingress remains open
-        // until producing adapters have stopped, then drains under its own non-lossy token.
+        // SSE closes as soon as graceful HTTP shutdown begins.
         let shutdown_token = CancellationToken::new();
-
-        // Construct the bounded command actor before any producer can publish. The handle is
-        // retained for the process lifetime and will be handed to producing adapters by #325;
-        // the read-only view is consumed by #326. No adaptive payload enters the public
-        // BusEvent/SSE contract.
-        let producer_actor_task = tokio::spawn(async move {
-            producer_actor.run().await;
-        });
-        let hqp_command_actor_task = tokio::spawn(hqp_command_actor.run());
-        tracing::info!("ProducerActor started");
 
         // Single loop to start all enabled adapters
         coord.start_all_enabled(&startable_adapters).await;
@@ -657,16 +632,6 @@ mod server {
         // Cleanup: publish ShuttingDown event and stop adapters
         tracing::info!("Shutting down adapters...");
 
-        // Close immediate-command ingress and drain accepted work before broadcasting shutdown.
-        // Some adapters react to that broadcast independently of the coordinator, so publishing it
-        // first would let native lifecycle teardown race an already-admitted command.
-        if let Err(error) = hqp_command_handle.shutdown().await {
-            tracing::warn!(?error, "HQPlayer command actor did not drain cleanly");
-        }
-        if let Err(error) = hqp_command_actor_task.await {
-            tracing::warn!(%error, "HQPlayer command actor exited with a join error");
-        }
-
         // Publish ShuttingDown event for any bus listeners
         bus.publish(bus::BusEvent::ShuttingDown {
             reason: Some("User requested shutdown".to_string()),
@@ -684,14 +649,6 @@ mod server {
             fw.stop();
         }
 
-        // No producer remains after adapters stop. Close ingress, drain every command already
-        // accepted by the bounded actor, and join it. Public-bus listeners are independently
-        // responsible for their own shutdown; no arbitrary sleep can prove they observed a
-        // broadcast.
-        producer_shutdown_token.cancel();
-        if let Err(error) = producer_actor_task.await {
-            tracing::warn!(%error, "ProducerActor exited with a join error");
-        }
         tracing::info!("Shutdown complete");
 
         server_result?;

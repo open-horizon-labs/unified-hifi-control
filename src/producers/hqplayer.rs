@@ -3026,6 +3026,14 @@ mod tests {
                 transport_generation: 1,
             },
             observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_016_400),
+            connection: crate::adapters::hqplayer::HqpConnectionStatus {
+                connected: true,
+                host: Some("127.0.0.1".to_string()),
+                port: 4321,
+                web_port: 8088,
+                info: None,
+            },
+            pipeline: crate::adapters::hqplayer::PipelineStatus::default(),
             transport: HqpNativeTransportState::Playing,
             metadata: HqpNativeMetadata {
                 track_id: Some("track-42".to_string()),

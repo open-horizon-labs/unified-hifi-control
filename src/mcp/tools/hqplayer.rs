@@ -132,6 +132,7 @@ fn parse_repeat(value: &str) -> Option<u8> {
 
 enum HqpTarget {
     Resolved {
+        instance: String,
         adapter: Arc<HqpAdapter>,
         scope: Scope,
     },
@@ -151,6 +152,7 @@ enum HqpTarget {
 async fn resolve_target(state: &AppState, zone_id: Option<&str>) -> HqpTarget {
     let Some(zone_id) = zone_id else {
         return HqpTarget::Resolved {
+            instance: "default".to_string(),
             adapter: state.hqplayer.clone(),
             scope: Scope::provider_only(Provider::HqPlayer),
         };
@@ -170,7 +172,11 @@ async fn resolve_target(state: &AppState, zone_id: Option<&str>) -> HqpTarget {
         };
     }
     match state.hqp_instances.get(instance).await {
-        Some(adapter) => HqpTarget::Resolved { adapter, scope },
+        Some(adapter) => HqpTarget::Resolved {
+            instance: instance.to_string(),
+            adapter,
+            scope,
+        },
         None => HqpTarget::Missing {
             scope,
             instance: instance.to_string(),
@@ -181,9 +187,13 @@ async fn resolve_target(state: &AppState, zone_id: Option<&str>) -> HqpTarget {
 fn target_failure(
     env: Envelope,
     target: HqpTarget,
-) -> Result<(Arc<HqpAdapter>, Envelope), Result<CallToolResult, CallToolError>> {
+) -> Result<(String, Arc<HqpAdapter>, Envelope), Result<CallToolResult, CallToolError>> {
     match target {
-        HqpTarget::Resolved { adapter, scope } => Ok((adapter, env.scope(scope))),
+        HqpTarget::Resolved {
+            instance,
+            adapter,
+            scope,
+        } => Ok((instance, adapter, env.scope(scope))),
         HqpTarget::Invalid { scope, detail } => Err(env.scope(scope).refused(
             &detail,
             Refusal::invalid_parameter(
@@ -198,10 +208,22 @@ fn target_failure(
     }
 }
 
-async fn hqp_status_payload_for_adapter(adapter: &HqpAdapter) -> McpHqpStatus {
-    let status = adapter.get_status().await;
+async fn hqp_status_payload_for_adapter(
+    state: &AppState,
+    instance: &str,
+    adapter: &HqpAdapter,
+) -> McpHqpStatus {
+    let status = match state.aggregator.get_hqplayer_snapshot(instance).await {
+        Some(snapshot) => {
+            let mut connection = snapshot.observation.connection;
+            connection.connected =
+                snapshot.presence == crate::aggregator::HqpSnapshotPresence::Live;
+            connection
+        }
+        None => adapter.get_status().await,
+    };
     let (pipeline, options, options_unavailable_reason) =
-        match adapter.get_advanced_options_snapshot().await {
+        match crate::api::refresh_hqp_advanced_aggregate(state, instance).await {
             Ok(snapshot) => {
                 let pipeline = snapshot.pipeline;
                 let state = snapshot.state;
@@ -276,7 +298,7 @@ async fn hqp_status_payload_for_adapter(adapter: &HqpAdapter) -> McpHqpStatus {
 
 /// Shared default-instance payload for the tool and `hifi://hqplayer/status` resource.
 pub async fn hqp_status_payload(state: &AppState) -> McpHqpStatus {
-    hqp_status_payload_for_adapter(&state.hqplayer).await
+    hqp_status_payload_for_adapter(state, "default", &state.hqplayer).await
 }
 
 pub async fn handle_status(
@@ -286,18 +308,16 @@ pub async fn handle_status(
     let env = Envelope::read("hifi_hqplayer_status", "get_status")
         .param_opt("zone_id", args.zone_id.as_deref());
     let target = resolve_target(state, args.zone_id.as_deref()).await;
-    let (adapter, env) = match target_failure(env, target) {
+    let (instance, adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
         Err(result) => return result,
     };
-    Ok(env.json_result(&hqp_status_payload_for_adapter(&adapter).await))
+    Ok(env.json_result(&hqp_status_payload_for_adapter(state, &instance, &adapter).await))
 }
 
 /// Fetch the default instance's profiles for the tool and MCP resource from one implementation.
 pub async fn hqp_profiles_payload(state: &AppState) -> Result<Vec<String>, String> {
-    state
-        .hqplayer
-        .fetch_profiles()
+    crate::api::refresh_hqp_profiles_aggregate(state, "default")
         .await
         .map(|profiles| profiles.into_iter().map(|profile| profile.title).collect())
         .map_err(|error| error.to_string())
@@ -310,14 +330,15 @@ pub async fn handle_profiles(
     let env = Envelope::read("hifi_hqplayer_profiles", "list_profiles")
         .param_opt("zone_id", args.zone_id.as_deref());
     let target = resolve_target(state, args.zone_id.as_deref()).await;
-    let (adapter, env) = match target_failure(env, target) {
+    let (instance, _adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
         Err(result) => return result,
     };
-    let profile_names: Vec<String> = match adapter.fetch_profiles().await {
-        Ok(profiles) => profiles.into_iter().map(|profile| profile.title).collect(),
-        Err(error) => return env.failed(format!("Failed to list profiles: {error}")),
-    };
+    let profile_names: Vec<String> =
+        match crate::api::refresh_hqp_profiles_aggregate(state, &instance).await {
+            Ok(profiles) => profiles.into_iter().map(|profile| profile.title).collect(),
+            Err(error) => return env.failed(format!("Failed to list profiles: {error}")),
+        };
     Ok(env.json_result(&profile_names))
 }
 
@@ -329,7 +350,7 @@ pub async fn handle_load_profile(
         .param("profile", &*args.profile)
         .param_opt("zone_id", args.zone_id.as_deref());
     let target = resolve_target(state, args.zone_id.as_deref()).await;
-    let (adapter, env) = match target_failure(env, target) {
+    let (instance, adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
         Err(result) => return result,
     };
@@ -338,7 +359,15 @@ pub async fn handle_load_profile(
         // `load_profile` returns only after persistent XML readback and native/web recovery.
         // The envelope still carries no legacy-zone observation because pipeline configuration
         // is not represented by the ZoneAggregator's playback shape.
-        Ok(()) => Ok(env.text_result(format!("Loaded profile: {}", args.profile))),
+        Ok(()) => {
+            if let Err(error) = state.hqp_instances.refresh_instance(&instance).await {
+                return env.failed(format!(
+                    "Loaded profile {}, but failed to publish recovered state: {error}",
+                    args.profile
+                ));
+            }
+            Ok(env.text_result(format!("Loaded profile: {}", args.profile)))
+        }
         Err(e) => env.failed(format!("Failed to load profile: {}", e)),
     }
 }
@@ -358,7 +387,7 @@ pub async fn handle_set_pipeline(
         .param("value", &*args.value)
         .param_opt("zone_id", args.zone_id.as_deref());
     let target = resolve_target(state, args.zone_id.as_deref()).await;
-    let (adapter, env) = match target_failure(env, target) {
+    let (instance, adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
         Err(result) => return result,
     };
@@ -468,8 +497,21 @@ pub async fn handle_set_pipeline(
     // "Set X to Y" for a setting that did not actually change — the same collapse
     // `hqp_apply_named_setting`/`hqp_apply_legacy_setting` (`src/api/mod.rs`) already use.
     match result.and_then(crate::adapters::hqplayer::SettingOutcome::into_applied_result) {
-        // No `observed` — same reason as load_profile.
-        Ok(()) => Ok(env.text_result(format!("Set {} to {}", args.setting, args.value))),
+        Ok(()) => {
+            if let Err(error) = state.hqp_instances.refresh_instance(&instance).await {
+                return env.failed(format!(
+                    "Set {} to {}, but failed to publish verified state: {error}",
+                    args.setting, args.value
+                ));
+            }
+            if let Err(error) = crate::api::refresh_hqp_advanced_aggregate(state, &instance).await {
+                return env.failed(format!(
+                    "Set {} to {}, but failed to publish advanced state: {error}",
+                    args.setting, args.value
+                ));
+            }
+            Ok(env.text_result(format!("Set {} to {}", args.setting, args.value)))
+        }
         Err(e) => env.failed(format!("Failed to set {}: {}", args.setting, e)),
     }
 }

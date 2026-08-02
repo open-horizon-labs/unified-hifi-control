@@ -1326,7 +1326,7 @@ impl FilterSide {
 }
 
 /// HQPlayer info
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HqpInfo {
     pub name: String,
     pub product: String,
@@ -1464,26 +1464,26 @@ pub struct FilterItem {
 }
 
 /// Pipeline settings for a single setting type
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PipelineSetting {
     pub selected: SelectedOption,
     pub options: Vec<SelectOption>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SelectedOption {
     pub value: String,
     pub label: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SelectOption {
     pub value: String,
     pub label: String,
 }
 
 /// Full pipeline status
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PipelineStatus {
     pub status: PipelineState,
     pub volume: PipelineVolume,
@@ -1497,6 +1497,7 @@ pub struct PipelineStatus {
 /// daemon session with junk-filter or matrix choices from a replacement session.
 #[derive(Debug, Clone)]
 pub struct HqpAdvancedOptionsSnapshot {
+    pub(crate) execution_target: HqpNativeExecutionTarget,
     pub pipeline: PipelineStatus,
     pub state: HqpState,
     pub junk_filters: Vec<ListItem>,
@@ -1517,6 +1518,8 @@ struct CoherentPipelineSnapshot {
     volume_range: VolumeRange,
     info: HqpInfo,
     host: String,
+    port: u16,
+    web_port: u16,
     instance_name: String,
     producer_epoch: u64,
     endpoint_generation: u64,
@@ -1528,6 +1531,8 @@ struct CoherentPipelineSnapshot {
 struct CoherentSessionIdentity {
     info: HqpInfo,
     host: String,
+    port: u16,
+    web_port: u16,
     instance_name: String,
     producer_epoch: u64,
     endpoint_generation: u64,
@@ -1546,6 +1551,11 @@ pub struct HqpNativeObservation {
     /// retains this out of the declarative document and copies it into the opaque command lease.
     pub(crate) execution_target: HqpNativeExecutionTarget,
     pub observed_at: SystemTime,
+    pub connection: HqpConnectionStatus,
+    /// Frozen legacy payload from the same generation-fenced observation. Existing HTTP and web
+    /// consumers can project their unchanged contract from the aggregator without re-querying the
+    /// adapter and accidentally joining two daemon moments.
+    pub pipeline: PipelineStatus,
     pub transport: HqpNativeTransportState,
     pub metadata: HqpNativeMetadata,
     pub volume: HqpNativeVolume,
@@ -1596,6 +1606,20 @@ pub struct HqpNativeSelection {
 pub trait HqpNativeObservationSink: Send + Sync {
     async fn manager_started(&self) -> Result<()>;
     async fn observed(&self, observation: HqpNativeObservation) -> Result<()>;
+    async fn advanced_observed(
+        &self,
+        _instance_name: &str,
+        _snapshot: HqpAdvancedOptionsSnapshot,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn profiles_observed(
+        &self,
+        _instance_name: &str,
+        _result: Result<Vec<HqpProfile>, String>,
+    ) -> Result<()> {
+        Ok(())
+    }
     async fn transient_failure(&self, instance_name: &str, observed_at: SystemTime) -> Result<()>;
     async fn instance_removed(&self, instance_name: &str, producer_epoch: u64) -> Result<()>;
     async fn manager_stopped(&self) -> Result<()>;
@@ -1607,7 +1631,7 @@ struct HqpNativeWorker {
     instance_name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PipelineState {
     pub state: String,
     pub mode: String,
@@ -1619,7 +1643,7 @@ pub struct PipelineState {
     pub invert: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PipelineVolume {
     pub value: i32,
     pub min: i32,
@@ -1627,7 +1651,7 @@ pub struct PipelineVolume {
     pub is_fixed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelineSettings {
     pub mode: PipelineSetting,
@@ -1641,7 +1665,7 @@ pub struct PipelineSettings {
 }
 
 /// HQPlayer connection status for API
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HqpConnectionStatus {
     pub connected: bool,
     pub host: Option<String>,
@@ -2539,6 +2563,8 @@ impl HqpAdapter {
         Some(CoherentSessionIdentity {
             info: state.info.clone()?,
             host: state.host.clone()?,
+            port: state.port,
+            web_port: state.web_port,
             instance_name: state
                 .instance_name
                 .clone()
@@ -2996,6 +3022,14 @@ impl HqpAdapter {
                 transport_generation: snapshot.transport_generation,
             },
             observed_at: snapshot.observed_at,
+            connection: HqpConnectionStatus {
+                connected: true,
+                host: Some(snapshot.host.clone()),
+                port: snapshot.port,
+                web_port: snapshot.web_port,
+                info: Some(snapshot.info.clone()),
+            },
+            pipeline: snapshot.legacy.clone(),
             transport: match snapshot.playback_status.state {
                 0 => HqpNativeTransportState::Stopped,
                 1 => HqpNativeTransportState::Paused,
@@ -4809,6 +4843,26 @@ impl HqpAdapter {
         }
 
         items
+    }
+
+    /// Parse matrix profiles using their order as the legacy numeric position.
+    ///
+    /// HQPlayer 6.0.4 Embedded omits an `index` attribute entirely. The public HTTP contract still
+    /// carries a number, but that number has always meant a position in the freshly returned list,
+    /// not a daemon-owned identifier. Deriving it here also prevents every no-index entry from
+    /// collapsing to zero and making all but the first profile unreachable.
+    fn parse_matrix_profiles(response: &str) -> Vec<MatrixProfile> {
+        Self::parse_items(response, "MatrixProfile", |item| {
+            Self::parse_attr(item, "name").unwrap_or_default()
+        })
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, name)| {
+            u32::try_from(index)
+                .ok()
+                .map(|index| MatrixProfile { index, name })
+        })
+        .collect()
     }
 
     /// Get available modes
@@ -6649,11 +6703,7 @@ impl HqpAdapter {
             .context(
                 "HQPlayer matrix-profile choices became unavailable during the coherent read",
             )?;
-        let matrix_profiles =
-            Self::parse_items(&matrix_response, "MatrixProfile", |item| MatrixProfile {
-                index: Self::parse_attr_u32(item, "index"),
-                name: Self::parse_attr(item, "name").unwrap_or_default(),
-            });
+        let matrix_profiles = Self::parse_matrix_profiles(&matrix_response);
         let current_matrix_profile = matrix_profiles
             .iter()
             .find(|profile| profile.name == snapshot.state.matrix_profile)
@@ -6666,6 +6716,12 @@ impl HqpAdapter {
             .context("HQPlayer session changed before the advanced-control snapshot completed")?;
 
         Ok(HqpAdvancedOptionsSnapshot {
+            execution_target: HqpNativeExecutionTarget {
+                instance_name: snapshot.instance_name,
+                producer_epoch: snapshot.producer_epoch,
+                endpoint_generation: snapshot.endpoint_generation,
+                transport_generation: snapshot.transport_generation,
+            },
             pipeline: snapshot.legacy,
             state: snapshot.state,
             junk_filters,
@@ -7088,6 +7144,8 @@ impl HqpAdapter {
             volume_range: vol_range,
             info: session.info,
             host: session.host,
+            port: session.port,
+            web_port: session.web_port,
             instance_name: session.instance_name,
             producer_epoch: session.producer_epoch,
             endpoint_generation: session.endpoint_generation,
@@ -7607,24 +7665,13 @@ impl HqpAdapter {
         let xml = Self::build_request("MatrixListProfiles", &[]);
         let response = self.send_command(&xml).await?;
 
-        Ok(Self::parse_items(&response, "MatrixProfile", |item| {
-            MatrixProfile {
-                index: Self::parse_attr_u32(item, "index"),
-                name: Self::parse_attr(item, "name").unwrap_or_default(),
-            }
-        }))
+        Ok(Self::parse_matrix_profiles(&response))
     }
 
     async fn get_matrix_profiles_with_generation(&self) -> Result<(Vec<MatrixProfile>, u64)> {
         let xml = Self::build_request("MatrixListProfiles", &[]);
         let (response, generation) = self.send_command_with_generation(&xml).await?;
-        Ok((
-            Self::parse_items(&response, "MatrixProfile", |item| MatrixProfile {
-                index: Self::parse_attr_u32(item, "index"),
-                name: Self::parse_attr(item, "name").unwrap_or_default(),
-            }),
-            generation,
-        ))
+        Ok((Self::parse_matrix_profiles(&response), generation))
     }
 
     /// The matrix profile the daemon currently has selected.
@@ -8128,6 +8175,52 @@ impl HqpInstanceManager {
     pub async fn get(&self, name: &str) -> Option<Arc<HqpAdapter>> {
         let instances = self.instances.read().await;
         instances.get(name).cloned()
+    }
+
+    /// Gather and publish one fresh coherent observation through the configured state sink.
+    ///
+    /// Command surfaces call this after a verified write so their response and every other reader
+    /// converge on the aggregator-owned snapshot instead of returning a private adapter read.
+    pub async fn refresh_instance(&self, name: &str) -> Result<()> {
+        let adapter = self
+            .get(name)
+            .await
+            .ok_or_else(|| anyhow!("Unknown HQPlayer instance: {name}"))?;
+        let worker = self.native_worker(name);
+        adapter.observe_and_publish_managed(worker.as_ref()).await
+    }
+
+    /// Refresh advanced native choices through the managed producer and publish them to its sink.
+    pub async fn refresh_advanced(&self, name: &str) -> Result<()> {
+        let adapter = self
+            .get(name)
+            .await
+            .ok_or_else(|| anyhow!("Unknown HQPlayer instance: {name}"))?;
+        let sink = self
+            .native_sink
+            .as_ref()
+            .ok_or_else(|| anyhow!("HQPlayer manager has no state sink"))?;
+        let snapshot = adapter.get_advanced_options_snapshot().await?;
+        sink.advanced_observed(name, snapshot).await
+    }
+
+    /// Refresh browser profile inventory through the managed producer and publish success/failure.
+    pub async fn refresh_profiles(&self, name: &str) -> Result<()> {
+        let adapter = self
+            .get(name)
+            .await
+            .ok_or_else(|| anyhow!("Unknown HQPlayer instance: {name}"))?;
+        let sink = self
+            .native_sink
+            .as_ref()
+            .ok_or_else(|| anyhow!("HQPlayer manager has no state sink"))?;
+        let fetched = adapter.fetch_profiles().await;
+        let publication = fetched
+            .as_ref()
+            .map(Clone::clone)
+            .map_err(ToString::to_string);
+        sink.profiles_observed(name, publication).await?;
+        fetched.map(|_| ())
     }
 
     /// Execute one semantic native setting against the exact managed instance.
@@ -8873,6 +8966,27 @@ mod wire_framing_tests {
 #[cfg(test)]
 mod parse_attr_scope_tests {
     use super::*;
+
+    #[test]
+    fn matrix_profiles_without_native_indexes_receive_distinct_list_positions() {
+        let response = concat!(
+            "<MatrixListProfiles result=\"OK\">",
+            "<MatrixProfile name=\"Default\"/>",
+            "<MatrixProfile name=\"Mch-to-Stereo mixdown\"/>",
+            "</MatrixListProfiles>"
+        );
+
+        assert_eq!(
+            HqpAdapter::parse_matrix_profiles(response)
+                .into_iter()
+                .map(|profile| (profile.index, profile.name))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "Default".to_string()),
+                (1, "Mch-to-Stereo mixdown".to_string())
+            ]
+        );
+    }
 
     /// Root-scoping, asserted directly on `parse_attr` (CodeRabbit thread 11).
     ///

@@ -1,5 +1,9 @@
 # ADR 004: Producer-owned adaptive command causality
 
+**Status: Superseded.** HQPlayer production control now uses the existing `ZoneAggregator` and the
+managed HQPlayer dispatcher with coherent post-command readback. The adaptive command actor remains
+historical code only and is not constructed by the server.
+
 ## Status
 
 Proposed

@@ -221,7 +221,7 @@ pub struct HqpMatrixProfile {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct HqpMatrixProfilesResponse {
     pub profiles: Vec<HqpMatrixProfile>,
-    pub current: Option<u32>,
+    pub current: Option<HqpMatrixProfile>,
 }
 
 // =============================================================================

@@ -131,7 +131,10 @@ impl Rig {
 
         let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
         let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
-        let manager = Arc::new(HqpInstanceManager::new(bus.clone()));
+        let manager = Arc::new(HqpInstanceManager::new_with_native_sink(
+            bus.clone(),
+            aggregator.clone(),
+        ));
         let hqplayer = manager.get_default().await;
         let hqp_zone_links = Arc::new(HqpZoneLinkService::new(manager.clone()));
         let lms = Arc::new(LmsAdapter::new(bus.clone()));

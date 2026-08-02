@@ -394,7 +394,9 @@ fn ZoneCard(
         .as_ref()
         .map(|m| m.profiles.clone())
         .unwrap_or_default();
-    let matrix_current = hqp_matrix.as_ref().and_then(|m| m.current);
+    let matrix_current = hqp_matrix
+        .as_ref()
+        .and_then(|m| m.current.as_ref().map(|profile| profile.index));
 
     rsx! {
         article { class: "zone-card",

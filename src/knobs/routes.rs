@@ -608,10 +608,9 @@ pub async fn knob_control_handler(
 /// is judged by, so "advertised" and "permitted" cannot drift apart. It is also required — a surface
 /// may not query an adapter for state (`docs/ARCHITECTURE.md`, `tests/architecture_lint.rs`).
 ///
-/// The cost is that the flags can be up to one poll interval (2 s by default) stale. That bound is
-/// accepted and recorded in `.oh/hqplayer-direct-zone.md`; closing it would need either a
-/// forbidden adapter state read on the command path or daemon-side compare-and-set, which the
-/// protocol does not offer.
+/// Capability decisions use the last published snapshot. After a successful write, the managed
+/// adapter performs a coherent readback and publishes it through the aggregator before this
+/// function reports success, so every surface converges on the same post-command state.
 /// Transport-neutral outcome of [`dispatch_hqplayer_action`].
 ///
 /// One dispatch function is shared by every surface that lets a caller name an arbitrary zone id
@@ -625,6 +624,15 @@ pub(crate) enum HqpDispatchError {
     BadRequest { message: String, code: &'static str },
     /// The adapter accepted the request but the native command itself failed.
     Backend(String),
+}
+
+impl HqpDispatchError {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::NotFound(message) | Self::Backend(message) => message,
+            Self::BadRequest { message, .. } => message,
+        }
+    }
 }
 
 /// Resolve a direct HQPlayer instance and execute one action against it (#328, and MCP's copy of
@@ -805,7 +813,17 @@ pub(crate) async fn dispatch_hqplayer_action(
         }
     };
 
-    result.map_err(|e| HqpDispatchError::Backend(e.to_string()))
+    result.map_err(|e| HqpDispatchError::Backend(e.to_string()))?;
+
+    state
+        .hqp_instances
+        .refresh_instance(instance)
+        .await
+        .map_err(|e| {
+            HqpDispatchError::Backend(format!(
+                "HQPlayer accepted action '{action}', but verified state refresh failed: {e}"
+            ))
+        })
 }
 
 async fn control_hqplayer(

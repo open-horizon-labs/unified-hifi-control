@@ -52,7 +52,7 @@
 //! different ways.
 
 use crate::api::AppState;
-use crate::bus::PlaybackState;
+use crate::knobs::routes::{dispatch_hqplayer_action, HqpDispatchError};
 use crate::mcp::capabilities::{support, Capability};
 use crate::mcp::envelope::{Envelope, Observed, Provider, Refusal, Scope};
 use crate::mcp::routing::{
@@ -272,20 +272,9 @@ const HQPLAYER_CONTROL_ACTIONS: &[&str] = &[
 ///   is decimal-dB clamped to the zone's own observed range rather than an
 ///   integer clamped to 0-100.
 ///
-/// # Never reports a pre-command poll as current state
-///
-/// A direct HQPlayer zone is refreshed only by the producer's status poll (2 s
-/// by default); every write below is fire-and-forget. Reading
-/// `state.aggregator` immediately afterwards and calling it "Current state"
-/// would tell a client the daemon they just told to pause is still playing —
-/// the poll from before the command, presented as if it were after. So, unlike
-/// [`handle_control`] above, this never calls [`Observed::from_aggregator`]
-/// after a write and never renders a "Current state" block; #397 already
-/// established the same constraint for the `hifi_hqplayer_*` tools
-/// (`src/mcp/tools/hqplayer.rs`), and this follows it for the same reason. It
-/// does read `state.aggregator` *before* dispatching `playpause`/`volume_up`/
-/// `volume_down` — as the input those actions resolve against, never as a claim
-/// about what happened afterwards.
+/// All direct HQPlayer surfaces use the same dispatcher. It validates against
+/// aggregator-owned state, executes the native command, then performs a coherent
+/// readback into the aggregator before reporting success.
 pub(crate) async fn handle_hqplayer_control(
     state: &AppState,
     args: HifiControlTool,
@@ -303,103 +292,42 @@ pub(crate) async fn handle_hqplayer_control(
         .zone_id
         .strip_prefix("hqplayer:")
         .unwrap_or(&args.zone_id);
-    let Some(adapter) = state.hqp_instances.get(instance_name).await else {
-        return env.failed(format!(
-            "HQPlayer instance '{instance_name}' is not configured"
-        ));
+    let dispatch_action = match args.action.as_str() {
+        "volume_set" => "volume",
+        other => other,
+    };
+    let resolved_value = match args.action.as_str() {
+        "volume_up" | "volume_down" => Some(args.value.unwrap_or(DEFAULT_VOLUME_DELTA)),
+        _ => args.value,
+    };
+    let env = match resolved_value {
+        Some(value) => env.param("value", value),
+        None => env,
     };
 
-    match args.action.as_str() {
-        "play" => hqplayer_result(env, &args.action, adapter.play().await),
-        "pause" => hqplayer_result(env, &args.action, adapter.pause().await),
-        "stop" => hqplayer_result(env, &args.action, adapter.stop().await),
-        "next" => hqplayer_result(env, &args.action, adapter.next().await),
-        "previous" | "prev" => hqplayer_result(env, &args.action, adapter.previous().await),
-        "mute" => hqplayer_result(env, &args.action, adapter.volume_mute().await),
-        // No native toggle on the wire (only discrete Play/Pause/Stop), so the
-        // toggle is resolved here against the last state the aggregator
-        // published — the same "most recently observed" state every other
-        // adapter's own `play_pause` resolves against internally.
-        "playpause" => {
-            let playing = state
-                .aggregator
-                .get_zone(&args.zone_id)
-                .await
-                .map(|zone| zone.state == PlaybackState::Playing)
-                .unwrap_or(false);
-            let result = if playing {
-                adapter.pause().await
-            } else {
-                adapter.play().await
-            };
-            hqplayer_result(env, &args.action, result)
-        }
-        "seek" => {
-            let Some(value) = args.value else {
-                return env.refused(
-                    "seek requires a value (position in seconds)",
-                    Refusal::invalid_parameter(
-                        "value",
-                        &["a position in seconds, e.g. 30"],
-                        "action='seek' has no default position and none may be invented.",
-                    ),
-                );
-            };
-            let env = env.param("value", value);
-            // The wire position is an unsigned integer; a negative or fractional
-            // request is rounded rather than rejected, since a client computing
-            // "10 seconds back" from track start can legitimately land on 0.
-            let position = value.max(0.0).round() as u32;
-            hqplayer_result(env, &args.action, adapter.seek(position).await)
-        }
-        "volume_set" => {
-            let Some(value) = args.value else {
-                return env.refused(
-                    "volume_set requires a value (a level in dB)",
-                    Refusal::invalid_parameter(
-                        "value",
-                        &["a decimal dB level, e.g. -20.0"],
-                        "action='volume_set' sets an absolute level and has no default. Use \
-                         volume_up or volume_down for a relative change.",
-                    ),
-                );
-            };
-            let sent = clamp_to_observed_range(state, &args.zone_id, value).await;
-            let env = env.param("value", sent);
-            hqplayer_result(env, &args.action, adapter.set_volume_db(sent).await)
-        }
-        "volume_up" | "volume_down" => {
-            let Some(control) = state
-                .aggregator
-                .get_zone(&args.zone_id)
-                .await
-                .and_then(|zone| zone.volume_control)
-            else {
-                return env.failed(format!(
-                    "Cannot adjust volume for '{}': no level has been observed yet for this zone",
-                    args.zone_id
-                ));
-            };
-            // HqpAdapter's own volume_up/volume_down send a fixed device-side
-            // step with no value ("VolumeUp"/"VolumeDown" on the wire) — not the
-            // arbitrary decimal delta this action documents. So a relative move
-            // is computed here instead: last observed level plus the resolved
-            // delta, clamped to the zone's own range, sent as one `set_volume_db`
-            // — decimal-dB throughout, unlike OpenHome/UPnP's integer rounding.
-            let magnitude = args.value.unwrap_or(DEFAULT_VOLUME_DELTA);
-            let delta = if args.action == "volume_up" {
-                magnitude
-            } else {
-                -magnitude
-            };
-            let env = env.param("value", delta);
-            let sent = (f64::from(control.value) + delta)
-                .clamp(f64::from(control.min), f64::from(control.max));
-            hqplayer_result(env, &args.action, adapter.set_volume_db(sent).await)
-        }
-        // Unreachable: HQPLAYER_CONTROL_ACTIONS gates this whole match, one arm
-        // per entry.
-        _ => unknown_action(state, &args.zone_id, &args.action, HQPLAYER_CONTROL_ACTIONS).await,
+    match dispatch_hqplayer_action(
+        state,
+        &args.zone_id,
+        instance_name,
+        dispatch_action,
+        resolved_value,
+    )
+    .await
+    {
+        Ok(()) => Ok(env.text_result(format!(
+            "Action '{}' executed and verified state was published.",
+            args.action
+        ))),
+        Err(HqpDispatchError::NotFound(message)) => env.failed(message),
+        Err(HqpDispatchError::BadRequest { message, .. }) => env.refused(
+            message,
+            Refusal::invalid_parameter(
+                "value",
+                &["a value valid for the selected HQPlayer action"],
+                "The action was rejected against the zone state published by the aggregator.",
+            ),
+        ),
+        Err(HqpDispatchError::Backend(message)) => env.failed(message),
     }
 }
 
@@ -419,36 +347,6 @@ fn hqplayer_operation(action: &str) -> &'static str {
         "volume_up" | "volume_down" => "volume_relative",
         // Unreachable: every `HQPLAYER_CONTROL_ACTIONS` entry has an arm above.
         _ => "unknown_action",
-    }
-}
-
-/// Finish a direct HQPlayer command: `accepted` on success, a backend error
-/// naming the daemon's own failure otherwise. Never `observed` — see
-/// [`handle_hqplayer_control`]'s doc comment.
-fn hqplayer_result(
-    env: Envelope,
-    action: &str,
-    result: anyhow::Result<()>,
-) -> Result<CallToolResult, CallToolError> {
-    match result {
-        Ok(()) => Ok(env.text_result(format!("Action '{action}' executed."))),
-        Err(e) => env.failed(format!("Control error: {}", e)),
-    }
-}
-
-/// Clamp a requested absolute dB level to the zone's own observed range, or
-/// pass it through unclamped if the aggregator holds no range yet — an absent
-/// range is not evidence the daemon has none, only that nothing has been
-/// observed to report.
-async fn clamp_to_observed_range(state: &AppState, zone_id: &str, value: f64) -> f64 {
-    match state
-        .aggregator
-        .get_zone(zone_id)
-        .await
-        .and_then(|zone| zone.volume_control)
-    {
-        Some(control) => value.clamp(f64::from(control.min), f64::from(control.max)),
-        None => value,
     }
 }
 

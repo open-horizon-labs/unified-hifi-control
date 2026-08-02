@@ -725,7 +725,9 @@ fn DspSettings(
         .as_ref()
         .map(|m| m.profiles.clone())
         .unwrap_or_default();
-    let matrix_current = matrix.as_ref().and_then(|m| m.current);
+    let matrix_current = matrix
+        .as_ref()
+        .and_then(|m| m.current.as_ref().map(|profile| profile.index));
 
     // Dynamic shaper label based on mode
     // SDM/DSD mode = "Modulator", PCM mode = "Shaper" (not "Dither")

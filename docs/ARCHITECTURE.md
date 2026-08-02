@@ -118,17 +118,18 @@ Real-time event streaming for clients via `/events` endpoint.
    - `stop()` with ACK → Coordinator waits
    - No hanging on Ctrl+C
 
-## Adaptive-Control Producer Contract
+## Adaptive-Control Producer Contract (dormant)
 
-Producers (HQPlayer today, others later) describe their controllable state as a versioned
-**producer document** rather than as backend-specific UI payloads. See
+The repository retains an experimental versioned **producer document** contract for compatibility
+and design history. No production adapter currently publishes it and no public surface consumes it.
+See
 [architecture/adaptive-producer-contract-v1.md](./architecture/adaptive-producer-contract-v1.md)
 and [ADR 003](./adr/003-adaptive-producer-document-v1.md).
 
-The contract does not change zone ownership: adapters publish, the aggregator owns and
-serves snapshots, and surfaces read from the aggregator. `src/adaptive/` is description
-only - it depends on nothing but `serde`, `serde_json` and `std`, enforced by
-`tests/adaptive_dependency_lint.rs`.
+HQPlayer instead publishes its typed coherent observation directly to `ZoneAggregator`, the same
+state owner used by every other zone. Web, knob, HTTP, and MCP surfaces read that aggregator and
+share the managed command path. `src/adaptive/` remains description-only; it depends on nothing but
+`serde`, `serde_json` and `std`, enforced by `tests/adaptive_dependency_lint.rs`.
 
 ## Implementation
 
