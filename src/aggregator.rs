@@ -14,7 +14,7 @@ use crate::bus::runtime::{
     ProjectionCommit, ProjectionCommitter, ProjectionEntry, ProjectionFreshness, ProjectionKind,
     ProjectionPayload, ProjectionUpdate,
 };
-use crate::bus::{BusEvent, NowPlaying, SharedBus, Zone};
+use crate::bus::{BusEvent, NowPlaying, PrefixedZoneId, SharedBus, Zone};
 
 /// Whether an HQPlayer snapshot is current or retained across a recoverable outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,15 +388,133 @@ impl ZoneAggregator {
                 freshness: ProjectionFreshness::Fresh,
             },
         );
+        let mut removed_zones = Vec::new();
         for ProjectionEntry { key, payload } in update.entries {
-            if let ProjectionPayload::Zone(zone) = &payload {
-                aggregate
-                    .zones
-                    .insert(zone.zone_id.clone(), (**zone).clone());
+            match &payload {
+                ProjectionPayload::Zone(zone) => {
+                    aggregate
+                        .zones
+                        .insert(zone.zone_id.clone(), (**zone).clone());
+                }
+                ProjectionPayload::HqpObservation(observation) => {
+                    let snapshots = &mut aggregate.hqplayer_snapshots;
+                    if snapshots
+                        .get(&observation.instance_name)
+                        .is_none_or(|current| {
+                            current.observation.producer_epoch <= observation.producer_epoch
+                        })
+                    {
+                        let previous = snapshots.get(&observation.instance_name);
+                        let snapshot_revision =
+                            previous.map_or(1, |current| current.revision.saturating_add(1));
+                        let same_native_session = previous.is_some_and(|current| {
+                            current.observation.execution_target == observation.execution_target
+                        });
+                        let same_endpoint = previous.is_some_and(|current| {
+                            current.observation.execution_target.instance_name
+                                == observation.execution_target.instance_name
+                                && current.observation.execution_target.endpoint_generation
+                                    == observation.execution_target.endpoint_generation
+                        });
+                        let advanced = same_native_session
+                            .then(|| previous.and_then(|current| current.advanced.clone()))
+                            .flatten();
+                        let profiles = same_endpoint
+                            .then(|| previous.and_then(|current| current.profiles.clone()))
+                            .flatten();
+                        let profiles_error = same_endpoint
+                            .then(|| previous.and_then(|current| current.profiles_error.clone()))
+                            .flatten();
+                        snapshots.insert(
+                            observation.instance_name.clone(),
+                            HqpSnapshot {
+                                observation: (**observation).clone(),
+                                advanced,
+                                profiles,
+                                profiles_error,
+                                presence: HqpSnapshotPresence::Live,
+                                revision: snapshot_revision,
+                                last_failure_at: None,
+                            },
+                        );
+                    }
+                }
+                ProjectionPayload::HqpAdvanced {
+                    instance_name,
+                    snapshot,
+                } => {
+                    if let Some(current) = aggregate.hqplayer_snapshots.get_mut(instance_name) {
+                        if current.observation.execution_target == snapshot.execution_target {
+                            current.observation.pipeline = snapshot.pipeline.clone();
+                            current.advanced = Some((**snapshot).clone());
+                            current.revision = current.revision.saturating_add(1);
+                        }
+                    }
+                }
+                ProjectionPayload::HqpProfiles {
+                    instance_name,
+                    result,
+                } => {
+                    if let Some(current) = aggregate.hqplayer_snapshots.get_mut(instance_name) {
+                        match result {
+                            Ok(profiles) => {
+                                current.profiles = Some(profiles.clone());
+                                current.profiles_error = None;
+                            }
+                            Err(error) => current.profiles_error = Some(error.clone()),
+                        }
+                        current.revision = current.revision.saturating_add(1);
+                    }
+                }
+                ProjectionPayload::HqpTransientFailure {
+                    instance_name,
+                    observed_at,
+                } => {
+                    if let Some(current) = aggregate.hqplayer_snapshots.get_mut(instance_name) {
+                        current.presence = HqpSnapshotPresence::LastKnown;
+                        current.revision = current.revision.saturating_add(1);
+                        current.last_failure_at = Some(*observed_at);
+                    }
+                }
+                ProjectionPayload::HqpRemoved {
+                    instance_name,
+                    producer_epoch,
+                } => {
+                    if aggregate
+                        .hqplayer_snapshots
+                        .get(instance_name)
+                        .is_some_and(|snapshot| {
+                            snapshot.observation.producer_epoch == *producer_epoch
+                        })
+                    {
+                        aggregate.hqplayer_snapshots.remove(instance_name);
+                        let zone_id = format!("hqplayer:{instance_name}");
+                        if aggregate.zones.remove(&zone_id).is_some() {
+                            removed_zones.push(PrefixedZoneId::hqplayer(instance_name));
+                        }
+                    }
+                }
+                ProjectionPayload::HqpManagerStopped => {
+                    for snapshot in aggregate.hqplayer_snapshots.values_mut() {
+                        snapshot.presence = HqpSnapshotPresence::LastKnown;
+                        snapshot.revision = snapshot.revision.saturating_add(1);
+                    }
+                    aggregate
+                        .zones
+                        .retain(|zone_id, _| !zone_id.starts_with("hqplayer:"));
+                }
+                ProjectionPayload::Marker(_) => {}
             }
             aggregate
                 .projection_entries
                 .insert(key, (revision, payload));
+        }
+        drop(aggregate);
+        // Reliable projection is the canonical mutation lane. Existing in-app bus consumers still
+        // receive lifecycle notifications, but only after the aggregator has committed the state
+        // they will subsequently read. The aggregator's own subscriber sees an idempotent removal.
+        for zone_id in removed_zones {
+            self.bus.publish(BusEvent::ZoneRemoved { zone_id });
         }
         ProjectionCommit::Committed { revision }
     }
@@ -444,6 +562,10 @@ impl HqpNativeObservationSink for ZoneAggregator {
         {
             return Ok(());
         }
+        aggregate
+            .zones
+            .insert(observation.zone.zone_id.clone(), observation.zone.clone());
+        let snapshots = &mut aggregate.hqplayer_snapshots;
         let previous = snapshots.get(&observation.instance_name);
         let revision = previous.map_or(1, |current| current.revision.saturating_add(1));
         let same_native_session = previous.is_some_and(|current| {
@@ -572,6 +694,7 @@ mod tests {
                 transport_generation: epoch,
             },
             observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(epoch),
+            zone: projected_zone("hqplayer:main"),
             connection: crate::adapters::hqplayer::HqpConnectionStatus {
                 connected: true,
                 host: Some("127.0.0.1".to_string()),

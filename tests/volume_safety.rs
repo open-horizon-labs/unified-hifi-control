@@ -181,39 +181,41 @@ fn relative_step_clamped_prevents_wild_jumps() {
 // daemon receives nothing. This lint exists because that test can only cover the paths it calls,
 // while a future edit could add a fifth volume arm with a default and break no existing test.
 
-/// The body of `dispatch_hqplayer_action`, from its signature to the sibling that follows it.
+/// The body of `hqp_command_from_published_zone`, from its signature to the sibling that follows
+/// it. The reliable command runtime moved native I/O out of the surface dispatcher; request-value
+/// validation and conversion now live in this pure semantic-command builder.
 ///
 /// The safety-critical capability checks and volume clamp/no-default logic used to live inline in
 /// `control_hqplayer`; #401 extracted them into this transport-neutral function (shared by the HTTP
 /// knob handler and MCP's `hifi_control` tool) so the same command core backs both surfaces. The
 /// lint follows the logic to its new home rather than continuing to describe `control_hqplayer`,
 /// which is now a thin wrapper with none of these arms in its own body.
-fn dispatch_hqplayer_action_body() -> String {
+fn hqp_command_from_published_zone_body() -> String {
     let source = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/knobs/routes.rs"),
     )
     .expect("read the routing surface");
 
-    let start = source
-        .find("async fn dispatch_hqplayer_action(")
-        .expect("dispatch_hqplayer_action must exist: the direct HQPlayer zone routes through it");
+    let start = source.find("fn hqp_command_from_published_zone(").expect(
+        "hqp_command_from_published_zone must exist: HQPlayer values are validated before bus dispatch",
+    );
     let rest = &source[start..];
     let end = rest
         .find("\nasync fn control_hqplayer(")
-        .expect("the function that follows dispatch_hqplayer_action must still follow it");
+        .expect("the function that follows hqp_command_from_published_zone must still follow it");
     rest[..end].to_string()
 }
 
 #[test]
 fn the_hqplayer_volume_path_never_substitutes_a_numeric_level() {
-    let body = dispatch_hqplayer_action_body();
+    let body = hqp_command_from_published_zone_body();
 
     // Non-vacuity: the arms this is a claim about have to be present, or the lint passes by
     // describing a function that no longer does the thing.
-    for marker in ["set_volume_db", "vol_abs", "vol_up"] {
+    for marker in ["Command::VolumeAbsolute", "vol_abs", "vol_up"] {
         assert!(
             body.contains(marker),
-            "`{marker}` is gone from dispatch_hqplayer_action; this lint is now vacuous and must be \
+            "`{marker}` is gone from hqp_command_from_published_zone; this lint is now vacuous and must be \
              updated alongside whatever replaced it"
         );
     }
@@ -257,7 +259,7 @@ fn the_hqplayer_volume_path_never_substitutes_a_numeric_level() {
 
 #[test]
 fn the_hqplayer_volume_path_clamps_to_the_zones_observed_bounds() {
-    let body = dispatch_hqplayer_action_body();
+    let body = hqp_command_from_published_zone_body();
 
     // Both the absolute and the relative arm must clamp, and must clamp to values read off the
     // published zone rather than to constants. `vc` is that zone's volume control.

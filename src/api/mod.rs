@@ -9,6 +9,7 @@ use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
 use crate::adapters::Startable;
 use crate::aggregator::{HqpSnapshotPresence, ZoneAggregator};
+use crate::bus::runtime::CommandGateway;
 use crate::bus::{BusEvent, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
@@ -56,6 +57,9 @@ pub struct AppState {
     /// constructor parameter -- like `sse_connections` above -- so every
     /// existing `AppState::new` call site is untouched by this addition.
     pub mcp_refs: crate::mcp::refs::RefTable,
+    /// Private reliable command ingress.  Surfaces retain their existing request/response shapes
+    /// and use this only for provider paths that have migrated to a correlated readback.
+    pub reliable_commands: Option<CommandGateway>,
 }
 
 impl AppState {
@@ -93,7 +97,13 @@ impl AppState {
             shutdown,
             sse_connections: Arc::new(AtomicUsize::new(0)),
             mcp_refs: crate::mcp::refs::RefTable::new(),
+            reliable_commands: None,
         }
+    }
+
+    pub fn with_reliable_commands(mut self, commands: CommandGateway) -> Self {
+        self.reliable_commands = Some(commands);
+        self
     }
 
     /// Get the count of active SSE connections

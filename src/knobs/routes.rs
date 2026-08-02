@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::api::AppState;
-use crate::bus::VolumeControl;
+use crate::bus::runtime::{CommandDeadlines, CommandLane, CommandRequest, CommandStatus};
+use crate::bus::{Command, PrefixedZoneId, VolumeControl};
 use crate::knobs::image::placeholder_svg;
 use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
 
@@ -656,16 +657,6 @@ pub(crate) async fn dispatch_hqplayer_action(
     action: &str,
     value: Option<f64>,
 ) -> Result<(), HqpDispatchError> {
-    // Resolve the instance explicitly. A missing instance is "not found" rather than a fallback:
-    // the client named a specific daemon, and quietly using a different one is the failure mode
-    // this function exists to remove.
-    let Some(adapter) = state.hqp_instances.get(instance).await else {
-        return Err(HqpDispatchError::NotFound(format!(
-            "HQPlayer instance '{}' is not configured",
-            instance
-        )));
-    };
-
     // The aggregator is the only state source consulted here.
     //
     // Its absence is decisive rather than merely inconvenient: the aggregator withdraws the zone when
@@ -675,67 +666,85 @@ pub(crate) async fn dispatch_hqplayer_action(
     // `{"ok":true}` — for a withdrawn zone whose instance still happened to exist in the manager's
     // map. Found by the review pass, pinned by
     // `transport_is_refused_for_a_zone_the_aggregator_has_withdrawn`.
+    let target = PrefixedZoneId::hqplayer(instance);
     let Some(zone) = state.aggregator.get_zone(zone_id).await else {
-        return Err(HqpDispatchError::NotFound(format!(
-            "zone {} is not currently published",
-            zone_id
-        )));
+        let message = match &state.reliable_commands {
+            Some(gateway) if gateway.has_endpoint(&target) => {
+                format!("zone {zone_id} is not currently published")
+            }
+            _ => format!("HQPlayer instance '{instance}' is not configured"),
+        };
+        return Err(HqpDispatchError::NotFound(message));
     };
-    let zone = Some(zone);
 
-    let result = match action {
-        "play" => adapter.play().await,
-        "pause" => adapter.pause().await,
-        "stop" => adapter.stop().await,
-        "next" | "previous" | "prev" => {
-            let allowed = zone
-                .as_ref()
-                .map(|z| {
-                    if action == "next" {
-                        z.is_next_allowed
-                    } else {
-                        z.is_previous_allowed
-                    }
-                })
-                .unwrap_or(false);
-            if !allowed {
-                return Err(HqpDispatchError::BadRequest {
-                    message: format!("{} is not available in the zone's current state", action),
-                    code: "ACTION_NOT_ALLOWED",
-                });
-            }
-            if action == "next" {
-                adapter.next().await
-            } else {
-                adapter.previous().await
-            }
+    let Some(gateway) = &state.reliable_commands else {
+        return Err(HqpDispatchError::Backend(
+            "HQPlayer reliable command runtime is unavailable".to_string(),
+        ));
+    };
+    let command = hqp_command_from_published_zone(&zone, action, value)?;
+    let now = tokio::time::Instant::now();
+    let mut ticket = gateway
+        .submit(CommandRequest {
+            target,
+            command,
+            correlation_id: None,
+            lane: CommandLane::Interactive,
+            deadlines: CommandDeadlines {
+                dispatch_by: now + std::time::Duration::from_secs(3),
+                confirm_by: now + std::time::Duration::from_secs(10),
+            },
+        })
+        .await
+        .map_err(|error| {
+            HqpDispatchError::Backend(format!("HQPlayer command admission failed: {error:?}"))
+        })?;
+    match ticket.wait_for_observable_result().await {
+        CommandStatus::Confirmed { .. } => Ok(()),
+        CommandStatus::Failed { detail } | CommandStatus::NotDispatched { detail } => {
+            Err(HqpDispatchError::Backend(detail))
         }
-        "play_pause" | "playpause" => {
-            // Resolved from the published state rather than sent as a toggle, because HQPlayer has
-            // no toggle command: `Pause` pauses and `Play` plays. With no published state there is
-            // nothing to resolve against, and guessing would be a coin flip on an audible action.
-            match zone.as_ref().map(|z| z.state) {
-                Some(crate::bus::PlaybackState::Playing) => adapter.pause().await,
-                Some(_) => adapter.play().await,
-                None => {
-                    return Err(HqpDispatchError::BadRequest {
-                        message:
-                            "play_pause needs a known playback state; none has been observed yet"
-                                .to_string(),
-                        code: "STATE_UNKNOWN",
-                    })
-                }
-            }
+        CommandStatus::Indeterminate => Err(HqpDispatchError::Backend(
+            "HQPlayer accepted the command but did not publish a verified readback in time"
+                .to_string(),
+        )),
+        CommandStatus::Queued | CommandStatus::Dispatched | CommandStatus::AwaitingProjection => {
+            Err(HqpDispatchError::Backend(
+                "HQPlayer command stopped without a terminal result".to_string(),
+            ))
         }
+    }
+}
+
+/// Translate only a request that the aggregator's published zone says is currently valid.  This
+/// mirrors the legacy direct path below, but returns a semantic command for the endpoint worker so
+/// no client surface gets its own HQPlayer transport implementation.
+fn hqp_command_from_published_zone(
+    zone: &crate::bus::Zone,
+    action: &str,
+    value: Option<f64>,
+) -> Result<Command, HqpDispatchError> {
+    match action {
+        "play" => Ok(Command::Play),
+        "pause" => Ok(Command::Pause),
+        "stop" => Ok(Command::Stop),
+        "next" if zone.is_next_allowed => Ok(Command::Next),
+        "previous" | "prev" if zone.is_previous_allowed => Ok(Command::Previous),
+        "next" | "previous" | "prev" => Err(HqpDispatchError::BadRequest {
+            message: format!("{} is not available in the zone's current state", action),
+            code: "ACTION_NOT_ALLOWED",
+        }),
+        "play_pause" | "playpause" => match zone.state {
+            crate::bus::PlaybackState::Playing => Ok(Command::Pause),
+            _ => Ok(Command::Play),
+        },
         "seek" => {
-            if !zone.as_ref().map(|z| z.is_seekable).unwrap_or(false) {
+            if !zone.is_seekable {
                 return Err(HqpDispatchError::BadRequest {
                     message: "this zone is not seekable in its current state".to_string(),
                     code: "ACTION_NOT_ALLOWED",
                 });
             }
-            // No default position. A seek with no usable target is a client bug, and inventing 0
-            // would restart the track.
             let Some(position) = value else {
                 return Err(HqpDispatchError::BadRequest {
                     message: "seek requires a numeric position in seconds".to_string(),
@@ -748,82 +757,54 @@ pub(crate) async fn dispatch_hqplayer_action(
                     code: "INVALID_VALUE",
                 });
             }
-            // Clamped to the observed duration so a slider released past the end lands on the end
-            // rather than drawing `result="Error"` from the daemon. Kept as an `Option` with no
-            // numeric default: an absent duration means "nothing observed to clamp against", which
-            // is a different fact from "the track is zero seconds long", and collapsing the two
-            // through `unwrap_or(0.0)` is the shape `tests/volume_safety.rs` refuses on this path.
             let ceiling = zone
+                .now_playing
                 .as_ref()
-                .and_then(|z| z.now_playing.as_ref())
                 .and_then(|np| np.duration)
-                .filter(|d| *d > 0.0);
-            let target = match ceiling {
-                Some(duration) => position.min(duration),
-                None => position,
-            };
-            adapter.seek(target.round().max(0.0) as u32).await
+                .filter(|duration| *duration > 0.0);
+            Ok(Command::Seek {
+                position: ceiling.map_or(position, |duration| position.min(duration)),
+            })
         }
         "vol_up" | "volume_up" | "vol_down" | "volume_down" => {
-            let vc = require_volume_control(zone.as_ref())?;
-            let down = action.contains("down");
-            // The step the client asked for, else the step this zone published. Both are decimal dB.
+            let vc = require_volume_control(Some(zone))?;
             let step = value
-                .map(|v| v.abs())
-                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(f64::abs)
+                .filter(|step| step.is_finite() && *step > 0.0)
                 .unwrap_or(f64::from(vc.step));
-            let delta = if down { -step } else { step };
-            // Relative movement is applied as an absolute write computed from the last observed
-            // level. HQPlayer's own `VolumeUp`/`VolumeDown` would avoid the staleness window but use
-            // the daemon's step — which the verified live sample does not even send — and would
-            // ignore the user's configured `volume_step_override`.
-            let target = (f64::from(vc.value) + delta).clamp(f64::from(vc.min), f64::from(vc.max));
-            adapter.set_volume_db(quantise_db(target)).await
+            let delta = if action.contains("down") { -step } else { step };
+            Ok(Command::VolumeAbsolute {
+                value: quantise_db(
+                    (f64::from(vc.value) + delta).clamp(f64::from(vc.min), f64::from(vc.max)),
+                ) as f32,
+                output_id: None,
+            })
         }
         "vol_abs" | "volume" => {
-            let vc = require_volume_control(zone.as_ref())?;
-            // SAFETY: no numeric default, in either direction. `unwrap_or(50.0)` on a dB zone means
-            // +50 dB, which is above every possible maximum; `unwrap_or(0.0)` means full scale. A
-            // level nobody supplied is a refusal, never a number.
-            let Some(requested) = value.filter(|v| v.is_finite()) else {
+            let vc = require_volume_control(Some(zone))?;
+            let Some(value) = value.filter(|value| value.is_finite()) else {
                 return Err(HqpDispatchError::BadRequest {
                     message: "an absolute volume requires a finite numeric level in dB".to_string(),
                     code: "INVALID_VALUE",
                 });
             };
-            adapter
-                .set_volume_db(quantise_db(
-                    requested.clamp(f64::from(vc.min), f64::from(vc.max)),
-                ))
-                .await
-        }
-        "mute" => {
-            require_volume_control(zone.as_ref())?;
-            // `VolumeMute` is a verified absolute, idempotent move to the range floor (#322, live
-            // 6.0.2). There is no daemon-side unmute and UHC stores no pre-mute level, so no
-            // toggle is advertised — an "unmute" whose result is not observable as unmute would be
-            // exactly the kind of claim this issue exists to remove.
-            adapter.volume_mute().await
-        }
-        _ => {
-            return Err(HqpDispatchError::BadRequest {
-                message: format!("Unknown action: {}", action),
-                code: "UNKNOWN_ACTION",
+            Ok(Command::VolumeAbsolute {
+                value: quantise_db(value.clamp(f64::from(vc.min), f64::from(vc.max))) as f32,
+                output_id: None,
             })
         }
-    };
-
-    result.map_err(|e| HqpDispatchError::Backend(e.to_string()))?;
-
-    state
-        .hqp_instances
-        .refresh_instance(instance)
-        .await
-        .map_err(|e| {
-            HqpDispatchError::Backend(format!(
-                "HQPlayer accepted action '{action}', but verified state refresh failed: {e}"
-            ))
-        })
+        "mute" => {
+            require_volume_control(Some(zone))?;
+            Ok(Command::Mute {
+                muted: true,
+                output_id: None,
+            })
+        }
+        _ => Err(HqpDispatchError::BadRequest {
+            message: format!("Unknown action: {action}"),
+            code: "UNKNOWN_ACTION",
+        }),
+    }
 }
 
 async fn control_hqplayer(

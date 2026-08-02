@@ -44,7 +44,8 @@ use rust_mcp_sdk::schema::{
 use rust_mcp_sdk::{McpClient, RequestOptions, StreamableTransportOptions};
 
 use unified_hifi_control::adapters::hqplayer::{
-    HqpAdapter, HqpInstanceManager, HqpRecoveryConfig, HqpTimeouts, HqpZoneLinkService,
+    HqpAdapter, HqpInstanceManager, HqpRecoveryConfig, HqpRuntimeBridge, HqpTimeouts,
+    HqpZoneLinkService,
 };
 use unified_hifi_control::adapters::lms::LmsAdapter;
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
@@ -53,6 +54,7 @@ use unified_hifi_control::adapters::upnp::UPnPAdapter;
 use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api::AppState;
+use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState, SharedBus};
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
@@ -111,6 +113,7 @@ struct Rig {
     aggregator: Arc<ZoneAggregator>,
     bus: SharedBus,
     aggregator_task: tokio::task::JoinHandle<()>,
+    projection_task: tokio::task::JoinHandle<()>,
     server_task: tokio::task::JoinHandle<()>,
     client: Arc<ClientRuntime>,
 }
@@ -128,13 +131,17 @@ impl Rig {
             tokio::spawn(async move { aggregator.run().await })
         };
         tokio::task::yield_now().await;
+        let runtime = build_runtime(aggregator.clone(), 16, 32);
+        let bridge = Arc::new(HqpRuntimeBridge::new(
+            runtime.projection_ingress.clone(),
+            runtime.commands.clone(),
+        ));
+        let reliable_commands = runtime.commands.clone();
+        let projection_task = tokio::spawn(runtime.projection_actor.run());
 
         let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
         let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
-        let manager = Arc::new(HqpInstanceManager::new_with_native_sink(
-            bus.clone(),
-            aggregator.clone(),
-        ));
+        let manager = Arc::new(HqpInstanceManager::new_with_runtime(bus.clone(), bridge));
         let hqplayer = manager.get_default().await;
         let hqp_zone_links = Arc::new(HqpZoneLinkService::new(manager.clone()));
         let lms = Arc::new(LmsAdapter::new(bus.clone()));
@@ -157,7 +164,8 @@ impl Rig {
             startable,
             Instant::now(),
             CancellationToken::new(),
-        );
+        )
+        .with_reliable_commands(reliable_commands);
 
         let mcp_extension = mcp::create_mcp_extension(state);
         let app = Router::new()
@@ -205,6 +213,7 @@ impl Rig {
             aggregator,
             bus,
             aggregator_task,
+            projection_task,
             server_task,
             client,
         }
@@ -290,6 +299,7 @@ impl Rig {
         self.manager.stop().await;
         self.bus.publish(BusEvent::ShuttingDown { reason: None });
         let _ = self.aggregator_task.await;
+        self.projection_task.abort();
         let _ = self.client.shut_down().await;
         self.server_task.abort();
     }

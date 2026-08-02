@@ -163,3 +163,28 @@ surface, with one managed command/readback path.
 ### Decision
 
 Proceed to commit, PR publication, CI, and x64 QNAP artifact. Do not merge without user approval.
+
+## Reliable in-app bus composition (2026-08-02)
+
+- The reliable command/projection runtime is now composed in production before adapters start.
+- Runtime projection storage was removed: `ZoneAggregator` alone owns revisions, source cursors,
+  freshness, zones, and HQPlayer-native snapshots under one lock.
+- Every configured HQPlayer instance registers an exact `hqplayer:<instance>` command endpoint.
+- Browser/knob, legacy HTTP, and MCP transport/seek/volume/mute share one submission path and return
+  success only after a coherent readback has committed through the aggregator.
+- The prior direct-adapter fallback in `dispatch_hqplayer_action` was removed; the deterministic AST
+  debt baseline was ratcheted down in the same change.
+- HQPlayer zone and native state now enter one atomic projection transaction. Compatibility
+  broadcast events are emitted after that commit and are not used to confirm commands.
+- Per-instance publication locks preserve sequence/admission order without letting a slow instance
+  block another instance's projection lane.
+- Interactive commands have a 3-second dispatch deadline and a 10-second readback-confirmation
+  deadline. Accepted commands without confirmed projection report indeterminate rather than false
+  success. Slow profile transactions retain their separate 30-second request / 120-second absolute
+  convergence policy and are not routed through the interactive lane yet.
+
+Verification passed: the complete all-feature suite (with only the explicitly operator-driven live
+tests ignored), HQPlayer direct-zone 65/65, MCP HQPlayer 48/48, MCP contract 104/104, runtime and
+aggregator unit suites, API contract, AST architecture/debt lints, ignored-send lint, all-feature
+library Clippy with warnings denied, formatting, and diff checks. Live/browser/package verification
+remain before publication of the next beta artifact.

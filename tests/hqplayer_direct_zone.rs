@@ -47,6 +47,7 @@ use unified_hifi_control::adapters::upnp::UPnPAdapter;
 use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api::AppState;
+use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState, SharedBus, Zone};
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::{self, KnobStore};
@@ -120,6 +121,7 @@ struct Rig {
     aggregator: Arc<ZoneAggregator>,
     bus: SharedBus,
     aggregator_task: tokio::task::JoinHandle<()>,
+    projection_task: tokio::task::JoinHandle<()>,
 }
 
 impl Rig {
@@ -137,10 +139,19 @@ impl Rig {
             tokio::spawn(async move { aggregator.run().await })
         };
         tokio::task::yield_now().await;
+        let runtime = build_runtime(aggregator.clone(), 16, 32);
+        let bridge = Arc::new(
+            unified_hifi_control::adapters::hqplayer::HqpRuntimeBridge::new(
+                runtime.projection_ingress.clone(),
+                runtime.commands.clone(),
+            ),
+        );
+        let reliable_commands = runtime.commands.clone();
+        let projection_task = tokio::spawn(runtime.projection_actor.run());
 
         let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
         let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
-        let manager = Arc::new(HqpInstanceManager::new(bus.clone()));
+        let manager = Arc::new(HqpInstanceManager::new_with_runtime(bus.clone(), bridge));
         let hqplayer = manager.get_default().await;
         let hqp_zone_links = Arc::new(HqpZoneLinkService::new(manager.clone()));
         let lms = Arc::new(LmsAdapter::new(bus.clone()));
@@ -163,7 +174,8 @@ impl Rig {
             startable,
             Instant::now(),
             CancellationToken::new(),
-        );
+        )
+        .with_reliable_commands(reliable_commands);
 
         Self {
             app: client_router(state.clone()),
@@ -172,6 +184,7 @@ impl Rig {
             aggregator,
             bus,
             aggregator_task,
+            projection_task,
         }
     }
 
@@ -263,6 +276,7 @@ impl Rig {
         self.manager.stop().await;
         self.bus.publish(BusEvent::ShuttingDown { reason: None });
         let _ = self.aggregator_task.await;
+        self.projection_task.abort();
     }
 }
 

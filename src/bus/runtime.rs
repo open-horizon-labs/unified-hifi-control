@@ -13,22 +13,24 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{timeout_at, Instant};
 
+use crate::adapters::hqplayer::{HqpAdvancedOptionsSnapshot, HqpNativeObservation, HqpProfile};
+
 use super::{Command, PrefixedZoneId, Zone};
 
 /// Stable internal identity for one admitted command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct CommandId(u64);
+pub struct CommandId(u64);
 
 impl CommandId {
     /// Numeric representation for logs and a future operation-resource projection.
-    pub(crate) fn get(self) -> u64 {
+    pub fn get(self) -> u64 {
         self.0
     }
 }
 
 /// Commands whose native protocol operation has different latency and serialization needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommandLane {
+pub enum CommandLane {
     /// Transport/volume interactions expected to respond promptly.
     Interactive,
     /// Slow configuration/profile changes that may trigger daemon recovery.
@@ -37,27 +39,27 @@ pub(crate) enum CommandLane {
 
 /// Internal deadlines. They are deliberately Tokio instants rather than a wire field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CommandDeadlines {
+pub struct CommandDeadlines {
     /// The endpoint must call [`EndpointWork::begin_dispatch`] before this instant.
-    pub(crate) dispatch_by: Instant,
+    pub dispatch_by: Instant,
     /// A command started before this instant may still finish later, but becomes indeterminate to
     /// a caller until an observed projection commits.
-    pub(crate) confirm_by: Instant,
+    pub confirm_by: Instant,
 }
 
 /// A semantic command admitted to the reliable runtime.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CommandRequest {
-    pub(crate) target: PrefixedZoneId,
-    pub(crate) command: Command,
-    pub(crate) correlation_id: Option<String>,
-    pub(crate) lane: CommandLane,
-    pub(crate) deadlines: CommandDeadlines,
+pub struct CommandRequest {
+    pub target: PrefixedZoneId,
+    pub command: Command,
+    pub correlation_id: Option<String>,
+    pub lane: CommandLane,
+    pub deadlines: CommandDeadlines,
 }
 
 /// The authoritative lifecycle state for an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CommandStatus {
+pub enum CommandStatus {
     Queued,
     Dispatched,
     AwaitingProjection,
@@ -85,17 +87,17 @@ impl CommandStatus {
 }
 
 /// A caller's handle for observing a correlated operation without owning its execution lifetime.
-pub(crate) struct CommandTicket {
+pub struct CommandTicket {
     id: CommandId,
     status: watch::Receiver<CommandStatus>,
 }
 
 impl CommandTicket {
-    pub(crate) fn id(&self) -> CommandId {
+    pub fn id(&self) -> CommandId {
         self.id
     }
 
-    pub(crate) fn status(&self) -> CommandStatus {
+    pub fn status(&self) -> CommandStatus {
         self.status.borrow().clone()
     }
 
@@ -103,7 +105,7 @@ impl CommandTicket {
     ///
     /// `Indeterminate` deliberately wakes the caller: a transport request must not hang merely
     /// because a backend accepted bytes and then took too long to make state observable.
-    pub(crate) async fn wait_for_observable_result(&mut self) -> CommandStatus {
+    pub async fn wait_for_observable_result(&mut self) -> CommandStatus {
         loop {
             let current = self.status();
             if current.is_final() || current == CommandStatus::Indeterminate {
@@ -118,20 +120,20 @@ impl CommandTicket {
 
 /// An endpoint cannot be registered twice under the same key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EndpointRegistrationError {
+pub enum EndpointRegistrationError {
     EmptyKey,
     AlreadyRegistered(String),
 }
 
 /// Submission can refuse a reused correlation key which names a different command.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CommandSubmissionError {
+pub enum CommandSubmissionError {
     CorrelationConflict(String),
 }
 
 /// Result an endpoint reports after a native attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NativeResult {
+pub enum NativeResult {
     /// The provider rejected or failed the attempted command.
     Failed(String),
     /// Native I/O was accepted. A matching projection is still required for confirmation.
@@ -223,7 +225,7 @@ impl EndpointRegistry {
 }
 
 /// Receiver owned by exactly one adapter worker. Dropping it unregisters the endpoint.
-pub(crate) struct CommandEndpoint {
+pub struct CommandEndpoint {
     receiver: mpsc::Receiver<EndpointWork>,
     key: EndpointKey,
     generation: u64,
@@ -232,14 +234,14 @@ pub(crate) struct CommandEndpoint {
 }
 
 impl CommandEndpoint {
-    pub(crate) async fn recv(&mut self) -> Option<EndpointWork> {
+    pub async fn recv(&mut self) -> Option<EndpointWork> {
         self.receiver.recv().await
     }
 
     /// Mark this logical endpoint as undergoing a slow configuration transition. While the guard
     /// is held, new interactive and competing reconfiguration commands fail admission immediately
     /// instead of waiting behind the slow operation. Other endpoints remain independent.
-    pub(crate) fn try_begin_reconfiguration(&self) -> Result<ReconfigurationGuard, CommandStatus> {
+    pub fn try_begin_reconfiguration(&self) -> Result<ReconfigurationGuard, CommandStatus> {
         self.reconfiguring
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| CommandStatus::NotDispatched {
@@ -251,7 +253,7 @@ impl CommandEndpoint {
     }
 }
 
-pub(crate) struct ReconfigurationGuard {
+pub struct ReconfigurationGuard {
     reconfiguring: Arc<AtomicBool>,
 }
 
@@ -279,23 +281,23 @@ impl Drop for CommandEndpoint {
 /// A queued command delivered to an adapter endpoint. It cannot be executed until `begin_dispatch`
 /// wins the deadline gate, which prevents late queue consumption from turning a timeout into an
 /// unreported native attempt.
-pub(crate) struct EndpointWork {
+pub struct EndpointWork {
     request: CommandRequest,
     id: CommandId,
     inner: Arc<RuntimeState>,
 }
 
 impl EndpointWork {
-    pub(crate) fn id(&self) -> CommandId {
+    pub fn id(&self) -> CommandId {
         self.id
     }
 
-    pub(crate) fn request(&self) -> &CommandRequest {
+    pub fn request(&self) -> &CommandRequest {
         &self.request
     }
 
     /// Acquire the irreversible native-dispatch lease. An expired work item must be discarded.
-    pub(crate) fn begin_dispatch(self) -> Result<EndpointPermit, CommandStatus> {
+    pub fn begin_dispatch(self) -> Result<EndpointPermit, CommandStatus> {
         if Instant::now() >= self.request.deadlines.dispatch_by {
             self.inner
                 .not_dispatched(self.id, "dispatch deadline elapsed before native I/O");
@@ -323,30 +325,30 @@ impl EndpointWork {
     }
 
     /// Refuse work before any native attempt (for example a provider is offline).
-    pub(crate) fn refuse(self, detail: impl Into<String>) {
+    pub fn refuse(self, detail: impl Into<String>) {
         self.inner.not_dispatched(self.id, &detail.into());
     }
 }
 
 /// The only capability which can report a native result for an admitted endpoint work item.
-pub(crate) struct EndpointPermit {
+pub struct EndpointPermit {
     request: CommandRequest,
     id: CommandId,
     inner: Arc<RuntimeState>,
 }
 
 impl EndpointPermit {
-    pub(crate) fn id(&self) -> CommandId {
+    pub fn id(&self) -> CommandId {
         self.id
     }
 
-    pub(crate) fn request(&self) -> &CommandRequest {
+    pub fn request(&self) -> &CommandRequest {
         &self.request
     }
 
     /// The adapter reports only native fact here. `Accepted` is never confirmation; confirmation
     /// is emitted only by [`ProjectionActor`] after a correlated commit.
-    pub(crate) fn complete_native(self, result: NativeResult) {
+    pub fn complete_native(self, result: NativeResult) {
         match result {
             NativeResult::Failed(detail) => self
                 .inner
@@ -374,14 +376,21 @@ struct CommandRecord {
 
 /// Surface-facing reliable command ingress.
 #[derive(Clone)]
-pub(crate) struct CommandGateway {
+pub struct CommandGateway {
     inner: Arc<RuntimeState>,
     registry: EndpointRegistry,
 }
 
 impl CommandGateway {
+    /// Whether an exact-zone or provider fallback endpoint currently owns this target. This is
+    /// routing metadata, not adapter state; surfaces use it only to distinguish an unknown target
+    /// from a temporarily withdrawn projection without reaching into an adapter registry.
+    pub fn has_endpoint(&self, target: &PrefixedZoneId) -> bool {
+        self.registry.route(target).is_some()
+    }
+
     /// Register a provider-wide endpoint (Roon/LMS/OpenHome/UPnP).
-    pub(crate) fn register_provider(
+    pub fn register_provider(
         &self,
         provider: impl Into<String>,
         capacity: usize,
@@ -391,7 +400,7 @@ impl CommandGateway {
     }
 
     /// Register an exact-zone endpoint (needed for independent HQPlayer instances).
-    pub(crate) fn register_zone(
+    pub fn register_zone(
         &self,
         zone: PrefixedZoneId,
         capacity: usize,
@@ -401,7 +410,7 @@ impl CommandGateway {
 
     /// Admit a command to the endpoint's bounded queue. A repeated correlation for the identical
     /// semantic request returns another watcher of the original operation; it never executes twice.
-    pub(crate) async fn submit(
+    pub async fn submit(
         &self,
         request: CommandRequest,
     ) -> Result<CommandTicket, CommandSubmissionError> {
@@ -459,14 +468,14 @@ impl CommandGateway {
 
 /// Per-source ordering metadata carried with every canonical projection update.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ProjectionSource {
-    pub(crate) adapter: String,
-    pub(crate) instance: Option<String>,
-    pub(crate) epoch: u64,
+pub struct ProjectionSource {
+    pub adapter: String,
+    pub instance: Option<String>,
+    pub epoch: u64,
 }
 
 impl ProjectionSource {
-    pub(crate) fn identity(&self) -> String {
+    pub fn identity(&self) -> String {
         match &self.instance {
             Some(instance) => format!("{}/{}", self.adapter, instance),
             None => self.adapter.clone(),
@@ -477,21 +486,41 @@ impl ProjectionSource {
 /// A private typed payload seam. The future aggregator migration can add a coherent HQPlayer
 /// snapshot variant without putting it on the public SSE `BusEvent` enum.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ProjectionPayload {
+pub enum ProjectionPayload {
     Zone(Box<Zone>),
+    /// One generation-fenced HQPlayer observation.  This stays on the private projection lane:
+    /// the legacy HTTP payload is still projected by the aggregator from this native fact.
+    HqpObservation(Box<HqpNativeObservation>),
+    HqpAdvanced {
+        instance_name: String,
+        snapshot: Box<HqpAdvancedOptionsSnapshot>,
+    },
+    HqpProfiles {
+        instance_name: String,
+        result: Result<Vec<HqpProfile>, String>,
+    },
+    HqpTransientFailure {
+        instance_name: String,
+        observed_at: std::time::SystemTime,
+    },
+    HqpRemoved {
+        instance_name: String,
+        producer_epoch: u64,
+    },
+    HqpManagerStopped,
     /// Test/control-plane payload used until a provider-specific typed snapshot is wired.
     Marker(String),
 }
 
 /// One entry in an atomic projection transaction.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ProjectionEntry {
-    pub(crate) key: String,
-    pub(crate) payload: ProjectionPayload,
+pub struct ProjectionEntry {
+    pub key: String,
+    pub payload: ProjectionPayload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectionKind {
+pub enum ProjectionKind {
     /// A coherent source snapshot can close a detected sequence gap.
     Snapshot,
     /// A partial change requires every preceding sequence to have been admitted.
@@ -500,20 +529,20 @@ pub(crate) enum ProjectionKind {
 
 /// A source observation submitted to the single projection actor.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ProjectionUpdate {
-    pub(crate) source: ProjectionSource,
-    pub(crate) sequence: u64,
-    pub(crate) kind: ProjectionKind,
+pub struct ProjectionUpdate {
+    pub source: ProjectionSource,
+    pub sequence: u64,
+    pub kind: ProjectionKind,
     /// A read-back verified command may nominate itself here. Native acknowledgement alone cannot.
-    pub(crate) caused_by: Option<CommandId>,
+    pub caused_by: Option<CommandId>,
     /// All entries share one revision, so a future direct HQPlayer Zone + native snapshot commit
     /// can be visible atomically.
-    pub(crate) entries: Vec<ProjectionEntry>,
+    pub entries: Vec<ProjectionEntry>,
 }
 
 /// The result of a projection ingress submission.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProjectionCommit {
+pub enum ProjectionCommit {
     Committed {
         revision: u64,
     },
@@ -531,19 +560,19 @@ pub(crate) enum ProjectionCommit {
 /// correlation, but it deliberately does not store projection data, revisions, or source cursors.
 /// That prevents it from becoming a second state authority beside `ZoneAggregator`.
 #[async_trait]
-pub(crate) trait ProjectionCommitter: Send + Sync {
+pub trait ProjectionCommitter: Send + Sync {
     async fn commit_projection(&self, update: ProjectionUpdate) -> ProjectionCommit;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProjectionFreshness {
+pub enum ProjectionFreshness {
     Fresh,
     Reconciling,
 }
 
 /// A post-commit egress hint. Consumers must reread the aggregator, never treat this as state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RuntimeNotification {
+pub enum RuntimeNotification {
     ProjectionCommitted {
         revision: u64,
         source: String,
@@ -562,12 +591,12 @@ pub(crate) enum RuntimeNotification {
 
 /// Adapter-facing bounded projection ingress.
 #[derive(Clone)]
-pub(crate) struct ProjectionIngress {
+pub struct ProjectionIngress {
     submissions: mpsc::Sender<ProjectionSubmission>,
 }
 
 impl ProjectionIngress {
-    pub(crate) async fn submit(
+    pub async fn submit(
         &self,
         update: ProjectionUpdate,
     ) -> Result<ProjectionCommit, ProjectionIngressClosed> {
@@ -581,7 +610,7 @@ impl ProjectionIngress {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProjectionIngressClosed;
+pub struct ProjectionIngressClosed;
 
 struct ProjectionSubmission {
     update: ProjectionUpdate,
@@ -589,14 +618,14 @@ struct ProjectionSubmission {
 }
 
 /// Exclusive projection consumer. Composition starts this once before adapters publish.
-pub(crate) struct ProjectionActor {
+pub struct ProjectionActor {
     submissions: mpsc::Receiver<ProjectionSubmission>,
     inner: Arc<RuntimeState>,
     committer: Arc<dyn ProjectionCommitter>,
 }
 
 impl ProjectionActor {
-    pub(crate) async fn run(mut self) {
+    pub async fn run(mut self) {
         while let Some(submission) = self.submissions.recv().await {
             let source = submission.update.source.clone();
             let caused_by = submission.update.caused_by;
@@ -613,27 +642,27 @@ impl ProjectionActor {
 /// Post-commit notification seam. Its events are hints only; all state reads remain owned by the
 /// projection committer (currently `ZoneAggregator`).
 #[derive(Clone)]
-pub(crate) struct ProjectionView {
+pub struct ProjectionView {
     inner: Arc<RuntimeState>,
 }
 
 impl ProjectionView {
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<RuntimeNotification> {
+    pub fn subscribe(&self) -> broadcast::Receiver<RuntimeNotification> {
         self.inner.notifications.subscribe()
     }
 }
 
 /// The four handles needed by composition. The actor is intentionally separate: it makes the
 /// ready-before-adapter startup ordering explicit and simple to test.
-pub(crate) struct RuntimeParts {
-    pub(crate) commands: CommandGateway,
-    pub(crate) projection_ingress: ProjectionIngress,
-    pub(crate) projection_actor: ProjectionActor,
-    pub(crate) projection_view: ProjectionView,
+pub struct RuntimeParts {
+    pub commands: CommandGateway,
+    pub projection_ingress: ProjectionIngress,
+    pub projection_actor: ProjectionActor,
+    pub projection_view: ProjectionView,
 }
 
 /// Construct the bounded reliable lanes. Neither capacity may be zero.
-pub(crate) fn build_runtime(
+pub fn build_runtime(
     committer: Arc<dyn ProjectionCommitter>,
     command_capacity: usize,
     projection_capacity: usize,

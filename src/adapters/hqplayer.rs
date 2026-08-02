@@ -33,19 +33,23 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::Startable;
+use crate::bus::runtime::{
+    CommandEndpoint, CommandGateway, CommandId, NativeResult, ProjectionEntry, ProjectionIngress,
+    ProjectionKind, ProjectionPayload, ProjectionSource, ProjectionUpdate,
+};
 use crate::bus::{
-    BusEvent, NowPlaying as BusNowPlaying, PlaybackState, PrefixedZoneId, SharedBus, TrackMetadata,
-    VolumeControl as BusVolumeControl, VolumeScale, Zone as BusZone,
+    BusEvent, Command, NowPlaying as BusNowPlaying, PlaybackState, PrefixedZoneId, SharedBus,
+    TrackMetadata, VolumeControl as BusVolumeControl, VolumeScale, Zone as BusZone,
 };
 use crate::config::{get_config_file_path, read_config_file};
 use lifecycle::{supervise_worker, RecoveryState, SharedRecoveryState, SharedWorkerPhase};
@@ -748,7 +752,7 @@ fn discard_native_delimiter(buf: &mut Vec<u8>) {
 }
 
 /// HQPlayer state information
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct HqpState {
     pub state: u8, // 0=stopped, 1=paused, 2=playing
     pub mode: u8,  // PCM=0, SDM=1
@@ -1527,7 +1531,7 @@ pub struct PipelineStatus {
 /// Every field is gathered while holding the endpoint operation lease and is fenced to the same
 /// native transport generation. This prevents callers from combining a pipeline read from one
 /// daemon session with junk-filter or matrix choices from a replacement session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HqpAdvancedOptionsSnapshot {
     pub(crate) execution_target: HqpNativeExecutionTarget,
     pub pipeline: PipelineStatus,
@@ -1583,6 +1587,10 @@ pub struct HqpNativeObservation {
     /// retains this out of the declarative document and copies it into the opaque command lease.
     pub(crate) execution_target: HqpNativeExecutionTarget,
     pub observed_at: SystemTime,
+    /// Unified zone projected from the exact same native snapshot. The reliable projection actor
+    /// commits this together with the provider-native payload so readers cannot observe a new
+    /// pipeline beside an older transport/volume view.
+    pub zone: BusZone,
     pub connection: HqpConnectionStatus,
     /// Frozen legacy payload from the same generation-fenced observation. Existing HTTP and web
     /// consumers can project their unchanged contract from the aggregator without re-querying the
@@ -1625,6 +1633,139 @@ pub struct HqpNativeVolume {
     pub adaptive: bool,
 }
 
+/// Composition-root bridge between managed HQPlayer observations and the reliable runtime.
+///
+/// The manager only knows this narrow sink/gateway pair; it never receives the aggregator.  The
+/// projection actor, whose committer is the aggregator, remains the sole owner of visible state.
+#[derive(Clone)]
+pub struct HqpRuntimeBridge {
+    ingress: ProjectionIngress,
+    commands: CommandGateway,
+    sequences: Arc<Mutex<HashMap<String, u64>>>,
+    epochs: Arc<Mutex<HashMap<String, u64>>>,
+    publication_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    marker_sequence: Arc<AtomicU64>,
+}
+
+impl HqpRuntimeBridge {
+    pub fn new(ingress: ProjectionIngress, commands: CommandGateway) -> Self {
+        Self {
+            ingress,
+            commands,
+            sequences: Arc::new(Mutex::new(HashMap::new())),
+            epochs: Arc::new(Mutex::new(HashMap::new())),
+            publication_locks: Arc::new(Mutex::new(HashMap::new())),
+            marker_sequence: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub(crate) fn commands(&self) -> CommandGateway {
+        self.commands.clone()
+    }
+
+    async fn next_sequence(&self, instance_name: &str) -> u64 {
+        let mut sequences = self.sequences.lock().await;
+        let sequence = sequences.entry(instance_name.to_string()).or_insert(0);
+        *sequence = sequence.saturating_add(1);
+        *sequence
+    }
+
+    async fn publish_entries(
+        &self,
+        instance_name: &str,
+        epoch: u64,
+        caused_by: Option<CommandId>,
+        kind: ProjectionKind,
+        entries: Vec<ProjectionEntry>,
+    ) -> Result<()> {
+        // Sequence allocation and admission are one per-instance critical section. Without this,
+        // two concurrent publishers could allocate 1 then 2 but enqueue 2 first, making the newer
+        // value win merely because task scheduling reordered the sends.
+        let publication_lock = {
+            let mut locks = self.publication_locks.lock().await;
+            locks
+                .entry(instance_name.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(1)))
+                .clone()
+        };
+        let _publication_permit = publication_lock
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("HQPlayer publication lane closed"))?;
+        let epoch = if epoch == 0 {
+            self.epochs
+                .lock()
+                .await
+                .get(instance_name)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            self.epochs
+                .lock()
+                .await
+                .insert(instance_name.to_string(), epoch);
+            epoch
+        };
+        let sequence = self.next_sequence(instance_name).await;
+        self.ingress
+            .submit(ProjectionUpdate {
+                source: ProjectionSource {
+                    adapter: "hqplayer".to_string(),
+                    instance: Some(instance_name.to_string()),
+                    epoch,
+                },
+                sequence,
+                kind,
+                caused_by,
+                entries,
+            })
+            .await
+            .map_err(|_| anyhow!("HQPlayer reliable projection ingress stopped"))?;
+        Ok(())
+    }
+
+    async fn publish(
+        &self,
+        instance_name: &str,
+        epoch: u64,
+        caused_by: Option<CommandId>,
+        kind: ProjectionKind,
+        payload: ProjectionPayload,
+    ) -> Result<()> {
+        self.publish_entries(
+            instance_name,
+            epoch,
+            caused_by,
+            kind,
+            vec![ProjectionEntry {
+                key: format!("hqplayer:{instance_name}"),
+                payload,
+            }],
+        )
+        .await
+    }
+
+    /// A command is confirmed only after its native write has been followed by the same worker's
+    /// coherent readback.  The marker carries no state: it is the correlated commit record for the
+    /// observation that was just committed through this same serial projection lane.
+    pub(crate) async fn confirm_readback(
+        &self,
+        instance_name: &str,
+        producer_epoch: u64,
+        command_id: CommandId,
+    ) -> Result<()> {
+        let marker = self.marker_sequence.fetch_add(1, Ordering::Relaxed);
+        self.publish(
+            instance_name,
+            producer_epoch,
+            Some(command_id),
+            ProjectionKind::Delta,
+            ProjectionPayload::Marker(format!("hqplayer-readback-{marker}")),
+        )
+        .await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HqpNativeSelection {
     pub selected: String,
@@ -1655,6 +1796,124 @@ pub trait HqpNativeObservationSink: Send + Sync {
     async fn transient_failure(&self, instance_name: &str, observed_at: SystemTime) -> Result<()>;
     async fn instance_removed(&self, instance_name: &str, producer_epoch: u64) -> Result<()>;
     async fn manager_stopped(&self) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl HqpNativeObservationSink for HqpRuntimeBridge {
+    async fn manager_started(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn observed(&self, observation: HqpNativeObservation) -> Result<()> {
+        let instance_name = observation.instance_name.clone();
+        let epoch = observation.producer_epoch;
+        let zone = observation.zone.clone();
+        self.publish_entries(
+            &instance_name,
+            epoch,
+            None,
+            ProjectionKind::Snapshot,
+            vec![
+                ProjectionEntry {
+                    key: format!("zone:{}", zone.zone_id),
+                    payload: ProjectionPayload::Zone(Box::new(zone)),
+                },
+                ProjectionEntry {
+                    key: format!("hqplayer:{instance_name}"),
+                    payload: ProjectionPayload::HqpObservation(Box::new(observation)),
+                },
+            ],
+        )
+        .await
+    }
+
+    async fn advanced_observed(
+        &self,
+        instance_name: &str,
+        snapshot: HqpAdvancedOptionsSnapshot,
+    ) -> Result<()> {
+        self.publish(
+            instance_name,
+            snapshot.execution_target.producer_epoch,
+            None,
+            ProjectionKind::Delta,
+            ProjectionPayload::HqpAdvanced {
+                instance_name: instance_name.to_string(),
+                snapshot: Box::new(snapshot),
+            },
+        )
+        .await
+    }
+
+    async fn profiles_observed(
+        &self,
+        instance_name: &str,
+        result: Result<Vec<HqpProfile>, String>,
+    ) -> Result<()> {
+        // Profile inventory is endpoint-scoped.  The observation epoch is not available on an
+        // error, but ordering is still retained by the per-instance sequence lane.
+        self.publish(
+            instance_name,
+            0,
+            None,
+            ProjectionKind::Delta,
+            ProjectionPayload::HqpProfiles {
+                instance_name: instance_name.to_string(),
+                result,
+            },
+        )
+        .await
+    }
+
+    async fn transient_failure(&self, instance_name: &str, observed_at: SystemTime) -> Result<()> {
+        self.publish(
+            instance_name,
+            0,
+            None,
+            ProjectionKind::Delta,
+            ProjectionPayload::HqpTransientFailure {
+                instance_name: instance_name.to_string(),
+                observed_at,
+            },
+        )
+        .await
+    }
+
+    async fn instance_removed(&self, instance_name: &str, producer_epoch: u64) -> Result<()> {
+        self.publish(
+            instance_name,
+            producer_epoch,
+            None,
+            ProjectionKind::Delta,
+            ProjectionPayload::HqpRemoved {
+                instance_name: instance_name.to_string(),
+                producer_epoch,
+            },
+        )
+        .await
+    }
+
+    async fn manager_stopped(&self) -> Result<()> {
+        let sequence = self.marker_sequence.fetch_add(1, Ordering::Relaxed);
+        self.ingress
+            .submit(ProjectionUpdate {
+                source: ProjectionSource {
+                    adapter: "hqplayer-lifecycle".to_string(),
+                    instance: None,
+                    epoch: 0,
+                },
+                sequence,
+                kind: ProjectionKind::Snapshot,
+                caused_by: None,
+                entries: vec![ProjectionEntry {
+                    key: "hqplayer:lifecycle".to_string(),
+                    payload: ProjectionPayload::HqpManagerStopped,
+                }],
+            })
+            .await
+            .map_err(|_| anyhow!("HQPlayer reliable projection ingress stopped"))?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1764,14 +2023,14 @@ impl Drop for InFlightConnection {
 }
 
 /// Profile info from web UI
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HqpProfile {
     pub value: String,
     pub title: String,
 }
 
 /// Matrix profile info
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatrixProfile {
     pub index: u32,
     pub name: String,
@@ -2193,6 +2452,13 @@ pub struct HqpAdapter {
     /// ordinary browser reads.
     profile_http_client: Client,
     bus: SharedBus,
+    /// Reliable lifecycle sink installed by the managed composition. Explicit disconnects retire
+    /// the canonical projection through this sink before returning; transient transport failures
+    /// deliberately use `mark_disconnected` and retain the last-known projection instead.
+    managed_lifecycle_sink: Option<Arc<dyn HqpNativeObservationSink>>,
+    /// Compatibility publication for standalone/legacy construction. Production reliable
+    /// composition disables this so canonical zone ingress cannot race through broadcast.
+    publish_legacy_zone_events: Arc<AtomicBool>,
     /// Unsolicited documents skipped while awaiting command replies. Diagnostics for tier-1 live
     /// verification: against a well-behaved daemon this should stay at zero, so a non-zero count on
     /// real hardware is the signal that the reply-element invariant is narrower than documented.
@@ -2273,6 +2539,13 @@ impl HqpAdapter {
     const MIN_PUBLISHED_VOLUME_STEP_DB: f64 = 0.5;
 
     pub fn new(bus: SharedBus) -> Self {
+        Self::new_with_managed_lifecycle_sink(bus, None)
+    }
+
+    fn new_with_managed_lifecycle_sink(
+        bus: SharedBus,
+        managed_lifecycle_sink: Option<Arc<dyn HqpNativeObservationSink>>,
+    ) -> Self {
         #[allow(clippy::expect_used)] // HTTP client creation only fails if TLS setup fails
         let http_client = Client::builder()
             .timeout(Duration::from_secs(3))
@@ -2303,11 +2576,18 @@ impl HqpAdapter {
             http_client,
             profile_http_client,
             bus,
+            managed_lifecycle_sink,
+            publish_legacy_zone_events: Arc::new(AtomicBool::new(true)),
             unsolicited_skipped: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         // Load saved config synchronously at startup
         adapter.load_config_sync();
         adapter
+    }
+
+    fn disable_legacy_zone_events(&self) {
+        self.publish_legacy_zone_events
+            .store(false, Ordering::Release);
     }
 
     /// Load config from disk (sync, for startup)
@@ -2814,7 +3094,7 @@ impl HqpAdapter {
         }
         .await;
 
-        let (info, observed_state, status, volume_range) = match handshake {
+        let (info, observed_state, _status, volume_range) = match handshake {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 {
@@ -2848,21 +3128,17 @@ impl HqpAdapter {
         self.bus
             .publish(BusEvent::HqpConnected { host: host.clone() });
 
-        // Get instance name for zone ID
-        let instance_name = {
-            let state = self.state.read().await;
-            state.instance_name.clone()
-        };
-
-        // Emit ZoneDiscovered for this HQPlayer instance
-        let zone = Self::hqp_status_to_zone(
-            &host,
-            instance_name.as_deref(),
-            &info,
-            &status,
-            &volume_range,
-        );
-        self.bus.publish(BusEvent::ZoneDiscovered { zone });
+        if self.publish_legacy_zone_events.load(Ordering::Acquire) {
+            let instance_name = self.state.read().await.instance_name.clone();
+            let zone = Self::hqp_status_to_zone(
+                &host,
+                instance_name.as_deref(),
+                &info,
+                &_status,
+                &volume_range,
+            );
+            self.bus.publish(BusEvent::ZoneDiscovered { zone });
+        }
 
         // Lists are fetched lazily on first pipeline request via refresh_lists()
         // (Background fetch was removed due to response desync bugs - it used single-line
@@ -2873,9 +3149,20 @@ impl HqpAdapter {
 
     /// Disconnect
     pub async fn disconnect(&self) {
+        self.disconnect_inner(true).await;
+    }
+
+    /// Close a managed worker's native session without retiring its configured producer.
+    /// Manager shutdown retains the last-known snapshot; only an explicit disconnect or instance
+    /// removal retires it.
+    async fn disconnect_retaining_projection(&self) {
+        self.disconnect_inner(false).await;
+    }
+
+    async fn disconnect_inner(&self, retire_projection: bool) {
         let _operation_guard = self.operation_lock.lock().await;
         let _conversation_guard = self.conversation_lock.lock().await;
-        let (was_connected, host, instance_name) = {
+        let (was_connected, host, instance_name, producer_epoch) = {
             let mut state = self.state.write().await;
             let was_connected = state.connected;
             state.connected = false;
@@ -2887,6 +3174,7 @@ impl HqpAdapter {
                 was_connected,
                 state.host.clone(),
                 state.instance_name.clone(),
+                state.producer_epoch,
             )
         };
         {
@@ -2900,12 +3188,27 @@ impl HqpAdapter {
             let Some(ref h) = host else {
                 return;
             };
-            // Emit ZoneRemoved for this HQPlayer instance
-            let zone_id = PrefixedZoneId::hqplayer(instance_name.as_deref().unwrap_or(h));
-            self.bus.publish(BusEvent::ZoneRemoved { zone_id });
+            if self.publish_legacy_zone_events.load(Ordering::Acquire) {
+                let zone_id = PrefixedZoneId::hqplayer(instance_name.as_deref().unwrap_or(h));
+                self.bus.publish(BusEvent::ZoneRemoved { zone_id });
+            }
 
             self.bus
                 .publish(BusEvent::HqpDisconnected { host: h.clone() });
+
+            if retire_projection {
+                if let (Some(sink), Some(instance_name)) =
+                    (&self.managed_lifecycle_sink, instance_name.as_deref())
+                {
+                    if let Err(error) = sink.instance_removed(instance_name, producer_epoch).await {
+                        tracing::warn!(
+                            %error,
+                            instance = %instance_name,
+                            "HQPlayer explicit disconnect could not retire reliable projection"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -2929,14 +3232,28 @@ impl HqpAdapter {
             Self::remember_volume_capability(&mut state, &snapshot.volume_range);
         }
 
-        let zone = Self::hqp_status_to_zone(
-            &snapshot.host,
-            Some(&snapshot.instance_name),
-            &snapshot.info,
-            &snapshot.playback_status,
-            &snapshot.volume_range,
-        );
-        self.bus.publish(BusEvent::ZoneDiscovered { zone });
+        // A managed worker commits its zone and native HQPlayer snapshot atomically through the
+        // reliable projection lane. The broadcast path remains only for standalone/legacy adapter
+        // construction where no managed sink exists.
+        if native_worker.is_none() {
+            let zone = Self::hqp_status_to_zone(
+                &snapshot.host,
+                Some(&snapshot.instance_name),
+                &snapshot.info,
+                &snapshot.playback_status,
+                &snapshot.volume_range,
+            );
+            self.bus.publish(BusEvent::ZoneDiscovered { zone });
+        }
+
+        if let Some(worker) = native_worker {
+            worker
+                .sink
+                .observed(Self::native_observation(&snapshot)?)
+                .await?;
+        }
+
+        // Compatibility notifications are egress hints emitted only after the canonical commit.
         self.bus.publish(BusEvent::HqpStateChanged {
             host: snapshot.host.clone(),
             state: match snapshot.playback_status.state {
@@ -2957,12 +3274,6 @@ impl HqpAdapter {
                 .then_some(snapshot.playback_status.active_rate.to_string()),
         });
 
-        if let Some(worker) = native_worker {
-            worker
-                .sink
-                .observed(Self::native_observation(&snapshot)?)
-                .await?;
-        }
         Ok(())
     }
 
@@ -3084,6 +3395,13 @@ impl HqpAdapter {
                 transport_generation: snapshot.transport_generation,
             },
             observed_at: snapshot.observed_at,
+            zone: Self::hqp_status_to_zone(
+                &snapshot.host,
+                Some(&snapshot.instance_name),
+                &snapshot.info,
+                &snapshot.playback_status,
+                &snapshot.volume_range,
+            ),
             connection: HqpConnectionStatus {
                 connected: true,
                 host: Some(snapshot.host.clone()),
@@ -3229,7 +3547,7 @@ impl HqpAdapter {
             }
         }
 
-        self.disconnect().await;
+        self.disconnect_retaining_projection().await;
     }
 
     /// Drop every cached chain-scoped enumeration.
@@ -8190,6 +8508,7 @@ pub struct HqpInstanceInfo {
 struct HqpManagedWorker {
     shutdown: CancellationToken,
     join: tokio::task::JoinHandle<()>,
+    command_join: Option<tokio::task::JoinHandle<()>>,
     phase: SharedWorkerPhase,
 }
 
@@ -8208,6 +8527,10 @@ pub struct HqpInstanceManager {
     /// Optional contract-free composition seam. Keeping the legacy constructor makes standalone
     /// adapter users and compatibility harnesses exercise their unchanged public behavior.
     native_sink: Option<Arc<dyn HqpNativeObservationSink>>,
+    /// Exact-instance command endpoints exist only in the reliable composition.  Standalone
+    /// adapters retain their legacy direct observer path.
+    command_gateway: Option<CommandGateway>,
+    runtime_bridge: Option<Arc<HqpRuntimeBridge>>,
 }
 
 impl HqpInstanceManager {
@@ -8224,9 +8547,30 @@ impl HqpInstanceManager {
         Self::new_with_optional_native_sink(bus, Some(native_sink))
     }
 
+    /// Construct the production manager with the reliable projection bridge.  Deliberately takes
+    /// the narrow bridge rather than a `ZoneAggregator`: the manager cannot mutate projection
+    /// state except by submitting a typed update through the runtime actor.
+    pub fn new_with_runtime(bus: SharedBus, bridge: Arc<HqpRuntimeBridge>) -> Self {
+        Self::new_with_optional_native_sink_and_runtime(
+            bus,
+            Some(bridge.clone()),
+            Some(bridge.commands()),
+            Some(bridge),
+        )
+    }
+
     fn new_with_optional_native_sink(
         bus: SharedBus,
         native_sink: Option<Arc<dyn HqpNativeObservationSink>>,
+    ) -> Self {
+        Self::new_with_optional_native_sink_and_runtime(bus, native_sink, None, None)
+    }
+
+    fn new_with_optional_native_sink_and_runtime(
+        bus: SharedBus,
+        native_sink: Option<Arc<dyn HqpNativeObservationSink>>,
+        command_gateway: Option<CommandGateway>,
+        runtime_bridge: Option<Arc<HqpRuntimeBridge>>,
     ) -> Self {
         Self {
             instances: Arc::new(RwLock::new(HashMap::new())),
@@ -8236,6 +8580,8 @@ impl HqpInstanceManager {
             workers: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_lock: Arc::new(Mutex::new(())),
             native_sink,
+            command_gateway,
+            runtime_bridge,
         }
     }
 
@@ -8243,7 +8589,13 @@ impl HqpInstanceManager {
     pub async fn load_from_config(&self) {
         let configs = load_hqp_configs();
         for config in configs {
-            let adapter = Arc::new(HqpAdapter::new(self.bus.clone()));
+            let adapter = Arc::new(HqpAdapter::new_with_managed_lifecycle_sink(
+                self.bus.clone(),
+                self.native_sink.clone(),
+            ));
+            if self.runtime_bridge.is_some() {
+                adapter.disable_legacy_zone_events();
+            }
             adapter.set_instance_name(config.name.clone()).await;
             adapter
                 .configure(
@@ -8294,7 +8646,13 @@ impl HqpInstanceManager {
     async fn get_or_create_locked(&self, name: &str) -> Arc<HqpAdapter> {
         // Prepare outside the map lock, then use the entry as the atomic winner. Two callers may
         // prepare candidates, but they can no longer return different adapters for the same name.
-        let adapter = Arc::new(HqpAdapter::new(self.bus.clone()));
+        let adapter = Arc::new(HqpAdapter::new_with_managed_lifecycle_sink(
+            self.bus.clone(),
+            self.native_sink.clone(),
+        ));
+        if self.runtime_bridge.is_some() {
+            adapter.disable_legacy_zone_events();
+        }
         adapter.set_instance_name(name.to_string()).await;
         let epoch_floor = self
             .producer_epoch_floors
@@ -8572,9 +8930,19 @@ impl HqpInstanceManager {
         )));
         let supervisor_name = name.clone();
         let run_adapter = adapter.clone();
+        let command_adapter = adapter.clone();
         let cleanup_adapter = adapter;
         let supervisor_phase = phase.clone();
         let native_worker = self.native_worker(&name);
+        let command_endpoint = self.command_gateway.as_ref().and_then(|gateway| {
+            match gateway.register_zone(PrefixedZoneId::hqplayer(&name), 16) {
+                Ok(endpoint) => Some(endpoint),
+                Err(error) => {
+                    tracing::error!(instance = %name, ?error, "HQPlayer reliable endpoint registration failed");
+                    None
+                }
+            }
+        });
         let supervisor = async move {
             supervise_worker(
                 supervisor_name,
@@ -8593,7 +8961,7 @@ impl HqpInstanceManager {
                 move || {
                     let adapter = cleanup_adapter.clone();
                     async move {
-                        adapter.disconnect().await;
+                        adapter.disconnect_retaining_projection().await;
                     }
                 },
             )
@@ -8612,11 +8980,25 @@ impl HqpInstanceManager {
         }
 
         let join = tokio::spawn(supervisor);
+        let command_join = command_endpoint.map(|endpoint| {
+            let adapter = command_adapter.clone();
+            let shutdown = shutdown.clone();
+            let native_worker = self.native_worker(&name);
+            let runtime_bridge = self.runtime_bridge.clone();
+            tokio::spawn(run_hqplayer_command_endpoint(
+                adapter,
+                endpoint,
+                shutdown,
+                native_worker,
+                runtime_bridge,
+            ))
+        });
         workers.insert(
             name,
             HqpManagedWorker {
                 shutdown,
                 join,
+                command_join,
                 phase,
             },
         );
@@ -8636,6 +9018,11 @@ impl HqpInstanceManager {
             worker.shutdown.cancel();
             if let Err(error) = worker.join.await {
                 tracing::warn!("HQPlayer child lifecycle failed to join: {error}");
+            }
+            if let Some(command_join) = worker.command_join {
+                if let Err(error) = command_join.await {
+                    tracing::warn!("HQPlayer command endpoint failed to join: {error}");
+                }
             }
         }
     }
@@ -8696,6 +9083,11 @@ impl HqpInstanceManager {
             if let Err(error) = worker.join.await {
                 tracing::warn!("HQPlayer child lifecycle failed to join: {error}");
             }
+            if let Some(command_join) = worker.command_join {
+                if let Err(error) = command_join.await {
+                    tracing::warn!("HQPlayer command endpoint failed to join: {error}");
+                }
+            }
         }
         if let Some(sink) = &self.native_sink {
             if let Err(error) = sink.manager_stopped().await {
@@ -8730,6 +9122,96 @@ impl HqpInstanceManager {
             supervisor_enabled,
             phase,
         }
+    }
+}
+
+/// Consume one exact-instance reliable endpoint.  The native write is not a success response:
+/// only the coherent readback's correlated projection commit resolves the caller's ticket.
+async fn run_hqplayer_command_endpoint(
+    adapter: Arc<HqpAdapter>,
+    mut endpoint: CommandEndpoint,
+    shutdown: CancellationToken,
+    native_worker: Option<HqpNativeWorker>,
+    runtime_bridge: Option<Arc<HqpRuntimeBridge>>,
+) {
+    loop {
+        let work = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            work = endpoint.recv() => work,
+        };
+        let Some(work) = work else { break };
+        let permit = match work.begin_dispatch() {
+            Ok(permit) => permit,
+            Err(_) => continue,
+        };
+        let command_id = permit.id();
+        let result = execute_hqplayer_runtime_command(&adapter, &permit.request().command).await;
+        if let Err(error) = result {
+            permit.complete_native(NativeResult::Failed(error.to_string()));
+            continue;
+        }
+
+        // Mark native I/O accepted before the refresh.  If refresh fails the operation remains
+        // explicitly indeterminate at its deadline; claiming backend failure here would erase the
+        // fact that the daemon may already have applied the write.
+        permit.complete_native(NativeResult::Accepted);
+        let readback = adapter
+            .observe_and_publish_managed(native_worker.as_ref())
+            .await;
+        match readback {
+            Ok(()) => {
+                if let Some(bridge) = &runtime_bridge {
+                    let epoch = adapter.producer_epoch().await;
+                    if let Err(error) = bridge
+                        .confirm_readback(
+                            native_worker
+                                .as_ref()
+                                .map(|worker| worker.instance_name.as_str())
+                                .unwrap_or("default"),
+                            epoch,
+                            command_id,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, command_id = command_id.get(), "HQPlayer readback could not commit command confirmation");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, command_id = command_id.get(), "HQPlayer native write accepted but coherent readback failed")
+            }
+        }
+    }
+}
+
+async fn execute_hqplayer_runtime_command(adapter: &HqpAdapter, command: &Command) -> Result<()> {
+    match command {
+        Command::Play => adapter.play().await,
+        Command::Pause => adapter.pause().await,
+        Command::Stop => adapter.stop().await,
+        Command::Next => adapter.next().await,
+        Command::Previous => adapter.previous().await,
+        Command::Seek { position } => adapter.seek(position.round().max(0.0) as u32).await,
+        Command::VolumeAbsolute { value, output_id } if output_id.is_none() => {
+            // Unified commands carry f32 for compatibility with existing providers. Remove the
+            // widening noise before formatting HQPlayer's decimal-dB wire value.
+            let db = (f64::from(*value) * 100.0).round() / 100.0;
+            adapter.set_volume_db(db).await
+        }
+        Command::Mute {
+            muted: true,
+            output_id,
+        } if output_id.is_none() => adapter.volume_mute().await,
+        Command::PlayPause
+        | Command::VolumeAbsolute { .. }
+        | Command::VolumeRelative { .. }
+        | Command::Mute { .. }
+        | Command::MuteToggle { .. }
+        | Command::SeekRelative { .. }
+        | Command::Shuffle { .. }
+        | Command::Repeat { .. } => Err(anyhow!(
+            "HQPlayer command was not resolved to a safe native operation before dispatch"
+        )),
     }
 }
 

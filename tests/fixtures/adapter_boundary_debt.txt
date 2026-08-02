@@ -87,7 +87,6 @@ src/knobs/routes.rs|control_lms|direct-field-access|lms
 src/knobs/routes.rs|control_openhome|direct-field-access|openhome
 src/knobs/routes.rs|control_roon|direct-field-access|roon
 src/knobs/routes.rs|control_upnp|direct-field-access|upnp
-src/knobs/routes.rs|dispatch_hqplayer_action|direct-field-access|hqp_instances
 src/mcp/tools/hqplayer.rs|<module-use>|concrete-adapter-import|HqpAdapter
 src/mcp/tools/hqplayer.rs|handle_load_profile|direct-field-access|hqp_instances
 src/mcp/tools/hqplayer.rs|handle_set_pipeline|direct-field-access|hqp_instances

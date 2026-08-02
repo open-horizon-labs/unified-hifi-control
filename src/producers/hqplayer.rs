@@ -3013,6 +3013,24 @@ mod tests {
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
+    fn sample_zone() -> crate::bus::Zone {
+        crate::bus::Zone {
+            zone_id: "hqplayer:main".to_string(),
+            zone_name: "Listening room".to_string(),
+            state: crate::bus::PlaybackState::Playing,
+            volume_control: None,
+            now_playing: None,
+            source: "hqplayer".to_string(),
+            is_controllable: true,
+            is_seekable: true,
+            last_updated: 0,
+            is_play_allowed: false,
+            is_pause_allowed: true,
+            is_next_allowed: true,
+            is_previous_allowed: true,
+        }
+    }
+
     fn sample() -> HqpNativeObservation {
         HqpNativeObservation {
             instance_name: "main".to_string(),
@@ -3026,6 +3044,7 @@ mod tests {
                 transport_generation: 1,
             },
             observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_786_016_400),
+            zone: sample_zone(),
             connection: crate::adapters::hqplayer::HqpConnectionStatus {
                 connected: true,
                 host: Some("127.0.0.1".to_string()),

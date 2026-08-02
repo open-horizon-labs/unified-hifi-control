@@ -218,13 +218,22 @@ mod server {
         // starts below, before adapters start, so broadcast zone events cannot race startup.
         let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
 
+        // The reliable lanes deliberately commit *into* the aggregator; they retain no competing
+        // projection store.  Start the actor after the aggregator's bus subscription is ready and
+        // before any adapter can publish a managed HQPlayer observation.
+        let reliable_runtime = bus::runtime::build_runtime(zone_aggregator.clone(), 16, 64);
+        let hqp_runtime_bridge = Arc::new(adapters::hqplayer::HqpRuntimeBridge::new(
+            reliable_runtime.projection_ingress.clone(),
+            reliable_runtime.commands.clone(),
+        ));
+        let reliable_commands = reliable_runtime.commands.clone();
+        let projection_actor = reliable_runtime.projection_actor;
+
         // HQPlayer instance manager (multi-instance support, no settings toggle)
-        let hqp_instances = Arc::new(
-            adapters::hqplayer::HqpInstanceManager::new_with_native_sink(
-                bus.clone(),
-                zone_aggregator.clone(),
-            ),
-        );
+        let hqp_instances = Arc::new(adapters::hqplayer::HqpInstanceManager::new_with_runtime(
+            bus.clone(),
+            hqp_runtime_bridge,
+        ));
         hqp_instances.load_from_config().await;
         let instance_count = hqp_instances.instance_count().await;
         if instance_count > 0 {
@@ -305,6 +314,8 @@ mod server {
             .await
             .map_err(|_| anyhow::anyhow!("ZoneAggregator stopped before subscribing to the bus"))?;
         tracing::info!("ZoneAggregator started");
+        tokio::spawn(projection_actor.run());
+        tracing::info!("Reliable projection runtime started");
 
         // Build list of startable adapters
         // Note: lms_cli shares config with lms - both start when LMS is configured
@@ -344,7 +355,8 @@ mod server {
             startable_adapters.clone(),
             Instant::now(),
             shutdown_token.clone(),
-        );
+        )
+        .with_reliable_commands(reliable_commands);
 
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();
