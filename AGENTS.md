@@ -21,7 +21,7 @@ Use GitHub for all task tracking:
 **Purpose:** Propose implementations for review
 - Link to the issue being addressed: `Fixes #123`
 - Describe what changed and how to test
-- Request review from coderabbit and superego
+- Request review from coderabbit
 
 ### Merging PRs
 **TEST BEFORE MERGING.** Do not merge PRs without testing.
@@ -37,25 +37,16 @@ Use GitHub for all task tracking:
 - Auto-merge in a "merge party" without explicit approval for each PR
 
 ### Git Workflow
-**DO NOT force push (`git push --force` or `git push -f`)**
-- This project uses squash merges, so commit history cleanup is unnecessary
-- Force pushing breaks checkouts for anyone tracking the branch
-- Force pushing loses SHA references (builds, comments, reviews)
-- Just push new commits - they all get squashed on merge anyway
+- Rebasing an owned feature branch is allowed when it keeps a stacked PR current or makes its dependency history clearer.
+- Publish rewritten history with `git push --force-with-lease`, never plain `--force`/`-f`, so an unseen remote update is not overwritten.
+- Do not rewrite `master`, `v3`, release branches, or another contributor's branch.
+- Before rewriting a branch, check for active worktrees/collaborators and record the new exact head in affected PR reports.
 
 ---
 
 ## Code Review
 
-This project uses two complementary review tools:
-
-### superego (Metacognitive Advisor)
-**When to use:** Before commits, when choosing between approaches, when uncertain
-**Protocol:**
-- Mode: `pull` (reviews on request, not automatically)
-- Use `sg review` at decision points during development
-- Post superego reviews to PRs for visibility
-- Handle findings: P1-P3 fix immediately, P4 can discard with reason
+This project uses CodeRabbit for automated pull-request review:
 
 ### coderabbit (Automated Code Review)
 **When to use:** Automatically runs on all PRs
@@ -63,13 +54,6 @@ This project uses two complementary review tools:
 - Reviews code style, potential bugs, and best practices
 - Address feedback before merging
 - Use `@coderabbit` in PR comments to ask questions
-
-### wm (Working Memory)
-**When to use:** Automatic - captures learnings from sessions
-**Protocol:**
-- Runs automatically via hooks
-- Extracts tacit knowledge from completed work
-- No manual intervention needed
 
 ---
 
