@@ -47,11 +47,51 @@ pub struct CommandDeadlines {
     pub confirm_by: Instant,
 }
 
+/// A provider-neutral control or provider-owned internal command admitted to the reliable runtime.
+///
+/// This wrapper deliberately lives only on the private reliable-runtime boundary.  The public
+/// `bus::Command` keeps its serialized compatibility contract: a provider must not have to add a
+/// variant to that wire enum merely because it has a native control plane beyond transport.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RuntimeCommand {
+    /// A normal transport/volume command shared by providers.
+    Control(Command),
+    /// HQPlayer's semantic pipeline/profile control plane.
+    Hqplayer(HqpRuntimeCommand),
+}
+
+impl From<Command> for RuntimeCommand {
+    fn from(command: Command) -> Self {
+        Self::Control(command)
+    }
+}
+
+/// A semantic HQPlayer operation whose values are intentionally names/values, never list indices.
+///
+/// The adapter resolves a pipeline name against the exact daemon session that owns the endpoint.
+/// Keeping the setting name and its value here lets the reliable lane stay independent from every
+/// public HTTP/MCP request shape while ensuring stale enum positions can never cross the boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HqpRuntimeCommand {
+    /// Change one pipeline setting. `setting` and `value` use the semantic spellings accepted by
+    /// HQPlayer's named-setting layer (for example `mode` / `PCM`, or `rate` / `96000`).
+    Pipeline { setting: String, value: String },
+    /// Frozen legacy HTTP compatibility: the endpoint resolves this ephemeral list position
+    /// against its current daemon session before any native write.
+    LegacyPipelineIndex { setting: String, index: u32 },
+    /// Refresh advanced native state/options through the exact-instance worker.
+    RefreshAdvanced,
+    /// Refresh the browser profile inventory through the exact-instance worker.
+    RefreshProfiles,
+    /// Load one named Embedded profile and wait for native recovery/readback.
+    LoadProfile { profile: String },
+}
+
 /// A semantic command admitted to the reliable runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandRequest {
     pub target: PrefixedZoneId,
-    pub command: Command,
+    pub command: RuntimeCommand,
     pub correlation_id: Option<String>,
     pub lane: CommandLane,
     pub deadlines: CommandDeadlines,
@@ -369,7 +409,7 @@ impl EndpointPermit {
 #[derive(Clone)]
 struct CommandRecord {
     target: PrefixedZoneId,
-    command: Command,
+    command: RuntimeCommand,
     status: CommandStatus,
     updates: watch::Sender<CommandStatus>,
 }
@@ -959,7 +999,7 @@ mod tests {
         let now = Instant::now();
         CommandRequest {
             target,
-            command: Command::Play,
+            command: RuntimeCommand::Control(Command::Play),
             correlation_id: correlation.map(str::to_string),
             lane: CommandLane::Interactive,
             deadlines: CommandDeadlines {
@@ -1075,6 +1115,85 @@ mod tests {
         assert_eq!(first.id(), duplicate.id());
         assert!(endpoint.recv().await.is_some());
         assert!(endpoint.receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn correlation_identity_includes_hqplayer_semantic_commands() {
+        let parts = test_runtime();
+        let _endpoint = match parts
+            .commands
+            .register_zone(PrefixedZoneId::hqplayer("main"), 2)
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("endpoint: {error:?}"),
+        };
+        let first = CommandRequest {
+            target: PrefixedZoneId::hqplayer("main"),
+            command: RuntimeCommand::Hqplayer(HqpRuntimeCommand::Pipeline {
+                setting: "mode".to_string(),
+                value: "PCM".to_string(),
+            }),
+            correlation_id: Some("hqp-change-1".to_string()),
+            lane: CommandLane::Reconfiguration,
+            deadlines: request(PrefixedZoneId::hqplayer("main"), None).deadlines,
+        };
+        let duplicate = parts.commands.submit(first.clone()).await;
+        assert!(duplicate.is_ok(), "identical semantic request deduplicates");
+        let changed = CommandRequest {
+            command: RuntimeCommand::Hqplayer(HqpRuntimeCommand::Pipeline {
+                setting: "mode".to_string(),
+                value: "SDM (DSD)".to_string(),
+            }),
+            ..first
+        };
+        assert!(
+            matches!(
+                parts.commands.submit(changed).await,
+                Err(CommandSubmissionError::CorrelationConflict(correlation))
+                    if correlation == "hqp-change-1"
+            ),
+            "a retried correlation cannot silently apply a different pipeline change"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfiguration_guard_refuses_interactive_work_before_native_dispatch() {
+        let parts = test_runtime();
+        let mut endpoint = match parts
+            .commands
+            .register_zone(PrefixedZoneId::hqplayer("main"), 2)
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => panic!("endpoint: {error:?}"),
+        };
+        let mut reconfiguration = request(PrefixedZoneId::hqplayer("main"), None);
+        reconfiguration.lane = CommandLane::Reconfiguration;
+        let _ticket = match parts.commands.submit(reconfiguration).await {
+            Ok(ticket) => ticket,
+            Err(error) => panic!("submit reconfiguration: {error:?}"),
+        };
+        let work = match endpoint.recv().await {
+            Some(work) => work,
+            None => panic!("endpoint closed"),
+        };
+        let guard = match endpoint.try_begin_reconfiguration() {
+            Ok(guard) => guard,
+            Err(status) => panic!("guard: {status:?}"),
+        };
+        let interactive = match parts
+            .commands
+            .submit(request(PrefixedZoneId::hqplayer("main"), None))
+            .await
+        {
+            Ok(ticket) => ticket,
+            Err(error) => panic!("submit interactive: {error:?}"),
+        };
+        assert!(matches!(
+            interactive.status(),
+            CommandStatus::NotDispatched { .. }
+        ));
+        drop(guard);
+        work.refuse("test complete");
     }
 
     #[tokio::test]

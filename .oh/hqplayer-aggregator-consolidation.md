@@ -188,3 +188,19 @@ tests ignored), HQPlayer direct-zone 65/65, MCP HQPlayer 48/48, MCP contract 104
 aggregator unit suites, API contract, AST architecture/debt lints, ignored-send lint, all-feature
 library Clippy with warnings denied, formatting, and diff checks. Live/browser/package verification
 remain before publication of the next beta artifact.
+
+## Reliable HQPlayer reconfiguration and refresh (2026-08-02)
+
+- The private runtime command vocabulary now separates public provider-neutral controls from typed
+  HQPlayer pipeline/profile operations without changing the serialized `bus::Command` contract.
+- Modern and frozen numeric HTTP controls, the HQPlayer web UI, and MCP pipeline/profile tools all
+  submit through the exact-instance runtime endpoint. Numeric compatibility values are resolved
+  under the endpoint's operation lease; they never become native writes outside that lease.
+- Advanced-option and profile refreshes also traverse the endpoint and commit into the aggregator;
+  surface helpers no longer invoke manager refresh methods.
+- A per-instance reconfiguration guard rejects new interactive or competing configuration work
+  while a slow profile/pipeline operation owns the endpoint. Other HQPlayer instances continue.
+- Pipeline success requires coherent zone/native plus advanced-state projection. Profile success
+  additionally requires recovered profile inventory. The correlated confirmation marker is last.
+- Deterministic adapter-boundary debt was ratcheted for every removed HTTP/MCP bypass; public route
+  and MCP text contracts remain unchanged.

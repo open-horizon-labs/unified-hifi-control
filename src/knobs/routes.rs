@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::api::AppState;
-use crate::bus::runtime::{CommandDeadlines, CommandLane, CommandRequest, CommandStatus};
+use crate::bus::runtime::{
+    CommandDeadlines, CommandLane, CommandRequest, CommandStatus, HqpRuntimeCommand, RuntimeCommand,
+};
 use crate::bus::{Command, PrefixedZoneId, VolumeControl};
 use crate::knobs::image::placeholder_svg;
 use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
@@ -666,8 +668,8 @@ pub(crate) async fn dispatch_hqplayer_action(
     // `{"ok":true}` — for a withdrawn zone whose instance still happened to exist in the manager's
     // map. Found by the review pass, pinned by
     // `transport_is_refused_for_a_zone_the_aggregator_has_withdrawn`.
-    let target = PrefixedZoneId::hqplayer(instance);
     let Some(zone) = state.aggregator.get_zone(zone_id).await else {
+        let target = PrefixedZoneId::hqplayer(instance);
         let message = match &state.reliable_commands {
             Some(gateway) if gateway.has_endpoint(&target) => {
                 format!("zone {zone_id} is not currently published")
@@ -677,22 +679,101 @@ pub(crate) async fn dispatch_hqplayer_action(
         return Err(HqpDispatchError::NotFound(message));
     };
 
+    let command = hqp_command_from_published_zone(&zone, action, value)?;
+    dispatch_hqplayer_runtime_command(
+        state,
+        instance,
+        RuntimeCommand::Control(command),
+        CommandLane::Interactive,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+}
+
+/// Submit an HQPlayer pipeline or profile operation through the same exact-instance runtime as
+/// transport. Reconfiguration admission is endpoint-scoped, so a slow profile restart blocks only
+/// competing commands for that HQPlayer instance.
+pub(crate) async fn dispatch_hqplayer_reconfiguration(
+    state: &AppState,
+    instance: &str,
+    command: HqpRuntimeCommand,
+) -> Result<(), HqpDispatchError> {
+    let confirmation_budget = match &command {
+        HqpRuntimeCommand::LoadProfile { .. } => std::time::Duration::from_secs(120),
+        HqpRuntimeCommand::Pipeline { .. } | HqpRuntimeCommand::LegacyPipelineIndex { .. } => {
+            std::time::Duration::from_secs(15)
+        }
+        HqpRuntimeCommand::RefreshAdvanced => std::time::Duration::from_secs(15),
+        HqpRuntimeCommand::RefreshProfiles => std::time::Duration::from_secs(30),
+    };
+    dispatch_hqplayer_runtime_command(
+        state,
+        instance,
+        RuntimeCommand::Hqplayer(command),
+        CommandLane::Reconfiguration,
+        confirmation_budget,
+    )
+    .await
+}
+
+pub(crate) async fn dispatch_hqplayer_refresh(
+    state: &AppState,
+    instance: &str,
+    command: HqpRuntimeCommand,
+) -> Result<(), HqpDispatchError> {
+    let confirmation_budget = match &command {
+        HqpRuntimeCommand::RefreshAdvanced => std::time::Duration::from_secs(15),
+        HqpRuntimeCommand::RefreshProfiles => std::time::Duration::from_secs(30),
+        _ => {
+            return Err(HqpDispatchError::BadRequest {
+                message: "HQPlayer refresh requires a read command".to_string(),
+                code: "INVALID_COMMAND",
+            });
+        }
+    };
+    dispatch_hqplayer_runtime_command(
+        state,
+        instance,
+        RuntimeCommand::Hqplayer(command),
+        CommandLane::Interactive,
+        confirmation_budget,
+    )
+    .await
+}
+
+async fn dispatch_hqplayer_runtime_command(
+    state: &AppState,
+    instance: &str,
+    command: RuntimeCommand,
+    lane: CommandLane,
+    confirmation_budget: std::time::Duration,
+) -> Result<(), HqpDispatchError> {
+    let target = PrefixedZoneId::hqplayer(instance);
+    let zone_id = target.to_string();
+    if state.aggregator.get_zone(&zone_id).await.is_none() {
+        let message = match &state.reliable_commands {
+            Some(gateway) if gateway.has_endpoint(&target) => {
+                format!("zone {zone_id} is not currently published")
+            }
+            _ => format!("HQPlayer instance '{instance}' is not configured"),
+        };
+        return Err(HqpDispatchError::NotFound(message));
+    }
     let Some(gateway) = &state.reliable_commands else {
         return Err(HqpDispatchError::Backend(
             "HQPlayer reliable command runtime is unavailable".to_string(),
         ));
     };
-    let command = hqp_command_from_published_zone(&zone, action, value)?;
     let now = tokio::time::Instant::now();
     let mut ticket = gateway
         .submit(CommandRequest {
             target,
             command,
             correlation_id: None,
-            lane: CommandLane::Interactive,
+            lane,
             deadlines: CommandDeadlines {
                 dispatch_by: now + std::time::Duration::from_secs(3),
-                confirm_by: now + std::time::Duration::from_secs(10),
+                confirm_by: now + confirmation_budget,
             },
         })
         .await

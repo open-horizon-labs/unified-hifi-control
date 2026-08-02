@@ -51,6 +51,7 @@ use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api;
 use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
+use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::{self, KnobStore};
 
@@ -192,10 +193,16 @@ async fn create_test_app_with_state() -> (Router, AppState) {
     // Create disconnected adapters
     let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
     let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
-    let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
-        bus.clone(),
-        aggregator.clone(),
-    ));
+    let runtime = build_runtime(aggregator.clone(), 16, 32);
+    let bridge = Arc::new(
+        unified_hifi_control::adapters::hqplayer::HqpRuntimeBridge::new(
+            runtime.projection_ingress.clone(),
+            runtime.commands.clone(),
+        ),
+    );
+    let reliable_commands = runtime.commands.clone();
+    tokio::spawn(runtime.projection_actor.run());
+    let hqp_instances = Arc::new(HqpInstanceManager::new_with_runtime(bus.clone(), bridge));
     let hqplayer = hqp_instances.get_default().await;
     let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
     let lms = Arc::new(LmsAdapter::new(bus.clone()));
@@ -222,7 +229,8 @@ async fn create_test_app_with_state() -> (Router, AppState) {
         startable_adapters,
         Instant::now(),
         CancellationToken::new(),
-    );
+    )
+    .with_reliable_commands(reliable_commands);
 
     // Build router with all routes (same as main.rs)
     let app = Router::new()
@@ -1387,7 +1395,30 @@ mod hqplayer_setting_route_contract {
                 max_attempts: 1,
             })
             .await;
-        state.hqplayer.connect().await.expect("connect endpoint A");
+        state
+            .hqp_instances
+            .start()
+            .await
+            .expect("start reliable endpoint A");
+        for _ in 0..100 {
+            if state
+                .aggregator
+                .get_zone("hqplayer:default")
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .aggregator
+                .get_zone("hqplayer:default")
+                .await
+                .is_some(),
+            "managed endpoint A publishes before the numeric command"
+        );
         let gate = ReplyGate::new("GetModes");
         first.set_policy(WirePolicy {
             reply_gate: Some(gate.clone()),
@@ -1434,6 +1465,7 @@ mod hqplayer_setting_route_contract {
         assert_eq!(first.stats().element_count("SetMode"), 1);
         assert_eq!(second.stats().element_count("SetMode"), 0);
 
+        state.hqp_instances.stop().await;
         first.stop();
         second.stop();
     }
@@ -1570,10 +1602,29 @@ mod hqplayer_setting_route_contract {
             })
             .await;
         state
-            .hqplayer
-            .connect()
+            .hqp_instances
+            .start()
             .await
-            .expect("connect mock HQPlayer");
+            .expect("start managed HQPlayer endpoint");
+        for _ in 0..100 {
+            if state
+                .aggregator
+                .get_zone("hqplayer:default")
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .aggregator
+                .get_zone("hqplayer:default")
+                .await
+                .is_some(),
+            "managed HQPlayer zone must publish before browser controls"
+        );
 
         let (status, initial_body) = get_request(&app, "/hqplayer/matrix/profiles").await;
         assert_eq!(status, StatusCode::OK, "{initial_body}");
@@ -1609,6 +1660,7 @@ mod hqplayer_setting_route_contract {
         assert_eq!(advanced["random"], true);
         assert!(advanced["native_state"].is_object());
 
+        state.hqp_instances.stop().await;
         server.stop();
     }
 }

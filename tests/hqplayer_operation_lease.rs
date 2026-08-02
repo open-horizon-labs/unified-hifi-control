@@ -1132,27 +1132,43 @@ async fn changing_only_web_credentials_clears_persistent_lane_caches() {
     web.stop();
 }
 
-/// Pin the actual frozen numeric HTTP boundary to the combined adapter operation. A future handler
-/// must not regress to `legacy_index_to_name(...).await` followed by a separately leased setter.
+/// Pin the frozen numeric HTTP boundary to the reliable command lane and the endpoint's combined
+/// adapter operation. A future handler must not regain direct adapter access or split resolution
+/// from its leased write.
 #[test]
 fn legacy_http_boundary_uses_combined_index_apply() {
-    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api/mod.rs"))
+    let api = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api/mod.rs"))
         .expect("read API source");
-    let start = source
+    let start = api
         .find("async fn hqp_apply_legacy_setting(")
         .expect("legacy handler helper exists");
-    let end = source[start..]
+    let end = api[start..]
         .find("async fn hqp_apply_named_setting(")
         .map(|offset| start + offset)
         .expect("named helper follows legacy helper");
-    let helper = &source[start..end];
+    let helper = &api[start..end];
+    assert!(helper.contains("HqpRuntimeCommand::LegacyPipelineIndex"));
+    assert!(!helper.contains("state.hqplayer"));
 
+    let adapter = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/adapters/hqplayer.rs"
+    ))
+    .expect("read HQPlayer adapter source");
+    let start = adapter
+        .find("async fn execute_hqplayer_runtime_legacy_pipeline(")
+        .expect("reliable endpoint legacy resolver exists");
+    let end = adapter[start..]
+        .find("async fn execute_hqplayer_runtime_pipeline(")
+        .map(|offset| start + offset)
+        .expect("named reliable resolver follows legacy resolver");
+    let endpoint = &adapter[start..end];
     assert_eq!(
-        helper.matches("apply_legacy_index").count(),
+        endpoint.matches("apply_legacy_index").count(),
         5,
         "mode, filter pair, both filter sides, and shaper must use the combined operation"
     );
-    assert!(!helper.contains("legacy_index_to_name"));
+    assert!(!endpoint.contains("legacy_index_to_name"));
 }
 
 /// Keep the await-in-lock exemption honest: the allowlisted guard name may only ever denote the

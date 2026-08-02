@@ -9,7 +9,7 @@ use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
 use crate::adapters::Startable;
 use crate::aggregator::{HqpSnapshotPresence, ZoneAggregator};
-use crate::bus::runtime::CommandGateway;
+use crate::bus::runtime::{CommandGateway, HqpRuntimeCommand};
 use crate::bus::{BusEvent, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
@@ -839,15 +839,13 @@ pub(crate) async fn refresh_hqp_advanced_aggregate(
     state: &AppState,
     instance_name: &str,
 ) -> anyhow::Result<HqpAdvancedOptionsSnapshot> {
-    if state
-        .aggregator
-        .get_hqplayer_snapshot(instance_name)
-        .await
-        .is_none()
-    {
-        state.hqp_instances.refresh_instance(instance_name).await?;
-    }
-    state.hqp_instances.refresh_advanced(instance_name).await?;
+    crate::knobs::routes::dispatch_hqplayer_refresh(
+        state,
+        instance_name,
+        HqpRuntimeCommand::RefreshAdvanced,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message().to_string()))?;
     state
         .aggregator
         .get_hqplayer_snapshot(instance_name)
@@ -862,28 +860,13 @@ pub(crate) async fn refresh_hqp_profiles_aggregate(
     state: &AppState,
     instance_name: &str,
 ) -> anyhow::Result<Vec<HqpProfile>> {
-    let base_refresh = if state
-        .aggregator
-        .get_hqplayer_snapshot(instance_name)
-        .await
-        .is_none()
-    {
-        state
-            .hqp_instances
-            .refresh_instance(instance_name)
-            .await
-            .err()
-    } else {
-        None
-    };
-
-    // The browser profile lane has a useful, stable failure of its own (for example missing web
-    // credentials). Always let the manager perform that read so a failed native bootstrap does not
-    // replace the more specific browser error with "HQPlayer host not configured".
-    state.hqp_instances.refresh_profiles(instance_name).await?;
-    if let Some(base_error) = base_refresh {
-        return Err(base_error);
-    }
+    crate::knobs::routes::dispatch_hqplayer_refresh(
+        state,
+        instance_name,
+        HqpRuntimeCommand::RefreshProfiles,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message().to_string()))?;
     state
         .aggregator
         .get_hqplayer_snapshot(instance_name)
@@ -970,38 +953,16 @@ async fn hqp_apply_legacy_setting(
     setting: &str,
     value: u32,
 ) -> anyhow::Result<()> {
-    use crate::adapters::hqplayer::LegacySettingTarget;
-
-    let hqp = &state.hqplayer;
-    let outcome = match setting {
-        "mode" => {
-            hqp.apply_legacy_index(LegacySettingTarget::Mode, value)
-                .await?
-        }
-        "filter" => {
-            // Both sides to the same filter, in **one** `SetFilter`. Two one-sided writes could
-            // half-apply — the first lands, the second is rejected or lost — leaving the daemon on a
-            // pair nobody asked for; a single request carrying both indices cannot.
-            hqp.apply_legacy_index(LegacySettingTarget::FilterPair, value)
-                .await?
-        }
-        "filter1x" => {
-            hqp.apply_legacy_index(LegacySettingTarget::Filter1x, value)
-                .await?
-        }
-        "filterNx" | "filternx" => {
-            hqp.apply_legacy_index(LegacySettingTarget::FilterNx, value)
-                .await?
-        }
-        "shaper" | "dither" => {
-            hqp.apply_legacy_index(LegacySettingTarget::Shaper, value)
-                .await?
-        }
-        // By contract this number is Hz, not a list position.
-        "samplerate" | "rate" => hqp.set_rate(value).await?,
-        other => return Err(anyhow::anyhow!("Unknown setting: {}", other)),
-    };
-    outcome.into_applied_result()
+    crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        state,
+        "default",
+        HqpRuntimeCommand::LegacyPipelineIndex {
+            setting: setting.to_string(),
+            index: value,
+        },
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message().to_string()))
 }
 
 /// Apply one setting given as a semantic name, which is the modern contract.
@@ -1010,26 +971,30 @@ async fn hqp_apply_named_setting(
     setting: &str,
     value: &str,
 ) -> anyhow::Result<()> {
-    let hqp = &state.hqplayer;
-    let outcome = match setting {
-        "mode" => hqp.set_mode(value).await?,
-        "filter1x" => hqp.set_filter_1x(value).await?,
-        "filterNx" | "filternx" => hqp.set_filter_nx(value).await?,
-        "shaper" | "dither" => hqp.set_shaper(value).await?,
-        "junk_filter" => hqp.set_junk_filter(value).await?,
-        "convolution" => hqp.set_convolution(parse_hqp_bool(value)?).await?,
-        "adaptive_volume" => hqp.set_adaptive_volume(parse_hqp_bool(value)?).await?,
-        "repeat" => hqp.set_repeat(parse_hqp_repeat(value)?).await?,
-        "random" => hqp.set_random(parse_hqp_bool(value)?).await?,
+    let normalized = match setting {
+        "mode" | "filter1x" | "filterNx" | "filternx" | "shaper" | "dither" | "junk_filter" => {
+            value.to_string()
+        }
+        "convolution" | "adaptive_volume" | "random" => parse_hqp_bool(value)?.to_string(),
+        "repeat" => parse_hqp_repeat(value)?.to_string(),
         "samplerate" | "rate" => {
             let hz: u32 = value.parse().map_err(|_| {
                 anyhow::anyhow!("Invalid rate value (expected Hz like 48000, 96000): {value}")
             })?;
-            hqp.set_rate(hz).await?
+            hz.to_string()
         }
         other => return Err(anyhow::anyhow!("Unknown setting: {}", other)),
     };
-    outcome.into_applied_result()
+    crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        state,
+        "default",
+        HqpRuntimeCommand::Pipeline {
+            setting: setting.to_string(),
+            value: normalized,
+        },
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message().to_string()))
 }
 
 fn parse_hqp_bool(value: &str) -> anyhow::Result<bool> {
@@ -1090,18 +1055,7 @@ pub async fn hqp_setting_handler(
     let result = hqp_apply_legacy_setting(&state, &req.name, req.value).await;
 
     match result {
-        Ok(()) => match state.hqp_instances.refresh_instance("default").await {
-            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!(
-                        "HQPlayer applied the setting, but verified state refresh failed: {e}"
-                    ),
-                }),
-            )
-                .into_response(),
-        },
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1224,23 +1178,20 @@ pub async fn hqp_load_profile_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpProfileRequest>,
 ) -> impl IntoResponse {
-    match state.hqplayer.load_profile(&req.profile).await {
-        Ok(()) => match state.hqp_instances.refresh_instance("default").await {
-            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!(
-                        "HQPlayer loaded the profile, but verified state refresh failed: {e}"
-                    ),
-                }),
-            )
-                .into_response(),
+    match crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        &state,
+        "default",
+        HqpRuntimeCommand::LoadProfile {
+            profile: req.profile,
         },
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: e.to_string(),
+                error: e.message().to_string(),
             }),
         )
             .into_response(),
@@ -1249,19 +1200,18 @@ pub async fn hqp_load_profile_handler(
 
 /// GET /hqplayer/matrix/profiles - Get matrix profiles and current selection
 pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl IntoResponse {
-    // Quick check - if not connected, return empty immediately (don't block on timeout)
-    let status = state.hqplayer.get_status().await;
-    if !status.connected {
+    if state
+        .aggregator
+        .get_hqplayer_snapshot("default")
+        .await
+        .is_none()
+    {
         return (
             StatusCode::OK,
-            Json(serde_json::json!({
-                "profiles": [],
-                "current": null
-            })),
+            Json(serde_json::json!({"profiles": [], "current": null})),
         )
             .into_response();
     }
-
     match refresh_hqp_advanced_aggregate(&state, "default").await {
         Ok(snapshot) => (
             StatusCode::OK,
@@ -1299,28 +1249,41 @@ pub async fn hqp_set_matrix_profile_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpMatrixProfileRequest>,
 ) -> impl IntoResponse {
-    match state
-        .hqplayer
-        .set_matrix_profile(req.profile)
+    let profile = match refresh_hqp_advanced_aggregate(&state, "default")
         .await
-        .and_then(|o| o.into_applied_result())
-    {
-        Ok(()) => match refresh_hqp_advanced_aggregate(&state, "default").await {
-            Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
+        .and_then(|snapshot| {
+            snapshot
+                .matrix_profiles
+                .into_iter()
+                .find(|profile| profile.index == req.profile)
+                .ok_or_else(|| anyhow::anyhow!("Unknown matrix profile index: {}", req.profile))
+        }) {
+        Ok(profile) => profile,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: format!(
-                        "HQPlayer applied the matrix profile, but verified state refresh failed: {e}"
-                    ),
+                    error: e.to_string(),
                 }),
             )
-                .into_response(),
+                .into_response();
+        }
+    };
+    match crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        &state,
+        "default",
+        HqpRuntimeCommand::Pipeline {
+            setting: "matrix_profile".to_string(),
+            value: profile.name,
         },
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: e.to_string(),
+                error: e.message().to_string(),
             }),
         )
             .into_response(),
@@ -2037,40 +2000,25 @@ pub async fn hqp_instance_load_profile_handler(
     Path(name): Path<String>,
     Json(req): Json<HqpProfileRequest>,
 ) -> impl IntoResponse {
-    let adapter = match state.hqp_instances.get(&name).await {
-        Some(adapter) => adapter,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("Instance not found: {}", name),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    match adapter.load_profile(&req.profile).await {
-        Ok(()) => match state.hqp_instances.refresh_instance(&name).await {
-            Ok(()) => (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "instance": name, "profile": req.profile})),
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!(
-                        "HQPlayer loaded the profile, but verified state refresh failed: {e}"
-                    ),
-                }),
-            )
-                .into_response(),
+    let profile = req.profile;
+    match crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        &state,
+        &name,
+        HqpRuntimeCommand::LoadProfile {
+            profile: profile.clone(),
         },
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "instance": name, "profile": profile})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: e.to_string(),
+                error: e.message().to_string(),
             }),
         )
             .into_response(),
@@ -2124,44 +2072,45 @@ pub async fn hqp_instance_set_matrix_profile_handler(
     Path(name): Path<String>,
     Json(req): Json<HqpInstanceMatrixProfileRequest>,
 ) -> impl IntoResponse {
-    let adapter = match state.hqp_instances.get(&name).await {
-        Some(a) => a,
-        None => {
+    let profile = match refresh_hqp_advanced_aggregate(&state, &name)
+        .await
+        .and_then(|snapshot| {
+            snapshot
+                .matrix_profiles
+                .into_iter()
+                .find(|profile| profile.index == req.value)
+                .ok_or_else(|| anyhow::anyhow!("Unknown matrix profile index: {}", req.value))
+        }) {
+        Ok(profile) => profile,
+        Err(e) => {
             return (
-                StatusCode::NOT_FOUND,
+                StatusCode::BAD_REQUEST,
                 Json(ErrorResponse {
-                    error: format!("Instance not found: {}", name),
+                    error: e.to_string(),
                 }),
             )
-                .into_response()
+                .into_response();
         }
     };
-
-    match adapter
-        .set_matrix_profile(req.value)
-        .await
-        .and_then(|o| o.into_applied_result())
-    {
-        Ok(()) => match refresh_hqp_advanced_aggregate(&state, &name).await {
-            Ok(_) => (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": true, "instance": name, "value": req.value})),
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse {
-                    error: format!(
-                        "HQPlayer applied the matrix profile, but verified state refresh failed: {e}"
-                    ),
-                }),
-            )
-                .into_response(),
+    match crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        &state,
+        &name,
+        HqpRuntimeCommand::Pipeline {
+            setting: "matrix_profile".to_string(),
+            value: profile.name,
         },
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "instance": name, "value": req.value})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
-                error: e.to_string(),
+                error: e.message().to_string(),
             }),
         )
             .into_response(),

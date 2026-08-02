@@ -44,8 +44,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapters::Startable;
 use crate::bus::runtime::{
-    CommandEndpoint, CommandGateway, CommandId, NativeResult, ProjectionEntry, ProjectionIngress,
-    ProjectionKind, ProjectionPayload, ProjectionSource, ProjectionUpdate,
+    CommandEndpoint, CommandGateway, CommandId, CommandStatus, HqpRuntimeCommand, NativeResult,
+    ProjectionEntry, ProjectionIngress, ProjectionKind, ProjectionPayload, ProjectionSource,
+    ProjectionUpdate, RuntimeCommand,
 };
 use crate::bus::{
     BusEvent, Command, NowPlaying as BusNowPlaying, PlaybackState, PrefixedZoneId, SharedBus,
@@ -1761,6 +1762,49 @@ impl HqpRuntimeBridge {
             Some(command_id),
             ProjectionKind::Delta,
             ProjectionPayload::Marker(format!("hqplayer-readback-{marker}")),
+        )
+        .await
+    }
+
+    /// Publish the exact advanced snapshot observed after a reliable reconfiguration command.
+    ///
+    /// This is separate from the periodic producer callback so the endpoint worker can require the
+    /// setting choices/state to have reached the aggregator before it confirms its ticket.
+    pub(crate) async fn publish_advanced_readback(
+        &self,
+        instance_name: &str,
+        snapshot: HqpAdvancedOptionsSnapshot,
+    ) -> Result<()> {
+        let epoch = snapshot.execution_target.producer_epoch;
+        self.publish(
+            instance_name,
+            epoch,
+            None,
+            ProjectionKind::Delta,
+            ProjectionPayload::HqpAdvanced {
+                instance_name: instance_name.to_string(),
+                snapshot: Box::new(snapshot),
+            },
+        )
+        .await
+    }
+
+    /// Publish the profile inventory proven by a completed profile load before confirming it.
+    pub(crate) async fn publish_profiles_readback(
+        &self,
+        instance_name: &str,
+        producer_epoch: u64,
+        profiles: Vec<HqpProfile>,
+    ) -> Result<()> {
+        self.publish(
+            instance_name,
+            producer_epoch,
+            None,
+            ProjectionKind::Delta,
+            ProjectionPayload::HqpProfiles {
+                instance_name: instance_name.to_string(),
+                result: Ok(profiles),
+            },
         )
         .await
     }
@@ -9140,16 +9184,43 @@ async fn run_hqplayer_command_endpoint(
             work = endpoint.recv() => work,
         };
         let Some(work) = work else { break };
+        // A profile load can restart HQPlayer and a pipeline change can replace every enum list.
+        // Admit exactly one such operation per daemon endpoint, and reject all new work while it is
+        // in flight.  The guard is acquired before dispatch: a failed admission must never turn a
+        // queueing race into native I/O.
+        let _reconfiguration_guard =
+            if work.request().lane == crate::bus::runtime::CommandLane::Reconfiguration {
+                match endpoint.try_begin_reconfiguration() {
+                    Ok(guard) => Some(guard),
+                    Err(CommandStatus::NotDispatched { detail }) => {
+                        work.refuse(detail);
+                        continue;
+                    }
+                    Err(status) => {
+                        work.refuse("HQPlayer reconfiguration admission failed");
+                        tracing::warn!(
+                            ?status,
+                            "HQPlayer reconfiguration admission returned an unexpected status"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
         let permit = match work.begin_dispatch() {
             Ok(permit) => permit,
             Err(_) => continue,
         };
         let command_id = permit.id();
         let result = execute_hqplayer_runtime_command(&adapter, &permit.request().command).await;
-        if let Err(error) = result {
-            permit.complete_native(NativeResult::Failed(error.to_string()));
-            continue;
-        }
+        let projection = match result {
+            Ok(projection) => projection,
+            Err(error) => {
+                permit.complete_native(NativeResult::Failed(error.to_string()));
+                continue;
+            }
+        };
 
         // Mark native I/O accepted before the refresh.  If refresh fails the operation remains
         // explicitly indeterminate at its deadline; claiming backend failure here would erase the
@@ -9161,16 +9232,23 @@ async fn run_hqplayer_command_endpoint(
         match readback {
             Ok(()) => {
                 if let Some(bridge) = &runtime_bridge {
+                    let instance_name = native_worker
+                        .as_ref()
+                        .map(|worker| worker.instance_name.as_str())
+                        .unwrap_or("default");
                     let epoch = adapter.producer_epoch().await;
-                    if let Err(error) = bridge
-                        .confirm_readback(
-                            native_worker
-                                .as_ref()
-                                .map(|worker| worker.instance_name.as_str())
-                                .unwrap_or("default"),
-                            epoch,
-                            command_id,
-                        )
+                    let required_projection = publish_hqplayer_runtime_readback(
+                        &adapter,
+                        bridge,
+                        instance_name,
+                        epoch,
+                        projection,
+                    )
+                    .await;
+                    if let Err(error) = required_projection {
+                        tracing::warn!(%error, command_id = command_id.get(), "HQPlayer native write accepted but required reconfiguration projection failed");
+                    } else if let Err(error) = bridge
+                        .confirm_readback(instance_name, epoch, command_id)
                         .await
                     {
                         tracing::warn!(%error, command_id = command_id.get(), "HQPlayer readback could not commit command confirmation");
@@ -9184,34 +9262,260 @@ async fn run_hqplayer_command_endpoint(
     }
 }
 
-async fn execute_hqplayer_runtime_command(adapter: &HqpAdapter, command: &Command) -> Result<()> {
+/// Which additional state documents must commit after the coherent zone/native observation before
+/// this command can be confirmed.  The final correlated marker is intentionally emitted only after
+/// this list succeeds, so a delayed profile restart cannot be reported as an applied UI change with
+/// stale advanced choices or profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HqpRuntimeReadback {
+    Interactive,
+    Pipeline,
+    Profile,
+}
+
+async fn publish_hqplayer_runtime_readback(
+    adapter: &HqpAdapter,
+    bridge: &HqpRuntimeBridge,
+    instance_name: &str,
+    epoch: u64,
+    readback: HqpRuntimeReadback,
+) -> Result<()> {
+    match readback {
+        HqpRuntimeReadback::Interactive => Ok(()),
+        HqpRuntimeReadback::Pipeline => {
+            let advanced = adapter.get_advanced_options_snapshot().await?;
+            bridge
+                .publish_advanced_readback(instance_name, advanced)
+                .await
+        }
+        HqpRuntimeReadback::Profile => {
+            let advanced = adapter.get_advanced_options_snapshot().await?;
+            bridge
+                .publish_advanced_readback(instance_name, advanced)
+                .await?;
+            // `load_profile` already proved this inventory after the daemon recovered.  Reusing the
+            // resulting semantic values avoids a second browser request racing its next restart.
+            bridge
+                .publish_profiles_readback(
+                    instance_name,
+                    epoch,
+                    adapter.get_cached_profiles().await,
+                )
+                .await
+        }
+    }
+}
+
+async fn execute_hqplayer_runtime_command(
+    adapter: &HqpAdapter,
+    command: &RuntimeCommand,
+) -> Result<HqpRuntimeReadback> {
     match command {
-        Command::Play => adapter.play().await,
-        Command::Pause => adapter.pause().await,
-        Command::Stop => adapter.stop().await,
-        Command::Next => adapter.next().await,
-        Command::Previous => adapter.previous().await,
-        Command::Seek { position } => adapter.seek(position.round().max(0.0) as u32).await,
-        Command::VolumeAbsolute { value, output_id } if output_id.is_none() => {
+        RuntimeCommand::Control(Command::Play) => adapter
+            .play()
+            .await
+            .map(|()| HqpRuntimeReadback::Interactive),
+        RuntimeCommand::Control(Command::Pause) => adapter
+            .pause()
+            .await
+            .map(|()| HqpRuntimeReadback::Interactive),
+        RuntimeCommand::Control(Command::Stop) => adapter
+            .stop()
+            .await
+            .map(|()| HqpRuntimeReadback::Interactive),
+        RuntimeCommand::Control(Command::Next) => adapter
+            .next()
+            .await
+            .map(|()| HqpRuntimeReadback::Interactive),
+        RuntimeCommand::Control(Command::Previous) => adapter
+            .previous()
+            .await
+            .map(|()| HqpRuntimeReadback::Interactive),
+        RuntimeCommand::Control(Command::Seek { position }) => adapter
+            .seek(position.round().max(0.0) as u32)
+            .await
+            .map(|()| HqpRuntimeReadback::Interactive),
+        RuntimeCommand::Control(Command::VolumeAbsolute { value, output_id })
+            if output_id.is_none() =>
+        {
             // Unified commands carry f32 for compatibility with existing providers. Remove the
             // widening noise before formatting HQPlayer's decimal-dB wire value.
             let db = (f64::from(*value) * 100.0).round() / 100.0;
-            adapter.set_volume_db(db).await
+            adapter
+                .set_volume_db(db)
+                .await
+                .map(|()| HqpRuntimeReadback::Interactive)
         }
-        Command::Mute {
+        RuntimeCommand::Control(Command::Mute {
             muted: true,
             output_id,
-        } if output_id.is_none() => adapter.volume_mute().await,
-        Command::PlayPause
-        | Command::VolumeAbsolute { .. }
-        | Command::VolumeRelative { .. }
-        | Command::Mute { .. }
-        | Command::MuteToggle { .. }
-        | Command::SeekRelative { .. }
-        | Command::Shuffle { .. }
-        | Command::Repeat { .. } => Err(anyhow!(
+        }) if output_id.is_none() => adapter
+            .volume_mute()
+            .await
+            .map(|()| HqpRuntimeReadback::Interactive),
+        RuntimeCommand::Hqplayer(HqpRuntimeCommand::Pipeline { setting, value }) => {
+            execute_hqplayer_runtime_pipeline(adapter, setting, value)
+                .await
+                .map(|()| HqpRuntimeReadback::Pipeline)
+        }
+        RuntimeCommand::Hqplayer(HqpRuntimeCommand::LegacyPipelineIndex { setting, index }) => {
+            execute_hqplayer_runtime_legacy_pipeline(adapter, setting, *index)
+                .await
+                .map(|()| HqpRuntimeReadback::Pipeline)
+        }
+        RuntimeCommand::Hqplayer(HqpRuntimeCommand::LoadProfile { profile }) => adapter
+            .load_profile(profile)
+            .await
+            .map(|()| HqpRuntimeReadback::Profile),
+        RuntimeCommand::Hqplayer(HqpRuntimeCommand::RefreshAdvanced) => {
+            Ok(HqpRuntimeReadback::Pipeline)
+        }
+        RuntimeCommand::Hqplayer(HqpRuntimeCommand::RefreshProfiles) => adapter
+            .fetch_profiles()
+            .await
+            .map(|_| HqpRuntimeReadback::Profile),
+        RuntimeCommand::Control(
+            Command::PlayPause
+            | Command::VolumeAbsolute { .. }
+            | Command::VolumeRelative { .. }
+            | Command::Mute { .. }
+            | Command::MuteToggle { .. }
+            | Command::SeekRelative { .. }
+            | Command::Shuffle { .. }
+            | Command::Repeat { .. },
+        ) => Err(anyhow!(
             "HQPlayer command was not resolved to a safe native operation before dispatch"
         )),
+    }
+}
+
+async fn execute_hqplayer_runtime_legacy_pipeline(
+    adapter: &HqpAdapter,
+    setting: &str,
+    index: u32,
+) -> Result<()> {
+    let outcome = match setting {
+        "mode" => {
+            adapter
+                .apply_legacy_index(LegacySettingTarget::Mode, index)
+                .await?
+        }
+        "filter" => {
+            adapter
+                .apply_legacy_index(LegacySettingTarget::FilterPair, index)
+                .await?
+        }
+        "filter1x" => {
+            adapter
+                .apply_legacy_index(LegacySettingTarget::Filter1x, index)
+                .await?
+        }
+        "filterNx" | "filternx" => {
+            adapter
+                .apply_legacy_index(LegacySettingTarget::FilterNx, index)
+                .await?
+        }
+        "shaper" | "dither" => {
+            adapter
+                .apply_legacy_index(LegacySettingTarget::Shaper, index)
+                .await?
+        }
+        "samplerate" | "rate" => adapter.set_rate(index).await?,
+        other => return Err(anyhow!("Unknown HQPlayer legacy pipeline setting: {other}")),
+    };
+    outcome.into_applied_result()
+}
+
+/// Execute a named HQPlayer setting through the adapter's verified setter layer.
+///
+/// Runtime values are deliberately strings: endpoint code receives semantic values from a surface
+/// adapter, not ephemeral list positions.  Parsing the three scalar domains here is strict and
+/// produces the same useful refusal rather than sending a best-effort native request.
+async fn execute_hqplayer_runtime_pipeline(
+    adapter: &HqpAdapter,
+    setting: &str,
+    value: &str,
+) -> Result<()> {
+    let outcome = match setting.trim().to_ascii_lowercase().as_str() {
+        "mode" => adapter.set_mode(value).await?,
+        "filter" | "filter_pair" => adapter.set_filter_pair(value).await?,
+        "filter1x" | "filter_1x" => adapter.set_filter_1x(value).await?,
+        "filternx" | "filter_nx" => adapter.set_filter_nx(value).await?,
+        "shaper" | "dither" => adapter.set_shaper(value).await?,
+        "junk" | "junk_filter" => adapter.set_junk_filter(value).await?,
+        "convolution" => {
+            adapter
+                .set_convolution(parse_hqp_runtime_bool(value)?)
+                .await?
+        }
+        "adaptive" | "adaptive_volume" => {
+            adapter
+                .set_adaptive_volume(parse_hqp_runtime_bool(value)?)
+                .await?
+        }
+        "repeat" => adapter.set_repeat(parse_hqp_runtime_repeat(value)?).await?,
+        "random" | "shuffle" => adapter.set_random(parse_hqp_runtime_bool(value)?).await?,
+        "samplerate" | "rate" => adapter.set_rate(parse_hqp_runtime_rate(value)?).await?,
+        "matrix" | "matrix_profile" => adapter.set_matrix_profile_named(value).await?,
+        other => return Err(anyhow!("Unknown HQPlayer pipeline setting: {other}")),
+    };
+    outcome.into_applied_result()
+}
+
+fn parse_hqp_runtime_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Ok(true),
+        "false" | "0" | "off" | "no" => Ok(false),
+        _ => Err(anyhow!(
+            "Invalid HQPlayer boolean value {value:?}; expected true or false"
+        )),
+    }
+}
+
+fn parse_hqp_runtime_repeat(value: &str) -> Result<u8> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "0" => Ok(0),
+        "one" | "track" | "1" => Ok(1),
+        "all" | "2" => Ok(2),
+        _ => Err(anyhow!(
+            "Invalid HQPlayer repeat value {value:?}; expected off, one, or all"
+        )),
+    }
+}
+
+fn parse_hqp_runtime_rate(value: &str) -> Result<u32> {
+    value.trim().parse().map_err(|_| {
+        anyhow!("Invalid HQPlayer rate value (expected Hz like 48000, 96000): {value}")
+    })
+}
+
+#[cfg(test)]
+mod runtime_command_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_pipeline_scalars_accept_only_explicit_semantic_spellings() {
+        assert_eq!(parse_hqp_runtime_bool("on").ok(), Some(true));
+        assert_eq!(parse_hqp_runtime_bool("OFF").ok(), Some(false));
+        assert_eq!(parse_hqp_runtime_repeat("track").ok(), Some(1));
+        assert_eq!(parse_hqp_runtime_repeat("all").ok(), Some(2));
+        assert_eq!(parse_hqp_runtime_rate(" 96000 ").ok(), Some(96_000));
+        assert!(parse_hqp_runtime_bool("maybe").is_err());
+        assert!(parse_hqp_runtime_repeat("loop").is_err());
+        assert!(parse_hqp_runtime_rate("96k").is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_runtime_pipeline_setting_is_refused_without_reaching_native_transport() {
+        let adapter = HqpAdapter::new(crate::bus::create_bus());
+        let error = execute_hqplayer_runtime_pipeline(&adapter, "not-a-setting", "value")
+            .await
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(
+            error.as_deref(),
+            Some("Unknown HQPlayer pipeline setting: not-a-setting")
+        );
     }
 }
 

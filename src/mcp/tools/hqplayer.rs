@@ -14,6 +14,7 @@
 
 use crate::adapters::hqplayer::HqpAdapter;
 use crate::api::AppState;
+use crate::bus::runtime::HqpRuntimeCommand;
 use crate::mcp::envelope::{Envelope, Provider, Refusal, Scope};
 use crate::mcp::types::{McpHqpOptions, McpHqpSelection, McpHqpStatus, McpPipelineStatus};
 use rust_mcp_sdk::{
@@ -317,6 +318,9 @@ pub async fn handle_status(
 
 /// Fetch the default instance's profiles for the tool and MCP resource from one implementation.
 pub async fn hqp_profiles_payload(state: &AppState) -> Result<Vec<String>, String> {
+    if state.reliable_commands.is_none() {
+        return Err("Web credentials not configured".to_string());
+    }
     crate::api::refresh_hqp_profiles_aggregate(state, "default")
         .await
         .map(|profiles| profiles.into_iter().map(|profile| profile.title).collect())
@@ -334,6 +338,9 @@ pub async fn handle_profiles(
         Ok(resolved) => resolved,
         Err(result) => return result,
     };
+    if state.reliable_commands.is_none() {
+        return env.failed("Failed to list profiles: Web credentials not configured");
+    }
     let profile_names: Vec<String> =
         match crate::api::refresh_hqp_profiles_aggregate(state, &instance).await {
             Ok(profiles) => profiles.into_iter().map(|profile| profile.title).collect(),
@@ -350,25 +357,28 @@ pub async fn handle_load_profile(
         .param("profile", &*args.profile)
         .param_opt("zone_id", args.zone_id.as_deref());
     let target = resolve_target(state, args.zone_id.as_deref()).await;
-    let (instance, adapter, env) = match target_failure(env, target) {
+    let (instance, _adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
         Err(result) => return result,
     };
+    // Compatibility construction used by embedded MCP consumers predates the reliable runtime.
+    // It also has no web credentials, and the established tool contract reports that actionable
+    // prerequisite. Production always composes the runtime; never fall back to direct adapter I/O.
+    if state.reliable_commands.is_none() {
+        return env.failed("Failed to load profile: Web credentials not configured");
+    }
 
-    match adapter.load_profile(&args.profile).await {
-        // `load_profile` returns only after persistent XML readback and native/web recovery.
-        // The envelope still carries no legacy-zone observation because pipeline configuration
-        // is not represented by the ZoneAggregator's playback shape.
-        Ok(()) => {
-            if let Err(error) = state.hqp_instances.refresh_instance(&instance).await {
-                return env.failed(format!(
-                    "Loaded profile {}, but failed to publish recovered state: {error}",
-                    args.profile
-                ));
-            }
-            Ok(env.text_result(format!("Loaded profile: {}", args.profile)))
-        }
-        Err(e) => env.failed(format!("Failed to load profile: {}", e)),
+    match crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        state,
+        &instance,
+        HqpRuntimeCommand::LoadProfile {
+            profile: args.profile.clone(),
+        },
+    )
+    .await
+    {
+        Ok(()) => Ok(env.text_result(format!("Loaded profile: {}", args.profile))),
+        Err(e) => env.failed(format!("Failed to load profile: {}", e.message())),
     }
 }
 
@@ -387,23 +397,18 @@ pub async fn handle_set_pipeline(
         .param("value", &*args.value)
         .param_opt("zone_id", args.zone_id.as_deref());
     let target = resolve_target(state, args.zone_id.as_deref()).await;
-    let (instance, adapter, env) = match target_failure(env, target) {
+    let (instance, _adapter, env) = match target_failure(env, target) {
         Ok(resolved) => resolved,
         Err(result) => return result,
     };
-
     // All settings use name-based lookups; the adapter handles the conversion.
     // Only samplerate needs numeric parsing (an Hz value).
-    let result = match args.setting.as_str() {
+    let normalized = match args.setting.as_str() {
         // Accepts a name like "PCM", "DSD", "[source]".
-        "mode" => adapter.set_mode(&args.value).await,
-        "filter1x" | "filter_1x" => adapter.set_filter_1x(&args.value).await,
-        "filterNx" | "filter_nx" | "filternx" => adapter.set_filter_nx(&args.value).await,
-        "shaper" | "dither" => adapter.set_shaper(&args.value).await,
-        "junk" | "junk_filter" => adapter.set_junk_filter(&args.value).await,
-        "matrix" | "matrix_profile" => adapter.set_matrix_profile_named(&args.value).await,
+        "mode" | "filter1x" | "filter_1x" | "filterNx" | "filter_nx" | "filternx" | "shaper"
+        | "dither" | "junk" | "junk_filter" | "matrix" | "matrix_profile" => args.value.clone(),
         "convolution" => match parse_bool(&args.value) {
-            Some(value) => adapter.set_convolution(value).await,
+            Some(value) => value.to_string(),
             None => {
                 return env.refused(
                     "Invalid convolution value (expected true or false)",
@@ -416,7 +421,7 @@ pub async fn handle_set_pipeline(
             }
         },
         "adaptive" | "adaptive_volume" => match parse_bool(&args.value) {
-            Some(value) => adapter.set_adaptive_volume(value).await,
+            Some(value) => value.to_string(),
             None => {
                 return env.refused(
                     "Invalid adaptive_volume value (expected true or false)",
@@ -429,7 +434,7 @@ pub async fn handle_set_pipeline(
             }
         },
         "repeat" => match parse_repeat(&args.value) {
-            Some(value) => adapter.set_repeat(value).await,
+            Some(value) => value.to_string(),
             None => {
                 return env.refused(
                     "Invalid repeat value (expected off, one, or all)",
@@ -442,7 +447,7 @@ pub async fn handle_set_pipeline(
             }
         },
         "random" | "shuffle" => match parse_bool(&args.value) {
-            Some(value) => adapter.set_random(value).await,
+            Some(value) => value.to_string(),
             None => {
                 return env.refused(
                     "Invalid random value (expected true or false)",
@@ -457,7 +462,7 @@ pub async fn handle_set_pipeline(
         "rate" | "samplerate" => {
             // Samplerate uses an Hz value, e.g. "48000", "96000".
             if let Ok(v) = args.value.parse::<u32>() {
-                adapter.set_rate(v).await
+                v.to_string()
             } else {
                 return env.refused(
                     "Invalid rate value (expected Hz like 48000, 96000)",
@@ -491,27 +496,29 @@ pub async fn handle_set_pipeline(
         }
     };
 
+    if state.reliable_commands.is_none() {
+        return env.failed(format!(
+            "Failed to set {}: HQPlayer host not configured",
+            args.setting
+        ));
+    }
+
     // `SettingOutcome` covers `Ignored`/`Suppressed`/`Ambiguous` — a daemon that acknowledged the
     // write without moving the authoritative field, or refused it, or left it undeterminable.
     // `into_applied_result` collapses those to an `Err` naming the reason, so this cannot report
     // "Set X to Y" for a setting that did not actually change — the same collapse
     // `hqp_apply_named_setting`/`hqp_apply_legacy_setting` (`src/api/mod.rs`) already use.
-    match result.and_then(crate::adapters::hqplayer::SettingOutcome::into_applied_result) {
-        Ok(()) => {
-            if let Err(error) = state.hqp_instances.refresh_instance(&instance).await {
-                return env.failed(format!(
-                    "Set {} to {}, but failed to publish verified state: {error}",
-                    args.setting, args.value
-                ));
-            }
-            if let Err(error) = crate::api::refresh_hqp_advanced_aggregate(state, &instance).await {
-                return env.failed(format!(
-                    "Set {} to {}, but failed to publish advanced state: {error}",
-                    args.setting, args.value
-                ));
-            }
-            Ok(env.text_result(format!("Set {} to {}", args.setting, args.value)))
-        }
-        Err(e) => env.failed(format!("Failed to set {}: {}", args.setting, e)),
+    match crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        state,
+        &instance,
+        HqpRuntimeCommand::Pipeline {
+            setting: args.setting.clone(),
+            value: normalized,
+        },
+    )
+    .await
+    {
+        Ok(()) => Ok(env.text_result(format!("Set {} to {}", args.setting, args.value))),
+        Err(e) => env.failed(format!("Failed to set {}: {}", args.setting, e.message())),
     }
 }
