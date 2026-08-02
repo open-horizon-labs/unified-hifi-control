@@ -7300,7 +7300,7 @@ impl HqpAdapter {
         let body = {
             let mut serializer = url::form_urlencoded::Serializer::new(String::new());
             let mut hidden: Vec<(&String, &String)> = hidden_fields.iter().collect();
-            hidden.sort_by(|(left, _), (right, _)| left.cmp(right));
+            hidden.sort_by_key(|(left, _)| *left);
             for (name, value) in hidden {
                 serializer.append_pair(name, value);
             }
