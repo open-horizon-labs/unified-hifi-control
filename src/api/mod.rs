@@ -852,15 +852,28 @@ pub(crate) async fn refresh_hqp_profiles_aggregate(
     state: &AppState,
     instance_name: &str,
 ) -> anyhow::Result<Vec<HqpProfile>> {
-    if state
+    let base_refresh = if state
         .aggregator
         .get_hqplayer_snapshot(instance_name)
         .await
         .is_none()
     {
-        state.hqp_instances.refresh_instance(instance_name).await?;
-    }
+        state
+            .hqp_instances
+            .refresh_instance(instance_name)
+            .await
+            .err()
+    } else {
+        None
+    };
+
+    // The browser profile lane has a useful, stable failure of its own (for example missing web
+    // credentials). Always let the manager perform that read so a failed native bootstrap does not
+    // replace the more specific browser error with "HQPlayer host not configured".
     state.hqp_instances.refresh_profiles(instance_name).await?;
+    if let Some(base_error) = base_refresh {
+        return Err(base_error);
+    }
     state
         .aggregator
         .get_hqplayer_snapshot(instance_name)

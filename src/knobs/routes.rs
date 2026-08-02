@@ -661,7 +661,7 @@ pub(crate) async fn dispatch_hqplayer_action(
     // this function exists to remove.
     let Some(adapter) = state.hqp_instances.get(instance).await else {
         return Err(HqpDispatchError::NotFound(format!(
-            "Unknown HQPlayer instance: {}",
+            "HQPlayer instance '{}' is not configured",
             instance
         )));
     };

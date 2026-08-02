@@ -206,14 +206,16 @@ async fn build_state_with_bus(
 ) -> AppState {
     let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
     let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
-    let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
+        bus.clone(),
+        aggregator.clone(),
+    ));
     let hqplayer = hqp_instances.get_default().await;
     let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
     let lms = lms.unwrap_or_else(|| Arc::new(LmsAdapter::new(bus.clone())));
     let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
     let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
-    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
-
     let startable_adapters: Vec<Arc<dyn Startable>> =
         vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 

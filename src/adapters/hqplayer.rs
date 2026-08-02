@@ -8219,8 +8219,16 @@ impl HqpInstanceManager {
             .as_ref()
             .map(Clone::clone)
             .map_err(ToString::to_string);
-        sink.profiles_observed(name, publication).await?;
-        fetched.map(|_| ())
+        let published = sink.profiles_observed(name, publication).await;
+
+        // Preserve the browser lane's own failure for callers. In particular, an unconfigured
+        // adapter has neither a native base snapshot nor web credentials; the stable public
+        // contract names the missing credentials rather than allowing the sink's inability to
+        // attach that failure to obscure its cause.
+        match fetched {
+            Err(error) => Err(error),
+            Ok(_) => published,
+        }
     }
 
     /// Execute one semantic native setting against the exact managed instance.
