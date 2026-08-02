@@ -206,14 +206,6 @@ mod server {
         let knob_store = knobs::KnobStore::new();
         tracing::info!("Knob store initialized");
 
-        // Roon adapter - coordinator handles starting based on enabled state
-        // Issue #169: Pass knob_store for controller count in extension status
-        let roon = Arc::new(adapters::roon::RoonAdapter::new_configured(
-            bus.clone(),
-            base_url.clone(),
-            knob_store.clone(),
-        ));
-
         // Construct the one state owner before any adapter can publish. Its bus subscription still
         // starts below, before adapters start, so broadcast zone events cannot race startup.
         let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
@@ -228,6 +220,19 @@ mod server {
         ));
         let reliable_commands = reliable_runtime.commands.clone();
         let projection_actor = reliable_runtime.projection_actor;
+
+        // Roon adapter - authoritative Core callbacks commit through the reliable projection lane;
+        // command success requires the matching callback rather than native dispatch alone.
+        let roon_runtime_bridge = Arc::new(adapters::roon::RoonRuntimeBridge::new(
+            reliable_runtime.projection_ingress.clone(),
+            reliable_commands.clone(),
+        ));
+        let roon = Arc::new(adapters::roon::RoonAdapter::new_configured_with_runtime(
+            bus.clone(),
+            base_url.clone(),
+            knob_store.clone(),
+            Some(roon_runtime_bridge),
+        ));
 
         // HQPlayer instance manager (multi-instance support, no settings toggle)
         let hqp_instances = Arc::new(adapters::hqplayer::HqpInstanceManager::new_with_runtime(
@@ -295,11 +300,27 @@ mod server {
             .await;
         }
 
-        // OpenHome adapter
-        let openhome = Arc::new(adapters::openhome::OpenHomeAdapter::new(bus.clone()));
+        // OpenHome adapter. Its provider endpoint confirms native writes only
+        // after a complete SOAP readback has committed into the aggregator.
+        let openhome_runtime_bridge = Arc::new(adapters::openhome::OpenHomeRuntimeBridge::new(
+            reliable_runtime.projection_ingress.clone(),
+            reliable_commands.clone(),
+        ));
+        let openhome = Arc::new(adapters::openhome::OpenHomeAdapter::new_with_runtime(
+            bus.clone(),
+            Some(openhome_runtime_bridge),
+        ));
 
-        // UPnP adapter
-        let upnp = Arc::new(adapters::upnp::UPnPAdapter::new(bus.clone()));
+        // UPnP follows the same reliable observer/command contract as
+        // OpenHome: commands resolve only once their SOAP readback commits.
+        let upnp_runtime_bridge = Arc::new(adapters::upnp::UPnPRuntimeBridge::new(
+            reliable_runtime.projection_ingress.clone(),
+            reliable_commands.clone(),
+        ));
+        let upnp = Arc::new(adapters::upnp::UPnPAdapter::new_with_runtime(
+            bus.clone(),
+            Some(upnp_runtime_bridge),
+        ));
 
         // =========================================================================
         // Start enabled adapters (single codepath using coordinator)

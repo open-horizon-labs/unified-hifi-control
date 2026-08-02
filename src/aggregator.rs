@@ -388,6 +388,7 @@ impl ZoneAggregator {
                 freshness: ProjectionFreshness::Fresh,
             },
         );
+        let mut changed_zones = Vec::new();
         let mut removed_zones = Vec::new();
         for ProjectionEntry { key, payload } in update.entries {
             match &payload {
@@ -395,6 +396,7 @@ impl ZoneAggregator {
                     aggregate
                         .zones
                         .insert(zone.zone_id.clone(), (**zone).clone());
+                    changed_zones.push((**zone).clone());
                 }
                 ProjectionPayload::ZoneRemoved { zone_id } => {
                     if aggregate.zones.remove(&zone_id.to_string()).is_some() {
@@ -516,8 +518,49 @@ impl ZoneAggregator {
         }
         drop(aggregate);
         // Reliable projection is the canonical mutation lane. Existing in-app bus consumers still
-        // receive lifecycle notifications, but only after the aggregator has committed the state
-        // they will subsequently read. The aggregator's own subscriber sees an idempotent removal.
+        // receive notifications, but only after the aggregator has committed the complete state
+        // they subsequently re-read. Its own subscriber sees idempotent partial updates; it is
+        // never asked to reconstruct canonical state from these compatibility hints.
+        for zone in changed_zones {
+            let Some(zone_id) = PrefixedZoneId::parse(&zone.zone_id) else {
+                tracing::error!(zone_id = %zone.zone_id, "reliable projection contained an invalid zone id");
+                continue;
+            };
+            // The full lifecycle hint invalidates MCP's zone-list resource; the granular hints
+            // below drive the existing browser/SSE refresh predicates.
+            self.bus
+                .publish(BusEvent::ZoneDiscovered { zone: zone.clone() });
+            self.bus.publish(BusEvent::ZoneUpdated {
+                zone_id: zone_id.clone(),
+                display_name: zone.zone_name.clone(),
+                state: zone.state.to_string(),
+            });
+            if let Some(now_playing) = &zone.now_playing {
+                self.bus.publish(BusEvent::NowPlayingChanged {
+                    zone_id: zone_id.clone(),
+                    title: Some(now_playing.title.clone()),
+                    artist: Some(now_playing.artist.clone()),
+                    album: Some(now_playing.album.clone()),
+                    image_key: now_playing.image_key.clone(),
+                });
+                if let Some(position) = now_playing.seek_position {
+                    self.bus.publish(BusEvent::SeekPositionChanged {
+                        zone_id: zone_id.clone(),
+                        position: position.round() as i64,
+                    });
+                }
+            }
+            if let Some(volume) = &zone.volume_control {
+                self.bus.publish(BusEvent::VolumeChanged {
+                    output_id: volume
+                        .output_id
+                        .clone()
+                        .unwrap_or_else(|| zone.zone_id.clone()),
+                    value: volume.value,
+                    is_muted: volume.is_muted,
+                });
+            }
+        }
         for zone_id in removed_zones {
             self.bus.publish(BusEvent::ZoneRemoved { zone_id });
         }
@@ -831,6 +874,75 @@ mod tests {
             Some(1)
         );
         assert!(aggregator.get_zone("hqplayer:main").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reliable_zone_projection_notifies_consumers_only_after_canonical_commit() {
+        let bus = crate::bus::create_bus();
+        let mut notifications = bus.subscribe();
+        let aggregator = ZoneAggregator::new(bus);
+        let mut zone = projected_zone("hqplayer:main");
+        zone.state = crate::bus::PlaybackState::Playing;
+        zone.now_playing = Some(crate::bus::NowPlaying {
+            title: "Observed title".to_string(),
+            artist: "Observed artist".to_string(),
+            album: "Observed album".to_string(),
+            image_key: Some("observed-image".to_string()),
+            seek_position: Some(12.0),
+            duration: Some(120.0),
+            metadata: None,
+        });
+        zone.volume_control = Some(crate::bus::VolumeControl {
+            output_id: Some("hqplayer:main".to_string()),
+            value: -9.0,
+            min: -60.0,
+            max: 0.0,
+            step: 0.5,
+            is_muted: false,
+            scale: crate::bus::VolumeScale::Decibel,
+        });
+
+        assert_eq!(
+            ProjectionCommitter::commit_projection(
+                &aggregator,
+                projection(
+                    source(1),
+                    1,
+                    ProjectionKind::Snapshot,
+                    vec![ProjectionEntry {
+                        key: "zone:hqplayer:main".to_string(),
+                        payload: ProjectionPayload::Zone(Box::new(zone.clone())),
+                    }],
+                ),
+            )
+            .await,
+            ProjectionCommit::Committed { revision: 1 }
+        );
+
+        let committed = aggregator
+            .get_zone("hqplayer:main")
+            .await
+            .expect("zone is canonical before notification");
+        assert_eq!(committed.state, crate::bus::PlaybackState::Playing);
+
+        let mut event_names = Vec::new();
+        for _ in 0..5 {
+            let event = tokio::time::timeout(Duration::from_millis(100), notifications.recv())
+                .await
+                .expect("post-commit notification")
+                .expect("notification bus remains open");
+            event_names.push(event.event_type());
+        }
+        assert_eq!(
+            event_names,
+            vec![
+                "zone_discovered",
+                "zone_updated",
+                "now_playing_changed",
+                "seek_position_changed",
+                "volume_changed"
+            ]
+        );
     }
 
     #[tokio::test]

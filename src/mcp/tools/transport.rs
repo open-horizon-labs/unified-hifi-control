@@ -51,7 +51,11 @@
 //! refusal and `hifi_capabilities`' report cannot describe the same gap two
 //! different ways.
 
-use crate::api::{dispatch_lms_runtime_command, lms_runtime_command_from_action, AppState};
+use crate::api::{
+    dispatch_lms_runtime_command, dispatch_openhome_runtime_command, dispatch_roon_runtime_command,
+    dispatch_upnp_runtime_command, lms_runtime_command_from_action,
+    renderer_runtime_command_from_action, AppState,
+};
 use crate::bus::Command;
 use crate::knobs::routes::{dispatch_hqplayer_action, HqpDispatchError};
 use crate::mcp::capabilities::{support, Capability};
@@ -182,18 +186,21 @@ pub async fn handle_control(
             Err(error) => Err(error),
         },
         TransportRoute::OpenHome => {
-            state
-                .openhome
-                .control(&args.zone_id, backend_action, None)
-                .await
+            match renderer_runtime_command_from_action(backend_action, None) {
+                Ok(command) => {
+                    dispatch_openhome_runtime_command(state, &args.zone_id, command).await
+                }
+                Err(error) => Err(error),
+            }
         }
-        TransportRoute::Upnp => {
-            state
-                .upnp
-                .control(&args.zone_id, backend_action, None)
-                .await
-        }
-        TransportRoute::Roon => state.roon.control(&args.zone_id, backend_action).await,
+        TransportRoute::Upnp => match renderer_runtime_command_from_action(backend_action, None) {
+            Ok(command) => dispatch_upnp_runtime_command(state, &args.zone_id, command).await,
+            Err(error) => Err(error),
+        },
+        TransportRoute::Roon => match renderer_runtime_command_from_action(backend_action, None) {
+            Ok(command) => dispatch_roon_runtime_command(state, &args.zone_id, command).await,
+            Err(error) => Err(error),
+        },
         // Handled above; kept exhaustive rather than caught by a wildcard so a
         // new route variant fails to compile instead of falling through.
         TransportRoute::Refused(_) => unreachable_refused(),
@@ -450,10 +457,18 @@ async fn set_volume(
             dispatch_lms_runtime_command(state, zone_id, command).await
         }
         VolumeRoute::Roon => {
-            state
-                .roon
-                .change_volume(zone_id, value as f32, relative)
-                .await
+            let command = if relative {
+                Command::VolumeRelative {
+                    delta: value as f32,
+                    output_id: None,
+                }
+            } else {
+                Command::VolumeAbsolute {
+                    value: value as f32,
+                    output_id: None,
+                }
+            };
+            dispatch_roon_runtime_command(state, zone_id, command).await
         }
         // #398. Both adapters clamp to 0-100 themselves — `vol_abs` clamps the
         // level, `vol_rel` clamps the sum — and both take an integer, which is
@@ -461,16 +476,32 @@ async fn set_volume(
         // deserializes `value` as an integer). So this reaches the adapter
         // identically to how the web UI does.
         VolumeRoute::OpenHome => {
-            state
-                .openhome
-                .control(zone_id, volume_action(relative), Some(integer_volume))
-                .await
+            let command = if relative {
+                Command::VolumeRelative {
+                    delta: integer_volume as f32,
+                    output_id: None,
+                }
+            } else {
+                Command::VolumeAbsolute {
+                    value: integer_volume as f32,
+                    output_id: None,
+                }
+            };
+            dispatch_openhome_runtime_command(state, zone_id, command).await
         }
         VolumeRoute::Upnp => {
-            state
-                .upnp
-                .control(zone_id, volume_action(relative), Some(integer_volume))
-                .await
+            let command = if relative {
+                Command::VolumeRelative {
+                    delta: integer_volume as f32,
+                    output_id: None,
+                }
+            } else {
+                Command::VolumeAbsolute {
+                    value: integer_volume as f32,
+                    output_id: None,
+                }
+            };
+            dispatch_upnp_runtime_command(state, zone_id, command).await
         }
         VolumeRoute::Refused(_) => unreachable_refused(),
         // `handle_control` returns through `handle_hqplayer_control` for every
@@ -493,18 +524,6 @@ async fn set_volume(
             )))
         }
         Err(e) => env.failed(format!("Volume error: {}", e)),
-    }
-}
-
-/// The OpenHome/UPnP `control` action name for a volume write.
-///
-/// Both adapters spell absolute volume `vol_abs` (with `volume` as a synonym) and
-/// relative `vol_rel`.
-fn volume_action(relative: bool) -> &'static str {
-    if relative {
-        "vol_rel"
-    } else {
-        "vol_abs"
     }
 }
 

@@ -232,6 +232,142 @@ pub(crate) async fn dispatch_lms_runtime_command(
     }
 }
 
+/// Route an OpenHome transport/volume action through the reliable endpoint.
+/// Public request and response shapes stay frozen; the command is successful
+/// only after the endpoint commits an exact-device Zone readback.
+pub(crate) async fn dispatch_openhome_runtime_command(
+    state: &AppState,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    if state.reliable_commands.is_none() {
+        let raw_id = zone_id.strip_prefix("openhome:").unwrap_or(zone_id);
+        return Err(anyhow::anyhow!("Device not found: {raw_id}"));
+    }
+    dispatch_provider_runtime_command(
+        state,
+        PrefixedZoneId::openhome(zone_id.strip_prefix("openhome:").unwrap_or(zone_id)),
+        command,
+        "OpenHome",
+    )
+    .await
+}
+
+/// Route a UPnP transport/volume action through the reliable endpoint. Public
+/// HTTP and MCP payloads stay unchanged; success means an exact SOAP readback
+/// has committed into the aggregator, never merely that a SOAP write returned.
+pub(crate) async fn dispatch_upnp_runtime_command(
+    state: &AppState,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    // Standalone API/MCP fixtures intentionally compose no runtime. Preserve
+    // the frozen adapter-shaped refusal without doing native I/O outside the
+    // composed server's reliable endpoint.
+    if state.reliable_commands.is_none() {
+        let raw_id = zone_id.strip_prefix("upnp:").unwrap_or(zone_id);
+        return Err(anyhow::anyhow!("Renderer not found: {raw_id}"));
+    }
+    dispatch_provider_runtime_command(
+        state,
+        PrefixedZoneId::upnp(zone_id.strip_prefix("upnp:").unwrap_or(zone_id)),
+        command,
+        "UPnP",
+    )
+    .await
+}
+
+/// Route a Roon transport/volume action through the reliable endpoint. Roon confirms through its
+/// authoritative Core callback rather than a synthetic synchronous readback.
+pub(crate) async fn dispatch_roon_runtime_command(
+    state: &AppState,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    if state.reliable_commands.is_none() {
+        return Err(anyhow::anyhow!("Not connected to Roon"));
+    }
+    dispatch_provider_runtime_command(
+        state,
+        PrefixedZoneId::roon(zone_id.strip_prefix("roon:").unwrap_or(zone_id)),
+        command,
+        "Roon",
+    )
+    .await
+}
+
+async fn dispatch_provider_runtime_command(
+    state: &AppState,
+    target: PrefixedZoneId,
+    command: Command,
+    provider: &str,
+) -> anyhow::Result<()> {
+    let Some(gateway) = state.reliable_commands.as_ref() else {
+        return Err(anyhow::anyhow!(
+            "{provider} reliable command runtime is unavailable"
+        ));
+    };
+    if !gateway.has_endpoint(&target) {
+        return Err(anyhow::anyhow!(
+            "{provider} command endpoint is not available"
+        ));
+    }
+    let now = tokio::time::Instant::now();
+    let mut ticket = gateway
+        .submit(CommandRequest {
+            target,
+            command: RuntimeCommand::Control(command),
+            correlation_id: None,
+            lane: CommandLane::Interactive,
+            deadlines: CommandDeadlines {
+                dispatch_by: now + Duration::from_secs(3),
+                confirm_by: now + Duration::from_secs(15),
+            },
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("{provider} command admission failed: {error:?}"))?;
+    match ticket.wait_for_observable_result().await {
+        CommandStatus::Confirmed { .. } => Ok(()),
+        CommandStatus::Failed { detail } | CommandStatus::NotDispatched { detail } => {
+            Err(anyhow::anyhow!(detail))
+        }
+        CommandStatus::Indeterminate => Err(anyhow::anyhow!(
+            "{provider} accepted the command but did not publish a verified readback in time"
+        )),
+        CommandStatus::Queued | CommandStatus::Dispatched | CommandStatus::AwaitingProjection => {
+            Err(anyhow::anyhow!(
+                "{provider} command stopped without a terminal result"
+            ))
+        }
+    }
+}
+
+/// Normalize OpenHome/UPnP's shared transport and integer volume vocabulary at
+/// the surface boundary.  Provider-specific refusals still happen inside their
+/// endpoint; this prevents a raw adapter action string crossing the bus seam.
+pub(crate) fn renderer_runtime_command_from_action(
+    action: &str,
+    value: Option<i32>,
+) -> anyhow::Result<Command> {
+    match action {
+        "play" => Ok(Command::Play),
+        "pause" => Ok(Command::Pause),
+        "play_pause" | "playpause" => Ok(Command::PlayPause),
+        "stop" => Ok(Command::Stop),
+        "next" => Ok(Command::Next),
+        "previous" | "prev" => Ok(Command::Previous),
+        "volume" | "vol_abs" => Ok(Command::VolumeAbsolute {
+            value: value.unwrap_or(50) as f32,
+            output_id: None,
+        }),
+        "vol_rel" => Ok(Command::VolumeRelative {
+            delta: value.unwrap_or(0) as f32,
+            output_id: None,
+        }),
+        _ => Err(anyhow::anyhow!("Unknown command: {action}")),
+    }
+}
+
 /// Normalize the stable legacy LMS action vocabulary before it crosses the private runtime seam.
 /// Kept here so HTTP, knob, and MCP surfaces cannot drift into subtly different native commands.
 pub(crate) fn lms_runtime_command_from_action(
@@ -367,7 +503,11 @@ pub async fn roon_control_handler(
     State(state): State<AppState>,
     Json(req): Json<ControlRequest>,
 ) -> impl IntoResponse {
-    match state.roon.control(&req.zone_id, &req.action).await {
+    let result = match renderer_runtime_command_from_action(&req.action, None) {
+        Ok(command) => dispatch_roon_runtime_command(&state, &req.zone_id, command).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -395,11 +535,18 @@ pub async fn roon_volume_handler(
     State(state): State<AppState>,
     Json(req): Json<VolumeRequest>,
 ) -> impl IntoResponse {
-    match state
-        .roon
-        .change_volume(&req.zone_id, req.value, req.relative)
-        .await
-    {
+    let command = if req.relative {
+        Command::VolumeRelative {
+            delta: req.value,
+            output_id: None,
+        }
+    } else {
+        Command::VolumeAbsolute {
+            value: req.value,
+            output_id: None,
+        }
+    };
+    match dispatch_roon_runtime_command(&state, &req.zone_id, command).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1610,11 +1757,11 @@ pub async fn openhome_control_handler(
     State(state): State<AppState>,
     Json(req): Json<OpenHomeControlRequest>,
 ) -> impl IntoResponse {
-    match state
-        .openhome
-        .control(&req.zone_id, &req.action, req.value)
-        .await
-    {
+    let result = match renderer_runtime_command_from_action(&req.action, req.value) {
+        Ok(command) => dispatch_openhome_runtime_command(&state, &req.zone_id, command).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1677,11 +1824,11 @@ pub async fn upnp_control_handler(
     State(state): State<AppState>,
     Json(req): Json<UPnPControlRequest>,
 ) -> impl IntoResponse {
-    match state
-        .upnp
-        .control(&req.zone_id, &req.action, req.value)
-        .await
-    {
+    let result = match renderer_runtime_command_from_action(&req.action, req.value) {
+        Ok(command) => dispatch_upnp_runtime_command(&state, &req.zone_id, command).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

@@ -225,3 +225,29 @@ remain before publication of the next beta artifact.
   state before the aggregator had published the zone. Status now reads the aggregator exclusively,
   with a deterministic regression test, and the debt baseline dropped the two corresponding HQP
   dependencies.
+
+## Reliable renderer and Roon control (2026-08-02)
+
+- OpenHome discovery, polling, stale removal, transport and volume now share one ordered reliable
+  projection source. Native writes no longer mutate visible cache optimistically; SOAP faults are
+  rejected and successful writes require coherent transport/volume/mute readback before the
+  correlated full-Zone commit confirms them.
+- Roon full-zone, seek and removal callbacks now enter one reliable source. Transport and volume
+  commands arm confirmation before native dispatch and remain serialized until an authoritative
+  same-zone callback demonstrates the requested playback, track or volume outcome. A same-zone
+  callback with unrelated state cannot confirm the command; timeout is explicitly indeterminate.
+- HTTP, knob and MCP transport/volume dispatch for OpenHome and Roon now use the same provider
+  gateway as the adapters. Frozen compatibility-only test construction retains its established
+  disconnected/not-found error text without performing direct native I/O.
+- Every full-Zone reliable commit updates the aggregator first, then emits a full lifecycle hint
+  for MCP resource invalidation and granular zone/metadata/seek/volume hints for browser SSE. The
+  lossy notification bus can therefore trigger re-reads but cannot become projection authority.
+- The exact AST debt baseline dropped four OpenHome and five Roon production command bypasses.
+  UPnP subsequently dropped four more: its discovery, polling, removal, transport and volume now
+  use the same ordered projection/command contract, including strict SOAP status handling and
+  transport/position/volume/mute readback.
+- The complete all-feature suite, architecture/boundary/await-under-lock lints, MCP contract (105),
+  Roon protocol (61), formatting, diff checks, and all-feature library Clippy with warnings denied
+  pass. The live read-only HQPlayer capture reached all native families in at most 45.2 ms with no
+  unsolicited frames and wrote `/tmp/uhc-hqp-tier1-reliable-runtime.json`; as before, the merge gate
+  correctly reports the checked-in abbreviated Opal corpus's 142 divergences from this daemon.

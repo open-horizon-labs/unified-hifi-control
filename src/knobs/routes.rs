@@ -22,7 +22,11 @@ use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
-use crate::api::{dispatch_lms_runtime_command, lms_runtime_command_from_action, AppState};
+use crate::api::{
+    dispatch_lms_runtime_command, dispatch_openhome_runtime_command, dispatch_roon_runtime_command,
+    dispatch_upnp_runtime_command, lms_runtime_command_from_action,
+    renderer_runtime_command_from_action, AppState,
+};
 use crate::bus::runtime::{
     CommandDeadlines, CommandLane, CommandRequest, CommandStatus, HqpRuntimeCommand, RuntimeCommand,
 };
@@ -964,30 +968,20 @@ async fn control_roon(
     action: &str,
     value: Option<&serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let roon_action = match action {
-        "play" => "play",
-        "pause" => "pause",
-        "play_pause" | "playpause" => "play_pause",
-        "next" => "next",
-        "previous" | "prev" => "previous",
-        "stop" => "stop",
+    let command = match action {
+        "play" | "pause" | "play_pause" | "playpause" | "next" | "previous" | "prev" | "stop" => {
+            renderer_runtime_command_from_action(action, None)
+        }
         "vol_up" | "volume_up" => {
             // Use provided value, or look up zone's actual step from aggregator
             let step = match value.and_then(|v| v.as_f64()) {
                 Some(v) => v as f32,
                 None => get_zone_step(state, &format!("roon:{}", zone_id)).await,
             };
-            state
-                .roon
-                .change_volume(zone_id, step, true)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
+            Ok(Command::VolumeRelative {
+                delta: step,
+                output_id: None,
+            })
         }
         "vol_down" | "volume_down" => {
             // Use provided value, or look up zone's actual step from aggregator
@@ -995,43 +989,30 @@ async fn control_roon(
                 Some(v) => v as f32,
                 None => get_zone_step(state, &format!("roon:{}", zone_id)).await,
             };
-            state
-                .roon
-                .change_volume(zone_id, -step, true)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
+            Ok(Command::VolumeRelative {
+                delta: -step,
+                output_id: None,
+            })
         }
         "vol_abs" | "volume" => {
             // Use as_f64() which handles both JSON integers and floats
             // (as_i64() returns None for floats like 75.0, causing fallback to 50)
             let vol = value.and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
-            state
-                .roon
-                .change_volume(zone_id, vol, false)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
+            Ok(Command::VolumeAbsolute {
+                value: vol,
+                output_id: None,
+            })
         }
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Unknown action: {}", action)})),
-            ));
-        }
+        _ => Err(anyhow::anyhow!("Unknown action: {action}")),
     };
 
-    match state.roon.control(zone_id, roon_action).await {
+    let command = command.map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
+    match dispatch_roon_runtime_command(state, zone_id, command).await {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1110,7 +1091,11 @@ async fn control_openhome(
         }
     };
 
-    match state.openhome.control(zone_id, oh_action, None).await {
+    let result = match renderer_runtime_command_from_action(oh_action, None) {
+        Ok(command) => dispatch_openhome_runtime_command(state, zone_id, command).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1140,7 +1125,11 @@ async fn control_upnp(
         }
     };
 
-    match state.upnp.control(zone_id, upnp_action, None).await {
+    let result = match renderer_runtime_command_from_action(upnp_action, None) {
+        Ok(command) => dispatch_upnp_runtime_command(state, zone_id, command).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
