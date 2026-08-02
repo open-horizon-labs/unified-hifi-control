@@ -681,6 +681,20 @@ struct RoonState {
     pending_loads: HashMap<usize, (Option<String>, LoadRequest)>,
 }
 
+async fn clear_roon_runtime_state(state: &Arc<RwLock<RoonState>>) {
+    let mut state = state.write().await;
+    state.connected = false;
+    state.core_name = None;
+    state.core_version = None;
+    state.zones.clear();
+    state.transport = None;
+    state.image = None;
+    state.browse = None;
+    state.pending_images.clear();
+    state.pending_browses.clear();
+    state.pending_loads.clear();
+}
+
 impl RoonState {
     /// Route a Core browse/load rejection to the exact request waiting on it.
     ///
@@ -2299,6 +2313,7 @@ impl AdapterLogic for RoonAdapter {
                 tracing::warn!(%error, "Roon reliable command endpoint failed to join");
             }
         }
+        clear_roon_runtime_state(&self.state).await;
         result
     }
 
@@ -2870,19 +2885,7 @@ async fn run_roon_loop(
                             .await;
                     }
 
-                    {
-                        let mut s = state_for_events.write().await;
-                        s.connected = false;
-                        s.core_name = None;
-                        s.core_version = None;
-                        s.zones.clear();
-                        s.transport = None;
-                        s.image = None;
-                        s.browse = None;
-                        s.pending_images.clear();
-                        s.pending_browses.clear();
-                        s.pending_loads.clear();
-                    }
+                    clear_roon_runtime_state(&state_for_events).await;
 
                     // Publish disconnected event
                     bus_for_events.publish(BusEvent::RoonDisconnected);
@@ -3462,6 +3465,28 @@ mod tests {
 
         assert!(!next.matches(&test_bus_zone_with_track("Blue Train", 0.0)));
         assert!(next.matches(&test_bus_zone_with_track("Moment's Notice", 0.0)));
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_clears_cached_roon_connection_state() {
+        let state = Arc::new(RwLock::new(RoonState {
+            connected: true,
+            core_name: Some("nuc14".to_string()),
+            core_version: Some("test".to_string()),
+            zones: HashMap::from([(
+                "test-zone".to_string(),
+                make_test_zone("output", Some(5.0), Some(0.0), Some(100.0)),
+            )]),
+            ..RoonState::default()
+        }));
+
+        clear_roon_runtime_state(&state).await;
+
+        let cleared = state.read().await;
+        assert!(!cleared.connected);
+        assert!(cleared.core_name.is_none());
+        assert!(cleared.core_version.is_none());
+        assert!(cleared.zones.is_empty());
     }
 
     /// A Roon control has no synchronous state readback.  Its confirmation must
