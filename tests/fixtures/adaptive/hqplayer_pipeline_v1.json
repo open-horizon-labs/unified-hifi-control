@@ -1,0 +1,823 @@
+{
+  "schema_version": "1.0",
+  "producer": {
+    "producer_id": "hqplayer:living-room",
+    "producer_type": "hqplayer",
+    "instance_label": "HQP-Main",
+    "product_version": "6.0.4",
+    "epoch": 7
+  },
+  "target": {
+    "role": "dsp_engine",
+    "zone_id": "roon:1601bb42ed14351b99c2926214f6cbb80724"
+  },
+  "revisions": {
+    "control_plane": 12,
+    "state": 4193
+  },
+  "lanes": [
+    {
+      "lane": "native",
+      "state": "connected",
+      "last_success": "2026-07-30T11:04:21Z",
+      "freshness": { "observed_at": "2026-07-30T11:04:21Z", "age_ms": 180 }
+    },
+    {
+      "lane": "persistent",
+      "state": "connected",
+      "last_success": "2026-07-30T10:58:02Z"
+    },
+    {
+      "lane": "telemetry",
+      "state": "unconfigured"
+    }
+  ],
+  "groups": [
+    {
+      "id": "transport",
+      "label_key": "group.transport",
+      "order": 10,
+      "members": ["hqplayer.transport.play", "hqplayer.transport.pause", "hqplayer.transport.state"]
+    },
+    {
+      "id": "volume",
+      "label_key": "group.volume",
+      "order": 20,
+      "members": ["hqplayer.volume.level", "hqplayer.volume.fixed"]
+    },
+    {
+      "id": "pipeline",
+      "label_key": "group.pipeline",
+      "order": 30,
+      "members": [
+        "hqplayer.pipeline.mode",
+        "hqplayer.pipeline.filter_1x",
+        "hqplayer.pipeline.adaptive_output",
+        "hqplayer.pipeline.rate.exact",
+        "hqplayer.chain.sdm.filter"
+      ]
+    },
+    {
+      "id": "matrix",
+      "label_key": "group.matrix",
+      "order": 40,
+      "members": ["hqplayer.matrix.profile", "hqplayer.matrix.channel_map"]
+    },
+    {
+      "id": "settings",
+      "label_key": "group.settings",
+      "order": 50,
+      "members": ["hqplayer.settings.buffer_time", "hqplayer.settings.legacy_dither"]
+    }
+  ],
+  "controls": [
+    {
+      "id": "hqplayer.transport.play",
+      "kind": "action",
+      "label_key": "control.transport.play",
+      "group": "transport",
+      "order": 10,
+      "widget_hint": "button",
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "live_immediate",
+        "disruption": "none",
+        "risk": "safe",
+        "verification": { "verify_via": "hqplayer.transport.state", "verify_lane": "observed" }
+      }
+    },
+    {
+      "id": "hqplayer.transport.pause",
+      "kind": "action",
+      "label_key": "control.transport.pause",
+      "group": "transport",
+      "order": 20,
+      "widget_hint": "button",
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "live_immediate",
+        "disruption": "none",
+        "risk": "safe",
+        "verification": { "verify_via": "hqplayer.transport.state", "verify_lane": "observed" }
+      }
+    },
+    {
+      "id": "hqplayer.transport.state",
+      "kind": "text",
+      "label_key": "control.transport.state",
+      "group": "transport",
+      "order": 30,
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "text", "value": "playing" },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 },
+          "freshness": { "observed_at": "2026-07-30T11:04:21Z", "age_ms": 180 }
+        }
+      ],
+      "availability": {
+        "state": "read_only",
+        "reasons": [
+          {
+            "code": "locked_by_producer",
+            "scope": "producer",
+            "display_text_key": "reason.transport_state_is_observed_only"
+          }
+        ]
+      }
+    },
+    {
+      "id": "hqplayer.volume.level",
+      "kind": "numeric_range",
+      "label_key": "control.volume.level",
+      "description_key": "control.volume.level.help",
+      "group": "volume",
+      "order": 10,
+      "widget_hint": "slider",
+      "unit": "dB",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "decimal", "value": -18.5 },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 },
+          "freshness": { "observed_at": "2026-07-30T11:04:21Z", "age_ms": 180 }
+        },
+        {
+          "lane": "persisted",
+          "grounding": "grounded",
+          "value": { "type": "decimal", "value": -20.0 },
+          "provenance": { "authority": "persisted_config", "source": "config_file", "revision": 12 }
+        },
+        {
+          "lane": "effective",
+          "grounding": "grounded",
+          "value": { "type": "decimal", "value": -18.5 },
+          "provenance": { "authority": "editor_projection", "source": "consumer" }
+        }
+      ],
+      "range": {
+        "min": -60.0,
+        "max": 0.0,
+        "step": 0.5,
+        "unit": "dB",
+        "authority": "runtime",
+        "revision": 12
+      },
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "verified_pending",
+        "disruption": "none",
+        "risk": "caution",
+        "verification": {
+          "verify_via": "hqplayer.volume.level",
+          "verify_lane": "observed",
+          "provisional_ack": true
+        }
+      },
+      "divergences": [
+        {
+          "kind": "observed_vs_persisted",
+          "lanes": ["observed", "persisted"],
+          "detected_at": "2026-07-30T11:04:21Z",
+          "display_text_key": "divergence.volume.runtime_vs_config"
+        }
+      ]
+    },
+    {
+      "id": "hqplayer.volume.fixed",
+      "kind": "group",
+      "label_key": "control.volume.fixed",
+      "group": "volume",
+      "order": 15,
+      "availability": { "state": "available" },
+      "members": ["hqplayer.volume.fixed.enabled", "hqplayer.volume.fixed.level"]
+    },
+    {
+      "id": "hqplayer.volume.fixed.enabled",
+      "kind": "boolean",
+      "label_key": "control.volume.fixed.enabled",
+      "group": "volume",
+      "order": 20,
+      "widget_hint": "switch",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "bool", "value": false },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 }
+        }
+      ],
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "composite",
+        "effect": "live_immediate",
+        "disruption": "playback_interruption",
+        "risk": "caution",
+        "verification": {
+          "verify_via": "hqplayer.volume.fixed.enabled",
+          "verify_lane": "observed",
+          "preserves": ["hqplayer.volume.fixed.level"]
+        },
+        "coupled_with": ["hqplayer.volume.fixed.level"]
+      }
+    },
+    {
+      "id": "hqplayer.volume.fixed.level",
+      "kind": "numeric_range",
+      "label_key": "control.volume.fixed.level",
+      "group": "volume",
+      "order": 30,
+      "unit": "dB",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "ungrounded",
+          "ungrounded_reason": "not_applicable_in_mode",
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 }
+        },
+        {
+          "lane": "held",
+          "grounding": "grounded",
+          "value": { "type": "decimal", "value": -6.0 },
+          "provenance": { "authority": "held_intent", "source": "config_file", "revision": 12 }
+        }
+      ],
+      "range": {
+        "min": -60.0,
+        "max": 0.0,
+        "step": 0.5,
+        "unit": "dB",
+        "authority": "persisted_config",
+        "revision": 12
+      },
+      "availability": {
+        "state": "unavailable",
+        "reasons": [
+          {
+            "code": "not_applicable_in_mode",
+            "scope": "observed",
+            "display_text_key": "reason.fixed_volume_disabled"
+          }
+        ]
+      },
+      "apply": {
+        "lane": "composite",
+        "effect": "held_until_chain_loaded",
+        "disruption": "none",
+        "risk": "caution",
+        "verification": {
+          "verify_via": "hqplayer.volume.fixed.level",
+          "verify_lane": "held",
+          "preserves": ["hqplayer.volume.fixed.enabled"]
+        },
+        "coupled_with": ["hqplayer.volume.fixed.enabled"]
+      },
+      "divergences": [
+        {
+          "kind": "held_unreachable",
+          "lanes": ["held", "observed"],
+          "display_text_key": "divergence.fixed_level_dormant"
+        }
+      ]
+    },
+    {
+      "id": "hqplayer.pipeline.mode",
+      "kind": "enumeration",
+      "label_key": "control.pipeline.mode",
+      "group": "pipeline",
+      "order": 10,
+      "widget_hint": "select",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "source" },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 }
+        },
+        {
+          "lane": "effective",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "source" },
+          "provenance": { "authority": "editor_projection", "source": "consumer" }
+        }
+      ],
+      "choices": {
+        "authority": "runtime",
+        "source": "live_protocol",
+        "revision": 12,
+        "choices": [
+          { "id": "source", "label_key": "choice.mode.source", "engine_name": "[source]" },
+          { "id": "pcm", "label_key": "choice.mode.pcm", "engine_name": "PCM" },
+          { "id": "sdm", "label_key": "choice.mode.sdm", "engine_name": "SDM" }
+        ]
+      },
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "live_immediate",
+        "disruption": "playback_interruption",
+        "risk": "disruptive",
+        "verification": { "verify_via": "hqplayer.pipeline.mode", "verify_lane": "observed" },
+        "invalidates": [
+          "hqplayer.pipeline.filter_1x",
+          "hqplayer.pipeline.rate.exact",
+          "hqplayer.chain.sdm.filter"
+        ]
+      }
+    },
+    {
+      "id": "hqplayer.pipeline.filter_1x",
+      "kind": "enumeration",
+      "label_key": "control.pipeline.filter_1x",
+      "group": "pipeline",
+      "order": 20,
+      "widget_hint": "select",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "poly-sinc-gauss-long" },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 }
+        },
+        {
+          "lane": "desired",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "sinc-m" },
+          "provenance": { "authority": "staged_intent", "source": "consumer", "revision": 4193 }
+        }
+      ],
+      "choices": {
+        "authority": "runtime",
+        "source": "live_protocol",
+        "revision": 12,
+        "choices": [
+          {
+            "id": "poly-sinc-gauss-long",
+            "label_key": "choice.filter.poly_sinc_gauss_long",
+            "engine_name": "poly-sinc-gauss-long"
+          },
+          { "id": "sinc-m", "label_key": "choice.filter.sinc_m", "engine_name": "sinc-M" },
+          { "id": "poly-sinc-hb-2s", "engine_name": "poly-sinc-hb-2s" }
+        ]
+      },
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "staged",
+        "effect": "verified_pending",
+        "disruption": "audible_glitch",
+        "risk": "caution",
+        "verification": {
+          "verify_via": "hqplayer.pipeline.filter_1x",
+          "verify_lane": "observed",
+          "provisional_ack": true
+        }
+      },
+      "divergences": [
+        {
+          "kind": "observed_vs_desired",
+          "lanes": ["observed", "desired"],
+          "display_text_key": "divergence.filter_staged"
+        }
+      ]
+    },
+    {
+      "id": "hqplayer.pipeline.adaptive_output",
+      "kind": "boolean",
+      "label_key": "control.pipeline.adaptive_output",
+      "description_key": "control.pipeline.adaptive_output.help",
+      "group": "pipeline",
+      "order": 30,
+      "widget_hint": "switch",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "bool", "value": true },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 }
+        }
+      ],
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "live_immediate",
+        "disruption": "playback_interruption",
+        "risk": "caution",
+        "verification": {
+          "verify_via": "hqplayer.pipeline.adaptive_output",
+          "verify_lane": "observed"
+        },
+        "invalidates": ["hqplayer.pipeline.rate.exact"]
+      }
+    },
+    {
+      "id": "hqplayer.pipeline.rate.exact",
+      "kind": "enumeration",
+      "label_key": "control.pipeline.rate_exact",
+      "group": "pipeline",
+      "order": 40,
+      "widget_hint": "select",
+      "unit": "Hz",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "ungrounded",
+          "ungrounded_reason": "not_applicable_in_mode",
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 }
+        }
+      ],
+      "choices": {
+        "authority": "static_fallback",
+        "source": "catalog",
+        "choices": [
+          { "id": "44100", "engine_name": "44.1 kHz" },
+          { "id": "48000", "engine_name": "48 kHz" },
+          { "id": "352800", "engine_name": "352.8 kHz" },
+          { "id": "384000", "engine_name": "384 kHz" }
+        ]
+      },
+      "availability": {
+        "state": "unavailable",
+        "reasons": [
+          {
+            "code": "not_applicable_in_mode",
+            "scope": "observed",
+            "display_text_key": "reason.exact_rate_needs_explicit_mode",
+            "detail": "pipeline mode is the source-following identity"
+          },
+          {
+            "code": "conflicting_sibling",
+            "scope": "observed",
+            "display_text_key": "reason.exact_rate_vs_adaptive"
+          }
+        ]
+      },
+      "apply": {
+        "lane": "staged",
+        "effect": "verified_pending",
+        "disruption": "playback_interruption",
+        "risk": "disruptive",
+        "verification": { "verify_via": "hqplayer.pipeline.rate.exact", "verify_lane": "observed" }
+      }
+    },
+    {
+      "id": "hqplayer.chain.sdm.filter",
+      "kind": "enumeration",
+      "label_key": "control.chain.sdm.filter",
+      "group": "pipeline",
+      "order": 50,
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "ungrounded",
+          "ungrounded_reason": "chain_not_loaded",
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 }
+        },
+        {
+          "lane": "held",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "poly-sinc-gauss-xl" },
+          "provenance": { "authority": "held_intent", "source": "web_interface", "revision": 12 },
+          "freshness": { "observed_at": "2026-07-30T10:58:02Z", "stale": true }
+        }
+      ],
+      "choices": {
+        "authority": "persisted_config",
+        "source": "web_interface",
+        "revision": 12,
+        "choices": [
+          { "id": "poly-sinc-gauss-xl", "engine_name": "poly-sinc-gauss-xl" },
+          { "id": "closed-form", "engine_name": "closed-form" }
+        ]
+      },
+      "availability": {
+        "state": "unavailable",
+        "reasons": [
+          {
+            "code": "chain_not_loaded",
+            "scope": "observed",
+            "display_text_key": "reason.sdm_chain_not_loaded"
+          }
+        ]
+      },
+      "apply": {
+        "lane": "staged",
+        "effect": "held_until_chain_loaded",
+        "disruption": "none",
+        "risk": "safe",
+        "verification": { "verify_via": "hqplayer.chain.sdm.filter", "verify_lane": "held" }
+      },
+      "divergences": [{ "kind": "held_unreachable", "lanes": ["held", "observed"] }]
+    },
+    {
+      "id": "hqplayer.matrix.profile",
+      "kind": "enumeration",
+      "label_key": "control.matrix.profile",
+      "group": "matrix",
+      "order": 10,
+      "widget_hint": "select",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "empty" },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 }
+        },
+        {
+          "lane": "persisted",
+          "grounding": "grounded",
+          "value": { "type": "empty" },
+          "provenance": { "authority": "persisted_config", "source": "config_file", "revision": 12 }
+        }
+      ],
+      "choices": {
+        "authority": "runtime",
+        "source": "live_protocol",
+        "revision": 12,
+        "choices": [
+          { "id": "", "label_key": "choice.matrix.default", "engine_name": "(default)" },
+          { "id": "room-a", "engine_name": "Room A" },
+          {
+            "id": "room-b",
+            "engine_name": "Room B",
+            "availability": {
+              "state": "unavailable",
+              "reasons": [
+                {
+                  "code": "requires_capability",
+                  "scope": "producer",
+                  "display_text_key": "reason.matrix_needs_channel_count"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "matrix_profile",
+        "effect": "live_immediate",
+        "disruption": "reconnect",
+        "risk": "disruptive",
+        "verification": {
+          "verify_via": "hqplayer.matrix.profile",
+          "verify_lane": "observed",
+          "provisional_ack": true
+        },
+        "invalidates": ["hqplayer.pipeline.filter_1x", "hqplayer.chain.sdm.filter"]
+      }
+    },
+    {
+      "id": "hqplayer.matrix.channel_map",
+      "kind": "composite",
+      "label_key": "control.matrix.channel_map",
+      "group": "matrix",
+      "order": 20,
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": {
+            "type": "composite",
+            "value": {
+              "left": { "type": "choice", "value": "ch0" },
+              "right": { "type": "choice", "value": "ch1" },
+              "sub": {
+                "type": "list",
+                "value": [
+                  { "type": "choice", "value": "ch0" },
+                  { "type": "choice", "value": "ch1" }
+                ]
+              }
+            }
+          },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 }
+        }
+      ],
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "composite",
+        "effect": "live_immediate",
+        "disruption": "audible_glitch",
+        "risk": "caution",
+        "verification": {
+          "verify_via": "hqplayer.matrix.channel_map",
+          "verify_lane": "observed"
+        },
+        "coupled_with": ["hqplayer.matrix.profile"]
+      }
+    },
+    {
+      "id": "hqplayer.settings.buffer_time",
+      "kind": "numeric_range",
+      "label_key": "control.settings.buffer_time",
+      "description_key": "control.settings.buffer_time.help",
+      "group": "settings",
+      "order": 10,
+      "unit": "ms",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "integer", "value": 100 },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4193 }
+        },
+        {
+          "lane": "persisted",
+          "grounding": "grounded",
+          "value": { "type": "integer", "value": 250 },
+          "provenance": { "authority": "persisted_config", "source": "config_file", "revision": 12 }
+        }
+      ],
+      "range": {
+        "min": 10.0,
+        "max": 2000.0,
+        "step": 10.0,
+        "unit": "ms",
+        "authority": "persisted_config",
+        "revision": 12
+      },
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "persistent",
+        "effect": "restart_required",
+        "disruption": "engine_restart",
+        "risk": "disruptive",
+        "verification": {
+          "verify_via": "hqplayer.settings.buffer_time",
+          "verify_lane": "persisted"
+        }
+      },
+      "divergences": [
+        {
+          "kind": "observed_vs_persisted",
+          "lanes": ["observed", "persisted"],
+          "display_text_key": "divergence.buffer_time_pending_restart"
+        }
+      ]
+    },
+    {
+      "id": "hqplayer.settings.legacy_dither",
+      "kind": "boolean",
+      "label_key": "control.settings.legacy_dither",
+      "group": "settings",
+      "order": 20,
+      "values": [
+        {
+          "lane": "persisted",
+          "grounding": "grounded",
+          "value": { "type": "bool", "value": false },
+          "provenance": { "authority": "persisted_config", "source": "config_file", "revision": 12 }
+        }
+      ],
+      "availability": {
+        "state": "deprecated",
+        "reasons": [
+          {
+            "code": "deprecated",
+            "scope": "producer",
+            "display_text_key": "reason.legacy_dither_deprecated"
+          }
+        ]
+      },
+      "apply": {
+        "lane": "persistent",
+        "effect": "persistent_only",
+        "disruption": "none",
+        "risk": "destructive",
+        "verification": {
+          "verify_via": "hqplayer.settings.legacy_dither",
+          "verify_lane": "persisted",
+          "preserves": ["hqplayer.settings.buffer_time"]
+        }
+      }
+    }
+  ],
+  "constraints": [
+    {
+      "id": "hqplayer.constraint.exact_rate_requires_explicit_mode",
+      "applies_to": ["hqplayer.pipeline.rate.exact"],
+      "when": {
+        "op": "eq",
+        "control": "hqplayer.pipeline.mode",
+        "lane": "effective",
+        "value": { "type": "choice", "value": "source" }
+      },
+      "effect": "invalidates",
+      "reason": {
+        "code": "not_applicable_in_mode",
+        "scope": "draft",
+        "display_text_key": "reason.exact_rate_needs_explicit_mode"
+      }
+    },
+    {
+      "id": "hqplayer.constraint.exact_rate_inert_when_adaptive",
+      "applies_to": ["hqplayer.pipeline.rate.exact"],
+      "when": {
+        "op": "all",
+        "of": [
+          {
+            "op": "eq",
+            "control": "hqplayer.pipeline.adaptive_output",
+            "lane": "effective",
+            "value": { "type": "bool", "value": true }
+          },
+          {
+            "op": "not",
+            "of": {
+              "op": "eq",
+              "control": "hqplayer.pipeline.mode",
+              "lane": "effective",
+              "value": { "type": "choice", "value": "source" }
+            }
+          }
+        ]
+      },
+      "effect": "makes_inert",
+      "reason": {
+        "code": "conflicting_sibling",
+        "scope": "draft",
+        "display_text_key": "reason.exact_rate_vs_adaptive"
+      }
+    },
+    {
+      "id": "hqplayer.constraint.buffer_time_needs_restart",
+      "applies_to": ["hqplayer.settings.buffer_time"],
+      "when": {
+        "op": "in_range",
+        "control": "hqplayer.settings.buffer_time",
+        "lane": "persisted",
+        "min": 10.0,
+        "max": 2000.0
+      },
+      "effect": "requires_restart",
+      "reason": {
+        "code": "restart_required",
+        "scope": "draft",
+        "display_text_key": "reason.buffer_time_restart"
+      }
+    },
+    {
+      "id": "hqplayer.constraint.sdm_filters_hidden_outside_sdm",
+      "applies_to": ["hqplayer.chain.sdm.filter"],
+      "when": {
+        "op": "any",
+        "of": [
+          {
+            "op": "one_of",
+            "control": "hqplayer.pipeline.mode",
+            "lane": "effective",
+            "values": [
+              { "type": "choice", "value": "pcm" },
+              { "type": "choice", "value": "source" }
+            ]
+          },
+          {
+            "op": "not_eq",
+            "control": "hqplayer.pipeline.mode",
+            "lane": "observed",
+            "value": { "type": "choice", "value": "sdm" }
+          }
+        ]
+      },
+      "effect": "hides_choice",
+      "reason": {
+        "code": "not_applicable_in_mode",
+        "scope": "draft",
+        "display_text_key": "reason.sdm_filters_hidden"
+      }
+    },
+    {
+      "id": "hqplayer.constraint.fixed_level_inert_while_dormant",
+      "applies_to": ["hqplayer.volume.fixed.level"],
+      "when": {
+        "op": "not",
+        "of": {
+          "op": "is_grounded",
+          "control": "hqplayer.volume.fixed.level",
+          "lane": "observed"
+        }
+      },
+      "effect": "makes_inert",
+      "reason": {
+        "code": "unobservable",
+        "scope": "observed",
+        "display_text_key": "reason.fixed_level_dormant"
+      }
+    }
+  ],
+  "draft_policy": {
+    "mode": "actor_scoped",
+    "on_conflict": "expose_contributors",
+    "retention": {
+      "survives_reconnect": true,
+      "survives_producer_restart": false,
+      "on_epoch_change": "revalidate",
+      "apply_requires_authorization": false
+    }
+  }
+}

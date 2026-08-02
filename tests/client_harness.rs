@@ -26,6 +26,9 @@
 //! - GET /hqp/status
 //! - POST /hqp/profiles/load with JSON body {profile}
 
+#[allow(dead_code, unused_imports, unused_variables)]
+mod mock_servers;
+
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -48,6 +51,7 @@ use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api;
 use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
+use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::{self, KnobStore};
 
@@ -176,6 +180,11 @@ struct HqpLoadProfileRequest {
 
 /// Create a test app with disconnected/mock adapters
 async fn create_test_app() -> Router {
+    create_test_app_with_state().await.0
+}
+
+/// Same client router plus the adapter state for protocol-boundary race tests.
+async fn create_test_app_with_state() -> (Router, AppState) {
     let bus = create_bus();
 
     // Create coordinator (tests don't need real lifecycle management)
@@ -183,7 +192,17 @@ async fn create_test_app() -> Router {
 
     // Create disconnected adapters
     let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
-    let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let runtime = build_runtime(aggregator.clone(), 16, 32);
+    let bridge = Arc::new(
+        unified_hifi_control::adapters::hqplayer::HqpRuntimeBridge::new(
+            runtime.projection_ingress.clone(),
+            runtime.commands.clone(),
+        ),
+    );
+    let reliable_commands = runtime.commands.clone();
+    tokio::spawn(runtime.projection_actor.run());
+    let hqp_instances = Arc::new(HqpInstanceManager::new_with_runtime(bus.clone(), bridge));
     let hqplayer = hqp_instances.get_default().await;
     let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
     let lms = Arc::new(LmsAdapter::new(bus.clone()));
@@ -195,7 +214,6 @@ async fn create_test_app() -> Router {
     let startable_adapters: Vec<Arc<dyn Startable>> =
         vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
-    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
     let state = AppState::new(
         roon,
         hqplayer,
@@ -211,10 +229,11 @@ async fn create_test_app() -> Router {
         startable_adapters,
         Instant::now(),
         CancellationToken::new(),
-    );
+    )
+    .with_reliable_commands(reliable_commands);
 
     // Build router with all routes (same as main.rs)
-    Router::new()
+    let app = Router::new()
         // Health check
         .route("/status", get(api::status_handler))
         // Roon routes
@@ -320,7 +339,8 @@ async fn create_test_app() -> Router {
         .route("/lms", get(ui_stubs::stub_page))
         .route("/knobs", get(ui_stubs::stub_page))
         .route("/settings", get(ui_stubs::stub_page))
-        .with_state(state)
+        .with_state(state.clone());
+    (app, state)
 }
 
 /// Helper to make a GET request and return body as string
@@ -1313,5 +1333,334 @@ mod integration {
         let (_, body) = get_request(&app, "/hqp/profiles").await;
         let _profiles: Value = serde_json::from_str(&body).unwrap();
         println!("iOS: Got HQPlayer profiles");
+    }
+}
+
+// =============================================================================
+// The two HQPlayer setting routes accept different name sets, and share an applier (#347)
+//
+// `POST /hqplayer/setting` and the numeric arm of `POST /hqp/pipeline` were made to share one
+// applier so a list position is interpreted in exactly one place. The applier has to accept
+// `dither`, because /hqp/pipeline always has — and /hqplayer/setting never has. Sharing the code
+// therefore silently added an accepted name to a frozen request contract. Found in self-review of
+// the diff rather than by a test, which is why these exist: the fix that followed had none.
+//
+// Asserted on the **response body**, not only the status, because both the widening and the fix
+// answer 4xx/5xx here — an unconfigured adapter fails too. Only the message says which path ran.
+// =============================================================================
+
+#[cfg(test)]
+mod hqplayer_setting_route_contract {
+    use super::*;
+    use std::time::Duration;
+
+    use mock_servers::hqplayer::corpus::VERIFIED_PROFILE;
+    use mock_servers::hqplayer::model::DaemonModel;
+    use mock_servers::hqplayer::wire::{ReplyGate, WirePolicy, WireServer};
+    use tokio::sync::Notify;
+    use unified_hifi_control::adapters::hqplayer::HqpTimeouts;
+
+    /// The actual frozen HTTP request shares one operation lease with its numeric resolution and
+    /// semantic write. This is the client boundary; adapter-only coverage cannot prove the route
+    /// did not split those calls again.
+    #[tokio::test]
+    async fn numeric_setting_request_cannot_resolve_on_a_and_write_on_b() {
+        let first = WireServer::start(
+            Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+            WirePolicy::default(),
+        )
+        .await;
+        let second = WireServer::start(
+            Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE)),
+            WirePolicy::default(),
+        )
+        .await;
+        let (app, state) = create_test_app_with_state().await;
+        state
+            .hqplayer
+            .configure(
+                "127.0.0.1".to_string(),
+                Some(first.port()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        state
+            .hqplayer
+            .set_timeouts(HqpTimeouts {
+                connect: Duration::from_millis(100),
+                response: Duration::from_millis(750),
+                reconnect_delay: Duration::from_millis(10),
+                max_attempts: 1,
+            })
+            .await;
+        state
+            .hqp_instances
+            .start()
+            .await
+            .expect("start reliable endpoint A");
+        for _ in 0..100 {
+            if state
+                .aggregator
+                .get_zone("hqplayer:default")
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .aggregator
+                .get_zone("hqplayer:default")
+                .await
+                .is_some(),
+            "managed endpoint A publishes before the numeric command"
+        );
+        let gate = ReplyGate::new("GetModes");
+        first.set_policy(WirePolicy {
+            reply_gate: Some(gate.clone()),
+            ..WirePolicy::default()
+        });
+
+        let request = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                post_json(
+                    &app,
+                    "/hqplayer/setting",
+                    &json!({ "name": "mode", "value": 2 }),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_until_reached())
+            .await
+            .expect("HTTP request reaches the manually gated GetModes");
+        let second_port = second.port();
+        let configure_started = Arc::new(Notify::new());
+        let reconfigure = {
+            let adapter = state.hqplayer.clone();
+            let configure_started = configure_started.clone();
+            tokio::spawn(async move {
+                configure_started.notify_one();
+                adapter
+                    .configure("127.0.0.1".to_string(), Some(second_port), None, None, None)
+                    .await;
+            })
+        };
+        configure_started.notified().await;
+        assert!(
+            !reconfigure.is_finished(),
+            "configure must remain pending while the numeric HTTP operation holds its endpoint lease"
+        );
+        gate.release();
+
+        let (status, body) = request.await.expect("HTTP task joins");
+        reconfigure.await.expect("configure follows request");
+        assert_eq!(status, StatusCode::OK, "unchanged success contract: {body}");
+        assert_eq!(assert_json("numeric setting", &body), json!({ "ok": true }));
+        assert_eq!(first.stats().element_count("SetMode"), 1);
+        assert_eq!(second.stats().element_count("SetMode"), 0);
+
+        state.hqp_instances.stop().await;
+        first.stop();
+        second.stop();
+    }
+
+    /// `dither` is not a name this route has ever accepted, and it must still be refused **by the
+    /// route**, before anything reaches the adapter.
+    #[tokio::test]
+    async fn the_legacy_setting_route_still_refuses_a_name_it_never_accepted() {
+        let app = create_test_app().await;
+        let (status, body) = post_json(
+            &app,
+            "/hqplayer/setting",
+            &json!({ "name": "dither", "value": 3 }),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unknown setting name is a bad request, as it always was. Body: {body}"
+        );
+        let json = assert_json("POST /hqplayer/setting (unknown name)", &body);
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("Unknown setting: dither"),
+            "the exact message this route already answered with — a different one means the name \
+             was accepted and something downstream refused it instead, which is the widening. \
+             Body: {body}"
+        );
+    }
+
+    /// The control for the check above: the gate must refuse only what the route never accepted.
+    /// `shaper` **is** one of its names, so it must get past the gate and fail downstream on the
+    /// unconfigured adapter instead.
+    #[tokio::test]
+    async fn the_legacy_setting_route_still_accepts_the_names_it_always_had() {
+        let app = create_test_app().await;
+        for name in ["mode", "filter", "filter1x", "filterNx", "shaper", "rate"] {
+            let (_, body) = post_json(
+                &app,
+                "/hqplayer/setting",
+                &json!({ "name": name, "value": 1 }),
+            )
+            .await;
+            assert!(
+                !body.contains("Unknown setting"),
+                "`{name}` is one of this route's own names and must reach the adapter; refusing it \
+                 would be the gate over-reaching. Body: {body}"
+            );
+        }
+    }
+
+    /// And the other side of the shared applier: `/hqp/pipeline` keeps accepting `dither`, so the
+    /// fix narrowed one route rather than both.
+    #[tokio::test]
+    async fn the_pipeline_route_still_accepts_dither() {
+        let app = create_test_app().await;
+        let (_, body) = post_json(
+            &app,
+            "/hqp/pipeline",
+            &json!({ "setting": "dither", "value": "NS9" }),
+        )
+        .await;
+
+        assert!(
+            !body.contains("Invalid setting"),
+            "`dither` is one of /hqp/pipeline's valid settings and must stay one — this route's \
+             own gate rejects with `Invalid setting`. Body: {body}"
+        );
+    }
+
+    /// The web HQPlayer zone uses the iOS-compatible route for the advanced controls that MCP
+    /// already exposes. Each name must pass the route gate and reach the adapter.
+    #[tokio::test]
+    async fn the_pipeline_route_accepts_every_advanced_web_control() {
+        let app = create_test_app().await;
+        for (setting, value) in [
+            ("junk_filter", "none"),
+            ("convolution", "true"),
+            ("adaptive_volume", "true"),
+            ("repeat", "all"),
+            ("random", "true"),
+        ] {
+            let (_, body) = post_json(
+                &app,
+                "/hqp/pipeline",
+                &json!({ "setting": setting, "value": value }),
+            )
+            .await;
+            assert!(
+                !body.contains("Invalid setting"),
+                "`{setting}` is a visible HQPlayer web control and must reach the adapter. \
+                 Body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pipeline_route_still_refuses_an_unknown_setting() {
+        let app = create_test_app().await;
+        let (status, body) = post_json(
+            &app,
+            "/hqp/pipeline",
+            &json!({ "setting": "oversampling_magic", "value": "on" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Invalid setting"), "Body: {body}");
+    }
+
+    #[tokio::test]
+    async fn advanced_state_and_choices_round_trip_through_the_web_routes() {
+        let model = Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE));
+        let server = WireServer::start(model, WirePolicy::default()).await;
+        let (app, state) = create_test_app_with_state().await;
+        state
+            .hqplayer
+            .configure(
+                "127.0.0.1".to_string(),
+                Some(server.port()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        state
+            .hqplayer
+            .set_timeouts(HqpTimeouts {
+                connect: Duration::from_millis(100),
+                response: Duration::from_millis(750),
+                reconnect_delay: Duration::from_millis(10),
+                max_attempts: 1,
+            })
+            .await;
+        state
+            .hqp_instances
+            .start()
+            .await
+            .expect("start managed HQPlayer endpoint");
+        for _ in 0..100 {
+            if state
+                .aggregator
+                .get_zone("hqplayer:default")
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            state
+                .aggregator
+                .get_zone("hqplayer:default")
+                .await
+                .is_some(),
+            "managed HQPlayer zone must publish before browser controls"
+        );
+
+        let (status, initial_body) = get_request(&app, "/hqplayer/matrix/profiles").await;
+        assert_eq!(status, StatusCode::OK, "{initial_body}");
+        let initial = assert_json("advanced HQPlayer state", &initial_body);
+        let junk_name = initial["junk_filters"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice["name"].as_str())
+            .expect("mock corpus has a junk-filter choice")
+            .to_string();
+        for (setting, value) in [
+            ("junk_filter", junk_name.as_str()),
+            ("convolution", "true"),
+            ("adaptive_volume", "true"),
+            ("repeat", "all"),
+            ("random", "true"),
+        ] {
+            let (status, body) = post_json(
+                &app,
+                "/hqp/pipeline",
+                &json!({ "setting": setting, "value": value }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{setting}: {body}");
+        }
+
+        let (status, body) = get_request(&app, "/hqplayer/matrix/profiles").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let advanced = assert_json("updated advanced HQPlayer state", &body);
+        assert_eq!(advanced["convolution"], true);
+        assert_eq!(advanced["adaptive_volume"], true);
+        assert_eq!(advanced["repeat"], 2);
+        assert_eq!(advanced["random"], true);
+        assert!(advanced["native_state"].is_object());
+
+        state.hqp_instances.stop().await;
+        server.stop();
     }
 }

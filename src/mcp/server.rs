@@ -68,7 +68,7 @@ pub fn server_details() -> InitializeResult {
             Use hifi_zones to list available zones, hifi_now_playing to see what's playing, \
             hifi_control for playback control, hifi_search to find music, and hifi_play to play it.\n\n\
             Note: hifi_search and hifi_play currently work with Roon and LMS zones only. \
-            Transport controls (play/pause/next/volume) work with all zones (Roon, LMS, OpenHome, UPnP).\n\n\
+            Transport controls (play/pause/next/volume) work with all zones (Roon, LMS, OpenHome, UPnP, HQPlayer).\n\n\
             To build a playlist: call hifi_play multiple times with action='queue'. The first track \
             can use action='play' to start playback, then subsequent tracks use action='queue' to add to the queue."
                 .into(),

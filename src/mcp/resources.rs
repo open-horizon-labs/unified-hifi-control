@@ -143,6 +143,17 @@ fn resource_not_found(uri: &str) -> RpcError {
     }
 }
 
+fn resource_unavailable(uri: &str, reason: String) -> RpcError {
+    RpcError {
+        code: -32000,
+        message: "Resource unavailable".to_string(),
+        data: Some(serde_json::json!({
+            "uri": uri,
+            "reason": reason,
+        })),
+    }
+}
+
 fn zone_resource(zone_id: &str, zone_name: &str) -> Resource {
     Resource {
         annotations: None,
@@ -251,7 +262,10 @@ pub async fn read_resource(state: &AppState, uri: &str) -> Result<ReadResourceRe
         ZONES_URI => text_resource(uri, &zones::zones_payload(state).await),
         STATUS_URI => text_resource(uri, &status::status_payload(state).await),
         HQP_STATUS_URI => text_resource(uri, &hqplayer::hqp_status_payload(state).await),
-        HQP_PROFILES_URI => text_resource(uri, &hqplayer::hqp_profiles_payload(state).await),
+        HQP_PROFILES_URI => match hqplayer::hqp_profiles_payload(state).await {
+            Ok(payload) => text_resource(uri, &payload),
+            Err(reason) => return Err(resource_unavailable(uri, reason)),
+        },
         _ => {
             let zone_id = uri
                 .strip_prefix(ZONE_PREFIX)

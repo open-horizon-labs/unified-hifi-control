@@ -26,6 +26,10 @@
 // Note: clippy::pedantic, clippy::nursery, and clippy::cargo are NOT enabled
 // because they have hundreds of existing violations. Enable incrementally.
 
+// Adaptive-control producer contract (shared: server, WASM consumers, MCP).
+// Deliberately not feature-gated - see src/adaptive/mod.rs for the dependency rule.
+pub mod adaptive;
+
 // Dioxus UI app (shared between server SSR and WASM client)
 pub mod app;
 
@@ -55,3 +59,7 @@ pub mod knobs;
 pub mod mcp;
 #[cfg(feature = "server")]
 pub mod mdns;
+// Adaptive producer publication: internal bus + aggregator-owned state (#324).
+// Server-only: it necessarily touches both `crate::bus` and `crate::adaptive`.
+#[cfg(feature = "server")]
+pub mod producers;

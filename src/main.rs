@@ -10,15 +10,12 @@ mod server {
         mdns,
     };
 
-    // Import Startable trait for adapter lifecycle methods
-    use adapters::Startable;
-
     // Import load_app_settings for checking adapter enabled state
     use api::load_app_settings;
 
     use anyhow::Result;
     use axum::{
-        response::{Html, IntoResponse, Redirect},
+        response::{IntoResponse, Redirect},
         routing::{delete, get, post, put},
         Router,
     };
@@ -30,29 +27,6 @@ mod server {
     use tokio_util::sync::CancellationToken;
     use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-    /// Flash page - redirects to external web flasher
-    async fn flash_page() -> impl IntoResponse {
-        Html(
-            r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Flash Knob - Unified Hi-Fi Control</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-</head>
-<body class="container">
-    <h1>Flash Knob Firmware</h1>
-    <article>
-        <p><strong>HTTPS Required</strong></p>
-        <p>Browser-based flashing requires HTTPS. Use the official web flasher:</p>
-        <p><a href="https://roon-knob.muness.com/" target="_blank" rel="noopener" role="button">Open Web Flasher</a></p>
-    </article>
-</body>
-</html>"#,
-        )
-    }
 
     /// Legacy redirect: /control -> /ui/zones
     async fn control_redirect() -> impl IntoResponse {
@@ -209,16 +183,39 @@ mod server {
         let knob_store = knobs::KnobStore::new();
         tracing::info!("Knob store initialized");
 
-        // Roon adapter - coordinator handles starting based on enabled state
-        // Issue #169: Pass knob_store for controller count in extension status
-        let roon = Arc::new(adapters::roon::RoonAdapter::new_configured(
+        // Construct the one state owner before any adapter can publish. Its bus subscription still
+        // starts below, before adapters start, so broadcast zone events cannot race startup.
+        let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
+
+        // The reliable lanes deliberately commit *into* the aggregator; they retain no competing
+        // projection store.  Start the actor after the aggregator's bus subscription is ready and
+        // before any adapter can publish a managed HQPlayer observation.
+        let reliable_runtime = bus::runtime::build_runtime(zone_aggregator.clone(), 16, 64);
+        let hqp_runtime_bridge = Arc::new(adapters::hqplayer::HqpRuntimeBridge::new(
+            reliable_runtime.projection_ingress.clone(),
+            reliable_runtime.commands.clone(),
+        ));
+        let reliable_commands = reliable_runtime.commands.clone();
+        let projection_actor = reliable_runtime.projection_actor;
+
+        // Roon adapter - authoritative Core callbacks commit through the reliable projection lane;
+        // command success requires the matching callback rather than native dispatch alone.
+        let roon_runtime_bridge = Arc::new(adapters::roon::RoonRuntimeBridge::new(
+            reliable_runtime.projection_ingress.clone(),
+            reliable_commands.clone(),
+        ));
+        let roon = Arc::new(adapters::roon::RoonAdapter::new_configured_with_runtime(
             bus.clone(),
             base_url.clone(),
             knob_store.clone(),
+            Some(roon_runtime_bridge),
         ));
 
         // HQPlayer instance manager (multi-instance support, no settings toggle)
-        let hqp_instances = Arc::new(adapters::hqplayer::HqpInstanceManager::new(bus.clone()));
+        let hqp_instances = Arc::new(adapters::hqplayer::HqpInstanceManager::new_with_runtime(
+            bus.clone(),
+            hqp_runtime_bridge,
+        ));
         hqp_instances.load_from_config().await;
         let instance_count = hqp_instances.instance_count().await;
         if instance_count > 0 {
@@ -252,17 +249,6 @@ mod server {
             }
         }
 
-        // Auto-connect HQPlayer if configured (establishes TCP connection at startup)
-        if hqplayer.is_configured().await {
-            match hqplayer.get_pipeline_status().await {
-                Ok(_) => tracing::info!("HQPlayer auto-connected at startup"),
-                Err(e) => tracing::warn!(
-                    "HQPlayer auto-connect failed (will retry on page access): {}",
-                    e
-                ),
-            }
-        }
-
         // HQP zone link service
         let hqp_zone_links = Arc::new(adapters::hqplayer::HqpZoneLinkService::new(
             hqp_instances.clone(),
@@ -275,7 +261,12 @@ mod server {
 
         // LMS adapters (polling + CLI subscription with shared state)
         // Issue #165: Split into two adapters with independent retry
-        let (lms, lms_cli) = adapters::lms::create_lms_adapters(bus.clone());
+        let lms_runtime_bridge = Arc::new(adapters::lms::LmsRuntimeBridge::new(
+            reliable_runtime.projection_ingress.clone(),
+            reliable_commands.clone(),
+        ));
+        let (lms, lms_cli) =
+            adapters::lms::create_lms_adapters_with_runtime(bus.clone(), Some(lms_runtime_bridge));
         if let Some(ref lms_config) = config.lms {
             lms.configure(
                 lms_config.host.clone(),
@@ -286,48 +277,76 @@ mod server {
             .await;
         }
 
-        // OpenHome adapter
-        let openhome = Arc::new(adapters::openhome::OpenHomeAdapter::new(bus.clone()));
+        // OpenHome adapter. Its provider endpoint confirms native writes only
+        // after a complete SOAP readback has committed into the aggregator.
+        let openhome_runtime_bridge = Arc::new(adapters::openhome::OpenHomeRuntimeBridge::new(
+            reliable_runtime.projection_ingress.clone(),
+            reliable_commands.clone(),
+        ));
+        let openhome = Arc::new(adapters::openhome::OpenHomeAdapter::new_with_runtime(
+            bus.clone(),
+            Some(openhome_runtime_bridge),
+        ));
 
-        // UPnP adapter
-        let upnp = Arc::new(adapters::upnp::UPnPAdapter::new(bus.clone()));
+        // UPnP follows the same reliable observer/command contract as
+        // OpenHome: commands resolve only once their SOAP readback commits.
+        let upnp_runtime_bridge = Arc::new(adapters::upnp::UPnPRuntimeBridge::new(
+            reliable_runtime.projection_ingress.clone(),
+            reliable_commands.clone(),
+        ));
+        let upnp = Arc::new(adapters::upnp::UPnPAdapter::new_with_runtime(
+            bus.clone(),
+            Some(upnp_runtime_bridge),
+        ));
 
         // =========================================================================
         // Start enabled adapters (single codepath using coordinator)
         // =========================================================================
 
+        // Subscribe the authoritative aggregator before any producer can publish its initial
+        // discovery snapshot. The bus is broadcast-only and does not replay messages to subscribers
+        // created after adapter startup.
+        let (aggregator_ready_tx, aggregator_ready_rx) = tokio::sync::oneshot::channel();
+        let aggregator_for_spawn = zone_aggregator.clone();
+        tokio::spawn(async move {
+            aggregator_for_spawn
+                .run_with_ready(aggregator_ready_tx)
+                .await;
+        });
+        aggregator_ready_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("ZoneAggregator stopped before subscribing to the bus"))?;
+        tracing::info!("ZoneAggregator started");
+        tokio::spawn(projection_actor.run());
+        tracing::info!("Reliable projection runtime started");
+
         // Build list of startable adapters
         // Note: lms_cli shares config with lms - both start when LMS is configured
         let startable_adapters: Vec<Arc<dyn adapters::Startable>> = vec![
             roon.clone(),
+            hqp_instances.clone(),
             lms.clone(),
             lms_cli.clone(),
             openhome.clone(),
             upnp.clone(),
         ];
 
+        // Fail before starting adapters or the adaptive actor if the public socket cannot be
+        // acquired. After this point every fallible server exit goes through explicit teardown.
+        let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+
+        // SSE closes as soon as graceful HTTP shutdown begins.
+        let shutdown_token = CancellationToken::new();
+
         // Single loop to start all enabled adapters
         coord.start_all_enabled(&startable_adapters).await;
-
-        // Initialize ZoneAggregator for unified zone state
-        let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
-        let aggregator_for_spawn = zone_aggregator.clone();
-        tokio::spawn(async move {
-            aggregator_for_spawn.run().await;
-        });
-        tracing::info!("ZoneAggregator started");
-
-        // Clone Roon adapter for shutdown access (cheap - just Arc clones)
-        let roon_for_shutdown = roon.clone();
-
-        // Create shutdown token for graceful SSE termination (fixes #73)
-        let shutdown_token = CancellationToken::new();
 
         // Build application state (clone Arcs so we can access adapters for shutdown)
         let state = api::AppState::new(
             roon,
             hqplayer,
-            hqp_instances,
+            hqp_instances.clone(),
             hqp_zone_links,
             lms.clone(),
             openhome.clone(),
@@ -339,7 +358,8 @@ mod server {
             startable_adapters.clone(),
             Instant::now(),
             shutdown_token.clone(),
-        );
+        )
+        .with_reliable_commands(reliable_commands);
 
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();
@@ -485,8 +505,8 @@ mod server {
             )
             // Protocol route: /zones returns JSON (for knob, iOS, etc.)
             .route("/zones", get(knobs::knob_zones_handler))
-            // Legacy SSR routes (flash page not yet migrated)
-            .route("/knobs/flash", get(flash_page))
+            // Legacy/bookmarked path also goes directly to the secure Web Serial origin.
+            .route("/knobs/flash", get(api::knob_flasher_redirect_handler))
             // Legacy redirects
             .route("/control", get(control_redirect))
             .route("/admin", get(settings_redirect))
@@ -557,7 +577,6 @@ mod server {
         };
 
         // Start server with graceful shutdown
-        let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
         tracing::info!("Listening on http://{}", addr);
 
         // Advertise via mDNS for knob discovery
@@ -593,8 +612,6 @@ mod server {
             None
         };
 
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-
         // Create shutdown future that cancels token before graceful shutdown (fixes #73)
         let graceful_shutdown = {
             let token = shutdown_token.clone();
@@ -616,12 +633,16 @@ mod server {
             }
         };
 
-        axum::serve(
+        let server_result = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(graceful_shutdown)
-        .await?;
+        .await;
+
+        // Graceful signal handling already cancels this token. Cancel again unconditionally so
+        // an Axum error closes SSE streams too.
+        shutdown_token.cancel();
 
         // Cleanup: publish ShuttingDown event and stop adapters
         tracing::info!("Shutting down adapters...");
@@ -634,16 +655,18 @@ mod server {
         // Give listeners a moment to react to ShuttingDown
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Stop adapters
-        roon_for_shutdown.stop().await;
+        // Stop every coordinator-owned Startable and wait for its children. Individual stop methods
+        // are idempotent, so adapters that already reacted to ShuttingDown remain safe here.
+        coord
+            .stop_all(state_for_shutdown.startable_adapters.as_ref())
+            .await;
         if let Some(ref fw) = firmware_service {
             fw.stop();
         }
-        lms.stop().await;
-        openhome.stop().await;
-        upnp.stop().await;
+
         tracing::info!("Shutdown complete");
 
+        server_result?;
         Ok(())
     }
 

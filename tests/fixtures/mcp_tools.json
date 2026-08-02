@@ -16,15 +16,15 @@
     }
   },
   "hifi_control": {
-    "description": "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume",
+    "description": "Control playback and volume. Common actions: play, pause, playpause, next, previous, volume_set, volume_up, volume_down. HQPlayer also supports stop, seek, and mute.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down",
+          "description": "Common action: play, pause, playpause, next, previous, volume_set, volume_up, or volume_down. HQPlayer also accepts stop, seek, and mute.",
           "type": "string"
         },
         "value": {
-          "description": "For volume actions: the level (0-100 for volume_set) or amount to change",
+          "description": "For seek, the position in seconds. For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.",
           "nullable": true,
           "type": "number"
         },
@@ -50,6 +50,11 @@
         "profile": {
           "description": "Configuration name to load (get from hifi_hqplayer_profiles)",
           "type": "string"
+        },
+        "zone_id": {
+          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "nullable": true,
+          "type": "string"
         }
       },
       "required": [
@@ -64,20 +69,31 @@
     },
     "description": "List available HQPlayer Embedded configurations",
     "inputSchema": {
-      "properties": {},
+      "properties": {
+        "zone_id": {
+          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
       "type": "object"
     }
   },
   "hifi_hqplayer_set_pipeline": {
-    "description": "Change an HQPlayer pipeline setting (mode, samplerate, filter1x, filterNx, shaper, dither)",
+    "description": "Change an immediate HQPlayer setting on an exact instance: mode, samplerate, filter1x, filterNx, shaper/dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, or random. Call hifi_hqplayer_status first for current values and choices. This does not persist a profile.",
     "inputSchema": {
       "properties": {
         "setting": {
-          "description": "Setting to change: mode, samplerate, filter1x, filterNx, shaper, dither",
+          "description": "Immediate setting to change; this does not persist an HQPlayer profile.",
           "type": "string"
         },
         "value": {
           "description": "New value for the setting",
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "nullable": true,
           "type": "string"
         }
       },
@@ -94,7 +110,13 @@
     },
     "description": "Get HQPlayer Embedded status and current pipeline settings",
     "inputSchema": {
-      "properties": {},
+      "properties": {
+        "zone_id": {
+          "description": "Optional direct HQPlayer zone (`hqplayer:<instance>`). Omit for the default instance.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
       "type": "object"
     }
   },
@@ -216,7 +238,7 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "List all available playback zones (Roon, LMS, OpenHome, UPnP)",
+    "description": "List all available playback zones (Roon, LMS, OpenHome, UPnP, HQPlayer)",
     "inputSchema": {
       "properties": {},
       "type": "object"

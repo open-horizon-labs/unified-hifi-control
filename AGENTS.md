@@ -21,7 +21,7 @@ Use GitHub for all task tracking:
 **Purpose:** Propose implementations for review
 - Link to the issue being addressed: `Fixes #123`
 - Describe what changed and how to test
-- Request review from coderabbit and superego
+- Request review from coderabbit
 
 ### Merging PRs
 **TEST BEFORE MERGING.** Do not merge PRs without testing.
@@ -36,26 +36,9 @@ Use GitHub for all task tracking:
 - Merge without verifying the fix works
 - Auto-merge in a "merge party" without explicit approval for each PR
 
-### Git Workflow
-**DO NOT force push (`git push --force` or `git push -f`)**
-- This project uses squash merges, so commit history cleanup is unnecessary
-- Force pushing breaks checkouts for anyone tracking the branch
-- Force pushing loses SHA references (builds, comments, reviews)
-- Just push new commits - they all get squashed on merge anyway
-
----
-
 ## Code Review
 
-This project uses two complementary review tools:
-
-### superego (Metacognitive Advisor)
-**When to use:** Before commits, when choosing between approaches, when uncertain
-**Protocol:**
-- Mode: `pull` (reviews on request, not automatically)
-- Use `sg review` at decision points during development
-- Post superego reviews to PRs for visibility
-- Handle findings: P1-P3 fix immediately, P4 can discard with reason
+This project uses automated review on pull requests:
 
 ### coderabbit (Automated Code Review)
 **When to use:** Automatically runs on all PRs
@@ -63,13 +46,6 @@ This project uses two complementary review tools:
 - Reviews code style, potential bugs, and best practices
 - Address feedback before merging
 - Use `@coderabbit` in PR comments to ask questions
-
-### wm (Working Memory)
-**When to use:** Automatic - captures learnings from sessions
-**Protocol:**
-- Runs automatically via hooks
-- Extracts tacit knowledge from completed work
-- No manual intervention needed
 
 ---
 
@@ -217,9 +193,9 @@ Two things this table does **not** claim:
 
 | Capability | roon | lms | openhome | upnp | hqplayer |
 |---|---|---|---|---|---|
-| `transport` | ✅ | ✅ | ✅ | ✅ | 🚧 #328 |
-| `transport_skip` | ✅ | ✅ | ✅ | 🚧 #392 | 🚧 #328 |
-| `volume` | ✅ | ✅ | ✅ | ✅ | 🚧 #328 |
+| `transport` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `transport_skip` | ✅ | ✅ | ✅ | 🚧 #392 | ✅ |
+| `volume` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `search` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 |
 | `play_by_query` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 |
 | `play_by_ref` | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #209 |
@@ -230,8 +206,8 @@ Two things this table does **not** claim:
 | `queue_remove` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 |
 | `queue_clear` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 |
 | `play_next` | 🚧 #399 | 🚧 #403 | 🚧 #392 | 🚧 #396 | 🚧 #209 |
-| `repeat_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | 🚧 #209 |
-| `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | 🚧 #209 |
+| `repeat_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ |
+| `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ |
 | `saved_playlists` | 🚧 #399 | 🚧 #403 | ⛔ | ⛔ | 🚧 #209 |
 | `favorites` | 🚧 #399 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 |
 | `multiroom_sync` | 🚧 #360 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 |
@@ -240,10 +216,7 @@ Two things this table does **not** claim:
 
 Every non-supported cell states the fact it rests on, so the claim can be checked rather than trusted:
 
-- 🚧 **hqplayer / `transport`** (#328) — HqpAdapter implements play, pause, stop, next, previous, seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them.
 - 🚧 **upnp / `transport_skip`** (#392) — AVTransport:1 -- the service this adapter already speaks -- defines Next and Previous actions, and UHC's adapter refuses them before issuing either (src/adapters/upnp.rs, REFUSED_TRANSPORT_ACTIONS). A renderer with no playlist would reject the call, but that is the device's answer to give, not UHC's to assume.
-- 🚧 **hqplayer / `transport_skip`** (#328) — HqpAdapter implements play, pause, stop, next, previous, seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them.
-- 🚧 **hqplayer / `volume`** (#328) — HqpAdapter implements play, pause, stop, next, previous, seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them.
 - ⛔ **openhome / `search`** — UHC discovers OpenHome zones by their av-openhome-org Product, Transport and Volume services (src/adapters/openhome.rs) and the OpenHome service set has no library: content is resolved by a control point against a separate media server. Verified from the OpenHome service definitions, not from a device.
 - ⛔ **upnp / `search`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `search`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
@@ -294,12 +267,10 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - 🚧 **lms / `repeat_mode`** (#403) — playlist repeat <0|1|2> and playlist repeat ? read and write it; verified live. Note the mode lives on the sync master, so setting it changes every member.
 - 🚧 **openhome / `repeat_mode`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
 - 🚧 **upnp / `repeat_mode`** (#392) — AVTransport:1's SetPlayMode takes REPEAT_ONE and REPEAT_ALL, so repeat is a protocol feature UHC does not use. Verified from the UPnP AV service definitions, not from a device.
-- 🚧 **hqplayer / `repeat_mode`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **roon / `shuffle_mode`** (#360) — the Roon API's transport service takes a shuffle setting; UHC drives it from no surface.
 - 🚧 **lms / `shuffle_mode`** (#403) — playlist shuffle <0|1|2> and playlist shuffle ? read and write it; verified live. Setting it reshuffles the queue, so it is also a queue mutation.
 - 🚧 **openhome / `shuffle_mode`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
 - 🚧 **upnp / `shuffle_mode`** (#392) — AVTransport:1's SetPlayMode takes SHUFFLE and RANDOM, so shuffle is a protocol feature UHC does not use. Verified from the UPnP AV service definitions, not from a device.
-- 🚧 **hqplayer / `shuffle_mode`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **roon / `saved_playlists`** (#399) — Roon exposes Playlists as a browse hierarchy, so this arrives with browse rather than as its own protocol feature.
 - 🚧 **lms / `saved_playlists`** (#403) — playlists / playlists tracks / playlistcontrol cmd:load playlist_id / playlists new / rename / delete all exist and were verified live. playlist save additionally needs a configured playlistdir, which is unset on a stock install -- so its own answer is three-state at the server level, which is why #403 probes pref playlistdir ?.
 - ⛔ **openhome / `saved_playlists`** — the av-openhome-org service set has no playlist storage: Playlist:1 is the live queue (Read/Insert/DeleteId/DeleteAll) with no save or recall action, and stored playlists live on whatever media server the control point uses. Verified from the OpenHome service definitions, not from a device.
@@ -320,7 +291,10 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 `hqplayer:` is a fifth zone prefix: `PrefixedZoneId` lists it and `HqpAdapter`
 publishes `ZoneDiscovered` with it, so HQPlayer zones appear in `hifi_zones`. Until
 #398 the MCP routing layer had no arm for it and sent every one of them to Roon.
-#398 recognises the prefix and reports the gap; wiring it is #328.
+#398 recognised the prefix and reported the gap; #328 wired transport and
+volume, resolved through `HqpInstanceManager` rather than a single shared
+adapter. Content operations (search, browse, queues, ...) remain a gap, tracked
+separately by #209.
 
 Two rows the earlier hand-written table had are deliberately absent, rather than
 lost. **Discovery** is not per-provider: `hifi_zones` reads the aggregator, which

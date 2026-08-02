@@ -1,0 +1,23 @@
+{
+  "schema_version": "2.0",
+  "producer": {
+    "identity": {
+      "urn": "urn:uhc:producer:hqplayer:living-room",
+      "generation": 7
+    }
+  },
+  "surface": {
+    "kind": "dsp",
+    "bindings": []
+  },
+  "revision": {
+    "vector": [12, 4193, 3]
+  },
+  "capabilities": [
+    {
+      "urn": "urn:uhc:control:hqplayer:pipeline:mode",
+      "shape": "enumeration",
+      "truths": []
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+<!--
+  provenance:
+    source: UHC-SALVAGE-UI-DATA-INTEGRATION.md and UHC-SALVAGE-BETA-DEV.md (2026-07-29 comparative salvage reports), which cite https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 2 integration lanes; architecture.md section 2); oversampling domain from hqptuner/lanes/livemap.py:15-20 citing the hqplayerd v6 readme sections 1.5/1.6
+    source_chain: read-via-report
+    daemon: hqplayerd 6.0.4 (Opal), persistent hqplayerd.xml lane
+    status: derived-semantics
+    date: 2026-07-29
+    playback: unknown
+    notes: CROSS-LANE FIXTURE. Verified: hqplayerd.xml stores numeric ENUM IDs while the Control API wire (State and Set*) speaks list INDICES, and the two domains must never be mixed. Every number here is an enum ID, resolvable against filters_pcm.xml / shapers_sdm.xml / modes.xml by the value attribute: filter=40 -> poly-sinc-gauss-long (list index 7), filter1x=6 -> poly-sinc-lp-2s (list index 5), shaper=5 -> ASDM5 (list index 4 in the SDM list), mode=0 -> PCM (list index 1). Feeding any of these to Set* verbatim selects the wrong setting or is rejected outright, which is the regression this fixture exists to catch. ADDED 2026-07-29 for the #322 HQPTuner amendment (bite 5): oversampling="38" is the SDM chain's SEPARATE persistent domain for the SAME semantic filter that filter="40" names in the PCM chain. So the persistent lane has TWO independently numbered filter domains, not one, and a single stored-ID-to-name conversion is insufficient without knowing which attribute a number came from. Upstream evidence for the 40-versus-38 pair is the persistent field names filter and oversampling, NOT a GetFilters capture: whether the LIVE GetFilters value for this name also differs between chains is an OPEN QUESTION recorded on issue #341 comment 5125948432, and this corpus deliberately still reports value=40 for the name in both live chain lists rather than answering it. The <Configuration> wrapper and <output> element are a representative container: what is verified is the enum-ID SEMANTICS of the numbers inside, not this markup. Source chain: read-via-report - the upstream file was NOT read directly for this fixture; the salvage report is the immediate source and the upstream ref is the report's own citation, recorded because two errors in this amendment came from treating a report's citation as if it had been read (a path that did not exist at the ref given, and a superseded claim the report's own newer companion had already corrected).
+-->
+<Configuration>
+<output mode="0" filter="40" filter1x="6" oversampling="38" shaper="5" rate="0"/>
+</Configuration>

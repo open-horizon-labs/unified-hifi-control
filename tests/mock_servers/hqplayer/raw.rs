@@ -1,0 +1,472 @@
+//! Test-only, strictly read-only raw observation lane.
+//!
+//! Some claims ADR 003 requires cannot be observed through the adapter's semantic types at all:
+//! `FilterItem` has no `description` field, and a `Status` document's `metadata` child either exists
+//! or does not regardless of the values inside it. Inferring those from parsed values is what produced
+//! two defects in this harness already, so they are **observed** instead.
+//!
+//! This lane opens its own connection, sends only query elements, and frames replies with the
+//! **production** `framing` code, so what it observes is what the client would see. It sends no
+//! `Set*`, no `Volume*`, no transport and no matrix-set command — there is no code path here that
+//! could change a daemon's state.
+//!
+//! Nothing it returns carries the address it connected to. Callers hand it a host, it hands back
+//! documents.
+
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+
+use unified_hifi_control::adapters::hqplayer::framing;
+
+/// A closed set of read-only requests this lane can express.
+///
+/// Deliberately not a free-form attribute string: with `attrs: &str` interpolated into the request, a
+/// caller could close the element and append anything - `/><Volume value="0"` - and the read-only
+/// guarantee would rest on caller discipline rather than on the type. Every variant here renders to a
+/// query and there is no variant that can render a mutating command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Query {
+    GetInfo,
+    /// One-shot status. `subscribe` is fixed to 0: push mode is not something this lane may enable.
+    Status,
+    State,
+    VolumeRange,
+    GetModes,
+    GetFilters,
+    GetShapers,
+    GetRates,
+    GetJunkFilters,
+    MatrixListProfiles,
+    MatrixGetProfile,
+}
+
+impl Query {
+    /// Every query this lane can express, for exhaustive coverage checks.
+    pub const ALL: [Query; 11] = [
+        Query::GetInfo,
+        Query::State,
+        Query::Status,
+        Query::VolumeRange,
+        Query::GetModes,
+        Query::GetFilters,
+        Query::GetShapers,
+        Query::GetRates,
+        Query::GetJunkFilters,
+        Query::MatrixListProfiles,
+        Query::MatrixGetProfile,
+    ];
+
+    /// The request element name.
+    pub fn element(self) -> &'static str {
+        match self {
+            Query::GetInfo => "GetInfo",
+            Query::State => "State",
+            Query::Status => "Status",
+            Query::VolumeRange => "VolumeRange",
+            Query::GetModes => "GetModes",
+            Query::GetFilters => "GetFilters",
+            Query::GetShapers => "GetShapers",
+            Query::GetRates => "GetRates",
+            Query::GetJunkFilters => "GetJunkFilters",
+            Query::MatrixListProfiles => "MatrixListProfiles",
+            Query::MatrixGetProfile => "MatrixGetProfile",
+        }
+    }
+
+    /// The element the daemon answers with.
+    ///
+    /// Stated per query rather than assumed equal to the request. Every family the reference documents
+    /// answers under its own request element, so today this is the identity — but it exists as a
+    /// separate function anyway: the moment one family answers under a different name, the fix is one
+    /// arm here rather than a timeout nobody can explain. The matrix pair was checked specifically,
+    /// being the likeliest to diverge — one is a container of `MatrixProfile` children, the other a
+    /// single current-selection element — and both echo.
+    pub fn reply_element(self) -> &'static str {
+        self.element()
+    }
+
+    /// The capture key this query's evidence is filed under, so the mapping lives with the query
+    /// instead of in a parallel list that can drift out of step with `ALL`.
+    pub fn capture_family(self) -> &'static str {
+        match self {
+            Query::GetInfo => "getinfo",
+            Query::State => "state",
+            Query::Status => "status",
+            Query::VolumeRange => "volume_range",
+            Query::GetModes => "modes",
+            Query::GetFilters => "filters",
+            Query::GetShapers => "shapers",
+            Query::GetRates => "rates",
+            Query::GetJunkFilters => "junkfilters",
+            Query::MatrixListProfiles => "matrix",
+            Query::MatrixGetProfile => "matrix_current",
+        }
+    }
+
+    /// The full request document. No caller-supplied text reaches it, so there is no interpolation
+    /// point at which a command could be appended.
+    pub fn request(self) -> String {
+        let attrs = match self {
+            // One-shot only. Push mode is not something this lane may enable.
+            Query::Status => " subscribe=\"0\"",
+            _ => "",
+        };
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><{}{attrs}/>\n",
+            self.element()
+        )
+    }
+}
+
+/// Read one raw reply document for a query element.
+///
+/// Only [`Query`] can be expressed, so the read-only guarantee is structural rather than left to the
+/// caller's care.
+pub async fn observe(
+    host: &str,
+    port: u16,
+    query: Query,
+    response_deadline: Duration,
+) -> anyhow::Result<String> {
+    let element = query.element();
+    let expected_reply = query.reply_element();
+
+    let stream = tokio::time::timeout(response_deadline, TcpStream::connect((host, port)))
+        .await
+        .map_err(|_| anyhow::anyhow!("raw lane connect timeout"))??;
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    let request = query.request();
+    write_half.write_all(request.as_bytes()).await?;
+    write_half.flush().await?;
+
+    // Same rule the client follows: read until a document parses. Bounded by one overall deadline so a
+    // chatty daemon cannot hold this open.
+    let deadline = tokio::time::Instant::now() + response_deadline;
+    let mut document = String::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        anyhow::ensure!(!remaining.is_zero(), "raw lane response timeout");
+        let mut line = String::new();
+        match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
+            Ok(Ok(0)) => anyhow::bail!("raw lane: connection closed mid-document"),
+            Ok(Ok(_)) => {
+                document.push_str(&line);
+                // Drain every complete frame the buffer now holds, not just the first, because one
+                // `read_line` can deliver several: the daemon pushes `Status` unprompted, so a push and
+                // the reply can arrive coalesced on one line.
+                //
+                // Two defects lived in doing this by whole buffer. Returning `document` returned the
+                // *buffer* rather than the frame, so a push coalesced behind the reply came back glued
+                // to it — and attribute reads scope to the root open tag, so a two-document buffer is
+                // one whose attributes cannot be trusted. And `document.clear()` on a non-matching
+                // root discarded whatever had arrived behind it, so a reply already in hand was thrown
+                // away and the lane then burned its whole deadline waiting for it.
+                //
+                // `framing::first_document_span` is the production helper that exists for exactly this
+                // and is what the client itself uses, so the lane keeps observing what the client sees.
+                loop {
+                    match framing::classify(&document) {
+                        framing::Framing::Complete => {
+                            let Some((start, end)) = framing::first_document_span(&document) else {
+                                // `Complete` and no span is not a shape `framing` produces; treating it
+                                // as "keep reading" would spin this loop, so stop rather than guess.
+                                break;
+                            };
+                            let frame = document[start..end].to_string();
+                            // Keep the tail: it may already hold the reply.
+                            document = document[end..].to_string();
+                            if framing::root_element(&frame).as_deref() == Some(expected_reply) {
+                                return Ok(frame);
+                            }
+                            // Unsolicited push frame; drop that frame only and keep reading, exactly
+                            // as the client does.
+                        }
+                        framing::Framing::Malformed => {
+                            anyhow::bail!("raw lane: malformed document for {element}")
+                        }
+                        framing::Framing::Incomplete => break,
+                    }
+                }
+            }
+            Ok(Err(e)) => anyhow::bail!("raw lane read error: {e}"),
+            Err(_) => anyhow::bail!("raw lane response timeout"),
+        }
+    }
+}
+
+/// Whether a container's named **direct child** element is present, as a structural fact rather than
+/// an inference from any value inside it.
+///
+/// Depth is tracked rather than matching any descendant. ADR 003's `status_metadata_child` claim is
+/// about `Status` carrying a `metadata` child; a `metadata` nested inside something else is a
+/// different fact, and answering "present" for it is a false *presence* — the mirror of the false
+/// absences this whole lane exists to avoid. The root element is at depth 0, so a direct child is
+/// exactly depth 1, and the root is never its own child.
+pub fn has_child(document: &str, child: &str) -> bool {
+    let mut reader = quick_xml::Reader::from_str(document);
+    reader.config_mut().check_end_names = false;
+    // How many elements are currently open. Incremented *after* the depth test on `Start`, so the
+    // element being tested is measured at its own nesting level rather than one deeper.
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                if depth == 1 && String::from_utf8_lossy(e.name().as_ref()) == child {
+                    return true;
+                }
+                depth += 1;
+            }
+            // A self-closing element opens and closes in one event, so it never changes the depth —
+            // it just occupies the level it appears at. This is the shape the real `metadata` child
+            // takes, so it must be measured, not skipped.
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                if depth == 1 && String::from_utf8_lossy(e.name().as_ref()) == child {
+                    return true;
+                }
+            }
+            Ok(quick_xml::events::Event::End(_)) => {
+                depth = depth.saturating_sub(1);
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return false,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Every `(name, attribute-map)` pair for a repeated child element, so attribute *presence* can be
+/// distinguished from attribute *value*.
+pub fn child_attrs(document: &str, child: &str) -> Vec<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut reader = quick_xml::Reader::from_str(document);
+    reader.config_mut().check_end_names = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                if String::from_utf8_lossy(e.name().as_ref()) == child {
+                    out.push(
+                        e.attributes()
+                            .filter_map(Result::ok)
+                            .map(|a| {
+                                let name = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                                let value = a
+                                    .normalized_value(quick_xml::XmlVersion::Explicit1_0)
+                                    .map(|v| v.into_owned())
+                                    .unwrap_or_else(|_| {
+                                        framing::decode_entities(&String::from_utf8_lossy(&a.value))
+                                    });
+                                (name, value)
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return out,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Attributes of a document's root element.
+pub fn root_attrs(document: &str) -> Vec<(String, String)> {
+    element_attrs(document)
+}
+
+/// Attributes of the first element in a fragment, parsed with quick-xml.
+///
+/// Hand-rolled scanning is what made the previous version silently under-observe: it assumed double
+/// quotes and no whitespace around `=`, so `index = '0'` yielded nothing at all and the diff reported
+/// a false absence. quick-xml is already in the dependency graph and handles both quote styles,
+/// whitespace, and entity decoding, so the parser cannot be more restrictive than the daemon.
+fn element_attrs(fragment: &str) -> Vec<(String, String)> {
+    let mut reader = quick_xml::Reader::from_str(fragment);
+    reader.config_mut().check_end_names = false;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                return e
+                    .attributes()
+                    .filter_map(Result::ok)
+                    .map(|a| {
+                        let name = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                        let value = a
+                            .normalized_value(quick_xml::XmlVersion::Explicit1_0)
+                            .map(|v| v.into_owned())
+                            .unwrap_or_else(|_| {
+                                framing::decode_entities(&String::from_utf8_lossy(&a.value))
+                            });
+                        (name, value)
+                    })
+                    .collect();
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return Vec::new(),
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Strip anything that must never reach a stored artifact: hidden form inputs, anything that looks
+/// like a token or credential, and `Authorization`-style headers.
+///
+/// Applied to every raw document before it is recorded, so the sanitiser is not something a caller can
+/// forget to invoke.
+/// The single list of substrings that mark a name, attribute, or text run as unsafe to keep.
+///
+/// One definition, deliberately. Three copies of this list existed briefly and had already drifted
+/// (`"apikey"` here, `"key"` in the config projection), which is the same failure mode as the leak
+/// this list exists to prevent: add `"bearer"` to one copy, miss the others, reopen the hole. The
+/// union is used, so matching stays as broad as the broadest former copy.
+///
+/// `"key"` is deliberately broad and now also drives *text* redaction, not just attribute matching, so
+/// its blast radius grew: an element named `monkey` would have its text dropped. That is accepted —
+/// HQPlayer's protocol vocabulary (`State`, `Status`, `FiltersItem`, `index`, `value`, `arg`, `rate`)
+/// contains no such name, and over-redaction costs evidence while under-redaction costs a secret.
+pub const SENSITIVE_MARKERS: [&str; 9] = [
+    "password",
+    "passwd",
+    "csrf",
+    "token",
+    "nonce",
+    "authorization",
+    "secret",
+    "key",
+    "bearer",
+];
+
+/// True when `text` contains any [`SENSITIVE_MARKERS`] substring, case-insensitively.
+pub fn is_sensitive(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    SENSITIVE_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+pub fn sanitize(document: &str) -> String {
+    // Element TEXT as well as tags. An earlier version redacted only tags, so
+    // `<password>SEKRET</password>` became `<!-- redacted -->SEKRET<!-- redacted -->` and the secret
+    // survived between them. Walking with quick-xml means a sensitive element's text is dropped with
+    // the element rather than left stranded in the output.
+    let mut out = String::with_capacity(document.len());
+    let mut reader = quick_xml::Reader::from_str(document);
+    reader.config_mut().check_end_names = false;
+    let mut suppress_depth = 0usize;
+
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Decl(_)) => out.push_str("<?xml version=\"1.0\"?>"),
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let hostile = is_hostile_tag(&e);
+                if hostile || suppress_depth > 0 {
+                    if suppress_depth == 0 {
+                        out.push_str("<!-- redacted: sensitive element -->");
+                    }
+                    suppress_depth += 1;
+                } else {
+                    out.push('<');
+                    out.push_str(&render_start(&e));
+                    out.push('>');
+                }
+            }
+            Ok(quick_xml::events::Event::Empty(e)) => {
+                let hostile = is_hostile_tag(&e);
+                if suppress_depth == 0 && hostile {
+                    out.push_str("<!-- redacted: sensitive element -->");
+                } else if suppress_depth == 0 {
+                    out.push('<');
+                    out.push_str(&render_start(&e));
+                    out.push_str("/>");
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                if suppress_depth > 0 {
+                    suppress_depth -= 1;
+                } else {
+                    out.push_str("</");
+                    out.push_str(&String::from_utf8_lossy(e.name().as_ref()));
+                    out.push('>');
+                }
+            }
+            Ok(quick_xml::events::Event::Text(t)) => {
+                if suppress_depth == 0 {
+                    let text = t
+                        .xml10_content()
+                        .ok()
+                        .and_then(|decoded| {
+                            quick_xml::escape::unescape(&decoded)
+                                .ok()
+                                .map(|value| value.into_owned())
+                        })
+                        .unwrap_or_default();
+                    // Belt and braces: text that itself looks like a credential line goes too.
+                    if is_sensitive(&text) {
+                        out.push_str("<!-- redacted: sensitive text -->");
+                    } else {
+                        // Re-escape. The text was decoded to inspect it, so emitting it verbatim would
+                        // put a bare `&` back into the document and the artifact embeds these as
+                        // evidence — sanitised output that no longer reparses is not evidence.
+                        out.push_str(&quick_xml::escape::escape(&text));
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::GeneralRef(reference)) => {
+                if suppress_depth == 0 {
+                    out.push('&');
+                    out.push_str(&reference.decode().unwrap_or_default());
+                    out.push(';');
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    out
+}
+
+/// Whether a tag must be dropped whole, along with everything inside it.
+///
+/// One definition covering both `Start` and `Empty`: the check was duplicated in the two arms, which
+/// is the same drift risk as the three copies of the marker list.
+fn is_hostile_tag(e: &quick_xml::events::BytesStart<'_>) -> bool {
+    if is_sensitive(&String::from_utf8_lossy(e.name().as_ref())) {
+        return true;
+    }
+    e.attributes().filter_map(Result::ok).any(|a| {
+        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+        // `type="hidden"` specifically, rather than "hidden" appearing in any attribute value: an
+        // unrelated `status="Hidden"` would otherwise cost a whole element of evidence for nothing.
+        // Secret-*named* attributes are already covered by `is_sensitive` on the key.
+        is_sensitive(&key)
+            || (key.eq_ignore_ascii_case("type")
+                && String::from_utf8_lossy(a.value.as_ref()).eq_ignore_ascii_case("hidden"))
+    })
+}
+
+/// Re-render a start tag's name and attributes, dropping any attribute whose name or value is
+/// sensitive.
+///
+/// Values are decoded before being inspected and re-escaped before being emitted, for the same reason
+/// [`sanitize`] does it for element text: `a.value` is the raw wire bytes, and XML permits a `"`
+/// inside a single-quoted value, so re-emitting verbatim between double quotes turned
+/// `song='say "hi"'` into a document that no longer reparses. A stored artifact that cannot be
+/// reparsed is not evidence.
+///
+/// The decode also makes the sensitivity check stronger rather than weaker: it runs on the *decoded*
+/// value, so `&quot;password&quot;` is caught where the raw bytes would have hidden it. Escaping
+/// happens only after that check has passed, so decoding can never become a way for a credential to
+/// come back out re-encoded.
+fn render_start(e: &quick_xml::events::BytesStart<'_>) -> String {
+    let mut out = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+    for a in e.attributes().filter_map(Result::ok) {
+        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+        let value = a
+            .normalized_value(quick_xml::XmlVersion::Explicit1_0)
+            .map(|v| v.into_owned())
+            .unwrap_or_else(|_| framing::decode_entities(&String::from_utf8_lossy(&a.value)));
+        if is_sensitive(&key) || is_sensitive(&value) {
+            continue;
+        }
+        out.push_str(&format!(" {key}=\"{}\"", quick_xml::escape::escape(&value)));
+    }
+    out
+}

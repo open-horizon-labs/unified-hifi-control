@@ -38,12 +38,17 @@ use axum::{
     Router,
 };
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use unified_hifi_control::adapters::hqplayer::{HqpInstanceManager, HqpZoneLinkService};
-use unified_hifi_control::adapters::lms::LmsAdapter;
+use unified_hifi_control::adapters::lms::{
+    create_lms_adapters_with_runtime, LmsAdapter, LmsRuntimeBridge,
+};
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
 use unified_hifi_control::adapters::roon::RoonAdapter;
 use unified_hifi_control::adapters::upnp::UPnPAdapter;
@@ -51,10 +56,13 @@ use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api::AppState;
 use unified_hifi_control::bus::create_bus;
+use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp;
-use unified_hifi_control::mcp::types::{McpPipelineStatus, McpPlayResult, McpSearchResult};
+use unified_hifi_control::mcp::types::{
+    McpHqpOptions, McpHqpSelection, McpPipelineStatus, McpPlayResult, McpSearchResult,
+};
 
 use mock_servers::{MockHqpServer, MockLmsServer, MockOpenHomeDevice, MockUpnpRenderer};
 
@@ -204,14 +212,16 @@ async fn build_state_with_bus(
 ) -> AppState {
     let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
     let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
-    let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
+        bus.clone(),
+        aggregator.clone(),
+    ));
     let hqplayer = hqp_instances.get_default().await;
     let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
     let lms = lms.unwrap_or_else(|| Arc::new(LmsAdapter::new(bus.clone())));
     let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
     let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
-    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
-
     let startable_adapters: Vec<Arc<dyn Startable>> =
         vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
@@ -754,12 +764,15 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
         ],
     ),
     ("hifi_status", &[]),
-    ("hifi_hqplayer_status", &[]),
-    ("hifi_hqplayer_profiles", &[]),
-    ("hifi_hqplayer_load_profile", &[("profile", true)]),
+    ("hifi_hqplayer_status", &[("zone_id", false)]),
+    ("hifi_hqplayer_profiles", &[("zone_id", false)]),
+    (
+        "hifi_hqplayer_load_profile",
+        &[("profile", true), ("zone_id", false)],
+    ),
     (
         "hifi_hqplayer_set_pipeline",
-        &[("setting", true), ("value", true)],
+        &[("setting", true), ("value", true), ("zone_id", false)],
     ),
     // #396. `ref` is required; `zone_id` is required (must match the ref's
     // provider); `action` is optional and defaults to "play".
@@ -1221,21 +1234,27 @@ async fn hifi_hqplayer_status_shape_is_pinned() {
 
     assert_eq!(
         parsed,
-        json!({ "connected": false, "host": null, "pipeline": null }),
+        json!({
+            "connected": false,
+            "host": null,
+            "pipeline": null,
+            "options": null,
+            "options_unavailable_reason": null
+        }),
         "hifi_hqplayer_status payload drifted"
     );
 }
 
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn hifi_hqplayer_profiles_returns_an_array() {
+async fn hifi_hqplayer_profiles_surfaces_a_fresh_read_failure() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
     let text = result_text(&app.call_tool("hifi_hqplayer_profiles", json!({})).await);
     assert_eq!(
-        text, "[]",
-        "hifi_hqplayer_profiles must return a JSON array"
+        text, "Error: Failed to list profiles: Web credentials not configured",
+        "an empty cache must not masquerade as an authoritative empty profile list"
     );
 }
 
@@ -1281,6 +1300,10 @@ async fn hqplayer_set_pipeline_alias_table_is_pinned() {
         "filternx",
         "shaper",
         "dither",
+        "junk",
+        "junk_filter",
+        "matrix",
+        "matrix_profile",
     ] {
         let text = result_text(
             &app.call_tool(
@@ -1292,6 +1315,27 @@ async fn hqplayer_set_pipeline_alias_table_is_pinned() {
         assert!(
             text.starts_with(&format!("Error: Failed to set {setting}: ")),
             "alias {setting:?} must be recognised and reach the adapter, got {text:?}"
+        );
+    }
+
+    for (setting, value) in [
+        ("convolution", "true"),
+        ("adaptive", "on"),
+        ("adaptive_volume", "1"),
+        ("repeat", "all"),
+        ("random", "true"),
+        ("shuffle", "enabled"),
+    ] {
+        let text = result_text(
+            &app.call_tool(
+                "hifi_hqplayer_set_pipeline",
+                json!({ "setting": setting, "value": value }),
+            )
+            .await,
+        );
+        assert!(
+            text.starts_with(&format!("Error: Failed to set {setting}: ")),
+            "immediate-control alias {setting:?} must be recognised, got {text:?}"
         );
     }
 
@@ -1332,7 +1376,7 @@ async fn hqplayer_set_pipeline_alias_table_is_pinned() {
     );
     assert_eq!(
         text,
-        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither",
+        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, random",
         "the refusal must enumerate the valid settings"
     );
 }
@@ -1356,7 +1400,7 @@ async fn hifi_control_volume_argument_handling_is_pinned() {
         .await,
     );
     assert_eq!(
-        text, "Error: volume_set requires a value (0-100)",
+        text, "Error: volume_set requires a value (0-100, or dB for HQPlayer)",
         "volume_set without a value must be refused with its documented range"
     );
 
@@ -1470,10 +1514,12 @@ async fn transport_routing_reaches_each_adapter_and_refuses_the_rest() {
             "bare id -> refused",
         ),
         ("sonos:abc", "names no adapter", "unknown prefix -> refused"),
+        // #328 wires this: HqpInstanceManager resolution reaches its own
+        // "instance not configured" failure rather than a refusal.
         (
             "hqplayer:desktop",
-            "hqplayer zones are not controllable from MCP yet",
-            "hqplayer: -> named, tracked by #328",
+            "HQPlayer instance 'desktop' is not configured",
+            "hqplayer: -> wired, backend error for an unconfigured instance",
         ),
     ];
 
@@ -1512,6 +1558,11 @@ async fn volume_routing_differs_from_transport_routing() {
         // #398 wired these two.
         ("openhome:abc", "Device not found: abc"),
         ("upnp:abc", "Renderer not found: abc"),
+        // #328 wired this one: HqpInstanceManager resolution.
+        (
+            "hqplayer:desktop",
+            "HQPlayer instance 'desktop' is not configured",
+        ),
     ];
     for (zone_id, expected_fragment) in volume_reaches_an_adapter {
         let text = result_text(
@@ -1528,11 +1579,10 @@ async fn volume_routing_differs_from_transport_routing() {
     }
 
     // What volume refuses is now exactly what transport refuses: ids UHC cannot
-    // place, plus the one recognised provider with nothing wired.
+    // place at all. `hqplayer:` is no longer in this list — #328 wired it above.
     for (zone_id, expected_fragment) in [
         ("1601a5d4bare", "has no provider prefix"),
         ("sonos:abc", "names no adapter"),
-        ("hqplayer:desktop", "not controllable from MCP yet"),
     ] {
         let text = result_text(
             &app.call_tool(
@@ -1610,6 +1660,7 @@ struct LmsHarness {
     player_id: &'static str,
     _settings: SettingsFixture,
     _aggregator: tokio::task::JoinHandle<()>,
+    _projection: tokio::task::JoinHandle<()>,
 }
 
 impl LmsHarness {
@@ -1632,7 +1683,13 @@ impl LmsHarness {
             .await;
 
         let bus = create_bus();
-        let lms = Arc::new(LmsAdapter::new(bus.clone()));
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let runtime = build_runtime(aggregator.clone(), 16, 32);
+        let bridge = Arc::new(LmsRuntimeBridge::new(
+            runtime.projection_ingress.clone(),
+            runtime.commands.clone(),
+        ));
+        let (lms, _lms_cli) = create_lms_adapters_with_runtime(bus.clone(), Some(bridge));
         lms.configure(
             mock.addr().ip().to_string(),
             Some(mock.addr().port()),
@@ -1641,11 +1698,39 @@ impl LmsHarness {
         )
         .await;
 
-        let state = build_state_with_bus(bus, Some(lms.clone())).await;
+        let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
+        let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
+        let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
+            bus.clone(),
+            aggregator.clone(),
+        ));
+        let hqplayer = hqp_instances.get_default().await;
+        let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
+        let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
+        let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
+        let startable_adapters: Vec<Arc<dyn Startable>> = vec![lms.clone()];
+        let state = AppState::new(
+            roon,
+            hqplayer,
+            hqp_instances,
+            hqp_zone_links,
+            lms.clone(),
+            openhome,
+            upnp,
+            KnobStore::new(),
+            bus.clone(),
+            aggregator.clone(),
+            coordinator,
+            startable_adapters,
+            Instant::now(),
+            CancellationToken::new(),
+        )
+        .with_reliable_commands(runtime.commands.clone());
 
-        // The aggregator only learns about zones by consuming bus events.
-        let aggregator = state.aggregator.clone();
+        // Match production ordering: both consumers are alive before the adapter can publish.
         let aggregator_task = tokio::spawn(async move { aggregator.run().await });
+        tokio::task::yield_now().await;
+        let projection_task = tokio::spawn(runtime.projection_actor.run());
 
         lms.start().await.expect("LMS adapter must start");
 
@@ -1679,6 +1764,7 @@ impl LmsHarness {
             player_id: Self::PLAYER_ID,
             _settings: settings,
             _aggregator: aggregator_task,
+            _projection: projection_task,
         }
     }
 
@@ -1688,6 +1774,7 @@ impl LmsHarness {
     async fn stop(self) {
         self.lms.stop().await;
         self._aggregator.abort();
+        self._projection.abort();
         self.mock.stop().await;
     }
 }
@@ -1772,6 +1859,33 @@ async fn lms_round_trip_pins_the_action_map_and_the_volume_sign() {
     h.stop().await;
 }
 
+/// The LMS server inventory is authoritative for player lifetime. Polling must retire a missing
+/// player through the reliable projection lane; a post-commit compatibility event may notify
+/// clients, but cannot be the mutation that removes it from the aggregator.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_poll_removes_a_missing_player_from_the_canonical_projection() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+    h.mock.remove_player(h.player_id).await;
+
+    let mut last = Value::Null;
+    for _ in 0..60 {
+        let text = result_text(&h.app.call_tool("hifi_zones", json!({})).await);
+        last = serde_json::from_str(&text).expect("hifi_zones JSON");
+        let still_present = last
+            .as_array()
+            .is_some_and(|zones| zones.iter().any(|zone| zone["zone_id"] == zone_id));
+        if !still_present {
+            h.stop().await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    panic!("removed LMS player remained in the aggregator: {last}");
+}
+
 /// `hifi_control` returns the action name plus the zone's post-command state.
 /// The prose framing is what a model reads back to the user.
 #[tokio::test]
@@ -1828,12 +1942,22 @@ async fn hqplayer_round_trip_reports_a_live_connection() {
         .connect()
         .await
         .expect("HQPlayer must connect to the mock");
+    state
+        .hqp_instances
+        .refresh_instance("default")
+        .await
+        .expect("the coherent observation must reach the aggregator");
 
     let app = TestApp::with_state(state.clone());
 
     let mut connected = false;
     for _ in 0..50 {
-        if state.hqplayer.get_status().await.connected {
+        if state
+            .aggregator
+            .get_hqplayer_snapshot("default")
+            .await
+            .is_some_and(|snapshot| snapshot.observation.connection.connected)
+        {
             connected = true;
             break;
         }
@@ -2023,6 +2147,59 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
     (
         "pipeline",
         DisplayOnly("hifi_hqplayer_status grouping key wrapping the pipeline readout"),
+    ),
+    (
+        "options",
+        DisplayOnly("discover-before-set grouping key for HQPlayer advanced controls"),
+    ),
+    (
+        "options_unavailable_reason",
+        DisplayOnly("actionable diagnostic when a connected HQPlayer cannot provide one coherent options snapshot"),
+    ),
+    (
+        "current",
+        Consumed("hifi_hqplayer_set_pipeline.value"),
+    ),
+    (
+        "choices",
+        Consumed("hifi_hqplayer_set_pipeline.value"),
+    ),
+    ("mode", Consumed("hifi_hqplayer_set_pipeline.setting='mode'")),
+    (
+        "samplerate",
+        Consumed("hifi_hqplayer_set_pipeline.setting='samplerate'"),
+    ),
+    (
+        "filter1x",
+        Consumed("hifi_hqplayer_set_pipeline.setting='filter1x'"),
+    ),
+    (
+        "filterNx",
+        Consumed("hifi_hqplayer_set_pipeline.setting='filterNx'"),
+    ),
+    (
+        "junk_filter",
+        Consumed("hifi_hqplayer_set_pipeline.setting='junk_filter'"),
+    ),
+    (
+        "matrix_profile",
+        Consumed("hifi_hqplayer_set_pipeline.setting='matrix_profile'"),
+    ),
+    (
+        "convolution",
+        Consumed("hifi_hqplayer_set_pipeline.setting='convolution'"),
+    ),
+    (
+        "adaptive_volume",
+        Consumed("hifi_hqplayer_set_pipeline.setting='adaptive_volume'"),
+    ),
+    (
+        "repeat",
+        Consumed("hifi_hqplayer_set_pipeline.setting='repeat'"),
+    ),
+    (
+        "random",
+        Consumed("hifi_hqplayer_set_pipeline.setting='random'"),
     ),
     (
         "filter",
@@ -2372,6 +2549,27 @@ async fn no_tool_returns_an_unclassified_field() {
         .expect("McpPipelineStatus must serialize"),
         &mut returned,
     );
+    let selection = || McpHqpSelection {
+        current: String::new(),
+        choices: Vec::new(),
+    };
+    collect_keys(
+        &serde_json::to_value(McpHqpOptions {
+            mode: selection(),
+            samplerate: selection(),
+            filter1x: selection(),
+            filter_nx: selection(),
+            shaper: selection(),
+            junk_filter: selection(),
+            matrix_profile: selection(),
+            convolution: false,
+            adaptive_volume: false,
+            repeat: String::new(),
+            random: false,
+        })
+        .expect("McpHqpOptions must serialize"),
+        &mut returned,
+    );
     // #395: hifi_play's success payload. Same reasoning — its success path needs a
     // live music library, which no mock provides, so serialize the production type
     // rather than trusting a comment.
@@ -2585,14 +2783,24 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
         "hifi_hqplayer_set_pipeline",
         || json!({ "setting": "samplerate", "value": "not-a-number" }),
     ),
-    // Added by #398, so its expected text is in TEXT_ADDITIONS rather than in the
-    // pre-envelope fixture. It is the only case producing a `not_implemented`
-    // refusal now that OpenHome/UPnP volume is wired, so
-    // `every_refusal_reason_is_actually_produced` depends on it.
+    // #328 wires transport/volume for a direct HQPlayer zone through
+    // `HqpInstanceManager` resolution — a zone id naming an instance nothing ever
+    // configured now fails as a backend error naming the missing instance,
+    // rather than #398's `not_implemented` (that classification moved to
+    // `hifi_search`/`hifi_play` below, which still have no HQPlayer content
+    // path).
     (
-        "hifi_control/hqplayer_zone_not_wired",
+        "hifi_control/hqplayer_instance_not_configured",
         "hifi_control",
         || json!({ "zone_id": "hqplayer:desktop", "action": "play" }),
+    ),
+    // Added by #328. HQPlayer's library gap (#209) is the only case left
+    // producing a `not_implemented` refusal now that transport/volume are wired,
+    // so `every_refusal_reason_is_actually_produced` depends on it.
+    (
+        "hifi_search/hqplayer_zone_has_no_library",
+        "hifi_search",
+        || json!({ "query": "Eagles", "zone_id": "hqplayer:desktop" }),
     ),
 ];
 
@@ -2602,14 +2810,20 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
 /// reason: `mcp_tool_text.json` is not edited, so a case that postdates it needs
 /// its expected value stated somewhere a reader can see. Every string a tool
 /// returns is therefore accounted for in exactly one of the three places.
-const TEXT_ADDITIONS: &[(&str, &str)] = &[(
-    "hifi_control/hqplayer_zone_not_wired",
-    "Error: hqplayer zones are not controllable from MCP yet: HqpAdapter implements play, \
-     pause, stop, next, previous, seek, set_volume and volume_up/down \
-     (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones \
-     lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them. \
-     hifi_capabilities reports what each provider supports.",
-)];
+const TEXT_ADDITIONS: &[(&str, &str)] = &[
+    (
+        "hifi_control/hqplayer_instance_not_configured",
+        "Error: HQPlayer instance 'desktop' is not configured",
+    ),
+    (
+        "hifi_search/hqplayer_zone_has_no_library",
+        "Error: hqplayer zones have no library path from MCP: UHC's HQPlayer adapter speaks \
+         transport, volume, seek and pipeline settings; whether HQPlayer's control protocol \
+         reaches content operations has not been verified here. Reported as not-yet-implemented \
+         rather than as a provider limit, because an unverified 'never' is the more expensive \
+         error. hifi_capabilities reports what each provider supports.",
+    ),
+];
 
 /// Every string #398 changes, with the value it replaces.
 ///
@@ -2631,6 +2845,13 @@ const TEXT_ADDITIONS: &[(&str, &str)] = &[(
 ///
 /// `(fixture key, the string #395 froze, the string #398 replaces it with)`
 const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
+    // #328 makes HQPlayer a normal transport/volume provider, but its native
+    // volume unit is dB rather than the normalized 0-100 scale.
+    (
+        "hifi_control/volume_set_without_value",
+        "Error: volume_set requires a value (0-100)",
+        "Error: volume_set requires a value (0-100, or dB for HQPlayer)",
+    ),
     // #398 wires the MCP volume path to the OpenHome and UPnP adapters, which
     // implement vol_abs/vol_rel and have been reachable over HTTP all along. The
     // old string claimed a provider limitation that does not exist.
@@ -2662,6 +2883,23 @@ const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
         "Error: Control error: Device not found: abc",
         "Error: Unknown action 'frobnicate'. Valid actions: play, pause, playpause, next, \
          previous, prev, volume_set, volume_up, volume_down.",
+    ),
+    // #209 exposes the native immediate controls the adapter now verifies. The
+    // refusal must teach clients the expanded setting vocabulary.
+    (
+        "hifi_hqplayer_set_pipeline/unknown_setting",
+        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither",
+        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, random",
+    ),
+    (
+        "hifi_hqplayer_profiles/empty",
+        "[]",
+        "Error: Failed to list profiles: Web credentials not configured",
+    ),
+    (
+        "hifi_hqplayer_status/disconnected",
+        "{\n  \"connected\": false,\n  \"host\": null,\n  \"pipeline\": null\n}",
+        "{\n  \"connected\": false,\n  \"host\": null,\n  \"pipeline\": null,\n  \"options\": null,\n  \"options_unavailable_reason\": null\n}",
     ),
 ];
 
@@ -2905,7 +3143,11 @@ const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
     ),
     ("hifi_status/disconnected", "ok", None),
     ("hifi_hqplayer_status/disconnected", "ok", None),
-    ("hifi_hqplayer_profiles/empty", "ok", None),
+    (
+        "hifi_hqplayer_profiles/empty",
+        "error",
+        Some("backend_error"),
+    ),
     (
         "hifi_hqplayer_load_profile/disconnected",
         "error",
@@ -2926,10 +3168,17 @@ const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
         "invalid",
         Some("invalid_parameter"),
     ),
-    // The only `not_implemented` left once OpenHome/UPnP volume is wired: a zone
-    // type hifi_zones advertises that hifi_control cannot reach.
+    // #328: a well-formed hqplayer: zone id now reaches HqpInstanceManager
+    // resolution and fails as a backend error, naming the missing instance.
     (
-        "hifi_control/hqplayer_zone_not_wired",
+        "hifi_control/hqplayer_instance_not_configured",
+        "error",
+        Some("backend_error"),
+    ),
+    // The only `not_implemented` left once transport/volume are wired: HQPlayer's
+    // library gap, tracked by #209.
+    (
+        "hifi_search/hqplayer_zone_has_no_library",
         "unsupported",
         Some("not_implemented"),
     ),
@@ -3121,7 +3370,6 @@ async fn envelope_data_parses_equal_to_the_text_payload() {
         "hifi_zones/empty",
         "hifi_status/disconnected",
         "hifi_hqplayer_status/disconnected",
-        "hifi_hqplayer_profiles/empty",
     ];
 
     let cases = all_cases(&app).await;
@@ -3723,13 +3971,13 @@ async fn scope_zone_name_is_absent_for_a_zone_the_aggregator_does_not_hold() {
 // mock a full round-trip can be driven through (see #394's notes on why Roon and
 // OpenHome/UPnP cannot be).
 
-/// A write reports `accepted`, never `ok`, and carries a read-back from the
+/// A write preserves the public `accepted` outcome and carries its confirmed read-back from the
 /// aggregator.
 ///
 /// The two halves of #221 in one assertion: the model is told the command was
-/// accepted (so it stops retrying) and is shown the state (so it does not need a
-/// follow-up call), with `as_of_ms` so it can judge staleness rather than being
-/// handed a conclusion the server cannot support.
+/// accepted (so it stops retrying) and is shown the causally linked state (so it does not need a
+/// follow-up call). Internally the command does not return until that projection commits; the
+/// stable envelope vocabulary remains unchanged.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
@@ -3748,7 +3996,7 @@ async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
     assert_eq!(
         env.get("outcome"),
         Some(&json!("accepted")),
-        "a write must report accepted — nothing here confirms the effect: {env}"
+        "the stable public write outcome remains accepted: {env}"
     );
     assert!(
         env.get("refusal").is_none(),
@@ -3798,6 +4046,11 @@ async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
         "observed.zone and the text's state block must be the same JSON value"
     );
     assert_eq!(from_text.get("zone_id"), Some(&json!(zone_id)));
+    assert_eq!(
+        from_text.get("state"),
+        Some(&json!("playing")),
+        "the endpoint must return the exact post-command LMS readback"
+    );
 
     h.stop().await;
 }
@@ -3808,17 +4061,8 @@ async fn lms_write_reports_accepted_with_state_read_back_from_the_aggregator() {
 /// envelope turns it into: accepted, on this zone, at this level, with a zone
 /// snapshot attached.
 ///
-/// # What this deliberately does not assert
-///
-/// It does not check `observed.zone.volume` against the level just set. LMS state
-/// reaches the aggregator by polling, so the snapshot may well predate the
-/// command — asserting the new level would be asserting the verification #395
-/// forbids inventing, and would make this test flaky the moment poll timing
-/// shifted. `as_of_ms` is there so the client draws that conclusion itself.
-///
-/// An earlier name for this test claimed "the resulting level", which the body
-/// never checked. That is the same mislabelled-coverage defect the design gate's
-/// dissent found elsewhere, so the name now says what the body does.
+/// The reliable LMS endpoint now makes the result stronger than the former polling path: it reads
+/// the exact player after the write and correlates that full Zone commit before returning.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn lms_volume_write_reports_the_resolved_level_and_reads_the_zone_back() {
@@ -3847,9 +4091,12 @@ async fn lms_volume_write_reports_the_resolved_level_and_reads_the_zone_back() {
         env.get("scope").and_then(|s| s.get("provider")),
         Some(&json!("lms"))
     );
-    assert!(
-        env.get("observed").is_some(),
-        "the volume path must read state back too, not just transport: {env}"
+    assert_eq!(
+        env.get("observed")
+            .and_then(|observed| observed.get("zone"))
+            .and_then(|zone| zone.get("volume")),
+        Some(&json!(55.0)),
+        "the volume path must return its verified post-command projection: {env}"
     );
 
     h.stop().await;
@@ -4349,6 +4596,7 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             "lms" => "LMS host not configured",
             "openhome" => "Device not found",
             "upnp" => "Renderer not found",
+            "hqplayer" => "HQPlayer instance 'abc' is not configured",
             other => panic!("no adapter fingerprint for {other}"),
         }
     }
@@ -4371,17 +4619,20 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             )),
             "search" => Some(("hifi_search", json!({ "query": "q", "zone_id": zone_id }))),
             "play_by_query" => Some(("hifi_play", json!({ "query": "q", "zone_id": zone_id }))),
+            "repeat_mode" => Some((
+                "hifi_hqplayer_set_pipeline",
+                json!({ "zone_id": zone_id, "setting": "repeat", "value": "off" }),
+            )),
+            "shuffle_mode" => Some((
+                "hifi_hqplayer_set_pipeline",
+                json!({ "zone_id": zone_id, "setting": "random", "value": "false" }),
+            )),
             _ => None,
         }
     }
 
     let mut proved = 0usize;
     for provider in EXPECTED_PROVIDERS {
-        // HQPlayer zones are recognised but nothing is wired, so there is no
-        // supported cell to prove; that is asserted separately.
-        if *provider == "hqplayer" {
-            continue;
-        }
         for (capability, entry) in capabilities_of(&payload, provider) {
             if support_of(&entry) != SUPPORTED {
                 continue;
@@ -4404,13 +4655,14 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             proved += 1;
         }
     }
-    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2 = 15.
+    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2 +
+    // HQPlayer 5 (transport, skip, volume, repeat, shuffle) = 20.
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 15,
-        "{proved} supported cells were proved end to end, expected 15. If a capability was          deliberately wired or unwired, change this number in the same commit."
+        proved, 20,
+        "{proved} supported cells were proved end to end, expected 20. If a capability was          deliberately wired or unwired, change this number in the same commit."
     );
 }
 
@@ -4540,11 +4792,20 @@ async fn an_unrecognised_zone_prefix_is_refused_instead_of_routed_to_roon() {
     }
 }
 
-/// HQPlayer zones are listed by `hifi_zones` and were being forwarded to Roon.
-/// They are now recognised, and reported as a UHC gap with a tracking issue.
+/// HQPlayer zones are listed by `hifi_zones` and, before #328, every
+/// `hifi_control` call against one was forwarded to Roon. #328 wires transport
+/// and volume through `HqpInstanceManager` resolution instead: a zone id naming
+/// an instance nothing configured now fails as a backend error naming that
+/// instance, never as a Roon failure and never as `not_implemented` (which
+/// would claim UHC has not wired this at all).
+///
+/// Live dispatch to a *configured* instance is exercised end-to-end in
+/// `tests/mcp_hqplayer_control.rs`, against the stateful HQPlayer wire fake —
+/// this test's job is only the routing/envelope contract for the zone id this
+/// fixture never configures an instance for.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn hqplayer_zones_are_recognised_and_reported_as_not_wired() {
+async fn hqplayer_zones_are_recognised_and_wired_to_hqp_instance_manager() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
@@ -4558,27 +4819,29 @@ async fn hqplayer_zones_are_recognised_and_reported_as_not_wired() {
             !text.contains("Not connected to Roon"),
             "an hqplayer: zone must not be forwarded to the Roon adapter; got {text:?}"
         );
+        assert!(
+            text.contains("HQPlayer instance 'desktop' is not configured"),
+            "an hqplayer: zone must resolve through HqpInstanceManager, naming the missing \
+             instance rather than a generic refusal; got {text:?}"
+        );
 
         let env = envelope(&result, "hifi_control");
         assert_eq!(
             env.get("outcome").and_then(Value::as_str),
-            Some("unsupported"),
-            "the zone id is valid and the operation is not wired: {env}"
+            Some("error"),
+            "a well-formed but unconfigured instance is a backend failure, not a capability \
+             refusal: {env}"
         );
         assert_eq!(
             env.pointer("/refusal/reason").and_then(Value::as_str),
-            Some("not_implemented"),
-            "HQPlayer's adapter has play/pause/next/volume, so this is UHC's gap: {env}"
-        );
-        assert_eq!(
-            env.pointer("/refusal/tracked_by").and_then(Value::as_str),
-            Some("#328"),
-            "the gap must name the issue that closes it: {env}"
+            Some("backend_error"),
+            "transport/volume are wired (#328); this is the instance lookup failing, not UHC \
+             declining the operation: {env}"
         );
         assert_eq!(
             env.pointer("/scope/provider").and_then(Value::as_str),
             Some("hqplayer"),
-            "the prefix identifies the provider even though nothing is wired: {env}"
+            "the prefix identifies the provider: {env}"
         );
     }
 }
@@ -5098,12 +5361,22 @@ async fn hqplayer_status_resource_agrees_with_the_tool_for_a_live_connection() {
         .connect()
         .await
         .expect("HQPlayer must connect to the mock");
+    state
+        .hqp_instances
+        .refresh_instance("default")
+        .await
+        .expect("the coherent observation must reach the aggregator");
 
     let app = TestApp::with_state(state.clone());
 
     let mut connected = false;
     for _ in 0..50 {
-        if state.hqplayer.get_status().await.connected {
+        if state
+            .aggregator
+            .get_hqplayer_snapshot("default")
+            .await
+            .is_some_and(|snapshot| snapshot.observation.connection.connected)
+        {
             connected = true;
             break;
         }
@@ -5136,11 +5409,9 @@ async fn hqplayer_status_resource_agrees_with_the_tool_for_a_live_connection() {
     mock.stop().await;
 }
 
-/// The profiles counterpart to the status test above. Trivially equal with no
-/// profiles cached (both are `[]`), which is honest: `get_cached_profiles`
-/// needs a `list_profiles` round-trip the mock doesn't drive here, and the
-/// point of this test is the shared-function property (`hqp_profiles_payload`
-/// is the one place either path reads from), not a specific profile list.
+/// The profiles counterpart to the status test above. A fresh server without
+/// HQPlayer web credentials must not fabricate an empty profile list: both
+/// surfaces report the same underlying unavailability.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
 async fn hqplayer_profiles_resource_agrees_with_hifi_hqplayer_profiles_tool() {
@@ -5148,20 +5419,13 @@ async fn hqplayer_profiles_resource_agrees_with_hifi_hqplayer_profiles_tool() {
     let app = TestApp::new().await;
 
     let tool_text = result_text(&app.call_tool("hifi_hqplayer_profiles", json!({})).await);
-    let tool_value: Value =
-        serde_json::from_str(&tool_text).expect("hifi_hqplayer_profiles must return JSON");
+    assert!(tool_text.contains("Web credentials not configured"));
 
     let read = app.read_resource("hifi://hqplayer/profiles").await;
-    let resource_text = read
-        .pointer("/result/contents/0/text")
-        .and_then(Value::as_str)
-        .expect("hifi://hqplayer/profiles must return text contents");
-    let resource_value: Value =
-        serde_json::from_str(resource_text).expect("resource contents must be JSON");
-
     assert_eq!(
-        tool_value, resource_value,
-        "hifi://hqplayer/profiles must carry exactly the hifi_hqplayer_profiles tool's payload"
+        read.pointer("/error/data/reason").and_then(Value::as_str),
+        Some("Web credentials not configured"),
+        "hifi://hqplayer/profiles must expose the same unavailable reason as the tool: {read}"
     );
 }
 

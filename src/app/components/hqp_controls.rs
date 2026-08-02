@@ -31,12 +31,16 @@ pub fn HqpProfileSelect(
             option { value: "", "Profile..." }
             for profile in profiles.iter() {
                 {
-                    let name = profile.name.as_deref().unwrap_or_default();
-                    let title = profile.title.as_deref().unwrap_or(name);
+                    let value = profile
+                        .value
+                        .as_deref()
+                        .or(profile.name.as_deref())
+                        .unwrap_or_default();
+                    let title = profile.title.as_deref().unwrap_or(value);
                     rsx! {
                         option {
-                            key: "{name}",
-                            value: "{name}",
+                            key: "{value}",
+                            value: "{value}",
                             "{title}"
                         }
                     }

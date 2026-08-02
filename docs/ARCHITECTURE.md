@@ -15,8 +15,8 @@ A source-agnostic hi-fi control platform where **complexity is absorbed by the b
            │
            ▼
 ┌─────────────────────────────────────────────────────────┐
-│                       EventBus                           │
-│  (tokio broadcast: zone events, commands, lifecycle)    │
+│                    In-App Bus Runtime                    │
+│  (bounded commands + ordered projection ingress)        │
 └─────────────────────────────────────────────────────────┘
      ▲           ▲           ▲              │
      │           │           │              ▼
@@ -48,14 +48,17 @@ A source-agnostic hi-fi control platform where **complexity is absorbed by the b
 - ACK on stop is automatic
 
 ### EventBus
-- Zone lifecycle: `ZoneDiscovered`, `ZoneUpdated`, `ZoneRemoved`
-- Now playing: `NowPlayingChanged`
-- Commands: `Command`, `CommandResponse`
-- Lifecycle: `AdapterStopping`, `AdapterStopped`, `ZonesFlushed`, `ShuttingDown`
+- Critical adapter communication uses private bounded request/reply lanes, never `broadcast`.
+- Commands are correlated, deadline-aware, and routed to one provider or exact-zone endpoint.
+- Native acceptance is not success: confirmation requires a causally linked projection commit.
+- Canonical observations carry source epoch and sequence and commit atomically at one revision.
+- The existing `BusEvent` broadcast is post-commit notification/lifecycle egress only. Receivers
+  reread the aggregator; they never reconstruct canonical state from the notification stream.
 
 ### ZoneAggregator
 - Single source of truth for zone state
-- Subscribes to bus, maintains `HashMap<zone_id, Zone>`
+- Admits ordered observations from the reliable bus and maintains the canonical projection
+- Rejects stale/duplicate observations and marks sequence gaps reconciling until a snapshot commits
 - Flushes zones on `AdapterStopping`
 - API calls this, never adapters directly
 
@@ -104,12 +107,13 @@ Real-time event streaming for clients via `/events` endpoint.
    - No "searching" for disabled backends
 
 2. **Zone identity is the zone_id prefix**
-   - `roon:`, `lms:`, `openhome:`, `upnp:`, `hqp:`
+   - `roon:`, `lms:`, `openhome:`, `upnp:`, `hqplayer:`
    - No separate `source` or `protocol` fields
 
-3. **Adapters are event publishers**
+3. **Adapters communicate only through the in-app bus**
    - Don't store zones (aggregator does)
-   - Publish events, handle commands
+   - Publish ordered observations and handle routed commands
+   - Never call the aggregator or a client surface directly
    - Lifecycle managed by handle
 
 4. **Clean shutdown path**
@@ -117,6 +121,19 @@ Real-time event streaming for clients via `/events` endpoint.
    - `AdapterStopping(prefix)` → Aggregator flushes
    - `stop()` with ACK → Coordinator waits
    - No hanging on Ctrl+C
+
+## Adaptive-Control Producer Contract (dormant)
+
+The repository retains an experimental versioned **producer document** contract for compatibility
+and design history. No production adapter currently publishes it and no public surface consumes it.
+See
+[architecture/adaptive-producer-contract-v1.md](./architecture/adaptive-producer-contract-v1.md)
+and [ADR 003](./adr/003-adaptive-producer-document-v1.md).
+
+HQPlayer instead publishes its typed coherent observation through the reliable in-app projection
+lane to `ZoneAggregator`, the same state owner used by every other zone. Web, knob, HTTP, and MCP surfaces read that aggregator and
+share the managed command path. `src/adaptive/` remains description-only; it depends on nothing but
+`serde`, `serde_json` and `std`, enforced by `tests/adaptive_dependency_lint.rs`.
 
 ## Implementation
 

@@ -29,8 +29,9 @@
 //!   two providers, and #395's envelope already flagged it `not_implemented`
 //!   tracked by #398. It is now simply implemented.
 //! - **An unplaceable zone id is refused instead of routed to Roon**, for both
-//!   transport and volume, and an `hqplayer:` zone is refused *as HQPlayer* with
-//!   #328 attached instead of being sent to Roon.
+//!   transport and volume, instead of being sent to Roon. An `hqplayer:` zone was
+//!   refused this way too, tracked by #328 — #328 itself now wires it instead,
+//!   through [`handle_hqplayer_control`], its own dispatch below.
 //!
 //! `operation` still reports the *normalized* action, so `prev` surfaces as
 //! `previous` and `playpause` as `play_pause`; `params.value` still reports the
@@ -50,9 +51,15 @@
 //! refusal and `hifi_capabilities`' report cannot describe the same gap two
 //! different ways.
 
-use crate::api::AppState;
+use crate::api::{
+    dispatch_lms_runtime_command, dispatch_openhome_runtime_command, dispatch_roon_runtime_command,
+    dispatch_upnp_runtime_command, lms_runtime_command_from_action,
+    renderer_runtime_command_from_action, AppState,
+};
+use crate::bus::Command;
+use crate::knobs::routes::{dispatch_hqplayer_action, HqpDispatchError};
 use crate::mcp::capabilities::{support, Capability};
-use crate::mcp::envelope::{Envelope, Observed, Refusal, Scope};
+use crate::mcp::envelope::{Envelope, Observed, Provider, Refusal, Scope};
 use crate::mcp::routing::{
     unplaceable_zone_refusal, unplaceable_zone_text, TransportRoute, VolumeRoute, ZoneTarget,
     CONTROL_ACTIONS, TRANSPORT_ACTIONS,
@@ -66,15 +73,15 @@ use serde::{Deserialize, Serialize};
 /// Control playback
 #[mcp_tool(
     name = "hifi_control",
-    description = "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume"
+    description = "Control playback and volume. Common actions: play, pause, playpause, next, previous, volume_set, volume_up, volume_down. HQPlayer also supports stop, seek, and mute."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiControlTool {
     /// The zone ID to control
     pub zone_id: String,
-    /// Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down
+    /// Common action: play, pause, playpause, next, previous, volume_set, volume_up, or volume_down. HQPlayer also accepts stop, seek, and mute.
     pub action: String,
-    /// For volume actions: the level (0-100 for volume_set) or amount to change
+    /// For seek, the position in seconds. For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
 }
@@ -86,11 +93,21 @@ pub async fn handle_control(
     state: &AppState,
     args: HifiControlTool,
 ) -> Result<CallToolResult, CallToolError> {
+    // A direct HQPlayer zone is resolved through `HqpInstanceManager`, not the
+    // single shared adapter the other four providers use, and it accepts a wider
+    // action vocabulary (stop/seek/mute, #328) than `CONTROL_ACTIONS` — so it is
+    // its own dispatch, branched before the closed-set check below rather than
+    // folded into it. `ZoneTarget::classify` is pure and does no I/O, so checking
+    // it first costs nothing on the other four providers' path.
+    if ZoneTarget::classify(&args.zone_id) == ZoneTarget::HqPlayer {
+        return handle_hqplayer_control(state, args).await;
+    }
+
     // The action is checked first, and before the zone is classified. It is a
     // closed set with no I/O behind it, so this is the cheapest fault to name —
     // and naming it does not depend on the zone id being right.
     if !CONTROL_ACTIONS.contains(&args.action.as_str()) {
-        return unknown_action(state, &args.zone_id, &args.action).await;
+        return unknown_action(state, &args.zone_id, &args.action, CONTROL_ACTIONS).await;
     }
 
     // Map MCP actions to backend actions. Volume actions divert to the volume
@@ -121,10 +138,10 @@ pub async fn handle_control(
                     .await,
                 )
                 .refused(
-                    "volume_set requires a value (0-100)",
+                    "volume_set requires a value (0-100, or dB for HQPlayer)",
                     Refusal::invalid_parameter(
                         "value",
-                        &["0-100"],
+                        &["0-100", "HQPlayer dB"],
                         "action='volume_set' sets an absolute level and has no default. \
                          Use volume_up or volume_down for a relative change.",
                     ),
@@ -143,7 +160,7 @@ pub async fn handle_control(
         // `routing::tests::control_actions_cover_the_documented_set` proves the
         // two lists agree. Refused rather than forwarded, because forwarding is
         // exactly what #398 removed.
-        _ => return unknown_action(state, &args.zone_id, &args.action).await,
+        _ => return unknown_action(state, &args.zone_id, &args.action, CONTROL_ACTIONS).await,
     };
 
     let target = ZoneTarget::classify(&args.zone_id);
@@ -164,23 +181,32 @@ pub async fn handle_control(
     }
 
     let result = match route {
-        TransportRoute::Lms => state.lms.control(&args.zone_id, backend_action, None).await,
+        TransportRoute::Lms => match lms_runtime_command_from_action(backend_action, None) {
+            Ok(command) => dispatch_lms_runtime_command(state, &args.zone_id, command).await,
+            Err(error) => Err(error),
+        },
         TransportRoute::OpenHome => {
-            state
-                .openhome
-                .control(&args.zone_id, backend_action, None)
-                .await
+            match renderer_runtime_command_from_action(backend_action, None) {
+                Ok(command) => {
+                    dispatch_openhome_runtime_command(state, &args.zone_id, command).await
+                }
+                Err(error) => Err(error),
+            }
         }
-        TransportRoute::Upnp => {
-            state
-                .upnp
-                .control(&args.zone_id, backend_action, None)
-                .await
-        }
-        TransportRoute::Roon => state.roon.control(&args.zone_id, backend_action).await,
+        TransportRoute::Upnp => match renderer_runtime_command_from_action(backend_action, None) {
+            Ok(command) => dispatch_upnp_runtime_command(state, &args.zone_id, command).await,
+            Err(error) => Err(error),
+        },
+        TransportRoute::Roon => match renderer_runtime_command_from_action(backend_action, None) {
+            Ok(command) => dispatch_roon_runtime_command(state, &args.zone_id, command).await,
+            Err(error) => Err(error),
+        },
         // Handled above; kept exhaustive rather than caught by a wildcard so a
         // new route variant fails to compile instead of falling through.
         TransportRoute::Refused(_) => unreachable_refused(),
+        // `handle_control` returns through `handle_hqplayer_control` for every
+        // `ZoneTarget::HqPlayer` zone id before this match is ever reached.
+        TransportRoute::HqPlayer => unreachable_refused(),
     };
 
     // One aggregator snapshot serves both `scope.zone_name` and `observed`, so
@@ -223,16 +249,141 @@ pub async fn handle_control(
     }
 }
 
-/// Refuse an action outside [`CONTROL_ACTIONS`].
+/// The action vocabulary a direct HQPlayer zone accepts through `hifi_control`.
+///
+/// A superset of [`CONTROL_ACTIONS`]. `stop`, `seek` and `mute` are additions
+/// #328 wires for HQPlayer specifically: `HqpAdapter` has a working call for
+/// each (`stop`, `seek`, `volume_mute` — `src/adapters/hqplayer.rs`), and no
+/// other adapter's `hifi_control` path exposes seek at all, so adding it to the
+/// shared list would offer four providers an action that does nothing.
+const HQPLAYER_CONTROL_ACTIONS: &[&str] = &[
+    "play",
+    "pause",
+    "playpause",
+    "next",
+    "previous",
+    "prev",
+    "stop",
+    "seek",
+    "mute",
+    "volume_set",
+    "volume_up",
+    "volume_down",
+];
+
+/// `hifi_control` for a direct HQPlayer zone (`hqplayer:<instance_name>`).
+///
+/// Its own dispatch rather than a branch inside the shared match above, for two
+/// reasons #328 could not fold into it:
+///
+/// - The zone id names an `HqpInstanceManager` instance, not one of the four
+///   providers' single shared adapter — resolution is a name lookup, not a
+///   route.
+/// - The action vocabulary is wider ([`HQPLAYER_CONTROL_ACTIONS`]), and volume
+///   is decimal-dB clamped to the zone's own observed range rather than an
+///   integer clamped to 0-100.
+///
+/// All direct HQPlayer surfaces use the same dispatcher. It validates against
+/// aggregator-owned state, executes the native command, then performs a coherent
+/// readback into the aggregator before reporting success.
+pub(crate) async fn handle_hqplayer_control(
+    state: &AppState,
+    args: HifiControlTool,
+) -> Result<CallToolResult, CallToolError> {
+    if !HQPLAYER_CONTROL_ACTIONS.contains(&args.action.as_str()) {
+        return unknown_action(state, &args.zone_id, &args.action, HQPLAYER_CONTROL_ACTIONS).await;
+    }
+
+    let env = Envelope::write("hifi_control", hqplayer_operation(&args.action))
+        .param("zone_id", &*args.zone_id)
+        .param("action", &*args.action)
+        .scope(Scope::for_zone(state, &args.zone_id, Provider::HqPlayer).await);
+
+    let instance_name = args
+        .zone_id
+        .strip_prefix("hqplayer:")
+        .unwrap_or(&args.zone_id);
+    let dispatch_action = match args.action.as_str() {
+        "volume_set" => "volume",
+        other => other,
+    };
+    let resolved_value = match args.action.as_str() {
+        "volume_up" | "volume_down" => Some(args.value.unwrap_or(DEFAULT_VOLUME_DELTA)),
+        _ => args.value,
+    };
+    let env = match resolved_value {
+        Some(value) => env.param("value", value),
+        None => env,
+    };
+
+    match dispatch_hqplayer_action(
+        state,
+        &args.zone_id,
+        instance_name,
+        dispatch_action,
+        resolved_value,
+    )
+    .await
+    {
+        Ok(()) => {
+            // The HQPlayer dispatcher returns only after its correlated native
+            // readback has committed. Return that aggregator-owned zone in the
+            // same shape as every other provider, instead of merely claiming in
+            // prose that a verified projection exists.
+            let observed = Observed::from_aggregator(state, &args.zone_id).await;
+            Ok(env.observed(observed).text_result(format!(
+                "Action '{}' executed and verified state was published.",
+                args.action
+            )))
+        }
+        Err(HqpDispatchError::NotFound(message)) => env.failed(message),
+        Err(HqpDispatchError::BadRequest { message, .. }) => env.refused(
+            message,
+            Refusal::invalid_parameter(
+                "value",
+                &["a value valid for the selected HQPlayer action"],
+                "The action was rejected against the zone state published by the aggregator.",
+            ),
+        ),
+        Err(HqpDispatchError::Backend(message)) => env.failed(message),
+    }
+}
+
+/// The envelope's `operation` for a direct HQPlayer action — the normalized name
+/// of what was asked for, same convention as `handle_control`'s `backend_action`.
+fn hqplayer_operation(action: &str) -> &'static str {
+    match action {
+        "play" => "play",
+        "pause" => "pause",
+        "stop" => "stop",
+        "next" => "next",
+        "previous" | "prev" => "previous",
+        "playpause" => "play_pause",
+        "seek" => "seek",
+        "mute" => "mute",
+        "volume_set" => "volume_absolute",
+        "volume_up" | "volume_down" => "volume_relative",
+        // Unreachable: every `HQPLAYER_CONTROL_ACTIONS` entry has an arm above.
+        _ => "unknown_action",
+    }
+}
+
+/// Refuse an action outside the accepted set.
 ///
 /// `operation` is the literal `"unknown_action"` rather than the string the client
 /// sent. Before #398, `other => other` put the unrecognised action straight into
 /// `operation`, which made that field an open set and let an envelope report a verb
 /// UHC does not have as though it were one.
+///
+/// `accepted` is a parameter rather than always [`CONTROL_ACTIONS`] because a
+/// direct HQPlayer zone accepts a wider vocabulary (`stop`/`seek`/`mute`, #328) —
+/// see [`HQPLAYER_CONTROL_ACTIONS`] — and the refusal should name the set that
+/// actually applies to this zone, not the other four providers' set.
 async fn unknown_action(
     state: &AppState,
     zone_id: &str,
     action: &str,
+    accepted: &'static [&'static str],
 ) -> Result<CallToolResult, CallToolError> {
     Envelope::write("hifi_control", "unknown_action")
         .param("zone_id", zone_id)
@@ -241,11 +392,11 @@ async fn unknown_action(
         .refused(
             format!(
                 "Unknown action '{action}'. Valid actions: {}.",
-                CONTROL_ACTIONS.join(", ")
+                accepted.join(", ")
             ),
             Refusal::invalid_parameter(
                 "action",
-                CONTROL_ACTIONS,
+                accepted,
                 "hifi_control's action set is closed. Until #398 an unrecognised action was \
                  forwarded to the backend, which then answered about whatever it thought you \
                  meant; now it is refused here, with the whole set.",
@@ -253,11 +404,10 @@ async fn unknown_action(
         )
 }
 
-/// Volume, absolute or relative.
-///
-/// Since #398 this reaches all four zone-controlling adapters. What it refuses is a
-/// zone id it cannot place, and an `hqplayer:` zone — the latter named as
-/// HQPlayer's gap rather than as a nonexistent provider's limit.
+/// Volume, absolute or relative, for the four zone-controlling adapters #398
+/// wired here. A direct HQPlayer zone's volume goes through
+/// [`handle_hqplayer_control`] instead — decimal-dB and clamped to the zone's
+/// observed range, neither of which this integer-rounding path does.
 async fn set_volume(
     state: &AppState,
     zone_id: &str,
@@ -289,7 +439,9 @@ async fn set_volume(
         VolumeRoute::OpenHome | VolumeRoute::Upnp => env.param("value", integer_volume),
         // Nothing is sent on a refusal, so the client's resolved request is the
         // honest value to report.
-        VolumeRoute::Lms | VolumeRoute::Roon | VolumeRoute::Refused(_) => env.param("value", value),
+        VolumeRoute::Lms | VolumeRoute::Roon | VolumeRoute::Refused(_) | VolumeRoute::HqPlayer => {
+            env.param("value", value)
+        }
     };
 
     if let VolumeRoute::Refused(refused) = route {
@@ -298,16 +450,32 @@ async fn set_volume(
 
     let result = match route {
         VolumeRoute::Lms => {
-            state
-                .lms
-                .change_volume(zone_id, value as f32, relative)
-                .await
+            let command = if relative {
+                Command::VolumeRelative {
+                    delta: value as f32,
+                    output_id: None,
+                }
+            } else {
+                Command::VolumeAbsolute {
+                    value: value as f32,
+                    output_id: None,
+                }
+            };
+            dispatch_lms_runtime_command(state, zone_id, command).await
         }
         VolumeRoute::Roon => {
-            state
-                .roon
-                .change_volume(zone_id, value as f32, relative)
-                .await
+            let command = if relative {
+                Command::VolumeRelative {
+                    delta: value as f32,
+                    output_id: None,
+                }
+            } else {
+                Command::VolumeAbsolute {
+                    value: value as f32,
+                    output_id: None,
+                }
+            };
+            dispatch_roon_runtime_command(state, zone_id, command).await
         }
         // #398. Both adapters clamp to 0-100 themselves — `vol_abs` clamps the
         // level, `vol_rel` clamps the sum — and both take an integer, which is
@@ -315,18 +483,37 @@ async fn set_volume(
         // deserializes `value` as an integer). So this reaches the adapter
         // identically to how the web UI does.
         VolumeRoute::OpenHome => {
-            state
-                .openhome
-                .control(zone_id, volume_action(relative), Some(integer_volume))
-                .await
+            let command = if relative {
+                Command::VolumeRelative {
+                    delta: integer_volume as f32,
+                    output_id: None,
+                }
+            } else {
+                Command::VolumeAbsolute {
+                    value: integer_volume as f32,
+                    output_id: None,
+                }
+            };
+            dispatch_openhome_runtime_command(state, zone_id, command).await
         }
         VolumeRoute::Upnp => {
-            state
-                .upnp
-                .control(zone_id, volume_action(relative), Some(integer_volume))
-                .await
+            let command = if relative {
+                Command::VolumeRelative {
+                    delta: integer_volume as f32,
+                    output_id: None,
+                }
+            } else {
+                Command::VolumeAbsolute {
+                    value: integer_volume as f32,
+                    output_id: None,
+                }
+            };
+            dispatch_upnp_runtime_command(state, zone_id, command).await
         }
         VolumeRoute::Refused(_) => unreachable_refused(),
+        // `handle_control` returns through `handle_hqplayer_control` for every
+        // `ZoneTarget::HqPlayer` zone id before this function is ever called.
+        VolumeRoute::HqPlayer => unreachable_refused(),
     };
 
     let env = env.scope(Scope::for_zone(state, zone_id, target.provider()).await);
@@ -344,18 +531,6 @@ async fn set_volume(
             )))
         }
         Err(e) => env.failed(format!("Volume error: {}", e)),
-    }
-}
-
-/// The OpenHome/UPnP `control` action name for a volume write.
-///
-/// Both adapters spell absolute volume `vol_abs` (with `volume` as a synonym) and
-/// relative `vol_rel`.
-fn volume_action(relative: bool) -> &'static str {
-    if relative {
-        "vol_rel"
-    } else {
-        "vol_abs"
     }
 }
 
