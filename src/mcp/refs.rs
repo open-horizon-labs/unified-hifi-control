@@ -163,8 +163,16 @@ impl Inner {
     /// oldest-inserted token(s). A loop rather than a single pop because a
     /// token at the front of `order` may already have been removed by a prior
     /// expiry-on-read, in which case it is skipped rather than counted.
+    ///
+    /// Gated on `order.len()` as well as `entries.len()`: an entry expiring
+    /// on read (see `RefTable::resolve`) shrinks `entries` without touching
+    /// `order`, so a table that expires faster than it fills would never
+    /// trip an `entries.len()`-only check and `order` would grow one token
+    /// per mint forever. Popping while *either* is at capacity drains those
+    /// already-expired fronts on the next mint instead of leaving them
+    /// stranded.
     fn evict_to_capacity(&mut self) {
-        while self.entries.len() >= self.capacity {
+        while self.entries.len() >= self.capacity || self.order.len() >= self.capacity {
             match self.order.pop_front() {
                 Some(oldest) => {
                     self.entries.remove(&oldest);
@@ -255,6 +263,15 @@ impl RefTable {
     #[cfg(test)]
     async fn len(&self) -> usize {
         self.inner.lock().await.entries.len()
+    }
+
+    /// The length of the insertion-order queue, independent of `entries.len()`
+    /// -- the two can diverge when entries expire on read (see `resolve`)
+    /// faster than eviction runs. Exists only so a test can prove `order`
+    /// itself stays bounded, not merely `entries`.
+    #[cfg(test)]
+    async fn order_len(&self) -> usize {
+        self.inner.lock().await.order.len()
     }
 }
 
@@ -488,6 +505,40 @@ mod tests {
                 assert!(resolved.is_some(), "mint {i} should still be live");
             }
         }
+    }
+
+    /// `order` stays bounded even when it is expiry, not eviction, doing the
+    /// shrinking -- a table whose entries always expire before the next mint
+    /// never trips an `entries.len()`-only capacity check (`entries` is
+    /// already near-empty every time `mint` runs), so without also gating on
+    /// `order.len()` this would grow by one token per mint forever. CodeRabbit
+    /// review on PR #427.
+    #[tokio::test]
+    async fn order_does_not_leak_when_expiry_outpaces_eviction() {
+        let table = RefTable::with_capacity_and_ttl(5, Duration::from_millis(5));
+        for i in 0..50 {
+            let token = table.mint(lms_target(i, "Fleeting")).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Resolving a stale ref is what actually triggers `entries`'
+            // lazy expiry removal (see `resolve`) -- exactly what happens
+            // in production whenever a client looks up an old ref. Nothing
+            // sweeps `entries` on its own, so without this the test would
+            // only be proving mint() alone never shrinks anything.
+            assert!(
+                table.resolve(&token).await.is_none(),
+                "token {i} should already have expired"
+            );
+        }
+
+        assert!(
+            table.len().await <= 1,
+            "entries should stay near-empty since every token was resolved past its TTL before the next mint"
+        );
+        assert!(
+            table.order_len().await <= 5,
+            "order leaked to {} entries despite entries.len() never approaching capacity",
+            table.order_len().await
+        );
     }
 
     /// A ref past its TTL resolves to `None`, indistinguishable from one that
