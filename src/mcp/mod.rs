@@ -19,6 +19,7 @@
 //! | [`envelope`] | the structured result envelope every tool fills           |
 //! | [`routing`]  | zone-prefix -> adapter, in exactly one place              |
 //! | [`capabilities`] | per-provider capability truth, in three states        |
+//! | [`refs`]     | the opaque ref table `hifi_search` mints into and `hifi_play_ref` resolves from (#396) |
 //! | [`resources`] | readable bridge state addressable by URI (#397)          |
 //!
 //! # The MCP surface is pinned by tests
@@ -35,6 +36,7 @@
 pub mod capabilities;
 pub mod envelope;
 pub mod handler;
+pub mod refs;
 pub mod resources;
 pub mod routing;
 pub mod server;

@@ -502,6 +502,25 @@ struct Level {
 #[derive(Default)]
 struct Session {
     levels: Vec<Level>,
+    /// Keys *this session itself* has minted (via `handle_load`), each
+    /// tagged with the epoch (see [`Self::epoch`]) it was minted in.
+    ///
+    /// Deliberately **not** a simple "is this key currently valid" set: a key
+    /// this session has never minted at all (reused from a different
+    /// session) must fall through to the existing cross-session checks
+    /// (`CoreState::minted` / [`ItemKeyScope`]) unaffected by anything here —
+    /// `play_item` legitimately mints a fresh, unrelated session and browses
+    /// a foreign key inside it under [`ItemKeyScope::Global`], and that must
+    /// keep working. This map only ever *adds* a restriction for keys this
+    /// exact session minted and then invalidated by popping past them.
+    minted_at_epoch: HashMap<String, u64>,
+    /// Incremented on every `pop_all`. Verified live against a real Core
+    /// (nuc14, Roon 2.70, #396's ship-gate re-review): `pop_all` invalidates
+    /// every key minted at the levels it discards, not merely the client's
+    /// conceptual position -- a key this session minted in an earlier epoch
+    /// is `InvalidItemKey` now, even though the global arena still contains
+    /// it and even under [`ItemKeyScope::Global`].
+    epoch: u64,
 }
 
 struct CoreState {
@@ -535,6 +554,11 @@ struct CoreState {
     /// assert the Core correlated its refusal to the right request and session even
     /// though today's adapter throws the payload away.
     errors: Vec<(usize, String, String)>,
+    /// Session keys of every browse request that combined `pop_all: true`
+    /// with a present `item_key` -- see the `handle_browse` comment at that
+    /// check. Empty is the passing state for any test asserting this
+    /// combination was never sent.
+    illegal_pop_all_with_item_key: Vec<String>,
     core_id: String,
     display_name: String,
     display_version: String,
@@ -581,6 +605,7 @@ impl FakeRoonCore {
             log: Vec::new(),
             sent: Vec::new(),
             errors: Vec::new(),
+            illegal_pop_all_with_item_key: Vec::new(),
             // Per-instance, so two fakes running concurrently are distinct Cores.
             // Tests read it back via `core_id()` rather than hardcoding it.
             core_id: format!("fake-core-408-{}", addr.port()),
@@ -804,6 +829,18 @@ impl FakeRoonCore {
     /// Browse/load refusals this Core sent, as `(request id, name, session key)`.
     pub async fn errors_sent(&self) -> Vec<(usize, String, String)> {
         self.state.read().await.errors.clone()
+    }
+
+    /// Session keys of every browse request that illegally combined
+    /// `pop_all: true` with a present `item_key` -- see `handle_browse`'s
+    /// comment on that check, and #396's ship-gate re-review for the live
+    /// evidence this hangs against a real Core. Empty is the passing state.
+    pub async fn illegal_pop_all_with_item_key_attempts(&self) -> Vec<String> {
+        self.state
+            .read()
+            .await
+            .illegal_pop_all_with_item_key
+            .clone()
     }
 
     /// Names of the responses sent, in order.
@@ -1244,6 +1281,30 @@ async fn handle_browse(
 
     let mut state = core.write().await;
 
+    // A request combining `pop_all: true` with a present `item_key` hangs
+    // against a real Core (verified live, nuc14/Roon 2.70, #396's ship-gate
+    // re-review) -- it never answers at all, which this fake cannot
+    // faithfully reproduce as a *hang* without making every test that
+    // regresses to this pattern pay a real wall-clock `BROWSE_TIMEOUT`. The
+    // fork's `Parsed::Error` path only recognises
+    // `FakeRoonCore::FORK_ERROR_NAMES` (an invented name degrades to
+    // `Parsed::None`, i.e. exactly the timeout this refuses to reproduce —
+    // see `an_unrecognised_error_name_degrades_to_an_indistinguishable_timeout`),
+    // so this answers `InvalidItemKey`, a real recognised name, for a fast
+    // and loud adapter-level test failure. The attempt is *also* recorded
+    // separately (`FakeRoonCore::illegal_pop_all_with_item_key_attempts`) so
+    // a test can assert the combination was never even sent, independent of
+    // whatever generic error text resulted.
+    if pop_all && item_key.is_some() {
+        state
+            .illegal_pop_all_with_item_key
+            .push(session_key.clone());
+        state.reject_next_browse = false;
+        drop(state);
+        refuse(core, writer, "InvalidItemKey", req_id, &session_key).await;
+        return;
+    }
+
     // --- error injection ---------------------------------------------------
     let rejected = state.reject_next_browse
         || item_key.is_some_and(|k| state.rejected_keys.contains(k))
@@ -1254,7 +1315,19 @@ async fn handle_browse(
                 .is_some_and(|sessions| sessions.contains(&session_key)),
             _ => false,
         }
-        || item_key.is_some_and(|k| state.arena.index_of(k).is_none());
+        || item_key.is_some_and(|k| state.arena.index_of(k).is_none())
+        // Same-session invalidation: THIS session minted this key in an
+        // earlier epoch (before its most recent `pop_all`) and hasn't seen it
+        // since. A key this session has never minted at all is untouched by
+        // this check -- see `Session::minted_at_epoch`'s own docs for why
+        // that distinction matters.
+        || item_key.is_some_and(|k| {
+            state.sessions.get(&session_key).is_some_and(|s| {
+                s.minted_at_epoch
+                    .get(k)
+                    .is_some_and(|minted_epoch| *minted_epoch != s.epoch)
+            })
+        });
     if rejected {
         state.reject_next_browse = false;
         let name = item_key
@@ -1274,6 +1347,12 @@ async fn handle_browse(
     let session = state.sessions.entry(session_key.clone()).or_default();
     if pop_all || session.levels.is_empty() {
         session.levels = vec![root_level];
+        // pop_all starts a new epoch: everything this session minted before
+        // it is gone, including the root-level keys this very response is
+        // about to hand out again (freshly, under the new epoch) -- matching
+        // what was observed live: browsing the "same" node twice mints a
+        // disjoint set of keys each time.
+        session.epoch += 1;
     }
     if let Some(n) = pop_levels {
         let keep = session.levels.len().saturating_sub(n as usize).max(1);
@@ -1392,12 +1471,21 @@ async fn handle_load(req_id: usize, body: &Value, core: &Arc<RwLock<CoreState>>,
         }
         let keyed = node.keyed;
         if keyed {
-            item["item_key"] = json!(key);
+            item["item_key"] = json!(key.clone());
             state
                 .minted
-                .entry(key)
+                .entry(key.clone())
                 .or_default()
                 .insert(session_key.clone());
+            // Same-session epoch tracking (`Session::minted_at_epoch`),
+            // orthogonal to the cross-session `minted` map above: record
+            // which epoch of *this* session minted this key, so a later
+            // `pop_all` (which bumps the epoch) can tell a still-live key
+            // apart from one it left behind.
+            if let Some(session) = state.sessions.get_mut(&session_key) {
+                let epoch = session.epoch;
+                session.minted_at_epoch.insert(key, epoch);
+            }
         }
         items.push(item);
     }

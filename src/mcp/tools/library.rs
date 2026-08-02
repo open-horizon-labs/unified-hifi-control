@@ -18,16 +18,35 @@
 //! reported as `scope.provider: "roon"`, so it is visible rather than silent, and
 //! `tests/mcp_contract.rs::an_absent_zone_id_still_routes_search_to_roon` pins it.
 //!
-//! This module is the primary target for #396 (opaque content references) and
-//! #399 (hierarchical browse). Note what `McpSearchResult` lacks: any stable
-//! identifier. A client that finds something here can only hand the title back
-//! to `hifi_play`, which re-searches and takes the first match. That is #392's
-//! keystone finding — recorded in `FIELD_ROLES` in `tests/mcp_contract.rs` as a
-//! known defect, and out of scope for #394.
+//! # Refs (#396): search -> hold ref -> play by ref
+//!
+//! `hifi_search` now mints an opaque `ref` alongside each result that has a
+//! durable-enough handle (a Roon `item_key`, or an LMS `Library`/`Url`
+//! target), and `HifiPlayRefTool` (below) is the one tool that consumes it —
+//! not an optional parameter on `hifi_play`, so a model can never send both a
+//! `query` and a `ref` and force the server to silently pick one. `hifi_play`
+//! itself is unchanged: its `query` path still re-searches and takes the
+//! first match, exactly as before this issue; that is #392's original
+//! keystone finding, still true for that path and recorded as such in
+//! `FIELD_ROLES` in `tests/mcp_contract.rs`. Refs are the way *around* it, not
+//! a change to it.
+//!
+//! A result can legitimately have no `ref`: LMS's `GlobalSearchItem` handle is
+//! a positional breadcrumb, not an identifier (see
+//! `crate::adapters::lms::LmsPlayTarget`), and minting a ref through it would
+//! trade an honest gap for a token that can silently play the wrong thing. So
+//! "no ref" is expected for some results, not a bug to chase.
+//!
+//! Refs live in [`crate::mcp::refs::RefTable`], are short-lived, and expire
+//! silently — resolving one that is gone reads as `unknown_ref` in
+//! `hifi_play_ref`'s refusal, which tells the client to call `hifi_search`
+//! again rather than failing generically. This module is also the target for
+//! #399 (hierarchical browse), which will mint refs the same way.
 
 use crate::api::AppState;
 use crate::mcp::capabilities::{support, Capability};
-use crate::mcp::envelope::{Envelope, Observed, Refusal, Scope};
+use crate::mcp::envelope::{Envelope, Observed, Provider, Refusal, Scope};
+use crate::mcp::refs::{RefTarget, RoonRefTarget};
 use crate::mcp::routing::{
     unplaceable_zone_refusal, unplaceable_zone_text, LibraryRoute, ZoneTarget,
 };
@@ -52,7 +71,7 @@ const ROON_SEARCH_LIMIT: usize = 10;
 /// Search for music
 #[mcp_tool(
     name = "hifi_search",
-    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins (zone_id recommended as different players may have different sources configured).",
+    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins (zone_id recommended as different players may have different sources configured). Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play, queue, or start radio from that exact result instead of hifi_play's first-match search. A result with no `ref` has no safe way to be addressed later — use hifi_play's query for it.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -70,7 +89,7 @@ pub struct HifiSearchTool {
 /// Search and play music in one command
 #[mcp_tool(
     name = "hifi_play",
-    description = "Search and play music. Searches and plays, queues, or starts radio from the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; LMS searches all providers."
+    description = "Search and play music. Searches and plays, queues, or starts radio from the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; LMS searches all providers. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiPlayTool {
@@ -82,6 +101,24 @@ pub struct HifiPlayTool {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// What to do: "play" (default), "queue", or "radio". radio is Roon-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+/// Play, queue, or start radio from a specific `hifi_search` result (#396)
+#[mcp_tool(
+    name = "hifi_play_ref",
+    description = "Play, queue, or play-next a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Use this instead of hifi_play when you need the exact result you found (e.g. the third one, or one of two same-titled albums), rather than whatever hifi_play's own search matches first. Refs are short-lived: hold one only within the current conversation. If this call is refused because the ref is unknown or expired, call hifi_search again for a fresh one — never guess or reuse an old one. zone_id must belong to the same provider (Roon or LMS) the ref was minted for.",
+    read_only_hint = false
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct HifiPlayRefTool {
+    /// The opaque `ref` from a hifi_search result. Do not construct, guess, or edit one.
+    #[serde(rename = "ref")]
+    pub r#ref: String,
+    /// Zone ID to play on (get from hifi_zones). Must be the same provider the ref was minted for.
+    pub zone_id: String,
+    /// What to do: "play" (default), "queue", "radio" (Roon only), or "next" (LMS play-next only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 }
@@ -145,13 +182,31 @@ pub async fn handle_search(
                 .await
             {
                 Ok(results) => {
-                    let mcp_results: Vec<McpSearchResult> = results
-                        .into_iter()
-                        .map(|item| McpSearchResult {
+                    let mut mcp_results = Vec::with_capacity(results.len());
+                    for item in results {
+                        // #396: mint a ref only for a durable-enough handle
+                        // (Library or Url). A GlobalSearchItem-only result
+                        // gets no ref at all, honestly, rather than one that
+                        // could silently mis-resolve — see
+                        // `LmsPlayTarget::mintable`'s own docs.
+                        let ref_token = match crate::adapters::lms::LmsPlayTarget::mintable(&item) {
+                            Some(target) => Some(
+                                state
+                                    .mcp_refs
+                                    .mint(RefTarget::Lms {
+                                        target,
+                                        title: item.title.clone(),
+                                    })
+                                    .await,
+                            ),
+                            None => None,
+                        };
+                        mcp_results.push(McpSearchResult {
                             subtitle: lms_subtitle(&item),
                             title: item.title,
-                        })
-                        .collect();
+                            r#ref: ref_token,
+                        });
+                    }
                     Ok(env.json_result(&mcp_results))
                 }
                 Err(e) => env.failed(format!("Search error: {}", e)),
@@ -160,7 +215,7 @@ pub async fn handle_search(
         LibraryRoute::Roon => {
             match state
                 .roon
-                .search(
+                .search_with_session(
                     &args.query,
                     args.zone_id.as_deref(),
                     Some(ROON_SEARCH_LIMIT),
@@ -168,14 +223,55 @@ pub async fn handle_search(
                 )
                 .await
             {
-                Ok(results) => {
-                    let mcp_results: Vec<McpSearchResult> = results
-                        .into_iter()
-                        .map(|item| McpSearchResult {
+                Ok((session_key, results)) => {
+                    let mut mcp_results = Vec::with_capacity(results.len());
+                    for item in results {
+                        // #396 (found live, ship-gate re-review): a real
+                        // Core's search results mix the actual hit with
+                        // grouping rows ("Albums", "Tracks", "Artists", ...)
+                        // that carry the same `hint: "list"` and a real
+                        // `item_key` -- `FakeRoonCore`'s search model never
+                        // included these, so nothing caught this minting a
+                        // ref for them indistinguishably from real content.
+                        // `crate::adapters::roon::is_ungrounded_grouping`
+                        // combines the adapter's own pre-existing title-list
+                        // check with a second, source-independent signal
+                        // (subtitle shaped like "<N> Results") verified live
+                        // for Library results but not for TIDAL/Qobuz -- see
+                        // that function's own doc comment for why the second
+                        // check is safe to include even where unverified.
+                        // Resolving a grouping row's ref would land in
+                        // `resolve_item_key`'s "guess the first item"
+                        // fallback and could silently play something the
+                        // client never asked for. Only a real, navigable
+                        // item_key on a non-grouping row gets a ref; a
+                        // grouping row (or one with no item_key at all — a
+                        // header, or non-navigable) mints nothing.
+                        let ref_token = match &item.item_key {
+                            Some(item_key)
+                                if !crate::adapters::roon::is_ungrounded_grouping(&item) =>
+                            {
+                                Some(
+                                    state
+                                        .mcp_refs
+                                        .mint(RefTarget::Roon {
+                                            target: RoonRefTarget {
+                                                item_key: item_key.clone(),
+                                                multi_session_key: session_key.clone(),
+                                            },
+                                            title: item.title.clone(),
+                                        })
+                                        .await,
+                                )
+                            }
+                            _ => None,
+                        };
+                        mcp_results.push(McpSearchResult {
                             title: item.title,
                             subtitle: item.subtitle,
-                        })
-                        .collect();
+                            r#ref: ref_token,
+                        });
+                    }
                     Ok(env.json_result(&mcp_results))
                 }
                 Err(e) => env.failed(format!("Search error: {}", e)),
@@ -353,14 +449,18 @@ pub async fn handle_play(
     }
 }
 
-/// Finish a successful `hifi_play`: the adapter's message verbatim as the text,
-/// plus a zone read-back.
+/// Finish a successful `hifi_play` or `hifi_play_ref`: the adapter's message
+/// verbatim as the text, plus a zone read-back. Shared by both tools so their
+/// success shape (`McpPlayResult` plus `observed`) is identical whichever path
+/// a client took.
 ///
 /// `data.message` duplicates the text on purpose, and it is the only field in
-/// this envelope that does. Without it a client reading only `structuredContent`
-/// would have no record of *which* item matched, because there is no addressable
-/// identifier for a search result until #396 lands. It is adapter-authored prose,
-/// not parsed — #396 replaces it with an opaque ref.
+/// this envelope that does. For `hifi_play`'s query path it remains the only
+/// record of *which* item matched — that path has no addressable identifier
+/// by design (`hifi_play_ref` is the way around it, not a change to it; see
+/// this module's docs). For `hifi_play_ref` the message still comes from the
+/// adapter/ref title, kept for the same reason: a client reading only
+/// `structuredContent` should not have to guess what played.
 async fn play_success(state: &AppState, env: Envelope, message: String) -> CallToolResult {
     let zone_id = env
         .scope
@@ -392,5 +492,262 @@ fn roon_action_name(action: crate::adapters::roon::PlayAction) -> &'static str {
         PlayAction::Play => "play",
         PlayAction::Queue => "queue",
         PlayAction::Radio => "radio",
+    }
+}
+
+// =============================================================================
+// hifi_play_ref (#396): the one consumer of a hifi_search `ref`
+// =============================================================================
+
+/// Every action `hifi_play_ref` accepts for a Roon-minted ref, in the order
+/// the tool description lists them. A closed set: an action outside it is
+/// refused by name rather than silently defaulted, which is what
+/// `PlayAction::parse` would otherwise do (see `handle_search`'s `roon_source_name`
+/// for the same "report what was actually resolved" principle applied to a
+/// different parameter).
+const ROON_REF_ACTIONS: &[&str] = &["play", "queue", "radio"];
+
+/// Every action `hifi_play_ref` accepts for an LMS-minted ref.
+const LMS_REF_ACTIONS: &[&str] = &["play", "queue", "next"];
+
+/// Validate `action` against a provider's closed action set, defaulting to
+/// the first (always `"play"`) when absent. Never falls through to a default
+/// for a *present but unrecognised* value -- that silent-fallback is the
+/// defect this whole issue exists to end.
+fn validate_ref_action(
+    action: Option<&str>,
+    accepted: &'static [&'static str],
+) -> Result<&'static str, Refusal> {
+    match action {
+        None => Ok(accepted[0]),
+        Some(requested) => {
+            let lower = requested.to_lowercase();
+            accepted
+                .iter()
+                .find(|candidate| **candidate == lower)
+                .copied()
+                .ok_or_else(|| {
+                    Refusal::invalid_parameter(
+                        "action",
+                        accepted,
+                        format!(
+                            "'{requested}' is not an accepted hifi_play_ref action for this \
+                             ref's provider. Accepted: {}.",
+                            accepted.join(", ")
+                        ),
+                    )
+                })
+        }
+    }
+}
+
+/// The lowercase label for a [`Provider`], for refusal prose. Every variant is
+/// listed explicitly so a new provider fails to compile here rather than
+/// silently falling through to a wrong label.
+fn provider_label(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Roon => "roon",
+        Provider::Lms => "lms",
+        Provider::OpenHome => "openhome",
+        Provider::Upnp => "upnp",
+        Provider::HqPlayer => "hqplayer",
+        Provider::Unknown => "unknown",
+    }
+}
+
+pub async fn handle_play_ref(
+    state: &AppState,
+    args: HifiPlayRefTool,
+) -> Result<CallToolResult, CallToolError> {
+    let target = ZoneTarget::classify(&args.zone_id);
+    let route = target.for_library();
+
+    // `operation` starts as the constant `"play_ref"` -- matching
+    // `hifi_play`'s own zone-refused path (`Envelope::write("hifi_play",
+    // "play")`, unconditionally, never `args.action`) -- because at this
+    // point `action` has not been validated against either provider's
+    // accepted set, so echoing it verbatim would let unvalidated client
+    // input (garbage, or a value that's valid for the *other* provider) flow
+    // straight into a field clients are told to branch on. `play_ref_roon`/
+    // `play_ref_lms` overwrite it once an action is actually known: the
+    // validated name on success (matching `hifi_play`'s
+    // `roon_action_name`/`lms_action_name` convention), or the normalized
+    // sentinel `"invalid_action"` on refusal (matching `hifi_control`'s
+    // `unknown_action` convention, `src/mcp/tools/transport.rs`).
+    let mut env = Envelope::write("hifi_play_ref", "play_ref")
+        .param("ref", &*args.r#ref)
+        .param("zone_id", &*args.zone_id)
+        .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
+    if let Some(action) = args.action.as_deref() {
+        env = env.param("action", action);
+    }
+
+    // A zone with no library path refuses the same way `hifi_play` does --
+    // the routing question ("can this zone accept a library-sourced play at
+    // all") is identical; only the resolution mechanism (ref vs. query)
+    // differs downstream of it.
+    if let LibraryRoute::Refused(refused) = route {
+        return refuse_library_zone(env, &args.zone_id, refused, Capability::PlayByQuery);
+    }
+
+    let Some(ref_target) = state.mcp_refs.resolve(&args.r#ref).await else {
+        return env.refused(
+            "ref is unknown or expired. Refs are short-lived -- call hifi_search again for a \
+             fresh one; never guess or reuse an old ref.",
+            Refusal::UnknownTarget {
+                parameter: "ref",
+                discover_with: "hifi_search",
+                detail: "This ref is not in UHC's ref table. It may have expired, been evicted \
+                         under load, or never existed -- all three look identical from here by \
+                         design, so there is nothing more specific to report. hifi_search mints \
+                         a fresh ref on every call; use the new one rather than an old one."
+                    .to_string(),
+            },
+        );
+    };
+
+    // Capability-honest cross-provider refusal: a ref minted for one provider
+    // must never be resolved against a zone of another, even though the zone
+    // itself has a perfectly good library path of its own.
+    let zone_provider = target.provider();
+    if ref_target.provider() != zone_provider {
+        let ref_provider_label = provider_label(ref_target.provider());
+        let zone_provider_label = provider_label(zone_provider);
+        return env.refused(
+            format!(
+                "this ref was minted for {ref_provider_label}, but zone_id '{}' is {zone_provider_label}.",
+                args.zone_id
+            ),
+            Refusal::InvalidParameter {
+                parameter: "zone_id",
+                accepted: vec![format!(
+                    "a {ref_provider_label} zone_id (this ref was minted for {ref_provider_label})"
+                )],
+                detail: format!(
+                    "hifi_search minted this ref against {ref_provider_label}; hifi_play_ref \
+                     cannot resolve it against a {zone_provider_label} zone. Call hifi_search \
+                     again with a {ref_provider_label} zone_id, or use hifi_zones to find one."
+                ),
+            },
+        );
+    }
+
+    match (route, ref_target) {
+        (LibraryRoute::Roon, RefTarget::Roon { target, title }) => {
+            play_ref_roon(state, env, &args, target, title).await
+        }
+        (LibraryRoute::Lms, RefTarget::Lms { target, title }) => {
+            play_ref_lms(state, env, &args, target, title).await
+        }
+        // Unreachable: the provider check above already refused any mismatch
+        // between the zone's provider and the ref's. Kept exhaustive so a
+        // third provider gaining a ref target fails to compile here rather
+        // than silently mis-dispatching.
+        (LibraryRoute::Roon, RefTarget::Lms { .. })
+        | (LibraryRoute::Lms, RefTarget::Roon { .. }) => env.failed(
+            "internal routing error: ref/zone provider mismatch reached dispatch after the \
+                 capability check. This is a UHC bug.",
+        ),
+        (LibraryRoute::Refused(_), _) => env.failed(
+            "internal routing error: a refused zone reached ref dispatch. This is a UHC bug.",
+        ),
+    }
+}
+
+async fn play_ref_roon(
+    state: &AppState,
+    mut env: Envelope,
+    args: &HifiPlayRefTool,
+    target: RoonRefTarget,
+    _title: String,
+) -> Result<CallToolResult, CallToolError> {
+    use crate::adapters::roon::PlayAction;
+
+    let action_name = match validate_ref_action(args.action.as_deref(), ROON_REF_ACTIONS) {
+        Ok(name) => name,
+        Err(refusal) => {
+            let detail = match &refusal {
+                Refusal::InvalidParameter { detail, .. } => detail.clone(),
+                _ => String::new(),
+            };
+            // A normalized sentinel, not an echo of the raw (unrecognised)
+            // request -- matching `hifi_control`'s own `unknown_action`
+            // convention for the same class of refusal
+            // (`src/mcp/tools/transport.rs`). A client branching on
+            // `operation` must never see arbitrary client input reflected
+            // back as if it were a real value.
+            env.operation = "invalid_action".to_string();
+            return env.refused(detail, refusal);
+        }
+    };
+    // `operation` follows `hifi_play`'s own convention (`roon_action_name`):
+    // the resolved action, not a constant tool-name-shaped string, so a
+    // client reading only `operation` can tell play_ref=queue from
+    // play_ref=play without also reading `params.action`.
+    let mut env = env.param("action", action_name);
+    env.operation = action_name.to_string();
+    let action = PlayAction::parse(action_name);
+
+    match state
+        .roon
+        .play_ref(
+            &target.item_key,
+            &target.multi_session_key,
+            &args.zone_id,
+            action,
+        )
+        .await
+    {
+        Ok(message) => Ok(play_success(state, env, message).await),
+        Err(e) => env.failed(format!("Play error: {}", e)),
+    }
+}
+
+async fn play_ref_lms(
+    state: &AppState,
+    mut env: Envelope,
+    args: &HifiPlayRefTool,
+    target: crate::adapters::lms::LmsPlayTarget,
+    title: String,
+) -> Result<CallToolResult, CallToolError> {
+    use crate::adapters::lms::LmsPlayAction;
+
+    let action_name = match validate_ref_action(args.action.as_deref(), LMS_REF_ACTIONS) {
+        Ok(name) => name,
+        Err(refusal) => {
+            let detail = match &refusal {
+                Refusal::InvalidParameter { detail, .. } => detail.clone(),
+                _ => String::new(),
+            };
+            // See play_ref_roon's identical comment: a normalized sentinel,
+            // matching hifi_control's `unknown_action` convention.
+            env.operation = "invalid_action".to_string();
+            return env.refused(detail, refusal);
+        }
+    };
+    let mut env = env.param("action", action_name);
+    env.operation = action_name.to_string();
+    let action = LmsPlayAction::parse(Some(action_name));
+
+    // `Some(&title)`: this target was resolved from a ref minted earlier in
+    // a possibly-different conversation turn, so it is validated against the
+    // live library before the mutating command runs (`LmsAdapter::play_target`'s
+    // own docs explain why, and why it is keyed off `title` rather than a
+    // dedicated existence query).
+    match state
+        .lms
+        .play_target(&target, &args.zone_id, action, Some(&title))
+        .await
+    {
+        Ok(()) => {
+            let action_verb = match action {
+                LmsPlayAction::Play => "Playing",
+                LmsPlayAction::Queue => "Queued",
+                LmsPlayAction::Insert => "Playing next",
+            };
+            let message = format!("{action_verb} {title}");
+            Ok(play_success(state, env, message).await)
+        }
+        Err(e) => env.failed(format!("Play error: {}", e)),
     }
 }

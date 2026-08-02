@@ -101,8 +101,65 @@ fn find_playable_item(items: &[BrowseItem]) -> Option<&BrowseItem> {
 }
 
 /// Check if an item is a category (Albums, Tracks, etc.) rather than playable content
-fn is_category(item: &BrowseItem) -> bool {
+///
+/// `pub(crate)` since #396's ship-gate re-review: a real Roon Core's search
+/// results include these grouping rows alongside the actual top hit (e.g.
+/// searching "kind of blue" returns "Kind of Blue" *and* "Albums (32
+/// Results)", "Tracks (34 Results)", ... all with the same `hint: "list"` and
+/// a real `item_key`) -- `tests/mock_servers/roon_core.rs`'s search model
+/// never included these grouping rows, so no test caught that
+/// `crate::mcp::tools::library::handle_search` was minting a ref for them
+/// indistinguishably from real content. Resolving one lands in
+/// `resolve_item_key`'s "guess the first item" fallback, which can silently
+/// play unrelated content -- see that function's call site in
+/// `src/mcp/tools/library.rs` for how this is now excluded from minting.
+pub(crate) fn is_category(item: &BrowseItem) -> bool {
     CATEGORY_NAMES.contains(&item.title.as_str())
+}
+
+/// A second, title-independent signal for the same "this is a grouping row,
+/// not addressable content" question `is_category` answers by name match.
+///
+/// #396's ship-gate re-review verified live (against nuc14, Roon 2.70, a
+/// Library search) that `is_category`'s exact title list is correct for
+/// Library results, but has **no live evidence for TIDAL or Qobuz sources**,
+/// which may group results under different labels `CATEGORY_NAMES` does not
+/// contain. This catches that case by a different, source-independent
+/// pattern observed in the same live data: every grouping row's subtitle was
+/// exactly `"<N> Results"` (`"7 Results"`, `"32 Results"`, `"19 Results"`),
+/// while every real hit's subtitle was something else (an artist name, an
+/// album title). **This pattern is also unverified for TIDAL/Qobuz** -- it
+/// is an inference from one source, not a second confirmed fact — but unlike
+/// guessing at a wire *filter* shape (see `LmsAdapter::assert_library_id_exists`'s
+/// own history in this same issue), a false miss here only fails to exclude
+/// a row `is_category` didn't already catch: it cannot mint a *worse* ref
+/// than the title check alone would have, only sometimes a few more of the
+/// same already-accepted risk. So it is included as a strictly-additive
+/// second layer rather than withheld pending verification.
+fn looks_like_a_result_count_grouping(item: &BrowseItem) -> bool {
+    let Some(subtitle) = item.subtitle.as_deref() else {
+        return false;
+    };
+    // Case and singular/plural tolerant: verified live only for Library's
+    // exact "<N> Results" shape (see #431), and TIDAL/Qobuz may reasonably
+    // format the same fact as "<N> result", "<n> RESULTS", or with
+    // incidental surrounding whitespace. Still requires the two-token
+    // "<count> <word>" shape, so this cannot start matching real content
+    // whose subtitle merely contains the word "results" or starts with a
+    // digit -- see `result_count_grouping_does_not_swallow_real_subtitles`.
+    let Some((count, word)) = subtitle.trim().split_once(' ') else {
+        return false;
+    };
+    count.parse::<u64>().is_ok() && matches!(word.to_lowercase().as_str(), "results" | "result")
+}
+
+/// Whether an item is a grouping/category row rather than addressable
+/// content, by either signal above. This is what `hifi_search`'s ref-minting
+/// (`src/mcp/tools/library.rs`) consults; `is_category` alone remains what
+/// `try_navigate_to_playable` uses, unchanged, since this function's second
+/// check is new to #396 and was never exercised by that existing path.
+pub(crate) fn is_ungrounded_grouping(item: &BrowseItem) -> bool {
+    is_category(item) || looks_like_a_result_count_grouping(item)
 }
 
 /// Strip "roon:" prefix from zone/output IDs.
@@ -1239,7 +1296,11 @@ impl RoonAdapter {
         }
     }
 
-    /// Search the Roon library, TIDAL, or Qobuz
+    /// Search the Roon library, TIDAL, or Qobuz.
+    ///
+    /// Thin wrapper over [`Self::search_with_session`] that drops the session
+    /// key, preserving this method's exact pre-#396 signature and behavior --
+    /// `/roon/search` (`src/api/mod.rs`) calls this one, unchanged.
     pub async fn search(
         &self,
         query: &str,
@@ -1247,6 +1308,25 @@ impl RoonAdapter {
         limit: Option<usize>,
         source: SearchSource,
     ) -> Result<Vec<BrowseItem>> {
+        self.search_with_session(query, zone_id, limit, source)
+            .await
+            .map(|(_session_key, items)| items)
+    }
+
+    /// [`Self::search`], plus the `multi_session_key` the search minted.
+    ///
+    /// #396: a returned `item_key`'s scope is that session, not the Core in
+    /// general -- see `tests/mock_servers/roon_core.rs`'s `ItemKeyScope` docs
+    /// for the third-party evidence this rests on. A ref minted from these
+    /// results must record the session key here so [`Self::play_ref`] can
+    /// resolve it inside the same session rather than a fresh, unrelated one.
+    pub async fn search_with_session(
+        &self,
+        query: &str,
+        zone_id: Option<&str>,
+        limit: Option<usize>,
+        source: SearchSource,
+    ) -> Result<(String, Vec<BrowseItem>)> {
         let session_key = format!(
             "search_{}",
             std::time::SystemTime::now()
@@ -1331,16 +1411,16 @@ impl RoonAdapter {
         if let Some(list) = &search_result.list {
             if list.count > 0 {
                 let load_opts = LoadOpts {
-                    multi_session_key: Some(session_key),
+                    multi_session_key: Some(session_key.clone()),
                     count: Some(limit.unwrap_or(DEFAULT_SEARCH_LIMIT)),
                     ..Default::default()
                 };
                 let load_result = self.load(load_opts).await?;
-                return Ok(load_result.items);
+                return Ok((session_key, load_result.items));
             }
         }
 
-        Ok(vec![])
+        Ok((session_key, vec![]))
     }
 
     /// Search and play the first matching result
@@ -1658,7 +1738,16 @@ impl RoonAdapter {
         Ok(None)
     }
 
-    /// Play an item by its item_key
+    /// Play an item by its item_key, in a session minted just for this call.
+    ///
+    /// **This bets that `item_key`s are portable across `multi_session_key`s.**
+    /// That bet is unproven in this repo (zero other callers, no test before
+    /// #408) and public evidence points against it -- see
+    /// `tests/mock_servers/roon_core.rs`'s `ItemKeyScope` docs. It is kept,
+    /// unchanged, only because `/roon/play_item` (`src/api/mod.rs`) is
+    /// existing, exposed HTTP surface with its own contract; #396's ref
+    /// resolution path is [`Self::play_ref`] below, which re-enters the
+    /// session that actually minted the key instead of taking this bet.
     pub async fn play_item(
         &self,
         item_key: &str,
@@ -1681,11 +1770,83 @@ impl RoonAdapter {
         );
 
         let bare_zone_id = strip_roon_prefix(zone_id);
+        self.resolve_item_key(&session_key, item_key, bare_zone_id, action)
+            .await
+    }
+
+    /// Resolve a `hifi_play_ref` (#396): play an item_key **inside the session
+    /// that minted it**, rather than a fresh, unrelated one.
+    ///
+    /// # `pop_all` was here, and it broke this against a real Core
+    ///
+    /// An earlier version of this method reset the shared session's browse
+    /// stack with `pop_all: true` before entering `item_key`, on the theory
+    /// (borrowed from `tests/mock_servers/roon_core.rs`'s model, which does
+    /// not actually enforce this) that two refs minted by one search sharing
+    /// one `multi_session_key` needed that reset to resolve independently.
+    /// Verified live against a real Core (nuc14, Roon 2.70) that this is
+    /// wrong on both counts:
+    ///
+    /// 1. **Combining `pop_all: true` with `item_key` in one browse request
+    ///    hangs** -- the Core never answers, and the caller waits out the
+    ///    full `BROWSE_TIMEOUT`. This is exactly the failure #396 shipped
+    ///    with and #401-adjacent live testing caught.
+    /// 2. **Sending them as two separate requests does not help**: `pop_all`
+    ///    invalidates every item_key minted at the levels it discards, so
+    ///    the *very key being resolved* becomes `InvalidItemKey` immediately
+    ///    after the reset.
+    /// 3. **The reset was solving a problem that does not exist.** Without
+    ///    any `pop_all`, resolving one ref from a search, navigating it all
+    ///    the way down to its action list, and then resolving a *second*,
+    ///    unrelated ref minted by the same search (sharing the same session
+    ///    key) still succeeds immediately -- verified live, twice, at
+    ///    different navigation depths. Item keys minted by one search
+    ///    remain independently resolvable regardless of where else that
+    ///    session has since navigated, as long as nothing pops it.
+    ///
+    /// So this is now `play_item`'s exact resolution logic, unchanged, with
+    /// only `multi_session_key` swapped for the caller-supplied minting
+    /// session instead of a fresh one.
+    pub async fn play_ref(
+        &self,
+        item_key: &str,
+        multi_session_key: &str,
+        zone_id: &str,
+        action: PlayAction,
+    ) -> Result<String> {
+        if item_key.is_empty() {
+            return Err(anyhow::anyhow!("item_key cannot be empty"));
+        }
+        if item_key.len() > 500 {
+            return Err(anyhow::anyhow!("item_key appears malformed (too long)"));
+        }
+
+        let bare_zone_id = strip_roon_prefix(zone_id);
+        self.resolve_item_key(multi_session_key, item_key, bare_zone_id, action)
+            .await
+    }
+
+    /// Shared body of [`Self::play_item`] and [`Self::play_ref`]: browse into
+    /// `item_key` within `session_key`, find (or navigate to) a playable
+    /// action, and invoke it.
+    ///
+    /// Deliberately never sends `pop_all` -- see [`Self::play_ref`]'s doc
+    /// comment for why combining it with `item_key`, or even sequencing it
+    /// beforehand, breaks against a real Core.
+    async fn resolve_item_key(
+        &self,
+        session_key: &str,
+        item_key: &str,
+        bare_zone_id: &str,
+        action: PlayAction,
+    ) -> Result<String> {
+        let session_key = session_key.to_string();
+        let bare_zone_id = bare_zone_id.to_string();
 
         self.browse(BrowseOpts {
             multi_session_key: Some(session_key.clone()),
             item_key: Some(item_key.to_string()),
-            zone_or_output_id: Some(bare_zone_id.to_string()),
+            zone_or_output_id: Some(bare_zone_id.clone()),
             ..Default::default()
         })
         .await?;
@@ -1705,7 +1866,7 @@ impl RoonAdapter {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
             return self
-                .execute_play_action(&session_key, bare_zone_id, &title, &key, action)
+                .execute_play_action(&session_key, &bare_zone_id, &title, &key, action)
                 .await;
         }
 
@@ -1716,7 +1877,7 @@ impl RoonAdapter {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
             return self
-                .execute_play_action(&session_key, bare_zone_id, "Album", &key, action)
+                .execute_play_action(&session_key, &bare_zone_id, "Album", &key, action)
                 .await;
         }
 
@@ -1726,7 +1887,7 @@ impl RoonAdapter {
                 self.browse(BrowseOpts {
                     multi_session_key: Some(session_key.clone()),
                     item_key: Some(key.clone()),
-                    zone_or_output_id: Some(bare_zone_id.to_string()),
+                    zone_or_output_id: Some(bare_zone_id.clone()),
                     ..Default::default()
                 })
                 .await?;
@@ -1746,7 +1907,7 @@ impl RoonAdapter {
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
                     return self
-                        .execute_play_action(&session_key, bare_zone_id, &title, &item_key, action)
+                        .execute_play_action(&session_key, &bare_zone_id, &title, &item_key, action)
                         .await;
                 }
 
@@ -1756,7 +1917,13 @@ impl RoonAdapter {
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("Play Album has no key"))?;
                     return self
-                        .execute_play_action(&session_key, bare_zone_id, &first.title, &key, action)
+                        .execute_play_action(
+                            &session_key,
+                            &bare_zone_id,
+                            &first.title,
+                            &key,
+                            action,
+                        )
                         .await;
                 }
             }
@@ -3378,5 +3545,60 @@ mod tests {
         assert_eq!(delivered_title(&mut second, browse_title), "TIDAL");
         assert_eq!(delivered_title(&mut third, browse_title), "Qobuz");
         assert!(state.pending_browses.is_empty());
+    }
+
+    fn grouping_row(subtitle: &str) -> BrowseItem {
+        BrowseItem {
+            title: "whatever category label this source uses".to_string(),
+            subtitle: Some(subtitle.to_string()),
+            image_key: None,
+            item_key: Some("some_key".to_string()),
+            hint: Some(ItemHint::List),
+            input_prompt: None,
+        }
+    }
+
+    /// Issue #431: `is_category`'s title list is verified only for Library
+    /// results; `looks_like_a_result_count_grouping`'s subtitle-shape check
+    /// is the fallback for TIDAL/Qobuz, which may format their own grouping
+    /// rows differently. Broadened to accept case and singular/plural
+    /// variation, since none of these were exercised by the one live Library
+    /// search this was built against -- still unverified against a real
+    /// TIDAL/Qobuz result (tracked on #431), but no longer needlessly narrow
+    /// to the exact casing and pluralization of the one confirmed shape.
+    #[test]
+    fn result_count_grouping_tolerates_case_and_pluralization_variants() {
+        for subtitle in [
+            "32 Results",  // the exact shape verified live against nuc14
+            "1 Result",    // singular -- untested live, but plausible grammar
+            "7 results",   // lowercase -- untested live, but plausible casing
+            "19 RESULTS",  // shouting case, same reasoning
+            " 5 Results ", // incidental whitespace
+        ] {
+            assert!(
+                looks_like_a_result_count_grouping(&grouping_row(subtitle)),
+                "subtitle {subtitle:?} should be recognised as a grouping row"
+            );
+        }
+    }
+
+    /// The broadened check must not start swallowing real content whose
+    /// subtitle happens to end in a number-ish word, or #396's whole point
+    /// (never silently misplay) fails in the other direction.
+    #[test]
+    fn result_count_grouping_does_not_swallow_real_subtitles() {
+        for subtitle in [
+            "Miles Davis",       // an artist name
+            "Kind of Blue",      // an album title
+            "32 Bit Adventures", // a real album title that merely starts with a number
+            "Results May Vary",  // a real album title containing the word, wrong shape
+            "results",           // the word alone, no count
+            "32",                // a count alone, no word
+        ] {
+            assert!(
+                !looks_like_a_result_count_grouping(&grouping_row(subtitle)),
+                "subtitle {subtitle:?} should NOT be recognised as a grouping row"
+            );
+        }
     }
 }
