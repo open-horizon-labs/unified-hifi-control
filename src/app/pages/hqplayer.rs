@@ -568,7 +568,7 @@ pub fn HqPlayer() -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::{hqplayer_mute_control, CoalescingRefresh, HqplayerMuteAction};
+    use super::{hqplayer_mute_control, CoalescingRefresh};
 
     #[test]
     fn advanced_refreshes_never_overlap_and_coalesce_bursts() {
@@ -600,72 +600,42 @@ mod tests {
     }
 
     #[test]
-    fn hqplayer_mute_remembers_and_restores_the_last_audible_volume() {
-        let audible = hqplayer_mute_control(Some(-3.0), Some(-60.0), None);
+    fn hqplayer_mute_matches_the_native_volume_floor_semantics() {
+        let audible = hqplayer_mute_control(Some(-3.0), Some(-60.0));
         assert_eq!(audible.label, "Mute to minimum volume");
         assert!(!audible.disabled);
-        assert_eq!(audible.action, HqplayerMuteAction::Mute);
 
-        let floored = hqplayer_mute_control(Some(-60.0), Some(-60.0), Some(-3.0));
-        assert_eq!(floored.label, "Restore volume");
-        assert!(!floored.disabled);
-        assert_eq!(floored.action, HqplayerMuteAction::Restore(-3.0));
-
-        let externally_floored = hqplayer_mute_control(Some(-60.0), Some(-60.0), None);
-        assert_eq!(externally_floored.label, "At minimum volume");
-        assert!(externally_floored.disabled);
-        assert_eq!(externally_floored.action, HqplayerMuteAction::Unavailable);
+        let floored = hqplayer_mute_control(Some(-60.0), Some(-60.0));
+        assert_eq!(floored.label, "At minimum volume");
+        assert!(floored.disabled);
     }
 }
 
 /// Linked zone card with playback controls
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 struct HqplayerMuteControl {
     label: &'static str,
     title: &'static str,
     disabled: bool,
-    action: HqplayerMuteAction,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum HqplayerMuteAction {
-    Mute,
-    Restore(f32),
-    Unavailable,
-}
-
-fn hqplayer_mute_control(
-    volume: Option<f32>,
-    volume_min: Option<f32>,
-    last_audible_volume: Option<f32>,
-) -> HqplayerMuteControl {
+fn hqplayer_mute_control(volume: Option<f32>, volume_min: Option<f32>) -> HqplayerMuteControl {
     let at_volume_floor = match (volume, volume_min) {
         (Some(value), Some(minimum)) => value <= minimum + 0.01,
         _ => false,
     };
 
     if at_volume_floor {
-        if let Some(value) = last_audible_volume {
-            HqplayerMuteControl {
-                label: "Restore volume",
-                title: "Restore the last audible volume",
-                disabled: false,
-                action: HqplayerMuteAction::Restore(value),
-            }
-        } else {
-            HqplayerMuteControl {
-                label: "At minimum volume",
-                title: "HQPlayer represents mute as its minimum volume",
-                disabled: true,
-                action: HqplayerMuteAction::Unavailable,
-            }
+        HqplayerMuteControl {
+            label: "At minimum volume",
+            title: "HQPlayer represents mute as its minimum volume",
+            disabled: true,
         }
     } else {
         HqplayerMuteControl {
             label: "Mute to minimum volume",
             title: "Mute to HQPlayer's minimum volume",
             disabled: false,
-            action: HqplayerMuteAction::Mute,
         }
     }
 }
@@ -698,8 +668,7 @@ fn LinkedZoneCard(
     let can_seek = length > 0;
     let can_previous = np.map(|n| n.is_previous_allowed).unwrap_or(false);
     let can_next = np.map(|n| n.is_next_allowed).unwrap_or(false);
-    let mut last_audible_volume = use_signal(|| None::<f32>);
-    let mute_control = hqplayer_mute_control(volume, volume_min, last_audible_volume());
+    let mute_control = hqplayer_mute_control(volume, volume_min);
 
     // Album art
     let base_image_url = np.and_then(|n| n.image_url.clone()).unwrap_or_default();
@@ -804,22 +773,7 @@ fn LinkedZoneCard(
                             "aria-label": mute_control.label,
                             title: mute_control.title,
                             disabled: mute_control.disabled,
-                            onclick: move |_| match mute_control.action {
-                                HqplayerMuteAction::Mute => {
-                                    if let Some(value) = volume {
-                                        last_audible_volume.set(Some(value));
-                                    }
-                                    on_control.call((zone_id_mute.clone(), "mute".to_string(), None));
-                                }
-                                HqplayerMuteAction::Restore(value) => {
-                                    on_control.call((
-                                        zone_id_mute.clone(),
-                                        "vol_abs".to_string(),
-                                        Some(f64::from(value)),
-                                    ));
-                                }
-                                HqplayerMuteAction::Unavailable => {}
-                            },
+                            onclick: move |_| on_control.call((zone_id_mute.clone(), "mute".to_string(), None)),
                             svg { class: "w-4 h-4", fill: "none", stroke: "currentColor", stroke_width: "2", view_box: "0 0 24 24",
                                 path { d: "M11 5 6 9H3v6h3l5 4V5Z" }
                                 path { d: "m19 9-6 6m0-6 6 6" }
