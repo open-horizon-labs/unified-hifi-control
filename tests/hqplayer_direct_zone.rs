@@ -643,7 +643,18 @@ async fn track_metadata_is_the_source_domain_never_the_output_stage() {
     let server = start_daemon(&model).await;
     let rig = Rig::new().await;
     rig.attach(&server).await;
-    let zone = rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+    // Playback and metadata are observed from separate daemon replies. Under CI load the
+    // transport projection can therefore commit before the metadata-bearing projection. Wait for
+    // the fact this test actually asserts instead of racing the first valid Playing snapshot.
+    let zone = rig
+        .zone_when(|z| {
+            z.state == PlaybackState::Playing
+                && z.now_playing
+                    .as_ref()
+                    .and_then(|np| np.metadata.as_ref())
+                    .is_some()
+        })
+        .await;
 
     let np = zone.now_playing.expect("now_playing");
     assert_eq!(np.title, "Gloria's Step");

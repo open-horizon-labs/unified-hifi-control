@@ -251,3 +251,13 @@ remain before publication of the next beta artifact.
   pass. The live read-only HQPlayer capture reached all native families in at most 45.2 ms with no
   unsolicited frames and wrote `/tmp/uhc-hqp-tier1-reliable-runtime.json`; as before, the merge gate
   correctly reports the checked-in abbreviated Opal corpus's 142 divergences from this daemon.
+
+### CI projection-echo correction
+
+- CI exposed that the post-commit `NowPlayingChanged` compatibility hint was not idempotent: the
+  aggregator consumed its own hint and replaced the just-committed full now-playing projection with
+  a payload whose event schema cannot carry source metadata.
+- The legacy handler now preserves metadata only when title, artist and album identify the same
+  track. A changed identity still clears metadata, preventing details from leaking across tracks.
+- The HQPlayer source-domain regression waits for the metadata-bearing projection it asserts. The
+  exact test passed ten consecutive focused runs and the complete 65-test direct-zone binary.

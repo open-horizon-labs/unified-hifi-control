@@ -150,12 +150,32 @@ impl ZoneAggregator {
                 } => {
                     debug!("Now playing changed: {}", zone_id);
                     if let Some(zone) = self.state.write().await.zones.get_mut(zone_id.as_str()) {
-                        // Preserve seek_position and duration from existing now_playing
-                        let (seek_position, duration) = zone
+                        // Preserve fields this compatibility event cannot carry when it describes
+                        // the same track as the canonical snapshot. Reliable projections publish a
+                        // complete Zone first and then emit this event as a post-commit SSE hint;
+                        // treating the hint as a replacement would erase source metadata from the
+                        // authoritative projection. A changed identity deliberately drops metadata
+                        // so details from the previous track cannot leak into the next one.
+                        let same_track = zone.now_playing.as_ref().is_some_and(|np| {
+                            title.as_deref().unwrap_or_default() == np.title
+                                && artist.as_deref().unwrap_or_default() == np.artist
+                                && album.as_deref().unwrap_or_default() == np.album
+                        });
+                        let (seek_position, duration, metadata) = zone
                             .now_playing
                             .as_ref()
-                            .map(|np| (np.seek_position, np.duration))
-                            .unwrap_or((None, None));
+                            .map(|np| {
+                                (
+                                    np.seek_position,
+                                    np.duration,
+                                    if same_track {
+                                        np.metadata.clone()
+                                    } else {
+                                        None
+                                    },
+                                )
+                            })
+                            .unwrap_or((None, None, None));
 
                         zone.now_playing = Some(NowPlaying {
                             title: title.unwrap_or_default(),
@@ -164,7 +184,7 @@ impl ZoneAggregator {
                             image_key,
                             seek_position,
                             duration,
-                            metadata: None,
+                            metadata,
                         });
                     }
                 }

@@ -1000,7 +1000,11 @@ impl RoonRuntimeBridge {
             .map_err(|_| anyhow::anyhow!("Roon reliable projection ingress stopped"))?;
         if matches!(commit, ProjectionCommit::Committed { .. }) {
             if let Some(observed) = observed {
-                let _ = observed.send(());
+                if observed.send(()).is_err() {
+                    tracing::debug!(
+                        "Roon command observer was dropped after its projection committed"
+                    );
+                }
             }
         }
         Ok(())
