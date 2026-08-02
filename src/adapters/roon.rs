@@ -1203,6 +1203,11 @@ impl RoonAdapter {
         // Cancel background tasks
         self.shutdown.read().await.cancel();
 
+        // The discovery/event-loop task may take time to observe cancellation. Clear the
+        // user-visible runtime cache synchronously so an explicit disable cannot continue to
+        // report a connected Core and stale zones during that shutdown window.
+        clear_roon_runtime_state(&self.state).await;
+
         // Reset started flag so we can restart later
         self.started.store(false, Ordering::SeqCst);
 
@@ -3469,20 +3474,21 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_stop_clears_cached_roon_connection_state() {
-        let state = Arc::new(RwLock::new(RoonState {
-            connected: true,
-            core_name: Some("nuc14".to_string()),
-            core_version: Some("test".to_string()),
-            zones: HashMap::from([(
+        let adapter = RoonAdapter::new_disconnected(crate::bus::create_bus());
+        {
+            let mut state = adapter.state.write().await;
+            state.connected = true;
+            state.core_name = Some("nuc14".to_string());
+            state.core_version = Some("test".to_string());
+            state.zones.insert(
                 "test-zone".to_string(),
                 make_test_zone("output", Some(5.0), Some(0.0), Some(100.0)),
-            )]),
-            ..RoonState::default()
-        }));
+            );
+        }
 
-        clear_roon_runtime_state(&state).await;
+        adapter.stop_internal().await;
 
-        let cleared = state.read().await;
+        let cleared = adapter.state.read().await;
         assert!(!cleared.connected);
         assert!(cleared.core_name.is_none());
         assert!(cleared.core_version.is_none());
