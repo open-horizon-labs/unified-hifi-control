@@ -101,6 +101,14 @@ pub struct NowPlaying {
     pub volume_step: Option<f32>,
     pub is_previous_allowed: bool,
     pub is_next_allowed: bool,
+    #[serde(default)]
+    pub seek_position: Option<i64>,
+    #[serde(default)]
+    pub length: Option<u32>,
+    #[serde(default)]
+    pub is_play_allowed: bool,
+    #[serde(default)]
+    pub is_pause_allowed: bool,
 }
 
 // =============================================================================
@@ -164,10 +172,13 @@ pub struct HqpPipeline {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct HqpPipelineStatus {
     pub state: Option<String>,
+    pub mode: Option<String>,
     pub active_mode: Option<String>,
     pub active_filter: Option<String>,
     pub active_shaper: Option<String>,
     pub active_rate: Option<u64>,
+    pub convolution: Option<bool>,
+    pub invert: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -222,6 +233,42 @@ pub struct HqpMatrixProfile {
 pub struct HqpMatrixProfilesResponse {
     pub profiles: Vec<HqpMatrixProfile>,
     pub current: Option<HqpMatrixProfile>,
+    #[serde(default)]
+    pub junk_filters: Vec<HqpNativeChoice>,
+    pub junk_filter: Option<u32>,
+    pub convolution: Option<bool>,
+    pub adaptive_volume: Option<bool>,
+    pub repeat: Option<u8>,
+    pub random: Option<bool>,
+    pub native_state: Option<HqpNativeState>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct HqpNativeChoice {
+    pub index: u32,
+    pub name: String,
+    pub value: i32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct HqpNativeState {
+    pub state: u8,
+    pub mode: u8,
+    pub filter: u32,
+    pub filter1x: Option<u32>,
+    pub filter_nx: Option<u32>,
+    pub shaper: u32,
+    pub rate: u32,
+    pub volume: i32,
+    pub active_mode: u8,
+    pub active_rate: u32,
+    pub invert: bool,
+    pub convolution: bool,
+    pub repeat: u8,
+    pub random: bool,
+    pub adaptive: bool,
+    pub filter_20k: bool,
+    pub matrix_profile: String,
 }
 
 // =============================================================================
@@ -320,6 +367,10 @@ pub async fn fetch_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, St
 
     let resp: Response = resp_value.dyn_into().map_err(|_| "Not a Response")?;
 
+    if !resp.ok() {
+        return Err(response_error(resp).await);
+    }
+
     let json = JsFuture::from(resp.json().map_err(|e| format!("{:?}", e))?)
         .await
         .map_err(|e| format!("{:?}", e))?;
@@ -365,6 +416,10 @@ pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
 
     let resp: Response = resp_value.dyn_into().map_err(|_| "Not a Response")?;
 
+    if !resp.ok() {
+        return Err(response_error(resp).await);
+    }
+
     let json = JsFuture::from(resp.json().map_err(|e| format!("{:?}", e))?)
         .await
         .map_err(|e| format!("{:?}", e))?;
@@ -384,8 +439,9 @@ pub async fn post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
 /// POST JSON without expecting response body
 #[cfg(target_arch = "wasm32")]
 pub async fn post_json_no_response<T: Serialize>(url: &str, body: &T) -> Result<(), String> {
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
-    use web_sys::{Headers, Request, RequestInit};
+    use web_sys::{Headers, Request, RequestInit, Response};
 
     let window = web_sys::window().ok_or("No window")?;
 
@@ -403,11 +459,47 @@ pub async fn post_json_no_response<T: Serialize>(url: &str, body: &T) -> Result<
 
     let request = Request::new_with_str_and_init(url, &opts).map_err(|e| format!("{:?}", e))?;
 
-    JsFuture::from(window.fetch_with_request(&request))
+    let resp_value = JsFuture::from(window.fetch_with_request(&request))
         .await
         .map_err(|e| format!("{:?}", e))?;
 
+    let resp: Response = resp_value.dyn_into().map_err(|_| "Not a Response")?;
+    if !resp.ok() {
+        return Err(response_error(resp).await);
+    }
+
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn response_error(resp: web_sys::Response) -> String {
+    use wasm_bindgen_futures::JsFuture;
+
+    let status = resp.status();
+    let body = match resp.text() {
+        Ok(text) => JsFuture::from(text)
+            .await
+            .ok()
+            .and_then(|value| value.as_string())
+            .unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+    let detail = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|json| {
+            json.get("error")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| {
+            if body.is_empty() {
+                "Request failed".to_string()
+            } else {
+                body
+            }
+        });
+    format!("HTTP {status}: {detail}")
 }
 
 /// SSR stub - returns error (should not be called during SSR)

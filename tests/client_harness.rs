@@ -191,7 +191,11 @@ async fn create_test_app_with_state() -> (Router, AppState) {
 
     // Create disconnected adapters
     let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
-    let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
+        bus.clone(),
+        aggregator.clone(),
+    ));
     let hqplayer = hqp_instances.get_default().await;
     let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
     let lms = Arc::new(LmsAdapter::new(bus.clone()));
@@ -203,7 +207,6 @@ async fn create_test_app_with_state() -> (Router, AppState) {
     let startable_adapters: Vec<Arc<dyn Startable>> =
         vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
-    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
     let state = AppState::new(
         roon,
         hqplayer,
@@ -1502,23 +1505,110 @@ mod hqplayer_setting_route_contract {
         );
     }
 
-    /// `/hqp/pipeline`'s own gate is unchanged too: a setting it never accepted is still refused
-    /// with its own wording, which is a different message from the other route's.
+    /// The web HQPlayer zone uses the iOS-compatible route for the advanced controls that MCP
+    /// already exposes. Each name must pass the route gate and reach the adapter.
     #[tokio::test]
-    async fn the_pipeline_route_still_refuses_a_setting_it_never_accepted() {
+    async fn the_pipeline_route_accepts_every_advanced_web_control() {
+        let app = create_test_app().await;
+        for (setting, value) in [
+            ("junk_filter", "none"),
+            ("convolution", "true"),
+            ("adaptive_volume", "true"),
+            ("repeat", "all"),
+            ("random", "true"),
+        ] {
+            let (_, body) = post_json(
+                &app,
+                "/hqp/pipeline",
+                &json!({ "setting": setting, "value": value }),
+            )
+            .await;
+            assert!(
+                !body.contains("Invalid setting"),
+                "`{setting}` is a visible HQPlayer web control and must reach the adapter. \
+                 Body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pipeline_route_still_refuses_an_unknown_setting() {
         let app = create_test_app().await;
         let (status, body) = post_json(
             &app,
             "/hqp/pipeline",
-            &json!({ "setting": "convolution", "value": "on" }),
+            &json!({ "setting": "oversampling_magic", "value": "on" }),
         )
         .await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            body.contains("Invalid setting"),
-            "each route keeps its own rejection wording; sharing an applier must not merge them. \
-             Body: {body}"
-        );
+        assert!(body.contains("Invalid setting"), "Body: {body}");
+    }
+
+    #[tokio::test]
+    async fn advanced_state_and_choices_round_trip_through_the_web_routes() {
+        let model = Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE));
+        let server = WireServer::start(model, WirePolicy::default()).await;
+        let (app, state) = create_test_app_with_state().await;
+        state
+            .hqplayer
+            .configure(
+                "127.0.0.1".to_string(),
+                Some(server.port()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        state
+            .hqplayer
+            .set_timeouts(HqpTimeouts {
+                connect: Duration::from_millis(100),
+                response: Duration::from_millis(750),
+                reconnect_delay: Duration::from_millis(10),
+                max_attempts: 1,
+            })
+            .await;
+        state
+            .hqplayer
+            .connect()
+            .await
+            .expect("connect mock HQPlayer");
+
+        let (status, initial_body) = get_request(&app, "/hqplayer/matrix/profiles").await;
+        assert_eq!(status, StatusCode::OK, "{initial_body}");
+        let initial = assert_json("advanced HQPlayer state", &initial_body);
+        let junk_name = initial["junk_filters"]
+            .as_array()
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice["name"].as_str())
+            .expect("mock corpus has a junk-filter choice")
+            .to_string();
+        for (setting, value) in [
+            ("junk_filter", junk_name.as_str()),
+            ("convolution", "true"),
+            ("adaptive_volume", "true"),
+            ("repeat", "all"),
+            ("random", "true"),
+        ] {
+            let (status, body) = post_json(
+                &app,
+                "/hqp/pipeline",
+                &json!({ "setting": setting, "value": value }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{setting}: {body}");
+        }
+
+        let (status, body) = get_request(&app, "/hqplayer/matrix/profiles").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let advanced = assert_json("updated advanced HQPlayer state", &body);
+        assert_eq!(advanced["convolution"], true);
+        assert_eq!(advanced["adaptive_volume"], true);
+        assert_eq!(advanced["repeat"], 2);
+        assert_eq!(advanced["random"], true);
+        assert!(advanced["native_state"].is_object());
+
+        server.stop();
     }
 }

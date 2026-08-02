@@ -1006,6 +1006,11 @@ async fn hqp_apply_named_setting(
         "filter1x" => hqp.set_filter_1x(value).await?,
         "filterNx" | "filternx" => hqp.set_filter_nx(value).await?,
         "shaper" | "dither" => hqp.set_shaper(value).await?,
+        "junk_filter" => hqp.set_junk_filter(value).await?,
+        "convolution" => hqp.set_convolution(parse_hqp_bool(value)?).await?,
+        "adaptive_volume" => hqp.set_adaptive_volume(parse_hqp_bool(value)?).await?,
+        "repeat" => hqp.set_repeat(parse_hqp_repeat(value)?).await?,
+        "random" => hqp.set_random(parse_hqp_bool(value)?).await?,
         "samplerate" | "rate" => {
             let hz: u32 = value.parse().map_err(|_| {
                 anyhow::anyhow!("Invalid rate value (expected Hz like 48000, 96000): {value}")
@@ -1015,6 +1020,27 @@ async fn hqp_apply_named_setting(
         other => return Err(anyhow::anyhow!("Unknown setting: {}", other)),
     };
     outcome.into_applied_result()
+}
+
+fn parse_hqp_bool(value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Ok(true),
+        "false" | "0" | "off" | "no" => Ok(false),
+        _ => Err(anyhow::anyhow!(
+            "Invalid boolean value {value:?}; expected true or false"
+        )),
+    }
+}
+
+fn parse_hqp_repeat(value: &str) -> anyhow::Result<u8> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "0" => Ok(0),
+        "one" | "track" | "1" => Ok(1),
+        "all" | "2" => Ok(2),
+        _ => Err(anyhow::anyhow!(
+            "Invalid repeat value {value:?}; expected off, one, or all"
+        )),
+    }
 }
 
 /// POST /hqplayer/setting - Change HQPlayer pipeline setting (legacy endpoint)
@@ -1095,6 +1121,11 @@ pub async fn hqp_pipeline_update_handler(
         "filterNx",
         "shaper",
         "dither",
+        "junk_filter",
+        "convolution",
+        "adaptive_volume",
+        "repeat",
+        "random",
     ];
     if !valid_settings.contains(&req.setting.as_str()) {
         return (
@@ -1137,9 +1168,7 @@ pub async fn hqp_pipeline_update_handler(
     match result {
         Ok(()) => {
             // Publish verified readback first, then answer from the one shared state owner.
-            if state
-                .hqp_instances
-                .refresh_instance("default")
+            if refresh_hqp_advanced_aggregate(&state, "default")
                 .await
                 .is_ok()
             {
@@ -1228,7 +1257,14 @@ pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl 
             StatusCode::OK,
             Json(serde_json::json!({
                 "profiles": snapshot.matrix_profiles,
-                "current": snapshot.current_matrix_profile
+                "current": snapshot.current_matrix_profile,
+                "junk_filters": snapshot.junk_filters,
+                "junk_filter": snapshot.state.filter_junk,
+                "convolution": snapshot.state.convolution,
+                "adaptive_volume": snapshot.state.adaptive,
+                "repeat": snapshot.state.repeat,
+                "random": snapshot.state.random,
+                "native_state": snapshot.state,
             })),
         )
             .into_response(),

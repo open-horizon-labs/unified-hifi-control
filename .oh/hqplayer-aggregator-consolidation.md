@@ -23,8 +23,20 @@ lane health/freshness, coherent observations, and verified receipts.
 
 ## Execute
 
-**Updated:** 2026-08-01
-**Status:** implementation and live verification complete; review/package publication pending
+**Updated:** 2026-08-02
+**Status:** complete — remaining HQPlayer native controls are exposed and live-browser verified
+
+### UI expansion pre-flight
+
+- Aim: every currently wired HQPlayer control is visible and operable from HQPlayer zones, with
+  advanced native state discoverable before a write.
+- Scope: junk filter, convolution, adaptive volume, repeat/random, stop/seek/mute, and the fuller
+  native status/options readout on the existing HQPlayer page and zone cards.
+- Constraints: preserve existing routes and incumbent visual language; additive payload fields only;
+  aggregator remains the sole state owner; mobile retains all controls with touch-sized targets.
+- Out of scope: playlist/library management, generic adaptive UI, merging without approval.
+- Success: contract tests fail before implementation and pass after; desktop and mobile browser
+  passes operate the live controls and verify readback without leaving the daemon changed.
 
 ### Pre-flight
 
@@ -51,6 +63,14 @@ lane health/freshness, coherent observations, and verified receipts.
 - Fixed the profile option value mismatch and matrix-current response model in the Dioxus client.
 - Fixed live HQPlayer 6.0.4 matrix lists that omit `index`: compatibility indices are now derived
   from list order, making the second and later matrix profiles selectable.
+- HQPlayer direct zones now render now-playing, previous/play-pause/next/stop, verified mute,
+  volume, and seek controls. Playback and volume observations refresh from aggregator events.
+- The DSP card now renders live engine state, matrix/profile selectors, core pipeline settings, junk
+  filter, repeat, convolution, adaptive volume, and random controls from native choices/readback.
+- Browser POST helpers now reject non-2xx responses and show the daemon's error instead of silently
+  treating a refused command as success.
+- HQPlayer cards and DSP controls collapse without loss at mobile widths; every small button has a
+  44 by 44 pixel minimum target.
 
 ### Verification
 
@@ -63,6 +83,18 @@ lane health/freshness, coherent observations, and verified receipts.
 - Live mode changed SDM -> PCM -> SDM with verified readback and restored the starting mode.
 - Live matrix changed Default -> Mch-to-Stereo mixdown -> Default with verified readback and restored
   the starting profile. The live no-index matrix defect reproduced before the fix and passed after.
+- Chrome exercised the live UI against `192.168.1.61`: junk filter none -> 20k -> none, repeat off ->
+  current -> off, adaptive volume off -> on -> off, random off -> on -> off, stop while stopped, and
+  mute -3 dB -> -60 dB -> -3 dB. Each mutation matched native state and the daemon was restored.
+- The live daemon accepted `SetConvolution` but continued to report convolution off. UHC correctly
+  refused to claim success and the browser displayed the verified HTTP 500 explanation.
+- Play against the daemon's empty transport correctly surfaced its native rejection; seek remained
+  disabled with a visible explanation because the daemon reported no track duration.
+- Browser checks passed at 1250 px and 375 px content widths with no horizontal overflow. Mobile
+  transport/volume targets measured 44 by 44 pixels; the Impeccable detector returned no findings.
+- `cargo test --test client_harness` (83), `hqplayer_direct_zone` (65),
+  `mcp_hqplayer_control` (48), and `api_contract` (2) passed; all-feature clippy passed with warnings
+  denied and `git diff --check` passed.
 - Live tier-1 capture completed every native family within 129 ms, but correctly failed the checked-in
   corpus diff: the abbreviated `hqpd-6.0.4-opal` fixtures differ from the real daemon in 142 entries,
   indices, or enum IDs. Artifact: `/tmp/uhc-hqp-tier1-aggregator.json`. This is a corpus provenance
