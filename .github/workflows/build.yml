@@ -1803,7 +1803,7 @@ jobs:
           sed -i "s/^sha256sums_armv7h=.*/sha256sums_armv7h=('${armv7h_sha}')/" PKGBUILD
 
       - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: unified-hifi-control-bin
           pkgbuild: build/arch/PKGBUILD
