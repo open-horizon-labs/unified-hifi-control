@@ -2236,6 +2236,7 @@ pub async fn api_settings_get_handler() -> impl IntoResponse {
 #[derive(Debug, Serialize)]
 pub struct SpotifyAccountResponse {
     pub account: Option<ProviderAccount>,
+    pub error: Option<String>,
 }
 
 /// GET /api/providers/spotify/account - Last account identity reported by the
@@ -2245,6 +2246,7 @@ pub async fn spotify_account_handler(
 ) -> Json<SpotifyAccountResponse> {
     Json(SpotifyAccountResponse {
         account: state.aggregator.get_provider_account("spotify").await,
+        error: state.aggregator.get_adapter_error("spotify").await,
     })
 }
 

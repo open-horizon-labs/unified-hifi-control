@@ -498,6 +498,9 @@ pub enum BusEvent {
         account: Option<ProviderAccount>,
     },
 
+    /// A provider adapter could not refresh its backend state.
+    AdapterError { adapter: String, error: String },
+
     // =========================================================================
     // Now Playing Events
     // =========================================================================
@@ -657,6 +660,7 @@ impl BusEvent {
             Self::ZoneUpdated { .. } => "zone_updated",
             Self::ZoneRemoved { .. } => "zone_removed",
             Self::ProviderAccountUpdated { .. } => "provider_account_updated",
+            Self::AdapterError { .. } => "adapter_error",
             Self::NowPlayingChanged { .. } => "now_playing_changed",
             Self::SeekPositionChanged { .. } => "seek_position_changed",
             Self::VolumeChanged { .. } => "volume_changed",
@@ -719,6 +723,7 @@ impl BusEvent {
                 | Self::AdapterStopped { .. }
                 | Self::AdapterConnected { .. }
                 | Self::AdapterDisconnected { .. }
+                | Self::AdapterError { .. }
         )
     }
 

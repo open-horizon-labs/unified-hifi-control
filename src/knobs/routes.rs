@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use sha2::{Digest, Sha256};
 
+use crate::adapters::AdapterCommand;
 use crate::api::AppState;
 use crate::bus::VolumeControl;
 use crate::knobs::image::placeholder_svg;
@@ -542,6 +543,8 @@ pub async fn knob_control_handler(
         // UPnP zone control
         let udn = req.zone_id.trim_start_matches("upnp:");
         return control_upnp(&state, udn, &req.action).await;
+    } else if req.zone_id.starts_with("spotify:") {
+        return control_spotify(&state, &req.zone_id, &req.action, req.value.as_ref()).await;
     }
 
     // Roon zone (or legacy zone_id without prefix)
@@ -552,6 +555,56 @@ pub async fn knob_control_handler(
     };
 
     control_roon(&state, &roon_zone_id, &req.action, req.value.as_ref()).await
+}
+
+/// Control a Spotify Connect device through the provider adapter registry.
+async fn control_spotify(
+    state: &AppState,
+    zone_id: &str,
+    action: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let command = match action {
+        "play" => AdapterCommand::Play,
+        "pause" => AdapterCommand::Pause,
+        "play_pause" | "playpause" => AdapterCommand::PlayPause,
+        "next" => AdapterCommand::Next,
+        "previous" | "prev" => AdapterCommand::Previous,
+        "stop" => AdapterCommand::Stop,
+        "vol_abs" | "volume" => {
+            AdapterCommand::VolumeAbsolute(value.and_then(|v| v.as_f64()).unwrap_or(50.0) as i32)
+        }
+        "vol_up" | "volume_up" => {
+            AdapterCommand::VolumeRelative(value.and_then(|v| v.as_f64()).unwrap_or(1.0) as i32)
+        }
+        "vol_down" | "volume_down" => {
+            AdapterCommand::VolumeRelative(-(value.and_then(|v| v.as_f64()).unwrap_or(1.0) as i32))
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Unknown Spotify action: {action}")})),
+            ));
+        }
+    };
+
+    match state
+        .adapter_registry
+        .command("spotify", zone_id, command)
+        .await
+    {
+        Ok(response) if response.success => Ok(Json(serde_json::json!({"ok": true}))),
+        Ok(response) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": response.error.unwrap_or_else(|| "Spotify command failed".to_string())
+            })),
+        )),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )),
+    }
 }
 
 /// Control Roon zone

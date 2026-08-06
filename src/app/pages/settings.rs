@@ -327,7 +327,6 @@ pub fn Settings() -> Element {
         crate::app::api::fetch_json::<SpotifyAccountResponse>("/api/providers/spotify/account")
             .await
             .ok()
-            .and_then(|response| response.account)
     });
     let mut apple_bridge_status = use_resource(|| async {
         crate::app::api::fetch_json::<AppleBridgeStatus>("/api/bridges/applemusic/status").await
@@ -849,12 +848,29 @@ pub fn Settings() -> Element {
                             div {
                                 h3 { id: "spotify-heading", class: "text-lg font-semibold", "Spotify Connect" }
                                 p { class: "mt-1 text-sm text-secondary", "Control existing Spotify Connect devices. UHC does not act as a receiver." }
-                                if let Some(account) = spotify_account_result.as_ref() {
+                                if let Some(account) = spotify_account_result
+                                    .as_ref()
+                                    .and_then(|response| response.account.as_ref())
+                                {
                                     p { class: "mt-2 text-sm text-secondary", "Signed in as "
                                         strong { class: "text-primary", "{account.display_name.as_deref().filter(|name| !name.is_empty()).unwrap_or(&account.id)}" }
+                                    }
+                                    div { class: "mt-1 space-y-0.5 text-xs text-muted" ,
+                                        p { "Spotify ID: {account.id}" }
                                         if let Some(email) = account.email.as_deref().filter(|email| !email.is_empty()) {
-                                            span { " · {email}" }
+                                            p { "Email: {email}" }
+                                        } else {
+                                            p { "Email: unavailable; reconnect Spotify to grant profile access." }
                                         }
+                                    }
+                                }
+                                if let Some(error) = spotify_account_result
+                                    .as_ref()
+                                    .and_then(|response| response.error.as_deref())
+                                {
+                                    p { class: "mt-3 status-err", role: "alert", "Spotify could not refresh this connection: {error}" }
+                                    if error.contains("not registered for this application") {
+                                        p { class: "mt-2 text-sm text-secondary", "Add the Spotify account email to this app's Development-mode Users list, then reconnect." }
                                     }
                                 }
                             }

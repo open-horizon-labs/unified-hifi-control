@@ -15,6 +15,7 @@ use crate::bus::{BusEvent, NowPlaying, ProviderAccount, SharedBus, Zone};
 pub struct ZoneAggregator {
     zones: Arc<RwLock<HashMap<String, Zone>>>,
     provider_accounts: Arc<RwLock<HashMap<String, ProviderAccount>>>,
+    adapter_errors: Arc<RwLock<HashMap<String, String>>>,
     bus: SharedBus,
 }
 
@@ -23,6 +24,7 @@ impl ZoneAggregator {
         Self {
             zones: Arc::new(RwLock::new(HashMap::new())),
             provider_accounts: Arc::new(RwLock::new(HashMap::new())),
+            adapter_errors: Arc::new(RwLock::new(HashMap::new())),
             bus,
         }
     }
@@ -66,6 +68,15 @@ impl ZoneAggregator {
                     } else {
                         accounts.remove(&provider);
                     }
+                }
+
+                BusEvent::AdapterError { adapter, error } => {
+                    debug!("Adapter error: {}: {}", adapter, error);
+                    self.adapter_errors.write().await.insert(adapter, error);
+                }
+
+                BusEvent::AdapterConnected { adapter, .. } => {
+                    self.adapter_errors.write().await.remove(&adapter);
                 }
 
                 BusEvent::NowPlayingChanged {
@@ -160,6 +171,7 @@ impl ZoneAggregator {
                     });
 
                     self.provider_accounts.write().await.remove(&adapter);
+                    self.adapter_errors.write().await.remove(&adapter);
                 }
 
                 BusEvent::ShuttingDown { .. } => {
@@ -215,5 +227,10 @@ impl ZoneAggregator {
     /// Get the last non-secret account identity reported by a provider.
     pub async fn get_provider_account(&self, provider: &str) -> Option<ProviderAccount> {
         self.provider_accounts.read().await.get(provider).cloned()
+    }
+
+    /// Get the last backend error reported by an adapter, if any.
+    pub async fn get_adapter_error(&self, adapter: &str) -> Option<String> {
+        self.adapter_errors.read().await.get(adapter).cloned()
     }
 }

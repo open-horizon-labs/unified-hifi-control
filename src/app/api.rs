@@ -120,6 +120,8 @@ pub struct SpotifyAccount {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpotifyAccountResponse {
     pub account: Option<SpotifyAccount>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

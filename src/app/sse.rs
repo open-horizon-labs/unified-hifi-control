@@ -39,6 +39,12 @@ pub struct ProviderAccountPayload {
     pub account: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct AdapterErrorPayload {
+    pub adapter: String,
+    pub error: String,
+}
+
 /// SSE event types from the server
 /// Server sends: {"type":"EventName","payload":{...}}
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -61,6 +67,9 @@ pub enum SseEvent {
     },
     ProviderAccountUpdated {
         payload: ProviderAccountPayload,
+    },
+    AdapterError {
+        payload: AdapterErrorPayload,
     },
     SeekPositionChanged {
         payload: ZonePayload,
@@ -132,6 +141,7 @@ impl SseContext {
                     | SseEvent::LmsConnected
                     | SseEvent::LmsDisconnected
                     | SseEvent::ProviderAccountUpdated { .. }
+                    | SseEvent::AdapterError { .. }
             )
         )
     }
@@ -176,6 +186,7 @@ impl SseContext {
                     | SseEvent::UpnpRendererFound
                     | SseEvent::UpnpRendererLost
                     | SseEvent::ProviderAccountUpdated { .. }
+                    | SseEvent::AdapterError { .. }
             )
         )
     }

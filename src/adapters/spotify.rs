@@ -405,9 +405,21 @@ impl SpotifyAdapter {
 
     async fn request(&self, method: Method, path: &str) -> Result<reqwest::Response> {
         let access_token = self.ensure_access_token().await?;
-        self.client
+        let has_command_body = method == Method::POST || method == Method::PUT;
+        let request = self
+            .client
             .request(method, format!("{}{}", self.api_base_url, path))
-            .bearer_auth(access_token)
+            .bearer_auth(access_token);
+        let request = if has_command_body {
+            // Spotify's command endpoints require an explicit zero-length
+            // body. Without it some proxies return HTTP 411 Length Required.
+            request
+                .header(reqwest::header::CONTENT_LENGTH, "0")
+                .body(String::new())
+        } else {
+            request
+        };
+        request
             .send()
             .await
             .map_err(|e| anyhow!("Spotify request {} failed: {}", path, e))
@@ -513,6 +525,13 @@ impl SpotifyAdapter {
         Ok(())
     }
 
+    fn publish_error(&self, error: &anyhow::Error) {
+        self.bus.publish(BusEvent::AdapterError {
+            adapter: "spotify".to_string(),
+            error: error.to_string(),
+        });
+    }
+
     async fn stop_internal(&self) {
         self.shutdown.read().await.cancel();
         self.state.write().await.running = false;
@@ -531,7 +550,10 @@ impl AdapterLogic for SpotifyAdapter {
                 "Spotify access token is not configured or has expired"
             ));
         }
-        self.update().await?;
+        if let Err(error) = self.update().await {
+            self.publish_error(&error);
+            return Err(error);
+        }
         self.bus.publish(BusEvent::AdapterConnected {
             adapter: "spotify".to_string(),
             details: Some("Spotify Web API".to_string()),
@@ -542,6 +564,7 @@ impl AdapterLogic for SpotifyAdapter {
                 _ = ctx.shutdown.cancelled() => break,
                 _ = ticker.tick() => {
                     if let Err(error) = self.update().await {
+                        self.publish_error(&error);
                         debug!("Spotify polling failed: {}", error);
                     }
                 }
