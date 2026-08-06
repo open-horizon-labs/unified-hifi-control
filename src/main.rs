@@ -397,9 +397,25 @@ mod server {
         );
 
         state.adapter_registry.register(spotify.clone()).await;
+        state.provider_auth.attach_spotify(spotify.clone()).await;
         if let Some(adapter) = music_assistant.clone() {
             state.adapter_registry.register(adapter).await;
         }
+
+        // Apple Music playback is owned by a native MusicKit companion. The
+        // paired bridge implementation shares the registry with the HTTP
+        // pairing endpoints and starts on the first successful claim.
+        let apple_music = Arc::new(adapters::apple_music::AppleMusicAdapter::with_companion(
+            bus.clone(),
+            Arc::new(api::apple_bridge::PairedMusicKitCompanion::new(
+                state.apple_bridges.clone(),
+            )),
+            std::time::Duration::from_secs(5),
+        ));
+        state
+            .adapter_registry
+            .register_with_lifecycle(apple_music.clone(), apple_music)
+            .await;
 
         // These adapters are configured by their provider credentials rather than
         // the legacy app-settings toggle. Start only when credentials are present.
@@ -423,9 +439,31 @@ mod server {
         let mcp_extension = mcp::create_mcp_extension(state.clone());
 
         // Build API routes
+        let api_oauth_start = api::provider_auth::oauth_start;
+        let api_oauth_callback = api::provider_auth::oauth_callback;
+        let api_oauth_revoke = api::provider_auth::oauth_revoke;
+        let api_bridge_pair = api::apple_bridge::pair;
+        let api_bridge_claim = api::apple_bridge::claim;
+        let api_bridge_revoke = api::apple_bridge::revoke;
+        let api_bridge_status = api::apple_bridge::status;
+        let api_bridge_state = api::apple_bridge::state;
+        let api_bridge_commands = api::apple_bridge::commands;
+        let api_bridge_ack = api::apple_bridge::acknowledge;
+        #[rustfmt::skip]
         let router = Router::new()
             // Health check
             .route("/status", get(api::status_handler))
+            // Provider authorization and native companion pairing
+            .route("/api/providers/{provider}/oauth/start", get(api_oauth_start))
+            .route("/api/providers/{provider}/oauth/callback", get(api_oauth_callback))
+            .route("/api/providers/{provider}/oauth/revoke", post(api_oauth_revoke))
+            .route("/api/bridges/applemusic/pair", post(api_bridge_pair))
+            .route("/api/bridges/applemusic/claim", post(api_bridge_claim))
+            .route("/api/bridges/applemusic/revoke", post(api_bridge_revoke))
+            .route("/api/bridges/applemusic/status", get(api_bridge_status))
+            .route("/api/bridges/applemusic/state", post(api_bridge_state))
+            .route("/api/bridges/applemusic/commands", get(api_bridge_commands))
+            .route("/api/bridges/applemusic/commands/{command_id}", post(api_bridge_ack))
             // Roon routes
             .route("/roon/status", get(api::roon_status_handler))
             .route("/roon/zones", get(api::roon_zones_handler))
@@ -717,6 +755,12 @@ mod server {
         lms.stop().await;
         openhome.stop().await;
         upnp.stop().await;
+        state_for_shutdown.adapter_registry.stop("spotify").await;
+        state_for_shutdown
+            .adapter_registry
+            .stop("musicassistant")
+            .await;
+        state_for_shutdown.adapter_registry.stop("applemusic").await;
         tracing::info!("Shutdown complete");
 
         Ok(())

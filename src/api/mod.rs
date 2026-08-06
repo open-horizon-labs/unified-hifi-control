@@ -29,6 +29,9 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+pub mod apple_bridge;
+pub mod provider_auth;
+
 /// Registry for provider adapters whose transport is not represented by a
 /// dedicated field on `AppState` (for example cloud and bridge-backed sources).
 /// The aggregator remains the read-side source of truth; this registry only
@@ -36,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default)]
 pub struct AdapterRegistry {
     adapters: tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn AdapterLogic>>>,
+    startables: tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn Startable>>>,
 }
 
 impl AdapterRegistry {
@@ -44,6 +48,35 @@ impl AdapterRegistry {
             .write()
             .await
             .insert(adapter.prefix().to_string(), adapter);
+    }
+
+    pub async fn register_with_lifecycle(
+        &self,
+        adapter: Arc<dyn AdapterLogic>,
+        startable: Arc<dyn Startable>,
+    ) {
+        self.register(adapter).await;
+        self.startables
+            .write()
+            .await
+            .insert(startable.name().to_string(), startable);
+    }
+
+    pub async fn start(&self, prefix: &str) -> anyhow::Result<()> {
+        let adapter = self
+            .startables
+            .read()
+            .await
+            .get(prefix)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not registered"))?;
+        adapter.start().await
+    }
+
+    pub async fn stop(&self, prefix: &str) {
+        if let Some(adapter) = self.startables.read().await.get(prefix).cloned() {
+            adapter.stop().await;
+        }
     }
 
     pub async fn command(
@@ -74,6 +107,8 @@ pub struct AppState {
     pub openhome: Arc<OpenHomeAdapter>,
     pub upnp: Arc<UPnPAdapter>,
     pub adapter_registry: Arc<AdapterRegistry>,
+    pub provider_auth: Arc<provider_auth::ProviderAuthState>,
+    pub apple_bridges: apple_bridge::AppleBridgeRegistry,
     pub knobs: KnobStore,
     pub bus: SharedBus,
     pub aggregator: Arc<ZoneAggregator>,
@@ -118,6 +153,8 @@ impl AppState {
             openhome,
             upnp,
             adapter_registry: Arc::new(AdapterRegistry::default()),
+            provider_auth: Arc::new(provider_auth::ProviderAuthState::default()),
+            apple_bridges: apple_bridge::AppleBridgeRegistry::default(),
             knobs,
             bus,
             aggregator,

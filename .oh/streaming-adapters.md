@@ -26,9 +26,9 @@ Apple Music is device-native; Spotify is account- and Connect-device-scoped; Ama
 3. Zones remain adapter-scoped: `spotify:`, `applemusic:`, and `musicassistant:` may each identify the same physical endpoint independently.
 4. Spotify is controller-only; UHC does not become a Spotify Connect receiver in this initiative.
 5. Browse/play saved playlists precedes create/edit provider playlists.
-6. OAuth and bridge endpoint additions are authorized only after a specific contract is reviewed; the user applies `api-change-approved` before endpoint implementation.
+6. OAuth and bridge endpoints are part of the reviewed #463 contract and are implemented in the initiative. The user applies `api-change-approved` to the PR because these routes intentionally extend the API contract.
 
-**Open evidence:** Amazon production access/terms; exact native MusicKit companion contract; whether current public capability vocabulary can represent all playlist actions without an approved expansion.
+**Open evidence:** Amazon production access/terms; native companion entitlement/runtime validation; whether current public capability vocabulary can represent all playlist actions without an approved expansion.
 
 ## Dissent
 

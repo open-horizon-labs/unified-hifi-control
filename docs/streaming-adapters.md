@@ -48,6 +48,42 @@ semantics are not silently projected onto native provider adapters.  See the
 [MA API documentation](https://www.music-assistant.io/api/) for the token and
 command contract.
 
+## Authorization and the Apple Music bridge
+
+The first authorization contract is now implemented in UHC. Spotify uses the
+standard authorization-code flow:
+
+- `GET /api/providers/spotify/oauth/start` creates a single-use, ten-minute
+  state and returns the provider authorization URL.
+- Spotify redirects to `GET /api/providers/spotify/oauth/callback`; UHC
+  exchanges the code server-side and stores the access/refresh token in the
+  Spotify adapter. Tokens are never returned by the endpoint.
+- `POST /api/providers/spotify/oauth/revoke` clears the in-memory token.
+
+Set `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, and optionally
+`SPOTIFY_REDIRECT_URI` (and `SPOTIFY_TOKEN_URL` for a local test server) before
+starting the flow. The callback endpoint must be registered exactly with the
+Spotify application.
+
+Apple Music authorization remains native to the companion. A macOS companion
+can run in-process, or a separate Mac can pair through the same bridge contract:
+
+- `POST /api/bridges/applemusic/pair` creates a five-minute one-time pairing
+  code for a companion id.
+- `POST /api/bridges/applemusic/claim` exchanges that code for a bearer token.
+- The companion publishes `POST /api/bridges/applemusic/state`, polls
+  `GET /api/bridges/applemusic/commands`, and acknowledges commands with
+  `POST /api/bridges/applemusic/commands/{command_id}`.
+- `GET /api/bridges/applemusic/status` reports pairing, snapshot, and
+  thirty-second liveness; `POST /api/bridges/applemusic/revoke` invalidates a
+  companion token.
+
+Pairing and provider credentials are intentionally in-memory in this first
+slice. Deploy these endpoints behind HTTPS and a trusted identity boundary;
+restart invalidates all pending OAuth states, bridge tokens, and provider
+tokens. The companion owns MusicKit authorization and uses the dedicated
+`ApplicationMusicPlayer` session.
+
 ## QNAP x86_64
 
 The QNAP x86_64 package uses the same static
