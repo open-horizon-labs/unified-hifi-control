@@ -333,8 +333,12 @@ pub async fn claim(
         .claim(request)
         .await
         .map_err(|e| error(StatusCode::BAD_REQUEST, &e.to_string(), "pairing_failed"))?;
-    if let Err(error) = state.adapter_registry.start("applemusic").await {
-        tracing::debug!("Apple Music adapter will start when registered: {error}");
+    if state.coordinator.is_enabled("applemusic").await {
+        if let Err(error) = state.adapter_registry.start("applemusic").await {
+            tracing::debug!("Apple Music adapter will start when registered: {error}");
+        }
+    } else {
+        tracing::info!("Apple Music companion paired while adapter is disabled");
     }
     Ok(Json(response))
 }

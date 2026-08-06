@@ -2139,6 +2139,15 @@ pub struct AdapterSettings {
     pub lms: bool,
     #[serde(default)]
     pub hqplayer: bool,
+    /// Spotify is an opt-in controller for existing Connect devices.
+    #[serde(default)]
+    pub spotify: bool,
+    /// Apple Music is an opt-in bridge-backed playback adapter.
+    #[serde(default)]
+    pub applemusic: bool,
+    /// Music Assistant is an opt-in remote playback adapter.
+    #[serde(default)]
+    pub musicassistant: bool,
 }
 
 fn default_true() -> bool {
@@ -2157,6 +2166,9 @@ impl Default for AppSettings {
                 openhome: false,
                 lms: false,
                 hqplayer: false,
+                spotify: false,
+                applemusic: false,
+                musicassistant: false,
             },
         }
     }
@@ -2249,6 +2261,15 @@ pub async fn api_settings_post_handler(
         ("openhome", old_adapters.openhome != new_adapters.openhome),
         ("upnp", old_adapters.upnp != new_adapters.upnp),
         ("hqplayer", old_adapters.hqplayer != new_adapters.hqplayer),
+        ("spotify", old_adapters.spotify != new_adapters.spotify),
+        (
+            "applemusic",
+            old_adapters.applemusic != new_adapters.applemusic,
+        ),
+        (
+            "musicassistant",
+            old_adapters.musicassistant != new_adapters.musicassistant,
+        ),
     ];
 
     for (name, changed) in adapter_changes {
@@ -2263,6 +2284,9 @@ pub async fn api_settings_post_handler(
             "openhome" => new_adapters.openhome,
             "upnp" => new_adapters.upnp,
             "hqplayer" => new_adapters.hqplayer,
+            "spotify" => new_adapters.spotify,
+            "applemusic" => new_adapters.applemusic,
+            "musicassistant" => new_adapters.musicassistant,
             _ => continue,
         };
 
@@ -2327,5 +2351,14 @@ mod tests {
             !settings.adapters.lms,
             "adapters.lms should be false without LMS_UNIFIEDHIFI_STARTED"
         );
+    }
+
+    #[test]
+    fn provider_adapters_are_opt_in_by_default() {
+        let settings = AppSettings::default();
+
+        assert!(!settings.adapters.spotify);
+        assert!(!settings.adapters.applemusic);
+        assert!(!settings.adapters.musicassistant);
     }
 }

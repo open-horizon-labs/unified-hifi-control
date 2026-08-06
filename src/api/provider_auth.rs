@@ -180,10 +180,10 @@ pub async fn configure_spotify(
         ));
     }
     let client_id = request.client_id.trim().to_string();
-    if client_id.is_empty() {
+    if !valid_spotify_client_id(&client_id) {
         return Err(error(
             StatusCode::BAD_REQUEST,
-            "Spotify client_id is required",
+            "Enter a valid Spotify client ID before saving setup",
             "invalid_client_configuration",
         ));
     }
@@ -280,6 +280,13 @@ pub async fn oauth_start(
                 "oauth_not_configured",
             )
         })?;
+    if !valid_spotify_client_id(&config.client_id) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Spotify client setup is incomplete; enter and save the client ID first",
+            "invalid_client_configuration",
+        ));
+    }
     let code_verifier = config.client_secret.is_none().then(generate_pkce_verifier);
     let code_challenge = code_verifier.as_deref().map(pkce_challenge);
     let state_token = random_token(32);
@@ -462,13 +469,17 @@ async fn oauth_callback_json(
         })?;
     }
     adapter.set_token(spotify_token).await;
-    state.adapter_registry.start("spotify").await.map_err(|e| {
-        error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &format!("Spotify adapter failed to start: {e}"),
-            "adapter_start_failed",
-        )
-    })?;
+    if state.coordinator.is_enabled("spotify").await {
+        state.adapter_registry.start("spotify").await.map_err(|e| {
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("Spotify adapter failed to start: {e}"),
+                "adapter_start_failed",
+            )
+        })?;
+    } else {
+        tracing::info!("Spotify authorization completed while adapter is disabled");
+    }
     Ok(Json(ProviderAuthResponse {
         provider,
         authorized: true,
@@ -526,6 +537,11 @@ fn spotify_oauth_config(
                 .filter(|value| !value.is_empty())
         })
         .ok_or_else(|| anyhow::anyhow!("SPOTIFY_CLIENT_ID is not configured"))?;
+    if !valid_spotify_client_id(&client_id) {
+        return Err(anyhow::anyhow!(
+            "Spotify client ID is invalid or still a placeholder"
+        ));
+    }
     let client_secret = std::env::var("SPOTIFY_CLIENT_SECRET")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -566,7 +582,9 @@ fn valid_redirect_uri(value: &str) -> bool {
         return false;
     };
     if url.scheme() == "https" {
-        return url.host_str().is_some();
+        return url
+            .host_str()
+            .is_some_and(|host| host != "example.test" && !host.ends_with(".test"));
     }
     if url.scheme() != "http" {
         return false;
@@ -575,6 +593,16 @@ fn valid_redirect_uri(value: &str) -> bool {
         url.host_str(),
         Some("127.0.0.1") | Some("[::1]") | Some("::1")
     )
+}
+
+fn valid_spotify_client_id(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    !normalized.is_empty()
+        && !matches!(
+            normalized.as_str(),
+            "test" | "local-test" | "example" | "example-client" | "your-client-id"
+        )
+        && !normalized.contains("example.test")
 }
 
 struct SpotifyOAuthRefresher {
@@ -845,7 +873,16 @@ mod tests {
         assert!(valid_redirect_uri("https://uhc.example/callback"));
         assert!(valid_redirect_uri("http://127.0.0.1:8088/callback"));
         assert!(valid_redirect_uri("http://[::1]:8088/callback"));
+        assert!(!valid_redirect_uri("https://example.test/callback"));
         assert!(!valid_redirect_uri("http://localhost:8088/callback"));
         assert!(!valid_redirect_uri("http://192.168.1.9:8088/callback"));
+    }
+
+    #[test]
+    fn client_id_validation_rejects_placeholders() {
+        assert!(valid_spotify_client_id("32characterSpotifyClientId"));
+        assert!(!valid_spotify_client_id(""));
+        assert!(!valid_spotify_client_id("local-test"));
+        assert!(!valid_spotify_client_id("your-client-id"));
     }
 }

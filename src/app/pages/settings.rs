@@ -249,11 +249,15 @@ pub fn Settings() -> Element {
     let mut openhome_enabled = use_signal(|| false);
     let mut upnp_enabled = use_signal(|| false);
     let mut hqplayer_enabled = use_signal(|| false);
+    let mut spotify_enabled = use_signal(|| false);
+    let mut applemusic_enabled = use_signal(|| false);
+    let mut musicassistant_enabled = use_signal(|| false);
 
     // Streaming-provider onboarding state. Provider credentials are never
     // rendered or stored in the browser; the backend owns OAuth tokens.
     let mut spotify_action = use_signal(ProviderActionState::default);
     let mut spotify_error = use_signal(|| None::<String>);
+    let mut spotify_local_setup_saved = use_signal(|| false);
     let mut spotify_client_id = use_signal(String::new);
     let mut spotify_client_secret = use_signal(String::new);
     let mut spotify_redirect_uri = use_signal(default_spotify_redirect_uri);
@@ -278,6 +282,9 @@ pub fn Settings() -> Element {
             openhome_enabled.set(s.adapters.openhome);
             upnp_enabled.set(s.adapters.upnp);
             hqplayer_enabled.set(s.adapters.hqplayer);
+            spotify_enabled.set(s.adapters.spotify);
+            applemusic_enabled.set(s.adapters.applemusic);
+            musicassistant_enabled.set(s.adapters.musicassistant);
             hide_knobs.set(s.hide_knobs_page);
             // Sync to shared context for Nav reactivity (page visibility follows adapter state)
             settings_ctx.update(s.hide_knobs_page, s.adapters.hqplayer, s.adapters.lms);
@@ -411,6 +418,7 @@ pub fn Settings() -> Element {
             {
                 Ok(response) if response.configured => {
                     spotify_action.set(ProviderActionState::Success);
+                    spotify_local_setup_saved.set(true);
                 }
                 Ok(_) => {
                     spotify_action.set(ProviderActionState::Failed);
@@ -445,6 +453,9 @@ pub fn Settings() -> Element {
                 openhome: openhome_enabled(),
                 upnp: upnp_enabled(),
                 hqplayer: hqp,
+                spotify: spotify_enabled(),
+                applemusic: applemusic_enabled(),
+                musicassistant: musicassistant_enabled(),
             },
             hide_knobs_page: hk,
             // These are now derived from adapter state but we keep them for API compat
@@ -469,6 +480,16 @@ pub fn Settings() -> Element {
             zones
                 .iter()
                 .filter(|zone| zone.zone_id.starts_with("spotify:"))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+    let musicassistant_zones = provider_zones_result
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|zones| {
+            zones
+                .iter()
+                .filter(|zone| zone.zone_id.starts_with("musicassistant:"))
                 .cloned()
                 .collect::<Vec<_>>()
         });
@@ -678,6 +699,106 @@ pub fn Settings() -> Element {
                                 }
                             }
                             // Knobs (page only, no adapter)
+                            // Spotify (controller adapter; zones arrive through the bus)
+                            tr { class: "border-b border-default",
+                                td { class: "py-2 px-3",
+                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "checkbox",
+                                            aria_label: "Enable Spotify",
+                                            checked: spotify_enabled(),
+                                            onchange: move |_| {
+                                                spotify_enabled.toggle();
+                                                save_settings();
+                                            }
+                                        }
+                                    }
+                                }
+                                td { class: "py-2 px-3", "Spotify" }
+                                td { class: "py-2 px-3",
+                                    if spotify_enabled() {
+                                        if let Some(ref devices) = spotify_devices {
+                                            if devices.is_empty() {
+                                                span { class: "status-err", "✗ No Connect devices" }
+                                            } else {
+                                                span { class: "status-ok", "✓ {devices.len()} device(s)" }
+                                            }
+                                        } else {
+                                            "..."
+                                        }
+                                    } else {
+                                        span { class: "text-muted", "-" }
+                                    }
+                                }
+                            }
+                            // Apple Music (bridge-backed adapter; zones arrive through the bus)
+                            tr { class: "border-b border-default",
+                                td { class: "py-2 px-3",
+                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "checkbox",
+                                            aria_label: "Enable Apple Music",
+                                            checked: applemusic_enabled(),
+                                            onchange: move |_| {
+                                                applemusic_enabled.toggle();
+                                                save_settings();
+                                            }
+                                        }
+                                    }
+                                }
+                                td { class: "py-2 px-3", "Apple Music" }
+                                td { class: "py-2 px-3",
+                                    if applemusic_enabled() {
+                                        if let Some(ref status) = apple_st {
+                                            if status.paired {
+                                                span { class: "status-ok", "✓ Paired" }
+                                            } else {
+                                                span { class: "status-err", "✗ Not paired" }
+                                            }
+                                        } else {
+                                            "..."
+                                        }
+                                    } else {
+                                        span { class: "text-muted", "-" }
+                                    }
+                                }
+                            }
+                            // Music Assistant (remote adapter; zones arrive through the bus)
+                            tr { class: "border-b border-default",
+                                td { class: "py-2 px-3",
+                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "checkbox",
+                                            aria_label: "Enable Music Assistant",
+                                            checked: musicassistant_enabled(),
+                                            onchange: move |_| {
+                                                musicassistant_enabled.toggle();
+                                                save_settings();
+                                            }
+                                        }
+                                    }
+                                }
+                                td { class: "py-2 px-3", "Music Assistant" }
+                                td { class: "py-2 px-3",
+                                    if musicassistant_enabled() {
+                                        if let Some(ref zones) = musicassistant_zones {
+                                            if zones.is_empty() {
+                                                span { class: "status-err", "✗ No players" }
+                                            } else {
+                                                span { class: "status-ok", "✓ {zones.len()} player(s)" }
+                                            }
+                                        } else {
+                                            "..."
+                                        }
+                                    } else {
+                                        span { class: "text-muted", "-" }
+                                    }
+                                }
+                            }
+                            // Knobs (page only, no adapter)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
                                     label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
@@ -718,7 +839,9 @@ pub fn Settings() -> Element {
                                 h3 { id: "spotify-heading", class: "text-lg font-semibold", "Spotify Connect" }
                                 p { class: "mt-1 text-sm text-secondary", "Control existing Spotify Connect devices. UHC does not act as a receiver." }
                             }
-                            if spotify_devices.as_ref().map(|devices| !devices.is_empty()).unwrap_or(false) {
+                            if !spotify_enabled() {
+                                span { class: "badge badge-secondary shrink-0", "Disabled" }
+                            } else if spotify_devices.as_ref().map(|devices| !devices.is_empty()).unwrap_or(false) {
                                 span { class: "badge badge-success shrink-0", "Connected" }
                             } else {
                                 span { class: "badge badge-secondary shrink-0", "Not connected" }
@@ -736,10 +859,13 @@ pub fn Settings() -> Element {
                                 button {
                                     r#type: "button",
                                     class: "btn btn-primary mt-4 min-h-11 w-full sm:w-auto",
-                                    disabled: spotify_action() == ProviderActionState::Loading,
+                                    disabled: spotify_action() == ProviderActionState::Loading || !spotify_local_setup_saved(),
                                     aria_busy: spotify_action() == ProviderActionState::Loading,
                                     onclick: start_spotify_oauth,
-                                    if spotify_action() == ProviderActionState::Loading { "Opening Spotify…" } else { "Connect Spotify" }
+                                    if spotify_action() == ProviderActionState::Loading { "Opening Spotify…" } else if spotify_local_setup_saved() { "Connect Spotify" } else { "Save setup first" }
+                                }
+                                if !spotify_local_setup_saved() {
+                                    p { class: "mt-2 text-xs text-muted", "Enter and save your Spotify client ID in Local setup before connecting." }
                                 }
                             }
                             div { class: "rounded-md border border-default p-4",
@@ -761,7 +887,10 @@ pub fn Settings() -> Element {
                                     class: "input mt-1 min-h-11 w-full",
                                     value: spotify_client_id(),
                                     autocomplete: "off",
-                                    oninput: move |event| spotify_client_id.set(event.value()),
+                                    oninput: move |event| {
+                                        spotify_local_setup_saved.set(false);
+                                        spotify_client_id.set(event.value());
+                                    },
                                 }
                                 label { class: "mt-3 block text-sm font-medium", r#for: "spotify-client-secret", "Client secret (optional for PKCE)" }
                                 input {
@@ -770,7 +899,10 @@ pub fn Settings() -> Element {
                                     r#type: "password",
                                     value: spotify_client_secret(),
                                     autocomplete: "new-password",
-                                    oninput: move |event| spotify_client_secret.set(event.value()),
+                                    oninput: move |event| {
+                                        spotify_local_setup_saved.set(false);
+                                        spotify_client_secret.set(event.value());
+                                    },
                                 }
                                 label { class: "mt-3 block text-sm font-medium", r#for: "spotify-redirect-uri", "Redirect URI (optional)" }
                                 input {
@@ -779,7 +911,10 @@ pub fn Settings() -> Element {
                                     value: spotify_redirect_uri(),
                                     placeholder: "https://your-uhc-host.example/api/providers/spotify/oauth/callback",
                                     autocomplete: "url",
-                                    oninput: move |event| spotify_redirect_uri.set(event.value()),
+                                    oninput: move |event| {
+                                        spotify_local_setup_saved.set(false);
+                                        spotify_redirect_uri.set(event.value());
+                                    },
                                 }
                                 p { class: "mt-2 text-xs text-muted", "Spotify requires HTTPS for a remote QNAP callback. Plain HTTP is accepted only on 127.0.0.1 or [::1]." }
                                 button {
@@ -870,7 +1005,9 @@ pub fn Settings() -> Element {
                                 h3 { id: "apple-music-heading", class: "text-lg font-semibold", "Apple Music" }
                                 p { class: "mt-1 text-sm text-secondary", "Use a signed native MusicKit companion. On macOS it controls the ApplicationMusicPlayer session; SystemMusicPlayer is unavailable in the macOS SDK." }
                             }
-                            if apple_st.as_ref().map(|status| status.paired && status.has_snapshot).unwrap_or(false) {
+                            if !applemusic_enabled() {
+                                span { class: "badge badge-secondary shrink-0", "Disabled" }
+                            } else if apple_st.as_ref().map(|status| status.paired && status.has_snapshot).unwrap_or(false) {
                                 span { class: "badge badge-success shrink-0", "Companion live" }
                             } else if apple_st.as_ref().map(|status| status.paired).unwrap_or(false) {
                                 span { class: "badge badge-secondary shrink-0", "Paired · waiting" }

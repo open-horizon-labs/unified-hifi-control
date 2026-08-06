@@ -379,7 +379,7 @@ mod server {
         let shutdown_token = CancellationToken::new();
 
         // Build application state (clone Arcs so we can access adapters for shutdown)
-        let state = api::AppState::new(
+        let mut state = api::AppState::new(
             roon,
             hqplayer,
             hqp_instances,
@@ -396,10 +396,16 @@ mod server {
             shutdown_token.clone(),
         );
 
-        state.adapter_registry.register(spotify.clone()).await;
+        state
+            .adapter_registry
+            .register_with_lifecycle(spotify.clone(), spotify.clone())
+            .await;
         state.provider_auth.attach_spotify(spotify.clone()).await;
         if let Some(adapter) = music_assistant.clone() {
-            state.adapter_registry.register(adapter).await;
+            state
+                .adapter_registry
+                .register_with_lifecycle(adapter.clone(), adapter)
+                .await;
         }
 
         // Apple Music playback is owned by a native MusicKit companion. The
@@ -414,23 +420,19 @@ mod server {
         ));
         state
             .adapter_registry
-            .register_with_lifecycle(apple_music.clone(), apple_music)
+            .register_with_lifecycle(apple_music.clone(), apple_music.clone())
             .await;
 
-        // These adapters are configured by their provider credentials rather than
-        // the legacy app-settings toggle. Start only when credentials are present.
-        if spotify.can_start().await {
-            if let Err(error) = spotify.start().await {
-                tracing::warn!("Spotify adapter failed to start: {error}");
-            }
-        }
-        if let Some(adapter) = music_assistant {
-            if adapter.can_start().await {
-                if let Err(error) = adapter.start().await {
-                    tracing::warn!("Music Assistant adapter failed to start: {error}");
-                }
-            }
-        }
+        // Provider adapters participate in the same feature-toggle lifecycle as
+        // local adapters. Their zones still arrive through the bus and the
+        // aggregator; the registry only dispatches commands and controls their
+        // lifecycle after the coordinator has approved them.
+        let mut startable_adapters = (*state.startable_adapters).clone();
+        startable_adapters.push(apple_music.clone());
+        state.startable_adapters = Arc::new(startable_adapters);
+        let provider_startables: Vec<Arc<dyn adapters::Startable>> =
+            vec![spotify.clone(), apple_music.clone()];
+        coord.start_all_enabled(&provider_startables).await;
 
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();

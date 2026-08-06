@@ -20,7 +20,16 @@ use std::sync::Arc;
 /// All available adapters in the system.
 /// This is the single source of truth for what adapters exist.
 /// Note: "lms-cli" is a companion to "lms" and shares its enabled state.
-pub const AVAILABLE_ADAPTERS: &[&str] = &["roon", "lms", "lms-cli", "openhome", "upnp"];
+pub const AVAILABLE_ADAPTERS: &[&str] = &[
+    "roon",
+    "lms",
+    "lms-cli",
+    "openhome",
+    "upnp",
+    "spotify",
+    "applemusic",
+    "musicassistant",
+];
 
 /// Registered adapter with its spawn function
 struct RegisteredAdapter {
@@ -79,6 +88,9 @@ impl AdapterCoordinator {
                 "lms-cli" => settings.lms,
                 "openhome" => settings.openhome,
                 "upnp" => settings.upnp,
+                "spotify" => settings.spotify,
+                "applemusic" => settings.applemusic,
+                "musicassistant" => settings.musicassistant,
                 _ => false,
             };
             self.register(name, enabled).await;
@@ -386,6 +398,24 @@ mod tests {
 
         coord.register("disabled", false).await;
         assert!(!coord.is_enabled("disabled").await);
+    }
+
+    #[tokio::test]
+    async fn provider_adapters_follow_feature_settings() {
+        let bus = create_bus();
+        let coord = AdapterCoordinator::new(bus);
+        let settings = AdapterSettings {
+            spotify: true,
+            applemusic: true,
+            musicassistant: true,
+            ..Default::default()
+        };
+
+        coord.register_from_settings(&settings).await;
+
+        assert!(coord.is_enabled("spotify").await);
+        assert!(coord.is_enabled("applemusic").await);
+        assert!(coord.is_enabled("musicassistant").await);
     }
 
     #[tokio::test]

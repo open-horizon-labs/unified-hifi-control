@@ -51,6 +51,12 @@ pub struct AdapterSettings {
     pub upnp: bool,
     #[serde(default)]
     pub hqplayer: bool,
+    #[serde(default)]
+    pub spotify: bool,
+    #[serde(default)]
+    pub applemusic: bool,
+    #[serde(default)]
+    pub musicassistant: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
