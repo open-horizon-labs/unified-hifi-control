@@ -1886,6 +1886,53 @@ async fn lms_poll_removes_a_missing_player_from_the_canonical_projection() {
     panic!("removed LMS player remained in the aggregator: {last}");
 }
 
+/// LMS retains a disconnected Squeezelite client in its inventory. The poll's
+/// `connected` flag, not only disappearance from the inventory, is therefore
+/// authoritative for whether its zone is controllable.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_poll_removes_a_disconnected_player_from_the_canonical_projection() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+    h.mock.set_connected(h.player_id, false).await;
+
+    let mut last = Value::Null;
+    for _ in 0..60 {
+        let text = result_text(&h.app.call_tool("hifi_zones", json!({})).await);
+        last = serde_json::from_str(&text).expect("hifi_zones JSON");
+        let still_present = last
+            .as_array()
+            .is_some_and(|zones| zones.iter().any(|zone| zone["zone_id"] == zone_id));
+        if !still_present {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        !last
+            .as_array()
+            .is_some_and(|zones| zones.iter().any(|zone| zone["zone_id"] == zone_id)),
+        "disconnected LMS player remained in the aggregator: {last}"
+    );
+
+    h.mock.set_connected(h.player_id, true).await;
+    for _ in 0..60 {
+        let text = result_text(&h.app.call_tool("hifi_zones", json!({})).await);
+        last = serde_json::from_str(&text).expect("hifi_zones JSON");
+        if last
+            .as_array()
+            .is_some_and(|zones| zones.iter().any(|zone| zone["zone_id"] == zone_id))
+        {
+            h.stop().await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    panic!("reconnected LMS player did not return to the aggregator: {last}");
+}
+
 /// `hifi_control` returns the action name plus the zone's post-command state.
 /// The prose framing is what a model reads back to the user.
 #[tokio::test]

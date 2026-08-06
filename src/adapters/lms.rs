@@ -2170,8 +2170,14 @@ async fn update_players_internal(
     runtime_bridge: Option<&LmsRuntimeBridge>,
 ) -> Result<()> {
     let players = rpc.get_players().await?;
+    // LMS keeps disconnected Squeezelite clients in its `players` inventory.
+    // That inventory is useful for server diagnostics, but only a connected
+    // client is a controllable UHC zone. Treat the connected subset as this
+    // poll's authoritative projection membership so a disconnect retires the
+    // old `lms:` zone through the reliable removal path below.
     let observed_ids: std::collections::HashSet<String> = players
         .iter()
+        .filter(|player| player.connected)
         .map(|player| player.playerid.clone())
         .collect();
 
@@ -2276,10 +2282,11 @@ async fn update_players_internal(
         s.players.insert(player.playerid.clone(), player);
     }
 
-    // `players` is LMS's authoritative server inventory. Keep the last observation for a player
-    // whose follow-up status call failed, but retire ids the inventory itself no longer reports.
-    // Without this retain, `current_ids` was always a superset of `previous_ids`, making the
-    // ZoneRemoved path below unreachable and leaving disconnected players in the aggregator.
+    // LMS's connected subset is the authoritative controllable-zone membership. Keep the last
+    // observation when a connected player's follow-up status call fails, but retire both missing
+    // and disconnected ids. Without this retain, `current_ids` was always a superset of
+    // `previous_ids`, making the ZoneRemoved path below unreachable and leaving disconnected
+    // players in the aggregator.
     state
         .write()
         .await
