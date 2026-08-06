@@ -6,6 +6,7 @@
 //! must remove its projection, and every coordinator/API stop route must flush
 //! before cancellation.
 
+use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{Expr, ExprMatch, ImplItem, Item, Pat};
 
@@ -87,9 +88,9 @@ fn facts(block: &syn::Block) -> SyntaxFacts {
     facts
 }
 
-fn expression_facts(expression: &Expr) -> SyntaxFacts {
+fn statement_facts(statement: &syn::Stmt) -> SyntaxFacts {
     let mut facts = SyntaxFacts::default();
-    facts.visit_expr(expression);
+    facts.visit_stmt(statement);
     facts
 }
 
@@ -105,7 +106,7 @@ impl<'ast> Visit<'ast> for StopFacts {
                 .path
                 .segments
                 .last()
-                .is_some_and(|segment| segment.ident == "stop_adapter_and_flush_zones")
+                .is_some_and(|segment| segment.ident == "stop_adapter_and_flush")
             {
                 self.events.push("flush");
                 self.events.push("stop");
@@ -115,6 +116,10 @@ impl<'ast> Visit<'ast> for StopFacts {
     }
 
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "stop_adapter_and_flush" {
+            self.events.push("flush");
+            self.events.push("stop");
+        }
         if call.method == "publish" {
             let mut arguments = SyntaxFacts::default();
             for argument in &call.args {
@@ -168,19 +173,82 @@ fn pat_has_core_lost(pat: &Pat) -> bool {
 
 #[derive(Default)]
 struct CoreLossFacts {
-    removes_projection: bool,
+    saw_lost: bool,
+    collects_all_zone_ids: bool,
+    clears_cache: bool,
+    retires_each_zone: bool,
+    bridge_removal: bool,
+    bus_fallback: bool,
+    restart_after_retirement: bool,
 }
 
 impl<'ast> Visit<'ast> for CoreLossFacts {
     fn visit_expr_match(&mut self, expression: &'ast ExprMatch) {
         for arm in &expression.arms {
-            if pat_has_core_lost(&arm.pat) {
-                let arm_facts = expression_facts(&arm.body);
-                self.removes_projection |= arm_facts
+            if !pat_has_core_lost(&arm.pat) {
+                continue;
+            }
+            self.saw_lost = true;
+            let mut arm_facts = SyntaxFacts::default();
+            arm_facts.visit_expr(&arm.body);
+            self.collects_all_zone_ids = arm_facts.method_calls.iter().any(|call| call == "keys")
+                && arm_facts.method_calls.iter().any(|call| call == "map")
+                && arm_facts.method_calls.iter().any(|call| call == "collect")
+                && arm_facts.paths.iter().any(|path| path == "PrefixedZoneId")
+                && arm_facts.paths.iter().any(|path| path == "roon");
+            self.clears_cache = arm_facts
+                .paths
+                .iter()
+                .any(|path| path == "clear_roon_runtime_state");
+            self.retires_each_zone = arm_facts
+                .paths
+                .iter()
+                .any(|path| path == "removed_zone_ids")
+                && arm_facts
                     .method_calls
                     .iter()
                     .any(|call| call == "publish_removed");
-            }
+            self.bridge_removal = arm_facts
+                .method_calls
+                .iter()
+                .any(|call| call == "publish_removed");
+            self.bus_fallback = arm_facts.paths.iter().any(|path| path == "ZoneRemoved");
+            let Expr::Block(block) = arm.body.as_ref() else {
+                continue;
+            };
+            let clear_line = block.block.stmts.iter().find_map(|statement| {
+                let facts = statement_facts(statement);
+                facts
+                    .paths
+                    .iter()
+                    .any(|path| path == "clear_roon_runtime_state")
+                    .then(|| statement.span().start().line)
+            });
+            let retirement_line = block.block.stmts.iter().find_map(|statement| {
+                let facts = statement_facts(statement);
+                (facts.paths.iter().any(|path| path == "removed_zone_ids")
+                    && facts
+                        .method_calls
+                        .iter()
+                        .any(|call| call == "publish_removed")
+                    && facts.paths.iter().any(|path| path == "ZoneRemoved"))
+                .then(|| statement.span().start().line)
+            });
+            let restart_line = block.block.stmts.iter().find_map(|statement| {
+                let facts = statement_facts(statement);
+                facts
+                    .method_calls
+                    .iter()
+                    .any(|call| call == "store")
+                    .then(|| statement.span().start().line)
+            });
+            self.restart_after_retirement = self.collects_all_zone_ids
+                && self.clears_cache
+                && self.retires_each_zone
+                && self.bridge_removal
+                && self.bus_fallback
+                && matches!((clear_line, retirement_line, restart_line),
+                    (Some(clear), Some(retirement), Some(restart)) if clear < retirement && retirement < restart);
         }
         visit::visit_expr_match(self, expression);
     }
@@ -200,10 +268,31 @@ fn lms_reconnect_can_republish_unchanged_players_as_snapshots() {
 fn roon_core_loss_retires_every_projected_zone() {
     let file = parse(include_str!("../src/adapters/roon.rs"));
     let mut facts = CoreLossFacts::default();
-    facts.visit_file(&file);
+    facts.visit_block(named_body(&file, "run_roon_loop"));
+    assert!(facts.saw_lost, "run_roon_loop must handle CoreEvent::Lost");
     assert!(
-        facts.removes_projection,
-        "CoreEvent::Lost must publish ZoneRemoved projections before reconnecting"
+        facts.collects_all_zone_ids,
+        "CoreEvent::Lost must collect every cached Roon zone ID"
+    );
+    assert!(
+        facts.clears_cache,
+        "CoreEvent::Lost must clear its operational cache"
+    );
+    assert!(
+        facts.retires_each_zone,
+        "CoreEvent::Lost must retire each collected zone"
+    );
+    assert!(
+        facts.bridge_removal,
+        "CoreEvent::Lost must use the reliable removal bridge"
+    );
+    assert!(
+        facts.bus_fallback,
+        "CoreEvent::Lost must fall back to BusEvent::ZoneRemoved"
+    );
+    assert!(
+        facts.restart_after_retirement,
+        "CoreEvent::Lost must retire projections before restart"
     );
 }
 
@@ -227,9 +316,9 @@ fn openhome_and_upnp_pollers_republish_cached_devices_as_snapshots() {
 fn every_production_stop_route_flushes_before_stopping() {
     for (name, source, function) in [
         (
-            "settings disable",
-            include_str!("../src/api/mod.rs"),
-            "stop_adapter_and_flush_zones",
+            "shared stop and flush",
+            include_str!("../src/coordinator.rs"),
+            "stop_adapter_and_flush",
         ),
         (
             "LMS reconfiguration",
