@@ -57,8 +57,18 @@ standard authorization-code flow:
   state and returns the provider authorization URL.
 - Spotify redirects to `GET /api/providers/spotify/oauth/callback`; UHC
   exchanges the code server-side and stores the access/refresh token in the
-  Spotify adapter. Tokens are never returned by the endpoint.
-- `POST /api/providers/spotify/oauth/revoke` clears the in-memory token.
+  Spotify adapter and encrypted credential store. Tokens are never returned
+  by the endpoint.
+- `POST /api/providers/spotify/oauth/revoke` clears the adapter and removes
+  the durable credential file.
+
+The credential envelope uses an operator-managed 32-byte key. Set
+`UHC_CREDENTIAL_KEY` (hex or base64url) or `UHC_CREDENTIAL_KEY_FILE`; when
+neither is set, UHC creates `credential.key` beside the encrypted credential
+file with owner-only permissions. `UHC_SPOTIFY_CREDENTIAL_FILE` can point at a
+secret-backed volume when the default config directory is not appropriate.
+The key and encrypted file must be backed up together if a restart or package
+upgrade is expected to preserve the connection.
 
 For a hosted UHC deployment, set `SPOTIFY_CLIENT_ID`,
 `SPOTIFY_CLIENT_SECRET`, and optionally
@@ -84,11 +94,12 @@ can run in-process, or a separate Mac can pair through the same bridge contract:
   thirty-second liveness; `POST /api/bridges/applemusic/revoke` invalidates a
   companion token.
 
-Pairing and provider credentials are intentionally in-memory in this first
-slice. Deploy these endpoints behind HTTPS and a trusted identity boundary;
-restart invalidates all pending OAuth states, bridge tokens, and provider
-tokens. The companion owns MusicKit authorization and uses the dedicated
-`ApplicationMusicPlayer` session.
+Pending OAuth states and bridge tokens are intentionally in-memory in this
+first slice, so a restart invalidates those short-lived values. Spotify's
+provider token is persisted through the encrypted credential boundary above;
+the companion still owns MusicKit authorization and uses the dedicated
+`ApplicationMusicPlayer` session. Deploy these endpoints behind HTTPS and a
+trusted identity boundary.
 
 ## QNAP x86_64
 
@@ -97,4 +108,8 @@ The QNAP x86_64 package uses the same static
 host can run direct cloud adapters such as Spotify when their credentials and
 device APIs are available.  Apple Music's native MusicKit companion remains a
 macOS deployment concern; a QNAP package does not claim to provide MusicKit
-playback in-process.
+playback in-process. Fresh packages create a private `config` directory and
+the service defaults `UHC_CONFIG_DIR` to it, so the encrypted Spotify
+credential file and its key survive process restarts and package upgrades.
+Operators may override that variable to mount a secret-backed config volume;
+the package does not remove credentials during an upgrade or uninstall.

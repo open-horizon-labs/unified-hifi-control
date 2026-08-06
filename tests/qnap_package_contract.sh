@@ -34,6 +34,17 @@ assert_contains "${QNAP_DIR}/qpkg.cfg" '^QDK_DATA_DIR_SHARED="shared"$' \
 assert_contains "${QNAP_DIR}/qpkg.cfg" '^QPKG_SERVICE_PROGRAM="unified-hifi-control.sh"$' \
     "QNAP metadata must register the service wrapper"
 
+# A fresh package must provide a private, stable config root for the server's
+# encrypted provider credential store.  The wrapper may still be overridden
+# by an operator-managed secret volume, but the default cannot depend on an
+# interactive shell environment.
+assert_contains "${QNAP_DIR}/shared/install.sh" 'mkdir -p .*QPKG_ROOT.*/config' \
+    "QNAP install must create the package-owned config directory"
+assert_contains "${QNAP_DIR}/shared/install.sh" 'chmod 700 .*QPKG_ROOT.*/config' \
+    "QNAP config directory must be owner-only"
+assert_contains "${QNAP_DIR}/shared/unified-hifi-control.sh" 'UHC_CONFIG_DIR=.*QPKG_ROOT.*/config' \
+    "QNAP service must default UHC_CONFIG_DIR to the package config directory"
+
 for script in "${QNAP_DIR}/shared"/*.sh; do
     [[ -f "$script" ]] || continue
     sh -n "$script" || fail "$(basename "$script") has invalid POSIX shell syntax"

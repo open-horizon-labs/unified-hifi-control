@@ -22,6 +22,13 @@ chmod +x "${QPKG_ROOT}/unified-hifi-control.sh"
 # Create log file
 touch "${QPKG_ROOT}/unified-hifi-control.log"
 
+# Keep provider credentials in the package-owned config volume.  The server's
+# config resolver creates the `unified-hifi` subdirectory below this path;
+# creating the parent here makes a fresh install deterministic and lets the
+# service run without relying on HOME or an operator shell profile.
+mkdir -p "${QPKG_ROOT}/config"
+chmod 700 "${QPKG_ROOT}/config"
+
 # Restart service if it was running before upgrade
 if [ "$WAS_RUNNING" = true ]; then
     echo "Restarting service after upgrade..."

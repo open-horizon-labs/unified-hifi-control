@@ -11,6 +11,10 @@ export USER=admin
 export LANG=en_US.UTF-8
 export LC_CTYPE=en_US.UTF-8
 export HOME=$QPKG_ROOT
+# Persist OAuth credentials below the QPKG so upgrades/restarts retain the
+# connection without requiring shell configuration.  Operators can override
+# this with an environment supplied by their service manager.
+export UHC_CONFIG_DIR=${UHC_CONFIG_DIR:-${QPKG_ROOT}/config}
 export PATH=$QPKG_ROOT:$PATH
 
 export PIDF=${QPKG_ROOT}/unified-hifi-control.pid
