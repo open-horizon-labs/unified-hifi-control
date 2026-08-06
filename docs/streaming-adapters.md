@@ -76,10 +76,15 @@ For a hosted UHC deployment, set `SPOTIFY_CLIENT_ID`,
 starting the flow. The callback endpoint must be registered exactly with the
 Spotify application.
 
-Local/distributed installs must not receive a shared client secret. Their
-onboarding flow is tracked in #469 and will use Spotify Authorization Code with
-PKCE plus a loopback redirect (`127.0.0.1` or `::1`), as recommended for public
-clients.
+For a local or QNAP install, open Settings in the browser you will use for
+authorization, enter the Spotify client ID, and leave the client secret blank
+to use Authorization Code with PKCE. The form pre-fills the callback from the
+current UHC origin so a hosted HTTPS QNAP URL can be registered directly in the
+Spotify application. Spotify accepts plain HTTP only for explicit loopback
+callbacks (`127.0.0.1` or `::1`); a remote QNAP needs HTTPS. Saving the form
+persists the client configuration in the encrypted credential envelope, after
+which **Connect Spotify** starts the browser authorization flow. This is the
+first-run onboarding path tracked in #469.
 
 Apple Music authorization remains native to the companion. A macOS companion
 can run in-process, or a separate Mac can pair through the same bridge contract:
@@ -98,7 +103,10 @@ Pending OAuth states and bridge tokens are intentionally in-memory in this
 first slice, so a restart invalidates those short-lived values. Spotify's
 provider token is persisted through the encrypted credential boundary above;
 the companion still owns MusicKit authorization and uses the dedicated
-`ApplicationMusicPlayer` session. Deploy these endpoints behind HTTPS and a
+`ApplicationMusicPlayer` session on macOS (the installed macOS MusicKit SDK
+marks `SystemMusicPlayer` unavailable). A `SystemMusicPlayer` implementation
+would require an iOS-family companion rather than the requested Mac bridge.
+Deploy these endpoints behind HTTPS and a
 trusted identity boundary.
 
 ## QNAP x86_64

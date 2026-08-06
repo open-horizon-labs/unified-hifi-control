@@ -55,7 +55,7 @@ impl PrefixedZoneId {
     /// Create an Apple Music zone ID.
     ///
     /// The raw ID is owned by the native MusicKit companion.  The first
-    /// companion uses `application` for its ApplicationMusicPlayer session;
+    /// macOS companion uses `application` for its ApplicationMusicPlayer session;
     /// paired companions may provide a stable installation identifier.
     pub fn applemusic(raw_id: impl AsRef<str>) -> Self {
         Self(format!("applemusic:{}", raw_id.as_ref()))

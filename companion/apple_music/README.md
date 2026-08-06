@@ -1,7 +1,7 @@
 # Apple Music MusicKit companion
 
 This macOS 14+ Swift Package is the native side of UHC's `applemusic:`
-adapter. It owns an `ApplicationMusicPlayer` session and must be embedded by a
+adapter. It owns an `ApplicationMusicPlayer` session on macOS and must be embedded by a
 signed host app (inline with UHC on macOS, or as a paired bridge when UHC runs
 elsewhere).
 

@@ -76,7 +76,7 @@ pub struct MusicKitTrack {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MusicKitSnapshot {
     /// Stable companion-local player identifier. `application` is the
-    /// canonical ID for ApplicationMusicPlayer.
+    /// canonical ID for ApplicationMusicPlayer on macOS.
     pub player_id: String,
     pub display_name: String,
     pub state: MusicKitPlaybackState,

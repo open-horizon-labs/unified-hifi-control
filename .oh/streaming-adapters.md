@@ -21,7 +21,7 @@ Apple Music is device-native; Spotify is account- and Connect-device-scoped; Ama
 
 **Selected decisions:**
 
-1. Apple uses a dedicated `ApplicationMusicPlayer` playback session, not the user's Music.app session and not Music.app automation.
+1. Apple uses native MusicKit; macOS uses `ApplicationMusicPlayer` because the macOS SDK marks `SystemMusicPlayer` unavailable.
 2. Apple supports inline macOS and paired-Mac bridge modes behind one adapter-facing identity.
 3. Zones remain adapter-scoped: `spotify:`, `applemusic:`, and `musicassistant:` may each identify the same physical endpoint independently.
 4. Spotify is controller-only; UHC does not become a Spotify Connect receiver in this initiative.
@@ -34,7 +34,7 @@ Apple Music is device-native; Spotify is account- and Connect-device-scoped; Ama
 
 **Decision under review:** Direct Apple and Spotify adapters with a native Apple MusicKit companion, plus an access-gated Amazon investigation.
 
-**Steel-man:** This preserves UHC as the direct control plane and avoids coupling every streaming service to Music Assistant. ApplicationMusicPlayer keeps the Apple session owned by UHC's companion; Spotify's supported remote-device API covers existing Connect devices.
+**Steel-man:** This preserves UHC as the direct control plane and avoids coupling every streaming service to Music Assistant. MusicKit keeps the Apple session owned by UHC's companion; Spotify's supported remote-device API covers existing Connect devices.
 
 **Contrary evidence:** Apple native playback creates a distributed companion and entitlement burden; Spotify availability varies by Premium status, account, and device; Amazon's published playback API is not generally available.
 
@@ -44,7 +44,7 @@ Apple Music is device-native; Spotify is account- and Connect-device-scoped; Ama
 2. Spotify appears supported but users cannot control their account/device. Warning: OAuth, Premium, restricted-device, or API eligibility failures dominate smoke tests. Mitigation: expose classified availability reasons before claiming transport support.
 3. The shared authorization layer becomes an unreviewed public API. Warning: a bridge needs an ad-hoc route or request shape. Mitigation: make contract review and `api-change-approved` a hard implementation gate.
 
-**Weakest assumption:** Apple MusicKit ApplicationMusicPlayer can deliver the intended dedicated playback behavior through both inline and paired bridge modes.
+**Weakest assumption:** Apple MusicKit's macOS `ApplicationMusicPlayer` can deliver the intended playback behavior through both inline and paired bridge modes.
 
 **Recommendation:** ADJUST — proceed with contract and native-companion validation before provider adapter implementation; keep Amazon discovery separate from delivery.
 

@@ -5,9 +5,9 @@
 //! device is exposed as its own `spotify:<device-id>` UHC zone.
 //!
 //! Authorization is intentionally supplied by the surrounding application.
-//! The adapter accepts an access token and refuses commands when the token is
-//! absent or expired. OAuth/browser pairing belongs to the shared provider
-//! authorization layer (issue #463), not to this provider transport.
+//! The adapter accepts an access token, refreshes it through the authorization
+//! layer when needed, and refuses commands when credentials are absent. OAuth
+//! and browser onboarding belong to the shared provider authorization layer.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;

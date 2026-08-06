@@ -147,6 +147,27 @@ fn callback_feedback() -> Option<&'static str> {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn default_spotify_redirect_uri() -> String {
+    let fallback = "http://127.0.0.1:8088/api/providers/spotify/oauth/callback";
+    let Some(window) = web_sys::window() else {
+        return fallback.to_string();
+    };
+    let Ok(origin) = window.location().origin() else {
+        return fallback.to_string();
+    };
+    if origin.is_empty() {
+        fallback.to_string()
+    } else {
+        format!("{origin}/api/providers/spotify/oauth/callback")
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_spotify_redirect_uri() -> String {
+    "http://127.0.0.1:8088/api/providers/spotify/oauth/callback".to_string()
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn callback_feedback() -> Option<&'static str> {
     None
@@ -235,7 +256,7 @@ pub fn Settings() -> Element {
     let mut spotify_error = use_signal(|| None::<String>);
     let mut spotify_client_id = use_signal(String::new);
     let mut spotify_client_secret = use_signal(String::new);
-    let mut spotify_redirect_uri = use_signal(String::new);
+    let mut spotify_redirect_uri = use_signal(default_spotify_redirect_uri);
     let mut apple_action = use_signal(ProviderActionState::default);
     let mut apple_error = use_signal(|| None::<String>);
 
@@ -746,10 +767,11 @@ pub fn Settings() -> Element {
                                     id: "spotify-redirect-uri",
                                     class: "input mt-1 min-h-11 w-full",
                                     value: spotify_redirect_uri(),
-                                    placeholder: "http://127.0.0.1:8088/api/providers/spotify/oauth/callback",
+                                    placeholder: "https://your-uhc-host.example/api/providers/spotify/oauth/callback",
                                     autocomplete: "url",
                                     oninput: move |event| spotify_redirect_uri.set(event.value()),
                                 }
+                                p { class: "mt-2 text-xs text-muted", "Spotify requires HTTPS for a remote QNAP callback. Plain HTTP is accepted only on 127.0.0.1 or [::1]." }
                                 button {
                                     r#type: "button",
                                     class: "btn btn-outline mt-4 min-h-11 w-full sm:w-auto",
@@ -836,7 +858,7 @@ pub fn Settings() -> Element {
                         div { class: "flex items-start justify-between gap-3",
                             div {
                                 h3 { id: "apple-music-heading", class: "text-lg font-semibold", "Apple Music" }
-                                p { class: "mt-1 text-sm text-secondary", "Use a signed MusicKit companion with a SystemMusicPlayer session." }
+                                p { class: "mt-1 text-sm text-secondary", "Use a signed native MusicKit companion. On macOS it controls the ApplicationMusicPlayer session; SystemMusicPlayer is unavailable in the macOS SDK." }
                             }
                             if apple_st.as_ref().map(|status| status.paired && status.has_snapshot).unwrap_or(false) {
                                 span { class: "badge badge-success shrink-0", "Companion live" }
