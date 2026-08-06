@@ -60,10 +60,16 @@ standard authorization-code flow:
   Spotify adapter. Tokens are never returned by the endpoint.
 - `POST /api/providers/spotify/oauth/revoke` clears the in-memory token.
 
-Set `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, and optionally
+For a hosted UHC deployment, set `SPOTIFY_CLIENT_ID`,
+`SPOTIFY_CLIENT_SECRET`, and optionally
 `SPOTIFY_REDIRECT_URI` (and `SPOTIFY_TOKEN_URL` for a local test server) before
 starting the flow. The callback endpoint must be registered exactly with the
 Spotify application.
+
+Local/distributed installs must not receive a shared client secret. Their
+onboarding flow is tracked in #469 and will use Spotify Authorization Code with
+PKCE plus a loopback redirect (`127.0.0.1` or `::1`), as recommended for public
+clients.
 
 Apple Music authorization remains native to the companion. A macOS companion
 can run in-process, or a separate Mac can pair through the same bridge contract:

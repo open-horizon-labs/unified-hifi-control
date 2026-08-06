@@ -94,7 +94,7 @@ pub async fn oauth_start(
         )
     })?;
     let redirect_uri = std::env::var("SPOTIFY_REDIRECT_URI").unwrap_or_else(|_| {
-        "http://localhost:8088/api/providers/spotify/oauth/callback".to_string()
+        "http://127.0.0.1:8088/api/providers/spotify/oauth/callback".to_string()
     });
     let state_token = random_token(32);
     let expires_at = now_secs() + OAUTH_TTL.as_secs();
@@ -167,7 +167,7 @@ pub async fn oauth_callback(
         )
     })?;
     let redirect_uri = std::env::var("SPOTIFY_REDIRECT_URI").unwrap_or_else(|_| {
-        "http://localhost:8088/api/providers/spotify/oauth/callback".to_string()
+        "http://127.0.0.1:8088/api/providers/spotify/oauth/callback".to_string()
     });
     let token_url =
         std::env::var("SPOTIFY_TOKEN_URL").unwrap_or_else(|_| SPOTIFY_TOKEN_URL.to_string());
