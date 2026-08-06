@@ -28,8 +28,8 @@ use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
 };
 use crate::bus::{
-    BusEvent, NowPlaying, PlaybackState, ProviderAccount, SharedBus, VolumeControl, VolumeScale,
-    Zone,
+    BusEvent, NowPlaying, PlaybackState, PrefixedZoneId, ProviderAccount, SharedBus, VolumeControl,
+    VolumeScale, Zone,
 };
 
 const SPOTIFY_API_URL: &str = "https://api.spotify.com/v1";
@@ -104,10 +104,7 @@ impl SpotifyDevice {
     /// device; Spotify does not expose independent now-playing state for every
     /// available device in one response.
     pub fn to_zone(&self, playback: Option<&SpotifyPlayback>) -> Zone {
-        // Keep the prefix construction local to this adapter. The central
-        // `PrefixedZoneId` vocabulary is extended by the shared routing work;
-        // this module remains independently testable until that lands.
-        let zone_id = format!("spotify:{}", self.id);
+        let zone_id = PrefixedZoneId::spotify(&self.id).to_string();
         let controllable = !self.is_restricted;
         let now_playing = playback.and_then(SpotifyPlayback::to_now_playing);
         let state = playback
@@ -327,6 +324,10 @@ impl SpotifyAdapter {
 
     /// Poll device inventory and current playback, publishing zones.
     pub async fn update(&self) -> Result<()> {
+        let (previous_devices, previous_playback) = {
+            let state = self.state.read().await;
+            (state.devices.clone(), state.playback.clone())
+        };
         let devices = self.fetch_devices().await?;
         let playback = self.fetch_playback().await?;
         let should_fetch_account = !self.state.read().await.account_loaded;
@@ -364,18 +365,65 @@ impl SpotifyAdapter {
             });
         }
 
-        for device in devices {
-            let device_playback = playback.as_ref().and_then(|current| {
-                current
-                    .device
-                    .as_ref()
-                    .and_then(|current_device| current_device.id.as_ref())
-                    .filter(|id| *id == &device.id)
-                    .map(|_| current)
-            });
-            self.bus.publish(BusEvent::ZoneDiscovered {
-                zone: device.to_zone(device_playback),
-            });
+        for device in &devices {
+            let zone_id = PrefixedZoneId::spotify(&device.id);
+            let device_playback = playback_for_device(playback.as_ref(), &device.id);
+            if previous_devices.contains_key(&device.id) {
+                let zone = device.to_zone(device_playback);
+                self.bus.publish(BusEvent::ZoneUpdated {
+                    zone_id: zone_id.clone(),
+                    display_name: device.name.clone(),
+                    state: zone.state.to_string(),
+                });
+
+                let previous_device_playback =
+                    playback_for_device(previous_playback.as_ref(), &device.id);
+                if track_identity(previous_device_playback) != track_identity(device_playback) {
+                    let now_playing = device_playback.and_then(SpotifyPlayback::to_now_playing);
+                    self.bus.publish(BusEvent::NowPlayingChanged {
+                        zone_id: zone_id.clone(),
+                        title: now_playing.as_ref().map(|track| track.title.clone()),
+                        artist: now_playing.as_ref().map(|track| track.artist.clone()),
+                        album: now_playing.as_ref().map(|track| track.album.clone()),
+                        image_key: now_playing.and_then(|track| track.image_key),
+                    });
+                }
+                if previous_device_playback.and_then(|state| state.progress_ms)
+                    != device_playback.and_then(|state| state.progress_ms)
+                {
+                    if let Some(position) = device_playback.and_then(|state| state.progress_ms) {
+                        self.bus.publish(BusEvent::SeekPositionChanged {
+                            zone_id: zone_id.clone(),
+                            position: (position / 1000) as i64,
+                        });
+                    }
+                }
+                if previous_devices
+                    .get(&device.id)
+                    .and_then(|previous| previous.volume_percent)
+                    != device.volume_percent
+                {
+                    if let Some(value) = device.volume_percent {
+                        self.bus.publish(BusEvent::VolumeChanged {
+                            output_id: zone_id.to_string(),
+                            value: f32::from(value),
+                            is_muted: false,
+                        });
+                    }
+                }
+            } else {
+                self.bus.publish(BusEvent::ZoneDiscovered {
+                    zone: device.to_zone(device_playback),
+                });
+            }
+        }
+
+        for device_id in previous_devices.keys() {
+            if !devices.iter().any(|device| &device.id == device_id) {
+                self.bus.publish(BusEvent::ZoneRemoved {
+                    zone_id: PrefixedZoneId::spotify(device_id),
+                });
+            }
         }
         Ok(())
     }
@@ -707,6 +755,35 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn playback_for_device<'a>(
+    playback: Option<&'a SpotifyPlayback>,
+    device_id: &str,
+) -> Option<&'a SpotifyPlayback> {
+    playback.filter(|current| {
+        current
+            .device
+            .as_ref()
+            .and_then(|device| device.id.as_deref())
+            == Some(device_id)
+    })
+}
+
+fn track_identity(
+    playback: Option<&SpotifyPlayback>,
+) -> Option<(String, String, String, Option<String>)> {
+    let track = playback?.item.as_ref()?;
+    Some((
+        track.name.clone(),
+        track
+            .artists
+            .first()
+            .map(|artist| artist.name.clone())
+            .unwrap_or_default(),
+        track.album.name.clone(),
+        track.album.images.first().map(|image| image.url.clone()),
+    ))
 }
 
 #[cfg(test)]

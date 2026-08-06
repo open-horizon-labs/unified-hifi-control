@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::{
@@ -13,7 +14,7 @@ use unified_hifi_control::adapters::spotify::{
     SpotifyAdapter, SpotifyDevice, SpotifyToken, SpotifyTokenRefresher,
 };
 use unified_hifi_control::adapters::{AdapterCommand, AdapterLogic, Startable};
-use unified_hifi_control::bus::create_bus;
+use unified_hifi_control::bus::{create_bus, BusEvent};
 
 struct RefreshingToken;
 
@@ -184,6 +185,38 @@ async fn update_discovers_devices_and_commands_target_device() {
     assert!(requests.iter().any(|request| {
         request == "PUT /me/player/volume?volume_percent=50&device_id=device-1"
     }));
+    server.abort();
+}
+
+#[tokio::test]
+async fn polling_emits_discovery_once_then_incremental_updates() {
+    let (base_url, _mock, server) = mock_server().await;
+    let bus = create_bus();
+    let mut events = bus.subscribe();
+    let adapter = SpotifyAdapter::with_base_url(bus, base_url);
+    adapter
+        .set_token(SpotifyToken {
+            access_token: "access".to_string(),
+            refresh_token: None,
+            expires_at: Some(u64::MAX),
+        })
+        .await;
+
+    adapter.update().await.expect("initial Spotify poll");
+    let first = events.recv().await.expect("account event");
+    let second = events.recv().await.expect("discovery event");
+    assert!(matches!(first, BusEvent::ProviderAccountUpdated { .. }));
+    assert!(matches!(second, BusEvent::ZoneDiscovered { .. }));
+
+    adapter.update().await.expect("subsequent Spotify poll");
+    let next = events.recv().await.expect("incremental update event");
+    assert!(matches!(next, BusEvent::ZoneUpdated { .. }));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), events.recv())
+            .await
+            .is_err()
+    );
+
     server.abort();
 }
 
