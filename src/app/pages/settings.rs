@@ -4,7 +4,11 @@
 
 use dioxus::prelude::*;
 
-use crate::app::api::{AdapterSettings, AppSettings, HqpStatus, LmsConfig, RoonStatus};
+use crate::app::api::{
+    AdapterSettings, AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, ProviderAuthResponse,
+    ProviderOAuthStart, RoonStatus, SpotifyConfigureRequest, SpotifyConfigureResponse,
+    ZonesResponse,
+};
 use crate::app::components::Layout;
 use crate::app::settings_context::use_settings;
 use crate::app::sse::use_sse;
@@ -98,6 +102,60 @@ fn copy_to_clipboard(value: String, state: Signal<CopyState>) {
     }
 }
 
+#[derive(Clone, Copy, Default, PartialEq)]
+enum ProviderActionState {
+    #[default]
+    Idle,
+    Loading,
+    Success,
+    Failed,
+}
+
+impl ProviderActionState {
+    fn message(self) -> Option<&'static str> {
+        match self {
+            Self::Idle | Self::Loading => None,
+            Self::Success => Some("Updated."),
+            Self::Failed => Some("Something went wrong. Try again or use local setup."),
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn redirect_to(url: &str) -> Result<(), String> {
+    web_sys::window()
+        .ok_or_else(|| "Browser window is unavailable".to_string())?
+        .location()
+        .set_href(url)
+        .map_err(|error| format!("Could not open provider authorization: {error:?}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn redirect_to(_url: &str) -> Result<(), String> {
+    Err("Provider authorization is available in the browser".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn callback_feedback() -> Option<&'static str> {
+    let search = web_sys::window()?.location().search().ok()?;
+    if search.contains("spotify=connected") || search.contains("oauth=success") {
+        Some("Spotify connected. Refreshing available devices…")
+    } else if search.contains("spotify=error") || search.contains("oauth=error") {
+        Some("Spotify authorization did not complete. Try Connect again or use local setup.")
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn callback_feedback() -> Option<&'static str> {
+    None
+}
+
+fn zone_state_label(zone: &crate::app::api::Zone) -> &str {
+    zone.state.as_deref().unwrap_or("unknown")
+}
+
 #[cfg(target_arch = "wasm32")]
 fn show_copy_result(mut state: Signal<CopyState>, result: CopyState) {
     state.set(result);
@@ -171,6 +229,16 @@ pub fn Settings() -> Element {
     let mut upnp_enabled = use_signal(|| false);
     let mut hqplayer_enabled = use_signal(|| false);
 
+    // Streaming-provider onboarding state. Provider credentials are never
+    // rendered or stored in the browser; the backend owns OAuth tokens.
+    let mut spotify_action = use_signal(ProviderActionState::default);
+    let mut spotify_error = use_signal(|| None::<String>);
+    let mut spotify_client_id = use_signal(String::new);
+    let mut spotify_client_secret = use_signal(String::new);
+    let mut spotify_redirect_uri = use_signal(String::new);
+    let mut apple_action = use_signal(ProviderActionState::default);
+    let mut apple_error = use_signal(|| None::<String>);
+
     // Hide knobs signal (LMS/HQPlayer visibility follows adapter enabled state)
     let mut hide_knobs = use_signal(|| false);
 
@@ -222,6 +290,14 @@ pub fn Settings() -> Element {
             .await
             .ok()
     });
+    let mut provider_zones = use_resource(|| async {
+        crate::app::api::fetch_json::<ZonesResponse>("/zones")
+            .await
+            .map(|response| response.zones)
+    });
+    let mut apple_bridge_status = use_resource(|| async {
+        crate::app::api::fetch_json::<AppleBridgeStatus>("/api/bridges/applemusic/status").await
+    });
 
     // Refresh discovery on SSE events
     let event_count = sse.event_count;
@@ -233,8 +309,104 @@ pub fn Settings() -> Element {
             upnp_status.restart();
             lms_config.restart();
             hqp_status.restart();
+            provider_zones.restart();
+            apple_bridge_status.restart();
         }
     });
+
+    let start_spotify_oauth = move |_| {
+        spotify_action.set(ProviderActionState::Loading);
+        spotify_error.set(None);
+        spawn(async move {
+            match crate::app::api::fetch_json::<ProviderOAuthStart>(
+                "/api/providers/spotify/oauth/start",
+            )
+            .await
+            {
+                Ok(response) if !response.authorization_url.is_empty() => {
+                    if let Err(error) = redirect_to(&response.authorization_url) {
+                        spotify_action.set(ProviderActionState::Failed);
+                        spotify_error.set(Some(error));
+                    }
+                }
+                Ok(_) => {
+                    spotify_action.set(ProviderActionState::Failed);
+                    spotify_error.set(Some(
+                        "Spotify did not return an authorization URL.".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    spotify_action.set(ProviderActionState::Failed);
+                    spotify_error.set(Some(error));
+                }
+            }
+        });
+    };
+
+    let disconnect_spotify = move |_| {
+        spotify_action.set(ProviderActionState::Loading);
+        spotify_error.set(None);
+        spawn(async move {
+            match crate::app::api::post_json::<serde_json::Value, ProviderAuthResponse>(
+                "/api/providers/spotify/oauth/revoke",
+                &serde_json::json!({}),
+            )
+            .await
+            {
+                Ok(_) => {
+                    spotify_action.set(ProviderActionState::Success);
+                    provider_zones.restart();
+                }
+                Err(error) => {
+                    spotify_action.set(ProviderActionState::Failed);
+                    spotify_error.set(Some(error));
+                }
+            }
+        });
+    };
+
+    let save_spotify_local = move |_| {
+        let client_id = spotify_client_id().trim().to_string();
+        let client_secret = spotify_client_secret().trim().to_string();
+        let redirect_uri = spotify_redirect_uri().trim().to_string();
+        if client_id.is_empty() {
+            spotify_action.set(ProviderActionState::Failed);
+            spotify_error.set(Some("Enter the Spotify client ID first.".to_string()));
+            return;
+        }
+        spotify_action.set(ProviderActionState::Loading);
+        spotify_error.set(None);
+        spawn(async move {
+            let request = SpotifyConfigureRequest {
+                client_id,
+                client_secret: (!client_secret.is_empty()).then_some(client_secret),
+                redirect_uri: (!redirect_uri.is_empty()).then_some(redirect_uri),
+            };
+            match crate::app::api::post_json::<SpotifyConfigureRequest, SpotifyConfigureResponse>(
+                "/api/providers/spotify/configure",
+                &request,
+            )
+            .await
+            {
+                Ok(response) if response.configured => {
+                    spotify_action.set(ProviderActionState::Success);
+                }
+                Ok(_) => {
+                    spotify_action.set(ProviderActionState::Failed);
+                    spotify_error.set(Some("Spotify configuration was not accepted.".to_string()));
+                }
+                Err(error) => {
+                    spotify_action.set(ProviderActionState::Failed);
+                    spotify_error.set(Some(error));
+                }
+            }
+        });
+    };
+
+    let refresh_providers = move |_| {
+        provider_zones.restart();
+        apple_bridge_status.restart();
+    };
 
     // Save settings handler
     let save_settings = move || {
@@ -268,6 +440,24 @@ pub fn Settings() -> Element {
     let upnp_st = upnp_status.read().clone().flatten();
     let lms_cfg = lms_config.read().clone().flatten();
     let hqp_st = hqp_status.read().clone().flatten();
+    let provider_zones_result = provider_zones.read().clone();
+    let spotify_devices = provider_zones_result
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .map(|zones| {
+            zones
+                .iter()
+                .filter(|zone| zone.zone_id.starts_with("spotify:"))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+    let apple_st = apple_bridge_status.read().clone().and_then(Result::ok);
+    let apple_bridge_label = apple_st
+        .as_ref()
+        .and_then(|status| status.bridge_id.as_deref())
+        .unwrap_or("unknown")
+        .to_string();
+    let callback_message = callback_feedback();
 
     rsx! {
         Layout {
@@ -485,6 +675,208 @@ pub fn Settings() -> Element {
                                 td { class: "py-2 px-3", "Knobs" }
                                 td { class: "py-2 px-3 text-muted", "-" }
                             }
+                        }
+                    }
+                }
+            }
+
+            // Direct streaming-provider onboarding
+            section { class: "mb-8", aria_labelledby: "streaming-heading",
+                div { class: "mb-4",
+                    h2 { id: "streaming-heading", class: "text-xl font-semibold", "Streaming providers" }
+                    p { class: "text-muted text-sm", "Connect providers without sharing credentials with the browser." }
+                }
+
+                div { class: "grid gap-4 lg:grid-cols-2",
+                    // Spotify: hosted OAuth and local-token guidance are
+                    // intentionally separate so users know which authority
+                    // owns their credentials.
+                    div { class: "card p-5 sm:p-6", aria_labelledby: "spotify-heading",
+                        div { class: "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between",
+                            div {
+                                h3 { id: "spotify-heading", class: "text-lg font-semibold", "Spotify Connect" }
+                                p { class: "mt-1 text-sm text-secondary", "Control existing Spotify Connect devices. UHC does not act as a receiver." }
+                            }
+                            if spotify_devices.as_ref().map(|devices| !devices.is_empty()).unwrap_or(false) {
+                                span { class: "badge badge-success shrink-0", "Connected" }
+                            } else {
+                                span { class: "badge badge-secondary shrink-0", "Not connected" }
+                            }
+                        }
+
+                        if let Some(message) = callback_message {
+                            p { class: "mt-4 status-ok", role: "status", aria_live: "polite", "{message}" }
+                        }
+
+                        div { class: "mt-5 grid gap-4 sm:grid-cols-2",
+                            div { class: "rounded-md border border-default p-4",
+                                h4 { class: "font-medium", "Hosted setup" }
+                                p { class: "mt-2 text-sm text-secondary", "Open Spotify’s consent page, approve playback access, and return here. Your token stays on this UHC server." }
+                                button {
+                                    r#type: "button",
+                                    class: "btn btn-primary mt-4 min-h-11 w-full sm:w-auto",
+                                    disabled: spotify_action() == ProviderActionState::Loading,
+                                    aria_busy: spotify_action() == ProviderActionState::Loading,
+                                    onclick: start_spotify_oauth,
+                                    if spotify_action() == ProviderActionState::Loading { "Opening Spotify…" } else { "Connect Spotify" }
+                                }
+                            }
+                            div { class: "rounded-md border border-default p-4",
+                                h4 { class: "font-medium", "Local setup" }
+                                p { class: "mt-2 text-sm text-secondary", "Use this for a self-hosted or QNAP deployment. UHC stores the OAuth client settings server-side and refreshes access automatically." }
+                                label { class: "mt-3 block text-sm font-medium", r#for: "spotify-client-id", "Client ID" }
+                                input {
+                                    id: "spotify-client-id",
+                                    class: "input mt-1 min-h-11 w-full",
+                                    value: spotify_client_id(),
+                                    autocomplete: "off",
+                                    oninput: move |event| spotify_client_id.set(event.value()),
+                                }
+                                label { class: "mt-3 block text-sm font-medium", r#for: "spotify-client-secret", "Client secret (optional for PKCE)" }
+                                input {
+                                    id: "spotify-client-secret",
+                                    class: "input mt-1 min-h-11 w-full",
+                                    r#type: "password",
+                                    value: spotify_client_secret(),
+                                    autocomplete: "new-password",
+                                    oninput: move |event| spotify_client_secret.set(event.value()),
+                                }
+                                label { class: "mt-3 block text-sm font-medium", r#for: "spotify-redirect-uri", "Redirect URI (optional)" }
+                                input {
+                                    id: "spotify-redirect-uri",
+                                    class: "input mt-1 min-h-11 w-full",
+                                    value: spotify_redirect_uri(),
+                                    placeholder: "http://127.0.0.1:8088/api/providers/spotify/oauth/callback",
+                                    autocomplete: "url",
+                                    oninput: move |event| spotify_redirect_uri.set(event.value()),
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "btn btn-outline mt-4 min-h-11 w-full sm:w-auto",
+                                    disabled: spotify_action() == ProviderActionState::Loading,
+                                    aria_busy: spotify_action() == ProviderActionState::Loading,
+                                    onclick: save_spotify_local,
+                                    if spotify_action() == ProviderActionState::Loading { "Saving…" } else { "Save local setup" }
+                                }
+                                p { class: "mt-2 text-xs text-muted", "Secrets are never returned to this page. Use hosted Connect after saving to authorize the account." }
+                            }
+                        }
+
+                        if let Some(devices) = spotify_devices {
+                            if devices.is_empty() {
+                                div { class: "mt-5 rounded-md bg-hover p-4", role: "status", aria_live: "polite",
+                                    p { class: "font-medium", "No Spotify devices found" }
+                                    p { class: "mt-1 text-sm text-secondary", "Start Spotify on a Connect-capable player, then refresh this list." }
+                                }
+                            } else {
+                                div { class: "mt-5",
+                                    div { class: "flex items-center justify-between gap-3",
+                                        h4 { class: "font-medium", "Available devices ({devices.len()})" }
+                                        button {
+                                            r#type: "button",
+                                            class: "btn btn-outline btn-sm min-h-11",
+                                            onclick: refresh_providers,
+                                            aria_label: "Refresh Spotify devices",
+                                            "Refresh"
+                                        }
+                                    }
+                                    ul { class: "mt-3 divide-y divide-default rounded-md border border-default", aria_label: "Spotify devices",
+                                        for device in devices {
+                                            li { class: "flex items-center justify-between gap-3 px-3 py-3",
+                                                div {
+                                                    p { class: "font-medium", "{device.zone_name}" }
+                                                    p { class: "text-xs text-muted", "{device.zone_id}" }
+                                                }
+                                                span { class: if zone_state_label(&device) == "unknown" { "text-muted text-sm" } else { "status-ok text-sm" }, "{zone_state_label(&device)}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if provider_zones_result.is_none() {
+                            div { class: "mt-5 rounded-md bg-hover p-4", role: "status", aria_live: "polite", "Loading Spotify devices…" }
+                        } else {
+                            div { class: "mt-5 rounded-md bg-hover p-4 status-err", role: "alert", "Unable to load Spotify devices. Refresh and try again." }
+                        }
+
+                        if let Some(error) = spotify_error() {
+                            p { class: "mt-4 status-err", role: "alert", "{error}" }
+                        } else if let Some(message) = spotify_action().message() {
+                            p { class: "mt-4 text-sm text-secondary", role: "status", aria_live: "polite", "{message}" }
+                        }
+
+                        div { class: "mt-5 flex flex-wrap gap-3 border-t border-default pt-4",
+                            button {
+                                r#type: "button",
+                                class: "btn btn-outline min-h-11",
+                                disabled: spotify_action() == ProviderActionState::Loading,
+                                onclick: start_spotify_oauth,
+                                "Reconnect Spotify"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "btn btn-ghost min-h-11",
+                                disabled: spotify_action() == ProviderActionState::Loading,
+                                onclick: refresh_providers,
+                                "Refresh devices"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "btn btn-ghost min-h-11",
+                                disabled: spotify_action() == ProviderActionState::Loading,
+                                onclick: disconnect_spotify,
+                                "Disconnect Spotify"
+                            }
+                        }
+                    }
+
+                    // Apple Music is paired through the native MusicKit app;
+                    // keep this card focused on status and the next action.
+                    div { class: "card p-5 sm:p-6", aria_labelledby: "apple-music-heading",
+                        div { class: "flex items-start justify-between gap-3",
+                            div {
+                                h3 { id: "apple-music-heading", class: "text-lg font-semibold", "Apple Music" }
+                                p { class: "mt-1 text-sm text-secondary", "Use a signed MusicKit companion with a SystemMusicPlayer session." }
+                            }
+                            if apple_st.as_ref().map(|status| status.paired && status.has_snapshot).unwrap_or(false) {
+                                span { class: "badge badge-success shrink-0", "Companion live" }
+                            } else if apple_st.as_ref().map(|status| status.paired).unwrap_or(false) {
+                                span { class: "badge badge-secondary shrink-0", "Paired · waiting" }
+                            } else {
+                                span { class: "badge badge-secondary shrink-0", "Not paired" }
+                            }
+                        }
+                        p { class: "mt-4 text-sm text-secondary", "On this Mac, run the native companion and authorize Apple Music there. When UHC runs elsewhere, pair that companion with a short-lived code." }
+                        if let Some(status) = apple_st {
+                            if status.paired {
+                                p { class: "mt-4 text-sm", "Bridge: {apple_bridge_label}" }
+                                if status.has_snapshot {
+                                    p { class: "mt-1 text-sm status-ok", role: "status", aria_live: "polite", "Apple Music state is available." }
+                                } else {
+                                    p { class: "mt-1 text-sm text-muted", role: "status", aria_live: "polite", "Waiting for the companion to publish playback state…" }
+                                }
+                            } else {
+                                p { class: "mt-4 text-sm text-muted", role: "status", aria_live: "polite", "No companion is paired yet." }
+                            }
+                        } else {
+                            p { class: "mt-4 text-sm text-muted", role: "status", aria_live: "polite", "Checking for a paired companion…" }
+                        }
+                        if let Some(error) = apple_error() {
+                            p { class: "mt-4 status-err", role: "alert", "{error}" }
+                        } else if apple_action() == ProviderActionState::Loading {
+                            p { class: "mt-4 text-sm text-muted", role: "status", aria_live: "polite", "Updating companion status…" }
+                        }
+                        button {
+                            r#type: "button",
+                            class: "btn btn-outline mt-5 min-h-11",
+                            disabled: apple_action() == ProviderActionState::Loading,
+                            onclick: move |_| {
+                                apple_action.set(ProviderActionState::Loading);
+                                apple_error.set(None);
+                                apple_bridge_status.restart();
+                                apple_action.set(ProviderActionState::Success);
+                            },
+                            "Refresh companion status"
                         }
                     }
                 }

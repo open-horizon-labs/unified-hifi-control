@@ -65,6 +65,54 @@ pub struct AppSettings {
 }
 
 // =============================================================================
+// Provider onboarding types
+// =============================================================================
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProviderOAuthStart {
+    pub provider: String,
+    pub authorization_url: String,
+    pub state: String,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProviderAuthResponse {
+    pub provider: String,
+    pub authorized: bool,
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyConfigureRequest {
+    pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyConfigureResponse {
+    pub provider: String,
+    pub configured: bool,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    #[serde(default)]
+    pub has_client_secret: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AppleBridgeStatus {
+    pub paired: bool,
+    pub bridge_id: Option<String>,
+    pub last_seen: Option<u64>,
+    pub has_snapshot: bool,
+}
+
+// =============================================================================
 // Zone Types
 // =============================================================================
 
@@ -73,6 +121,8 @@ pub struct Zone {
     pub zone_id: String,
     pub zone_name: String,
     pub source: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
     pub dsp: Option<ZoneDsp>,
 }
 
