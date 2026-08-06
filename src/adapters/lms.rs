@@ -2838,17 +2838,17 @@ async fn handle_cli_event(
                     }
                 }
                 "disconnect" => {
-                    // Client disconnected
-                    let mut s = state.write().await;
-                    if let Some(player) = s.players.get_mut(&player_id) {
-                        player.connected = false;
-                    }
-                    drop(s);
+                    // A CLI disconnect is authoritative membership evidence, not merely a state
+                    // delta. Retire immediately rather than republishing a cached stopped zone
+                    // and waiting for the deliberately slowed-down poller to catch up.
+                    state.write().await.players.remove(&player_id);
+                    let zone_id = PrefixedZoneId::lms(&player_id);
                     if let Some(bridge) = runtime_bridge {
-                        if let Err(error) = publish_cached_lms_zone(state, bridge, &player_id).await
-                        {
-                            warn!(%error, player = %player_id, "could not project LMS CLI disconnect readback");
+                        if let Err(error) = bridge.publish_removed(zone_id).await {
+                            warn!(%error, player = %player_id, "could not retire LMS CLI disconnect projection");
                         }
+                    } else {
+                        bus.publish(BusEvent::ZoneRemoved { zone_id });
                     }
                 }
                 _ => {}
