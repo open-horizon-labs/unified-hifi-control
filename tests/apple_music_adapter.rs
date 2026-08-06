@@ -1,0 +1,153 @@
+//! Contract tests for the native MusicKit Apple Music adapter.
+//!
+//! These tests deliberately exercise the Rust/Swift companion boundary rather
+//! than MusicKit itself.  MusicKit is only available in a signed macOS target;
+//! the companion is tested separately on macOS.
+
+use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+use unified_hifi_control::adapters::apple_music::{
+    AppleMusicAdapter, MusicKitCommand, MusicKitCompanion, MusicKitPlaybackState, MusicKitSnapshot,
+    MusicKitTrack,
+};
+use unified_hifi_control::adapters::{AdapterCommand, AdapterContext, AdapterLogic};
+use unified_hifi_control::bus::SharedBus;
+use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState};
+
+#[derive(Clone)]
+struct FakeCompanion {
+    snapshot: MusicKitSnapshot,
+    commands: Arc<Mutex<Vec<MusicKitCommand>>>,
+}
+
+#[async_trait]
+impl MusicKitCompanion for FakeCompanion {
+    async fn snapshot(&self) -> anyhow::Result<MusicKitSnapshot> {
+        Ok(self.snapshot.clone())
+    }
+
+    async fn execute(&self, command: MusicKitCommand) -> anyhow::Result<()> {
+        self.commands
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fake companion lock poisoned"))?
+            .push(command);
+        Ok(())
+    }
+}
+
+fn snapshot() -> MusicKitSnapshot {
+    MusicKitSnapshot {
+        player_id: "application".to_string(),
+        display_name: "Apple Music".to_string(),
+        state: MusicKitPlaybackState::Playing,
+        track: Some(MusicKitTrack {
+            title: "Song".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            artwork_url: Some("https://example.test/art.jpg".to_string()),
+            position_seconds: Some(12.0),
+            duration_seconds: Some(180.0),
+        }),
+        volume: Some(0.75),
+        is_muted: false,
+    }
+}
+
+fn adapter(bus: SharedBus, commands: Arc<Mutex<Vec<MusicKitCommand>>>) -> AppleMusicAdapter {
+    AppleMusicAdapter::with_companion(
+        bus,
+        Arc::new(FakeCompanion {
+            snapshot: snapshot(),
+            commands,
+        }),
+        Duration::from_millis(5),
+    )
+}
+
+#[tokio::test]
+async fn companion_snapshot_maps_to_an_applemusic_zone() {
+    let bus = create_bus();
+    let mut events = bus.subscribe();
+    let adapter = adapter(bus.clone(), Arc::new(Mutex::new(Vec::new())));
+    let shutdown = CancellationToken::new();
+
+    let run = tokio::spawn({
+        let adapter = adapter.clone();
+        let shutdown = shutdown.clone();
+        async move { adapter.run(AdapterContext { bus, shutdown }).await }
+    });
+
+    let event = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(BusEvent::ZoneDiscovered { zone }) = events.recv().await {
+                break zone;
+            }
+        }
+    })
+    .await
+    .expect("adapter must publish a zone");
+
+    assert_eq!(event.zone_id, "applemusic:application");
+    assert_eq!(event.source, "applemusic");
+    assert_eq!(event.state, PlaybackState::Playing);
+    assert_eq!(event.zone_name, "Apple Music");
+    assert_eq!(
+        event.now_playing.as_ref().map(|track| track.title.as_str()),
+        Some("Song")
+    );
+    assert_eq!(
+        event.volume_control.as_ref().map(|volume| volume.value),
+        Some(75.0)
+    );
+
+    shutdown.cancel();
+    run.await
+        .expect("adapter task must join")
+        .expect("adapter must stop cleanly");
+}
+
+#[tokio::test]
+async fn adapter_translates_unified_commands_to_musickit_commands() {
+    let bus = create_bus();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let adapter = adapter(bus, commands.clone());
+
+    let response = adapter
+        .handle_command("applemusic:application", AdapterCommand::Play)
+        .await
+        .expect("command must be handled");
+    assert!(response.success);
+
+    let response = adapter
+        .handle_command("applemusic:application", AdapterCommand::VolumeAbsolute(42))
+        .await
+        .expect("volume command must be handled");
+    assert!(response.success);
+
+    let recorded = commands.lock().expect("fake companion lock").clone();
+    assert_eq!(
+        recorded,
+        vec![
+            MusicKitCommand::Play,
+            MusicKitCommand::SetVolume { value: 0.42 }
+        ]
+    );
+}
+
+#[tokio::test]
+async fn adapter_rejects_zone_owned_by_another_provider() {
+    let bus = create_bus();
+    let adapter = adapter(bus, Arc::new(Mutex::new(Vec::new())));
+
+    let response = adapter
+        .handle_command("spotify:device", AdapterCommand::Play)
+        .await
+        .expect("invalid owner should be a classified response");
+    assert!(!response.success);
+    assert!(response
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("applemusic")));
+}

@@ -152,6 +152,12 @@ pub enum Provider {
     Upnp,
     #[serde(rename = "hqplayer")]
     HqPlayer,
+    #[serde(rename = "applemusic")]
+    AppleMusic,
+    #[serde(rename = "spotify")]
+    Spotify,
+    #[serde(rename = "musicassistant")]
+    MusicAssistant,
     /// The zone id's prefix names no adapter, so UHC identified nothing.
     ///
     /// No claim is made about such a zone's capabilities, because none can be.

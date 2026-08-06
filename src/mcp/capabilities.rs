@@ -301,6 +301,9 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 | (ZoneTarget::Lms, TransportRoute::Lms)
                 | (ZoneTarget::OpenHome, TransportRoute::OpenHome)
                 | (ZoneTarget::Upnp, TransportRoute::Upnp)
+                | (ZoneTarget::AppleMusic, TransportRoute::AppleMusic)
+                | (ZoneTarget::Spotify, TransportRoute::Spotify)
+                | (ZoneTarget::MusicAssistant, TransportRoute::MusicAssistant)
         ),
         // Same route as Transport, minus the adapters that refuse the two skip
         // actions. Read from the adapter's own const so the claim cannot drift
@@ -312,6 +315,9 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                     | (ZoneTarget::Lms, TransportRoute::Lms)
                     | (ZoneTarget::OpenHome, TransportRoute::OpenHome)
                     | (ZoneTarget::Upnp, TransportRoute::Upnp)
+                    | (ZoneTarget::AppleMusic, TransportRoute::AppleMusic)
+                    | (ZoneTarget::Spotify, TransportRoute::Spotify)
+                    | (ZoneTarget::MusicAssistant, TransportRoute::MusicAssistant)
             );
             let adapter_refuses = target == ZoneTarget::Upnp
                 && crate::adapters::upnp::REFUSED_TRANSPORT_ACTIONS.contains(&"next");
@@ -323,6 +329,9 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 | (ZoneTarget::Lms, VolumeRoute::Lms)
                 | (ZoneTarget::OpenHome, VolumeRoute::OpenHome)
                 | (ZoneTarget::Upnp, VolumeRoute::Upnp)
+                | (ZoneTarget::AppleMusic, VolumeRoute::AppleMusic)
+                | (ZoneTarget::Spotify, VolumeRoute::Spotify)
+                | (ZoneTarget::MusicAssistant, VolumeRoute::MusicAssistant)
         ),
         Capability::Search | Capability::PlayByQuery => matches!(
             (target, target.for_library()),
@@ -616,6 +625,15 @@ pub fn support(target: ZoneTarget, capability: Capability) -> Support {
     if let Some(supported) = routed(target, capability) {
         return supported;
     }
+    if matches!(
+        target,
+        ZoneTarget::AppleMusic | ZoneTarget::Spotify | ZoneTarget::MusicAssistant
+    ) {
+        return Support::NotImplemented {
+            tracked_by: "#462",
+            evidence: "the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.",
+        };
+    }
     match GAPS
         .iter()
         .find(|(t, c, _)| *t == target && *c == capability)
@@ -738,7 +756,30 @@ mod tests {
         let mut stale = Vec::new();
         for target in ZoneTarget::PROVIDERS {
             for capability in Capability::ALL {
-                let listed = GAPS.iter().any(|(t, c, _)| t == target && c == capability);
+                let listed = GAPS.iter().any(|(t, c, _)| t == target && c == capability)
+                    || (matches!(
+                        target,
+                        &ZoneTarget::AppleMusic
+                            | &ZoneTarget::Spotify
+                            | &ZoneTarget::MusicAssistant
+                    ) && matches!(
+                        capability,
+                        Capability::PlayByRef
+                            | Capability::Browse
+                            | Capability::QueueRead
+                            | Capability::QueueJump
+                            | Capability::QueueReorder
+                            | Capability::QueueRemove
+                            | Capability::QueueClear
+                            | Capability::PlayNext
+                            | Capability::RepeatMode
+                            | Capability::ShuffleMode
+                            | Capability::SavedPlaylists
+                            | Capability::Favorites
+                            | Capability::MultiroomSync
+                            | Capability::Search
+                            | Capability::PlayByQuery
+                    ));
                 let routed = routed(*target, *capability).is_some();
                 if !routed && !listed {
                     missing.push((target.label(), capability.name()));

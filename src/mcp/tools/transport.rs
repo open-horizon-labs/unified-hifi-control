@@ -50,6 +50,7 @@
 //! refusal and `hifi_capabilities`' report cannot describe the same gap two
 //! different ways.
 
+use crate::adapters::AdapterCommand;
 use crate::api::AppState;
 use crate::mcp::capabilities::{support, Capability};
 use crate::mcp::envelope::{Envelope, Observed, Refusal, Scope};
@@ -178,6 +179,15 @@ pub async fn handle_control(
                 .await
         }
         TransportRoute::Roon => state.roon.control(&args.zone_id, backend_action).await,
+        TransportRoute::AppleMusic | TransportRoute::Spotify | TransportRoute::MusicAssistant => {
+            dispatch_adapter_command(
+                state,
+                target.label(),
+                &args.zone_id,
+                transport_command(backend_action),
+            )
+            .await
+        }
         // Handled above; kept exhaustive rather than caught by a wildcard so a
         // new route variant fails to compile instead of falling through.
         TransportRoute::Refused(_) => unreachable_refused(),
@@ -289,7 +299,12 @@ async fn set_volume(
         VolumeRoute::OpenHome | VolumeRoute::Upnp => env.param("value", integer_volume),
         // Nothing is sent on a refusal, so the client's resolved request is the
         // honest value to report.
-        VolumeRoute::Lms | VolumeRoute::Roon | VolumeRoute::Refused(_) => env.param("value", value),
+        VolumeRoute::AppleMusic
+        | VolumeRoute::Spotify
+        | VolumeRoute::MusicAssistant
+        | VolumeRoute::Lms
+        | VolumeRoute::Roon
+        | VolumeRoute::Refused(_) => env.param("value", value),
     };
 
     if let VolumeRoute::Refused(refused) = route {
@@ -326,6 +341,19 @@ async fn set_volume(
                 .control(zone_id, volume_action(relative), Some(integer_volume))
                 .await
         }
+        VolumeRoute::AppleMusic | VolumeRoute::Spotify | VolumeRoute::MusicAssistant => {
+            dispatch_adapter_command(
+                state,
+                target.label(),
+                zone_id,
+                if relative {
+                    AdapterCommand::VolumeRelative(integer_volume)
+                } else {
+                    AdapterCommand::VolumeAbsolute(integer_volume)
+                },
+            )
+            .await
+        }
         VolumeRoute::Refused(_) => unreachable_refused(),
     };
 
@@ -356,6 +384,37 @@ fn volume_action(relative: bool) -> &'static str {
         "vol_rel"
     } else {
         "vol_abs"
+    }
+}
+
+fn transport_command(action: &str) -> AdapterCommand {
+    match action {
+        "play" => AdapterCommand::Play,
+        "pause" => AdapterCommand::Pause,
+        "play_pause" => AdapterCommand::PlayPause,
+        "stop" => AdapterCommand::Stop,
+        "next" => AdapterCommand::Next,
+        "previous" => AdapterCommand::Previous,
+        _ => unreachable!("validated transport action: {action}"),
+    }
+}
+
+async fn dispatch_adapter_command(
+    state: &AppState,
+    prefix: &str,
+    zone_id: &str,
+    command: AdapterCommand,
+) -> anyhow::Result<()> {
+    let response = state
+        .adapter_registry
+        .command(prefix, zone_id, command)
+        .await?;
+    if response.success {
+        Ok(())
+    } else {
+        anyhow::bail!(response
+            .error
+            .unwrap_or_else(|| format!("{prefix} adapter rejected command")))
     }
 }
 

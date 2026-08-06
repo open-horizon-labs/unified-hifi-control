@@ -90,6 +90,12 @@ pub enum ZoneTarget {
     /// `hqplayer:` prefix — a real zone type `hifi_zones` lists. See the module
     /// docs: recognised by #398, not yet wired to a control path.
     HqPlayer,
+    /// `applemusic:` prefix — native MusicKit companion session.
+    AppleMusic,
+    /// `spotify:` prefix — Spotify Connect controller.
+    Spotify,
+    /// `musicassistant:` prefix — optional MA peer adapter.
+    MusicAssistant,
     /// No `:` at all. Was Roon until #398; now refused with the prefix list.
     Unprefixed,
     /// A prefix that matches no adapter, e.g. `sonos:x`.
@@ -111,6 +117,9 @@ impl ZoneTarget {
         Self::OpenHome,
         Self::Upnp,
         Self::HqPlayer,
+        Self::AppleMusic,
+        Self::Spotify,
+        Self::MusicAssistant,
     ];
 
     /// Classify a zone id by prefix.
@@ -125,6 +134,12 @@ impl ZoneTarget {
             Self::Upnp
         } else if zone_id.starts_with("hqplayer:") {
             Self::HqPlayer
+        } else if zone_id.starts_with("applemusic:") {
+            Self::AppleMusic
+        } else if zone_id.starts_with("spotify:") {
+            Self::Spotify
+        } else if zone_id.starts_with("musicassistant:") {
+            Self::MusicAssistant
         } else if zone_id.contains(':') {
             Self::Unknown
         } else {
@@ -151,6 +166,9 @@ impl ZoneTarget {
             Self::OpenHome => "openhome:",
             Self::Upnp => "upnp:",
             Self::HqPlayer => "hqplayer:",
+            Self::AppleMusic => "applemusic:",
+            Self::Spotify => "spotify:",
+            Self::MusicAssistant => "musicassistant:",
             Self::Unprefixed | Self::Unknown => return None,
         })
     }
@@ -163,6 +181,9 @@ impl ZoneTarget {
             Self::OpenHome => "openhome",
             Self::Upnp => "upnp",
             Self::HqPlayer => "hqplayer",
+            Self::AppleMusic => "applemusic",
+            Self::Spotify => "spotify",
+            Self::MusicAssistant => "musicassistant",
             Self::Unprefixed => "unprefixed",
             Self::Unknown => "unknown",
         }
@@ -177,6 +198,9 @@ pub enum TransportRoute {
     Lms,
     OpenHome,
     Upnp,
+    AppleMusic,
+    Spotify,
+    MusicAssistant,
     /// No transport path for this zone id. Carries the target so the caller can
     /// tell "not wired for this provider" from "not a zone id UHC understands".
     Refused(ZoneTarget),
@@ -193,6 +217,9 @@ pub enum VolumeRoute {
     Lms,
     OpenHome,
     Upnp,
+    AppleMusic,
+    Spotify,
+    MusicAssistant,
     /// No volume path for this zone id.
     Refused(ZoneTarget),
 }
@@ -228,7 +255,16 @@ pub enum LibraryRoute {
 ///
 /// It is not a zone id UHC ever emits (`src/bus/events.rs` prefixes every one),
 /// and since #398 it is refused. Every value listed here works as a prefix.
-pub const ACCEPTED_ZONE_PREFIXES: &[&str] = &["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"];
+pub const ACCEPTED_ZONE_PREFIXES: &[&str] = &[
+    "roon:",
+    "lms:",
+    "openhome:",
+    "upnp:",
+    "hqplayer:",
+    "applemusic:",
+    "spotify:",
+    "musicassistant:",
+];
 
 /// Every `hifi_control` action, in the order the tool's description lists them.
 ///
@@ -268,6 +304,9 @@ impl ZoneTarget {
             Self::Lms => TransportRoute::Lms,
             Self::OpenHome => TransportRoute::OpenHome,
             Self::Upnp => TransportRoute::Upnp,
+            Self::AppleMusic => TransportRoute::AppleMusic,
+            Self::Spotify => TransportRoute::Spotify,
+            Self::MusicAssistant => TransportRoute::MusicAssistant,
             // Recognised, and genuinely not wired. #328.
             Self::HqPlayer => TransportRoute::Refused(self),
             // #398: was Roon for both of these.
@@ -283,6 +322,9 @@ impl ZoneTarget {
             // #398 wired both: the adapters implement vol_abs/vol_rel.
             Self::OpenHome => VolumeRoute::OpenHome,
             Self::Upnp => VolumeRoute::Upnp,
+            Self::AppleMusic => VolumeRoute::AppleMusic,
+            Self::Spotify => VolumeRoute::Spotify,
+            Self::MusicAssistant => VolumeRoute::MusicAssistant,
             Self::HqPlayer => VolumeRoute::Refused(self),
             Self::Unprefixed | Self::Unknown => VolumeRoute::Refused(self),
         }
@@ -296,7 +338,12 @@ impl ZoneTarget {
             // OpenHome and UPnP zones are renderers with no library; before #398
             // both were sent to Roon, which searched a library the zone could not
             // play from.
-            Self::OpenHome | Self::Upnp | Self::HqPlayer => LibraryRoute::Refused(self),
+            Self::OpenHome
+            | Self::Upnp
+            | Self::HqPlayer
+            | Self::AppleMusic
+            | Self::Spotify
+            | Self::MusicAssistant => LibraryRoute::Refused(self),
             Self::Unprefixed | Self::Unknown => LibraryRoute::Refused(self),
         }
     }
@@ -322,6 +369,9 @@ impl ZoneTarget {
             Self::OpenHome => Provider::OpenHome,
             Self::Upnp => Provider::Upnp,
             Self::HqPlayer => Provider::HqPlayer,
+            Self::AppleMusic => Provider::AppleMusic,
+            Self::Spotify => Provider::Spotify,
+            Self::MusicAssistant => Provider::MusicAssistant,
             Self::Unprefixed | Self::Unknown => Provider::Unknown,
         }
     }

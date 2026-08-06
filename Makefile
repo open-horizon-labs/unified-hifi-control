@@ -24,7 +24,7 @@ else
     TAILWIND_BINARY := tailwindcss-linux-x64
 endif
 
-.PHONY: help setup-tailwind css css-watch synology-test clean
+.PHONY: help setup-tailwind css css-watch synology-test qnap-test clean
 
 help:
 	@echo "Available targets:"
@@ -32,6 +32,7 @@ help:
 	@echo "  css             - Build Tailwind CSS"
 	@echo "  css-watch       - Watch and rebuild Tailwind CSS"
 	@echo "  synology-test   - Validate SPK structure and unprivileged lifecycle"
+	@echo "  qnap-test       - Validate QNAP x86_64 package contract"
 	@echo "  clean           - Remove generated files"
 
 setup-tailwind:
@@ -54,6 +55,9 @@ css-watch: setup-tailwind
 synology-test:
 	tests/synology_package_contract.sh
 	tests/synology_package_lifecycle.sh
+
+qnap-test:
+	tests/qnap_package_contract.sh
 
 clean:
 	rm -f public/tailwind.css

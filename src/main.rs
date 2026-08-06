@@ -292,19 +292,74 @@ mod server {
         // UPnP adapter
         let upnp = Arc::new(adapters::upnp::UPnPAdapter::new(bus.clone()));
 
+        // Direct streaming adapters. Credentials remain environment/configuration
+        // concerns until the shared OAuth/bridge contract (#463) is finalized.
+        // Spotify is controller-only: it discovers and controls existing Connect
+        // devices, never acting as a receiver.
+        let spotify = Arc::new(adapters::spotify::SpotifyAdapter::new(bus.clone()));
+        if let Ok(access_token) = std::env::var("SPOTIFY_ACCESS_TOKEN") {
+            if !access_token.trim().is_empty() {
+                spotify
+                    .set_token(adapters::spotify::SpotifyToken {
+                        access_token,
+                        refresh_token: std::env::var("SPOTIFY_REFRESH_TOKEN").ok(),
+                        expires_at: std::env::var("SPOTIFY_TOKEN_EXPIRES_AT")
+                            .ok()
+                            .and_then(|value| value.parse().ok()),
+                    })
+                    .await;
+            }
+        }
+
+        let music_assistant = match (
+            std::env::var("MUSIC_ASSISTANT_HOST"),
+            std::env::var("MUSIC_ASSISTANT_TOKEN"),
+        ) {
+            (Ok(host), Ok(token)) if !host.trim().is_empty() && !token.trim().is_empty() => {
+                let port = std::env::var("MUSIC_ASSISTANT_PORT")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(8095);
+                let tls = std::env::var("MUSIC_ASSISTANT_TLS")
+                    .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(false);
+                match adapters::musicassistant::MusicAssistantAdapter::new(
+                    bus.clone(),
+                    adapters::musicassistant::MusicAssistantConfig {
+                        host,
+                        port,
+                        token,
+                        tls,
+                    },
+                ) {
+                    Ok(adapter) => Some(Arc::new(adapter)),
+                    Err(error) => {
+                        tracing::warn!("Music Assistant adapter disabled: {error}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         // =========================================================================
         // Start enabled adapters (single codepath using coordinator)
         // =========================================================================
 
         // Build list of startable adapters
         // Note: lms_cli shares config with lms - both start when LMS is configured
-        let startable_adapters: Vec<Arc<dyn adapters::Startable>> = vec![
+        let mut startable_adapters: Vec<Arc<dyn adapters::Startable>> = vec![
             roon.clone(),
             lms.clone(),
             lms_cli.clone(),
             openhome.clone(),
             upnp.clone(),
+            spotify.clone(),
         ];
+
+        if let Some(adapter) = music_assistant.clone() {
+            startable_adapters.push(adapter);
+        }
 
         // Single loop to start all enabled adapters
         coord.start_all_enabled(&startable_adapters).await;
@@ -340,6 +395,26 @@ mod server {
             Instant::now(),
             shutdown_token.clone(),
         );
+
+        state.adapter_registry.register(spotify.clone()).await;
+        if let Some(adapter) = music_assistant.clone() {
+            state.adapter_registry.register(adapter).await;
+        }
+
+        // These adapters are configured by their provider credentials rather than
+        // the legacy app-settings toggle. Start only when credentials are present.
+        if spotify.can_start().await {
+            if let Err(error) = spotify.start().await {
+                tracing::warn!("Spotify adapter failed to start: {error}");
+            }
+        }
+        if let Some(adapter) = music_assistant {
+            if adapter.can_start().await {
+                if let Err(error) = adapter.start().await {
+                    tracing::warn!("Music Assistant adapter failed to start: {error}");
+                }
+            }
+        }
 
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();

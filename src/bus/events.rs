@@ -52,11 +52,39 @@ impl PrefixedZoneId {
         Self(format!("hqplayer:{}", raw_id.as_ref()))
     }
 
+    /// Create an Apple Music zone ID.
+    ///
+    /// The raw ID is owned by the native MusicKit companion.  The first
+    /// companion uses `application` for its ApplicationMusicPlayer session;
+    /// paired companions may provide a stable installation identifier.
+    pub fn applemusic(raw_id: impl AsRef<str>) -> Self {
+        Self(format!("applemusic:{}", raw_id.as_ref()))
+    }
+
+    /// Create a Spotify Connect device zone ID.
+    pub fn spotify(raw_id: impl AsRef<str>) -> Self {
+        Self(format!("spotify:{}", raw_id.as_ref()))
+    }
+
+    /// Create a Music Assistant player zone ID.
+    pub fn musicassistant(raw_id: impl AsRef<str>) -> Self {
+        Self(format!("musicassistant:{}", raw_id.as_ref()))
+    }
+
     /// Parse a prefixed zone ID from a string.
     /// Returns None if the string doesn't contain a valid prefix.
     pub fn parse(s: impl AsRef<str>) -> Option<Self> {
         let s = s.as_ref();
-        let valid_prefixes = ["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"];
+        let valid_prefixes = [
+            "roon:",
+            "lms:",
+            "openhome:",
+            "upnp:",
+            "hqplayer:",
+            "applemusic:",
+            "spotify:",
+            "musicassistant:",
+        ];
         if valid_prefixes.iter().any(|p| s.starts_with(p)) {
             Some(Self(s.to_string()))
         } else {
@@ -780,6 +808,9 @@ mod tests {
 
         let hqp = PrefixedZoneId::hqplayer("instance");
         assert_eq!(hqp.as_str(), "hqplayer:instance");
+
+        let applemusic = PrefixedZoneId::applemusic("application");
+        assert_eq!(applemusic.as_str(), "applemusic:application");
     }
 
     #[test]
@@ -790,6 +821,7 @@ mod tests {
         assert!(PrefixedZoneId::parse("openhome:abc").is_some());
         assert!(PrefixedZoneId::parse("upnp:abc").is_some());
         assert!(PrefixedZoneId::parse("hqplayer:abc").is_some());
+        assert!(PrefixedZoneId::parse("applemusic:application").is_some());
 
         // Invalid - no prefix
         assert!(PrefixedZoneId::parse("abc123").is_none());

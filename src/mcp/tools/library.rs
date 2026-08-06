@@ -551,6 +551,9 @@ fn provider_label(provider: Provider) -> &'static str {
         Provider::OpenHome => "openhome",
         Provider::Upnp => "upnp",
         Provider::HqPlayer => "hqplayer",
+        Provider::AppleMusic => "applemusic",
+        Provider::Spotify => "spotify",
+        Provider::MusicAssistant => "musicassistant",
         Provider::Unknown => "unknown",
     }
 }

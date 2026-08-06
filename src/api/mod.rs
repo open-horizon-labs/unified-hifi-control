@@ -5,7 +5,7 @@ use crate::adapters::lms::LmsAdapter;
 use crate::adapters::openhome::OpenHomeAdapter;
 use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
-use crate::adapters::Startable;
+use crate::adapters::{AdapterCommand, AdapterCommandResponse, AdapterLogic, Startable};
 use crate::aggregator::ZoneAggregator;
 use crate::bus::SharedBus;
 use crate::coordinator::AdapterCoordinator;
@@ -29,6 +29,40 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+/// Registry for provider adapters whose transport is not represented by a
+/// dedicated field on `AppState` (for example cloud and bridge-backed sources).
+/// The aggregator remains the read-side source of truth; this registry only
+/// dispatches commands to the owning adapter.
+#[derive(Default)]
+pub struct AdapterRegistry {
+    adapters: tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn AdapterLogic>>>,
+}
+
+impl AdapterRegistry {
+    pub async fn register(&self, adapter: Arc<dyn AdapterLogic>) {
+        self.adapters
+            .write()
+            .await
+            .insert(adapter.prefix().to_string(), adapter);
+    }
+
+    pub async fn command(
+        &self,
+        prefix: &str,
+        zone_id: &str,
+        command: AdapterCommand,
+    ) -> anyhow::Result<AdapterCommandResponse> {
+        let adapter = self
+            .adapters
+            .read()
+            .await
+            .get(prefix)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
+        adapter.handle_command(zone_id, command).await
+    }
+}
+
 /// Shared application state
 #[derive(Clone)]
 pub struct AppState {
@@ -39,6 +73,7 @@ pub struct AppState {
     pub lms: Arc<LmsAdapter>,
     pub openhome: Arc<OpenHomeAdapter>,
     pub upnp: Arc<UPnPAdapter>,
+    pub adapter_registry: Arc<AdapterRegistry>,
     pub knobs: KnobStore,
     pub bus: SharedBus,
     pub aggregator: Arc<ZoneAggregator>,
@@ -82,6 +117,7 @@ impl AppState {
             lms,
             openhome,
             upnp,
+            adapter_registry: Arc::new(AdapterRegistry::default()),
             knobs,
             bus,
             aggregator,

@@ -2652,7 +2652,7 @@ const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
         "hifi_control/volume_unknown_prefix",
         "Error: Volume control not supported for this zone type",
         "Error: Zone id 'sonos:abc' uses the prefix 'sonos:', which names no adapter. \
-         Accepted prefixes: roon:, lms:, openhome:, upnp:, hqplayer:. Call hifi_zones for \
+         Accepted prefixes: roon:, lms:, openhome:, upnp:, hqplayer:, applemusic:, spotify:, musicassistant:. Call hifi_zones for \
          valid zone ids.",
     ),
     // `other => other` forwarded any action string to the adapter, so offline the
@@ -3499,9 +3499,17 @@ async fn unknown_zone_prefix_volume_blames_the_zone_id_not_the_provider() {
     assert_eq!(refusal.get("parameter"), Some(&json!("zone_id")));
     assert_eq!(
         refusal.get("accepted"),
-        Some(&json!(["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"])),
-        "the refusal must enumerate every prefix that names an adapter — five, since \
-         hifi_zones returns hqplayer: ids: {refusal}"
+        Some(&json!([
+            "roon:",
+            "lms:",
+            "openhome:",
+            "upnp:",
+            "hqplayer:",
+            "applemusic:",
+            "spotify:",
+            "musicassistant:"
+        ])),
+        "the refusal must enumerate every prefix that names an adapter: {refusal}"
     );
 
     // And it must NOT claim anything about a provider.
@@ -4034,13 +4042,22 @@ const EXPECTED_CAPABILITIES: &[&str] = &[
     "multiroom_sync",
 ];
 
-/// Every provider a zone id can name — five, not four.
+/// Every provider a zone id can name.
 ///
 /// `hqplayer:` is in `PrefixedZoneId`'s own valid-prefix list
 /// (`src/bus/events.rs`) and `HqpAdapter` publishes `ZoneDiscovered` with it, so
 /// HQPlayer zones appear in `hifi_zones`. A capability report that omitted them
 /// would understate the surface in exactly the way #392 rule 3 forbids.
-const EXPECTED_PROVIDERS: &[&str] = &["roon", "lms", "openhome", "upnp", "hqplayer"];
+const EXPECTED_PROVIDERS: &[&str] = &[
+    "roon",
+    "lms",
+    "openhome",
+    "upnp",
+    "hqplayer",
+    "applemusic",
+    "spotify",
+    "musicassistant",
+];
 
 /// The three states, spelled as they appear on the wire.
 const SUPPORTED: &str = "supported";
@@ -4349,6 +4366,9 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             "lms" => "LMS host not configured",
             "openhome" => "Device not found",
             "upnp" => "Renderer not found",
+            "applemusic" => "adapter `applemusic` is not configured",
+            "spotify" => "adapter `spotify` is not configured",
+            "musicassistant" => "adapter `musicassistant` is not configured",
             other => panic!("no adapter fingerprint for {other}"),
         }
     }
@@ -4404,12 +4424,13 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             proved += 1;
         }
     }
-    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2 = 15.
+    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2
+    // + three direct providers with transport/skip/volume = 24.
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 15,
+        proved, 24,
         "{proved} supported cells were proved end to end, expected 15. If a capability was          deliberately wired or unwired, change this number in the same commit."
     );
 }
@@ -4467,7 +4488,16 @@ async fn an_unprefixed_zone_id_is_refused_by_name_instead_of_routed_to_roon() {
              use instead — this is what makes the behavior change recoverable in one call; \
              got {text:?}"
         );
-        for prefix in ["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"] {
+        for prefix in [
+            "roon:",
+            "lms:",
+            "openhome:",
+            "upnp:",
+            "hqplayer:",
+            "applemusic:",
+            "spotify:",
+            "musicassistant:",
+        ] {
             assert!(
                 text.contains(prefix),
                 "{tool}: the refusal must name the accepted prefix {prefix:?}; got {text:?}"
