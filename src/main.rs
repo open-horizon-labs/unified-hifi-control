@@ -175,6 +175,13 @@ mod server {
         let bus = bus::create_bus();
         tracing::info!("Event bus initialized");
 
+        // Subscribe before any provider can connect or discover a zone. The
+        // event bus is non-replaying, so spawning this after adapters would
+        // silently lose their initial ZoneDiscovered snapshots.
+        let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
+        zone_aggregator.clone().start().await?;
+        tracing::info!("ZoneAggregator subscribed");
+
         // Load app settings and create adapter coordinator (single source of truth for lifecycle)
         let app_settings = load_app_settings();
         let coord = Arc::new(coordinator::AdapterCoordinator::new(bus.clone()));
@@ -308,14 +315,6 @@ mod server {
 
         // Single loop to start all enabled adapters
         coord.start_all_enabled(&startable_adapters).await;
-
-        // Initialize ZoneAggregator for unified zone state
-        let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
-        let aggregator_for_spawn = zone_aggregator.clone();
-        tokio::spawn(async move {
-            aggregator_for_spawn.run().await;
-        });
-        tracing::info!("ZoneAggregator started");
 
         // Clone Roon adapter for shutdown access (cheap - just Arc clones)
         let roon_for_shutdown = roon.clone();

@@ -2,8 +2,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, info};
+
+use anyhow::{anyhow, Result};
 
 use crate::bus::{BusEvent, NowPlaying, SharedBus, Zone};
 
@@ -25,10 +27,36 @@ impl ZoneAggregator {
         }
     }
 
-    /// Start the aggregator's event processing loop
-    /// Should be spawned as a task
+    /// Spawn the event loop and wait until its bus receiver exists.
+    ///
+    /// A `broadcast` sender drops events when no receiver is attached. Startup
+    /// must therefore await this barrier before any adapter can publish its
+    /// initial `ZoneDiscovered` snapshot.
+    pub async fn start(self: Arc<Self>) -> Result<()> {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            self.run_with_ready(Some(ready_tx)).await;
+        });
+        ready_rx
+            .await
+            .map_err(|_| anyhow!("ZoneAggregator task exited before subscribing to the bus"))
+    }
+
+    /// Start the aggregator's event processing loop.
+    ///
+    /// Kept for existing test harnesses that deliberately own the task. New
+    /// production startup must use [`Self::start`] so publication cannot race
+    /// the subscription.
     pub async fn run(&self) {
+        self.run_with_ready(None).await;
+    }
+
+    async fn run_with_ready(&self, ready: Option<oneshot::Sender<()>>) {
         let mut rx = self.bus.subscribe();
+
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
 
         info!("ZoneAggregator started");
 
@@ -196,5 +224,26 @@ impl ZoneAggregator {
     /// Get zone count
     pub async fn zone_count(&self) -> usize {
         self.zones.read().await.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::create_bus;
+
+    #[tokio::test]
+    async fn start_returns_only_after_the_bus_subscription_exists() {
+        let bus = create_bus();
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+
+        assert!(aggregator.start().await.is_ok());
+
+        assert_eq!(
+            bus.subscriber_count(),
+            1,
+            "a producer may publish as soon as start() returns"
+        );
+        bus.publish(BusEvent::ShuttingDown { reason: None });
     }
 }

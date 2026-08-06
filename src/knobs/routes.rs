@@ -162,7 +162,7 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
                 adapters.openhome
             } else if z.zone_id.starts_with("upnp:") {
                 adapters.upnp
-            } else if z.zone_id.starts_with("hqp:") {
+            } else if z.zone_id.starts_with("hqplayer:") {
                 adapters.hqplayer
             } else {
                 true // Unknown prefix, include by default
