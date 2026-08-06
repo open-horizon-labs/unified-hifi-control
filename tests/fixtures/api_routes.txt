@@ -17,6 +17,7 @@ DELETE /mcp
 GET /admin
 GET /api/bridges/applemusic/commands
 GET /api/bridges/applemusic/status
+GET /api/providers/spotify/account
 GET /api/providers/{provider}/oauth/callback
 GET /api/providers/{provider}/oauth/start
 GET /api/settings

@@ -455,6 +455,14 @@ pub struct CommandResponse {
 /// - Adapter lifecycle: Adapter start/stop, cleanup
 /// - System: Shutdown, health checks
 /// - Legacy: Backward-compatible events for existing integrations
+/// Non-secret account identity returned by a provider adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderAccount {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 #[allow(clippy::large_enum_variant)] // Zone is intentionally large for full state
@@ -482,6 +490,12 @@ pub enum BusEvent {
     ZoneRemoved {
         /// Zone identifier (must be prefixed, e.g., "roon:xxx")
         zone_id: PrefixedZoneId,
+    },
+
+    /// Provider account identity discovered by an adapter.
+    ProviderAccountUpdated {
+        provider: String,
+        account: Option<ProviderAccount>,
     },
 
     // =========================================================================
@@ -642,6 +656,7 @@ impl BusEvent {
             Self::ZoneDiscovered { .. } => "zone_discovered",
             Self::ZoneUpdated { .. } => "zone_updated",
             Self::ZoneRemoved { .. } => "zone_removed",
+            Self::ProviderAccountUpdated { .. } => "provider_account_updated",
             Self::NowPlayingChanged { .. } => "now_playing_changed",
             Self::SeekPositionChanged { .. } => "seek_position_changed",
             Self::VolumeChanged { .. } => "volume_changed",

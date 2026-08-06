@@ -110,6 +110,18 @@ pub struct SpotifyConfigureResponse {
     pub has_client_secret: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpotifyAccount {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpotifyAccountResponse {
+    pub account: Option<SpotifyAccount>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AppleBridgeStatus {
     pub paired: bool,

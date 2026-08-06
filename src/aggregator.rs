@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use crate::bus::{BusEvent, NowPlaying, SharedBus, Zone};
+use crate::bus::{BusEvent, NowPlaying, ProviderAccount, SharedBus, Zone};
 
 /// ZoneAggregator maintains unified zone state from all adapters.
 /// - Subscribes to bus events
@@ -14,6 +14,7 @@ use crate::bus::{BusEvent, NowPlaying, SharedBus, Zone};
 /// - Provides query interface for API layer
 pub struct ZoneAggregator {
     zones: Arc<RwLock<HashMap<String, Zone>>>,
+    provider_accounts: Arc<RwLock<HashMap<String, ProviderAccount>>>,
     bus: SharedBus,
 }
 
@@ -21,6 +22,7 @@ impl ZoneAggregator {
     pub fn new(bus: SharedBus) -> Self {
         Self {
             zones: Arc::new(RwLock::new(HashMap::new())),
+            provider_accounts: Arc::new(RwLock::new(HashMap::new())),
             bus,
         }
     }
@@ -54,6 +56,16 @@ impl ZoneAggregator {
                 BusEvent::ZoneRemoved { zone_id } => {
                     debug!("Zone removed: {}", zone_id);
                     self.zones.write().await.remove(zone_id.as_str());
+                }
+
+                BusEvent::ProviderAccountUpdated { provider, account } => {
+                    debug!("Provider account updated: {}", provider);
+                    let mut accounts = self.provider_accounts.write().await;
+                    if let Some(account) = account {
+                        accounts.insert(provider, account);
+                    } else {
+                        accounts.remove(&provider);
+                    }
                 }
 
                 BusEvent::NowPlayingChanged {
@@ -146,6 +158,8 @@ impl ZoneAggregator {
                         adapter: adapter.clone(),
                         zone_ids,
                     });
+
+                    self.provider_accounts.write().await.remove(&adapter);
                 }
 
                 BusEvent::ShuttingDown { .. } => {
@@ -196,5 +210,10 @@ impl ZoneAggregator {
     /// Get zone count
     pub async fn zone_count(&self) -> usize {
         self.zones.read().await.len()
+    }
+
+    /// Get the last non-secret account identity reported by a provider.
+    pub async fn get_provider_account(&self, provider: &str) -> Option<ProviderAccount> {
+        self.provider_accounts.read().await.get(provider).cloned()
     }
 }

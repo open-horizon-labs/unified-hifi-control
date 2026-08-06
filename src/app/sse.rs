@@ -33,6 +33,12 @@ pub struct VolumePayload {
     pub is_muted: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ProviderAccountPayload {
+    pub provider: String,
+    pub account: Option<serde_json::Value>,
+}
+
 /// SSE event types from the server
 /// Server sends: {"type":"EventName","payload":{...}}
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -52,6 +58,9 @@ pub enum SseEvent {
     },
     VolumeChanged {
         payload: VolumePayload,
+    },
+    ProviderAccountUpdated {
+        payload: ProviderAccountPayload,
     },
     SeekPositionChanged {
         payload: ZonePayload,
@@ -122,6 +131,7 @@ impl SseContext {
                     | SseEvent::RoonDisconnected
                     | SseEvent::LmsConnected
                     | SseEvent::LmsDisconnected
+                    | SseEvent::ProviderAccountUpdated { .. }
             )
         )
     }
@@ -165,6 +175,7 @@ impl SseContext {
                     | SseEvent::OpenHomeDeviceLost
                     | SseEvent::UpnpRendererFound
                     | SseEvent::UpnpRendererLost
+                    | SseEvent::ProviderAccountUpdated { .. }
             )
         )
     }

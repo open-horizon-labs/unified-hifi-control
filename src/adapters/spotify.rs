@@ -28,7 +28,8 @@ use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
 };
 use crate::bus::{
-    BusEvent, NowPlaying, PlaybackState, SharedBus, VolumeControl, VolumeScale, Zone,
+    BusEvent, NowPlaying, PlaybackState, ProviderAccount, SharedBus, VolumeControl, VolumeScale,
+    Zone,
 };
 
 const SPOTIFY_API_URL: &str = "https://api.spotify.com/v1";
@@ -215,11 +216,22 @@ struct DevicesResponse {
     devices: Vec<SpotifyDevice>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SpotifyUserProfile {
+    id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
 #[derive(Default)]
 struct SpotifyState {
     token: Option<SpotifyToken>,
     devices: HashMap<String, SpotifyDevice>,
     playback: Option<SpotifyPlayback>,
+    account: Option<ProviderAccount>,
+    account_loaded: bool,
     running: bool,
 }
 
@@ -259,7 +271,10 @@ impl SpotifyAdapter {
 
     /// Install or replace the token supplied by the authorization layer.
     pub async fn set_token(&self, token: SpotifyToken) {
-        self.state.write().await.token = Some(token);
+        let mut state = self.state.write().await;
+        state.token = Some(token);
+        state.account = None;
+        state.account_loaded = false;
     }
 
     /// Install the authorization-layer refresh callback.
@@ -283,6 +298,8 @@ impl SpotifyAdapter {
         state.token = None;
         state.devices.clear();
         state.playback = None;
+        state.account = None;
+        state.account_loaded = false;
     }
 
     /// Return whether an unexpired access token is available.
@@ -303,10 +320,29 @@ impl SpotifyAdapter {
         self.state.read().await.devices.values().cloned().collect()
     }
 
+    /// Return the last non-secret account identity fetched from Spotify.
+    pub async fn get_account(&self) -> Option<ProviderAccount> {
+        self.state.read().await.account.clone()
+    }
+
     /// Poll device inventory and current playback, publishing zones.
     pub async fn update(&self) -> Result<()> {
         let devices = self.fetch_devices().await?;
         let playback = self.fetch_playback().await?;
+        let should_fetch_account = !self.state.read().await.account_loaded;
+        let account = if should_fetch_account {
+            match self.fetch_account().await {
+                Ok(account) => Some(account),
+                Err(error) => {
+                    // Profile scopes are optional for playback. Keep the
+                    // controller usable if an older grant lacks them.
+                    debug!("Spotify account profile unavailable: {}", error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         {
             let mut state = self.state.write().await;
             state.devices = devices
@@ -315,6 +351,17 @@ impl SpotifyAdapter {
                 .map(|device| (device.id.clone(), device))
                 .collect();
             state.playback = playback.clone();
+            if should_fetch_account {
+                state.account_loaded = true;
+                state.account = account.clone();
+            }
+        }
+
+        if should_fetch_account {
+            self.bus.publish(BusEvent::ProviderAccountUpdated {
+                provider: "spotify".to_string(),
+                account,
+            });
         }
 
         for device in devices {
@@ -345,6 +392,15 @@ impl SpotifyAdapter {
             return Ok(None);
         }
         self.decode_response(response).await.map(Some)
+    }
+
+    async fn fetch_account(&self) -> Result<ProviderAccount> {
+        let profile: SpotifyUserProfile = self.request_json(Method::GET, "/me").await?;
+        Ok(ProviderAccount {
+            id: profile.id,
+            display_name: profile.display_name,
+            email: profile.email,
+        })
     }
 
     async fn request(&self, method: Method, path: &str) -> Result<reqwest::Response> {
@@ -628,4 +684,34 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_maps_only_non_secret_identity_fields() {
+        let profile: SpotifyUserProfile = serde_json::from_value(serde_json::json!({
+            "id": "acct-123",
+            "display_name": "Ada Lovelace",
+            "email": "ada@example.test",
+            "country": "US",
+            "product": "premium"
+        }))
+        .expect("Spotify profile should decode");
+
+        assert_eq!(
+            ProviderAccount {
+                id: profile.id,
+                display_name: profile.display_name,
+                email: profile.email,
+            },
+            ProviderAccount {
+                id: "acct-123".to_string(),
+                display_name: Some("Ada Lovelace".to_string()),
+                email: Some("ada@example.test".to_string()),
+            }
+        );
+    }
 }

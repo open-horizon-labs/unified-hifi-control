@@ -6,8 +6,8 @@ use dioxus::prelude::*;
 
 use crate::app::api::{
     AdapterSettings, AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, ProviderAuthResponse,
-    ProviderOAuthStart, RoonStatus, SpotifyConfigureRequest, SpotifyConfigureResponse,
-    ZonesResponse,
+    ProviderOAuthStart, RoonStatus, SpotifyAccountResponse, SpotifyConfigureRequest,
+    SpotifyConfigureResponse, ZonesResponse,
 };
 use crate::app::components::Layout;
 use crate::app::settings_context::use_settings;
@@ -323,6 +323,12 @@ pub fn Settings() -> Element {
             .await
             .map(|response| response.zones)
     });
+    let mut spotify_account = use_resource(|| async {
+        crate::app::api::fetch_json::<SpotifyAccountResponse>("/api/providers/spotify/account")
+            .await
+            .ok()
+            .and_then(|response| response.account)
+    });
     let mut apple_bridge_status = use_resource(|| async {
         crate::app::api::fetch_json::<AppleBridgeStatus>("/api/bridges/applemusic/status").await
     });
@@ -338,6 +344,7 @@ pub fn Settings() -> Element {
             lms_config.restart();
             hqp_status.restart();
             provider_zones.restart();
+            spotify_account.restart();
             apple_bridge_status.restart();
         }
     });
@@ -434,6 +441,7 @@ pub fn Settings() -> Element {
 
     let refresh_providers = move |_| {
         provider_zones.restart();
+        spotify_account.restart();
         apple_bridge_status.restart();
     };
 
@@ -473,6 +481,7 @@ pub fn Settings() -> Element {
     let lms_cfg = lms_config.read().clone().flatten();
     let hqp_st = hqp_status.read().clone().flatten();
     let provider_zones_result = provider_zones.read().clone();
+    let spotify_account_result = spotify_account.read().clone().flatten();
     let spotify_devices = provider_zones_result
         .as_ref()
         .and_then(|result| result.as_ref().ok())
@@ -840,6 +849,14 @@ pub fn Settings() -> Element {
                             div {
                                 h3 { id: "spotify-heading", class: "text-lg font-semibold", "Spotify Connect" }
                                 p { class: "mt-1 text-sm text-secondary", "Control existing Spotify Connect devices. UHC does not act as a receiver." }
+                                if let Some(account) = spotify_account_result.as_ref() {
+                                    p { class: "mt-2 text-sm text-secondary", "Signed in as "
+                                        strong { class: "text-primary", "{account.display_name.as_deref().filter(|name| !name.is_empty()).unwrap_or(&account.id)}" }
+                                        if let Some(email) = account.email.as_deref().filter(|email| !email.is_empty()) {
+                                            span { " · {email}" }
+                                        }
+                                    }
+                                }
                             }
                             if !spotify_enabled() {
                                 span { class: "badge badge-secondary shrink-0", "Disabled" }

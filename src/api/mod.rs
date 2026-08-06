@@ -7,7 +7,7 @@ use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
 use crate::adapters::{AdapterCommand, AdapterCommandResponse, AdapterLogic, Startable};
 use crate::aggregator::ZoneAggregator;
-use crate::bus::SharedBus;
+use crate::bus::{ProviderAccount, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -2231,6 +2231,21 @@ fn save_app_settings(settings: &AppSettings) -> bool {
 /// GET /api/settings - Get app settings
 pub async fn api_settings_get_handler() -> impl IntoResponse {
     Json(load_app_settings())
+}
+
+#[derive(Debug, Serialize)]
+pub struct SpotifyAccountResponse {
+    pub account: Option<ProviderAccount>,
+}
+
+/// GET /api/providers/spotify/account - Last account identity reported by the
+/// Spotify adapter. Tokens and client credentials never leave the server.
+pub async fn spotify_account_handler(
+    State(state): State<AppState>,
+) -> Json<SpotifyAccountResponse> {
+    Json(SpotifyAccountResponse {
+        account: state.aggregator.get_provider_account("spotify").await,
+    })
 }
 
 /// POST /api/settings - Update app settings with dynamic adapter enable/disable
