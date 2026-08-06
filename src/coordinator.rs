@@ -43,6 +43,10 @@ struct RegisteredAdapter {
 /// - Coordinate graceful shutdown
 pub struct AdapterCoordinator {
     adapters: RwLock<HashMap<String, RegisteredAdapter>>,
+    /// Companion workers grouped under their provider's one client-visible
+    /// projection. The coordinator owns this topology so every lifecycle path
+    /// applies the same cancellation fence.
+    companions: RwLock<HashMap<String, Vec<Arc<dyn Startable>>>>,
     bus: SharedBus,
     /// Global shutdown token (parent of all adapter tokens)
     shutdown: CancellationToken,
@@ -54,6 +58,7 @@ impl AdapterCoordinator {
     pub fn new(bus: SharedBus) -> Self {
         Self {
             adapters: RwLock::new(HashMap::new()),
+            companions: RwLock::new(HashMap::new()),
             bus,
             shutdown: CancellationToken::new(),
             shutdown_timeout: Duration::from_secs(5),
@@ -64,6 +69,7 @@ impl AdapterCoordinator {
     pub fn with_shutdown_timeout(bus: SharedBus, timeout: Duration) -> Self {
         Self {
             adapters: RwLock::new(HashMap::new()),
+            companions: RwLock::new(HashMap::new()),
             bus,
             shutdown: CancellationToken::new(),
             shutdown_timeout: timeout,
@@ -96,8 +102,12 @@ impl AdapterCoordinator {
     /// Start all enabled adapters from the provided list.
     /// This is the single codepath for starting adapters.
     pub async fn start_all_enabled(&self, adapters: &[Arc<dyn Startable>]) {
+        let companion_names = self.companion_names().await;
         for adapter in adapters {
             let name = adapter.name();
+            if companion_names.iter().any(|companion| companion == name) {
+                continue;
+            }
             if !self.is_enabled(name).await {
                 debug!("Adapter {} is disabled, skipping", name);
                 continue;
@@ -106,23 +116,41 @@ impl AdapterCoordinator {
                 debug!("Adapter {} cannot start (not configured?), skipping", name);
                 continue;
             }
-            match adapter.start().await {
-                Ok(()) => {
-                    if let Some(registered) = self.adapters.write().await.get_mut(name) {
-                        registered.direct_running = true;
-                    }
-                    info!("Started adapter: {}", name);
-                }
+            match self.start_adapter_and_companions(adapter.as_ref()).await {
+                Ok(()) => info!("Started adapter: {}", name),
                 Err(e) => warn!("Failed to start adapter {}: {}", name, e),
             }
         }
     }
 
+    /// Start one direct [`Startable`] and update the coordinator's lifecycle
+    /// record.  HTTP configuration paths use this rather than owning a shadow
+    /// "running" state beside the coordinator.
+    pub async fn start_adapter_and_track(&self, adapter: &dyn Startable) -> Result<()> {
+        if !adapter.can_start().await {
+            return Err(anyhow::anyhow!("adapter cannot start"));
+        }
+        adapter.start().await?;
+        self.set_running(adapter.name(), true).await;
+        Ok(())
+    }
+
     /// Stop all adapters from the provided list.
     pub async fn stop_all(&self, adapters: &[Arc<dyn Startable>]) {
+        let companion_names = self.companion_names().await;
         for adapter in adapters {
-            self.stop_adapter_and_flush(adapter.as_ref(), "coordinator shutdown")
-                .await;
+            if companion_names
+                .iter()
+                .any(|companion| companion == adapter.name())
+            {
+                continue;
+            }
+            self.stop_adapter_and_companions_then_flush(
+                adapter.as_ref(),
+                adapter.name(),
+                "coordinator shutdown",
+            )
+            .await;
         }
     }
 
@@ -140,6 +168,107 @@ impl AdapterCoordinator {
         adapter.stop().await;
         self.set_running(adapter.name(), false).await;
         debug!("Stopped adapter: {}", adapter.name());
+    }
+
+    /// Cancel a group of workers which jointly observe one provider, then retire that
+    /// provider's projection exactly once.
+    ///
+    /// LMS is the current user: its HTTP poller and CLI subscription share an
+    /// `lms:` projection.  Retiring the projection after only one observer has
+    /// stopped lets the other observer re-publish a fact from the old server.
+    /// Cancellation is therefore issued to *every* observer before the
+    /// aggregator is told the provider has stopped.  The explicit projection
+    /// owner is separate from worker names because companion workers need not
+    /// have their own zone-ID prefix.
+    pub async fn stop_adapters_then_flush(
+        &self,
+        adapters: &[&dyn Startable],
+        projection_adapter: &str,
+        reason: &str,
+    ) {
+        for adapter in adapters {
+            adapter.stop().await;
+        }
+        self.bus.publish(BusEvent::AdapterStopping {
+            adapter: projection_adapter.to_string(),
+            reason: Some(reason.to_string()),
+        });
+        for adapter in adapters {
+            self.set_running(adapter.name(), false).await;
+            debug!("Stopped adapter: {}", adapter.name());
+        }
+    }
+
+    /// Register a worker that observes the same provider projection as
+    /// `provider`. Composition does this once; handlers never need to know a
+    /// provider's internal worker topology.
+    pub async fn register_companion(&self, provider: &str, companion: Arc<dyn Startable>) {
+        self.companions
+            .write()
+            .await
+            .entry(provider.to_string())
+            .or_default()
+            .push(companion);
+    }
+
+    /// Start a provider's primary adapter and every registered companion,
+    /// tracking their lifecycle centrally.
+    pub async fn start_adapter_and_companions(&self, adapter: &dyn Startable) -> Result<()> {
+        self.start_adapter_and_track(adapter).await?;
+        let companions = self
+            .companions
+            .read()
+            .await
+            .get(adapter.name())
+            .cloned()
+            .unwrap_or_default();
+        for companion in companions {
+            if let Err(error) = self.start_adapter_and_track(companion.as_ref()).await {
+                self.stop_adapters_then_flush(
+                    &[adapter],
+                    adapter.name(),
+                    "companion start failure",
+                )
+                .await;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Cancel a provider's primary worker and its registered companions, then
+    /// retire their shared projection once.
+    pub async fn stop_adapter_and_companions_then_flush(
+        &self,
+        adapter: &dyn Startable,
+        projection_adapter: &str,
+        reason: &str,
+    ) {
+        let companions = self
+            .companions
+            .read()
+            .await
+            .get(projection_adapter)
+            .cloned()
+            .unwrap_or_default();
+        let mut observers: Vec<&dyn Startable> = vec![adapter];
+        observers.extend(
+            companions
+                .iter()
+                .map(|companion| companion.as_ref() as &dyn Startable),
+        );
+        self.stop_adapters_then_flush(&observers, projection_adapter, reason)
+            .await;
+    }
+
+    async fn companion_names(&self) -> Vec<String> {
+        self.companions
+            .read()
+            .await
+            .values()
+            .flatten()
+            .map(|companion| companion.name().to_string())
+            .collect()
     }
 
     /// Register an adapter without starting it
@@ -412,6 +541,26 @@ mod tests {
         started: AtomicBool,
     }
 
+    struct RecordingStartable {
+        name: &'static str,
+        stopped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Startable for RecordingStartable {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        async fn start(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
     #[async_trait::async_trait]
     impl Startable for DirectStartable {
         fn name(&self) -> &'static str {
@@ -487,6 +636,46 @@ mod tests {
         assert!(!adapter.started.load(Ordering::SeqCst));
         assert!(!coord.is_running("direct").await);
         assert!(!coord.adapter_status().await["direct"].running);
+    }
+
+    #[tokio::test]
+    async fn grouped_lifecycle_cancels_every_lms_observer_and_retires_one_projection() {
+        let bus = create_bus();
+        let mut events = bus.subscribe();
+        let coord = AdapterCoordinator::new(bus);
+        coord.register("lms", true).await;
+        coord.register("lms-cli", true).await;
+        coord.set_running("lms", true).await;
+        coord.set_running("lms-cli", true).await;
+
+        let polling_stopped = Arc::new(AtomicBool::new(false));
+        let cli_stopped = Arc::new(AtomicBool::new(false));
+        let polling = Arc::new(RecordingStartable {
+            name: "lms",
+            stopped: polling_stopped.clone(),
+        });
+        let cli = Arc::new(RecordingStartable {
+            name: "lms-cli",
+            stopped: cli_stopped.clone(),
+        });
+        coord.register_companion("lms", cli.clone()).await;
+
+        coord
+            .stop_adapter_and_companions_then_flush(
+                polling.as_ref(),
+                "lms",
+                "test LMS reconfiguration",
+            )
+            .await;
+
+        assert!(polling_stopped.load(Ordering::SeqCst));
+        assert!(cli_stopped.load(Ordering::SeqCst));
+        assert!(!coord.is_running("lms").await);
+        assert!(!coord.is_running("lms-cli").await);
+        assert!(matches!(
+            events.recv().await,
+            Ok(BusEvent::AdapterStopping { adapter, .. }) if adapter == "lms"
+        ));
     }
 
     #[tokio::test]

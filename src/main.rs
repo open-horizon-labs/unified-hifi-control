@@ -267,6 +267,7 @@ mod server {
         ));
         let (lms, lms_cli) =
             adapters::lms::create_lms_adapters_with_runtime(bus.clone(), Some(lms_runtime_bridge));
+        coord.register_companion("lms", lms_cli.clone()).await;
         if let Some(ref lms_config) = config.lms {
             lms.configure(
                 lms_config.host.clone(),

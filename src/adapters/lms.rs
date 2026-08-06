@@ -1043,6 +1043,9 @@ pub struct LmsAdapter {
     runtime_bridge: Option<Arc<LmsRuntimeBridge>>,
     /// Wrapped in RwLock to allow creating fresh token on restart
     shutdown: Arc<RwLock<CancellationToken>>,
+    /// The polling supervisor.  Stop waits for this task so a readback from an
+    /// old LMS server cannot cross a reconfiguration projection retirement.
+    task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl LmsAdapter {
@@ -1064,6 +1067,7 @@ impl LmsAdapter {
             bus,
             runtime_bridge,
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
+            task: Arc::new(Mutex::new(None)),
         };
         // Load saved config synchronously at startup
         adapter.load_config_sync();
@@ -1264,7 +1268,10 @@ impl LmsAdapter {
         let bus = self.bus.clone();
         let handle = AdapterHandle::new(adapter, bus, shutdown);
 
-        tokio::spawn(async move { handle.run_with_retry(RetryConfig::default()).await });
+        let task = tokio::spawn(async move {
+            let _ = handle.run_with_retry(RetryConfig::default()).await;
+        });
+        *self.task.lock().await = Some(task);
 
         Ok(())
     }
@@ -1284,6 +1291,15 @@ impl LmsAdapter {
     async fn stop_internal(&self) {
         // Cancel background tasks first
         self.shutdown.read().await.cancel();
+
+        // Do not let a request already in flight publish a snapshot from the
+        // old server after the paired LMS projection has been retired.
+        let task = self.task.lock().await.take();
+        if let Some(task) = task {
+            if let Err(error) = task.await {
+                warn!(%error, "LMS polling supervisor did not stop cleanly");
+            }
+        }
 
         let host = {
             let mut state = self.state.write().await;
@@ -3139,6 +3155,8 @@ pub struct LmsCliAdapter {
     shutdown: Arc<RwLock<CancellationToken>>,
     /// Guard against duplicate start() calls
     running: Arc<RwLock<bool>>,
+    /// CLI supervisor, joined on stop to fence in-flight CLI readbacks.
+    task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl LmsCliAdapter {
@@ -3157,6 +3175,7 @@ impl LmsCliAdapter {
             runtime_bridge,
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
             running: Arc::new(RwLock::new(false)),
+            task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3251,17 +3270,24 @@ impl Startable for LmsCliAdapter {
         let running_flag = self.running.clone();
         let handle = AdapterHandle::new(adapter, bus, shutdown);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _ = handle.run_with_retry(RetryConfig::default()).await;
             // Reset running flag when task completes
             *running_flag.write().await = false;
         });
+        *self.task.lock().await = Some(task);
 
         Ok(())
     }
 
     async fn stop(&self) {
         self.shutdown.read().await.cancel();
+        let task = self.task.lock().await.take();
+        if let Some(task) = task {
+            if let Err(error) = task.await {
+                warn!(%error, "LMS CLI supervisor did not stop cleanly");
+            }
+        }
     }
 
     async fn can_start(&self) -> bool {

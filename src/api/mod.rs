@@ -1864,10 +1864,12 @@ pub async fn lms_configure_handler(
     State(state): State<AppState>,
     Json(req): Json<LmsConfigRequest>,
 ) -> impl IntoResponse {
-    // Stop existing connection if any
+    // LMS has two concurrent observers of the same `lms:` projection.  Stop
+    // both before retirement/reconfiguration so an old CLI callback cannot
+    // republish zones from the former server after the projection is flushed.
     state
         .coordinator
-        .stop_adapter_and_flush(state.lms.as_ref(), "LMS reconfiguration")
+        .stop_adapter_and_companions_then_flush(state.lms.as_ref(), "lms", "LMS reconfiguration")
         .await;
 
     // Configure new connection
@@ -1876,8 +1878,13 @@ pub async fn lms_configure_handler(
         .configure(req.host.clone(), req.port, req.username, req.password)
         .await;
 
-    // Start the adapter
-    match state.lms.start().await {
+    // Start both observers together; the CLI companion is not an optional
+    // feature of a manually configured LMS connection.
+    match state
+        .coordinator
+        .start_adapter_and_companions(state.lms.as_ref())
+        .await
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2681,18 +2688,30 @@ pub async fn api_settings_post_handler(
         if let Some(adapter) = adapters_list.iter().find(|a| a.name() == name) {
             if now_enabled {
                 tracing::info!("Dynamically enabling adapter: {}", name);
-                if adapter.can_start().await {
-                    if let Err(e) = adapter.start().await {
+                if name == "lms" {
+                    if let Err(e) = coord.start_adapter_and_companions(adapter.as_ref()).await {
+                        tracing::warn!("Failed to start LMS observers: {}", e);
+                    }
+                } else if adapter.can_start().await {
+                    if let Err(e) = coord.start_adapter_and_track(adapter.as_ref()).await {
                         tracing::warn!("Failed to start adapter {}: {}", name, e);
-                    } else {
-                        coord.set_running(name, true).await;
                     }
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
-                coord
-                    .stop_adapter_and_flush(adapter.as_ref(), "disabled via settings")
-                    .await;
+                if name == "lms" {
+                    coord
+                        .stop_adapter_and_companions_then_flush(
+                            adapter.as_ref(),
+                            "lms",
+                            "disabled via settings",
+                        )
+                        .await;
+                } else {
+                    coord
+                        .stop_adapter_and_flush(adapter.as_ref(), "disabled via settings")
+                        .await;
+                }
             }
         }
     }

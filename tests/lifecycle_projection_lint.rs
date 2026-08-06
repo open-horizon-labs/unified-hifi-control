@@ -3,8 +3,8 @@
 //! The adapter-boundary lint prevents new surface-to-adapter bypasses. This
 //! suite protects the recovery half of that contract using parsed Rust syntax:
 //! every composed observer must be able to re-admit a full snapshot, Core loss
-//! must remove its projection, and every coordinator/API stop route must flush
-//! before cancellation.
+//! must remove its projection, and every coordinator/API stop route must cover
+//! every observer before it retires a shared projection.
 
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -50,6 +50,20 @@ fn named_body<'a>(file: &'a syn::File, name: &str) -> &'a syn::Block {
 struct SyntaxFacts {
     method_calls: Vec<String>,
     paths: Vec<String>,
+}
+
+#[derive(Default)]
+struct AwaitFacts {
+    awaits_task: bool,
+}
+
+impl<'ast> Visit<'ast> for AwaitFacts {
+    fn visit_expr_await(&mut self, expression: &'ast syn::ExprAwait) {
+        let mut base = SyntaxFacts::default();
+        base.visit_expr(&expression.base);
+        self.awaits_task |= base.paths.iter().any(|path| path == "task");
+        visit::visit_expr_await(self, expression);
+    }
 }
 
 #[derive(Default)]
@@ -314,23 +328,11 @@ fn openhome_and_upnp_pollers_republish_cached_devices_as_snapshots() {
 
 #[test]
 fn every_production_stop_route_flushes_before_stopping() {
-    for (name, source, function) in [
-        (
-            "shared stop and flush",
-            include_str!("../src/coordinator.rs"),
-            "stop_adapter_and_flush",
-        ),
-        (
-            "LMS reconfiguration",
-            include_str!("../src/api/mod.rs"),
-            "lms_configure_handler",
-        ),
-        (
-            "coordinator shutdown",
-            include_str!("../src/coordinator.rs"),
-            "stop_all",
-        ),
-    ] {
+    for (name, source, function) in [(
+        "shared stop and flush",
+        include_str!("../src/coordinator.rs"),
+        "stop_adapter_and_flush",
+    )] {
         let events = stop_events(named_body(&parse(source), function));
         let flush = events
             .iter()
@@ -341,6 +343,103 @@ fn every_production_stop_route_flushes_before_stopping() {
             .position(|event| *event == "stop")
             .unwrap_or_else(|| panic!("{name} must stop adapters"));
         assert!(flush < stop, "{name} must flush the projection before stop");
+    }
+}
+
+#[test]
+fn lms_reconfiguration_cancels_both_observers_before_retiring_lms_projection() {
+    let coordinator = parse(include_str!("../src/coordinator.rs"));
+    let group_stop = named_body(&coordinator, "stop_adapters_then_flush");
+    let events = stop_events(group_stop);
+    let first_flush = events
+        .iter()
+        .position(|event| *event == "flush")
+        .expect("group lifecycle must retire the shared projection");
+    assert!(
+        events[..first_flush]
+            .iter()
+            .filter(|event| **event == "stop")
+            .count()
+            >= 1,
+        "group lifecycle must cancel its observers before retirement"
+    );
+
+    let api = parse(include_str!("../src/api/mod.rs"));
+    let configure = facts(named_body(&api, "lms_configure_handler"));
+    assert!(
+        configure
+            .method_calls
+            .iter()
+            .any(|call| call == "stop_adapter_and_companions_then_flush"),
+        "LMS reconfiguration must use the paired-observer stop path"
+    );
+    assert!(
+        configure
+            .method_calls
+            .iter()
+            .any(|call| call == "start_adapter_and_companions"),
+        "LMS reconfiguration must restart the CLI companion with the poller"
+    );
+    let settings = facts(named_body(&api, "api_settings_post_handler"));
+    assert!(
+        settings
+            .method_calls
+            .iter()
+            .any(|call| call == "stop_adapter_and_companions_then_flush"),
+        "settings disable must stop LMS's complete observer group"
+    );
+    assert!(
+        settings
+            .method_calls
+            .iter()
+            .any(|call| call == "start_adapter_and_companions"),
+        "settings enable must start LMS's complete observer group"
+    );
+
+    let paired_stop = facts(named_body(
+        &coordinator,
+        "stop_adapter_and_companions_then_flush",
+    ));
+    assert!(
+        paired_stop.paths.iter().any(|path| path == "companions"),
+        "the LMS lifecycle must include the CLI observer"
+    );
+    assert!(
+        paired_stop
+            .method_calls
+            .iter()
+            .any(|call| call == "stop_adapters_then_flush"),
+        "the LMS pair must be retired through the coordinator"
+    );
+    let shutdown = facts(named_body(&coordinator, "stop_all"));
+    assert!(
+        shutdown
+            .method_calls
+            .iter()
+            .any(|call| call == "stop_adapter_and_companions_then_flush"),
+        "coordinator shutdown must use the paired-observer stop path"
+    );
+
+    for (name, body) in [
+        (
+            "LMS poller",
+            named_body(
+                &parse(include_str!("../src/adapters/lms.rs")),
+                "stop_internal",
+            ),
+        ),
+        (
+            "LMS CLI",
+            named_body(&parse(include_str!("../src/adapters/lms.rs")), "stop"),
+        ),
+    ] {
+        let stop = facts(body);
+        let mut awaits = AwaitFacts::default();
+        awaits.visit_block(body);
+        assert!(
+            stop.method_calls.iter().any(|call| call == "take") && awaits.awaits_task,
+            "{name} stop must join its supervisor, not merely signal cancellation"
+        );
     }
 }
 
