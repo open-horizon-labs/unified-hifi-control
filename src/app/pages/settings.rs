@@ -745,6 +745,16 @@ pub fn Settings() -> Element {
                             div { class: "rounded-md border border-default p-4",
                                 h4 { class: "font-medium", "Local setup" }
                                 p { class: "mt-2 text-sm text-secondary", "Use this for a self-hosted or QNAP deployment. UHC stores the OAuth client settings server-side and refreshes access automatically." }
+                                div { class: "mt-4 rounded-md bg-hover p-3", aria_label: "Remote QNAP setup instructions",
+                                    h5 { class: "font-medium", "Using UHC from another device?" }
+                                    p { class: "mt-1 text-sm text-secondary", "Start a temporary HTTPS tunnel to this UHC server, then open the tunnel URL in this browser. The callback below will follow that secure origin." }
+                                    ol { class: "mt-2 list-decimal space-y-1 pl-5 text-sm text-secondary",
+                                        li { "On the QNAP, tunnel port 8088 with your provider (for example, ", code { "cloudflared tunnel --url http://127.0.0.1:8088" }, " or Tailscale Funnel)." }
+                                        li { "Open the provider’s HTTPS URL here; do not continue from the NAS’s plain HTTP address." }
+                                        li { "Register the exact callback URI below in the Spotify developer dashboard, then save and connect." }
+                                        li { "Stop the tunnel after authorization. Start a new one if Spotify needs reauthorization later." }
+                                    }
+                                }
                                 label { class: "mt-3 block text-sm font-medium", r#for: "spotify-client-id", "Client ID" }
                                 input {
                                     id: "spotify-client-id",

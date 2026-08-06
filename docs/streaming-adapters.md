@@ -78,12 +78,15 @@ Spotify application.
 
 For a local or QNAP install, open Settings in the browser you will use for
 authorization, enter the Spotify client ID, and leave the client secret blank
-to use Authorization Code with PKCE. The form pre-fills the callback from the
-current UHC origin so a hosted HTTPS QNAP URL can be registered directly in the
-Spotify application. Spotify accepts plain HTTP only for explicit loopback
-callbacks (`127.0.0.1` or `::1`); a remote QNAP needs HTTPS. Saving the form
-persists the client configuration in the encrypted credential envelope, after
-which **Connect Spotify** starts the browser authorization flow. This is the
+to use Authorization Code with PKCE. If the browser is not on the UHC host,
+first start a temporary HTTPS tunnel to port 8088 (for example with
+`cloudflared` or Tailscale Funnel), open its HTTPS URL in the browser, and
+register the exact callback shown by Settings in the Spotify developer
+dashboard. Spotify accepts plain HTTP only for explicit loopback callbacks
+(`127.0.0.1` or `::1`); a remote QNAP needs HTTPS. Saving the form persists the
+client configuration in the encrypted credential envelope, after which
+**Connect Spotify** starts the browser authorization flow. Stop the tunnel
+after authorization; reauthorization creates a new callback URL. This is the
 first-run onboarding path tracked in #469.
 
 Apple Music authorization remains native to the companion. A macOS companion
