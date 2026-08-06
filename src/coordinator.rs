@@ -121,6 +121,13 @@ impl AdapterCoordinator {
     /// Stop all adapters from the provided list.
     pub async fn stop_all(&self, adapters: &[Arc<dyn Startable>]) {
         for adapter in adapters {
+            // The aggregator owns client-visible zones. Stopping the worker alone
+            // leaves that projection live until a future discovery happens; flush
+            // before cancellation on every coordinator-owned shutdown route.
+            self.bus.publish(BusEvent::AdapterStopping {
+                adapter: adapter.name().to_string(),
+                reason: Some("coordinator shutdown".to_string()),
+            });
             adapter.stop().await;
             if let Some(registered) = self.adapters.write().await.get_mut(adapter.name()) {
                 registered.direct_running = false;

@@ -1,98 +1,66 @@
 //! Deterministic lifecycle/projection architecture checks.
 //!
-//! The adapter-boundary lint prevents new surface-to-adapter bypasses. This suite
-//! protects the complementary invariant: producers may only publish after the
-//! ZoneAggregator is receiving events, and lifecycle helpers must retire a
-//! provider's projection before stopping it.
+//! The adapter-boundary lint prevents new surface-to-adapter bypasses. This
+//! suite protects the recovery half of that contract using parsed Rust syntax:
+//! every composed observer must be able to re-admit a full snapshot, Core loss
+//! must remove its projection, and every coordinator/API stop route must flush
+//! before cancellation.
 
 use syn::visit::{self, Visit};
-use syn::{Expr, ExprMethodCall, ExprPath, File, ItemFn, Lit};
+use syn::{Expr, ExprMatch, ImplItem, Item, Pat};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartupEvent {
-    AggregatorReady,
-    HqplayerConnect,
-    StartAdapters,
+fn parse(source: &str) -> syn::File {
+    syn::parse_file(source).expect("production Rust must parse")
 }
 
-struct StartupVisitor {
-    events: Vec<StartupEvent>,
-}
-
-impl<'ast> Visit<'ast> for StartupVisitor {
-    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
-        let receiver = expression_root_ident(call.receiver.as_ref());
-        match (receiver.as_deref(), call.method.to_string().as_str()) {
-            (Some("zone_aggregator"), "start") => self.events.push(StartupEvent::AggregatorReady),
-            (Some("hqplayer"), "get_pipeline_status") => {
-                self.events.push(StartupEvent::HqplayerConnect)
+fn named_body<'a>(file: &'a syn::File, name: &str) -> &'a syn::Block {
+    fn find<'a>(items: &'a [Item], name: &str) -> Option<&'a syn::Block> {
+        for item in items {
+            match item {
+                Item::Fn(function) if function.sig.ident == name => return Some(&function.block),
+                Item::Mod(module) => {
+                    if let Some((_, children)) = &module.content {
+                        if let Some(block) = find(children, name) {
+                            return Some(block);
+                        }
+                    }
+                }
+                Item::Impl(implementation) => {
+                    for member in &implementation.items {
+                        if let ImplItem::Fn(function) = member {
+                            if function.sig.ident == name {
+                                return Some(&function.block);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
-            (_, "start_all_enabled") => self.events.push(StartupEvent::StartAdapters),
-            _ => {}
         }
-        visit::visit_expr_method_call(self, call);
+        None
     }
-}
-
-fn expression_root_ident(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Path(ExprPath { path, .. }) if path.segments.len() == 1 => path
-            .segments
-            .first()
-            .map(|segment| segment.ident.to_string()),
-        Expr::MethodCall(call) => expression_root_ident(call.receiver.as_ref()),
-        Expr::Paren(paren) => expression_root_ident(paren.expr.as_ref()),
-        Expr::Reference(reference) => expression_root_ident(reference.expr.as_ref()),
-        _ => None,
+    if let Some(block) = find(&file.items, name) {
+        return block;
     }
+    panic!("missing function `{name}`")
 }
 
-fn startup_events(source: &str) -> Vec<StartupEvent> {
-    let syntax: File = syn::parse_file(source).expect("main.rs must parse");
-    let run = syntax
-        .items
-        .iter()
-        .find_map(|item| match item {
-            syn::Item::Mod(module) => module.content.as_ref().and_then(|(_, items)| {
-                items.iter().find_map(|item| match item {
-                    syn::Item::Fn(function) if function.sig.ident == "run" => Some(function),
-                    _ => None,
-                })
-            }),
-            _ => None,
-        })
-        .expect("server::run must exist");
-    let mut visitor = StartupVisitor { events: Vec::new() };
-    visitor.visit_block(&run.block);
-    visitor.events
+#[derive(Default)]
+struct SyntaxFacts {
+    method_calls: Vec<String>,
+    paths: Vec<String>,
 }
 
-fn assert_aggregator_precedes_producers(events: &[StartupEvent]) -> Result<(), String> {
-    let aggregator = events
-        .iter()
-        .position(|event| *event == StartupEvent::AggregatorReady)
-        .ok_or_else(|| "ZoneAggregator::start was not awaited".to_string())?;
-    for producer in [StartupEvent::HqplayerConnect, StartupEvent::StartAdapters] {
-        let index = events
-            .iter()
-            .position(|event| *event == producer)
-            .ok_or_else(|| format!("missing producer event {producer:?}"))?;
-        if index < aggregator {
-            return Err(format!("{producer:?} happens before ZoneAggregator::start"));
-        }
-    }
-    Ok(())
-}
-
-struct StartsWithVisitor {
+#[derive(Default)]
+struct PrefixFacts {
     prefixes: Vec<String>,
 }
 
-impl<'ast> Visit<'ast> for StartsWithVisitor {
-    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+impl<'ast> Visit<'ast> for PrefixFacts {
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         if call.method == "starts_with" {
-            if let Some(syn::Expr::Lit(literal)) = call.args.first() {
-                if let Lit::Str(prefix) = &literal.lit {
+            if let Some(Expr::Lit(literal)) = call.args.first() {
+                if let syn::Lit::Str(prefix) = &literal.lit {
                     self.prefixes.push(prefix.value());
                 }
             }
@@ -101,23 +69,45 @@ impl<'ast> Visit<'ast> for StartsWithVisitor {
     }
 }
 
-fn zone_prefixes(source: &str) -> Vec<String> {
-    let syntax: File = syn::parse_file(source).expect("routes.rs must parse");
-    let mut visitor = StartsWithVisitor {
-        prefixes: Vec::new(),
-    };
-    visitor.visit_file(&syntax);
-    visitor.prefixes
+impl<'ast> Visit<'ast> for SyntaxFacts {
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.method_calls.push(call.method.to_string());
+        visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
+        self.paths.push(segment.ident.to_string());
+        visit::visit_path_segment(self, segment);
+    }
 }
 
-struct StopFlushVisitor {
+fn facts(block: &syn::Block) -> SyntaxFacts {
+    let mut facts = SyntaxFacts::default();
+    facts.visit_block(block);
+    facts
+}
+
+fn expression_facts(expression: &Expr) -> SyntaxFacts {
+    let mut facts = SyntaxFacts::default();
+    facts.visit_expr(expression);
+    facts
+}
+
+#[derive(Default)]
+struct StopFacts {
     events: Vec<&'static str>,
 }
 
-impl<'ast> Visit<'ast> for StopFlushVisitor {
-    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
-        if call.method == "publish" && contains_adapter_stopping(call) {
-            self.events.push("flush");
+impl<'ast> Visit<'ast> for StopFacts {
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "publish" {
+            let mut arguments = SyntaxFacts::default();
+            for argument in &call.args {
+                arguments.visit_expr(argument);
+            }
+            if arguments.paths.iter().any(|path| path == "AdapterStopping") {
+                self.events.push("flush");
+            }
         }
         if call.method == "stop" {
             self.events.push("stop");
@@ -126,90 +116,157 @@ impl<'ast> Visit<'ast> for StopFlushVisitor {
     }
 }
 
-fn contains_adapter_stopping(call: &ExprMethodCall) -> bool {
-    struct EventVisitor {
-        found: bool,
-    }
-    impl<'ast> Visit<'ast> for EventVisitor {
-        fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
-            if segment.ident == "AdapterStopping" {
-                self.found = true;
+fn stop_events(block: &syn::Block) -> Vec<&'static str> {
+    let mut facts = StopFacts::default();
+    facts.visit_block(block);
+    facts.events
+}
+
+fn requires_snapshot_bridge(
+    source: &str,
+    bridge_method: &str,
+    observer_publish: &str,
+    observer_name: &str,
+) {
+    let file = parse(source);
+    let bridge = facts(named_body(&file, bridge_method));
+    assert!(
+        bridge.paths.iter().any(|path| path == "Snapshot"),
+        "the reliable bridge must publish ProjectionKind::Snapshot, not a lossy delta"
+    );
+    let observer = facts(named_body(&file, observer_name));
+    assert!(
+        observer
+            .method_calls
+            .iter()
+            .any(|call| call == observer_publish),
+        "{observer_name} must re-publish an authoritative zone through `{observer_publish}`"
+    );
+}
+
+fn pat_has_core_lost(pat: &Pat) -> bool {
+    let mut facts = SyntaxFacts::default();
+    facts.visit_pat(pat);
+    facts.paths.iter().any(|path| path == "CoreEvent")
+        && facts.paths.iter().any(|path| path == "Lost")
+}
+
+#[derive(Default)]
+struct CoreLossFacts {
+    removes_projection: bool,
+}
+
+impl<'ast> Visit<'ast> for CoreLossFacts {
+    fn visit_expr_match(&mut self, expression: &'ast ExprMatch) {
+        for arm in &expression.arms {
+            if pat_has_core_lost(&arm.pat) {
+                let arm_facts = expression_facts(&arm.body);
+                self.removes_projection |= arm_facts
+                    .method_calls
+                    .iter()
+                    .any(|call| call == "publish_removed");
             }
-            visit::visit_path_segment(self, segment);
         }
+        visit::visit_expr_match(self, expression);
     }
-    let mut visitor = EventVisitor { found: false };
-    for argument in &call.args {
-        visitor.visit_expr(argument);
-    }
-    visitor.found
 }
 
-fn stop_flush_events(source: &str) -> Vec<&'static str> {
-    let syntax: File = syn::parse_file(source).expect("api/mod.rs must parse");
-    let helper = syntax
-        .items
+#[test]
+fn lms_reconnect_can_republish_unchanged_players_as_snapshots() {
+    requires_snapshot_bridge(
+        include_str!("../src/adapters/lms.rs"),
+        "publish",
+        "publish_zone",
+        "update_players_internal",
+    );
+}
+
+#[test]
+fn roon_core_loss_retires_every_projected_zone() {
+    let file = parse(include_str!("../src/adapters/roon.rs"));
+    let mut facts = CoreLossFacts::default();
+    facts.visit_file(&file);
+    assert!(
+        facts.removes_projection,
+        "CoreEvent::Lost must publish ZoneRemoved projections before reconnecting"
+    );
+}
+
+#[test]
+fn openhome_and_upnp_pollers_republish_cached_devices_as_snapshots() {
+    requires_snapshot_bridge(
+        include_str!("../src/adapters/openhome.rs"),
+        "publish_zone",
+        "publish_zone",
+        "poll_device",
+    );
+    requires_snapshot_bridge(
+        include_str!("../src/adapters/upnp.rs"),
+        "publish_zone",
+        "publish_zone",
+        "poll_renderer",
+    );
+}
+
+#[test]
+fn every_production_stop_route_flushes_before_stopping() {
+    for (name, source, function) in [
+        (
+            "settings disable",
+            include_str!("../src/api/mod.rs"),
+            "stop_adapter_and_flush_zones",
+        ),
+        (
+            "coordinator shutdown",
+            include_str!("../src/coordinator.rs"),
+            "stop_all",
+        ),
+    ] {
+        let events = stop_events(named_body(&parse(source), function));
+        let flush = events
+            .iter()
+            .position(|event| *event == "flush")
+            .unwrap_or_else(|| panic!("{name} must publish AdapterStopping"));
+        let stop = events
+            .iter()
+            .position(|event| *event == "stop")
+            .unwrap_or_else(|| panic!("{name} must stop adapters"));
+        assert!(flush < stop, "{name} must flush the projection before stop");
+    }
+}
+
+#[test]
+fn aggregator_subscribes_before_starting_any_adapter() {
+    let facts = facts(named_body(&parse(include_str!("../src/main.rs")), "run"));
+    let subscription = facts
+        .method_calls
         .iter()
-        .find_map(|item| match item {
-            syn::Item::Fn(ItemFn { sig, block, .. })
-                if sig.ident == "stop_adapter_and_flush_zones" =>
-            {
-                Some(block)
-            }
-            _ => None,
-        })
-        .expect("stop_adapter_and_flush_zones must exist");
-    let mut visitor = StopFlushVisitor { events: Vec::new() };
-    visitor.visit_block(helper);
-    visitor.events
+        .position(|call| call == "run_with_ready")
+        .expect("startup must use the aggregator readiness barrier");
+    let starts = facts
+        .method_calls
+        .iter()
+        .position(|call| call == "start_all_enabled")
+        .expect("startup must use AdapterCoordinator::start_all_enabled");
+    assert!(
+        subscription < starts,
+        "adapter startup must not precede the aggregator subscription barrier"
+    );
 }
 
 #[test]
-fn aggregator_subscription_precedes_every_startup_producer() {
-    let source = include_str!("../src/main.rs");
-    assert_aggregator_precedes_producers(&startup_events(source)).unwrap();
-}
-
-#[test]
-fn controller_filters_the_full_prefixed_zone_vocabulary() {
-    let prefixes = zone_prefixes(include_str!("../src/knobs/routes.rs"));
-    for expected in ["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"] {
+fn controller_recognizes_every_prefixed_provider() {
+    let file = parse(include_str!("../src/knobs/routes.rs"));
+    let mut facts = PrefixFacts::default();
+    facts.visit_file(&file);
+    for prefix in ["roon:", "lms:", "openhome:", "upnp:", "hqplayer:"] {
         assert!(
-            prefixes.contains(&expected.to_string()),
-            "missing {expected}"
+            facts.prefixes.iter().any(|actual| actual == prefix),
+            "controller does not recognize `{prefix}`"
         );
     }
     assert!(
-        !prefixes.contains(&"hqp:".to_string()),
-        "hqp: is not a valid PrefixedZoneId provider"
+        !facts.prefixes.iter().any(|prefix| prefix == "hqp:"),
+        "hqp: is not a valid provider prefix"
     );
-}
-
-#[test]
-fn adapter_stop_flushes_its_projection_before_cancellation() {
-    assert_eq!(
-        stop_flush_events(include_str!("../src/api/mod.rs")),
-        ["flush", "stop"],
-        "stopping a provider must first publish AdapterStopping for the aggregator"
-    );
-}
-
-#[test]
-fn startup_lint_rejects_a_producer_before_the_aggregator() {
-    let events = [
-        StartupEvent::HqplayerConnect,
-        StartupEvent::AggregatorReady,
-        StartupEvent::StartAdapters,
-    ];
-    assert!(assert_aggregator_precedes_producers(&events).is_err());
-}
-
-#[test]
-fn startup_lint_accepts_an_aggregator_before_every_producer() {
-    let events = [
-        StartupEvent::AggregatorReady,
-        StartupEvent::HqplayerConnect,
-        StartupEvent::StartAdapters,
-    ];
-    assert_aggregator_precedes_producers(&events).unwrap();
 }

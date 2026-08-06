@@ -2890,7 +2890,28 @@ async fn run_roon_loop(
                             .await;
                     }
 
+                    // Losing the Core invalidates every zone it supplied. Capture their
+                    // prefixed identities before clearing the operational cache, then retire
+                    // the canonical projection. A later reconnect commonly reuses the same
+                    // zone IDs, so merely clearing local state leaves controllers displaying
+                    // controllable ghosts until some unrelated update happens.
+                    let removed_zone_ids: Vec<PrefixedZoneId> = state_for_events
+                        .read()
+                        .await
+                        .zones
+                        .keys()
+                        .map(PrefixedZoneId::roon)
+                        .collect();
                     clear_roon_runtime_state(&state_for_events).await;
+                    for zone_id in removed_zone_ids {
+                        if let Some(bridge) = runtime_bridge_for_events.as_ref() {
+                            if let Err(error) = bridge.publish_removed(zone_id).await {
+                                tracing::warn!(%error, "Roon Core-loss projection removal failed");
+                            }
+                        } else {
+                            bus_for_events.publish(BusEvent::ZoneRemoved { zone_id });
+                        }
+                    }
 
                     // Publish disconnected event
                     bus_for_events.publish(BusEvent::RoonDisconnected);
