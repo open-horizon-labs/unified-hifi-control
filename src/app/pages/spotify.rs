@@ -22,6 +22,16 @@ async fn fetch_now_playing(zone_id: &str) -> Option<NowPlaying> {
     crate::app::api::fetch_json::<NowPlaying>(&url).await.ok()
 }
 
+async fn fetch_all_now_playing(zones: &[Zone]) -> HashMap<String, NowPlaying> {
+    let mut now_playing = HashMap::new();
+    for zone in zones {
+        if let Some(np) = fetch_now_playing(&zone.zone_id).await {
+            now_playing.insert(zone.zone_id.clone(), np);
+        }
+    }
+    now_playing
+}
+
 /// Spotify Connect device page, visible only when the Spotify adapter is enabled.
 #[component]
 pub fn Spotify() -> Element {
@@ -45,53 +55,102 @@ pub fn Spotify() -> Element {
             .ok()
     });
     let mut error = use_signal(|| None::<String>);
+    let mut pending_zone = use_signal(|| None::<String>);
 
     let zone_list = use_memo(move || zones.read().clone().flatten().unwrap_or_default());
     use_effect(move || {
         let list = zone_list();
         if !list.is_empty() {
             spawn(async move {
-                let mut next = HashMap::new();
-                for zone in list {
-                    if let Some(np) = fetch_now_playing(&zone.zone_id).await {
-                        next.insert(zone.zone_id, np);
-                    }
-                }
-                now_playing.set(next);
+                now_playing.set(fetch_all_now_playing(&list).await);
             });
         }
     });
 
-    let event_count = sse.event_count;
     use_effect(move || {
-        let _ = event_count();
-        if matches!(
-            sse.last_event.read().as_ref(),
-            Some(
-                SseEvent::ZoneDiscovered { .. }
-                    | SseEvent::ZoneUpdated { .. }
-                    | SseEvent::ZoneRemoved { .. }
-                    | SseEvent::NowPlayingChanged { .. }
-                    | SseEvent::VolumeChanged { .. }
-                    | SseEvent::AdapterError { .. }
-                    | SseEvent::ProviderAccountUpdated { .. }
-            )
-        ) {
-            zones.restart();
+        let _ = (sse.event_count)();
+        let event = (sse.last_event)();
+        match event.as_ref() {
+            Some(SseEvent::ZoneDiscovered { .. } | SseEvent::ZoneRemoved { .. }) => {
+                zones.restart();
+            }
+            Some(SseEvent::ZoneUpdated { .. } | SseEvent::NowPlayingChanged { .. }) => {
+                if let Some(zone_id) = event.as_ref().and_then(SseEvent::zone_id) {
+                    let zone_id = zone_id.to_string();
+                    if matches!(event, Some(SseEvent::NowPlayingChanged { .. }))
+                        && pending_zone() == Some(zone_id.clone())
+                    {
+                        pending_zone.set(None);
+                    }
+                    spawn(async move {
+                        if let Some(np) = fetch_now_playing(&zone_id).await {
+                            now_playing.with_mut(|map| {
+                                map.insert(zone_id, np);
+                            });
+                        }
+                    });
+                }
+            }
+            Some(SseEvent::VolumeChanged { payload })
+                if payload.output_id.starts_with("spotify:") =>
+            {
+                let zone_id = payload.output_id.clone();
+                if pending_zone() == Some(zone_id.clone()) {
+                    pending_zone.set(None);
+                }
+                spawn(async move {
+                    if let Some(np) = fetch_now_playing(&zone_id).await {
+                        now_playing.with_mut(|map| {
+                            map.insert(zone_id, np);
+                        });
+                    }
+                });
+            }
+            _ => {}
         }
     });
 
     let control = move |(zone_id, action): (String, String)| {
         let mut error = error;
+        let mut pending_zone = pending_zone;
+        let mut now_playing = now_playing;
         spawn(async move {
+            pending_zone.set(Some(zone_id.clone()));
+            let retry_track = matches!(action.as_str(), "next" | "previous");
+            let previous_track = now_playing()
+                .get(&zone_id)
+                .map(|np| (np.line1.clone(), np.image_key.clone()));
             let request = ControlRequest {
-                zone_id,
+                zone_id: zone_id.clone(),
                 action,
                 value: None,
             };
             if let Err(message) = crate::app::api::post_json_no_response("/control", &request).await
             {
+                pending_zone.set(None);
                 error.set(Some(message));
+            } else if retry_track {
+                let retry_zone_id = zone_id.clone();
+                spawn(async move {
+                    for delay in [250, 500, 750, 1000, 1500, 2000] {
+                        dioxus_sdk_time::sleep(std::time::Duration::from_millis(delay)).await;
+                        if pending_zone().as_deref() != Some(retry_zone_id.as_str()) {
+                            return;
+                        }
+                        if let Some(np) = fetch_now_playing(&retry_zone_id).await {
+                            let changed = previous_track.as_ref()
+                                != Some(&(np.line1.clone(), np.image_key.clone()));
+                            now_playing.with_mut(|map| {
+                                map.insert(retry_zone_id.clone(), np);
+                            });
+                            if changed {
+                                pending_zone.set(None);
+                                return;
+                            }
+                        }
+                    }
+                    pending_zone.set(None);
+                });
             }
         });
     };
@@ -103,6 +162,11 @@ pub fn Spotify() -> Element {
         .map(|settings| settings.adapters.spotify);
     let list = zone_list();
     let np = now_playing();
+    let active_device = list.iter().find_map(|zone| {
+        np.get(&zone.zone_id)
+            .filter(|now_playing| now_playing.is_playing)
+            .map(|_| zone.zone_name.as_str())
+    });
 
     rsx! {
         Layout {
@@ -110,7 +174,7 @@ pub fn Spotify() -> Element {
             nav_active: "spotify".to_string(),
 
             h1 { class: "text-2xl font-bold mb-2", "Spotify" }
-            p { class: "text-muted text-sm mb-6", "Spotify Connect devices controlled through UHC." }
+            p { class: "text-secondary text-sm mb-6", "Spotify Connect devices controlled through UHC." }
 
             if let Some(message) = error() {
                 ErrorAlert { message, on_dismiss: move |_| error.set(None) }
@@ -123,15 +187,37 @@ pub fn Spotify() -> Element {
             } else if list.is_empty() {
                 div { class: "card p-6",
                     p { class: "font-medium", "No Spotify Connect devices found" }
-                    p { class: "mt-1 text-sm text-muted", "Start Spotify on a device, select it from Spotify Connect, then refresh this page." }
+                    p { class: "mt-1 text-sm text-secondary", "Start Spotify on a Connect-capable player; UHC will detect it automatically." }
+                    button {
+                        r#type: "button",
+                        class: "btn btn-outline mt-4 min-h-11",
+                        onclick: move |_| zones.restart(),
+                        "Refresh devices"
+                    }
                 }
             } else {
+                div { class: "card mb-4 flex flex-wrap items-center justify-between gap-3 p-4", role: "status", aria_live: "polite",
+                    div {
+                        p { class: "font-medium", "Spotify Connect is live" }
+                        p { class: "mt-1 text-sm text-secondary",
+                            "{list.len()} device(s)"
+                            if let Some(device) = active_device { " · Playing on {device}" }
+                        }
+                    }
+                    button {
+                        r#type: "button",
+                        class: "btn btn-outline min-h-11",
+                        onclick: move |_| zones.restart(),
+                        "Refresh devices"
+                    }
+                }
                 div { class: "grid gap-4 grid-cols-1 md:grid-cols-2 lg:grid-cols-3",
                     for zone in list {
                         SpotifyDeviceCard {
                             key: "{zone.zone_id}",
                             zone: zone.clone(),
                             now_playing: np.get(&zone.zone_id).cloned(),
+                            pending: pending_zone() == Some(zone.zone_id.clone()),
                             on_control: control,
                         }
                     }
@@ -145,6 +231,7 @@ pub fn Spotify() -> Element {
 fn SpotifyDeviceCard(
     zone: Zone,
     now_playing: Option<NowPlaying>,
+    pending: bool,
     on_control: EventHandler<(String, String)>,
 ) -> Element {
     let zone_id = zone.zone_id.clone();
@@ -163,10 +250,24 @@ fn SpotifyDeviceCard(
         .filter(|title| *title != "Idle")
         .unwrap_or("Nothing playing");
     let artist = now_playing.as_ref().and_then(|np| np.line2.as_deref());
-    let image_url = now_playing
+    let base_image_url = now_playing
         .as_ref()
         .and_then(|np| np.image_url.as_deref())
         .unwrap_or_default();
+    let image_url = if base_image_url.is_empty() {
+        String::new()
+    } else if let Some(key) = now_playing.as_ref().and_then(|np| np.image_key.as_deref()) {
+        format!(
+            "{base_image_url}{}k={key}",
+            if base_image_url.contains('?') {
+                '&'
+            } else {
+                '?'
+            }
+        )
+    } else {
+        base_image_url.to_string()
+    };
 
     rsx! {
         article { class: "zone-card",
@@ -180,14 +281,14 @@ fn SpotifyDeviceCard(
                     h2 { class: "font-semibold truncate", "{zone.zone_name}" }
                     p { class: "text-sm font-medium truncate mt-2", "{title}" }
                     if let Some(artist) = artist {
-                        p { class: "text-sm text-muted truncate", "{artist}" }
+                        p { class: "text-sm text-secondary truncate", "{artist}" }
                     }
                 }
             }
             div { class: "flex flex-wrap items-center gap-2 mt-4",
-                button { class: "btn btn-ghost", aria_label: "Previous track", onclick: move |_| on_control.call((previous.clone(), "previous".to_string())), "◀◀" }
-                button { class: "btn btn-primary", aria_label: if is_playing { "Pause" } else { "Play" }, onclick: move |_| on_control.call((play_pause.clone(), "play_pause".to_string())), if is_playing { "⏸" } else { "▶" } }
-                button { class: "btn btn-ghost", aria_label: "Next track", onclick: move |_| on_control.call((next.clone(), "next".to_string())), "▶▶" }
+                button { class: "btn btn-ghost", disabled: pending, aria_label: "Previous track", onclick: move |_| on_control.call((previous.clone(), "previous".to_string())), "◀◀" }
+                button { class: "btn btn-primary", disabled: pending, aria_busy: pending, aria_label: if is_playing { "Pause" } else { "Play" }, onclick: move |_| on_control.call((play_pause.clone(), "play_pause".to_string())), if is_playing { "⏸" } else { "▶" } }
+                button { class: "btn btn-ghost", disabled: pending, aria_label: "Next track", onclick: move |_| on_control.call((next.clone(), "next".to_string())), "▶▶" }
                 VolumeControlsCompact {
                     volume: now_playing.as_ref().and_then(|np| np.volume),
                     volume_type: now_playing.as_ref().and_then(|np| np.volume_type.clone()),
@@ -195,6 +296,9 @@ fn SpotifyDeviceCard(
                     on_vol_down: move |_| on_control.call((volume_down.clone(), "vol_down".to_string())),
                     on_vol_up: move |_| on_control.call((volume_up.clone(), "vol_up".to_string())),
                 }
+            }
+            if pending {
+                p { class: "mt-2 text-sm text-secondary", role: "status", aria_live: "polite", "Updating playback…" }
             }
         }
     }

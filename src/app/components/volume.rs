@@ -77,6 +77,7 @@ pub fn VolumeControlsCompact(
         div { class: "ml-auto flex items-center gap-1",
             button {
                 class: "btn btn-outline btn-sm",
+                aria_label: "Decrease volume",
                 onclick: move |_| on_vol_down.call(()),
                 "−"
             }
@@ -87,6 +88,7 @@ pub fn VolumeControlsCompact(
             }
             button {
                 class: "btn btn-outline btn-sm",
+                aria_label: "Increase volume",
                 onclick: move |_| on_vol_up.call(()),
                 "+"
             }
@@ -128,11 +130,13 @@ pub fn VolumeControlsFull(
         }
         button {
             style: "width:2.5rem;",
+            aria_label: "Decrease volume",
             onclick: move |_| on_vol_down.call(()),
             "−"
         }
         button {
             style: "width:2.5rem;",
+            aria_label: "Increase volume",
             onclick: move |_| on_vol_up.call(()),
             "+"
         }

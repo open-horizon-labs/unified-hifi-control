@@ -22,7 +22,7 @@
 @layer components {
   /* Status indicators - using theme success/error colors */
   .status-ok {
-    color: var(--secondary-success-color);
+    color: color-mix(in srgb, var(--secondary-success-color) 70%, var(--text-primary));
   }
   .status-err {
     color: var(--primary-error-color);
@@ -182,6 +182,11 @@
   .badge-secondary {
     background: var(--surface-hover);
     color: var(--text-secondary);
+  }
+
+  .badge-success {
+    background: color-mix(in srgb, var(--secondary-success-color) 16%, var(--surface-base));
+    color: color-mix(in srgb, var(--secondary-success-color) 70%, var(--text-primary));
   }
 
   /* Checkbox styling */

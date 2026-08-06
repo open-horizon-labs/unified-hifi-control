@@ -258,6 +258,7 @@ pub fn Settings() -> Element {
     let mut spotify_action = use_signal(ProviderActionState::default);
     let mut spotify_error = use_signal(|| None::<String>);
     let mut spotify_local_setup_saved = use_signal(|| false);
+    let mut spotify_editing = use_signal(|| false);
     let mut spotify_client_id = use_signal(String::new);
     let mut spotify_client_secret = use_signal(String::new);
     let mut spotify_redirect_uri = use_signal(default_spotify_redirect_uri);
@@ -430,6 +431,7 @@ pub fn Settings() -> Element {
                 Ok(response) if response.configured => {
                     spotify_action.set(ProviderActionState::Success);
                     spotify_local_setup_saved.set(true);
+                    spotify_editing.set(false);
                 }
                 Ok(_) => {
                     spotify_action.set(ProviderActionState::Failed);
@@ -496,6 +498,10 @@ pub fn Settings() -> Element {
                 .cloned()
                 .collect::<Vec<_>>()
         });
+    let spotify_connected = spotify_account_result
+        .as_ref()
+        .and_then(|response| response.account.as_ref())
+        .is_some();
     let musicassistant_zones = provider_zones_result
         .as_ref()
         .and_then(|result| result.as_ref().ok())
@@ -843,7 +849,7 @@ pub fn Settings() -> Element {
                     p { class: "text-muted text-sm", "Connect providers without sharing credentials with the browser." }
                 }
 
-                div { class: "grid gap-4 lg:grid-cols-2",
+                div { class: if spotify_enabled() && applemusic_enabled() { "grid gap-4 md:grid-cols-2" } else { "grid gap-4 md:grid-cols-1" },
                     // Spotify: hosted OAuth and local-token guidance are
                     // intentionally separate so users know which authority
                     // owns their credentials.
@@ -881,8 +887,10 @@ pub fn Settings() -> Element {
                             }
                             if !spotify_enabled() {
                                 span { class: "badge badge-secondary shrink-0", "Disabled" }
-                            } else if spotify_devices.as_ref().map(|devices| !devices.is_empty()).unwrap_or(false) {
+                            } else if spotify_connected {
                                 span { class: "badge badge-success shrink-0", "Connected" }
+                            } else if spotify_local_setup_saved() {
+                                span { class: "badge badge-secondary shrink-0", "Configured" }
                             } else {
                                 span { class: "badge badge-secondary shrink-0", "Not connected" }
                             }
@@ -892,10 +900,22 @@ pub fn Settings() -> Element {
                             p { class: "mt-4 status-ok", role: "status", aria_live: "polite", "{message}" }
                         }
 
+                        if spotify_connected && !spotify_editing() {
+                            div { class: "mt-5 rounded-md bg-hover p-4", role: "status", aria_live: "polite",
+                                p { class: "font-medium", "Spotify is configured on this UHC server." }
+                                p { class: "mt-1 text-sm text-secondary", "OAuth credentials are stored server-side and refreshed automatically. Use Reconnect Spotify below only if you need to change the account." }
+                                button {
+                                    r#type: "button",
+                                    class: "btn btn-ghost mt-3 min-h-11",
+                                    onclick: move |_| spotify_editing.set(true),
+                                    "Edit client settings"
+                                }
+                            }
+                        } else {
                         div { class: "mt-5 grid gap-4 sm:grid-cols-2",
                             div { class: "rounded-md border border-default p-4",
-                                h4 { class: "font-medium", "Hosted setup" }
-                                p { class: "mt-2 text-sm text-secondary", "Open Spotify’s consent page, approve playback access, and return here. Your token stays on this UHC server." }
+                                h4 { class: "font-medium", "Connect Spotify" }
+                                p { class: "mt-2 text-sm text-secondary", "After saving the client settings below, open Spotify’s consent page, approve playback access, and return here. Your token stays on this UHC server." }
                                 button {
                                     r#type: "button",
                                     class: "btn btn-primary mt-4 min-h-11 w-full sm:w-auto",
@@ -909,7 +929,7 @@ pub fn Settings() -> Element {
                                 }
                             }
                             div { class: "rounded-md border border-default p-4",
-                                h4 { class: "font-medium", "Local setup" }
+                                h4 { class: "font-medium", "Client settings" }
                                 p { class: "mt-2 text-sm text-secondary", "Use this when UHC is self-hosted or running on another machine. UHC stores the OAuth client settings server-side and refreshes access automatically." }
                                 p { class: "mt-2 text-sm text-secondary",
                                     "Create or manage your Spotify app in the "
@@ -970,15 +990,16 @@ pub fn Settings() -> Element {
                                     onclick: save_spotify_local,
                                     if spotify_action() == ProviderActionState::Loading { "Saving…" } else { "Save local setup" }
                                 }
-                                p { class: "mt-2 text-xs text-muted", "Secrets are never returned to this page. Use hosted Connect after saving to authorize the account." }
+                                p { class: "mt-2 text-xs text-muted", "Secrets are never returned to this page. Use Connect after saving to authorize the account." }
                             }
+                        }
                         }
 
                         if let Some(devices) = spotify_devices {
                             if devices.is_empty() {
                                 div { class: "mt-5 rounded-md bg-hover p-4", role: "status", aria_live: "polite",
                                     p { class: "font-medium", "No Spotify devices found" }
-                                    p { class: "mt-1 text-sm text-secondary", "Start Spotify on a Connect-capable player, then refresh this list." }
+                                    p { class: "mt-1 text-sm text-secondary", "Start Spotify on a Connect-capable player; UHC will detect it automatically." }
                                 }
                             } else {
                                 div { class: "mt-5",
@@ -995,9 +1016,12 @@ pub fn Settings() -> Element {
                                     ul { class: "mt-3 divide-y divide-default rounded-md border border-default", aria_label: "Spotify devices",
                                         for device in devices {
                                             li { class: "flex items-center justify-between gap-3 px-3 py-3",
-                                                div {
+                                                div { class: "min-w-0",
                                                     p { class: "font-medium", "{device.zone_name}" }
-                                                    p { class: "text-xs text-muted", "{device.zone_id}" }
+                                                    details { class: "mt-1 text-xs text-muted",
+                                                        summary { class: "cursor-pointer", "Show device ID" }
+                                                        code { class: "mt-1 block break-all", "{device.zone_id}" }
+                                                    }
                                                 }
                                                 span { class: if zone_state_label(&device) == "unknown" { "text-muted text-sm" } else { "status-ok text-sm" }, "{zone_state_label(&device)}" }
                                             }

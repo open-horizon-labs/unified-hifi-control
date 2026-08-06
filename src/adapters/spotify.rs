@@ -724,13 +724,22 @@ impl AdapterLogic for SpotifyAdapter {
                 ));
             }
         };
-        Ok(match result {
-            Ok(()) => AdapterCommandResponse {
-                success: true,
-                error: None,
-            },
-            Err(error) => failure(&error.to_string()),
-        })
+        match result {
+            Ok(()) => {
+                // Spotify's command endpoints return before the next normal
+                // five-second poll. Refresh once immediately so the bus and
+                // all clients see the new track/state without waiting for the
+                // polling cadence.
+                if let Err(error) = self.update().await {
+                    debug!("Spotify command succeeded but refresh failed: {}", error);
+                }
+                Ok(AdapterCommandResponse {
+                    success: true,
+                    error: None,
+                })
+            }
+            Err(error) => Ok(failure(&error.to_string())),
+        }
     }
 }
 
