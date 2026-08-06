@@ -156,7 +156,7 @@ syn = { version = "2", features = ["full", "parsing", "visit"] }
 # Token-level inspection for tests/adaptive_publication_lint.rs. Already in the lock
 # graph as a transitive dependency of syn; declared so the lint can walk TokenTree
 # without stringifying a macro body, which made string literals fabricate matches.
-proc-macro2 = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
 walkdir = "2"
 tempfile = "3"
 # WebSocket *server* for tests/mock_servers/roon_core.rs (the Roon Core protocol fake).

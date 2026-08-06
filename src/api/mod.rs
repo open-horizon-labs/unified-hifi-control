@@ -13,7 +13,7 @@ use crate::bus::runtime::{
     CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
     HqpRuntimeCommand, RuntimeCommand,
 };
-use crate::bus::{BusEvent, Command, PrefixedZoneId, SharedBus};
+use crate::bus::{Command, PrefixedZoneId, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -1864,8 +1864,13 @@ pub async fn lms_configure_handler(
     State(state): State<AppState>,
     Json(req): Json<LmsConfigRequest>,
 ) -> impl IntoResponse {
-    // Stop existing connection if any
-    state.lms.stop().await;
+    // LMS has two concurrent observers of the same `lms:` projection.  Stop
+    // both before retirement/reconfiguration so an old CLI callback cannot
+    // republish zones from the former server after the projection is flushed.
+    state
+        .coordinator
+        .stop_adapter_and_companions_then_flush(state.lms.as_ref(), "lms", "LMS reconfiguration")
+        .await;
 
     // Configure new connection
     state
@@ -1873,8 +1878,13 @@ pub async fn lms_configure_handler(
         .configure(req.host.clone(), req.port, req.username, req.password)
         .await;
 
-    // Start the adapter
-    match state.lms.start().await {
+    // Start both observers together; the CLI companion is not an optional
+    // feature of a manually configured LMS connection.
+    match state
+        .coordinator
+        .start_adapter_and_companions(state.lms.as_ref())
+        .await
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2626,22 +2636,6 @@ pub async fn api_settings_get_handler() -> impl IntoResponse {
     Json(load_app_settings())
 }
 
-/// Stop an adapter and tell the aggregator to flush its zones.
-///
-/// `Startable::stop` alone leaves `ZoneAggregator`'s zone map untouched.
-/// The aggregator already handles `BusEvent::AdapterStopping` correctly --
-/// removes every zone prefixed `"{adapter}:"`, publishes `ZonesFlushed` --
-/// but until this fix nothing ever published that event, so a disabled
-/// adapter's zones stayed listed in `/zones`, `hifi_zones`, and (since #397)
-/// MCP resources, forever (issue #429).
-async fn stop_adapter_and_flush_zones(adapter: &Arc<dyn Startable>, bus: &SharedBus) {
-    bus.publish(BusEvent::AdapterStopping {
-        adapter: adapter.name().to_string(),
-        reason: Some("disabled via settings".to_string()),
-    });
-    adapter.stop().await;
-}
-
 /// POST /api/settings - Update app settings with dynamic adapter enable/disable
 pub async fn api_settings_post_handler(
     State(state): State<AppState>,
@@ -2694,16 +2688,30 @@ pub async fn api_settings_post_handler(
         if let Some(adapter) = adapters_list.iter().find(|a| a.name() == name) {
             if now_enabled {
                 tracing::info!("Dynamically enabling adapter: {}", name);
-                if adapter.can_start().await {
-                    if let Err(e) = adapter.start().await {
+                if name == "lms" {
+                    if let Err(e) = coord.start_adapter_and_companions(adapter.as_ref()).await {
+                        tracing::warn!("Failed to start LMS observers: {}", e);
+                    }
+                } else if adapter.can_start().await {
+                    if let Err(e) = coord.start_adapter_and_track(adapter.as_ref()).await {
                         tracing::warn!("Failed to start adapter {}: {}", name, e);
-                    } else {
-                        coord.set_running(name, true).await;
                     }
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
-                stop_adapter_and_flush_zones(adapter, &state.bus).await;
+                if name == "lms" {
+                    coord
+                        .stop_adapter_and_companions_then_flush(
+                            adapter.as_ref(),
+                            "lms",
+                            "disabled via settings",
+                        )
+                        .await;
+                } else {
+                    coord
+                        .stop_adapter_and_flush(adapter.as_ref(), "disabled via settings")
+                        .await;
+                }
             }
         }
     }
@@ -2714,7 +2722,7 @@ pub async fn api_settings_post_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::{create_bus, PlaybackState, Zone};
+    use crate::bus::{create_bus, BusEvent, PlaybackState, Zone};
     use serial_test::serial;
     use std::env;
     use std::time::Duration;
@@ -2780,7 +2788,11 @@ mod tests {
         );
 
         let adapter: Arc<dyn Startable> = Arc::new(FakeAdapter("lms"));
-        stop_adapter_and_flush_zones(&adapter, &bus).await;
+        let coordinator = AdapterCoordinator::new(bus.clone());
+        coordinator.register("lms", true).await;
+        coordinator
+            .stop_adapter_and_flush(adapter.as_ref(), "test shutdown")
+            .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let remaining = aggregator.get_zones().await;
@@ -2825,7 +2837,7 @@ mod tests {
     /// Issue #429, proving the wiring itself: calling the real
     /// `POST /api/settings` handler to disable an adapter must remove its
     /// zones. Unlike `stopping_an_adapter_flushes_its_zones_from_the_aggregator`
-    /// above (which calls `stop_adapter_and_flush_zones` directly and would
+    /// above (which calls the coordinator lifecycle operation directly and would
     /// stay green even if the handler stopped calling it), this goes through
     /// `api_settings_post_handler` itself.
     #[tokio::test]
@@ -2841,6 +2853,8 @@ mod tests {
 
         let adapter: Arc<dyn Startable> = Arc::new(FakeAdapter("lms"));
         let state = app_state_with_startable(adapter).await;
+        state.coordinator.register("lms", true).await;
+        state.coordinator.set_running("lms", true).await;
         let agg_for_task = state.aggregator.clone();
         tokio::spawn(async move { agg_for_task.run().await });
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2866,6 +2880,10 @@ mod tests {
             remaining.len(),
             0,
             "disabling lms via the real endpoint should flush its zone, got {remaining:?}"
+        );
+        assert!(
+            !state.coordinator.is_running("lms").await,
+            "disabling an adapter must also retire its coordinator running state"
         );
 
         env::remove_var("UHC_CONFIG_DIR");

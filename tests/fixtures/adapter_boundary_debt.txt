@@ -62,7 +62,6 @@ src/api/mod.rs|status_handler|direct-field-access|lms
 src/api/mod.rs|status_handler|direct-field-access|openhome
 src/api/mod.rs|status_handler|direct-field-access|roon
 src/api/mod.rs|status_handler|direct-field-access|upnp
-src/api/mod.rs|stop_adapter_and_flush_zones|concrete-adapter-type|Startable
 src/api/mod.rs|upnp_now_playing_handler|direct-field-access|upnp
 src/api/mod.rs|upnp_status_handler|direct-field-access|upnp
 src/api/mod.rs|upnp_zones_handler|direct-field-access|upnp
