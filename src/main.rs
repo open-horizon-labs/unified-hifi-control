@@ -292,8 +292,8 @@ mod server {
         // UPnP adapter
         let upnp = Arc::new(adapters::upnp::UPnPAdapter::new(bus.clone()));
 
-        // Direct streaming adapters. Credentials remain environment/configuration
-        // concerns until the shared OAuth/bridge contract (#463) is finalized.
+        // Direct streaming adapters. Credentials are supplied through the
+        // provider OAuth/bridge contract (#463) or environment bootstrap.
         // Spotify is controller-only: it discovers and controls existing Connect
         // devices, never acting as a receiver.
         let spotify = Arc::new(adapters::spotify::SpotifyAdapter::new(bus.clone()));

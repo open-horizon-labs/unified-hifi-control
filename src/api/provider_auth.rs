@@ -217,6 +217,13 @@ pub async fn oauth_callback(
             expires_at,
         })
         .await;
+    state.adapter_registry.start("spotify").await.map_err(|e| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("Spotify adapter failed to start: {e}"),
+            "adapter_start_failed",
+        )
+    })?;
     Ok(Json(ProviderAuthResponse {
         provider,
         authorized: true,
@@ -243,6 +250,7 @@ pub async fn oauth_revoke(
         )
     })?;
     adapter.clear_token().await;
+    state.adapter_registry.stop("spotify").await;
     Ok(Json(ProviderAuthResponse {
         provider,
         authorized: false,
