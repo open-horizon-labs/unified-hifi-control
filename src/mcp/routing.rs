@@ -226,12 +226,13 @@ pub enum VolumeRoute {
 
 /// Where a library operation (`hifi_search` / `hifi_play`) is sent.
 ///
-/// Only Roon and LMS have a library at all; OpenHome and UPnP zones are
+/// Roon, LMS, and Spotify expose library/content surfaces; OpenHome and UPnP zones are
 /// renderers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibraryRoute {
     Roon,
     Lms,
+    Spotify,
     /// No library path for this zone id.
     Refused(ZoneTarget),
 }
@@ -287,6 +288,11 @@ pub const CONTROL_ACTIONS: &[&str] = &[
     "volume_set",
     "volume_up",
     "volume_down",
+    "repeat_off",
+    "repeat_context",
+    "repeat_track",
+    "shuffle_on",
+    "shuffle_off",
 ];
 
 /// The transport subset of [`CONTROL_ACTIONS`], for "what can this zone do
@@ -335,6 +341,7 @@ impl ZoneTarget {
         match self {
             Self::Roon => LibraryRoute::Roon,
             Self::Lms => LibraryRoute::Lms,
+            Self::Spotify => LibraryRoute::Spotify,
             // OpenHome and UPnP zones are renderers with no library; before #398
             // both were sent to Roon, which searched a library the zone could not
             // play from.
@@ -342,7 +349,6 @@ impl ZoneTarget {
             | Self::Upnp
             | Self::HqPlayer
             | Self::AppleMusic
-            | Self::Spotify
             | Self::MusicAssistant => LibraryRoute::Refused(self),
             Self::Unprefixed | Self::Unknown => LibraryRoute::Refused(self),
         }
@@ -550,7 +556,7 @@ mod tests {
     /// Volume and transport still differ, and the difference has moved: it used
     /// to be OpenHome/UPnP, and now it is only the library rule that narrows.
     #[test]
-    fn library_routes_only_roon_and_lms() {
+    fn library_routes_roon_lms_and_spotify() {
         assert_eq!(
             ZoneTarget::classify("roon:x").for_library(),
             LibraryRoute::Roon
@@ -558,6 +564,10 @@ mod tests {
         assert_eq!(
             ZoneTarget::classify("lms:x").for_library(),
             LibraryRoute::Lms
+        );
+        assert_eq!(
+            ZoneTarget::classify("spotify:x").for_library(),
+            LibraryRoute::Spotify
         );
         for zone_id in ["openhome:x", "upnp:x", "hqplayer:x"] {
             assert!(

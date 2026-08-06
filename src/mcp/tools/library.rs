@@ -67,11 +67,12 @@ const LMS_SEARCH_LIMIT: usize = 10;
 
 /// How many results to request from Roon.
 const ROON_SEARCH_LIMIT: usize = 10;
+const SPOTIFY_SEARCH_LIMIT: usize = 10;
 
 /// Search for music
 #[mcp_tool(
     name = "hifi_search",
-    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins (zone_id recommended as different players may have different sources configured). Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play, queue, or start radio from that exact result instead of hifi_play's first-match search. A result with no `ref` has no safe way to be addressed later — use hifi_play's query for it.",
+    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins. Spotify: searches the Spotify catalog for a Spotify Connect zone. Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play or queue that exact result.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -89,7 +90,7 @@ pub struct HifiSearchTool {
 /// Search and play music in one command
 #[mcp_tool(
     name = "hifi_play",
-    description = "Search and play music. Searches and plays, queues, or starts radio from the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; LMS searches all providers. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead."
+    description = "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiPlayTool {
@@ -108,7 +109,7 @@ pub struct HifiPlayTool {
 /// Play, queue, or start radio from a specific `hifi_search` result (#396)
 #[mcp_tool(
     name = "hifi_play_ref",
-    description = "Play, queue, or play-next a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Use this instead of hifi_play when you need the exact result you found (e.g. the third one, or one of two same-titled albums), rather than whatever hifi_play's own search matches first. Refs are short-lived: hold one only within the current conversation. If this call is refused because the ref is unknown or expired, call hifi_search again for a fresh one — never guess or reuse an old one. zone_id must belong to the same provider (Roon or LMS) the ref was minted for.",
+    description = "Play or queue a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Refs are short-lived; call hifi_search again if one expires. zone_id must belong to the same provider (Roon, LMS, or Spotify) the ref was minted for.",
     read_only_hint = false
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -153,7 +154,7 @@ pub async fn handle_search(
         // LMS ignores `source` entirely, so echoing it back as understood would
         // claim the server honored something it discarded. A refused zone
         // reaches no backend at all, so the same reasoning applies.
-        LibraryRoute::Lms | LibraryRoute::Refused(_) => env,
+        LibraryRoute::Lms | LibraryRoute::Spotify | LibraryRoute::Refused(_) => env,
         LibraryRoute::Roon => env.param(
             "source",
             roon_source_name(roon_search_source(args.source.as_deref())),
@@ -205,6 +206,33 @@ pub async fn handle_search(
                             subtitle: lms_subtitle(&item),
                             title: item.title,
                             r#ref: ref_token,
+                        });
+                    }
+                    Ok(env.json_result(&mcp_results))
+                }
+                Err(e) => env.failed(format!("Search error: {}", e)),
+            }
+        }
+        LibraryRoute::Spotify => {
+            match state
+                .adapter_registry
+                .search_library("spotify", &args.query, SPOTIFY_SEARCH_LIMIT)
+                .await
+            {
+                Ok(results) => {
+                    let mut mcp_results = Vec::with_capacity(results.len());
+                    for item in results {
+                        let ref_token = state
+                            .mcp_refs
+                            .mint(RefTarget::Spotify {
+                                uri: item.uri,
+                                title: item.title.clone(),
+                            })
+                            .await;
+                        mcp_results.push(McpSearchResult {
+                            title: item.title,
+                            subtitle: item.subtitle,
+                            r#ref: Some(ref_token),
                         });
                     }
                     Ok(env.json_result(&mcp_results))
@@ -374,7 +402,6 @@ pub async fn handle_play(
             .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
         return refuse_library_zone(env, &args.zone_id, refused, Capability::PlayByQuery);
     }
-
     match route {
         LibraryRoute::Lms => {
             use crate::adapters::lms::LmsPlayAction;
@@ -419,6 +446,59 @@ pub async fn handle_play(
             {
                 Ok(message) => Ok(play_success(state, env, message).await),
                 Err(e) => env.failed(format!("Play error: {}", e)),
+            }
+        }
+        LibraryRoute::Spotify => {
+            let action = args.action.as_deref().unwrap_or("play");
+            if !matches!(action, "play" | "queue") {
+                let env = Envelope::write("hifi_play", action)
+                    .param("query", &*args.query)
+                    .param("zone_id", &*args.zone_id)
+                    .param("action", action)
+                    .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
+                return env.refused(
+                    "Spotify query playback supports action='play' or action='queue'; radio is not part of the Spotify controller surface.",
+                    Refusal::InvalidParameter {
+                        parameter: "action",
+                        accepted: vec!["play".to_string(), "queue".to_string()],
+                        detail: "Spotify Connect zones can play a catalog result or add it to Spotify's queue. Radio is not exposed by this controller surface.".to_string(),
+                    },
+                );
+            }
+            let env = Envelope::write("hifi_play", action)
+                .param("query", &*args.query)
+                .param("zone_id", &*args.zone_id)
+                .param("action", action)
+                .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
+            match state
+                .adapter_registry
+                .search_library("spotify", &args.query, SPOTIFY_SEARCH_LIMIT)
+                .await
+            {
+                Ok(mut results) => match results.drain(..).next() {
+                    Some(item) => {
+                        let result = if action == "queue" {
+                            state
+                                .adapter_registry
+                                .queue_library_uri("spotify", &args.zone_id, &item.uri)
+                                .await
+                                .map(|_| format!("Queued {} on Spotify", item.title))
+                        } else {
+                            state
+                                .adapter_registry
+                                .play_library_uri("spotify", &args.zone_id, &item.uri)
+                                .await
+                        };
+                        match result {
+                            Ok(message) => Ok(play_success(state, env, message).await),
+                            Err(e) => env.failed(format!("Play error: {}", e)),
+                        }
+                    }
+                    None => {
+                        env.failed("Play error: Spotify search returned no results".to_string())
+                    }
+                },
+                Err(e) => env.failed(format!("Search error: {}", e)),
             }
         }
         LibraryRoute::Roon => {
@@ -509,6 +589,7 @@ const ROON_REF_ACTIONS: &[&str] = &["play", "queue", "radio"];
 
 /// Every action `hifi_play_ref` accepts for an LMS-minted ref.
 const LMS_REF_ACTIONS: &[&str] = &["play", "queue", "next"];
+const SPOTIFY_REF_ACTIONS: &[&str] = &["play", "queue"];
 
 /// Validate `action` against a provider's closed action set, defaulting to
 /// the first (always `"play"`) when absent. Never falls through to a default
@@ -642,12 +723,19 @@ pub async fn handle_play_ref(
         (LibraryRoute::Lms, RefTarget::Lms { target, title }) => {
             play_ref_lms(state, env, &args, target, title).await
         }
+        (LibraryRoute::Spotify, RefTarget::Spotify { uri, title }) => {
+            play_ref_spotify(state, env, &args, uri, title).await
+        }
         // Unreachable: the provider check above already refused any mismatch
         // between the zone's provider and the ref's. Kept exhaustive so a
         // third provider gaining a ref target fails to compile here rather
         // than silently mis-dispatching.
         (LibraryRoute::Roon, RefTarget::Lms { .. })
-        | (LibraryRoute::Lms, RefTarget::Roon { .. }) => env.failed(
+        | (LibraryRoute::Roon, RefTarget::Spotify { .. })
+        | (LibraryRoute::Lms, RefTarget::Roon { .. })
+        | (LibraryRoute::Lms, RefTarget::Spotify { .. })
+        | (LibraryRoute::Spotify, RefTarget::Roon { .. })
+        | (LibraryRoute::Spotify, RefTarget::Lms { .. }) => env.failed(
             "internal routing error: ref/zone provider mismatch reached dispatch after the \
                  capability check. This is a UHC bug.",
         ),
@@ -752,5 +840,43 @@ async fn play_ref_lms(
             Ok(play_success(state, env, message).await)
         }
         Err(e) => env.failed(format!("Play error: {}", e)),
+    }
+}
+
+async fn play_ref_spotify(
+    state: &AppState,
+    mut env: Envelope,
+    args: &HifiPlayRefTool,
+    uri: String,
+    title: String,
+) -> Result<CallToolResult, CallToolError> {
+    let action_name = match validate_ref_action(args.action.as_deref(), SPOTIFY_REF_ACTIONS) {
+        Ok(name) => name,
+        Err(refusal) => {
+            env.operation = "invalid_action".to_string();
+            let detail = match &refusal {
+                Refusal::InvalidParameter { detail, .. } => detail.clone(),
+                _ => String::new(),
+            };
+            return env.refused(detail, refusal);
+        }
+    };
+    let mut env = env.param("action", action_name);
+    env.operation = action_name.to_string();
+    let result = if action_name == "queue" {
+        state
+            .adapter_registry
+            .queue_library_uri("spotify", &args.zone_id, &uri)
+            .await
+            .map(|_| format!("Queued {title} on Spotify"))
+    } else {
+        state
+            .adapter_registry
+            .play_library_uri("spotify", &args.zone_id, &uri)
+            .await
+    };
+    match result {
+        Ok(message) => Ok(play_success(state, env, message).await),
+        Err(e) => env.failed(format!("Play error for {title}: {}", e)),
     }
 }

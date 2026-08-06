@@ -182,6 +182,8 @@ impl AppleMusicAdapter {
             seek_position: track.position_seconds,
             duration: track.duration_seconds,
             metadata: None,
+            repeat_mode: None,
+            shuffle: None,
         });
         let volume_control = snapshot.volume.map(|value| VolumeControl {
             value: value * 100.0,
@@ -284,6 +286,9 @@ impl AppleMusicAdapter {
                 })
             }
             AdapterCommand::Mute(muted) => Ok(MusicKitCommand::SetMute { muted }),
+            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
+                bail!("Apple Music repeat and shuffle are not implemented by the adapter")
+            }
         }
     }
 

@@ -67,13 +67,13 @@ use serde::{Deserialize, Serialize};
 /// Control playback
 #[mcp_tool(
     name = "hifi_control",
-    description = "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume"
+    description = "Control playback: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, or adjust volume"
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiControlTool {
     /// The zone ID to control
     pub zone_id: String,
-    /// Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down
+    /// Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, volume_down
     pub action: String,
     /// For volume actions: the level (0-100 for volume_set) or amount to change
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -140,6 +140,9 @@ pub async fn handle_control(
             // Negated: the same relative call, opposite direction.
             return set_volume(state, &args.zone_id, -delta, true).await;
         }
+        "repeat_off" | "repeat_context" | "repeat_track" | "shuffle_on" | "shuffle_off" => {
+            args.action.as_str()
+        }
         // Unreachable: CONTROL_ACTIONS gates this whole match, and
         // `routing::tests::control_actions_cover_the_documented_set` proves the
         // two lists agree. Refused rather than forwarded, because forwarding is
@@ -153,6 +156,15 @@ pub async fn handle_control(
     let env = Envelope::write("hifi_control", backend_action)
         .param("zone_id", &*args.zone_id)
         .param("action", &*args.action);
+
+    if let Some(capability) = mode_capability(backend_action) {
+        if !matches!(
+            support(target, capability),
+            crate::mcp::capabilities::Support::Supported
+        ) {
+            return refuse_zone(state, env, &args.zone_id, target, capability).await;
+        }
+    }
 
     let route = target.for_transport();
     if let TransportRoute::Refused(refused) = route {
@@ -395,7 +407,20 @@ fn transport_command(action: &str) -> AdapterCommand {
         "stop" => AdapterCommand::Stop,
         "next" => AdapterCommand::Next,
         "previous" => AdapterCommand::Previous,
+        "repeat_off" => AdapterCommand::SetRepeat(crate::bus::RepeatMode::Off),
+        "repeat_context" => AdapterCommand::SetRepeat(crate::bus::RepeatMode::All),
+        "repeat_track" => AdapterCommand::SetRepeat(crate::bus::RepeatMode::One),
+        "shuffle_on" => AdapterCommand::SetShuffle(true),
+        "shuffle_off" => AdapterCommand::SetShuffle(false),
         _ => unreachable!("validated transport action: {action}"),
+    }
+}
+
+fn mode_capability(action: &str) -> Option<Capability> {
+    match action {
+        "repeat_off" | "repeat_context" | "repeat_track" => Some(Capability::RepeatMode),
+        "shuffle_on" | "shuffle_off" => Some(Capability::ShuffleMode),
+        _ => None,
     }
 }
 

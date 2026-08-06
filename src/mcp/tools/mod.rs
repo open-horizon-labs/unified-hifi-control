@@ -21,6 +21,8 @@
 pub mod capabilities;
 pub mod hqplayer;
 pub mod library;
+pub mod queue;
+pub mod spotify;
 pub mod status;
 pub mod transport;
 pub mod zones;
@@ -34,6 +36,8 @@ pub use hqplayer::{
     HifiHqplayerStatusTool,
 };
 pub use library::{HifiPlayRefTool, HifiPlayTool, HifiSearchTool};
+pub use queue::HifiQueueTool;
+pub use spotify::HifiSpotifyTool;
 pub use status::HifiStatusTool;
 pub use transport::HifiControlTool;
 pub use zones::{HifiNowPlayingTool, HifiZonesTool};
@@ -62,7 +66,9 @@ tool_box!(
         HifiCapabilitiesTool,
         // Appended by #396 (opaque content refs): the one consumer of
         // hifi_search's new `ref` field.
-        HifiPlayRefTool
+        HifiPlayRefTool,
+        HifiQueueTool,
+        HifiSpotifyTool
     ]
 );
 
@@ -89,6 +95,8 @@ pub fn static_name(name: &str) -> Option<&'static str> {
         "hifi_hqplayer_set_pipeline" => "hifi_hqplayer_set_pipeline",
         "hifi_capabilities" => "hifi_capabilities",
         "hifi_play_ref" => "hifi_play_ref",
+        "hifi_queue" => "hifi_queue",
+        "hifi_spotify" => "hifi_spotify",
         _ => return None,
     })
 }
@@ -111,6 +119,18 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
         "hifi_search" => &["query", "zone_id", "source"],
         "hifi_play" => &["query", "zone_id", "source", "action"],
         "hifi_play_ref" => &["ref", "zone_id", "action"],
+        "hifi_queue" => &["zone_id"],
+        "hifi_spotify" => &[
+            "action",
+            "playlist_id",
+            "category_id",
+            "name",
+            "description",
+            "uri",
+            "track_id",
+            "public",
+            "limit",
+        ],
         "hifi_hqplayer_load_profile" => &["profile"],
         "hifi_hqplayer_set_pipeline" => &["setting", "value"],
         _ => &[],
@@ -154,8 +174,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn advertises_twelve_tools_when_hqplayer_is_enabled() {
-        assert_eq!(list_tools(true).len(), 12);
+    fn advertises_fourteen_tools_when_hqplayer_is_enabled() {
+        assert_eq!(list_tools(true).len(), 14);
     }
 
     /// The filter must remove exactly the four HQPlayer tools and nothing else.
@@ -164,7 +184,7 @@ mod tests {
         let enabled: Vec<String> = list_tools(true).into_iter().map(|t| t.name).collect();
         let disabled: Vec<String> = list_tools(false).into_iter().map(|t| t.name).collect();
 
-        assert_eq!(disabled.len(), 8);
+        assert_eq!(disabled.len(), 10);
         assert!(disabled.iter().all(|n| !n.starts_with("hifi_hqplayer")));
 
         let removed: Vec<&String> = enabled.iter().filter(|n| !disabled.contains(n)).collect();

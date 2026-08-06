@@ -924,6 +924,8 @@ fn openhome_device_to_zone(device: &OpenHomeDevice) -> Zone {
             seek_position: None,
             duration: None,
             metadata: None,
+            repeat_mode: None,
+            shuffle: None,
         }),
         source: "openhome".to_string(),
         is_controllable: true,
@@ -1009,6 +1011,15 @@ impl AdapterLogic for OpenHomeAdapter {
                 return Ok(AdapterCommandResponse {
                     success: false,
                     error: Some("Mute not supported by OpenHome adapter".to_string()),
+                });
+            }
+            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
+                return Ok(AdapterCommandResponse {
+                    success: false,
+                    error: Some(
+                        "Repeat and shuffle are not implemented by the OpenHome adapter"
+                            .to_string(),
+                    ),
                 });
             }
         };

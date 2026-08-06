@@ -30,8 +30,7 @@ use super::AppState;
 const OAUTH_TTL: Duration = Duration::from_secs(600);
 const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
-const SPOTIFY_SCOPE: &str =
-    "user-read-playback-state user-modify-playback-state user-read-private user-read-email";
+const SPOTIFY_SCOPE: &str = "user-read-playback-state user-modify-playback-state user-read-private user-read-email playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private user-library-read user-library-modify";
 
 #[derive(Clone)]
 pub struct ProviderAuthState {

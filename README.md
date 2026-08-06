@@ -145,18 +145,21 @@ Control your hi-fi with natural language. The bridge includes an MCP server so C
 
 | Tool | Description |
 |------|-------------|
-| `hifi_zones` | List available zones (Roon, LMS, OpenHome, UPnP) |
+| `hifi_zones` | List available zones (including Spotify Connect devices) |
 | `hifi_now_playing` | Get current track, artist, album, play state |
 | `hifi_control` | Play, pause, next, previous, volume control |
-| `hifi_search` | Search library, TIDAL, or Qobuz *(Roon, LMS)* |
-| `hifi_play` | Search and play/queue in one command *(Roon, LMS)* |
+| `hifi_search` | Search provider catalogs *(Roon, LMS, Spotify)* |
+| `hifi_play` | Search and play/queue in one command *(Roon, LMS, Spotify)* |
+| `hifi_play_ref` | Play or queue an exact search result |
+| `hifi_queue` | Read the current provider queue |
+| `hifi_spotify` | Browse Spotify, access playlists/liked tracks, and create/edit playlists |
 | `hifi_status` | Overall bridge status |
 | `hifi_hqplayer_status` | HQPlayer Embedded status and pipeline |
 | `hifi_hqplayer_profiles` | List saved HQPlayer profiles |
 | `hifi_hqplayer_load_profile` | Switch HQPlayer profile |
 | `hifi_hqplayer_set_pipeline` | Change filter, shaper, dither settings |
 
-*Search and play work with Roon and LMS. Transport controls work with all adapters.*
+*Spotify is a controller for existing Spotify Connect devices, not a receiver. Spotify search, exact play/queue, queue read, catalog browsing, playlists, liked tracks, repeat, and shuffle require the corresponding OAuth scopes; transport controls work with all enabled adapters.*
 
 ### Example Usage
 

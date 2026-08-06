@@ -67,10 +67,14 @@ pub fn server_details() -> InitializeResult {
             "Unified Hi-Fi Control MCP Server - Control Your Music System\n\n\
             Use hifi_zones to list available zones, hifi_now_playing to see what's playing, \
             hifi_control for playback control, hifi_search to find music, and hifi_play to play it.\n\n\
-            Note: hifi_search and hifi_play currently work with Roon and LMS zones only. \
-            Transport controls (play/pause/next/volume) work with all zones (Roon, LMS, OpenHome, UPnP).\n\n\
-            To build a playlist: call hifi_play multiple times with action='queue'. The first track \
-            can use action='play' to start playback, then subsequent tracks use action='queue' to add to the queue."
+            Spotify zones are existing Spotify Connect devices; UHC is a controller, not a Spotify receiver. \
+            Transport controls (play/pause/next/previous/volume) work for Spotify as well as the \
+            other routed adapters. Search, browse, queue inspection, playlists, and saved-library \
+            operations are provider-specific; hifi_capabilities is the source of truth for what is \
+            wired for each zone.\n\n\
+            To build a playlist where the provider supports it: call hifi_play multiple times with \
+            action='queue'. The first track can use action='play' to start playback, then subsequent \
+            tracks use action='queue' to add to the queue."
                 .into(),
         ),
         protocol_version: ProtocolVersion::V2025_11_25.into(),

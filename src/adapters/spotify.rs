@@ -12,6 +12,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use reqwest::{Client, Method, StatusCode};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -25,11 +26,12 @@ use tracing::{debug, warn};
 
 use crate::adapters::handle::{AdapterHandle, RetryConfig};
 use crate::adapters::traits::{
-    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, LibraryAdapter,
+    LibrarySearchResult,
 };
 use crate::bus::{
-    BusEvent, NowPlaying, PlaybackState, PrefixedZoneId, ProviderAccount, SharedBus, VolumeControl,
-    VolumeScale, Zone,
+    BusEvent, NowPlaying, PlaybackState, PrefixedZoneId, ProviderAccount, RepeatMode, SharedBus,
+    VolumeControl, VolumeScale, Zone,
 };
 
 const SPOTIFY_API_URL: &str = "https://api.spotify.com/v1";
@@ -154,10 +156,14 @@ pub struct SpotifyPlayback {
     pub device: Option<SpotifyPlaybackDevice>,
     #[serde(default)]
     pub item: Option<SpotifyTrack>,
+    #[serde(default)]
+    pub repeat_state: Option<String>,
+    #[serde(default)]
+    pub shuffle_state: Option<bool>,
 }
 
 impl SpotifyPlayback {
-    fn to_now_playing(&self) -> Option<NowPlaying> {
+    pub fn to_now_playing(&self) -> Option<NowPlaying> {
         let track = self.item.as_ref()?;
         Some(NowPlaying {
             title: track.name.clone(),
@@ -171,7 +177,18 @@ impl SpotifyPlayback {
             seek_position: self.progress_ms.map(|ms| ms as f64 / 1000.0),
             duration: track.duration_ms.map(|ms| ms as f64 / 1000.0),
             metadata: None,
+            repeat_mode: self.repeat_mode(),
+            shuffle: self.shuffle_state,
         })
+    }
+
+    fn repeat_mode(&self) -> Option<RepeatMode> {
+        match self.repeat_state.as_deref()? {
+            "off" => Some(RepeatMode::Off),
+            "context" => Some(RepeatMode::All),
+            "track" => Some(RepeatMode::One),
+            _ => None,
+        }
     }
 }
 
@@ -184,25 +201,158 @@ pub struct SpotifyPlaybackDevice {
 pub struct SpotifyTrack {
     pub name: String,
     #[serde(default)]
+    pub uri: String,
+    #[serde(default)]
     pub artists: Vec<SpotifyArtist>,
     pub album: SpotifyAlbum,
     #[serde(default)]
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// A queue entry returned by Spotify's Web API.
+///
+/// Tracks and episodes share `name`, `uri`, and `duration_ms`, while only
+/// tracks carry `artists`/`album` and only episodes carry `show`. Keeping those
+/// fields optional lets the adapter represent both item kinds without making
+/// the MCP layer parse provider-specific JSON.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyQueueItem {
+    #[serde(default)]
+    pub uri: String,
+    pub name: String,
+    #[serde(default)]
+    pub artists: Vec<SpotifyArtist>,
+    #[serde(default)]
+    pub album: Option<SpotifyAlbum>,
+    #[serde(default)]
+    pub show: Option<SpotifyShow>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+}
+
+/// The current Spotify playback queue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyQueue {
+    #[serde(default)]
+    pub currently_playing: Option<SpotifyQueueItem>,
+    #[serde(default)]
+    pub queue: Vec<SpotifyQueueItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyShow {
+    pub name: String,
+}
+
+/// A bounded Spotify Web API page. The adapter always clamps `limit` before
+/// sending a request; `next`/`previous` remain provider links for callers that
+/// want to continue walking a catalog surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyPage<T> {
+    #[serde(default)]
+    pub href: String,
+    #[serde(default)]
+    pub limit: usize,
+    #[serde(default)]
+    pub next: Option<String>,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub previous: Option<String>,
+    #[serde(default)]
+    pub total: usize,
+    #[serde(default)]
+    pub items: Vec<T>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyCategory {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub icons: Vec<SpotifyImage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyPlaylist {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub uri: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub public: Option<bool>,
+    #[serde(default)]
+    pub collaborative: bool,
+    #[serde(default)]
+    pub images: Vec<SpotifyImage>,
+    #[serde(default)]
+    pub tracks: Option<SpotifyPlaylistTrackSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyPlaylistTrackSummary {
+    #[serde(default)]
+    pub total: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyPlaylistItem {
+    #[serde(default)]
+    pub added_at: Option<String>,
+    #[serde(default)]
+    pub item: Option<SpotifyQueueItem>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpotifySavedTrack {
+    #[serde(default)]
+    pub added_at: Option<String>,
+    pub track: SpotifyQueueItem,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SpotifyAlbumSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub uri: String,
+    #[serde(default)]
+    pub artists: Vec<SpotifyArtist>,
+    #[serde(default)]
+    pub images: Vec<SpotifyImage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SpotifySnapshot {
+    #[serde(default)]
+    snapshot_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SpotifyFeaturedPlaylists {
+    playlists: SpotifyPage<SpotifyPlaylist>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SpotifyNewReleases {
+    albums: SpotifyPage<SpotifyAlbumSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SpotifyArtist {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SpotifyAlbum {
     pub name: String,
     #[serde(default)]
     pub images: Vec<SpotifyImage>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SpotifyImage {
     pub url: String,
 }
@@ -211,6 +361,51 @@ pub struct SpotifyImage {
 struct DevicesResponse {
     #[serde(default)]
     devices: Vec<SpotifyDevice>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SpotifySearchResponse {
+    #[serde(default)]
+    tracks: SpotifySearchPage<SpotifySearchTrack>,
+    #[serde(default)]
+    albums: SpotifySearchPage<SpotifySearchAlbum>,
+    #[serde(default)]
+    artists: SpotifySearchPage<SpotifySearchArtist>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SpotifySearchPage<T> {
+    #[serde(default)]
+    items: Vec<T>,
+}
+
+impl<T> Default for SpotifySearchPage<T> {
+    fn default() -> Self {
+        Self { items: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SpotifySearchTrack {
+    name: String,
+    uri: String,
+    #[serde(default)]
+    artists: Vec<SpotifyArtist>,
+    album: SpotifyAlbum,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SpotifySearchAlbum {
+    name: String,
+    uri: String,
+    #[serde(default)]
+    artists: Vec<SpotifyArtist>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct SpotifySearchArtist {
+    name: String,
+    uri: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -322,6 +517,442 @@ impl SpotifyAdapter {
         self.state.read().await.account.clone()
     }
 
+    /// Search Spotify's catalog and return provider URIs suitable for an
+    /// exact play-by-reference call. Search is intentionally independent of
+    /// the current playback device; the zone is selected when the URI plays.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<LibrarySearchResult>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(anyhow!("Spotify search query cannot be empty"));
+        }
+        let limit = limit.clamp(1, 50);
+        let path = format!(
+            "/search?q={}&type=track%2Calbum%2Cartist&limit={limit}",
+            urlencoding::encode(query)
+        );
+        let response: SpotifySearchResponse = self.request_json(Method::GET, &path).await?;
+        let mut results = Vec::with_capacity(
+            response.tracks.items.len()
+                + response.albums.items.len()
+                + response.artists.items.len(),
+        );
+        results.extend(
+            response
+                .tracks
+                .items
+                .into_iter()
+                .map(|track| LibrarySearchResult {
+                    title: track.name,
+                    subtitle: match (track.artists.first(), track.album.name.is_empty()) {
+                        (Some(artist), false) => {
+                            Some(format!("{} - {}", artist.name, track.album.name))
+                        }
+                        (Some(artist), true) => Some(artist.name.clone()),
+                        (None, false) => Some(track.album.name),
+                        (None, true) => None,
+                    },
+                    uri: track.uri,
+                }),
+        );
+        results.extend(response.albums.items.into_iter().map(|album| {
+            LibrarySearchResult {
+                title: album.name,
+                subtitle: album
+                    .artists
+                    .first()
+                    .map(|artist| format!("Album by {}", artist.name)),
+                uri: album.uri,
+            }
+        }));
+        results.extend(
+            response
+                .artists
+                .items
+                .into_iter()
+                .map(|artist| LibrarySearchResult {
+                    title: artist.name,
+                    subtitle: Some("Artist".to_string()),
+                    uri: artist.uri,
+                }),
+        );
+        Ok(results)
+    }
+
+    /// Browse Spotify's top-level catalog categories.
+    pub async fn browse_categories(
+        &self,
+        limit: usize,
+        offset: usize,
+        country: Option<&str>,
+        locale: Option<&str>,
+    ) -> Result<SpotifyPage<SpotifyCategory>> {
+        let mut query = vec![
+            format!("limit={}", spotify_page_limit(limit)),
+            format!("offset={offset}"),
+        ];
+        if let Some(country) = country.filter(|value| !value.is_empty()) {
+            query.push(format!("country={}", urlencoding::encode(country)));
+        }
+        if let Some(locale) = locale.filter(|value| !value.is_empty()) {
+            query.push(format!("locale={}", urlencoding::encode(locale)));
+        }
+        let path = format!("/browse/categories?{}", query.join("&"));
+        self.request_json(Method::GET, &path).await
+    }
+
+    /// Browse playlists attached to one Spotify catalog category.
+    pub async fn browse_category_playlists(
+        &self,
+        category_id: &str,
+        limit: usize,
+        offset: usize,
+        country: Option<&str>,
+    ) -> Result<SpotifyPage<SpotifyPlaylist>> {
+        let category_id = category_id.trim();
+        if category_id.is_empty() {
+            return Err(anyhow!("Spotify category id cannot be empty"));
+        }
+        let mut query = vec![
+            format!("limit={}", spotify_page_limit(limit)),
+            format!("offset={offset}"),
+        ];
+        if let Some(country) = country.filter(|value| !value.is_empty()) {
+            query.push(format!("country={}", urlencoding::encode(country)));
+        }
+        let path = format!(
+            "/browse/categories/{}/playlists?{}",
+            urlencoding::encode(category_id),
+            query.join("&")
+        );
+        self.request_json(Method::GET, &path).await
+    }
+
+    /// Browse Spotify's featured editorial playlists.
+    pub async fn browse_featured_playlists(
+        &self,
+        limit: usize,
+        offset: usize,
+        country: Option<&str>,
+        locale: Option<&str>,
+        timestamp: Option<&str>,
+    ) -> Result<SpotifyPage<SpotifyPlaylist>> {
+        let mut query = vec![
+            format!("limit={}", spotify_page_limit(limit)),
+            format!("offset={offset}"),
+        ];
+        if let Some(country) = country.filter(|value| !value.is_empty()) {
+            query.push(format!("country={}", urlencoding::encode(country)));
+        }
+        if let Some(locale) = locale.filter(|value| !value.is_empty()) {
+            query.push(format!("locale={}", urlencoding::encode(locale)));
+        }
+        if let Some(timestamp) = timestamp.filter(|value| !value.is_empty()) {
+            query.push(format!("timestamp={}", urlencoding::encode(timestamp)));
+        }
+        let path = format!("/browse/featured-playlists?{}", query.join("&"));
+        let response: SpotifyFeaturedPlaylists = self.request_json(Method::GET, &path).await?;
+        Ok(response.playlists)
+    }
+
+    /// Browse Spotify's new-release album catalog.
+    pub async fn browse_new_releases(
+        &self,
+        limit: usize,
+        offset: usize,
+        country: Option<&str>,
+    ) -> Result<SpotifyPage<SpotifyAlbumSummary>> {
+        let mut query = vec![
+            format!("limit={}", spotify_page_limit(limit)),
+            format!("offset={offset}"),
+        ];
+        if let Some(country) = country.filter(|value| !value.is_empty()) {
+            query.push(format!("country={}", urlencoding::encode(country)));
+        }
+        let path = format!("/browse/new-releases?{}", query.join("&"));
+        let response: SpotifyNewReleases = self.request_json(Method::GET, &path).await?;
+        Ok(response.albums)
+    }
+
+    /// List playlists visible to the current Spotify user.
+    pub async fn get_playlists(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SpotifyPage<SpotifyPlaylist>> {
+        let path = format!(
+            "/me/playlists?limit={}&offset={offset}",
+            spotify_page_limit(limit)
+        );
+        self.request_json(Method::GET, &path).await
+    }
+
+    /// Read one playlist's items. Spotify calls this endpoint `/items`; the
+    /// adapter keeps the item URI and metadata intact for reference minting.
+    pub async fn get_playlist_items(
+        &self,
+        playlist_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SpotifyPage<SpotifyPlaylistItem>> {
+        let playlist_id = playlist_id.trim();
+        if playlist_id.is_empty() {
+            return Err(anyhow!("Spotify playlist id cannot be empty"));
+        }
+        let path = format!(
+            "/playlists/{}/items?limit={}&offset={offset}",
+            urlencoding::encode(playlist_id),
+            spotify_page_limit(limit)
+        );
+        self.request_json(Method::GET, &path).await
+    }
+
+    /// List the user's saved (liked) tracks.
+    pub async fn get_saved_tracks(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SpotifyPage<SpotifySavedTrack>> {
+        let path = format!(
+            "/me/tracks?limit={}&offset={offset}",
+            spotify_page_limit(limit)
+        );
+        self.request_json(Method::GET, &path).await
+    }
+
+    /// Check which Spotify track IDs are in the user's saved library.
+    pub async fn check_saved_tracks(&self, ids: &[String]) -> Result<Vec<bool>> {
+        let ids = spotify_ids(ids)?;
+        let path = format!("/me/tracks/contains?ids={ids}");
+        self.request_json(Method::GET, &path).await
+    }
+
+    /// Save tracks to the user's Spotify library.
+    pub async fn save_tracks(&self, ids: &[String]) -> Result<()> {
+        let ids = spotify_ids(ids)?;
+        self.send_command(Method::PUT, &format!("/me/tracks?ids={ids}"))
+            .await
+    }
+
+    /// Remove tracks from the user's Spotify library.
+    pub async fn remove_saved_tracks(&self, ids: &[String]) -> Result<()> {
+        let ids = spotify_ids(ids)?;
+        self.send_command(Method::DELETE, &format!("/me/tracks?ids={ids}"))
+            .await
+    }
+
+    /// Create a playlist owned by the authenticated Spotify user.
+    pub async fn create_playlist(
+        &self,
+        name: &str,
+        public: bool,
+        collaborative: bool,
+        description: Option<&str>,
+    ) -> Result<SpotifyPlaylist> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("Spotify playlist name cannot be empty"));
+        }
+        let account = self.fetch_account().await?;
+        let path = format!("/users/{}/playlists", urlencoding::encode(&account.id));
+        let body = serde_json::json!({
+            "name": name,
+            "public": public,
+            "collaborative": collaborative,
+            "description": description.unwrap_or_default(),
+        });
+        self.request_json_body(Method::POST, &path, &body).await
+    }
+
+    /// Update playlist metadata without changing its item list.
+    pub async fn update_playlist(
+        &self,
+        playlist_id: &str,
+        name: Option<&str>,
+        public: Option<bool>,
+        collaborative: Option<bool>,
+        description: Option<&str>,
+    ) -> Result<()> {
+        let playlist_id = playlist_id.trim();
+        if playlist_id.is_empty() {
+            return Err(anyhow!("Spotify playlist id cannot be empty"));
+        }
+        let mut body = serde_json::Map::new();
+        if let Some(name) = name.filter(|value| !value.trim().is_empty()) {
+            body.insert("name".to_string(), serde_json::json!(name));
+        }
+        if let Some(public) = public {
+            body.insert("public".to_string(), serde_json::json!(public));
+        }
+        if let Some(collaborative) = collaborative {
+            body.insert(
+                "collaborative".to_string(),
+                serde_json::json!(collaborative),
+            );
+        }
+        if let Some(description) = description {
+            body.insert("description".to_string(), serde_json::json!(description));
+        }
+        if body.is_empty() {
+            return Err(anyhow!("Spotify playlist update has no fields"));
+        }
+        self.send_json_command(
+            Method::PUT,
+            &format!("/playlists/{}", urlencoding::encode(playlist_id)),
+            &serde_json::Value::Object(body),
+        )
+        .await
+    }
+
+    /// Add track or episode URIs to a playlist, returning Spotify's snapshot.
+    pub async fn add_playlist_items(
+        &self,
+        playlist_id: &str,
+        uris: &[String],
+        position: Option<usize>,
+    ) -> Result<Option<String>> {
+        let playlist_id = spotify_playlist_id(playlist_id)?;
+        let uris = spotify_content_uris(uris)?;
+        let mut body = serde_json::json!({"uris": uris});
+        if let Some(position) = position {
+            body["position"] = serde_json::json!(position);
+        }
+        let response: SpotifySnapshot = self
+            .request_json_body(
+                Method::POST,
+                &format!("/playlists/{playlist_id}/items"),
+                &body,
+            )
+            .await?;
+        Ok(response.snapshot_id)
+    }
+
+    /// Replace a playlist's item list with track or episode URIs.
+    pub async fn replace_playlist_items(
+        &self,
+        playlist_id: &str,
+        uris: &[String],
+    ) -> Result<Option<String>> {
+        let playlist_id = spotify_playlist_id(playlist_id)?;
+        let uris = spotify_content_uris(uris)?;
+        let response: SpotifySnapshot = self
+            .request_json_body(
+                Method::PUT,
+                &format!("/playlists/{playlist_id}/items"),
+                &serde_json::json!({"uris": uris}),
+            )
+            .await?;
+        Ok(response.snapshot_id)
+    }
+
+    /// Remove playlist items by URI, optionally guarded by a snapshot ID.
+    pub async fn remove_playlist_items(
+        &self,
+        playlist_id: &str,
+        uris: &[String],
+        snapshot_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let playlist_id = spotify_playlist_id(playlist_id)?;
+        let uris = spotify_content_uris(uris)?;
+        let tracks: Vec<Value> = uris
+            .iter()
+            .map(|uri| serde_json::json!({"uri": uri}))
+            .collect();
+        let mut body = serde_json::json!({"tracks": tracks});
+        if let Some(snapshot_id) = snapshot_id.filter(|value| !value.is_empty()) {
+            body["snapshot_id"] = serde_json::json!(snapshot_id);
+        }
+        let response: SpotifySnapshot = self
+            .request_json_body(
+                Method::DELETE,
+                &format!("/playlists/{playlist_id}/items"),
+                &body,
+            )
+            .await?;
+        Ok(response.snapshot_id)
+    }
+
+    /// Play a Spotify track, album, artist, or other context URI on a UHC
+    /// Spotify zone. Track URIs use uris; context URIs use context_uri.
+    pub async fn play_uri(&self, zone_id: &str, uri: &str) -> Result<String> {
+        let uri = uri.trim();
+        if uri.is_empty() || !uri.starts_with("spotify:") {
+            return Err(anyhow!("Spotify play target must be a spotify: URI"));
+        }
+        if !self.is_configured().await {
+            return Err(anyhow!(
+                "Spotify access token is not configured or has expired"
+            ));
+        }
+        let device_id = zone_id.strip_prefix("spotify:").unwrap_or(zone_id);
+        let device = self
+            .state
+            .read()
+            .await
+            .devices
+            .get(device_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Spotify device is not currently available"))?;
+        if device.is_restricted {
+            return Err(anyhow!("Spotify device is restricted"));
+        }
+        let query = format!("?device_id={}", urlencoding::encode(device_id));
+        let body = if uri.starts_with("spotify:track:") {
+            serde_json::json!({ "uris": [uri] })
+        } else {
+            serde_json::json!({ "context_uri": uri })
+        };
+        self.send_json_command(Method::PUT, &format!("/me/player/play{query}"), &body)
+            .await?;
+        if let Err(error) = self.update().await {
+            debug!("Spotify URI play succeeded but refresh failed: {}", error);
+        }
+        Ok(format!("Playing {uri} on {}", device.name))
+    }
+
+    /// Read Spotify's account-level playback queue for a known Connect device.
+    ///
+    /// The Web API queue endpoint has no device selector, but requiring a known
+    /// zone keeps MCP scope honest and prevents a typo from returning another
+    /// device's queue. An empty `currently_playing` value is valid when Spotify
+    /// has no active playback.
+    pub async fn get_queue(&self, zone_id: &str) -> Result<SpotifyQueue> {
+        self.require_device(zone_id).await?;
+        self.request_json(Method::GET, "/me/player/queue").await
+    }
+
+    /// Add a track or episode URI to Spotify's playback queue for a device.
+    pub async fn add_to_queue(&self, zone_id: &str, uri: &str) -> Result<()> {
+        let device_id = self.require_device(zone_id).await?;
+        if !(uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:")) {
+            return Err(anyhow!(
+                "Spotify queue URI must be a spotify:track: or spotify:episode: URI"
+            ));
+        }
+        if uri.ends_with(':') {
+            return Err(anyhow!("Spotify queue URI is missing its item id"));
+        }
+        let query = format!(
+            "?uri={}&device_id={}",
+            urlencoding::encode(uri),
+            urlencoding::encode(&device_id)
+        );
+        self.send_command(Method::POST, &format!("/me/player/queue{query}"))
+            .await
+    }
+
+    async fn require_device(&self, zone_id: &str) -> Result<String> {
+        let device_id = zone_id.strip_prefix("spotify:").unwrap_or(zone_id);
+        let state = self.state.read().await;
+        let device = state
+            .devices
+            .get(device_id)
+            .ok_or_else(|| anyhow!("Spotify device is not currently available"))?;
+        if device.is_restricted {
+            return Err(anyhow!("Spotify device is restricted"));
+        }
+        Ok(device_id.to_string())
+    }
+
     /// Poll device inventory and current playback, publishing zones.
     pub async fn update(&self) -> Result<()> {
         let (previous_devices, previous_playback) = {
@@ -386,6 +1017,17 @@ impl SpotifyAdapter {
                         artist: now_playing.as_ref().map(|track| track.artist.clone()),
                         album: now_playing.as_ref().map(|track| track.album.clone()),
                         image_key: now_playing.and_then(|track| track.image_key),
+                    });
+                }
+                let previous_modes = previous_device_playback
+                    .map(|state| (state.repeat_mode(), state.shuffle_state));
+                let current_modes =
+                    device_playback.map(|state| (state.repeat_mode(), state.shuffle_state));
+                if previous_modes != current_modes {
+                    self.bus.publish(BusEvent::PlaybackModesChanged {
+                        zone_id: zone_id.clone(),
+                        repeat_mode: current_modes.and_then(|modes| modes.0),
+                        shuffle: current_modes.and_then(|modes| modes.1),
                     });
                 }
                 if previous_device_playback.and_then(|state| state.progress_ms)
@@ -519,6 +1161,24 @@ impl SpotifyAdapter {
         self.decode_response(response).await
     }
 
+    async fn request_json_body<T: Serialize, R: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &T,
+    ) -> Result<R> {
+        let access_token = self.ensure_access_token().await?;
+        let response = self
+            .client
+            .request(method, format!("{}{}", self.api_base_url, path))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Spotify request {} failed: {}", path, e))?;
+        self.decode_response(response).await
+    }
+
     async fn decode_response<T: for<'de> Deserialize<'de>>(
         &self,
         response: reqwest::Response,
@@ -549,7 +1209,62 @@ impl SpotifyAdapter {
             .ok()
             .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
             .unwrap_or_else(|| body.chars().take(240).collect());
+        if status == StatusCode::FORBIDDEN {
+            return Err(anyhow!(
+                "Spotify playback control requires a Premium account: {detail}"
+            ));
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(anyhow!(
+                "Spotify playback control is rate limited; try again shortly: {detail}"
+            ));
+        }
         Err(anyhow!("Spotify API returned HTTP {}: {}", status, detail))
+    }
+
+    async fn send_json_command<T: Serialize>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &T,
+    ) -> Result<()> {
+        let access_token = self.ensure_access_token().await?;
+        let response = self
+            .client
+            .request(method, format!("{}{}", self.api_base_url, path))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Spotify request {} failed: {}", path, e))?;
+        let status = response.status();
+        if status.is_success() || status == StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        let body = response.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| body.chars().take(240).collect());
+        Err(anyhow!("Spotify API returned HTTP {}: {}", status, detail))
+    }
+
+    async fn request_json_with_body<T: Serialize, R: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &T,
+    ) -> Result<R> {
+        let access_token = self.ensure_access_token().await?;
+        let response = self
+            .client
+            .request(method, format!("{}{}", self.api_base_url, path))
+            .bearer_auth(access_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Spotify request {} failed: {}", path, e))?;
+        self.decode_response(response).await
     }
 
     async fn start_internal(&self) -> Result<()> {
@@ -715,6 +1430,31 @@ impl AdapterLogic for SpotifyAdapter {
                     Err(error) => Err(error),
                 }
             }
+            AdapterCommand::SetRepeat(mode) => {
+                let state = match mode {
+                    RepeatMode::Off => "off",
+                    RepeatMode::One => "track",
+                    RepeatMode::All => "context",
+                };
+                self.send_command(
+                    Method::PUT,
+                    &format!(
+                        "/me/player/repeat?state={state}&device_id={}",
+                        urlencoding::encode(device_id)
+                    ),
+                )
+                .await
+            }
+            AdapterCommand::SetShuffle(enabled) => {
+                self.send_command(
+                    Method::PUT,
+                    &format!(
+                        "/me/player/shuffle?state={enabled}&device_id={}",
+                        urlencoding::encode(device_id)
+                    ),
+                )
+                .await
+            }
             AdapterCommand::Mute(_) => {
                 return Ok(failure("Spotify Connect does not expose a mute command"));
             }
@@ -743,6 +1483,192 @@ impl AdapterLogic for SpotifyAdapter {
     }
 }
 
+#[async_trait]
+impl LibraryAdapter for SpotifyAdapter {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<LibrarySearchResult>> {
+        SpotifyAdapter::search(self, query, limit).await
+    }
+
+    async fn play_uri(&self, zone_id: &str, uri: &str) -> Result<String> {
+        SpotifyAdapter::play_uri(self, zone_id, uri).await
+    }
+
+    async fn queue_uri(&self, zone_id: &str, uri: &str) -> Result<()> {
+        self.add_to_queue(zone_id, uri).await
+    }
+
+    async fn read_queue(&self, zone_id: &str) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(self.get_queue(zone_id).await?)?)
+    }
+
+    async fn content(
+        &self,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 50);
+        let result = match operation {
+            "browse_categories" => serde_json::to_value(
+                self.browse_categories(limit as usize, 0, None, None)
+                    .await?,
+            )?,
+            "browse_category_playlists" => {
+                let id = params
+                    .get("category_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("category_id is required"))?;
+                serde_json::to_value(
+                    self.browse_category_playlists(id, limit as usize, 0, None)
+                        .await?,
+                )?
+            }
+            "browse_featured_playlists" => serde_json::to_value(
+                self.browse_featured_playlists(limit as usize, 0, None, None, None)
+                    .await?,
+            )?,
+            "browse_new_releases" => {
+                serde_json::to_value(self.browse_new_releases(limit as usize, 0, None).await?)?
+            }
+            "playlists" => {
+                self.request_json(Method::GET, &format!("/me/playlists?limit={limit}"))
+                    .await?
+            }
+            "saved_tracks" => {
+                self.request_json(Method::GET, &format!("/me/tracks?limit={limit}"))
+                    .await?
+            }
+            "playlist_tracks" => {
+                let id = params
+                    .get("playlist_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("playlist_id is required"))?;
+                if !valid_spotify_id(id) {
+                    return Err(anyhow!("playlist_id is invalid"));
+                }
+                serde_json::to_value(self.get_playlist_items(id, limit as usize, 0).await?)?
+            }
+            "create_playlist" => {
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| anyhow!("name is required"))?;
+                let profile = self
+                    .request_json::<SpotifyUserProfile>(Method::GET, "/me")
+                    .await?;
+                let body = serde_json::json!({
+                    "name": name,
+                    "public": params.get("public").and_then(Value::as_bool).unwrap_or(false),
+                    "collaborative": false,
+                    "description": params.get("description").and_then(Value::as_str).unwrap_or("")
+                });
+                let path = format!("/users/{}/playlists", profile.id);
+                self.request_json_with_body(Method::POST, &path, &body)
+                    .await?
+            }
+            "update_playlist" => {
+                let id = params
+                    .get("playlist_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("playlist_id is required"))?;
+                if !valid_spotify_id(id) {
+                    return Err(anyhow!("playlist_id is invalid"));
+                }
+                let mut body = serde_json::Map::new();
+                for key in ["name", "description", "public", "collaborative"] {
+                    if let Some(value) = params.get(key) {
+                        body.insert(key.to_string(), value.clone());
+                    }
+                }
+                self.send_json_command(
+                    Method::PUT,
+                    &format!("/playlists/{id}"),
+                    &Value::Object(body),
+                )
+                .await?;
+                serde_json::json!({"updated": true, "playlist_id": id})
+            }
+            "playlist_add" => {
+                let id = params
+                    .get("playlist_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("playlist_id is required"))?;
+                let uri = params
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("uri is required"))?;
+                if !valid_spotify_id(id) || !uri.starts_with("spotify:track:") {
+                    return Err(anyhow!(
+                        "playlist_add requires a valid playlist id and spotify:track URI"
+                    ));
+                }
+                serde_json::to_value(
+                    self.add_playlist_items(id, &[uri.to_string()], None)
+                        .await?,
+                )?
+            }
+            "playlist_replace" => {
+                let id = params
+                    .get("playlist_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("playlist_id is required"))?;
+                let uri = params
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("uri is required"))?;
+                serde_json::to_value(self.replace_playlist_items(id, &[uri.to_string()]).await?)?
+            }
+            "playlist_remove" => {
+                let id = params
+                    .get("playlist_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("playlist_id is required"))?;
+                let uri = params
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("uri is required"))?;
+                serde_json::to_value(
+                    self.remove_playlist_items(id, &[uri.to_string()], None)
+                        .await?,
+                )?
+            }
+            "saved_tracks_check" => {
+                let id = params
+                    .get("track_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("track_id is required"))?;
+                serde_json::to_value(self.check_saved_tracks(&[id.to_string()]).await?)?
+            }
+            "saved_tracks_add" => {
+                let id = params
+                    .get("track_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("track_id is required"))?;
+                self.save_tracks(&[id.to_string()]).await?;
+                serde_json::json!({"saved": true})
+            }
+            "saved_tracks_remove" => {
+                let id = params
+                    .get("track_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("track_id is required"))?;
+                self.remove_saved_tracks(&[id.to_string()]).await?;
+                serde_json::json!({"saved": false})
+            }
+            _ => return Err(anyhow!("unknown Spotify content operation: {operation}")),
+        };
+        Ok(result)
+    }
+}
+
+fn valid_spotify_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 fn failure(message: &str) -> AdapterCommandResponse {
     AdapterCommandResponse {
         success: false,
@@ -757,6 +1683,56 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn spotify_page_limit(limit: usize) -> usize {
+    limit.clamp(1, 50)
+}
+
+fn spotify_ids(ids: &[String]) -> Result<String> {
+    if ids.is_empty() {
+        return Err(anyhow!("Spotify track id list cannot be empty"));
+    }
+    if ids.len() > 50 {
+        return Err(anyhow!("Spotify accepts at most 50 track ids per request"));
+    }
+    if ids
+        .iter()
+        .any(|id| id.trim().is_empty() || id.contains(','))
+    {
+        return Err(anyhow!(
+            "Spotify track ids must be non-empty and cannot contain commas"
+        ));
+    }
+    Ok(urlencoding::encode(&ids.join(",")).into_owned())
+}
+
+fn spotify_playlist_id(playlist_id: &str) -> Result<String> {
+    let playlist_id = playlist_id.trim();
+    if playlist_id.is_empty() {
+        return Err(anyhow!("Spotify playlist id cannot be empty"));
+    }
+    Ok(urlencoding::encode(playlist_id).into_owned())
+}
+
+fn spotify_content_uris(uris: &[String]) -> Result<Vec<String>> {
+    if uris.is_empty() {
+        return Err(anyhow!("Spotify playlist URI list cannot be empty"));
+    }
+    if uris.len() > 100 {
+        return Err(anyhow!(
+            "Spotify accepts at most 100 playlist items per request"
+        ));
+    }
+    if uris.iter().any(|uri| {
+        !(uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:"))
+            || uri.ends_with(':')
+    }) {
+        return Err(anyhow!(
+            "Spotify playlist items must be spotify:track: or spotify:episode: URIs"
+        ));
+    }
+    Ok(uris.to_vec())
 }
 
 fn now_millis() -> u64 {

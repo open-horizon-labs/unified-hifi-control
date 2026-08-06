@@ -5,7 +5,10 @@ use crate::adapters::lms::LmsAdapter;
 use crate::adapters::openhome::OpenHomeAdapter;
 use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
-use crate::adapters::{AdapterCommand, AdapterCommandResponse, AdapterLogic, Startable};
+use crate::adapters::{
+    AdapterCommand, AdapterCommandResponse, AdapterLogic, LibraryAdapter, LibrarySearchResult,
+    Startable,
+};
 use crate::aggregator::ZoneAggregator;
 use crate::bus::{ProviderAccount, SharedBus};
 use crate::coordinator::AdapterCoordinator;
@@ -40,6 +43,7 @@ pub mod provider_auth;
 #[derive(Default)]
 pub struct AdapterRegistry {
     adapters: tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn AdapterLogic>>>,
+    libraries: tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn LibraryAdapter>>>,
     startables: tokio::sync::RwLock<std::collections::HashMap<String, Arc<dyn Startable>>>,
 }
 
@@ -61,6 +65,16 @@ impl AdapterRegistry {
             .write()
             .await
             .insert(startable.name().to_string(), startable);
+    }
+
+    /// Register the optional content-library surface for a provider. Keeping
+    /// this separate from transport registration prevents a provider that can
+    /// control a zone from being advertised as searchable by accident.
+    pub async fn register_library(&self, prefix: &str, adapter: Arc<dyn LibraryAdapter>) {
+        self.libraries
+            .write()
+            .await
+            .insert(prefix.to_string(), adapter);
     }
 
     pub async fn start(&self, prefix: &str) -> anyhow::Result<()> {
@@ -94,6 +108,85 @@ impl AdapterRegistry {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
         adapter.handle_command(zone_id, command).await
+    }
+
+    pub async fn search_library(
+        &self,
+        prefix: &str,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LibrarySearchResult>> {
+        let adapter = self
+            .libraries
+            .read()
+            .await
+            .get(prefix)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
+        adapter.search(query, limit).await
+    }
+
+    pub async fn play_library_uri(
+        &self,
+        prefix: &str,
+        zone_id: &str,
+        uri: &str,
+    ) -> anyhow::Result<String> {
+        let adapter = self
+            .libraries
+            .read()
+            .await
+            .get(prefix)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
+        adapter.play_uri(zone_id, uri).await
+    }
+
+    pub async fn queue_library_uri(
+        &self,
+        prefix: &str,
+        zone_id: &str,
+        uri: &str,
+    ) -> anyhow::Result<()> {
+        let adapter = self
+            .libraries
+            .read()
+            .await
+            .get(prefix)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
+        adapter.queue_uri(zone_id, uri).await
+    }
+
+    pub async fn read_library_queue(
+        &self,
+        prefix: &str,
+        zone_id: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let adapter = self
+            .libraries
+            .read()
+            .await
+            .get(prefix)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
+        adapter.read_queue(zone_id).await
+    }
+
+    pub async fn library_content(
+        &self,
+        prefix: &str,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let adapter = self
+            .libraries
+            .read()
+            .await
+            .get(prefix)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
+        adapter.content(operation, params).await
     }
 }
 

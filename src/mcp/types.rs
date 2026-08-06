@@ -53,6 +53,8 @@ pub struct McpNowPlaying {
     pub album: Option<String>,
     pub volume: Option<f64>,
     pub is_muted: Option<bool>,
+    pub repeat_mode: Option<crate::bus::RepeatMode>,
+    pub shuffle: Option<bool>,
 }
 
 /// A search hit.
@@ -138,5 +140,7 @@ pub fn now_playing_from_zone(zone: crate::bus::Zone) -> McpNowPlaying {
         album: zone.now_playing.as_ref().map(|n| n.album.clone()),
         volume: zone.volume_control.as_ref().map(|v| v.value as f64),
         is_muted: zone.volume_control.as_ref().map(|v| v.is_muted),
+        repeat_mode: zone.now_playing.as_ref().and_then(|n| n.repeat_mode),
+        shuffle: zone.now_playing.as_ref().and_then(|n| n.shuffle),
     }
 }

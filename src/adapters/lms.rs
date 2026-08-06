@@ -1955,6 +1955,8 @@ fn lms_player_to_zone(player: &LmsPlayer) -> Zone {
                 seek_position: Some(player.time),
                 duration: Some(player.duration),
                 metadata: None,
+                repeat_mode: None,
+                shuffle: None,
             })
         } else {
             None
@@ -2680,6 +2682,14 @@ impl AdapterLogic for LmsAdapter {
                         "Mute control is not yet implemented in UHC for LMS. LMS \
                          itself supports it via `mixer muting <0|1>`; see #403."
                             .to_string(),
+                    ),
+                });
+            }
+            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
+                return Ok(AdapterCommandResponse {
+                    success: false,
+                    error: Some(
+                        "Repeat and shuffle are not implemented by the LMS adapter".to_string(),
                     ),
                 });
             }

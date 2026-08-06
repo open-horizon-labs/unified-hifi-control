@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::bus::SharedBus;
+use crate::bus::{RepeatMode, SharedBus};
 
 // =============================================================================
 // Startable - Uniform adapter lifecycle trait
@@ -102,6 +102,10 @@ pub enum AdapterCommand {
     VolumeAbsolute(i32),
     VolumeRelative(i32),
     Mute(bool),
+    /// Set the provider's repeat mode for the selected zone.
+    SetRepeat(RepeatMode),
+    /// Enable or disable shuffle for the selected zone.
+    SetShuffle(bool),
 }
 
 /// Response from command execution
@@ -109,6 +113,56 @@ pub enum AdapterCommand {
 pub struct AdapterCommandResponse {
     pub success: bool,
     pub error: Option<String>,
+}
+
+/// A provider library hit that can be addressed by a stable provider URI.
+///
+/// The MCP layer deliberately keeps provider-specific fields out of its wire
+/// result. Adapters translate their native result into this small contract and
+/// retain the URI for play-by-reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibrarySearchResult {
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub uri: String,
+}
+
+/// Optional content-library surface implemented by adapters that can search
+/// and play a provider URI. Transport-only adapters do not implement this
+/// trait; the adapter registry routes only providers registered here.
+#[async_trait]
+pub trait LibraryAdapter: Send + Sync + 'static {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<LibrarySearchResult>>;
+
+    async fn play_uri(&self, zone_id: &str, uri: &str) -> Result<String>;
+
+    /// Add one URI to a provider's playback queue when the provider exposes a
+    /// safe queue-add operation. Transport-only libraries keep the default
+    /// refusal rather than pretending queue support exists.
+    async fn queue_uri(&self, _zone_id: &str, _uri: &str) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "queue add is not implemented for this provider"
+        ))
+    }
+
+    /// Read a provider queue as JSON for provider-neutral MCP projection.
+    async fn read_queue(&self, _zone_id: &str) -> Result<serde_json::Value> {
+        Err(anyhow::anyhow!(
+            "queue read is not implemented for this provider"
+        ))
+    }
+
+    /// Provider-specific catalog/library operation used by the provider-aware
+    /// MCP surface. Transport-only adapters keep the honest default refusal.
+    async fn content(
+        &self,
+        _operation: &str,
+        _params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        Err(anyhow::anyhow!(
+            "content operation is not implemented for this provider"
+        ))
+    }
 }
 
 /// Adapter-specific logic trait

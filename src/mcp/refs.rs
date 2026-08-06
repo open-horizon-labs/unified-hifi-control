@@ -122,6 +122,10 @@ pub enum RefTarget {
         target: LmsPlayTarget,
         title: String,
     },
+    Spotify {
+        uri: String,
+        title: String,
+    },
 }
 
 impl RefTarget {
@@ -131,6 +135,7 @@ impl RefTarget {
         match self {
             Self::Roon { .. } => Provider::Roon,
             Self::Lms { .. } => Provider::Lms,
+            Self::Spotify { .. } => Provider::Spotify,
         }
     }
 
@@ -138,7 +143,9 @@ impl RefTarget {
     /// resolution does not re-derive it from the (possibly stale) backend.
     pub fn title(&self) -> &str {
         match self {
-            Self::Roon { title, .. } | Self::Lms { title, .. } => title,
+            Self::Roon { title, .. } | Self::Lms { title, .. } | Self::Spotify { title, .. } => {
+                title
+            }
         }
     }
 }

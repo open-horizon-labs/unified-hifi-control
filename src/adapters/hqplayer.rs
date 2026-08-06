@@ -2092,6 +2092,8 @@ impl HqpAdapter {
                     track_number: Some(status.track),
                     disc_number: None,
                 }),
+                repeat_mode: None,
+                shuffle: None,
             })
         } else {
             None

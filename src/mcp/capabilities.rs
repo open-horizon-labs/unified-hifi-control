@@ -335,8 +335,24 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
         ),
         Capability::Search | Capability::PlayByQuery => matches!(
             (target, target.for_library()),
-            (ZoneTarget::Roon, LibraryRoute::Roon) | (ZoneTarget::Lms, LibraryRoute::Lms)
+            (ZoneTarget::Roon, LibraryRoute::Roon)
+                | (ZoneTarget::Lms, LibraryRoute::Lms)
+                | (ZoneTarget::Spotify, LibraryRoute::Spotify)
         ),
+        Capability::PlayByRef => {
+            matches!(
+                (target, target.for_library()),
+                (ZoneTarget::Spotify, LibraryRoute::Spotify)
+            )
+        }
+        Capability::RepeatMode | Capability::ShuffleMode => {
+            target == ZoneTarget::Spotify
+                && matches!(target.for_transport(), TransportRoute::Spotify)
+        }
+        Capability::QueueRead
+        | Capability::Browse
+        | Capability::SavedPlaylists
+        | Capability::Favorites => target == ZoneTarget::Spotify,
         // Nothing else has an MCP call path at all yet.
         _ => false,
     };
@@ -756,31 +772,37 @@ mod tests {
         let mut stale = Vec::new();
         for target in ZoneTarget::PROVIDERS {
             for capability in Capability::ALL {
-                let listed = GAPS.iter().any(|(t, c, _)| t == target && c == capability)
-                    || (matches!(
-                        target,
-                        &ZoneTarget::AppleMusic
-                            | &ZoneTarget::Spotify
-                            | &ZoneTarget::MusicAssistant
-                    ) && matches!(
-                        capability,
-                        Capability::PlayByRef
-                            | Capability::Browse
-                            | Capability::QueueRead
-                            | Capability::QueueJump
-                            | Capability::QueueReorder
-                            | Capability::QueueRemove
-                            | Capability::QueueClear
-                            | Capability::PlayNext
-                            | Capability::RepeatMode
-                            | Capability::ShuffleMode
-                            | Capability::SavedPlaylists
-                            | Capability::Favorites
-                            | Capability::MultiroomSync
-                            | Capability::Search
-                            | Capability::PlayByQuery
-                    ));
                 let routed = routed(*target, *capability).is_some();
+                let listed = !routed
+                    && (GAPS.iter().any(|(t, c, _)| t == target && c == capability)
+                        || (matches!(
+                            target,
+                            &ZoneTarget::AppleMusic
+                                | &ZoneTarget::Spotify
+                                | &ZoneTarget::MusicAssistant
+                        ) && matches!(
+                            capability,
+                            Capability::Browse
+                                | Capability::QueueRead
+                                | Capability::QueueJump
+                                | Capability::QueueReorder
+                                | Capability::QueueRemove
+                                | Capability::QueueClear
+                                | Capability::PlayNext
+                                | Capability::SavedPlaylists
+                                | Capability::Favorites
+                                | Capability::MultiroomSync
+                        ) || (matches!(
+                            target,
+                            &ZoneTarget::AppleMusic | &ZoneTarget::MusicAssistant
+                        ) && matches!(
+                            capability,
+                            Capability::Search
+                                | Capability::PlayByQuery
+                                | Capability::PlayByRef
+                                | Capability::RepeatMode
+                                | Capability::ShuffleMode
+                        ))));
                 if !routed && !listed {
                     missing.push((target.label(), capability.name()));
                 }
@@ -1000,5 +1022,41 @@ mod tests {
         assert!(Support::Supported
             .refusal(Capability::Transport, vec![])
             .is_none());
+    }
+
+    #[test]
+    fn spotify_repeat_and_shuffle_are_supported() {
+        assert_eq!(
+            support(ZoneTarget::Spotify, Capability::RepeatMode),
+            Support::Supported
+        );
+        assert_eq!(
+            support(ZoneTarget::Spotify, Capability::ShuffleMode),
+            Support::Supported
+        );
+        assert!(matches!(
+            support(ZoneTarget::AppleMusic, Capability::RepeatMode),
+            Support::NotImplemented { .. }
+        ));
+    }
+
+    #[test]
+    fn spotify_library_capabilities_follow_library_routing() {
+        assert_eq!(
+            support(ZoneTarget::Spotify, Capability::Search),
+            Support::Supported
+        );
+        assert_eq!(
+            support(ZoneTarget::Spotify, Capability::PlayByQuery),
+            Support::Supported
+        );
+        assert_eq!(
+            support(ZoneTarget::Spotify, Capability::PlayByRef),
+            Support::Supported
+        );
+        assert!(matches!(
+            support(ZoneTarget::Spotify, Capability::Browse),
+            Support::Supported
+        ));
     }
 }

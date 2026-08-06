@@ -280,6 +280,14 @@ pub struct NowPlaying {
 
     /// Additional metadata (format, bitrate, etc.)
     pub metadata: Option<TrackMetadata>,
+
+    /// Current repeat mode, when the provider reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_mode: Option<RepeatMode>,
+
+    /// Current shuffle state, when the provider reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shuffle: Option<bool>,
 }
 
 /// Additional track metadata
@@ -518,6 +526,13 @@ pub enum BusEvent {
         image_key: Option<String>,
     },
 
+    /// Repeat/shuffle state changed for a zone.
+    PlaybackModesChanged {
+        zone_id: PrefixedZoneId,
+        repeat_mode: Option<RepeatMode>,
+        shuffle: Option<bool>,
+    },
+
     /// Seek position changed (for progress updates)
     SeekPositionChanged {
         /// Zone identifier (must be prefixed, e.g., "roon:xxx")
@@ -662,6 +677,7 @@ impl BusEvent {
             Self::ProviderAccountUpdated { .. } => "provider_account_updated",
             Self::AdapterError { .. } => "adapter_error",
             Self::NowPlayingChanged { .. } => "now_playing_changed",
+            Self::PlaybackModesChanged { .. } => "playback_modes_changed",
             Self::SeekPositionChanged { .. } => "seek_position_changed",
             Self::VolumeChanged { .. } => "volume_changed",
             Self::CommandReceived { .. } => "command_received",
@@ -702,6 +718,7 @@ impl BusEvent {
         matches!(
             self,
             Self::NowPlayingChanged { .. }
+                | Self::PlaybackModesChanged { .. }
                 | Self::SeekPositionChanged { .. }
                 | Self::VolumeChanged { .. }
         )

@@ -372,6 +372,8 @@ fn parse_now_playing(value: &Value) -> Option<NowPlaying> {
         seek_position,
         duration,
         metadata: None,
+        repeat_mode: None,
+        shuffle: None,
     })
 }
 
@@ -461,6 +463,15 @@ impl AdapterLogic for MusicAssistantAdapter {
             AdapterCommand::VolumeRelative(_) => ("players/cmd/volume_down", None),
             AdapterCommand::Mute(muted) => {
                 ("players/cmd/volume_mute", Some(json!({ "muted": muted })))
+            }
+            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
+                return Ok(AdapterCommandResponse {
+                    success: false,
+                    error: Some(
+                        "Repeat and shuffle are not implemented by the Music Assistant adapter"
+                            .to_string(),
+                    ),
+                });
             }
         };
 

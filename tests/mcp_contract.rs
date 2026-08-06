@@ -491,8 +491,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        12,
-        "expected 12 tools with HQPlayer enabled, got {}: {:?}",
+        14,
+        "expected 14 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -555,6 +555,8 @@ async fn tools_list_order_is_pinned() {
             "hifi_capabilities",
             // Appended by #396.
             "hifi_play_ref",
+            "hifi_queue",
+            "hifi_spotify",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -597,8 +599,10 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
             "hifi_status",
             "hifi_capabilities",
             "hifi_play_ref",
+            "hifi_queue",
+            "hifi_spotify",
         ],
-        "HQPlayer disabled must yield exactly the eight non-HQPlayer tools, in order"
+        "HQPlayer disabled must yield exactly the non-HQPlayer tools, in order"
     );
 }
 
@@ -767,6 +771,21 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
         "hifi_play_ref",
         &[("ref", true), ("zone_id", true), ("action", false)],
     ),
+    ("hifi_queue", &[("zone_id", true)]),
+    (
+        "hifi_spotify",
+        &[
+            ("action", true),
+            ("playlist_id", false),
+            ("category_id", false),
+            ("name", false),
+            ("description", false),
+            ("uri", false),
+            ("track_id", false),
+            ("public", false),
+            ("limit", false),
+        ],
+    ),
 ];
 
 #[tokio::test]
@@ -929,7 +948,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        12,
+        14,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }
@@ -1968,6 +1987,14 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
         DisplayOnly("mute readout with no corresponding write: hifi_control has no mute action"),
     ),
     (
+        "repeat_mode",
+        DisplayOnly("current repeat readout; hifi_control repeat_* actions are the write path"),
+    ),
+    (
+        "shuffle",
+        DisplayOnly("current shuffle readout; hifi_control shuffle_* actions are the write path"),
+    ),
+    (
         "title",
         DisplayOnly(
             "human-readable label for a hifi_search result. #396 added `ref` as the \
@@ -2661,7 +2688,8 @@ const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
         "hifi_control/unknown_action_never_reaches_dispatch",
         "Error: Control error: Device not found: abc",
         "Error: Unknown action 'frobnicate'. Valid actions: play, pause, playpause, next, \
-         previous, prev, volume_set, volume_up, volume_down.",
+         previous, prev, volume_set, volume_up, volume_down, repeat_off, repeat_context, \
+         repeat_track, shuffle_on, shuffle_off.",
     ),
 ];
 
@@ -4391,6 +4419,22 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             )),
             "search" => Some(("hifi_search", json!({ "query": "q", "zone_id": zone_id }))),
             "play_by_query" => Some(("hifi_play", json!({ "query": "q", "zone_id": zone_id }))),
+            "play_by_ref" => Some((
+                "hifi_play_ref",
+                json!({ "ref": "bad-ref", "zone_id": zone_id }),
+            )),
+            "browse" | "saved_playlists" | "favorites" => {
+                Some(("hifi_spotify", json!({ "action": "playlists" })))
+            }
+            "queue_read" => Some(("hifi_queue", json!({ "zone_id": zone_id }))),
+            "repeat_mode" => Some((
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "repeat_off" }),
+            )),
+            "shuffle_mode" => Some((
+                "hifi_control",
+                json!({ "zone_id": zone_id, "action": "shuffle_off" }),
+            )),
             _ => None,
         }
     }
@@ -4414,7 +4458,11 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                 )
             });
             let text = result_text(&app.call_tool(tool, args).await);
-            let expected = fingerprint(provider);
+            let expected = if *provider == "spotify" && capability == "play_by_ref" {
+                "unknown or expired"
+            } else {
+                fingerprint(provider)
+            };
             assert!(
                 text.to_lowercase().contains(&expected.to_lowercase()),
                 "{provider}/{capability} is reported supported, but calling {tool} produced \
@@ -4424,13 +4472,13 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             proved += 1;
         }
     }
-    // Roon 5 + LMS 5 + OpenHome 3 (no skip refusal, no library) + UPnP 2
-    // + three direct providers with transport/skip/volume = 24.
+    // The routed Spotify content and mode cells add twelve probes to the
+    // original provider transport set.
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 24,
+        proved, 33,
         "{proved} supported cells were proved end to end, expected 15. If a capability was          deliberately wired or unwired, change this number in the same commit."
     );
 }

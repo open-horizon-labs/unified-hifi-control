@@ -2062,6 +2062,14 @@ impl AdapterLogic for RoonAdapter {
                 self.change_volume(zone_id, delta as f32, true).await
             }
             AdapterCommand::Mute(mute) => self.mute(zone_id, mute).await,
+            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
+                return Ok(AdapterCommandResponse {
+                    success: false,
+                    error: Some(
+                        "Repeat and shuffle are not implemented by the Roon adapter".to_string(),
+                    ),
+                });
+            }
         };
 
         match result {
@@ -2174,6 +2182,8 @@ fn roon_zone_to_bus_zone(zone: &Zone) -> BusZone {
         seek_position: np.seek_position.map(|p| p as f64),
         duration: np.length.map(|l| l as f64),
         metadata: None,
+        repeat_mode: None,
+        shuffle: None,
     });
 
     BusZone {

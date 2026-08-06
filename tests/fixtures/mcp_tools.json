@@ -16,11 +16,11 @@
     }
   },
   "hifi_control": {
-    "description": "Control playback: play, pause, playpause (toggle), next, previous, or adjust volume",
+    "description": "Control playback: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, or adjust volume",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "Action: play, pause, playpause, next, previous, volume_set, volume_up, volume_down",
+          "description": "Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, volume_down",
           "type": "string"
         },
         "value": {
@@ -117,7 +117,7 @@
     }
   },
   "hifi_play": {
-    "description": "Search and play music. Searches and plays, queues, or starts radio from the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; LMS searches all providers. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead.",
+    "description": "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead.",
     "inputSchema": {
       "properties": {
         "action": {
@@ -150,7 +150,7 @@
     "annotations": {
       "readOnlyHint": false
     },
-    "description": "Play, queue, or play-next a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Use this instead of hifi_play when you need the exact result you found (e.g. the third one, or one of two same-titled albums), rather than whatever hifi_play's own search matches first. Refs are short-lived: hold one only within the current conversation. If this call is refused because the ref is unknown or expired, call hifi_search again for a fresh one — never guess or reuse an old one. zone_id must belong to the same provider (Roon or LMS) the ref was minted for.",
+    "description": "Play or queue a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Refs are short-lived; call hifi_search again if one expires. zone_id must belong to the same provider (Roon, LMS, or Spotify) the ref was minted for.",
     "inputSchema": {
       "properties": {
         "action": {
@@ -174,11 +174,26 @@
       "type": "object"
     }
   },
+  "hifi_queue": {
+    "description": "Read the current playback queue for a zone. Spotify returns its account playback queue; queue add is hifi_play action='queue'. Queue edit, remove, reorder, and clear are not claimed unless a provider exposes them.",
+    "inputSchema": {
+      "properties": {
+        "zone_id": {
+          "description": "Zone ID from hifi_zones.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "zone_id"
+      ],
+      "type": "object"
+    }
+  },
   "hifi_search": {
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins (zone_id recommended as different players may have different sources configured). Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play, queue, or start radio from that exact result instead of hifi_play's first-match search. A result with no `ref` has no safe way to be addressed later — use hifi_play's query for it.",
+    "description": "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins. Spotify: searches the Spotify catalog for a Spotify Connect zone. Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play or queue that exact result.",
     "inputSchema": {
       "properties": {
         "query": {
@@ -198,6 +213,61 @@
       },
       "required": [
         "query"
+      ],
+      "type": "object"
+    }
+  },
+  "hifi_spotify": {
+    "description": "Spotify catalog and library access. Actions include browse_categories, browse_category_playlists, browse_featured_playlists, browse_new_releases, playlists, playlist_tracks, saved_tracks, saved_tracks_check, saved_tracks_add/remove, create_playlist, update_playlist, playlist_add/replace/remove. Use hifi_search and hifi_play for catalog search and playback. Playlist/library writes require the corresponding Spotify scopes.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "Operation to perform.",
+          "type": "string"
+        },
+        "category_id": {
+          "description": "Spotify browse category id.",
+          "nullable": true,
+          "type": "string"
+        },
+        "description": {
+          "description": "Playlist description for create/update.",
+          "nullable": true,
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum number of entries to return.",
+          "nullable": true,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Playlist name for create/update.",
+          "nullable": true,
+          "type": "string"
+        },
+        "playlist_id": {
+          "description": "Playlist id for playlist_tracks, update_playlist, or playlist_add.",
+          "nullable": true,
+          "type": "string"
+        },
+        "public": {
+          "description": "Public visibility for create/update.",
+          "nullable": true,
+          "type": "boolean"
+        },
+        "track_id": {
+          "description": "Track id for saved-library membership or mutation.",
+          "nullable": true,
+          "type": "string"
+        },
+        "uri": {
+          "description": "Track URI for playlist_add.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
       ],
       "type": "object"
     }

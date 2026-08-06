@@ -766,39 +766,6 @@ pub fn Settings() -> Element {
                                     }
                                 }
                             }
-                            // Apple Music (bridge-backed adapter; zones arrive through the bus)
-                            tr { class: "border-b border-default",
-                                td { class: "py-2 px-3",
-                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "checkbox",
-                                            aria_label: "Enable Apple Music",
-                                            checked: applemusic_enabled(),
-                                            onchange: move |_| {
-                                                applemusic_enabled.toggle();
-                                                save_settings();
-                                            }
-                                        }
-                                    }
-                                }
-                                td { class: "py-2 px-3", "Apple Music" }
-                                td { class: "py-2 px-3",
-                                    if applemusic_enabled() {
-                                        if let Some(ref status) = apple_st {
-                                            if status.paired {
-                                                span { class: "status-ok", "✓ Paired" }
-                                            } else {
-                                                span { class: "status-err", "✗ Not paired" }
-                                            }
-                                        } else {
-                                            "..."
-                                        }
-                                    } else {
-                                        span { class: "text-muted", "-" }
-                                    }
-                                }
-                            }
                             // Music Assistant (remote adapter; zones arrive through the bus)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",

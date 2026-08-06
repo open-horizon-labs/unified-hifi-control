@@ -400,6 +400,10 @@ mod server {
             .adapter_registry
             .register_with_lifecycle(spotify.clone(), spotify.clone())
             .await;
+        state
+            .adapter_registry
+            .register_library("spotify", spotify.clone())
+            .await;
         state.provider_auth.attach_spotify(spotify.clone()).await;
         if let Some(adapter) = music_assistant.clone() {
             state

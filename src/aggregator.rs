@@ -95,6 +95,11 @@ impl ZoneAggregator {
                             .map(|np| (np.seek_position, np.duration))
                             .unwrap_or((None, None));
 
+                        let (repeat_mode, shuffle) = zone
+                            .now_playing
+                            .as_ref()
+                            .map(|np| (np.repeat_mode, np.shuffle))
+                            .unwrap_or((None, None));
                         zone.now_playing = Some(NowPlaying {
                             title: title.unwrap_or_default(),
                             artist: artist.unwrap_or_default(),
@@ -103,7 +108,23 @@ impl ZoneAggregator {
                             seek_position,
                             duration,
                             metadata: None,
+                            repeat_mode,
+                            shuffle,
                         });
+                    }
+                }
+
+                BusEvent::PlaybackModesChanged {
+                    zone_id,
+                    repeat_mode,
+                    shuffle,
+                } => {
+                    debug!("Playback modes changed: {}", zone_id);
+                    if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
+                        if let Some(ref mut now_playing) = zone.now_playing {
+                            now_playing.repeat_mode = repeat_mode;
+                            now_playing.shuffle = shuffle;
+                        }
                     }
                 }
 

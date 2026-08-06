@@ -21,7 +21,7 @@ Use GitHub for all task tracking:
 **Purpose:** Propose implementations for review
 - Link to the issue being addressed: `Fixes #123`
 - Describe what changed and how to test
-- Request review from coderabbit and superego
+- CodeRabbit review is optional and advisory; it is never a merge gate.
 
 ### Merging PRs
 **TEST BEFORE MERGING.** Do not merge PRs without testing.
@@ -47,29 +47,19 @@ Use GitHub for all task tracking:
 
 ## Code Review
 
-This project uses two complementary review tools:
-
-### superego (Metacognitive Advisor)
-**When to use:** Before commits, when choosing between approaches, when uncertain
-**Protocol:**
-- Mode: `pull` (reviews on request, not automatically)
-- Use `sg review` at decision points during development
-- Post superego reviews to PRs for visibility
-- Handle findings: P1-P3 fix immediately, P4 can discard with reason
-
 ### coderabbit (Automated Code Review)
-**When to use:** Automatically runs on all PRs
+**When to use:** Optional automated feedback when it is available.
 **Protocol:**
 - Reviews code style, potential bugs, and best practices
-- Address feedback before merging
+- Evaluate actionable feedback, but do not wait on CodeRabbit or treat its status as required approval.
 - Use `@coderabbit` in PR comments to ask questions
 
-### wm (Working Memory)
-**When to use:** Automatic - captures learnings from sessions
-**Protocol:**
-- Runs automatically via hooks
-- Extracts tacit knowledge from completed work
-- No manual intervention needed
+### Open Horizons skills
+**When to use:** Apply the skill that fits the decision or phase of work.
+- Use `/review` before commits and at natural pause points.
+- Use `/dissent` before significant or one-way decisions.
+- Use `/problem-space` when a defect or architectural concern repeats.
+- Use `/salvage` when work has drifted or an approach has reversed repeatedly.
 
 ---
 
@@ -220,20 +210,20 @@ Two things this table does **not** claim:
 | `transport` | ✅ | ✅ | ✅ | ✅ | 🚧 #328 | ✅ | ✅ | ✅ |
 | `transport_skip` | ✅ | ✅ | ✅ | 🚧 #392 | 🚧 #328 | ✅ | ✅ | ✅ |
 | `volume` | ✅ | ✅ | ✅ | ✅ | 🚧 #328 | ✅ | ✅ | ✅ |
-| `search` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
-| `play_by_query` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
-| `play_by_ref` | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
-| `browse` | 🚧 #399 | 🚧 #402 | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
-| `queue_read` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
+| `search` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | ✅ | 🚧 #462 |
+| `play_by_query` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | ✅ | 🚧 #462 |
+| `play_by_ref` | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #209 | 🚧 #462 | ✅ | 🚧 #462 |
+| `browse` | 🚧 #399 | 🚧 #402 | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | ✅ | 🚧 #462 |
+| `queue_read` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | ✅ | 🚧 #462 |
 | `queue_jump` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
 | `queue_reorder` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
 | `queue_remove` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
 | `queue_clear` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
 | `play_next` | 🚧 #399 | 🚧 #403 | 🚧 #392 | 🚧 #396 | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
-| `repeat_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
-| `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
-| `saved_playlists` | 🚧 #399 | 🚧 #403 | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
-| `favorites` | 🚧 #399 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
+| `repeat_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | 🚧 #209 | 🚧 #462 | ✅ | 🚧 #462 |
+| `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | 🚧 #209 | 🚧 #462 | ✅ | 🚧 #462 |
+| `saved_playlists` | 🚧 #399 | 🚧 #403 | ⛔ | ⛔ | 🚧 #209 | 🚧 #462 | ✅ | 🚧 #462 |
+| `favorites` | 🚧 #399 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | ✅ | 🚧 #462 |
 | `multiroom_sync` | 🚧 #360 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
 
 ✅ supported · ⛔ the provider's protocol cannot do it · 🚧 the provider can, UHC has not wired it (issue that will)
@@ -248,13 +238,11 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `search`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `search`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `search`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
-- 🚧 **spotify / `search`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **musicassistant / `search`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - ⛔ **openhome / `play_by_query`** — UHC discovers OpenHome zones by their av-openhome-org Product, Transport and Volume services (src/adapters/openhome.rs) and the OpenHome service set has no library: content is resolved by a control point against a separate media server. Verified from the OpenHome service definitions, not from a device.
 - ⛔ **upnp / `play_by_query`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `play_by_query`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `play_by_query`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
-- 🚧 **spotify / `play_by_query`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **musicassistant / `play_by_query`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `play_by_ref`** (#396) — RoonAdapter::browse/load/play_item exist and are exposed over HTTP; MCP mints no reference for a search hit to act on.
 - 🚧 **lms / `play_by_ref`** (#396) — the native taggedlist queries return durable entity ids (track_id/album_id/artist_id) that playlistcontrol accepts, verified live; MCP discards them and hands back a title. Note the XMLBrowser paths (globalsearch, favorites) return positional breadcrumbs instead, which is #396's safety problem, not a capability gap.
@@ -262,7 +250,6 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - 🚧 **upnp / `play_by_ref`** (#396) — the protocol can play a specific item -- UPnP AVTransport:1 takes SetAVTransportURI and SetNextAVTransportURI, OpenHome Playlist:1 takes Insert(AfterId, Uri, Metadata) -- so what is missing is UHC's ability to name one, not the device's ability to play it. Reported as a UHC gap rather than a provider limit, because a reference minted against a media server would work. Verified from the UPnP AV and OpenHome service definitions, not from a device.
 - 🚧 **hqplayer / `play_by_ref`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `play_by_ref`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
-- 🚧 **spotify / `play_by_ref`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **musicassistant / `play_by_ref`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `browse`** (#399) — RoonAdapter::browse() and load() exist and POST /roon/browse exposes them; only the MCP projection is missing.
 - 🚧 **lms / `browse`** (#402) — browselibrary items and the native albums/artists/genres/years/playlists/mediafolder queries walk the whole hierarchy with native <start> <n> paging -- all verified live on Lyrion 9.1.2. The adapter never calls any of them.
@@ -270,7 +257,6 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `browse`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `browse`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `browse`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
-- 🚧 **spotify / `browse`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **musicassistant / `browse`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `queue_read`** (#400) — the pinned roon-api fork exposes subscribe_queue(zone, max_items), which nothing in UHC calls.
 - 🚧 **lms / `queue_read`** (#400) — status <player> <start> <n> returns the whole current playlist with playlist_cur_index; verified live.
@@ -278,7 +264,6 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `queue_read`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `queue_read`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `queue_read`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
-- 🚧 **spotify / `queue_read`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **musicassistant / `queue_read`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `queue_jump`** (#400) — the pinned roon-api fork exposes play_from_here(zone, queue_item_id), which nothing in UHC calls.
 - 🚧 **lms / `queue_jump`** (#400) — playlist index <n> jumps to a queue position; verified live.
@@ -326,7 +311,6 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - 🚧 **upnp / `repeat_mode`** (#392) — AVTransport:1's SetPlayMode takes REPEAT_ONE and REPEAT_ALL, so repeat is a protocol feature UHC does not use. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `repeat_mode`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `repeat_mode`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
-- 🚧 **spotify / `repeat_mode`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **musicassistant / `repeat_mode`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `shuffle_mode`** (#360) — the Roon API's transport service takes a shuffle setting; UHC drives it from no surface.
 - 🚧 **lms / `shuffle_mode`** (#403) — playlist shuffle <0|1|2> and playlist shuffle ? read and write it; verified live. Setting it reshuffles the queue, so it is also a queue mutation.
@@ -334,7 +318,6 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - 🚧 **upnp / `shuffle_mode`** (#392) — AVTransport:1's SetPlayMode takes SHUFFLE and RANDOM, so shuffle is a protocol feature UHC does not use. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `shuffle_mode`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `shuffle_mode`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
-- 🚧 **spotify / `shuffle_mode`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **musicassistant / `shuffle_mode`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `saved_playlists`** (#399) — Roon exposes Playlists as a browse hierarchy, so this arrives with browse rather than as its own protocol feature.
 - 🚧 **lms / `saved_playlists`** (#403) — playlists / playlists tracks / playlistcontrol cmd:load playlist_id / playlists new / rename / delete all exist and were verified live. playlist save additionally needs a configured playlistdir, which is unset on a stock install -- so its own answer is three-state at the server level, which is why #403 probes pref playlistdir ?.
@@ -342,7 +325,6 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `saved_playlists`** — AVTransport:1 and RenderingControl:1 store nothing; a MediaRenderer has no playlist storage. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `saved_playlists`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `saved_playlists`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
-- 🚧 **spotify / `saved_playlists`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **musicassistant / `saved_playlists`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `favorites`** (#399) — Roon exposes My Favorites and tags as browse hierarchies, so this arrives with browse.
 - 🚧 **lms / `favorites`** (#403) — favorites items / favorites playlist play / add / delete / exists all work; verified live. Note LMS favorites have no durable id -- only a url -- so a ref must be minted over the url.
@@ -350,7 +332,6 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `favorites`** — AVTransport:1 and RenderingControl:1 store nothing; a MediaRenderer has no favourites. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `favorites`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `favorites`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
-- 🚧 **spotify / `favorites`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **musicassistant / `favorites`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `multiroom_sync`** (#360) — the Roon API's transport service groups and ungroups outputs; UHC exposes no grouping on any surface.
 - 🚧 **lms / `multiroom_sync`** (#403) — sync <playerid>, sync -, sync ? and the server-scoped syncgroups ? all work; verified live. Joining is destructive to the target zone's queue, which is why #403 gates it behind confirmation.

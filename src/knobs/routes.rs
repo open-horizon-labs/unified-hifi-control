@@ -574,12 +574,12 @@ async fn control_spotify(
         "vol_abs" | "volume" => {
             AdapterCommand::VolumeAbsolute(value.and_then(|v| v.as_f64()).unwrap_or(50.0) as i32)
         }
-        "vol_up" | "volume_up" => {
-            AdapterCommand::VolumeRelative(value.and_then(|v| v.as_f64()).unwrap_or(1.0) as i32)
-        }
-        "vol_down" | "volume_down" => {
-            AdapterCommand::VolumeRelative(-(value.and_then(|v| v.as_f64()).unwrap_or(1.0) as i32))
-        }
+        "vol_up" | "volume_up" => AdapterCommand::VolumeRelative(
+            value.and_then(|v| v.as_f64()).unwrap_or(1.0).round() as i32,
+        ),
+        "vol_down" | "volume_down" => AdapterCommand::VolumeRelative(
+            -(value.and_then(|v| v.as_f64()).unwrap_or(1.0).round() as i32),
+        ),
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
