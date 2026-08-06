@@ -30,6 +30,7 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 pub mod apple_bridge;
+pub mod credentials;
 pub mod provider_auth;
 
 /// Registry for provider adapters whose transport is not represented by a

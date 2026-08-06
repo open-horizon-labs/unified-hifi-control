@@ -68,6 +68,7 @@ POST /api/bridges/applemusic/commands/{command_id}
 POST /api/bridges/applemusic/pair
 POST /api/bridges/applemusic/revoke
 POST /api/bridges/applemusic/state
+POST /api/providers/{provider}/configure
 POST /api/providers/{provider}/oauth/revoke
 POST /api/settings
 POST /control

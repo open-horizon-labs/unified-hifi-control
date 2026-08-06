@@ -442,6 +442,7 @@ mod server {
         let api_oauth_start = api::provider_auth::oauth_start;
         let api_oauth_callback = api::provider_auth::oauth_callback;
         let api_oauth_revoke = api::provider_auth::oauth_revoke;
+        let api_spotify_configure = api::provider_auth::configure_spotify;
         let api_bridge_pair = api::apple_bridge::pair;
         let api_bridge_claim = api::apple_bridge::claim;
         let api_bridge_revoke = api::apple_bridge::revoke;
@@ -457,6 +458,7 @@ mod server {
             .route("/api/providers/{provider}/oauth/start", get(api_oauth_start))
             .route("/api/providers/{provider}/oauth/callback", get(api_oauth_callback))
             .route("/api/providers/{provider}/oauth/revoke", post(api_oauth_revoke))
+            .route("/api/providers/{provider}/configure", post(api_spotify_configure))
             .route("/api/bridges/applemusic/pair", post(api_bridge_pair))
             .route("/api/bridges/applemusic/claim", post(api_bridge_claim))
             .route("/api/bridges/applemusic/revoke", post(api_bridge_revoke))

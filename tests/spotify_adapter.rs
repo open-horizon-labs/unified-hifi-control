@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use axum::{
     extract::State,
     http::{Method, StatusCode, Uri},
@@ -8,9 +9,24 @@ use axum::{
     Json, Router,
 };
 use tokio::net::TcpListener;
-use unified_hifi_control::adapters::spotify::{SpotifyAdapter, SpotifyDevice, SpotifyToken};
+use unified_hifi_control::adapters::spotify::{
+    SpotifyAdapter, SpotifyDevice, SpotifyToken, SpotifyTokenRefresher,
+};
 use unified_hifi_control::adapters::{AdapterCommand, AdapterLogic, Startable};
 use unified_hifi_control::bus::create_bus;
+
+struct RefreshingToken;
+
+#[async_trait]
+impl SpotifyTokenRefresher for RefreshingToken {
+    async fn refresh(&self, _current: &SpotifyToken) -> anyhow::Result<SpotifyToken> {
+        Ok(SpotifyToken {
+            access_token: "fresh".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some(u64::MAX),
+        })
+    }
+}
 
 #[derive(Clone, Default)]
 struct MockSpotifyState {
@@ -112,6 +128,20 @@ async fn adapter_without_token_cannot_start() {
         .expect("unsupported adapter command should be a response");
     assert!(!result.success);
     assert!(result.error.expect("error").contains("token"));
+}
+
+#[tokio::test]
+async fn expired_persisted_token_can_start_when_refresh_is_available() {
+    let adapter = SpotifyAdapter::new(create_bus());
+    adapter
+        .set_token(SpotifyToken {
+            access_token: "expired".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            expires_at: Some(0),
+        })
+        .await;
+    adapter.set_token_refresher(Arc::new(RefreshingToken)).await;
+    assert!(adapter.can_start().await);
 }
 
 #[tokio::test]

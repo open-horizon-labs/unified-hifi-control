@@ -15,6 +15,7 @@ use reqwest::{Client, Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -38,13 +39,35 @@ const SPOTIFY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// `expires_at` is a Unix timestamp in seconds. The token itself is not
 /// refreshed here: refresh-token exchange needs the client credentials and
 /// redirect policy owned by the shared authorization layer (#463).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpotifyToken {
     pub access_token: String,
     #[serde(default)]
     pub refresh_token: Option<String>,
     #[serde(default)]
     pub expires_at: Option<u64>,
+}
+
+impl fmt::Debug for SpotifyToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SpotifyToken")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Refreshes an expired Spotify access token. The authorization layer owns the
+/// provider client credentials and durable storage; the adapter only invokes
+/// this narrow callback immediately before a Web API request.
+#[async_trait]
+pub trait SpotifyTokenRefresher: Send + Sync {
+    async fn refresh(&self, current: &SpotifyToken) -> Result<SpotifyToken>;
 }
 
 impl SpotifyToken {
@@ -192,7 +215,7 @@ struct DevicesResponse {
     devices: Vec<SpotifyDevice>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct SpotifyState {
     token: Option<SpotifyToken>,
     devices: HashMap<String, SpotifyDevice>,
@@ -208,6 +231,7 @@ pub struct SpotifyAdapter {
     api_base_url: String,
     bus: SharedBus,
     shutdown: Arc<RwLock<CancellationToken>>,
+    refresher: Arc<RwLock<Option<Arc<dyn SpotifyTokenRefresher>>>>,
 }
 
 impl SpotifyAdapter {
@@ -229,12 +253,28 @@ impl SpotifyAdapter {
             api_base_url: api_base_url.trim_end_matches('/').to_string(),
             bus,
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
+            refresher: Arc::new(RwLock::new(None)),
         }
     }
 
     /// Install or replace the token supplied by the authorization layer.
     pub async fn set_token(&self, token: SpotifyToken) {
         self.state.write().await.token = Some(token);
+    }
+
+    /// Install the authorization-layer refresh callback.
+    pub async fn set_token_refresher(&self, refresher: Arc<dyn SpotifyTokenRefresher>) {
+        *self.refresher.write().await = Some(refresher);
+    }
+
+    /// Return the in-memory token metadata without exposing it through HTTP.
+    pub async fn token_metadata(&self) -> Option<(bool, Option<u64>)> {
+        self.state
+            .read()
+            .await
+            .token
+            .as_ref()
+            .map(|token| (!token.is_expired(now_secs()), token.expires_at))
     }
 
     /// Remove credentials and cached provider state.
@@ -247,12 +287,15 @@ impl SpotifyAdapter {
 
     /// Return whether an unexpired access token is available.
     pub async fn is_configured(&self) -> bool {
-        let state = self.state.read().await;
-        state
-            .token
-            .as_ref()
-            .map(|token| !token.access_token.is_empty() && !token.is_expired(now_secs()))
-            .unwrap_or(false)
+        let token = self.state.read().await.token.clone();
+        let Some(token) = token else { return false };
+        if token.access_token.is_empty() {
+            return false;
+        }
+        if !token.is_expired(now_secs()) {
+            return true;
+        }
+        token.refresh_token.is_some() && self.refresher.read().await.is_some()
     }
 
     /// Return the last device inventory fetched from Spotify.
@@ -305,25 +348,50 @@ impl SpotifyAdapter {
     }
 
     async fn request(&self, method: Method, path: &str) -> Result<reqwest::Response> {
-        let token = {
-            let state = self.state.read().await;
-            state.token.clone()
-        }
-        .ok_or_else(|| anyhow!("Spotify access token is not configured"))?;
-        if token.access_token.is_empty() {
-            return Err(anyhow!("Spotify access token is empty"));
-        }
-        if token.is_expired(now_secs()) {
-            return Err(anyhow!(
-                "Spotify access token is expired; authorize Spotify again"
-            ));
-        }
+        let access_token = self.ensure_access_token().await?;
         self.client
             .request(method, format!("{}{}", self.api_base_url, path))
-            .bearer_auth(token.access_token)
+            .bearer_auth(access_token)
             .send()
             .await
             .map_err(|e| anyhow!("Spotify request {} failed: {}", path, e))
+    }
+
+    async fn ensure_access_token(&self) -> Result<String> {
+        let token = self
+            .state
+            .read()
+            .await
+            .token
+            .clone()
+            .ok_or_else(|| anyhow!("Spotify access token is not configured"))?;
+        if token.access_token.is_empty() {
+            return Err(anyhow!("Spotify access token is empty"));
+        }
+        if !token.is_expired(now_secs()) {
+            return Ok(token.access_token);
+        }
+        let refresher =
+            self.refresher.read().await.clone().ok_or_else(|| {
+                anyhow!("Spotify access token is expired; authorize Spotify again")
+            })?;
+        let refreshed = match refresher.refresh(&token).await {
+            Ok(token) => token,
+            Err(error) => {
+                // A failed refresh (especially invalid_grant) must not leave an
+                // expired token in memory for every subsequent poll/command.
+                self.state.write().await.token = None;
+                return Err(error);
+            }
+        };
+        if refreshed.access_token.is_empty() {
+            return Err(anyhow!(
+                "Spotify token refresh returned an empty access token"
+            ));
+        }
+        let access_token = refreshed.access_token.clone();
+        self.state.write().await.token = Some(refreshed);
+        Ok(access_token)
     }
 
     async fn request_json<T: for<'de> Deserialize<'de>>(
