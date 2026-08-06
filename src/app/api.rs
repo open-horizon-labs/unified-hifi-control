@@ -121,6 +121,8 @@ pub struct SpotifyAccount {
 pub struct SpotifyAccountResponse {
     pub account: Option<SpotifyAccount>,
     #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
     pub error: Option<String>,
 }
 

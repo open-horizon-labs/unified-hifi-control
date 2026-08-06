@@ -112,6 +112,12 @@ impl ProviderAuthState {
     async fn spotify(&self) -> Option<Arc<SpotifyAdapter>> {
         self.spotify.read().await.clone()
     }
+
+    /// Whether a valid Spotify client configuration is available. This only
+    /// reports configuration presence; it never exposes client credentials.
+    pub async fn spotify_configured(&self) -> bool {
+        self.oauth.read().await.is_some()
+    }
 }
 
 #[derive(Debug, Serialize)]

@@ -2246,6 +2246,11 @@ pub async fn api_settings_get_handler() -> impl IntoResponse {
 #[derive(Debug, Serialize)]
 pub struct SpotifyAccountResponse {
     pub account: Option<ProviderAccount>,
+    /// Whether UHC has a persisted Spotify client configuration. This is
+    /// deliberately non-secret and lets the UI distinguish configured from
+    /// unconfigured even when Spotify profile lookup is unavailable.
+    #[serde(default)]
+    pub configured: bool,
     pub error: Option<String>,
 }
 
@@ -2256,6 +2261,7 @@ pub async fn spotify_account_handler(
 ) -> Json<SpotifyAccountResponse> {
     Json(SpotifyAccountResponse {
         account: state.aggregator.get_provider_account("spotify").await,
+        configured: state.provider_auth.spotify_configured().await,
         error: state.aggregator.get_adapter_error("spotify").await,
     })
 }

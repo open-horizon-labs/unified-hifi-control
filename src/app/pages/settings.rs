@@ -116,7 +116,7 @@ impl ProviderActionState {
         match self {
             Self::Idle | Self::Loading => None,
             Self::Success => Some("Updated."),
-            Self::Failed => Some("Something went wrong. Try again or use local setup."),
+            Self::Failed => Some("Something went wrong. Try again or open Client settings."),
         }
     }
 }
@@ -141,7 +141,7 @@ fn callback_feedback() -> Option<&'static str> {
     if search.contains("spotify=connected") || search.contains("oauth=success") {
         Some("Spotify connected. Refreshing available devices…")
     } else if search.contains("spotify=error") || search.contains("oauth=error") {
-        Some("Spotify authorization did not complete. Try Connect again or use local setup.")
+        Some("Spotify authorization did not complete. Try Connect again or open Client settings.")
     } else {
         None
     }
@@ -502,6 +502,12 @@ pub fn Settings() -> Element {
         .as_ref()
         .and_then(|response| response.account.as_ref())
         .is_some();
+    let spotify_configured = spotify_account_result
+        .as_ref()
+        .map(|response| response.configured)
+        .unwrap_or(false)
+        || spotify_connected
+        || spotify_local_setup_saved();
     let musicassistant_zones = provider_zones_result
         .as_ref()
         .and_then(|result| result.as_ref().ok())
@@ -850,9 +856,8 @@ pub fn Settings() -> Element {
                 }
 
                 div { class: if spotify_enabled() && applemusic_enabled() { "grid gap-4 md:grid-cols-2" } else { "grid gap-4 md:grid-cols-1" },
-                    // Spotify: hosted OAuth and local-token guidance are
-                    // intentionally separate so users know which authority
-                    // owns their credentials.
+                    // Keep authorization and client settings as separate
+                    // actions so the credential boundary stays explicit.
                     if spotify_enabled() {
                     div { class: "card p-5 sm:p-6", aria_labelledby: "spotify-heading",
                         div { class: "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between",
@@ -889,7 +894,7 @@ pub fn Settings() -> Element {
                                 span { class: "badge badge-secondary shrink-0", "Disabled" }
                             } else if spotify_connected {
                                 span { class: "badge badge-success shrink-0", "Connected" }
-                            } else if spotify_local_setup_saved() {
+                            } else if spotify_configured {
                                 span { class: "badge badge-secondary shrink-0", "Configured" }
                             } else {
                                 span { class: "badge badge-secondary shrink-0", "Not connected" }
@@ -900,15 +905,31 @@ pub fn Settings() -> Element {
                             p { class: "mt-4 status-ok", role: "status", aria_live: "polite", "{message}" }
                         }
 
-                        if spotify_connected && !spotify_editing() {
+                        if spotify_configured && !spotify_editing() {
                             div { class: "mt-5 rounded-md bg-hover p-4", role: "status", aria_live: "polite",
                                 p { class: "font-medium", "Spotify is configured on this UHC server." }
-                                p { class: "mt-1 text-sm text-secondary", "OAuth credentials are stored server-side and refreshed automatically. Use Reconnect Spotify below only if you need to change the account." }
-                                button {
-                                    r#type: "button",
-                                    class: "btn btn-ghost mt-3 min-h-11",
-                                    onclick: move |_| spotify_editing.set(true),
-                                    "Edit client settings"
+                                p { class: "mt-1 text-sm text-secondary",
+                                    if spotify_connected {
+                                        "OAuth credentials are stored server-side and refreshed automatically."
+                                    } else {
+                                        "Client settings are saved. Connect Spotify to authorize an account; secrets stay on this UHC server."
+                                    }
+                                }
+                                div { class: "mt-3 flex flex-wrap gap-3",
+                                    button {
+                                        r#type: "button",
+                                        class: "btn btn-primary min-h-11",
+                                        disabled: spotify_action() == ProviderActionState::Loading,
+                                        aria_busy: spotify_action() == ProviderActionState::Loading,
+                                        onclick: start_spotify_oauth,
+                                        if spotify_connected { "Reconnect Spotify" } else { "Connect Spotify" }
+                                    }
+                                    button {
+                                        r#type: "button",
+                                        class: "btn btn-ghost min-h-11",
+                                        onclick: move |_| spotify_editing.set(true),
+                                        "Edit client settings"
+                                    }
                                 }
                             }
                         } else {
@@ -925,7 +946,7 @@ pub fn Settings() -> Element {
                                     if spotify_action() == ProviderActionState::Loading { "Opening Spotify…" } else if spotify_local_setup_saved() { "Connect Spotify" } else { "Save setup first" }
                                 }
                                 if !spotify_local_setup_saved() {
-                                    p { class: "mt-2 text-xs text-muted", "Enter and save your Spotify client ID in Local setup before connecting." }
+                                    p { class: "mt-2 text-xs text-muted", "Enter and save your Spotify client ID in Client settings before connecting." }
                                 }
                             }
                             div { class: "rounded-md border border-default p-4",
@@ -988,7 +1009,7 @@ pub fn Settings() -> Element {
                                     disabled: spotify_action() == ProviderActionState::Loading,
                                     aria_busy: spotify_action() == ProviderActionState::Loading,
                                     onclick: save_spotify_local,
-                                    if spotify_action() == ProviderActionState::Loading { "Saving…" } else { "Save local setup" }
+                                    if spotify_action() == ProviderActionState::Loading { "Saving…" } else { "Save client settings" }
                                 }
                                 p { class: "mt-2 text-xs text-muted", "Secrets are never returned to this page. Use Connect after saving to authorize the account." }
                             }
@@ -1042,13 +1063,6 @@ pub fn Settings() -> Element {
                         }
 
                         div { class: "mt-5 flex flex-wrap gap-3 border-t border-default pt-4",
-                            button {
-                                r#type: "button",
-                                class: "btn btn-outline min-h-11",
-                                disabled: spotify_action() == ProviderActionState::Loading,
-                                onclick: start_spotify_oauth,
-                                "Reconnect Spotify"
-                            }
                             button {
                                 r#type: "button",
                                 class: "btn btn-ghost min-h-11",
