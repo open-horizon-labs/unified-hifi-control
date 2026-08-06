@@ -834,6 +834,7 @@ pub fn Settings() -> Element {
                     // Spotify: hosted OAuth and local-token guidance are
                     // intentionally separate so users know which authority
                     // owns their credentials.
+                    if spotify_enabled() {
                     div { class: "card p-5 sm:p-6", aria_labelledby: "spotify-heading",
                         div { class: "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between",
                             div {
@@ -872,6 +873,11 @@ pub fn Settings() -> Element {
                             div { class: "rounded-md border border-default p-4",
                                 h4 { class: "font-medium", "Local setup" }
                                 p { class: "mt-2 text-sm text-secondary", "Use this when UHC is self-hosted or running on another machine. UHC stores the OAuth client settings server-side and refreshes access automatically." }
+                                p { class: "mt-2 text-sm text-secondary",
+                                    "Create or manage your Spotify app in the "
+                                    a { href: "https://developer.spotify.com/dashboard", target: "_blank", rel: "noopener noreferrer", class: "link", "Spotify Developer Dashboard" }
+                                    ". Copy its Client ID and Client Secret here."
+                                }
                                 div { class: "mt-4 rounded-md bg-hover p-3", aria_label: "Remote UHC setup instructions",
                                     h5 { class: "font-medium", "Using UHC from another device?" }
                                     p { class: "mt-1 text-sm text-secondary", "Start a temporary HTTPS tunnel to this UHC server, then open the tunnel URL in this browser. The callback below will follow that secure origin." }
@@ -997,9 +1003,11 @@ pub fn Settings() -> Element {
                             }
                         }
                     }
+                    }
 
                     // Apple Music is paired through the native MusicKit app;
                     // keep this card focused on status and the next action.
+                    if applemusic_enabled() {
                     div { class: "card p-5 sm:p-6", aria_labelledby: "apple-music-heading",
                         div { class: "flex items-start justify-between gap-3",
                             div {
@@ -1048,6 +1056,7 @@ pub fn Settings() -> Element {
                             },
                             "Refresh companion status"
                         }
+                    }
                     }
                 }
                 }
