@@ -1865,7 +1865,7 @@ pub async fn lms_configure_handler(
     Json(req): Json<LmsConfigRequest>,
 ) -> impl IntoResponse {
     // Stop existing connection if any
-    state.lms.stop().await;
+    stop_adapter_and_flush_zones(state.lms.as_ref(), &state.bus).await;
 
     // Configure new connection
     state
@@ -2634,7 +2634,7 @@ pub async fn api_settings_get_handler() -> impl IntoResponse {
 /// but until this fix nothing ever published that event, so a disabled
 /// adapter's zones stayed listed in `/zones`, `hifi_zones`, and (since #397)
 /// MCP resources, forever (issue #429).
-async fn stop_adapter_and_flush_zones(adapter: &Arc<dyn Startable>, bus: &SharedBus) {
+async fn stop_adapter_and_flush_zones(adapter: &dyn Startable, bus: &SharedBus) {
     bus.publish(BusEvent::AdapterStopping {
         adapter: adapter.name().to_string(),
         reason: Some("disabled via settings".to_string()),
@@ -2703,7 +2703,7 @@ pub async fn api_settings_post_handler(
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
-                stop_adapter_and_flush_zones(adapter, &state.bus).await;
+                stop_adapter_and_flush_zones(adapter.as_ref(), &state.bus).await;
             }
         }
     }
@@ -2780,7 +2780,7 @@ mod tests {
         );
 
         let adapter: Arc<dyn Startable> = Arc::new(FakeAdapter("lms"));
-        stop_adapter_and_flush_zones(&adapter, &bus).await;
+        stop_adapter_and_flush_zones(adapter.as_ref(), &bus).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         let remaining = aggregator.get_zones().await;

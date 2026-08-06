@@ -99,6 +99,21 @@ struct StopFacts {
 }
 
 impl<'ast> Visit<'ast> for StopFacts {
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let Expr::Path(path) = call.func.as_ref() {
+            if path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "stop_adapter_and_flush_zones")
+            {
+                self.events.push("flush");
+                self.events.push("stop");
+            }
+        }
+        visit::visit_expr_call(self, call);
+    }
+
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         if call.method == "publish" {
             let mut arguments = SyntaxFacts::default();
@@ -215,6 +230,11 @@ fn every_production_stop_route_flushes_before_stopping() {
             "settings disable",
             include_str!("../src/api/mod.rs"),
             "stop_adapter_and_flush_zones",
+        ),
+        (
+            "LMS reconfiguration",
+            include_str!("../src/api/mod.rs"),
+            "lms_configure_handler",
         ),
         (
             "coordinator shutdown",
