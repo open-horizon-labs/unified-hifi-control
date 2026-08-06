@@ -83,7 +83,8 @@ pub fn Zones() -> Element {
         if matches!(
             event.as_ref(),
             Some(
-                SseEvent::ZoneUpdated { .. }
+                SseEvent::ZoneDiscovered { .. }
+                    | SseEvent::ZoneUpdated { .. }
                     | SseEvent::ZoneRemoved { .. }
                     | SseEvent::RoonConnected
                     | SseEvent::RoonDisconnected

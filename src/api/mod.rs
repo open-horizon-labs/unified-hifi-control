@@ -207,6 +207,16 @@ impl AppState {
             anyhow::bail!(
                 "UPnP zones don't support image retrieval - the protocol doesn't expose album art URLs"
             )
+        } else if zone_id.starts_with("spotify:") {
+            let response = reqwest::get(image_key).await?;
+            let content_type = response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("image/jpeg")
+                .to_string();
+            let data = response.bytes().await?.to_vec();
+            ImageData { content_type, data }
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
             let img = self.roon.get_image(image_key, width, height).await?;
             ImageData {

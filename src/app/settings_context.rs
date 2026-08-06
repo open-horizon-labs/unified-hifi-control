@@ -16,6 +16,8 @@ pub struct SettingsContext {
     hqp_enabled: Signal<bool>,
     /// LMS adapter enabled (page visible when true)
     lms_enabled: Signal<bool>,
+    /// Spotify adapter enabled (page visible when true)
+    spotify_enabled: Signal<bool>,
     /// Whether settings have been loaded from server
     loaded: Signal<bool>,
 }
@@ -41,14 +43,27 @@ impl SettingsContext {
         !(self.lms_enabled)()
     }
 
+    /// Whether the Spotify page should be visible.
+    pub fn hide_spotify(&self) -> bool {
+        !(self.spotify_enabled)()
+    }
+
     /// Update settings - now takes adapter enabled states
-    pub fn update(&self, hide_knobs: bool, hqp_enabled: bool, lms_enabled: bool) {
+    pub fn update(
+        &self,
+        hide_knobs: bool,
+        hqp_enabled: bool,
+        lms_enabled: bool,
+        spotify_enabled: bool,
+    ) {
         let mut hk = self.hide_knobs;
         let mut he = self.hqp_enabled;
         let mut le = self.lms_enabled;
         hk.set(hide_knobs);
         he.set(hqp_enabled);
         le.set(lms_enabled);
+        let mut se = self.spotify_enabled;
+        se.set(spotify_enabled);
     }
 
     /// Mark settings as loaded
@@ -63,12 +78,14 @@ pub fn use_settings_provider() {
     let hide_knobs = use_signal(|| false);
     let hqp_enabled = use_signal(|| false);
     let lms_enabled = use_signal(|| false);
+    let spotify_enabled = use_signal(|| false);
     let loaded = use_signal(|| false);
 
     let ctx = SettingsContext {
         hide_knobs,
         hqp_enabled,
         lms_enabled,
+        spotify_enabled,
         loaded,
     };
 
@@ -87,6 +104,7 @@ pub fn use_settings_provider() {
                         settings.hide_knobs_page,
                         settings.adapters.hqplayer,
                         settings.adapters.lms,
+                        settings.adapters.spotify,
                     );
                     ctx.mark_loaded();
                 }

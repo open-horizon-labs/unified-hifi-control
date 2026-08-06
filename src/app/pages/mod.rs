@@ -6,10 +6,12 @@ mod hqplayer;
 mod knobs;
 mod lms;
 mod settings;
+mod spotify;
 mod zones;
 
 pub use hqplayer::HqPlayer;
 pub use knobs::Knobs;
 pub use lms::Lms;
 pub use settings::Settings;
+pub use spotify::Spotify;
 pub use zones::Zones;

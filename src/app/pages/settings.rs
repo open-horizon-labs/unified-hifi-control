@@ -287,7 +287,12 @@ pub fn Settings() -> Element {
             musicassistant_enabled.set(s.adapters.musicassistant);
             hide_knobs.set(s.hide_knobs_page);
             // Sync to shared context for Nav reactivity (page visibility follows adapter state)
-            settings_ctx.update(s.hide_knobs_page, s.adapters.hqplayer, s.adapters.lms);
+            settings_ctx.update(
+                s.hide_knobs_page,
+                s.adapters.hqplayer,
+                s.adapters.lms,
+                s.adapters.spotify,
+            );
             settings_ctx.mark_loaded();
         }
     });
@@ -451,7 +456,7 @@ pub fn Settings() -> Element {
         let lms = lms_enabled();
 
         // Update shared context immediately for reactive Nav updates
-        settings_ctx.update(hk, hqp, lms);
+        settings_ctx.update(hk, hqp, lms, spotify_enabled());
 
         let settings = AppSettings {
             adapters: AdapterSettings {

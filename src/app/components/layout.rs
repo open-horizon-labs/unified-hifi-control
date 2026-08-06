@@ -22,6 +22,9 @@ pub struct LayoutProps {
     /// Hide LMS tab in nav
     #[props(default = false)]
     pub hide_lms: bool,
+    /// Hide Spotify tab in nav
+    #[props(default = false)]
+    pub hide_spotify: bool,
     /// Hide Knobs tab in nav
     #[props(default = false)]
     pub hide_knobs: bool,
@@ -76,6 +79,7 @@ pub fn Layout(props: LayoutProps) -> Element {
             active: props.nav_active.clone(),
             hide_hqp: props.hide_hqp,
             hide_lms: props.hide_lms,
+            hide_spotify: props.hide_spotify,
             hide_knobs: props.hide_knobs,
         }
         main { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mt-4",

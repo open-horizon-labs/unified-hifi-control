@@ -15,6 +15,9 @@ pub struct NavProps {
     /// Hide LMS tab (fallback if settings not loaded)
     #[props(default = false)]
     pub hide_lms: bool,
+    /// Hide Spotify tab (fallback if settings not loaded)
+    #[props(default = false)]
+    pub hide_spotify: bool,
     /// Hide Knobs tab (fallback if settings not loaded)
     #[props(default = false)]
     pub hide_knobs: bool,
@@ -29,14 +32,20 @@ pub fn Nav(props: NavProps) -> Element {
     let settings_ctx = use_settings();
 
     // Use context values if loaded, otherwise fall back to props
-    let (hide_hqp, hide_lms, hide_knobs) = if settings_ctx.is_loaded() {
+    let (hide_hqp, hide_lms, hide_spotify, hide_knobs) = if settings_ctx.is_loaded() {
         (
             settings_ctx.hide_hqp(),
             settings_ctx.hide_lms(),
+            settings_ctx.hide_spotify(),
             settings_ctx.hide_knobs(),
         )
     } else {
-        (props.hide_hqp, props.hide_lms, props.hide_knobs)
+        (
+            props.hide_hqp,
+            props.hide_lms,
+            props.hide_spotify,
+            props.hide_knobs,
+        )
     };
 
     let nav_link_class = |page: &str| {
@@ -76,6 +85,9 @@ pub fn Nav(props: NavProps) -> Element {
                     if !hide_lms {
                         Link { class: nav_link_class("lms"), to: Route::Lms {}, "LMS" }
                     }
+                    if !hide_spotify {
+                        Link { class: nav_link_class("spotify"), to: Route::Spotify {}, "Spotify" }
+                    }
                     if !hide_knobs {
                         Link { class: nav_link_class("knobs"), to: Route::Knobs {}, "Knobs" }
                     }
@@ -113,6 +125,9 @@ pub fn Nav(props: NavProps) -> Element {
                     }
                     if !hide_lms {
                         Link { class: nav_link_class("lms"), to: Route::Lms {}, onclick: move |_| menu_open.set(false), "LMS" }
+                    }
+                    if !hide_spotify {
+                        Link { class: nav_link_class("spotify"), to: Route::Spotify {}, onclick: move |_| menu_open.set(false), "Spotify" }
                     }
                     if !hide_knobs {
                         Link { class: nav_link_class("knobs"), to: Route::Knobs {}, onclick: move |_| menu_open.set(false), "Knobs" }

@@ -19,6 +19,11 @@ pub struct ZonePayload {
     pub zone_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct ZoneDiscoveredPayload {
+    pub zone: crate::app::api::Zone,
+}
+
 /// Payload for LMS player events
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct LmsPlayerPayload {
@@ -53,6 +58,9 @@ pub enum SseEvent {
     // Roon events
     RoonConnected,
     RoonDisconnected,
+    ZoneDiscovered {
+        payload: ZoneDiscoveredPayload,
+    },
     ZoneUpdated {
         payload: ZonePayload,
     },
@@ -105,6 +113,7 @@ impl SseEvent {
     /// Extract zone_id from zone-related events
     pub fn zone_id(&self) -> Option<&str> {
         match self {
+            SseEvent::ZoneDiscovered { payload } => Some(&payload.zone.zone_id),
             SseEvent::ZoneUpdated { payload } => Some(&payload.zone_id),
             SseEvent::ZoneRemoved { payload } => Some(&payload.zone_id),
             SseEvent::NowPlayingChanged { payload } => Some(&payload.zone_id),
@@ -131,7 +140,8 @@ impl SseContext {
         matches!(
             self.last_event.read().as_ref(),
             Some(
-                SseEvent::ZoneUpdated { .. }
+                SseEvent::ZoneDiscovered { .. }
+                    | SseEvent::ZoneUpdated { .. }
                     | SseEvent::ZoneRemoved { .. }
                     | SseEvent::NowPlayingChanged { .. }
                     | SseEvent::SeekPositionChanged { .. }
@@ -171,6 +181,7 @@ impl SseContext {
             Some(SseEvent::LmsConnected | SseEvent::LmsDisconnected) => true,
             // ZoneUpdated with lms: prefix indicates LMS player state change
             Some(SseEvent::ZoneUpdated { payload }) => payload.zone_id.starts_with("lms:"),
+            Some(SseEvent::ZoneDiscovered { payload }) => payload.zone.zone_id.starts_with("lms:"),
             _ => false,
         }
     }
@@ -181,6 +192,7 @@ impl SseContext {
             Some(
                 SseEvent::RoonConnected
                     | SseEvent::RoonDisconnected
+                    | SseEvent::ZoneDiscovered { .. }
                     | SseEvent::OpenHomeDeviceFound
                     | SseEvent::OpenHomeDeviceLost
                     | SseEvent::UpnpRendererFound
@@ -196,6 +208,7 @@ impl SseContext {
             self.last_event.read().as_ref(),
             Some(
                 SseEvent::ZoneUpdated { .. }
+                    | SseEvent::ZoneDiscovered { .. }
                     | SseEvent::ZoneRemoved { .. }
                     | SseEvent::RoonConnected
                     | SseEvent::RoonDisconnected
