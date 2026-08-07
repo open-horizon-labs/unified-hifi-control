@@ -172,7 +172,7 @@ pub async fn list_resources(state: &AppState, hqplayer_enabled: bool) -> Vec<Res
         Resource {
             annotations: None,
             description: Some(
-                "All available playback zones (Roon, LMS, OpenHome, UPnP, HQPlayer), with \
+                "All available playback zones (Roon, LMS, OpenHome, UPnP, HQPlayer, Apple Music, Spotify, Music Assistant), with \
                  state, volume and mute. Same payload as the hifi_zones tool."
                     .to_string(),
             ),

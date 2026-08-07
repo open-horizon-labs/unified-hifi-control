@@ -286,7 +286,7 @@
     "annotations": {
       "readOnlyHint": true
     },
-    "description": "List all available playback zones (Roon, LMS, OpenHome, UPnP)",
+    "description": "List all available playback zones (Roon, LMS, OpenHome, UPnP, HQPlayer, Apple Music, Spotify, Music Assistant)",
     "inputSchema": {
       "properties": {},
       "type": "object"

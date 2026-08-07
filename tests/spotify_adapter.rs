@@ -263,10 +263,10 @@ async fn spotify_mock(
             }]
         }))
         .into_response(),
-        (Method::GET, "/me/tracks/contains") => {
+        (Method::GET, "/me/library/contains") => {
             Json(serde_json::json!([true, false])).into_response()
         }
-        (Method::POST, "/users/account-1/playlists") => Json(serde_json::json!({
+        (Method::POST, "/me/playlists") => Json(serde_json::json!({
             "id": "playlist-2",
             "name": "New Playlist",
             "uri": "spotify:playlist:playlist-2",
@@ -290,8 +290,8 @@ async fn spotify_mock(
             "snapshot_id": "snapshot-remove"
         }))
         .into_response(),
-        (Method::PUT, "/me/tracks") => StatusCode::NO_CONTENT.into_response(),
-        (Method::DELETE, "/me/tracks") => StatusCode::NO_CONTENT.into_response(),
+        (Method::PUT, "/me/library") => StatusCode::NO_CONTENT.into_response(),
+        (Method::DELETE, "/me/library") => StatusCode::NO_CONTENT.into_response(),
         _ => StatusCode::NO_CONTENT.into_response(),
     }
 }
@@ -731,10 +731,10 @@ async fn catalog_playlists_saved_tracks_and_playlist_edits_use_spotify_endpoints
         .any(|request| request.starts_with("GET /me/tracks?")));
     assert!(requests
         .iter()
-        .any(|request| request.starts_with("GET /me/tracks/contains?")));
+        .any(|request| request.starts_with("GET /me/library/contains?")));
     assert!(requests
         .iter()
-        .any(|request| request == "POST /users/account-1/playlists"));
+        .any(|request| request == "POST /me/playlists"));
     assert!(requests
         .iter()
         .any(|request| request == "PUT /playlists/playlist-1"));
@@ -749,13 +749,16 @@ async fn catalog_playlists_saved_tracks_and_playlist_edits_use_spotify_endpoints
         .any(|request| request == "DELETE /playlists/playlist-1/items"));
     assert!(requests
         .iter()
-        .any(|request| request.starts_with("PUT /me/tracks?ids=")));
+        .any(|request| request.starts_with("PUT /me/library?uris=")));
     assert!(requests
         .iter()
-        .any(|request| request.starts_with("DELETE /me/tracks?ids=")));
+        .any(|request| request.starts_with("DELETE /me/library?uris=")));
     let bodies = mock.bodies.lock().expect("mock body lock").clone();
     assert!(bodies.iter().any(|body| body.contains("New Playlist")));
     assert!(bodies.iter().any(|body| body.contains("track-1")));
+    assert!(bodies
+        .iter()
+        .any(|body| body.contains("\"items\"") && !body.contains("\"tracks\"")));
     server.abort();
 }
 

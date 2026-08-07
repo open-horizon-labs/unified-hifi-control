@@ -721,22 +721,22 @@ impl SpotifyAdapter {
 
     /// Check which Spotify track IDs are in the user's saved library.
     pub async fn check_saved_tracks(&self, ids: &[String]) -> Result<Vec<bool>> {
-        let ids = spotify_ids(ids)?;
-        let path = format!("/me/tracks/contains?ids={ids}");
+        let uris = spotify_track_uris(ids)?;
+        let path = format!("/me/library/contains?uris={uris}");
         self.request_json(Method::GET, &path).await
     }
 
     /// Save tracks to the user's Spotify library.
     pub async fn save_tracks(&self, ids: &[String]) -> Result<()> {
-        let ids = spotify_ids(ids)?;
-        self.send_command(Method::PUT, &format!("/me/tracks?ids={ids}"))
+        let uris = spotify_track_uris(ids)?;
+        self.send_library_command(Method::PUT, &format!("/me/library?uris={uris}"))
             .await
     }
 
     /// Remove tracks from the user's Spotify library.
     pub async fn remove_saved_tracks(&self, ids: &[String]) -> Result<()> {
-        let ids = spotify_ids(ids)?;
-        self.send_command(Method::DELETE, &format!("/me/tracks?ids={ids}"))
+        let uris = spotify_track_uris(ids)?;
+        self.send_library_command(Method::DELETE, &format!("/me/library?uris={uris}"))
             .await
     }
 
@@ -752,15 +752,14 @@ impl SpotifyAdapter {
         if name.is_empty() {
             return Err(anyhow!("Spotify playlist name cannot be empty"));
         }
-        let account = self.fetch_account().await?;
-        let path = format!("/users/{}/playlists", urlencoding::encode(&account.id));
         let body = serde_json::json!({
             "name": name,
             "public": public,
             "collaborative": collaborative,
             "description": description.unwrap_or_default(),
         });
-        self.request_json_body(Method::POST, &path, &body).await
+        self.request_json_body(Method::POST, "/me/playlists", &body)
+            .await
     }
 
     /// Update playlist metadata without changing its item list.
@@ -857,7 +856,7 @@ impl SpotifyAdapter {
             .iter()
             .map(|uri| serde_json::json!({"uri": uri}))
             .collect();
-        let mut body = serde_json::json!({"tracks": tracks});
+        let mut body = serde_json::json!({"items": tracks});
         if let Some(snapshot_id) = snapshot_id.filter(|value| !value.is_empty()) {
             body["snapshot_id"] = serde_json::json!(snapshot_id);
         }
@@ -1199,6 +1198,19 @@ impl SpotifyAdapter {
     }
 
     async fn send_command(&self, method: Method, path: &str) -> Result<()> {
+        self.send_command_with_context(method, path, true).await
+    }
+
+    async fn send_library_command(&self, method: Method, path: &str) -> Result<()> {
+        self.send_command_with_context(method, path, false).await
+    }
+
+    async fn send_command_with_context(
+        &self,
+        method: Method,
+        path: &str,
+        playback_control: bool,
+    ) -> Result<()> {
         let response = self.request(method, path).await?;
         let status = response.status();
         if status.is_success() || status == StatusCode::NO_CONTENT {
@@ -1209,12 +1221,12 @@ impl SpotifyAdapter {
             .ok()
             .and_then(|json| json["error"]["message"].as_str().map(str::to_string))
             .unwrap_or_else(|| body.chars().take(240).collect());
-        if status == StatusCode::FORBIDDEN {
+        if playback_control && status == StatusCode::FORBIDDEN {
             return Err(anyhow!(
                 "Spotify playback control requires a Premium account: {detail}"
             ));
         }
-        if status == StatusCode::TOO_MANY_REQUESTS {
+        if playback_control && status == StatusCode::TOO_MANY_REQUESTS {
             return Err(anyhow!(
                 "Spotify playback control is rate limited; try again shortly: {detail}"
             ));
@@ -1705,6 +1717,16 @@ fn spotify_ids(ids: &[String]) -> Result<String> {
         ));
     }
     Ok(urlencoding::encode(&ids.join(",")).into_owned())
+}
+
+fn spotify_track_uris(ids: &[String]) -> Result<String> {
+    let _ = spotify_ids(ids)?;
+    let uris = ids
+        .iter()
+        .map(|id| format!("spotify:track:{}", id.trim()))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(urlencoding::encode(&uris).into_owned())
 }
 
 fn spotify_playlist_id(playlist_id: &str) -> Result<String> {
