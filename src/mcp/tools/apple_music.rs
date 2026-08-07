@@ -45,6 +45,9 @@ pub struct HifiAppleMusicTool {
     /// Maximum number of entries to return.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Ordered short-lived opaque refs for queue_plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<String>>,
 }
 
 pub async fn handle_apple_music(
@@ -103,6 +106,79 @@ pub async fn handle_apple_music(
             );
     }
 
+    if args.action == "queue_plan" {
+        let Some(zone_id) = args.zone_id.as_deref() else {
+            return Envelope::write("hifi_apple_music", "queue_plan").refused(
+                "queue_plan requires an applemusic execution-owner zone_id.",
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "Choose the named Apple Music companion that owns playback.",
+                ),
+            );
+        };
+        if !zone_id.starts_with("applemusic:") {
+            return Envelope::write("hifi_apple_music", "queue_plan").refused(
+                "queue_plan can target only an applemusic zone.",
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "AirPlay routes are destinations, not execution-owner zones.",
+                ),
+            );
+        }
+        let Some(items) = args.items.as_ref() else {
+            return Envelope::write("hifi_apple_music", "queue_plan").refused(
+                "queue_plan requires an ordered items array of opaque Apple Music refs.",
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "items",
+                    &["an array of refs returned by hifi_search"],
+                    "Search first, then pass the selected refs in the desired order.",
+                ),
+            );
+        };
+        let mut plan_items = Vec::with_capacity(items.len());
+        for token in items {
+            let Some(crate::mcp::refs::RefTarget::AppleMusic { title, .. }) =
+                state.mcp_refs.resolve(token).await
+            else {
+                return Envelope::write("hifi_apple_music", "queue_plan").refused(
+                    "queue_plan contains an unknown, expired, or cross-provider ref.",
+                    crate::mcp::envelope::Refusal::UnknownTarget {
+                        parameter: "items",
+                        discover_with: "hifi_search",
+                        detail:
+                            "Search again for fresh Apple Music refs before replacing the plan."
+                                .to_string(),
+                    },
+                );
+            };
+            plan_items.push(crate::mcp::listening_plan::ListeningPlanItem {
+                reference: token.clone(),
+                title,
+            });
+        }
+        let params = json!({
+            "zone_id": zone_id,
+            "items": items,
+            "confirm": confirmed,
+        });
+        let env = Envelope::write("hifi_apple_music", "queue_plan")
+            .param("action", "queue_plan")
+            .param("zone_id", zone_id);
+        return match state
+            .adapter_registry
+            .library_content("applemusic", "queue_plan", &params)
+            .await
+        {
+            Ok(value) => {
+                let plan = state.listening_plans.replace(zone_id, plan_items).await;
+                Ok(env.json_result(&json!({"plan": plan, "companion": value})))
+            }
+            Err(e) => env.failed(format!("Apple Music queue plan failed: {}", e)),
+        };
+    }
+
     let params = json!({
         "id": args.id,
         "query": args.query,
@@ -112,6 +188,7 @@ pub async fn handle_apple_music(
         "description": args.description,
         "confirm": confirmed,
         "limit": args.limit,
+        "items": args.items,
     });
     let env =
         Envelope::write("hifi_apple_music", "apple_music_content").param("action", &*args.action);

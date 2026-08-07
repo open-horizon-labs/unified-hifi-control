@@ -145,6 +145,7 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
             "description",
             "confirm",
             "limit",
+            "items",
         ],
         "hifi_hqplayer_load_profile" => &["profile"],
         "hifi_hqplayer_set_pipeline" => &["setting", "value"],

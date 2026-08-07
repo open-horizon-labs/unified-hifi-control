@@ -218,6 +218,9 @@ pub struct AppState {
     /// constructor parameter -- like `sse_connections` above -- so every
     /// existing `AppState::new` call site is untouched by this addition.
     pub mcp_refs: crate::mcp::refs::RefTable,
+    /// UHC-owned requested listening sequences, separate from provider queue
+    /// observations (#483).
+    pub listening_plans: crate::mcp::listening_plan::ListeningPlanStore,
 }
 
 impl AppState {
@@ -258,6 +261,7 @@ impl AppState {
             shutdown,
             sse_connections: Arc::new(AtomicUsize::new(0)),
             mcp_refs: crate::mcp::refs::RefTable::new(),
+            listening_plans: crate::mcp::listening_plan::ListeningPlanStore::default(),
         }
     }
 

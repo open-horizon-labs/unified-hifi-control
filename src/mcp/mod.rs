@@ -36,6 +36,7 @@
 pub mod capabilities;
 pub mod envelope;
 pub mod handler;
+pub mod listening_plan;
 pub mod refs;
 pub mod resources;
 pub mod routing;

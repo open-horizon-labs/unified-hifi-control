@@ -22,6 +22,14 @@
           "nullable": true,
           "type": "string"
         },
+        "items": {
+          "description": "Ordered short-lived opaque refs for queue_plan.",
+          "items": {
+            "type": "string"
+          },
+          "nullable": true,
+          "type": "array"
+        },
         "limit": {
           "description": "Maximum number of entries to return.",
           "nullable": true,
