@@ -1246,16 +1246,7 @@ pub fn Settings() -> Element {
                             }
                         }
                         p { class: "mt-4 text-sm text-secondary", "Run companions on your iPhone, iPad, or Mac, authorize Apple Music on each device, then pair each one with UHC using a short-lived code. Each companion is an independent Apple Music zone; credentials stay on the device." }
-                        p { class: "mt-3 text-sm text-secondary",
-                            "Catalog and library requests also require MusicKit enabled for the companion's explicit App ID. "
-                            a {
-                                class: "link",
-                                href: "https://developer.apple.com/account/resources/identifiers/list",
-                                target: "_blank",
-                                rel: "noopener noreferrer",
-                                "Enable MusicKit in Apple Developer"
-                            }
-                        }
+                        p { class: "mt-3 text-sm text-secondary", "Catalog and library access uses the same signed companion and Apple Music account." }
                         if let Some(ref status) = apple_st {
                             if status.companions.is_empty() {
                                 p { class: "mt-4 text-sm text-muted", role: "status", aria_live: "polite", "No companion is paired yet." }
