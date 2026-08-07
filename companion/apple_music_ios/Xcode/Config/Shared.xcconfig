@@ -24,9 +24,8 @@ TARGETED_DEVICE_FAMILY = 1,2
 // ==========================================
 // Info PLIST
 // ==========================================
-GENERATE_INFOPLIST_FILE = YES
-INFOPLIST_KEY_NSAppleMusicUsageDescription = UHC uses Apple Music to control the session you choose on this iPhone.
-INFOPLIST_KEY_NSLocalNetworkUsageDescription = UHC uses your local network to reach your paired UHC server.
+GENERATE_INFOPLIST_FILE = NO
+INFOPLIST_FILE = Config/AppleMusicIOSCompanionHost-Info.plist
 INFOPLIST_KEY_UISupportedInterfaceOrientations = UIInterfaceOrientationLandscapeRight UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationPortrait
 INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = UIInterfaceOrientationLandscapeRight UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown
 

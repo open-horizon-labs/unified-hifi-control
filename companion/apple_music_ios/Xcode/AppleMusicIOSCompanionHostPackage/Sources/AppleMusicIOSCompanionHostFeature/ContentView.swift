@@ -11,8 +11,7 @@ func newAppleMusicCompanionInstallation() -> AppleMusicCompanionInstallation {
 @MainActor
 private final class CompanionModel: ObservableObject {
     @Published private(set) var status = "Not authorized"
-    @Published var uhcURL = "http://127.0.0.1:18088"
-    @Published var bridgeID = ""
+    private let bridgeID: String
     @Published private(set) var pairingCode = ""
     @Published private(set) var isPaired = false
     private let installationStore: KeychainAppleMusicCompanionInstallationStore
@@ -20,6 +19,7 @@ private final class CompanionModel: ObservableObject {
     private var host: AppleMusicCompanionHost
     private let player = SystemMusicPlayerCompanion()
     private var pollTask: Task<Void, Never>?
+    private var discovery: UHCBonjourDiscovery?
 
     init() {
         let store = KeychainAppleMusicCompanionInstallationStore()
@@ -36,42 +36,43 @@ private final class CompanionModel: ObservableObject {
             installation = fresh
         }
         companionID = installation.companionID
-        uhcURL = installation.baseURL.absoluteString
         host = AppleMusicCompanionHost(installation: installation, store: store)
         bridgeID = installation.bridgeID ?? companionID
         isPaired = installation.accessToken != nil
         status = isPaired ? "Paired; waiting for snapshots" : "Not authorized"
     }
 
-    func authorize() { Task { @MainActor in do { _ = try await host.authorize(); status = "Authorized; enter a UHC pairing code" } catch { status = error.localizedDescription } } }
+    func authorize() { Task { @MainActor in do { _ = try await host.authorize(); status = "Authorized; find your UHC server to pair" } catch { status = error.localizedDescription } } }
     func discover() {
-        guard !bridgeID.isEmpty else { status = "Enter the companion ID"; return }
-        guard let baseURL = Self.validatedURL(uhcURL) else {
-            status = "Enter a valid UHC URL (http:// or https://)"
-            return
+        guard !bridgeID.isEmpty else { status = "Companion identity is unavailable"; return }
+        status = "Searching for UHC on your local network…"
+        let browser = UHCBonjourDiscovery()
+        discovery = browser
+        browser.onFailure = { [weak self] message in
+            Task { @MainActor in self?.status = message }
         }
-        // The setup field is authoritative. Rebuild the bridge client before
-        // claiming so a phone can pair to a LAN/tunnel UHC server instead of
-        // silently sending the claim to the localhost default.
-        host = AppleMusicCompanionHost(
-            bridgeBaseURL: baseURL,
-            companionID: companionID,
-            store: installationStore
-        )
+        browser.onBaseURL = { [weak self] baseURL in
+            Task { @MainActor in self?.requestPairing(at: baseURL) }
+        }
+        browser.start()
+    }
+    private func requestPairing(at baseURL: URL) {
+        discovery?.stop(); discovery = nil
+        host = AppleMusicCompanionHost(bridgeBaseURL: baseURL, companionID: companionID, store: installationStore)
         let discoverHost = host
-        Task { @MainActor in do { let pairing = try await discoverHost.discoverPairing(bridgeID: bridgeID); pairingCode = pairing.pairingCode; status = "Confirm that UHC shows the same code: (pairing.pairingCode)" } catch { status = error.localizedDescription } }
+        status = "UHC found; requesting a confirmation code…"
+        Task { @MainActor in
+            do {
+                let pairing = try await discoverHost.discoverPairing(bridgeID: bridgeID)
+                pairingCode = pairing.pairingCode
+                status = "Confirm that UHC shows the same code, then tap Confirm."
+            } catch { status = error.localizedDescription }
+        }
     }
     func confirm() {
         guard !bridgeID.isEmpty, !pairingCode.isEmpty else { status = "Discover UHC first"; return }
         let claimHost = host
         Task { @MainActor in do { _ = try await claimHost.claim(bridgeID: bridgeID, pairingCode: pairingCode); isPaired = true; status = "Paired; waiting for snapshots"; startPolling() } catch { status = error.localizedDescription } }
-    }
-    private static func validatedURL(_ raw: String) -> URL? {
-        guard let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
-              let scheme = url.scheme?.lowercased(),
-              ["http", "https"].contains(scheme),
-              url.host != nil else { return nil }
-        return url
     }
     func startPolling() {
         guard isPaired else { return }
