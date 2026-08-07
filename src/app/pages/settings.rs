@@ -984,8 +984,7 @@ pub fn Settings() -> Element {
             }
             div { id: "streaming-providers-anchor",
                 section {
-                    class: "mb-8",
-                    hidden: !(spotify_enabled() || applemusic_enabled()),
+                    class: if spotify_enabled() || applemusic_enabled() { "mb-8" } else { "hidden" },
                     aria_labelledby: "streaming-heading",
                 div { class: "mb-4",
                     h2 { id: "streaming-heading", class: "text-xl font-semibold", "Streaming providers" }
@@ -1000,8 +999,7 @@ pub fn Settings() -> Element {
                     // Keep authorization and client settings as separate
                     // actions so the credential boundary stays explicit.
                     div {
-                        class: "card p-5 sm:p-6",
-                        hidden: !spotify_enabled(),
+                        class: if spotify_enabled() { "card p-5 sm:p-6" } else { "hidden" },
                         aria_labelledby: "spotify-heading",
                         div { class: "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between",
                             div {
@@ -1292,8 +1290,7 @@ pub fn Settings() -> Element {
                     // Bonjour discovery. Settings is a calm confirmation
                     // surface, never a second setup form.
                     div {
-                        class: "card p-5 sm:p-6",
-                        hidden: !applemusic_enabled(),
+                        class: if applemusic_enabled() { "card p-5 sm:p-6" } else { "hidden" },
                         aria_labelledby: "apple-music-heading",
                         div { class: "flex items-start justify-between gap-3",
                             div {
