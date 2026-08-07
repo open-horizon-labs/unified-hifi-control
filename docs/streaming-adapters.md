@@ -115,6 +115,12 @@ through the same bridge contract:
   thirty-second liveness; `POST /api/bridges/applemusic/revoke` invalidates a
   companion token.
 
+Internally, the bridge registry keeps owner-scoped liveness distinct: an owner
+can be `unpaired`, `awaiting_snapshot`, `reachable`, or `stale`. The existing
+HTTP status remains backward-compatible while adapter/aggregator work can use
+the richer classification; a paired token alone is not evidence that playback
+is controllable.
+
 Pending OAuth states and bridge tokens are intentionally in-memory in this
 first slice, so a restart invalidates those short-lived values. Spotify's
 provider token is persisted through the encrypted credential boundary above;
