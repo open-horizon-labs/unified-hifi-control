@@ -260,7 +260,13 @@ pub async fn middleware(
 /// compatibility mode for ordinary LAN playback is enabled.  The native
 /// companion bearer routes remain explicitly excluded by `is_native_bridge`.
 fn requires_controller_auth(path: &str) -> bool {
-    path.starts_with("/api/providers/")
+    // Spotify's provider redirect is a cross-site top-level navigation. The
+    // browser's SameSite=Strict controller cookie is intentionally absent, so
+    // the callback must be authorized by its single-use pending OAuth state
+    // and PKCE exchange instead of the browser session. Start/configure,
+    // account, and revoke remain controller-owned operations.
+    (path.starts_with("/api/providers/")
+        && path != "/api/providers/spotify/oauth/callback")
         || matches!(
             path,
             "/api/bridges/applemusic/pair" | "/api/bridges/applemusic/status"
@@ -468,6 +474,9 @@ mod tests {
     fn authority_transitions_are_protected_in_compatibility_mode() {
         assert!(requires_controller_auth(
             "/api/providers/spotify/oauth/start"
+        ));
+        assert!(!requires_controller_auth(
+            "/api/providers/spotify/oauth/callback"
         ));
         assert!(requires_controller_auth("/api/providers/spotify/account"));
         assert!(requires_controller_auth("/api/bridges/applemusic/pair"));
