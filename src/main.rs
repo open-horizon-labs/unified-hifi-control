@@ -42,28 +42,8 @@ mod server {
     /// intentionally host a separate UI must set `UHC_ALLOWED_ORIGINS` to a
     /// comma-separated list of exact origins.
     fn configured_cors_layer() -> CorsLayer {
-        let origins = std::env::var("UHC_ALLOWED_ORIGINS")
-            .ok()
-            .into_iter()
-            .flat_map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|origin| !origin.is_empty())
-            .filter_map(|origin| match axum::http::HeaderValue::from_str(&origin) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    tracing::warn!(
-                        origin,
-                        "Ignoring invalid UHC_ALLOWED_ORIGINS entry: {error}"
-                    );
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let origins =
+            configured_origin_headers(std::env::var("UHC_ALLOWED_ORIGINS").ok().as_deref());
 
         if origins.is_empty() {
             tracing::info!("CORS disabled; same-origin access remains available");
@@ -74,6 +54,33 @@ mod server {
                 .allow_methods(Any)
                 .allow_headers(Any)
         }
+    }
+
+    fn configured_origin_headers(raw: Option<&str>) -> Vec<axum::http::HeaderValue> {
+        raw.into_iter()
+            .flat_map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|origin| !origin.is_empty())
+            .filter(|origin| {
+                (origin.starts_with("http://") || origin.starts_with("https://"))
+                    && !origin.chars().any(char::is_whitespace)
+            })
+            .filter_map(|origin| match axum::http::HeaderValue::from_str(&origin) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::warn!(
+                        origin,
+                        "Ignoring invalid UHC_ALLOWED_ORIGINS entry: {error}"
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
     }
 
     /// Flash page - redirects to external web flasher
@@ -173,6 +180,22 @@ mod server {
             assert!(!is_trusted_lan_ip(&IpAddr::V6(Ipv6Addr::new(
                 0x2001, 0x0db8, 0, 0, 0, 0, 0, 1
             ))));
+        }
+    }
+
+    #[cfg(test)]
+    mod cors_tests {
+        use super::configured_origin_headers;
+
+        #[test]
+        fn cors_is_empty_by_default_and_accepts_only_explicit_origins() {
+            assert!(configured_origin_headers(None).is_empty());
+            let origins = configured_origin_headers(Some(
+                "https://uhc.example.test, https://admin.example.test,not an origin",
+            ));
+            assert_eq!(origins.len(), 2);
+            assert_eq!(origins[0], "https://uhc.example.test");
+            assert_eq!(origins[1], "https://admin.example.test");
         }
     }
 
