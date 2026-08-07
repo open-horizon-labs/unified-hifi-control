@@ -889,7 +889,11 @@ pub fn Settings() -> Element {
                     p { class: "text-muted text-sm", "Connect providers without sharing credentials with the browser." }
                 }
 
-                div { class: "grid gap-4 md:grid-cols-2",
+                // Provider cards occupy the full settings column. Their own
+                // setup panes remain responsive two-column layouts; keeping
+                // the outer grid single-column prevents Spotify's configuration
+                // form from being needlessly squeezed beside another provider.
+                div { class: "grid gap-4",
                     // Keep authorization and client settings as separate
                     // actions so the credential boundary stays explicit.
                     div {
