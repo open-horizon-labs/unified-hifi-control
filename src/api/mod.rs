@@ -1,6 +1,8 @@
 //! HTTP API handlers
 
-use crate::adapters::hqplayer::{HqpAdapter, HqpInstanceManager, HqpZoneLinkService};
+use crate::adapters::hqplayer::{
+    HqpAdapter, HqpAdvancedOptionsSnapshot, HqpInstanceManager, HqpProfile, HqpZoneLinkService,
+};
 use crate::adapters::lms::LmsAdapter;
 use crate::adapters::openhome::OpenHomeAdapter;
 use crate::adapters::roon::RoonAdapter;
@@ -9,8 +11,12 @@ use crate::adapters::{
     AdapterCommand, AdapterCommandResponse, AdapterLogic, LibraryAdapter, LibrarySearchResult,
     Startable,
 };
-use crate::aggregator::ZoneAggregator;
-use crate::bus::{ProviderAccount, SharedBus};
+use crate::aggregator::{HqpSnapshotPresence, ZoneAggregator};
+use crate::bus::runtime::{
+    CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
+    HqpRuntimeCommand, RuntimeCommand,
+};
+use crate::bus::{Command, PrefixedZoneId, ProviderAccount, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -240,6 +246,8 @@ pub struct AppState {
     pub listening_plans: crate::mcp::listening_plan::ListeningPlanStore,
     /// Explicit Apple Music feedback and bounded adaptation context (#485).
     pub apple_feedback: crate::mcp::feedback::FeedbackStore,
+    /// Private reliable command ingress for provider paths with correlated readback.
+    pub reliable_commands: Option<CommandGateway>,
 }
 
 impl AppState {
@@ -282,7 +290,13 @@ impl AppState {
             mcp_refs: crate::mcp::refs::RefTable::new(),
             listening_plans: crate::mcp::listening_plan::ListeningPlanStore::from_config(),
             apple_feedback: crate::mcp::feedback::FeedbackStore::from_config(),
+            reliable_commands: None,
         }
+    }
+
+    pub fn with_reliable_commands(mut self, commands: CommandGateway) -> Self {
+        self.reliable_commands = Some(commands);
+        self
     }
 
     /// Get the count of active SSE connections
@@ -981,6 +995,55 @@ pub async fn roon_browse_status_handler(State(state): State<AppState>) -> impl I
 // =============================================================================
 // HQPlayer handlers
 // =============================================================================
+
+async fn hqp_default_pipeline_from_aggregator(
+    state: &AppState,
+) -> Option<crate::adapters::hqplayer::PipelineStatus> {
+    state
+        .aggregator
+        .get_hqplayer_snapshot("default")
+        .await
+        .filter(|snapshot| snapshot.presence == HqpSnapshotPresence::Live)
+        .map(|snapshot| snapshot.observation.pipeline)
+}
+
+pub(crate) async fn refresh_hqp_advanced_aggregate(
+    state: &AppState,
+    instance_name: &str,
+) -> anyhow::Result<HqpAdvancedOptionsSnapshot> {
+    crate::knobs::routes::dispatch_hqplayer_refresh(
+        state,
+        instance_name,
+        HqpRuntimeCommand::RefreshAdvanced,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message().to_string()))?;
+    state
+        .aggregator
+        .get_hqplayer_snapshot(instance_name)
+        .await
+        .and_then(|snapshot| snapshot.advanced)
+        .ok_or_else(|| anyhow::anyhow!("HQPlayer advanced state was not retained by the aggregator"))
+}
+
+pub(crate) async fn refresh_hqp_profiles_aggregate(
+    state: &AppState,
+    instance_name: &str,
+) -> anyhow::Result<Vec<HqpProfile>> {
+    crate::knobs::routes::dispatch_hqplayer_refresh(
+        state,
+        instance_name,
+        HqpRuntimeCommand::RefreshProfiles,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message().to_string()))?;
+    state
+        .aggregator
+        .get_hqplayer_snapshot(instance_name)
+        .await
+        .and_then(|snapshot| snapshot.profiles)
+        .ok_or_else(|| anyhow::anyhow!("HQPlayer profiles were not retained by the aggregator"))
+}
 
 /// GET /hqplayer/status - HQPlayer connection status
 pub async fn hqp_status_handler(

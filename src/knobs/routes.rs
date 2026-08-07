@@ -24,6 +24,11 @@ use sha2::{Digest, Sha256};
 
 use crate::adapters::AdapterCommand;
 use crate::api::AppState;
+use crate::bus::runtime::{
+    CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
+    HqpRuntimeCommand, RuntimeCommand,
+};
+use crate::bus::PrefixedZoneId;
 use crate::bus::VolumeControl;
 use crate::knobs::image::placeholder_svg;
 use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
@@ -555,6 +560,122 @@ pub async fn knob_control_handler(
     };
 
     control_roon(&state, &roon_zone_id, &req.action, req.value.as_ref()).await
+}
+
+/// HQPlayer command failures retain the semantic distinction used by MCP.
+pub(crate) enum HqpDispatchError {
+    NotFound(String),
+    BadRequest { message: String, code: &'static str },
+    Backend(String),
+}
+
+impl HqpDispatchError {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::NotFound(message) | Self::Backend(message) => message,
+            Self::BadRequest { message, .. } => message,
+        }
+    }
+}
+
+/// Submit HQPlayer reconfiguration through the reliable provider runtime.
+pub(crate) async fn dispatch_hqplayer_reconfiguration(
+    state: &AppState,
+    instance: &str,
+    command: HqpRuntimeCommand,
+) -> Result<(), HqpDispatchError> {
+    let confirmation_budget = match &command {
+        HqpRuntimeCommand::LoadProfile { .. } => std::time::Duration::from_secs(120),
+        HqpRuntimeCommand::Pipeline { .. } | HqpRuntimeCommand::LegacyPipelineIndex { .. } => {
+            std::time::Duration::from_secs(15)
+        }
+        HqpRuntimeCommand::RefreshAdvanced => std::time::Duration::from_secs(15),
+        HqpRuntimeCommand::RefreshProfiles => std::time::Duration::from_secs(30),
+    };
+    dispatch_hqplayer_runtime_command(
+        state,
+        instance,
+        RuntimeCommand::Hqplayer(command),
+        CommandLane::Reconfiguration,
+        confirmation_budget,
+    )
+    .await
+}
+
+pub(crate) async fn dispatch_hqplayer_refresh(
+    state: &AppState,
+    instance: &str,
+    command: HqpRuntimeCommand,
+) -> Result<(), HqpDispatchError> {
+    let confirmation_budget = match &command {
+        HqpRuntimeCommand::RefreshAdvanced => std::time::Duration::from_secs(15),
+        HqpRuntimeCommand::RefreshProfiles => std::time::Duration::from_secs(30),
+        _ => {
+            return Err(HqpDispatchError::BadRequest {
+                message: "HQPlayer refresh requires a read command".to_string(),
+                code: "INVALID_COMMAND",
+            });
+        }
+    };
+    dispatch_hqplayer_runtime_command(
+        state,
+        instance,
+        RuntimeCommand::Hqplayer(command),
+        CommandLane::Interactive,
+        confirmation_budget,
+    )
+    .await
+}
+
+async fn dispatch_hqplayer_runtime_command(
+    state: &AppState,
+    instance: &str,
+    command: RuntimeCommand,
+    lane: CommandLane,
+    confirmation_budget: std::time::Duration,
+) -> Result<(), HqpDispatchError> {
+    let target = PrefixedZoneId::hqplayer(instance);
+    let zone_id = target.to_string();
+    if state.aggregator.get_zone(&zone_id).await.is_none() {
+        let message = match &state.reliable_commands {
+            Some(gateway) if gateway.has_endpoint(&target) => {
+                format!("zone {zone_id} is not currently published")
+            }
+            _ => format!("HQPlayer instance '{instance}' is not configured"),
+        };
+        return Err(HqpDispatchError::NotFound(message));
+    }
+    let Some(gateway) = &state.reliable_commands else {
+        return Err(HqpDispatchError::Backend(
+            "HQPlayer reliable command runtime is unavailable".to_string(),
+        ));
+    };
+    let now = tokio::time::Instant::now();
+    let mut ticket = gateway
+        .submit(CommandRequest {
+            target,
+            command,
+            correlation_id: None,
+            lane,
+            deadlines: CommandDeadlines {
+                dispatch_by: now + std::time::Duration::from_secs(3),
+                confirm_by: now + confirmation_budget,
+            },
+        })
+        .await
+        .map_err(|error| HqpDispatchError::Backend(format!("HQPlayer command admission failed: {error:?}")))?;
+    match ticket.wait_for_observable_result().await {
+        CommandStatus::Confirmed { .. } => Ok(()),
+        CommandStatus::Failed { detail } | CommandStatus::NotDispatched { detail } => {
+            Err(HqpDispatchError::Backend(detail))
+        }
+        CommandStatus::Indeterminate => Err(HqpDispatchError::Backend(
+            "HQPlayer accepted the command but did not publish a verified readback in time".to_string(),
+        )),
+        CommandStatus::Queued | CommandStatus::Dispatched | CommandStatus::AwaitingProjection => {
+            Err(HqpDispatchError::Backend("HQPlayer command stopped without a terminal result".to_string()))
+        }
+    }
 }
 
 /// Control a Spotify Connect device through the provider adapter registry.
