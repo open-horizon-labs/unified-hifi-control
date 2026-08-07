@@ -1,0 +1,8 @@
+schemaVersion: 1
+enabledWorkflows:
+  - macos
+  - swift-package
+  - project-discovery
+sessionDefaults:
+  projectPath: companion/apple_music
+  scheme: AppleMusicCompanionApp
