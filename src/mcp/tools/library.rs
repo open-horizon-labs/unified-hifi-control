@@ -568,7 +568,12 @@ pub async fn handle_play(
                 .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
             match state
                 .adapter_registry
-                .search_library("applemusic", &args.query, SPOTIFY_SEARCH_LIMIT)
+                .search_library_for_zone(
+                    "applemusic",
+                    &args.zone_id,
+                    &args.query,
+                    SPOTIFY_SEARCH_LIMIT,
+                )
                 .await
             {
                 Ok(mut results) => match results.drain(..).next() {
@@ -1010,28 +1015,6 @@ async fn play_ref_spotify(
     };
     let mut env = env.param("action", action_name);
     env.operation = action_name.to_string();
-    let plan = if action_name == "queue" {
-        match state
-            .listening_plans
-            .append(
-                &args.zone_id,
-                vec![crate::mcp::listening_plan::ListeningPlanItem {
-                    reference: args.r#ref.clone(),
-                    title: title.clone(),
-                }],
-            )
-            .await
-        {
-            Ok(plan) => Some(plan),
-            Err(error) => {
-                return env.failed(format!(
-                    "Apple Music listening plan could not be persisted: {error}"
-                ))
-            }
-        }
-    } else {
-        None
-    };
     let result = if action_name == "queue" {
         state
             .adapter_registry
@@ -1046,10 +1029,6 @@ async fn play_ref_spotify(
     };
     match result {
         Ok(message) => Ok(play_success(state, env, message).await),
-        Err(error) if plan.is_some() => Ok(env.json_result(&json!({
-            "plan": plan,
-            "provider": {"outcome": "refused", "detail": error.to_string()}
-        }))),
         Err(error) => env.failed(format!("Play error for {title}: {}", error)),
     }
 }
@@ -1075,6 +1054,28 @@ async fn play_ref_apple_music(
     };
     let mut env = env.param("action", action_name);
     env.operation = action_name.to_string();
+    let plan = if action_name == "queue" {
+        match state
+            .listening_plans
+            .append(
+                &args.zone_id,
+                vec![crate::mcp::listening_plan::ListeningPlanItem {
+                    reference: args.r#ref.clone(),
+                    title: title.clone(),
+                }],
+            )
+            .await
+        {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                return env.failed(format!(
+                    "Apple Music listening plan could not be persisted: {error}"
+                ))
+            }
+        }
+    } else {
+        None
+    };
     let result = if action_name == "queue" {
         state
             .adapter_registry
@@ -1089,6 +1090,10 @@ async fn play_ref_apple_music(
     };
     match result {
         Ok(message) => Ok(play_success(state, env, message).await),
-        Err(e) => env.failed(format!("Play error for {title}: {}", e)),
+        Err(error) if plan.is_some() => Ok(env.json_result(&json!({
+            "plan": plan,
+            "provider": {"outcome": "refused", "detail": error.to_string()}
+        }))),
+        Err(error) => env.failed(format!("Play error for {title}: {}", error)),
     }
 }

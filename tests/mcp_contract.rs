@@ -54,6 +54,7 @@ use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp;
+use unified_hifi_control::mcp::refs::RefTarget;
 use unified_hifi_control::mcp::types::{
     McpHqpOptions, McpHqpSelection, McpPipelineStatus, McpPlayResult, McpSearchResult,
 };
@@ -1456,6 +1457,39 @@ async fn hifi_play_refuses_radio_for_lms() {
     assert_eq!(
         text, "Error: Radio mode not supported for LMS. Use 'play' or 'queue'.",
         "the refusal must name the supported actions"
+    );
+}
+
+/// A Spotify ref queued through the generic play-by-ref tool must not touch
+/// the Apple-only listening-plan store. This catches accidental copy/paste of
+/// the Apple queue bookkeeping into the Spotify branch (#483).
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn spotify_play_ref_queue_does_not_write_apple_listening_plan() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let state = build_state(None).await;
+    let token = state
+        .mcp_refs
+        .mint(RefTarget::Spotify {
+            uri: "spotify:track:test".to_string(),
+            title: "Test track".to_string(),
+        })
+        .await;
+    let app = TestApp::with_state(state.clone());
+    let result = app
+        .call_tool(
+            "hifi_play_ref",
+            json!({"ref": token, "zone_id": "spotify:test", "action": "queue"}),
+        )
+        .await;
+    let text = result_text(&result);
+    assert!(
+        !text.contains("listening plan"),
+        "Spotify queueing must not fail through the Apple-only listening plan: {text}"
+    );
+    assert!(
+        state.listening_plans.get("spotify:test").await.is_none(),
+        "Apple listening-plan store must not contain a Spotify zone"
     );
 }
 
