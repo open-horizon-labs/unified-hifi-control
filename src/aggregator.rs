@@ -95,6 +95,7 @@ impl ZoneAggregator {
 
                 BusEvent::ZoneRemoved { zone_id } => {
                     debug!("Zone removed: {}", zone_id);
+                    self.observed_playback.clear_zone(zone_id.as_str()).await;
                     self.zones.write().await.remove(zone_id.as_str());
                 }
 
@@ -224,17 +225,23 @@ impl ZoneAggregator {
                     info!("Flushing zones for adapter: {}", adapter);
                     let prefix = format!("{}:", adapter);
 
-                    // Remove all zones with this prefix
-                    let mut zones = self.zones.write().await;
-
-                    let zone_ids: Vec<String> = zones
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix))
-                        .cloned()
-                        .collect();
-
-                    for zone_id in &zone_ids {
-                        zones.remove(zone_id);
+                    // Remove all zones with this prefix.
+                    let zone_ids = {
+                        let mut zones = self.zones.write().await;
+                        let zone_ids: Vec<String> = zones
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix))
+                            .cloned()
+                            .collect();
+                        for zone_id in &zone_ids {
+                            zones.remove(zone_id);
+                        }
+                        zone_ids
+                    };
+                    if adapter == "applemusic" {
+                        for zone_id in &zone_ids {
+                            self.observed_playback.clear_zone(zone_id).await;
+                        }
                     }
 
                     // Publish flush acknowledgment

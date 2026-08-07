@@ -93,6 +93,16 @@ impl PlaybackObservationHistory {
             .collect()
     }
 
+    /// Forget observations when an execution owner is removed or revoked.
+    /// This prevents a new owner reusing the same player id from inheriting
+    /// the previous owner's private listening context.
+    pub async fn clear_zone(&self, zone_id: &str) {
+        if !zone_id.starts_with("applemusic:") {
+            return;
+        }
+        self.records.write().await.remove(zone_id);
+    }
+
     async fn record(
         &self,
         zone_id: &str,
@@ -229,5 +239,20 @@ mod tests {
         let recent = store.recent("applemusic:iphone", usize::MAX).await;
         assert_eq!(recent.len(), MAX_RECORDS_PER_ZONE);
         assert_eq!(recent.first().unwrap().title.as_deref(), Some("Track 68"));
+    }
+
+    #[tokio::test]
+    async fn clearing_an_owner_removes_private_context_before_repair() {
+        let store = PlaybackObservationHistory::new_for_test();
+        store
+            .record_zone(&zone("applemusic:iphone", "Private"), 1)
+            .await;
+        store.clear_zone("applemusic:iphone").await;
+        store
+            .record_zone(&zone("applemusic:iphone", "New owner"), 2)
+            .await;
+        let recent = store.recent("applemusic:iphone", 10).await;
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].title.as_deref(), Some("New owner"));
     }
 }

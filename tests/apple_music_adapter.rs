@@ -188,6 +188,10 @@ async fn companion_snapshot_flows_through_aggregator_and_flushes_on_stop() {
     })
     .await
     .expect("stopping the adapter must flush its aggregator zones");
+    assert!(aggregator
+        .observed_playback_history("applemusic:application", 10)
+        .await
+        .is_empty());
 
     bus.publish(BusEvent::ShuttingDown { reason: None });
     aggregator_task
