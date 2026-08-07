@@ -15,7 +15,7 @@ use serde_json::json;
 
 #[mcp_tool(
     name = "hifi_apple_music",
-    description = "Apple Music catalog, library, playlist, feedback, and bounded adaptation context through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, context, clear_feedback, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Feedback accepts explicit user signals only; skips and manual changes are not inferred as dislike. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback."
+    description = "Apple Music catalog, library, playlist, feedback, and bounded adaptation context through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, queue_append, play_next, context, clear_feedback, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Feedback accepts explicit user signals only; skips and manual changes are not inferred as dislike. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiAppleMusicTool {
@@ -51,7 +51,7 @@ pub struct HifiAppleMusicTool {
     /// Maximum number of entries to return.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
-    /// Ordered short-lived opaque refs for queue_plan.
+    /// Ordered short-lived opaque refs for queue_plan or queue_append.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<Vec<String>>,
     /// Explicit feedback signal: favorite, unfavorite, rating, skip,
@@ -82,6 +82,8 @@ pub async fn handle_apple_music(
         "recommendations",
         "favorites",
         "queue_plan",
+        "queue_append",
+        "play_next",
         "playlist_create",
         "playlist_update",
         "playlist_add",
@@ -392,6 +394,100 @@ pub async fn handle_apple_music(
                 })))
             }
         }
+    }
+
+    if matches!(args.action.as_str(), "queue_append" | "play_next") {
+        let Some(zone_id) = args.zone_id.as_deref() else {
+            return Envelope::write("hifi_apple_music", &args.action).refused(
+                format!("{} requires an applemusic execution-owner zone_id.", args.action),
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "Choose the named Apple Music companion that owns playback.",
+                ),
+            );
+        };
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
+            return Envelope::write("hifi_apple_music", &args.action).refused(
+                format!("{} can target only an applemusic zone.", args.action),
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "AirPlay routes are destinations, not execution-owner zones.",
+                ),
+            );
+        }
+        let refs = if args.action == "play_next" {
+            args.uri.clone().or_else(|| args.id.clone()).into_iter().collect()
+        } else {
+            args.items.clone().unwrap_or_default()
+        };
+        if refs.is_empty() || (args.action == "play_next" && refs.len() != 1) {
+            return Envelope::write("hifi_apple_music", &args.action).refused(
+                format!("{} requires one or more opaque refs returned by hifi_search.", args.action),
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    if args.action == "play_next" { "uri" } else { "items" },
+                    &["opaque Apple Music refs returned by hifi_search"],
+                    "Search first, then use the refs for this execution owner.",
+                ),
+            );
+        }
+        let companion = zone_id.strip_prefix("applemusic:").unwrap_or_default();
+        let mut plan_items = Vec::with_capacity(refs.len());
+        let mut handles = Vec::with_capacity(refs.len());
+        for token in &refs {
+            let Some(crate::mcp::refs::RefTarget::AppleMusic { title, companion_id, handle }) =
+                state.mcp_refs.resolve(token).await
+            else {
+                return Envelope::write("hifi_apple_music", &args.action).refused(
+                    "The Apple Music ref is unknown, expired, or from another provider.",
+                    crate::mcp::envelope::Refusal::UnknownTarget {
+                        parameter: if args.action == "play_next" { "uri" } else { "items" },
+                        discover_with: "hifi_search",
+                        detail: "Search again for a fresh owner-scoped ref.".to_string(),
+                    },
+                );
+            };
+            if companion_id != companion {
+                return Envelope::write("hifi_apple_music", &args.action).refused(
+                    "The Apple Music ref belongs to a different execution owner.",
+                    crate::mcp::envelope::Refusal::InvalidParameter {
+                        parameter: if args.action == "play_next" { "uri" } else { "items" },
+                        accepted: vec!["refs minted for this applemusic:<companion> zone".to_string()],
+                        detail: "Search against the selected execution owner first.".to_string(),
+                    },
+                );
+            }
+            plan_items.push(crate::mcp::listening_plan::ListeningPlanItem { reference: token.clone(), title });
+            handles.push(handle);
+        }
+        let plan = if args.action == "play_next" {
+            state.listening_plans.play_next(zone_id, plan_items[0].clone()).await
+        } else {
+            state.listening_plans.append(zone_id, plan_items).await
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => return Envelope::write("hifi_apple_music", &args.action).failed(error.to_string()),
+        };
+        let mut accepted = 0usize;
+        for handle in handles {
+            if let Err(error) = state.adapter_registry.library_content(
+                "applemusic",
+                "queue_uri",
+                &json!({"zone_id": zone_id, "uri": handle}),
+            ).await {
+                return Ok(Envelope::write("hifi_apple_music", &args.action).json_result(&json!({
+                    "plan": plan,
+                    "provider": {"outcome": "refused", "accepted": accepted, "detail": error.to_string()}
+                })));
+            }
+            accepted += 1;
+        }
+        return Ok(Envelope::write("hifi_apple_music", &args.action).json_result(&json!({
+            "plan": plan,
+            "provider": {"outcome": "accepted", "accepted": accepted}
+        })));
     }
 
     let params = json!({
