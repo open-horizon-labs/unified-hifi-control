@@ -557,6 +557,8 @@ public actor SystemMusicPlayerCompanion {
     private let player = SystemMusicPlayer.shared
     private var handles: [String: Song] = [:]
     private var handleOrder: [String] = []
+    private var playlistHandles: [String: Playlist] = [:]
+    private var playlistHandleOrder: [String] = []
     private static let maxHandles = 256
 
     public init() {}
@@ -752,6 +754,38 @@ public actor SystemMusicPlayerCompanion {
             let limit = intParam(request.params, "limit") ?? 25
             let items = try await searchForBridge(term: query, limit: limit)
             return MusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "library":
+            let items = try await libraryForBridge(
+                limit: intParam(request.params, "limit") ?? 25,
+                offset: intParam(request.params, "offset") ?? 0
+            )
+            return MusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "recent":
+            let items = try await recentForBridge(
+                limit: intParam(request.params, "limit") ?? 25,
+                offset: intParam(request.params, "offset") ?? 0
+            )
+            return MusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "playlists":
+            let items = try await playlistsForBridge(
+                limit: intParam(request.params, "limit") ?? 25,
+                offset: intParam(request.params, "offset") ?? 0
+            )
+            return MusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "playlist_tracks":
+            guard let reference = stringParam(request.params, "id") ?? stringParam(request.params, "uri"),
+                  let playlist = playlistHandles[reference] else {
+                return MusicKitContentResult(
+                    outcome: "not_found",
+                    error: MusicKitContentError(code: "unknown_ref", message: "Playlist handle is unknown or expired.", retryable: false)
+                )
+            }
+            let loaded = try await playlist.with([.entries], preferredSource: .library)
+            let entries = (loaded.entries ?? []).compactMap { entry -> AppleMusicBridgeSearchItem? in
+                guard let song = entry.item as? Song else { return nil }
+                return AppleMusicBridgeSearchItem(title: song.title, subtitle: song.artistName, uri: mintHandle(for: song))
+            }
+            return MusicKitContentResult(outcome: "success", data: try jsonValue(entries))
         case "play_uri", "queue_uri":
             guard let handle = stringParam(request.params, "uri") else {
                 return invalidContentResult("uri is required")
@@ -794,6 +828,37 @@ public actor SystemMusicPlayerCompanion {
         }
     }
 
+    private func libraryForBridge(limit: Int, offset: Int) async throws -> [AppleMusicBridgeSearchItem] {
+        var request = MusicLibraryRequest<Song>()
+        request.limit = min(max(limit, 1), 50)
+        request.offset = max(offset, 0)
+        let response = try await request.response()
+        return response.items.map { song in
+            AppleMusicBridgeSearchItem(title: song.title, subtitle: song.artistName, uri: mintHandle(for: song))
+        }
+    }
+
+    private func recentForBridge(limit: Int, offset: Int) async throws -> [AppleMusicBridgeSearchItem] {
+        var request = MusicRecentlyPlayedRequest<Song>()
+        request.limit = min(max(limit, 1), 50)
+        request.offset = max(offset, 0)
+        let response = try await request.response()
+        return response.items.map { song in
+            AppleMusicBridgeSearchItem(title: song.title, subtitle: song.artistName, uri: mintHandle(for: song))
+        }
+    }
+
+    private func playlistsForBridge(limit: Int, offset: Int) async throws -> [AppleMusicBridgePlaylistSummary] {
+        var request = MusicLibraryRequest<Playlist>()
+        request.limit = min(max(limit, 1), 50)
+        request.offset = max(offset, 0)
+        let response = try await request.response()
+        return response.items.map { playlist in
+            let handle = mintPlaylistHandle(for: playlist)
+            return AppleMusicBridgePlaylistSummary(ref: handle, title: playlist.name)
+        }
+    }
+
     private func mintHandle(for song: Song) -> String {
         let handle = "apple_handle_\(UUID().uuidString.lowercased())"
         handles[handle] = song
@@ -801,6 +866,17 @@ public actor SystemMusicPlayerCompanion {
         handleOrder.append(handle)
         while handleOrder.count > Self.maxHandles {
             handles.removeValue(forKey: handleOrder.removeFirst())
+        }
+        return handle
+    }
+
+    private func mintPlaylistHandle(for playlist: Playlist) -> String {
+        let handle = "apple_playlist_\(UUID().uuidString.lowercased())"
+        playlistHandles[handle] = playlist
+        playlistHandleOrder.removeAll { $0 == handle }
+        playlistHandleOrder.append(handle)
+        while playlistHandleOrder.count > Self.maxHandles {
+            playlistHandles.removeValue(forKey: playlistHandleOrder.removeFirst())
         }
         return handle
     }
@@ -929,6 +1005,17 @@ public struct AppleMusicBridgeSearchItem: Codable, Sendable, Equatable {
         self.title = title
         self.subtitle = subtitle
         self.uri = uri
+    }
+}
+
+@available(iOS 17.0, *)
+public struct AppleMusicBridgePlaylistSummary: Codable, Sendable, Equatable {
+    public let ref: String
+    public let title: String
+
+    public init(ref: String, title: String) {
+        self.ref = ref
+        self.title = title
     }
 }
 
