@@ -13,6 +13,27 @@ use rust_mcp_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+/// Content reads and account mutations are scoped to one Apple execution
+/// owner. Catalog search is the sole provider-global operation; every other
+/// provider request must name the companion whose account/session is used.
+fn apple_music_action_requires_owner(action: &str) -> bool {
+    matches!(
+        action,
+        "library"
+            | "playlists"
+            | "playlist_tracks"
+            | "recent"
+            | "recommendations"
+            | "favorites"
+            | "playlist_create"
+            | "playlist_update"
+            | "playlist_add"
+            | "playlist_remove"
+            | "favorite_add"
+            | "favorite_remove"
+    )
+}
+
 #[mcp_tool(
     name = "hifi_apple_music",
     description = "Apple Music catalog, library, playlist, feedback, and bounded adaptation context through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, queue_append, play_next, context, clear_feedback, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Feedback accepts explicit user signals only; skips and manual changes are not inferred as dislike. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback."
@@ -200,6 +221,37 @@ pub async fn handle_apple_music(
                 "Apple Music feedback could not be deleted: {error}"
             )),
         };
+    }
+
+    if apple_music_action_requires_owner(&args.action) {
+        let envelope = if mutation {
+            Envelope::write("hifi_apple_music", &args.action)
+        } else {
+            Envelope::read("hifi_apple_music", &args.action)
+        };
+        let Some(zone_id) = args.zone_id.as_deref() else {
+            return envelope.refused(
+                format!(
+                    "{} requires an applemusic execution-owner zone_id.",
+                    args.action
+                ),
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "Choose the named Apple Music companion whose account/session should be used.",
+                ),
+            );
+        };
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
+            return envelope.refused(
+                format!("{} can target only an applemusic zone.", args.action),
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "AirPlay routes are destinations, not Apple Music execution-owner zones.",
+                ),
+            );
+        }
     }
 
     let feedback_record = if args.action == "feedback" {
@@ -584,5 +636,32 @@ pub async fn handle_apple_music(
             "provider": {"outcome": "refused", "detail": error.to_string()}
         }))),
         Err(error) => env.failed(format!("Apple Music {} failed: {}", args.action, error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn owner_scoped_library_actions_require_a_companion_zone() {
+        for action in [
+            "library",
+            "playlists",
+            "playlist_tracks",
+            "recent",
+            "recommendations",
+            "favorites",
+            "playlist_create",
+            "playlist_update",
+            "playlist_add",
+            "playlist_remove",
+            "favorite_add",
+            "favorite_remove",
+        ] {
+            assert!(
+                super::apple_music_action_requires_owner(action),
+                "{action} must be scoped to a named Apple Music companion"
+            );
+        }
+        assert!(!super::apple_music_action_requires_owner("catalog_search"));
     }
 }
