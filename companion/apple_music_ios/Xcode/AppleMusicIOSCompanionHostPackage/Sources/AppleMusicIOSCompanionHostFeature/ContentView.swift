@@ -2,6 +2,12 @@ import AppleMusicIOSCompanion
 import AVKit
 import SwiftUI
 
+func newAppleMusicCompanionInstallation() -> AppleMusicCompanionInstallation {
+    AppleMusicCompanionInstallation(
+        baseURL: URL(string: "http://127.0.0.1:18088")!,
+        companionID: "ios-\(UUID().uuidString.lowercased())")
+}
+
 @MainActor
 private final class CompanionModel: ObservableObject {
     @Published private(set) var status = "Not authorized"
@@ -10,6 +16,7 @@ private final class CompanionModel: ObservableObject {
     @Published var pairingCode = ""
     @Published private(set) var isPaired = false
     private let installationStore: KeychainAppleMusicCompanionInstallationStore
+    private let companionID: String
     private var host: AppleMusicCompanionHost
     private let player = SystemMusicPlayerCompanion()
     private var pollTask: Task<Void, Never>?
@@ -17,8 +24,18 @@ private final class CompanionModel: ObservableObject {
     init() {
         let store = KeychainAppleMusicCompanionInstallationStore()
         installationStore = store
-        let installation = store.load() ?? AppleMusicCompanionInstallation(
-            baseURL: URL(string: "http://127.0.0.1:18088")!, companionID: "ios-companion")
+        let installation: AppleMusicCompanionInstallation
+        if let saved = store.load() {
+            installation = saved
+        } else {
+            // The bridge identity is an installation identity, not a product
+            // label. Persist a unique value before pairing so two iPhones do
+            // not collapse into one owner/zone.
+            let fresh = newAppleMusicCompanionInstallation()
+            try? store.save(fresh)
+            installation = fresh
+        }
+        companionID = installation.companionID
         uhcURL = installation.baseURL.absoluteString
         host = AppleMusicCompanionHost(installation: installation, store: store)
         bridgeID = installation.bridgeID ?? ""
@@ -38,7 +55,7 @@ private final class CompanionModel: ObservableObject {
         // silently sending the claim to the localhost default.
         host = AppleMusicCompanionHost(
             bridgeBaseURL: baseURL,
-            companionID: "ios-companion",
+            companionID: companionID,
             store: installationStore
         )
         let claimHost = host

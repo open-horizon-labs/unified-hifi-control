@@ -36,3 +36,11 @@ import AppleMusicIOSCompanion
     #expect(playlistEntryRange(limit: 0, offset: 0, count: 10).isEmpty)
     #expect(playlistEntryRange(limit: 50, offset: 100, count: 100).isEmpty)
 }
+
+@Test func freshCompanionInstallationsHaveUniqueOwnerSafeIDs() {
+    let first = newAppleMusicCompanionInstallation()
+    let second = newAppleMusicCompanionInstallation()
+    #expect(first.companionID.hasPrefix("ios-"))
+    #expect(!first.companionID.contains(":"))
+    #expect(first.companionID != second.companionID)
+}
