@@ -12,8 +12,12 @@ public actor ApplicationMusicPlayerCompanion {
     public static let playerID = "application"
 
     private let player = ApplicationMusicPlayer.shared
+    public let companionID: String
 
-    public init() {}
+    public init(companionID: String) {
+        precondition(!companionID.isEmpty && !companionID.contains(":"), "companionID must be a non-empty owner-safe identifier")
+        self.companionID = companionID
+    }
 
     public func play() async throws {
         try await player.play()
@@ -64,12 +68,87 @@ public actor ApplicationMusicPlayerCompanion {
         try await player.queue.insert(song, position: .afterCurrentEntry)
     }
 
-    /// State projection is intentionally kept behind the host app's bridge
-    /// protocol. MusicKit's item metadata and artwork URL require an active
-    /// catalog/user authorization context, which this package cannot obtain
-    /// without the embedding app's developer-token policy and entitlements.
-    public func snapshot() throws -> Never {
-        throw CompanionError.hostIntegrationRequired
+    /// Project the app-private player state. This proves only the
+    /// ApplicationMusicPlayer session owned by this host; it does not claim
+    /// control of Music.app or any AirPlay destination.
+    public func snapshot() -> MacMusicKitSnapshot {
+        let entry = player.queue.currentEntry
+        let track: MacMusicKitTrack?
+        if let entry, case let .song(song) = entry.item {
+            track = MacMusicKitTrack(
+                title: song.title,
+                artist: song.artistName,
+                album: song.albumTitle ?? "",
+                artworkURL: song.artwork?.url(width: 512, height: 512)?.absoluteString,
+                positionSeconds: finite(player.playbackTime),
+                durationSeconds: song.duration
+            )
+        } else if let entry {
+            track = MacMusicKitTrack(title: entry.title, artist: entry.subtitle ?? "", album: "", positionSeconds: finite(player.playbackTime))
+        } else {
+            track = nil
+        }
+        return MacMusicKitSnapshot(
+            playerID: companionID,
+            displayName: "Mac Apple Music",
+            state: playbackState(player.state.playbackStatus),
+            track: track,
+            volume: nil,
+            isMuted: false
+        )
+    }
+
+    private func finite(_ value: TimeInterval) -> Double? {
+        value.isFinite && value >= 0 ? value : nil
+    }
+
+    private func playbackState(_ status: MusicPlayer.PlaybackStatus) -> String {
+        switch status {
+        case .playing: "playing"
+        case .paused: "paused"
+        case .stopped: "stopped"
+        case .interrupted: "interrupted"
+        case .seekingForward, .seekingBackward: "seeking"
+        @unknown default: "unknown"
+        }
+    }
+}
+
+@available(macOS 14.0, *)
+public struct MacMusicKitSnapshot: Sendable, Equatable {
+    public let playerID: String
+    public let displayName: String
+    public let state: String
+    public let track: MacMusicKitTrack?
+    public let volume: Float?
+    public let isMuted: Bool
+
+    public init(playerID: String, displayName: String, state: String, track: MacMusicKitTrack? = nil, volume: Float? = nil, isMuted: Bool = false) {
+        self.playerID = playerID
+        self.displayName = displayName
+        self.state = state
+        self.track = track
+        self.volume = volume
+        self.isMuted = isMuted
+    }
+}
+
+@available(macOS 14.0, *)
+public struct MacMusicKitTrack: Sendable, Equatable {
+    public let title: String
+    public let artist: String
+    public let album: String
+    public let artworkURL: String?
+    public let positionSeconds: Double?
+    public let durationSeconds: Double?
+
+    public init(title: String, artist: String, album: String, artworkURL: String? = nil, positionSeconds: Double? = nil, durationSeconds: Double? = nil) {
+        self.title = title
+        self.artist = artist
+        self.album = album
+        self.artworkURL = artworkURL
+        self.positionSeconds = positionSeconds
+        self.durationSeconds = durationSeconds
     }
 }
 

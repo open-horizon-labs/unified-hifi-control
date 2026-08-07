@@ -23,7 +23,9 @@ and Music User Token policy, requests MusicKit authorization, and projects the
 authorized player's metadata into the Rust `MusicKitSnapshot` shape.
 
 `Companion.swift` includes the safe, SDK-backed transport operations (`play`,
-`pause`, `skipToNextItem`, and `skipToPreviousItem`). Snapshot projection and
-queue/library work remain host integration points until the signed macOS app
-and entitlements are defined. Linux, QNAP, and other non-macOS builds do not
-compile this package.
+`pause`, `skipToNextItem`, and `skipToPreviousItem`) and a bounded snapshot
+projection for its own app-private session. The projection deliberately leaves
+volume and route unknown; it does not claim Music.app or AirPlay control.
+Signed-host lifecycle, Keychain identity, and physical validation remain
+required by #486/#487. Linux, QNAP, and other non-macOS builds do not compile
+this package.
