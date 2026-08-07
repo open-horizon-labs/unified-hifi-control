@@ -134,6 +134,13 @@ pub struct AppleBridgeStatus {
     pub has_snapshot: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppleBridgePairingResponse {
+    pub bridge_id: String,
+    pub pairing_code: String,
+    pub expires_at: u64,
+}
+
 // =============================================================================
 // Zone Types
 // =============================================================================

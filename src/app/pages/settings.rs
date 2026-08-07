@@ -5,9 +5,9 @@
 use dioxus::prelude::*;
 
 use crate::app::api::{
-    AdapterSettings, AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, ProviderAuthResponse,
-    ProviderOAuthStart, RoonStatus, SpotifyAccountResponse, SpotifyConfigureRequest,
-    SpotifyConfigureResponse, ZonesResponse,
+    AdapterSettings, AppSettings, AppleBridgePairingResponse, AppleBridgeStatus, HqpStatus,
+    LmsConfig, ProviderAuthResponse, ProviderOAuthStart, RoonStatus, SpotifyAccountResponse,
+    SpotifyConfigureRequest, SpotifyConfigureResponse, ZonesResponse,
 };
 use crate::app::components::Layout;
 use crate::app::settings_context::use_settings;
@@ -306,6 +306,8 @@ pub fn Settings() -> Element {
     let mut spotify_redirect_uri = use_signal(default_spotify_redirect_uri);
     let mut apple_action = use_signal(ProviderActionState::default);
     let mut apple_error = use_signal(|| None::<String>);
+    let mut apple_bridge_id = use_signal(|| "ios-companion".to_string());
+    let mut apple_pairing = use_signal(|| None::<AppleBridgePairingResponse>);
 
     // Hide knobs signal (LMS/HQPlayer visibility follows adapter enabled state)
     let mut hide_knobs = use_signal(|| false);
@@ -1259,7 +1261,7 @@ pub fn Settings() -> Element {
                                 "Enable MusicKit in Apple Developer"
                             }
                         }
-                        if let Some(status) = apple_st {
+                        if let Some(ref status) = apple_st {
                             if status.paired {
                                 p { class: "mt-4 text-sm", "Bridge: {apple_bridge_label}" }
                                 if status.has_snapshot {
@@ -1272,6 +1274,54 @@ pub fn Settings() -> Element {
                             }
                         } else {
                             p { class: "mt-4 text-sm text-muted", role: "status", aria_live: "polite", "Checking for a paired companion…" }
+                        }
+                        if !apple_st.as_ref().map(|status| status.paired).unwrap_or(false) {
+                            div { class: "mt-5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end",
+                                label { class: "block text-sm",
+                                    span { class: "mb-1 block text-secondary", "Companion ID" }
+                                    input {
+                                        class: "input input-bordered w-full min-h-11",
+                                        aria_label: "Apple Music companion ID",
+                                        value: "{apple_bridge_id}",
+                                        oninput: move |event| apple_bridge_id.set(event.value().to_string()),
+                                        placeholder: "ios-companion"
+                                    }
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "btn btn-primary min-h-11",
+                                    disabled: apple_action() == ProviderActionState::Loading || apple_bridge_id().trim().is_empty(),
+                                    onclick: move |_| {
+                                        let bridge_id = apple_bridge_id().trim().to_string();
+                                        apple_action.set(ProviderActionState::Loading);
+                                        apple_error.set(None);
+                                        apple_pairing.set(None);
+                                        spawn(async move {
+                                            match crate::app::api::post_json::<serde_json::Value, AppleBridgePairingResponse>(
+                                                "/api/bridges/applemusic/pair",
+                                                &serde_json::json!({ "bridge_id": bridge_id }),
+                                            ).await {
+                                                Ok(pairing) => {
+                                                    apple_pairing.set(Some(pairing));
+                                                    apple_action.set(ProviderActionState::Success);
+                                                }
+                                                Err(error) => {
+                                                    apple_action.set(ProviderActionState::Failed);
+                                                    apple_error.set(Some(error));
+                                                }
+                                            }
+                                        });
+                                    },
+                                    "Generate pairing code"
+                                }
+                            }
+                            if let Some(pairing) = apple_pairing() {
+                                div { class: "mt-4 rounded-lg border border-default bg-surface-muted p-4",
+                                    p { class: "text-sm font-medium", "Enter this code in the companion" }
+                                    p { class: "mt-2 break-all font-mono text-lg tracking-wide", aria_label: "Apple Music pairing code", "{pairing.pairing_code}" }
+                                    p { class: "mt-2 text-xs text-secondary", "Bridge ID: {pairing.bridge_id} · Expires in about 5 minutes" }
+                                }
+                            }
                         }
                         if let Some(error) = apple_error() {
                             p { class: "mt-4 status-err", role: "alert", "{error}" }
