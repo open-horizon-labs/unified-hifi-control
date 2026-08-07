@@ -638,6 +638,9 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
 ///
 /// Routing answers first; anything it does not decide comes from [`GAPS`].
 pub fn support(target: ZoneTarget, capability: Capability) -> Support {
+    if let Some(supported) = routed(target, capability) {
+        return supported;
+    }
     // A route to the bridge is not evidence that Apple's SystemMusicPlayer
     // exposes the operation on a real iPhone. Keep the public matrix truthful
     // until #465's signed-device validation proves each transport/volume cell.
@@ -668,9 +671,6 @@ pub fn support(target: ZoneTarget, capability: Capability) -> Support {
             tracked_by,
             evidence: "the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.",
         };
-    }
-    if let Some(supported) = routed(target, capability) {
-        return supported;
     }
     if matches!(
         target,
