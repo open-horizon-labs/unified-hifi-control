@@ -6,14 +6,18 @@
 //! be distinguished from user intent without changing the retention boundary.
 
 use serde::{Deserialize, Serialize};
+use rand::RngCore;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 const MAX_RECORDS: usize = 256;
 const MAX_REFERENCE_LENGTH: usize = 512;
 const MAX_REASON_LENGTH: usize = 512;
+static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
+static BOOT_NONCE: OnceLock<u64> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -184,6 +188,15 @@ pub fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Mint a process-unique event identity while retaining a human-useful time
+/// prefix. The counter prevents same-second feedback from collapsing into one
+/// logical event; persisted records remain the durable source of truth.
+pub fn next_event_id() -> String {
+    let sequence = NEXT_EVENT_ID.fetch_add(1, Ordering::Relaxed);
+    let boot_nonce = *BOOT_NONCE.get_or_init(|| rand::thread_rng().next_u64());
+    format!("feedback-{}-{}-{}", now_secs(), boot_nonce, sequence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +230,10 @@ mod tests {
         value.rating = Some(5);
         value.explicit = false;
         assert!(validate(&value).is_err());
+    }
+
+    #[test]
+    fn event_ids_are_unique_within_the_same_second() {
+        assert_ne!(next_event_id(), next_event_id());
     }
 }
