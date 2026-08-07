@@ -56,6 +56,7 @@ pub fn Spotify() -> Element {
     });
     let mut error = use_signal(|| None::<String>);
     let mut pending_zone = use_signal(|| None::<String>);
+    let mut pending_track_change = use_signal(|| false);
 
     let zone_list = use_memo(move || zones.read().clone().flatten().unwrap_or_default());
     use_effect(move || {
@@ -77,10 +78,16 @@ pub fn Spotify() -> Element {
             Some(SseEvent::ZoneUpdated { .. } | SseEvent::NowPlayingChanged { .. }) => {
                 if let Some(zone_id) = event.as_ref().and_then(SseEvent::zone_id) {
                     let zone_id = zone_id.to_string();
-                    if matches!(event, Some(SseEvent::NowPlayingChanged { .. }))
-                        && pending_zone() == Some(zone_id.clone())
-                    {
-                        pending_zone.set(None);
+                    if pending_zone() == Some(zone_id.clone()) {
+                        if matches!(event, Some(SseEvent::NowPlayingChanged { .. })) {
+                            pending_zone.set(None);
+                            pending_track_change.set(false);
+                        } else if !pending_track_change() {
+                            // Play/pause and stop are reported as a normal
+                            // zone update; only track-changing commands need
+                            // the longer metadata retry window below.
+                            pending_zone.set(None);
+                        }
                     }
                     spawn(async move {
                         if let Some(np) = fetch_now_playing(&zone_id).await {
@@ -97,6 +104,7 @@ pub fn Spotify() -> Element {
                 let zone_id = payload.output_id.clone();
                 if pending_zone() == Some(zone_id.clone()) {
                     pending_zone.set(None);
+                    pending_track_change.set(false);
                 }
                 spawn(async move {
                     if let Some(np) = fetch_now_playing(&zone_id).await {
@@ -113,10 +121,12 @@ pub fn Spotify() -> Element {
     let control = move |(zone_id, action): (String, String)| {
         let mut error = error;
         let mut pending_zone = pending_zone;
+        let mut pending_track_change = pending_track_change;
         let mut now_playing = now_playing;
         spawn(async move {
             pending_zone.set(Some(zone_id.clone()));
             let retry_track = matches!(action.as_str(), "next" | "previous");
+            pending_track_change.set(retry_track);
             let previous_track = now_playing()
                 .get(&zone_id)
                 .map(|np| (np.line1.clone(), np.image_key.clone()));
@@ -128,6 +138,7 @@ pub fn Spotify() -> Element {
             if let Err(message) = crate::app::api::post_json_no_response("/control", &request).await
             {
                 pending_zone.set(None);
+                pending_track_change.set(false);
                 error.set(Some(message));
             } else if retry_track {
                 let retry_zone_id = zone_id.clone();
@@ -145,11 +156,13 @@ pub fn Spotify() -> Element {
                             });
                             if changed {
                                 pending_zone.set(None);
+                                pending_track_change.set(false);
                                 return;
                             }
                         }
                     }
                     pending_zone.set(None);
+                    pending_track_change.set(false);
                 });
             }
         });
