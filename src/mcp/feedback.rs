@@ -1,7 +1,9 @@
 //! Bounded, provenance-tagged Apple Music feedback for future adaptation.
 //!
 //! This records explicit signals only. It never infers dislike from absence
-//! of a signal and never stores provider credentials or raw Apple IDs.
+//! of a signal and never stores provider credentials or raw Apple IDs. Records
+//! carry a bounded event identity and confidence so future observed events can
+//! be distinguished from user intent without changing the retention boundary.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -32,8 +34,19 @@ pub enum FeedbackSource {
     Observed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackConfidence {
+    #[default]
+    Explicit,
+    Observed,
+    Inferred,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FeedbackRecord {
+    #[serde(default)]
+    pub event_id: String,
     pub zone_id: String,
     pub reference: String,
     pub signal: FeedbackSignal,
@@ -41,6 +54,8 @@ pub struct FeedbackRecord {
     pub rating: Option<u8>,
     pub reason: Option<String>,
     pub explicit: bool,
+    #[serde(default)]
+    pub confidence: FeedbackConfidence,
     pub recorded_at: u64,
 }
 
@@ -123,6 +138,9 @@ pub fn validate(record: &FeedbackRecord) -> anyhow::Result<()> {
     if !record.explicit {
         anyhow::bail!("feedback must identify an explicit user signal");
     }
+    if record.confidence != FeedbackConfidence::Explicit {
+        anyhow::bail!("explicit feedback must have explicit confidence");
+    }
     Ok(())
 }
 
@@ -167,6 +185,7 @@ mod tests {
     use super::*;
     fn record(signal: FeedbackSignal) -> FeedbackRecord {
         FeedbackRecord {
+            event_id: "test-event".into(),
             zone_id: "applemusic:iphone".into(),
             reference: "ref".into(),
             signal,
@@ -174,6 +193,7 @@ mod tests {
             rating: None,
             reason: None,
             explicit: true,
+            confidence: FeedbackConfidence::Explicit,
             recorded_at: now_secs(),
         }
     }

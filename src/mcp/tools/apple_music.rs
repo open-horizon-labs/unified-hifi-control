@@ -216,6 +216,7 @@ pub async fn handle_apple_music(
             );
         }
         Some(crate::mcp::feedback::FeedbackRecord {
+            event_id: format!("feedback-{}", crate::mcp::feedback::now_secs()),
             zone_id: zone_id.to_string(),
             reference: args
                 .uri
@@ -227,6 +228,7 @@ pub async fn handle_apple_music(
             rating: args.rating,
             reason: args.reason.clone(),
             explicit: true,
+            confidence: crate::mcp::feedback::FeedbackConfidence::Explicit,
             recorded_at: crate::mcp::feedback::now_secs(),
         })
     } else {
