@@ -23,6 +23,11 @@ private final class CompanionModel: ObservableObject {
         bridgeID = installation.bridgeID ?? ""
         isPaired = installation.accessToken != nil
         status = isPaired ? "Paired; waiting for snapshots" : "Not authorized"
+        // Restore the bridge lease after a relaunch. The scene-phase callback
+        // is not guaranteed to fire for the initial active transition, so a
+        // persisted pairing must begin publishing immediately rather than
+        // appearing paired while silently offline.
+        if isPaired { startPolling() }
     }
 
     func authorize() {
