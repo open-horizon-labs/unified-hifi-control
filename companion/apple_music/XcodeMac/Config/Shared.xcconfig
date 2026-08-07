@@ -21,6 +21,7 @@ MACOSX_DEPLOYMENT_TARGET = 14.0
 // Info PLIST
 // ==========================================
 GENERATE_INFOPLIST_FILE = YES
+INFOPLIST_KEY_NSAppleMusicUsageDescription = UHC uses Apple Music to control playback and provide metadata to your paired UHC server.
 
 // ==========================================
 // Entitlements
