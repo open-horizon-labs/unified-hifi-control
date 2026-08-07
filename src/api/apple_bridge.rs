@@ -91,6 +91,26 @@ pub struct BridgeStatus {
     pub has_snapshot: bool,
 }
 
+/// Internal owner-scoped liveness. The legacy HTTP status remains unchanged;
+/// this classification is available to adapter/aggregator wiring without
+/// pretending that a boolean `paired` means controllable playback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeOwnerLiveness {
+    Unpaired,
+    AwaitingSnapshot,
+    Reachable,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeOwnerStatus {
+    pub player_id: String,
+    pub bridge_id: Option<String>,
+    pub last_seen: Option<u64>,
+    pub has_snapshot: bool,
+    pub liveness: BridgeOwnerLiveness,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BridgeCommand {
     pub command_id: String,
@@ -276,6 +296,45 @@ impl AppleBridgeRegistry {
             .max_by_key(|session| session.last_seen)
             .and_then(|session| session.snapshot.clone())
             .ok_or_else(|| anyhow!("Apple Music player `{player_id}` is not paired or live"))
+    }
+
+    /// Classify one execution owner without collapsing pairing, first-state,
+    /// reachability, and stale state into a single connected flag.
+    pub async fn owner_status(&self, player_id: &str) -> BridgeOwnerStatus {
+        let now = now_secs();
+        let state = self.inner.read().await;
+        let session = state
+            .sessions
+            .values()
+            .filter(|session| {
+                session.bridge_id == player_id
+                    || session.bound_player_id.as_deref() == Some(player_id)
+            })
+            .max_by_key(|session| session.last_seen);
+        let Some(session) = session else {
+            return BridgeOwnerStatus {
+                player_id: player_id.to_string(),
+                bridge_id: None,
+                last_seen: None,
+                has_snapshot: false,
+                liveness: BridgeOwnerLiveness::Unpaired,
+            };
+        };
+        let has_snapshot = session.snapshot.is_some();
+        let live = session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now;
+        BridgeOwnerStatus {
+            player_id: player_id.to_string(),
+            bridge_id: Some(session.bridge_id.clone()),
+            last_seen: Some(session.last_seen),
+            has_snapshot,
+            liveness: if !live {
+                BridgeOwnerLiveness::Stale
+            } else if has_snapshot {
+                BridgeOwnerLiveness::Reachable
+            } else {
+                BridgeOwnerLiveness::AwaitingSnapshot
+            },
+        }
     }
 
     pub async fn enqueue(&self, command: MusicKitCommand) -> Result<String> {
@@ -821,6 +880,37 @@ mod tests {
             .update_snapshot(&claim.access_token, other)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn owner_status_distinguishes_unpaired_awaiting_snapshot_and_reachable() {
+        let registry = AppleBridgeRegistry::default();
+        assert_eq!(
+            registry.owner_status("iphone").await.liveness,
+            BridgeOwnerLiveness::Unpaired
+        );
+        let pairing = registry.create_pairing("iphone".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+        // A paired owner is known, but its player identity is not bound until
+        // its first state publication.
+        assert_eq!(
+            registry.owner_status("iphone").await.liveness,
+            BridgeOwnerLiveness::AwaitingSnapshot
+        );
+        registry
+            .update_snapshot(&claim.access_token, snapshot_for("system"))
+            .await
+            .expect("snapshot binds owner");
+        let status = registry.owner_status("system").await;
+        assert_eq!(status.bridge_id.as_deref(), Some("iphone"));
+        assert_eq!(status.liveness, BridgeOwnerLiveness::Reachable);
+        assert!(status.has_snapshot);
     }
 
     #[tokio::test]
