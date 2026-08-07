@@ -19,7 +19,8 @@ let package = Package(
         .executableTarget(
             name: "AppleMusicCompanionApp",
             dependencies: ["AppleMusicCompanion"],
-            path: "Host"
+            path: "Host",
+            exclude: ["Info.plist", "AppleMusicCompanion.entitlements", "README.md"]
         ),
     ]
 )
