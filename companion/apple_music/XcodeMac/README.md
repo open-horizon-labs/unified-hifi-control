@@ -90,11 +90,9 @@ App ID change, then authorize Apple Music again. MusicKit will generate the
 developer token automatically once the App ID's MusicKit service is enabled;
 UHC must never be given that token.
 
-The iPhone host uses a separate explicit identifier and must be enabled too:
-
-```
-com.openhorizonlabs.uhc.applemusiccompanion.ios
-```
+The iPhone and Mac hosts intentionally share this same explicit identifier;
+Apple permits one App ID to target multiple Apple platforms. Enable MusicKit
+once on the identifier above and use it for both signed targets.
 
 ### XCConfig Build Settings
 Build settings are managed through **XCConfig files** in `Config/`:
