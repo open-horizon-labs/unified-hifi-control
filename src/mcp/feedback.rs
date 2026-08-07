@@ -5,8 +5,8 @@
 //! carry a bounded event identity and confidence so future observed events can
 //! be distinguished from user intent without changing the retention boundary.
 
-use serde::{Deserialize, Serialize};
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};

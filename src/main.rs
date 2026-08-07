@@ -852,9 +852,7 @@ mod server {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Stop every adapter through the coordinator-owned lifecycle list.
-        coord
-            .stop_all(&state_for_shutdown.startable_adapters)
-            .await;
+        coord.stop_all(&state_for_shutdown.startable_adapters).await;
         if let Some(ref fw) = firmware_service {
             fw.stop();
         }

@@ -1032,7 +1032,9 @@ pub(crate) async fn refresh_hqp_advanced_aggregate(
         .get_hqplayer_snapshot(instance_name)
         .await
         .and_then(|snapshot| snapshot.advanced)
-        .ok_or_else(|| anyhow::anyhow!("HQPlayer advanced state was not retained by the aggregator"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("HQPlayer advanced state was not retained by the aggregator")
+        })
 }
 
 pub(crate) async fn refresh_hqp_profiles_aggregate(
@@ -1171,9 +1173,12 @@ async fn hqp_apply_named_setting(
         | "junk_filter" => value.to_string(),
         "convolution" | "adaptive_volume" | "random" => parse_hqp_bool(value)?.to_string(),
         "repeat" => parse_hqp_repeat(value)?.to_string(),
-        "samplerate" | "rate" => value.parse::<u32>().map_err(|_| {
-            anyhow::anyhow!("Invalid rate value (expected Hz like 48000, 96000): {value}")
-        })?.to_string(),
+        "samplerate" | "rate" => value
+            .parse::<u32>()
+            .map_err(|_| {
+                anyhow::anyhow!("Invalid rate value (expected Hz like 48000, 96000): {value}")
+            })?
+            .to_string(),
         other => return Err(anyhow::anyhow!("Unknown setting: {other}")),
     };
     crate::knobs::routes::dispatch_hqplayer_reconfiguration(
@@ -1192,7 +1197,9 @@ fn parse_hqp_bool(value: &str) -> anyhow::Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "on" | "yes" => Ok(true),
         "false" | "0" | "off" | "no" => Ok(false),
-        _ => Err(anyhow::anyhow!("Invalid boolean value {value:?}; expected true or false")),
+        _ => Err(anyhow::anyhow!(
+            "Invalid boolean value {value:?}; expected true or false"
+        )),
     }
 }
 
@@ -1201,7 +1208,9 @@ fn parse_hqp_repeat(value: &str) -> anyhow::Result<u8> {
         "off" | "0" => Ok(0),
         "one" | "track" | "1" => Ok(1),
         "all" | "2" => Ok(2),
-        _ => Err(anyhow::anyhow!("Invalid repeat value {value:?}; expected off, one, or all")),
+        _ => Err(anyhow::anyhow!(
+            "Invalid repeat value {value:?}; expected off, one, or all"
+        )),
     }
 }
 
@@ -1211,20 +1220,33 @@ pub async fn hqp_setting_handler(
     Json(req): Json<HqpSettingRequest>,
 ) -> impl IntoResponse {
     const ACCEPTED: [&str; 8] = [
-        "mode", "filter", "filter1x", "filterNx", "filternx", "shaper", "samplerate", "rate",
+        "mode",
+        "filter",
+        "filter1x",
+        "filterNx",
+        "filternx",
+        "shaper",
+        "samplerate",
+        "rate",
     ];
     if !ACCEPTED.contains(&req.name.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: format!("Unknown setting: {}", req.name) }),
-        ).into_response();
+            Json(ErrorResponse {
+                error: format!("Unknown setting: {}", req.name),
+            }),
+        )
+            .into_response();
     }
     match hqp_apply_legacy_setting(&state, &req.name, req.value).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: e.to_string() }),
-        ).into_response(),
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -1265,10 +1287,17 @@ pub async fn hqp_pipeline_update_handler(
 
     let result = match &req.value {
         serde_json::Value::Number(n) => match n.as_u64() {
-            Some(v) if v <= u64::from(u32::MAX) => hqp_apply_legacy_setting(&state, &req.setting, v as u32).await,
-            _ => Err(anyhow::anyhow!("Invalid numeric value for {}: {n}", req.setting)),
+            Some(v) if v <= u64::from(u32::MAX) => {
+                hqp_apply_legacy_setting(&state, &req.setting, v as u32).await
+            }
+            _ => Err(anyhow::anyhow!(
+                "Invalid numeric value for {}: {n}",
+                req.setting
+            )),
         },
-        serde_json::Value::String(value) => hqp_apply_named_setting(&state, &req.setting, value).await,
+        serde_json::Value::String(value) => {
+            hqp_apply_named_setting(&state, &req.setting, value).await
+        }
         _ => Err(anyhow::anyhow!("Invalid value type")),
     };
 
@@ -1353,13 +1382,15 @@ pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl 
                 "random": snapshot.state.random,
                 "native_state": snapshot.state,
             })),
-        ).into_response(),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -1377,7 +1408,13 @@ pub async fn hqp_set_matrix_profile_handler(
     match state.hqplayer.set_matrix_profile(req.profile).await {
         Ok(outcome) => match outcome.into_applied_result() {
             Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-            Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })).into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response(),
         },
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1745,7 +1782,8 @@ pub async fn lms_configure_handler(
                 "host": req.host,
                 "port": req.port.unwrap_or(9000)
             })),
-            ).into_response(),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -2095,7 +2133,8 @@ pub async fn hqp_instance_load_profile_handler(
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"ok": true, "instance": name, "profile": req.profile})),
-        ).into_response(),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -2177,8 +2216,15 @@ pub async fn hqp_instance_set_matrix_profile_handler(
             Ok(()) => (
                 StatusCode::OK,
                 Json(serde_json::json!({"ok": true, "instance": name, "value": req.value})),
-            ).into_response(),
-            Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })).into_response(),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response(),
         },
         Err(e) => (
             StatusCode::BAD_REQUEST,

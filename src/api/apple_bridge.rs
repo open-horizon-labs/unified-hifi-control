@@ -1303,7 +1303,9 @@ mod tests {
             )
             .await
             .expect_err("unknown outcome must be rejected at the bridge boundary");
-        assert!(error.to_string().contains("unknown Apple Music content outcome"));
+        assert!(error
+            .to_string()
+            .contains("unknown Apple Music content outcome"));
 
         // Rejection does not consume the request or create a durable result;
         // the companion can retry with a member of the documented vocabulary.

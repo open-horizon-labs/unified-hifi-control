@@ -154,7 +154,8 @@ async fn companion_snapshot_flows_through_aggregator_and_flushes_on_stop() {
     let bus = create_bus();
     let observations = PlaybackObservationHistory::new_for_test();
     let aggregator = Arc::new(ZoneAggregator::new_with_observation_history(
-        bus.clone(), observations,
+        bus.clone(),
+        observations,
     ));
     let aggregator_task = {
         let aggregator = aggregator.clone();
@@ -178,7 +179,11 @@ async fn companion_snapshot_flows_through_aggregator_and_flushes_on_stop() {
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if aggregator.get_zone("applemusic:application").await.is_some() {
+            if aggregator
+                .get_zone("applemusic:application")
+                .await
+                .is_some()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -230,9 +235,7 @@ async fn companion_snapshot_flows_through_aggregator_and_flushes_on_stop() {
         .is_empty());
 
     bus.publish(BusEvent::ShuttingDown { reason: None });
-    aggregator_task
-        .await
-        .expect("aggregator task must join");
+    aggregator_task.await.expect("aggregator task must join");
 }
 
 #[tokio::test]
@@ -261,7 +264,10 @@ async fn transient_companion_failure_retains_zone_until_recovery() {
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if matches!(events.recv().await.expect("bus event"), BusEvent::ZoneDiscovered { .. }) {
+            if matches!(
+                events.recv().await.expect("bus event"),
+                BusEvent::ZoneDiscovered { .. }
+            ) {
                 break;
             }
         }
@@ -285,7 +291,10 @@ async fn transient_companion_failure_retains_zone_until_recovery() {
     })
     .await
     .expect("temporary failure must mark the retained zone unknown");
-    assert!(!removed, "a transient refresh failure must not remove the zone");
+    assert!(
+        !removed,
+        "a transient refresh failure must not remove the zone"
+    );
 
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {

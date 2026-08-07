@@ -528,7 +528,10 @@ mod tests {
 
         coord.set_enabled("probe", false).await;
         started.store(false, Ordering::SeqCst);
-        coord.start_enabled(&adapter).await.expect("disabled is no-op");
+        coord
+            .start_enabled(&adapter)
+            .await
+            .expect("disabled is no-op");
         assert!(!started.load(Ordering::SeqCst));
     }
 

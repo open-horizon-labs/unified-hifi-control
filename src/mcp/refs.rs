@@ -634,7 +634,11 @@ mod tests {
     async fn apple_refs_are_opaque_and_companion_scoped_in_the_table() {
         let table = RefTable::new();
         let token = table
-            .mint(apple_target("iphone", "apple-catalog-id-should-not-leak", "Song"))
+            .mint(apple_target(
+                "iphone",
+                "apple-catalog-id-should-not-leak",
+                "Song",
+            ))
             .await;
         assert!(!token.contains("apple-catalog-id-should-not-leak"));
         let target = table.resolve(&token).await.unwrap();

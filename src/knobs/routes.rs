@@ -663,17 +663,22 @@ async fn dispatch_hqplayer_runtime_command(
             },
         })
         .await
-        .map_err(|error| HqpDispatchError::Backend(format!("HQPlayer command admission failed: {error:?}")))?;
+        .map_err(|error| {
+            HqpDispatchError::Backend(format!("HQPlayer command admission failed: {error:?}"))
+        })?;
     match ticket.wait_for_observable_result().await {
         CommandStatus::Confirmed { .. } => Ok(()),
         CommandStatus::Failed { detail } | CommandStatus::NotDispatched { detail } => {
             Err(HqpDispatchError::Backend(detail))
         }
         CommandStatus::Indeterminate => Err(HqpDispatchError::Backend(
-            "HQPlayer accepted the command but did not publish a verified readback in time".to_string(),
+            "HQPlayer accepted the command but did not publish a verified readback in time"
+                .to_string(),
         )),
         CommandStatus::Queued | CommandStatus::Dispatched | CommandStatus::AwaitingProjection => {
-            Err(HqpDispatchError::Backend("HQPlayer command stopped without a terminal result".to_string()))
+            Err(HqpDispatchError::Backend(
+                "HQPlayer command stopped without a terminal result".to_string(),
+            ))
         }
     }
 }
