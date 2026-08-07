@@ -398,6 +398,23 @@ pub fn Settings() -> Element {
         }
     });
 
+    // A companion creates its pairing request through the Bonjour discovery
+    // endpoint. That request does not produce a playback SSE event, so keep
+    // the Settings view's pending-code display fresh while Apple Music is
+    // enabled. This also covers a companion being opened on another device
+    // after this page has loaded.
+    use_effect(move || {
+        if !applemusic_enabled() {
+            return;
+        }
+        spawn(async move {
+            loop {
+                dioxus_sdk_time::sleep(std::time::Duration::from_secs(2)).await;
+                apple_bridge_status.restart();
+            }
+        });
+    });
+
     let start_spotify_oauth = move |_| {
         spotify_action.set(ProviderActionState::Loading);
         spotify_error.set(None);
@@ -1266,11 +1283,13 @@ pub fn Settings() -> Element {
                                     "Generate pairing code"
                                 }
                         }
-                        if let Some(pending) = apple_st.as_ref().and_then(|status| status.pending_pairings.iter().find(|p| p.bridge_id == apple_bridge_id().trim())) {
-                            div { class: "mt-4 rounded-lg border border-default bg-surface-muted p-4",
-                                p { class: "text-sm font-medium", "Confirm this code in the companion" }
-                                p { class: "mt-2 font-mono text-2xl tracking-[0.35em]", aria_label: "Apple Music pairing confirmation code", "{pending.pairing_code}" }
-                                p { class: "mt-2 text-xs text-secondary", "The companion will discover this UHC server automatically. Confirm that both screens show the same code; nothing needs to be typed." }
+                        if let Some(status) = apple_st.as_ref() {
+                            for pending in status.pending_pairings.iter() {
+                                div { class: "mt-4 rounded-lg border border-default bg-surface-muted p-4",
+                                    p { class: "text-sm font-medium", "Confirm this code in the companion" }
+                                    p { class: "mt-2 font-mono text-2xl tracking-[0.35em]", aria_label: "Apple Music pairing confirmation code", "{pending.pairing_code}" }
+                                    p { class: "mt-2 text-xs text-secondary", "Companion: {pending.bridge_id} · The companion discovered this UHC server automatically. Confirm that both screens show the same code; nothing needs to be typed." }
+                                }
                             }
                         }
                         if let Some(pairing) = apple_pairing() {
