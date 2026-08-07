@@ -426,6 +426,10 @@ mod server {
             .adapter_registry
             .register_with_lifecycle(apple_music.clone(), apple_music.clone())
             .await;
+        state
+            .adapter_registry
+            .register_library("applemusic", apple_music.clone())
+            .await;
 
         // Provider adapters participate in the same feature-toggle lifecycle as
         // local adapters. Their zones still arrive through the bus and the

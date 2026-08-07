@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use unified_hifi_control::adapters::apple_music::{
-    AppleMusicAdapter, MusicKitCommand, MusicKitCompanion, MusicKitPlaybackState, MusicKitSnapshot,
-    MusicKitTrack,
+    AppleMusicAdapter, CompanionPlatform, ExecutionOwner, MusicKitCommand, MusicKitCompanion,
+    MusicKitPlaybackState, MusicKitSnapshot, MusicKitTrack, PlaybackRoute,
 };
 use unified_hifi_control::adapters::{AdapterCommand, AdapterContext, AdapterLogic};
 use unified_hifi_control::bus::SharedBus;
@@ -150,4 +150,37 @@ async fn adapter_rejects_zone_owned_by_another_provider() {
         .error
         .as_deref()
         .is_some_and(|error| error.contains("applemusic")));
+}
+
+#[test]
+fn execution_owner_is_the_only_controllable_zone() {
+    let iphone = ExecutionOwner::new("muness-iphone", CompanionPlatform::IPhone)
+        .expect("valid companion id");
+    let mac =
+        ExecutionOwner::new("studio-mac", CompanionPlatform::Mac).expect("valid companion id");
+
+    assert_eq!(iphone.zone_id().to_string(), "applemusic:muness-iphone");
+    assert_eq!(mac.zone_id().to_string(), "applemusic:studio-mac");
+    assert_ne!(iphone.zone_id(), mac.zone_id());
+}
+
+#[test]
+fn airplay_route_is_destination_observation_not_a_zone() {
+    let route = PlaybackRoute::AirPlay {
+        route_id: "homepod:kitchen".to_string(),
+        display_name: "Kitchen HomePod".to_string(),
+    };
+
+    assert!(route.is_destination_only());
+    assert!(!PlaybackRoute::Unknown.is_destination_only());
+    assert!(!PlaybackRoute::LocalOutput {
+        display_name: "iPhone Speaker".to_string(),
+    }
+    .is_destination_only());
+}
+
+#[test]
+fn companion_ids_cannot_collide_with_prefixed_zone_ids() {
+    assert!(ExecutionOwner::new("", CompanionPlatform::IPhone).is_err());
+    assert!(ExecutionOwner::new("applemusic:fake", CompanionPlatform::Mac).is_err());
 }

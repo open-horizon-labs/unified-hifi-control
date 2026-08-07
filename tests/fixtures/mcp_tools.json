@@ -1,4 +1,59 @@
 {
+  "hifi_apple_music": {
+    "description": "Apple Music catalog, library, playlist, and feedback access through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "Operation to perform.",
+          "type": "string"
+        },
+        "confirm": {
+          "description": "Explicit confirmation for destructive account mutations.",
+          "nullable": true,
+          "type": "boolean"
+        },
+        "description": {
+          "description": "Optional playlist description for playlist operations.",
+          "nullable": true,
+          "type": "string"
+        },
+        "id": {
+          "description": "Provider content or playlist identifier, held server-side where possible.",
+          "nullable": true,
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum number of entries to return.",
+          "nullable": true,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Optional user-facing name/description for playlist operations.",
+          "nullable": true,
+          "type": "string"
+        },
+        "query": {
+          "description": "Search/query text.",
+          "nullable": true,
+          "type": "string"
+        },
+        "uri": {
+          "description": "Opaque Apple Music ref or provider URI for a content operation.",
+          "nullable": true,
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Optional target execution-owner zone.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  },
   "hifi_capabilities": {
     "annotations": {
       "readOnlyHint": true

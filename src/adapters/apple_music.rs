@@ -446,6 +446,73 @@ impl AdapterLogic for AppleMusicAdapter {
     }
 }
 
+#[async_trait]
+impl LibraryAdapter for AppleMusicAdapter {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<LibrarySearchResult>> {
+        let value = self
+            .companion
+            .content(
+                "search",
+                &serde_json::json!({"query": query, "limit": limit.clamp(1, 50)}),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    async fn play_uri(&self, zone_id: &str, uri: &str) -> Result<String> {
+        self.validate_content_zone(zone_id)?;
+        let value = self
+            .companion
+            .content("play_uri", &serde_json::json!({"uri": uri}))
+            .await?;
+        content_message(value, "Apple Music item started")
+    }
+
+    async fn queue_uri(&self, zone_id: &str, uri: &str) -> Result<()> {
+        self.validate_content_zone(zone_id)?;
+        self.companion
+            .content("queue_uri", &serde_json::json!({"uri": uri}))
+            .await
+            .map(|_| ())
+    }
+
+    async fn read_queue(&self, zone_id: &str) -> Result<serde_json::Value> {
+        self.validate_content_zone(zone_id)?;
+        self.companion
+            .content("queue_read", &serde_json::json!({}))
+            .await
+    }
+
+    async fn content(
+        &self,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.companion.content(operation, params).await
+    }
+}
+
+impl AppleMusicAdapter {
+    fn validate_content_zone(&self, zone_id: &str) -> Result<()> {
+        if !zone_id.starts_with("applemusic:") {
+            bail!("zone `{zone_id}` is not owned by the applemusic adapter");
+        }
+        Ok(())
+    }
+}
+
+fn content_message(value: serde_json::Value, default: &str) -> Result<String> {
+    match value {
+        serde_json::Value::String(message) => Ok(message),
+        serde_json::Value::Object(map) => Ok(map
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(default)
+            .to_string()),
+        _ => Ok(default.to_string()),
+    }
+}
+
 crate::impl_startable!(AppleMusicAdapter, "applemusic");
 
 fn now_millis() -> u64 {

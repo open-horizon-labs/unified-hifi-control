@@ -154,7 +154,10 @@ pub async fn handle_search(
         // LMS ignores `source` entirely, so echoing it back as understood would
         // claim the server honored something it discarded. A refused zone
         // reaches no backend at all, so the same reasoning applies.
-        LibraryRoute::Lms | LibraryRoute::Spotify | LibraryRoute::Refused(_) => env,
+        LibraryRoute::Lms
+        | LibraryRoute::Spotify
+        | LibraryRoute::AppleMusic
+        | LibraryRoute::Refused(_) => env,
         LibraryRoute::Roon => env.param(
             "source",
             roon_source_name(roon_search_source(args.source.as_deref())),
@@ -225,6 +228,33 @@ pub async fn handle_search(
                         let ref_token = state
                             .mcp_refs
                             .mint(RefTarget::Spotify {
+                                uri: item.uri,
+                                title: item.title.clone(),
+                            })
+                            .await;
+                        mcp_results.push(McpSearchResult {
+                            title: item.title,
+                            subtitle: item.subtitle,
+                            r#ref: Some(ref_token),
+                        });
+                    }
+                    Ok(env.json_result(&mcp_results))
+                }
+                Err(e) => env.failed(format!("Search error: {}", e)),
+            }
+        }
+        LibraryRoute::AppleMusic => {
+            match state
+                .adapter_registry
+                .search_library("applemusic", &args.query, SPOTIFY_SEARCH_LIMIT)
+                .await
+            {
+                Ok(results) => {
+                    let mut mcp_results = Vec::with_capacity(results.len());
+                    for item in results {
+                        let ref_token = state
+                            .mcp_refs
+                            .mint(RefTarget::AppleMusic {
                                 uri: item.uri,
                                 title: item.title.clone(),
                             })
@@ -501,6 +531,59 @@ pub async fn handle_play(
                 Err(e) => env.failed(format!("Search error: {}", e)),
             }
         }
+        LibraryRoute::AppleMusic => {
+            let action = args.action.as_deref().unwrap_or("play");
+            if !matches!(action, "play" | "queue") {
+                let env = Envelope::write("hifi_play", action)
+                    .param("query", &*args.query)
+                    .param("zone_id", &*args.zone_id)
+                    .param("action", action)
+                    .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
+                return env.refused(
+                    "Apple Music query playback supports action='play' or action='queue'.",
+                    Refusal::InvalidParameter {
+                        parameter: "action",
+                        accepted: vec!["play".to_string(), "queue".to_string()],
+                        detail: "Apple Music companion playback does not expose radio through this MCP surface.".to_string(),
+                    },
+                );
+            }
+            let env = Envelope::write("hifi_play", action)
+                .param("query", &*args.query)
+                .param("zone_id", &*args.zone_id)
+                .param("action", action)
+                .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
+            match state
+                .adapter_registry
+                .search_library("applemusic", &args.query, SPOTIFY_SEARCH_LIMIT)
+                .await
+            {
+                Ok(mut results) => match results.drain(..).next() {
+                    Some(item) => {
+                        let result = if action == "queue" {
+                            state
+                                .adapter_registry
+                                .queue_library_uri("applemusic", &args.zone_id, &item.uri)
+                                .await
+                                .map(|_| format!("Queued {} on Apple Music", item.title))
+                        } else {
+                            state
+                                .adapter_registry
+                                .play_library_uri("applemusic", &args.zone_id, &item.uri)
+                                .await
+                        };
+                        match result {
+                            Ok(message) => Ok(play_success(state, env, message).await),
+                            Err(e) => env.failed(format!("Play error: {}", e)),
+                        }
+                    }
+                    None => {
+                        env.failed("Play error: Apple Music search returned no results".to_string())
+                    }
+                },
+                Err(e) => env.failed(format!("Search error: {}", e)),
+            }
+        }
         LibraryRoute::Roon => {
             use crate::adapters::roon::PlayAction;
 
@@ -726,6 +809,9 @@ pub async fn handle_play_ref(
         (LibraryRoute::Spotify, RefTarget::Spotify { uri, title }) => {
             play_ref_spotify(state, env, &args, uri, title).await
         }
+        (LibraryRoute::AppleMusic, RefTarget::AppleMusic { uri, title }) => {
+            play_ref_apple_music(state, env, &args, uri, title).await
+        }
         // Unreachable: the provider check above already refused any mismatch
         // between the zone's provider and the ref's. Kept exhaustive so a
         // third provider gaining a ref target fails to compile here rather
@@ -735,7 +821,13 @@ pub async fn handle_play_ref(
         | (LibraryRoute::Lms, RefTarget::Roon { .. })
         | (LibraryRoute::Lms, RefTarget::Spotify { .. })
         | (LibraryRoute::Spotify, RefTarget::Roon { .. })
-        | (LibraryRoute::Spotify, RefTarget::Lms { .. }) => env.failed(
+        | (LibraryRoute::Spotify, RefTarget::Lms { .. })
+        | (LibraryRoute::AppleMusic, RefTarget::Roon { .. })
+        | (LibraryRoute::AppleMusic, RefTarget::Lms { .. })
+        | (LibraryRoute::AppleMusic, RefTarget::Spotify { .. })
+        | (LibraryRoute::Roon, RefTarget::AppleMusic { .. })
+        | (LibraryRoute::Lms, RefTarget::AppleMusic { .. })
+        | (LibraryRoute::Spotify, RefTarget::AppleMusic { .. }) => env.failed(
             "internal routing error: ref/zone provider mismatch reached dispatch after the \
                  capability check. This is a UHC bug.",
         ),
@@ -873,6 +965,45 @@ async fn play_ref_spotify(
         state
             .adapter_registry
             .play_library_uri("spotify", &args.zone_id, &uri)
+            .await
+    };
+    match result {
+        Ok(message) => Ok(play_success(state, env, message).await),
+        Err(e) => env.failed(format!("Play error for {title}: {}", e)),
+    }
+}
+
+async fn play_ref_apple_music(
+    state: &AppState,
+    mut env: Envelope,
+    args: &HifiPlayRefTool,
+    uri: String,
+    title: String,
+) -> Result<CallToolResult, CallToolError> {
+    const ACTIONS: &[&str] = &["play", "queue"];
+    let action_name = match validate_ref_action(args.action.as_deref(), ACTIONS) {
+        Ok(name) => name,
+        Err(refusal) => {
+            env.operation = "invalid_action".to_string();
+            let detail = match &refusal {
+                Refusal::InvalidParameter { detail, .. } => detail.clone(),
+                _ => String::new(),
+            };
+            return env.refused(detail, refusal);
+        }
+    };
+    let mut env = env.param("action", action_name);
+    env.operation = action_name.to_string();
+    let result = if action_name == "queue" {
+        state
+            .adapter_registry
+            .queue_library_uri("applemusic", &args.zone_id, &uri)
+            .await
+            .map(|_| format!("Queued {title} on Apple Music"))
+    } else {
+        state
+            .adapter_registry
+            .play_library_uri("applemusic", &args.zone_id, &uri)
             .await
     };
     match result {

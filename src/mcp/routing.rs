@@ -233,6 +233,7 @@ pub enum LibraryRoute {
     Roon,
     Lms,
     Spotify,
+    AppleMusic,
     /// No library path for this zone id.
     Refused(ZoneTarget),
 }
@@ -342,14 +343,13 @@ impl ZoneTarget {
             Self::Roon => LibraryRoute::Roon,
             Self::Lms => LibraryRoute::Lms,
             Self::Spotify => LibraryRoute::Spotify,
+            Self::AppleMusic => LibraryRoute::AppleMusic,
             // OpenHome and UPnP zones are renderers with no library; before #398
             // both were sent to Roon, which searched a library the zone could not
             // play from.
-            Self::OpenHome
-            | Self::Upnp
-            | Self::HqPlayer
-            | Self::AppleMusic
-            | Self::MusicAssistant => LibraryRoute::Refused(self),
+            Self::OpenHome | Self::Upnp | Self::HqPlayer | Self::MusicAssistant => {
+                LibraryRoute::Refused(self)
+            }
             Self::Unprefixed | Self::Unknown => LibraryRoute::Refused(self),
         }
     }

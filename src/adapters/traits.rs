@@ -120,7 +120,7 @@ pub struct AdapterCommandResponse {
 /// The MCP layer deliberately keeps provider-specific fields out of its wire
 /// result. Adapters translate their native result into this small contract and
 /// retain the URI for play-by-reference.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LibrarySearchResult {
     pub title: String,
     pub subtitle: Option<String>,

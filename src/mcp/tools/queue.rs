@@ -44,6 +44,14 @@ pub async fn handle_queue(
             Ok(value) => Ok(env.json_result(&value)),
             Err(e) => env.failed(format!("Queue error: {e}")),
         },
+        LibraryRoute::AppleMusic => match state
+            .adapter_registry
+            .read_library_queue("applemusic", &args.zone_id)
+            .await
+        {
+            Ok(value) => Ok(env.json_result(&value)),
+            Err(e) => env.failed(format!("Queue error: {e}")),
+        },
         _ => env.failed("Queue read is not implemented for this provider"),
     }
 }
