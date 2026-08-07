@@ -301,7 +301,6 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 | (ZoneTarget::Lms, TransportRoute::Lms)
                 | (ZoneTarget::OpenHome, TransportRoute::OpenHome)
                 | (ZoneTarget::Upnp, TransportRoute::Upnp)
-                | (ZoneTarget::AppleMusic, TransportRoute::AppleMusic)
                 | (ZoneTarget::Spotify, TransportRoute::Spotify)
                 | (ZoneTarget::MusicAssistant, TransportRoute::MusicAssistant)
         ),
@@ -315,7 +314,6 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                     | (ZoneTarget::Lms, TransportRoute::Lms)
                     | (ZoneTarget::OpenHome, TransportRoute::OpenHome)
                     | (ZoneTarget::Upnp, TransportRoute::Upnp)
-                    | (ZoneTarget::AppleMusic, TransportRoute::AppleMusic)
                     | (ZoneTarget::Spotify, TransportRoute::Spotify)
                     | (ZoneTarget::MusicAssistant, TransportRoute::MusicAssistant)
             );
@@ -329,7 +327,6 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 | (ZoneTarget::Lms, VolumeRoute::Lms)
                 | (ZoneTarget::OpenHome, VolumeRoute::OpenHome)
                 | (ZoneTarget::Upnp, VolumeRoute::Upnp)
-                | (ZoneTarget::AppleMusic, VolumeRoute::AppleMusic)
                 | (ZoneTarget::Spotify, VolumeRoute::Spotify)
                 | (ZoneTarget::MusicAssistant, VolumeRoute::MusicAssistant)
         ),
@@ -424,6 +421,10 @@ const PLAY_A_NAMED_URI_EXISTS: &str =
     device's ability to play it. Reported as a UHC gap rather than a provider limit, because a \
     reference minted against a media server would work. Verified from the UPnP AV and OpenHome \
     service definitions, not from a device.";
+
+const APPLE_TRANSPORT_NOT_VALIDATED: &str = "the native iPhone companion path is implemented, \
+    but SystemMusicPlayer transport and volume behavior remains pending signed physical-device \
+    validation (#465).";
 
 /// HQPlayer content operations: UHC's XML control protocol coverage does not
 /// include them and the protocol's own reach has not been verified here. Reported
@@ -606,6 +607,14 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
          service definitions, not from a device.")),
 
     // -------------------------------------------------------------------------
+    // Apple Music. The native companion path exists, but transport acceptance
+    // remains deliberately gated until a signed iPhone run proves it.
+    // -------------------------------------------------------------------------
+    (ZoneTarget::AppleMusic, Capability::Transport, Gap::NotWired("#465", APPLE_TRANSPORT_NOT_VALIDATED)),
+    (ZoneTarget::AppleMusic, Capability::TransportSkip, Gap::NotWired("#465", APPLE_TRANSPORT_NOT_VALIDATED)),
+    (ZoneTarget::AppleMusic, Capability::Volume, Gap::NotWired("#465", APPLE_TRANSPORT_NOT_VALIDATED)),
+
+    // -------------------------------------------------------------------------
     // HQPlayer. Nothing is routed -- hifi_zones lists these zones and
     // hifi_control cannot reach any of them. The largest gap #398 found, and the
     // one it does not close.
@@ -641,21 +650,16 @@ pub fn support(target: ZoneTarget, capability: Capability) -> Support {
     if let Some(supported) = routed(target, capability) {
         return supported;
     }
-    // A route to the bridge is not evidence that Apple's SystemMusicPlayer
-    // exposes the operation on a real iPhone. Keep the public matrix truthful
-    // until #465's signed-device validation proves each transport/volume cell.
-    if target == ZoneTarget::AppleMusic
-        && matches!(
+    if target == ZoneTarget::AppleMusic {
+        if matches!(
             capability,
             Capability::Transport | Capability::TransportSkip | Capability::Volume
-        )
-    {
-        return Support::NotImplemented {
-            tracked_by: "#465",
-            evidence: "the native iPhone companion path is implemented, but this capability remains pending signed physical-device validation of SystemMusicPlayer behavior.",
-        };
-    }
-    if target == ZoneTarget::AppleMusic {
+        ) {
+            return Support::NotImplemented {
+                tracked_by: "#465",
+                evidence: APPLE_TRANSPORT_NOT_VALIDATED,
+            };
+        }
         let tracked_by = match capability {
             Capability::Search | Capability::PlayByQuery | Capability::PlayByRef => "#481",
             Capability::Browse | Capability::SavedPlaylists | Capability::Favorites => "#482",
@@ -1093,10 +1097,17 @@ mod tests {
 
     #[test]
     fn apple_transport_capabilities_wait_for_physical_validation() {
-        for capability in [Capability::Transport, Capability::TransportSkip, Capability::Volume] {
+        for capability in [
+            Capability::Transport,
+            Capability::TransportSkip,
+            Capability::Volume,
+        ] {
             assert!(matches!(
                 support(ZoneTarget::AppleMusic, capability),
-                Support::NotImplemented { tracked_by: "#465", .. }
+                Support::NotImplemented {
+                    tracked_by: "#465",
+                    ..
+                }
             ));
         }
     }

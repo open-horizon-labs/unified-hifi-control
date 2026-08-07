@@ -207,9 +207,9 @@ Two things this table does **not** claim:
 
 | Capability | roon | lms | openhome | upnp | hqplayer | applemusic | spotify | musicassistant |
 |---|---|---|---|---|---|---|---|---|
-| `transport` | ✅ | ✅ | ✅ | ✅ | 🚧 #328 | ✅ | ✅ | ✅ |
-| `transport_skip` | ✅ | ✅ | ✅ | 🚧 #392 | 🚧 #328 | ✅ | ✅ | ✅ |
-| `volume` | ✅ | ✅ | ✅ | ✅ | 🚧 #328 | ✅ | ✅ | ✅ |
+| `transport` | ✅ | ✅ | ✅ | ✅ | 🚧 #328 | 🚧 #465 | ✅ | ✅ |
+| `transport_skip` | ✅ | ✅ | ✅ | 🚧 #392 | 🚧 #328 | 🚧 #465 | ✅ | ✅ |
+| `volume` | ✅ | ✅ | ✅ | ✅ | 🚧 #328 | 🚧 #465 | ✅ | ✅ |
 | `search` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #481 | ✅ | 🚧 #462 |
 | `play_by_query` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #481 | ✅ | 🚧 #462 |
 | `play_by_ref` | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #209 | 🚧 #481 | ✅ | 🚧 #462 |
@@ -231,9 +231,12 @@ Two things this table does **not** claim:
 Every non-supported cell states the fact it rests on, so the claim can be checked rather than trusted:
 
 - 🚧 **hqplayer / `transport`** (#328) — HqpAdapter implements play, pause, stop, next, previous, seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them.
+- 🚧 **applemusic / `transport`** (#465) — the native iPhone companion path is implemented, but SystemMusicPlayer transport and volume behavior remains pending signed physical-device validation (#465).
 - 🚧 **upnp / `transport_skip`** (#392) — AVTransport:1 -- the service this adapter already speaks -- defines Next and Previous actions, and UHC's adapter refuses them before issuing either (src/adapters/upnp.rs, REFUSED_TRANSPORT_ACTIONS). A renderer with no playlist would reject the call, but that is the device's answer to give, not UHC's to assume.
 - 🚧 **hqplayer / `transport_skip`** (#328) — HqpAdapter implements play, pause, stop, next, previous, seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them.
+- 🚧 **applemusic / `transport_skip`** (#465) — the native iPhone companion path is implemented, but SystemMusicPlayer transport and volume behavior remains pending signed physical-device validation (#465).
 - 🚧 **hqplayer / `volume`** (#328) — HqpAdapter implements play, pause, stop, next, previous, seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them.
+- 🚧 **applemusic / `volume`** (#465) — the native iPhone companion path is implemented, but SystemMusicPlayer transport and volume behavior remains pending signed physical-device validation (#465).
 - ⛔ **openhome / `search`** — UHC discovers OpenHome zones by their av-openhome-org Product, Transport and Volume services (src/adapters/openhome.rs) and the OpenHome service set has no library: content is resolved by a control point against a separate media server. Verified from the OpenHome service definitions, not from a device.
 - ⛔ **upnp / `search`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `search`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
