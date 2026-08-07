@@ -18,17 +18,7 @@
       "Bash(gh pr edit:*)",
       "Bash(gh pr view:*)",
       "Bash(gh pr comment:*)",
-      "Bash(cargo check:*)",
-      "WebSearch",
-      "WebFetch(domain:openai.com)"
+      "Bash(cargo check:*)"
     ]
-  },
-  "enabledMcpjsonServers": [
-    "rna-mcp",
-    "unified-hifi-control"
-  ],
-  "disabledMcpjsonServers": [
-    "rna-mcp",
-    "unified-hifi-control"
-  ]
+  }
 }
