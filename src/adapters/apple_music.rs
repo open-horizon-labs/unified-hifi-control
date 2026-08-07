@@ -552,6 +552,7 @@ impl LibraryAdapter for AppleMusicAdapter {
         operation: &str,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value> {
+        validate_content_request(operation, params)?;
         self.companion.content(operation, params).await
     }
 }
@@ -563,6 +564,24 @@ impl AppleMusicAdapter {
         }
         Ok(())
     }
+}
+
+fn validate_content_request(operation: &str, params: &serde_json::Value) -> Result<()> {
+    // Catalog search is provider-global. Every account, queue, playlist, and
+    // playback operation must name the execution owner so a future multi-
+    // companion bridge cannot silently route content to the wrong player.
+    if matches!(operation, "search" | "catalog_search") {
+        return Ok(());
+    }
+    let zone_id = params
+        .get("zone_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Apple Music content operation requires zone_id"))?;
+    let player_id = zone_id.strip_prefix("applemusic:");
+    if player_id.is_none_or(str::is_empty) || player_id.is_some_and(|value| value.contains(':')) {
+        bail!("zone `{zone_id}` is not an Apple Music execution-owner zone");
+    }
+    Ok(())
 }
 
 fn content_message(value: serde_json::Value, default: &str) -> Result<String> {
@@ -633,5 +652,22 @@ mod tests {
             is_muted: false,
         };
         assert!(AppleMusicAdapter::zone_from_snapshot(&snapshot).is_err());
+    }
+
+    #[test]
+    fn content_operations_require_an_apple_execution_owner() {
+        assert!(validate_content_request("catalog_search", &serde_json::json!({})).is_ok());
+        assert!(validate_content_request("search", &serde_json::json!({})).is_ok());
+        assert!(validate_content_request("playlist_add", &serde_json::json!({})).is_err());
+        assert!(validate_content_request(
+            "playlist_add",
+            &serde_json::json!({"zone_id": "spotify:device"})
+        )
+        .is_err());
+        assert!(validate_content_request(
+            "playlist_add",
+            &serde_json::json!({"zone_id": "applemusic:iphone"})
+        )
+        .is_ok());
     }
 }
