@@ -898,7 +898,7 @@ pub fn Settings() -> Element {
                             } else if spotify_configured {
                                 span { class: "badge badge-secondary shrink-0", "Configured" }
                             } else {
-                                span { class: "badge badge-secondary shrink-0", "Not connected" }
+                                span { class: "badge badge-secondary shrink-0", "Setup required" }
                             }
                         }
 
@@ -1024,7 +1024,12 @@ pub fn Settings() -> Element {
                         }
                         }
 
-                        if let Some(devices) = spotify_devices {
+                        if !spotify_configured {
+                            div { class: "rounded-md border border-default bg-elevated p-4", role: "status", aria_live: "polite",
+                                p { class: "font-medium", "Spotify setup required" }
+                                p { class: "mt-1 text-sm text-secondary", "Save your Spotify client settings, then connect your account to discover Connect devices." }
+                            }
+                        } else if let Some(devices) = spotify_devices {
                             if devices.is_empty() {
                                 div { class: "rounded-md border border-default bg-elevated p-4", role: "status", aria_live: "polite",
                                     p { class: "font-medium", "No Spotify devices found" }
@@ -1071,13 +1076,15 @@ pub fn Settings() -> Element {
                             p { class: "mt-4 text-sm text-secondary", role: "status", aria_live: "polite", "{message}" }
                         }
 
-                        div { class: "mt-5 flex flex-wrap gap-3 border-t border-default pt-4",
-                            button {
-                                r#type: "button",
-                                class: "btn btn-outline min-h-11",
-                                disabled: spotify_action() == ProviderActionState::Loading,
-                                onclick: disconnect_spotify,
-                                "Disconnect Spotify"
+                        if spotify_configured || spotify_connected {
+                            div { class: "mt-5 flex flex-wrap gap-3 border-t border-default pt-4",
+                                button {
+                                    r#type: "button",
+                                    class: "btn btn-outline min-h-11",
+                                    disabled: spotify_action() == ProviderActionState::Loading,
+                                    onclick: disconnect_spotify,
+                                    "Disconnect Spotify"
+                                }
                             }
                         }
                     }
