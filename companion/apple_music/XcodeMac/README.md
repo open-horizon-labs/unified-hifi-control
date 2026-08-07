@@ -81,7 +81,7 @@ the explicit bundle identifier below under the Apple Developer account that
 will sign the app, then enable **MusicKit** in the App Services tab:
 
 ```
-com.openhorizonlabs.uhc.applemusiccompanion
+com.openhorizonlabs.uhc.applemusiccompanion.ios
 ```
 
 In Xcode, set the target's Team to the same account (the display name may be

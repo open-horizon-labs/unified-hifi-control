@@ -8,7 +8,7 @@
 // ==========================================
 PRODUCT_NAME = AppleMusicCompanionMac
 PRODUCT_DISPLAY_NAME = Apple Music Companion
-PRODUCT_BUNDLE_IDENTIFIER = com.openhorizonlabs.uhc.applemusiccompanion
+PRODUCT_BUNDLE_IDENTIFIER = com.openhorizonlabs.uhc.applemusiccompanion.ios
 MARKETING_VERSION = 0.1.0
 CURRENT_PROJECT_VERSION = 1
 

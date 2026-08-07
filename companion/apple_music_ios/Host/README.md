@@ -9,7 +9,7 @@ be stable across relaunches (store it in Keychain).
 The host flow is:
 
 1. Register the single explicit bundle ID
-   `com.openhorizonlabs.uhc.applemusiccompanion` under the signing team in
+   `com.openhorizonlabs.uhc.applemusiccompanion.ios` under the signing team in
    Certificates, Identifiers & Profiles, enable the **MusicKit** App Service,
    and include `Info.plist` here. MusicKit manages both token lifecycles inside
    the signed app; no custom MusicKit entitlement is required. A subscription
