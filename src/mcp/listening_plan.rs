@@ -96,6 +96,80 @@ impl ListeningPlanStore {
     pub async fn get(&self, zone_id: &str) -> Option<ListeningPlan> {
         self.plans.read().await.get(zone_id).cloned()
     }
+
+    /// Append intent to an existing plan without pretending the provider queue
+    /// has accepted it. The generation changes so callers can correlate a
+    /// later acknowledgement or detect a stale plan response.
+    pub async fn append(
+        &self,
+        zone_id: &str,
+        items: Vec<ListeningPlanItem>,
+    ) -> anyhow::Result<ListeningPlan> {
+        validate_items(zone_id, &items)?;
+        let mut plans = self.plans.write().await;
+        let previous = plans.get(zone_id).cloned();
+        let mut plan = previous.clone().unwrap_or(ListeningPlan {
+            zone_id: zone_id.to_string(),
+            items: Vec::new(),
+            current_index: None,
+            generation: 0,
+            updated_at: 0,
+        });
+        if plan.items.len().saturating_add(items.len()) > MAX_ITEMS {
+            anyhow::bail!("listening plan is limited to {MAX_ITEMS} items");
+        }
+        plan.items.extend(items);
+        plan.generation = plan.generation.saturating_add(1).max(1);
+        plan.updated_at = now_secs();
+        plans.insert(zone_id.to_string(), plan.clone());
+        trim_plans(&mut plans);
+        if let Some(path) = &self.path {
+            if let Err(error) = persist_plans(path, &plans) {
+                restore_plan(&mut plans, zone_id, previous);
+                return Err(error);
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Add one item immediately after the plan's observed current item. If no
+    /// current item is known, it is inserted at the front and remains merely
+    /// planned intent until the companion confirms playback.
+    pub async fn play_next(
+        &self,
+        zone_id: &str,
+        item: ListeningPlanItem,
+    ) -> anyhow::Result<ListeningPlan> {
+        validate_items(zone_id, std::slice::from_ref(&item))?;
+        let mut plans = self.plans.write().await;
+        let previous = plans.get(zone_id).cloned();
+        let mut plan = previous.clone().unwrap_or(ListeningPlan {
+            zone_id: zone_id.to_string(),
+            items: Vec::new(),
+            current_index: None,
+            generation: 0,
+            updated_at: 0,
+        });
+        if plan.items.len() >= MAX_ITEMS {
+            anyhow::bail!("listening plan is limited to {MAX_ITEMS} items");
+        }
+        let index = plan
+            .current_index
+            .map(|current| current.saturating_add(1).min(plan.items.len()))
+            .unwrap_or(0);
+        plan.items.insert(index, item);
+        plan.generation = plan.generation.saturating_add(1).max(1);
+        plan.updated_at = now_secs();
+        plans.insert(zone_id.to_string(), plan.clone());
+        trim_plans(&mut plans);
+        if let Some(path) = &self.path {
+            if let Err(error) = persist_plans(path, &plans) {
+                restore_plan(&mut plans, zone_id, previous);
+                return Err(error);
+            }
+        }
+        Ok(plan)
+    }
 }
 
 const MAX_PLANS: usize = 32;
@@ -113,6 +187,35 @@ fn trim_plans(plans: &mut HashMap<String, ListeningPlan>) {
             break;
         };
         plans.remove(&oldest);
+    }
+}
+
+fn validate_items(zone_id: &str, items: &[ListeningPlanItem]) -> anyhow::Result<()> {
+    if zone_id.is_empty() || !zone_id.starts_with("applemusic:") {
+        anyhow::bail!("listening plan zone must be an applemusic execution-owner zone");
+    }
+    if items.len() > MAX_ITEMS {
+        anyhow::bail!("listening plan is limited to {MAX_ITEMS} items");
+    }
+    if items.iter().any(|item| {
+        item.reference.is_empty()
+            || item.reference.len() > MAX_REFERENCE_LENGTH
+            || item.title.len() > MAX_TITLE_LENGTH
+    }) {
+        anyhow::bail!("listening plan contains an invalid or oversized item");
+    }
+    Ok(())
+}
+
+fn restore_plan(
+    plans: &mut HashMap<String, ListeningPlan>,
+    zone_id: &str,
+    previous: Option<ListeningPlan>,
+) {
+    if let Some(previous) = previous {
+        plans.insert(zone_id.to_string(), previous);
+    } else {
+        plans.remove(zone_id);
     }
 }
 
@@ -221,5 +324,44 @@ mod tests {
         };
         assert_eq!(restarted.get("applemusic:iphone").await, Some(expected));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn append_and_play_next_preserve_truthful_plan_generation() {
+        let store = ListeningPlanStore::default();
+        let first = store
+            .replace(
+                "applemusic:iphone",
+                vec![ListeningPlanItem {
+                    reference: "one".into(),
+                    title: "One".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let appended = store
+            .append(
+                "applemusic:iphone",
+                vec![ListeningPlanItem {
+                    reference: "two".into(),
+                    title: "Two".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(appended.generation, first.generation + 1);
+        assert_eq!(appended.items.iter().map(|i| i.reference.as_str()).collect::<Vec<_>>(), ["one", "two"]);
+        let next = store
+            .play_next(
+                "applemusic:iphone",
+                ListeningPlanItem {
+                    reference: "next".into(),
+                    title: "Next".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.items[0].reference, "next");
+        assert_eq!(next.generation, appended.generation + 1);
     }
 }
