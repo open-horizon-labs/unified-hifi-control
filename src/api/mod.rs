@@ -39,6 +39,7 @@ use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 pub mod apple_bridge;
+pub mod controller_auth;
 pub mod credentials;
 pub mod provider_auth;
 
@@ -231,6 +232,7 @@ pub struct AppState {
     pub upnp: Arc<UPnPAdapter>,
     pub adapter_registry: Arc<AdapterRegistry>,
     pub provider_auth: Arc<provider_auth::ProviderAuthState>,
+    pub controller_auth: controller_auth::ControllerAuthState,
     pub apple_bridges: apple_bridge::AppleBridgeRegistry,
     pub knobs: KnobStore,
     pub bus: SharedBus,
@@ -284,6 +286,7 @@ impl AppState {
             upnp,
             adapter_registry: Arc::new(AdapterRegistry::default()),
             provider_auth: Arc::new(provider_auth::ProviderAuthState::default()),
+            controller_auth: controller_auth::ControllerAuthState::new(),
             apple_bridges: apple_bridge::AppleBridgeRegistry::default(),
             knobs,
             bus,

@@ -14,6 +14,7 @@ mod server {
     use api::load_app_settings;
 
     use anyhow::Result;
+    use axum::middleware::from_fn_with_state;
     use axum::{
         response::{Html, IntoResponse, Redirect},
         routing::{delete, get, post, put},
@@ -466,6 +467,12 @@ mod server {
             Instant::now(),
             shutdown_token.clone(),
         );
+        if let Some(bootstrap_token) = state.controller_auth.take_bootstrap_secret().await {
+            tracing::info!(
+                "UHC controller bootstrap token (display once; do not put it in a tunnel URL): {}",
+                bootstrap_token
+            );
+        }
 
         state
             .adapter_registry
@@ -533,10 +540,15 @@ mod server {
         let api_bridge_ack = api::apple_bridge::acknowledge;
         let api_bridge_content = api::apple_bridge::content;
         let api_bridge_content_ack = api::apple_bridge::acknowledge_content;
+        let controller_bootstrap = api::controller_auth::bootstrap;
+        let controller_status = api::controller_auth::status;
         #[rustfmt::skip]
         let router = Router::new()
             // Health check
             .route("/status", get(api::status_handler))
+            // Installation-bound controller bootstrap/session boundary
+            .route("/api/controller/bootstrap", post(controller_bootstrap))
+            .route("/api/controller/status", get(controller_status))
             // Provider authorization and native companion pairing
             .route("/api/providers/{provider}/oauth/start", get(api_oauth_start))
             .route("/api/providers/{provider}/oauth/callback", get(api_oauth_callback))
@@ -726,6 +738,10 @@ mod server {
             .route("/mcp", delete(mcp::handle_mcp_delete))
             // Middleware
             .layer(mcp_extension)
+            .layer(from_fn_with_state(
+                state.controller_auth.clone(),
+                api::controller_auth::middleware,
+            ))
             .layer(configured_cors_layer())
             .layer(CompressionLayer::new())
             .layer(TraceLayer::new_for_http())

@@ -69,6 +69,14 @@ installation-scoped controller token. It does not receive or replay the local
 browser cookie. Exact CORS origins remain opt-in, and forwarded host/scheme
 headers are trusted only from a configured proxy.
 
-Until this contract is approved and implemented, UHC must remain LAN-only or
-sit behind an authenticated tunnel/reverse proxy such as Cloudflare Access or
-Tailscale identity-aware access.
+## Migration and enforcement
+
+The controller boundary is implemented behind the explicit
+`UHC_REQUIRE_CONTROLLER_AUTH=true` install switch. It is intentionally opt-in
+for existing LAN installs while the Settings UI gains its bootstrap screen;
+when unset, the historical LAN browser flow remains available. Tunnel or
+hosted deployments must set the switch before exposing UHC. With enforcement
+enabled, provider configuration/OAuth/account, Apple pairing management, MCP,
+and mutating playback/configuration routes require the browser session and
+CSRF checks. Read-only device/status pages remain available, and native Apple
+bridge bearer routes remain independent.

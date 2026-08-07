@@ -18,6 +18,7 @@ GET /admin
 GET /api/bridges/applemusic/commands
 GET /api/bridges/applemusic/content
 GET /api/bridges/applemusic/status
+GET /api/controller/status
 GET /api/providers/spotify/account
 GET /api/providers/{provider}/oauth/callback
 GET /api/providers/{provider}/oauth/start
@@ -71,6 +72,7 @@ POST /api/bridges/applemusic/content/{request_id}
 POST /api/bridges/applemusic/pair
 POST /api/bridges/applemusic/revoke
 POST /api/bridges/applemusic/state
+POST /api/controller/bootstrap
 POST /api/providers/{provider}/configure
 POST /api/providers/{provider}/oauth/revoke
 POST /api/settings
