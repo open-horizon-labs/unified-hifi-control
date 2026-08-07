@@ -1,10 +1,11 @@
 //! Native Apple Music adapter boundary.
 //!
-//! Apple Music playback is controlled by a native macOS MusicKit companion.
-//! The companion owns MusicKit authorization and an
-//! [`ApplicationMusicPlayer`](https://developer.apple.com/documentation/musickit/applicationmusicplayer)
+//! Apple Music playback is controlled by a native MusicKit companion.
+//! The companion owns MusicKit authorization and its platform playback
 //! session; this module owns the UHC adapter lifecycle and translates the
-//! companion's state into the shared zone/event model.
+//! companion's state into the shared zone/event model.  The initial platform
+//! target is iPhone `SystemMusicPlayer`; the legacy macOS package remains a
+//! separate, unvalidated execution owner until #486 is proven on hardware.
 //!
 //! The Rust server deliberately does not import MusicKit or automate the
 //! Music.app process.  [`MusicKitCompanion`] is the narrow boundary used by an
@@ -22,7 +23,8 @@ use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::traits::{
-    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, LibraryAdapter,
+    LibrarySearchResult,
 };
 use crate::bus::{
     BusEvent, NowPlaying, PlaybackState, PrefixedZoneId, VolumeControl, VolumeScale, Zone,
@@ -33,6 +35,65 @@ pub const APPLE_MUSIC_PREFIX: &str = "applemusic";
 
 /// The ApplicationMusicPlayer session used by the native companion.
 pub const APPLICATION_PLAYER_ID: &str = "application";
+
+/// The platform that owns an Apple Music playback session.
+///
+/// This is deliberately not part of [`MusicKitSnapshot`]'s wire shape yet:
+/// adding fields to the paired bridge payload requires the API contract work
+/// tracked by #463.  Keeping the model here lets the adapter and tests make
+/// the ownership distinction without claiming an unvalidated SDK surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompanionPlatform {
+    IPhone,
+    Mac,
+}
+
+/// Identity of the process/device that owns playback for an `applemusic:` zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionOwner {
+    pub companion_id: String,
+    pub platform: CompanionPlatform,
+}
+
+impl ExecutionOwner {
+    pub fn new(companion_id: impl Into<String>, platform: CompanionPlatform) -> Result<Self> {
+        let companion_id = companion_id.into();
+        if companion_id.is_empty() || companion_id.contains(':') {
+            bail!("Apple Music companion id must be non-empty and may not contain ':'");
+        }
+        Ok(Self {
+            companion_id,
+            platform,
+        })
+    }
+
+    /// The only controllable zone identity owned by this companion.
+    pub fn zone_id(&self) -> PrefixedZoneId {
+        PrefixedZoneId::applemusic(&self.companion_id)
+    }
+}
+
+/// Output route selected by the execution owner.
+///
+/// A route is observation about where audio is expected to emerge; it is not
+/// a UHC zone and therefore cannot receive commands or create a second zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaybackRoute {
+    Unknown,
+    LocalOutput {
+        display_name: String,
+    },
+    AirPlay {
+        route_id: String,
+        display_name: String,
+    },
+}
+
+impl PlaybackRoute {
+    pub fn is_destination_only(&self) -> bool {
+        matches!(self, Self::AirPlay { .. })
+    }
+}
 
 /// Playback states emitted by the MusicKit companion.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +191,19 @@ pub enum MusicKitResponse {
 pub trait MusicKitCompanion: Send + Sync {
     async fn snapshot(&self) -> Result<MusicKitSnapshot>;
     async fn execute(&self, command: MusicKitCommand) -> Result<()>;
+
+    /// Execute an authenticated Apple Music content operation on the native
+    /// companion. The companion owns the MusicKit token; UHC receives only the
+    /// provider-neutral JSON result. Keeping this optional preserves playback
+    /// compatibility with older companions while the content surface rolls
+    /// out in a later companion version.
+    async fn content(
+        &self,
+        _operation: &str,
+        _params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        bail!("Apple Music content operations are not implemented by this companion")
+    }
 }
 
 /// Apple Music adapter backed by a native MusicKit companion.
@@ -221,7 +295,7 @@ impl AppleMusicAdapter {
         &self,
         bus: &crate::bus::SharedBus,
         discovered: &mut bool,
-    ) -> Result<()> {
+    ) -> Result<PrefixedZoneId> {
         let snapshot = self.companion.snapshot().await?;
         let zone = Self::zone_from_snapshot(&snapshot)?;
         let zone_id = PrefixedZoneId::applemusic(&snapshot.player_id);
@@ -245,7 +319,7 @@ impl AppleMusicAdapter {
                 });
                 if let Some(position) = track.position_seconds {
                     bus.publish(BusEvent::SeekPositionChanged {
-                        zone_id,
+                        zone_id: zone_id.clone(),
                         position: position as i64,
                     });
                 }
@@ -258,7 +332,7 @@ impl AppleMusicAdapter {
                 });
             }
         }
-        Ok(())
+        Ok(zone_id)
     }
 
     fn command_for(command: AdapterCommand) -> Result<MusicKitCommand> {
@@ -329,10 +403,22 @@ impl AdapterLogic for AppleMusicAdapter {
     async fn run(&self, ctx: AdapterContext) -> Result<()> {
         let mut ticker = interval(self.poll_interval);
         let mut discovered = false;
+        let mut zone_id: Option<PrefixedZoneId> = None;
         loop {
             tokio::select! {
                 _ = ctx.shutdown.cancelled() => return Ok(()),
-                _ = ticker.tick() => self.publish_snapshot(&ctx.bus, &mut discovered).await?,
+                _ = ticker.tick() => {
+                    match self.publish_snapshot(&ctx.bus, &mut discovered).await {
+                        Ok(id) => zone_id = Some(id),
+                        Err(error) => {
+                            if let Some(zone_id) = zone_id.take() {
+                                ctx.bus.publish(BusEvent::ZoneRemoved { zone_id });
+                            }
+                            discovered = false;
+                            tracing::debug!("Apple Music companion unavailable: {error}");
+                        }
+                    }
+                },
             }
         }
     }

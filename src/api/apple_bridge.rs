@@ -94,6 +94,11 @@ struct QueuedCommand {
     command_id: String,
     command: MusicKitCommand,
     expires_at: u64,
+    /// Commands are removed from the delivery stream after the first poll.
+    /// This prevents a reconnecting companion from executing a transport
+    /// command such as Next more than once. The result remains tracked until
+    /// the adapter observes the acknowledgement or the command expires.
+    delivered: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +136,12 @@ impl AppleBridgeRegistry {
             bail!("pairing code is expired or belongs to another bridge");
         }
         let access_token = random_token(48);
+        // A bridge identity represents one companion installation. Re-pairing
+        // that installation supersedes its previous token, avoiding a stale
+        // companion winning the "freshest session" selection race.
+        state
+            .sessions
+            .retain(|_, session| session.bridge_id != request.bridge_id);
         state.sessions.insert(
             access_token.clone(),
             BridgeSession {
@@ -171,6 +182,7 @@ impl AppleBridgeRegistry {
         let session = state
             .sessions
             .values()
+            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now_secs())
             .max_by_key(|session| session.last_seen)
             .ok_or_else(|| anyhow!("Apple Music companion is not paired"))?;
         if session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() <= now_secs() {
@@ -187,6 +199,7 @@ impl AppleBridgeRegistry {
         let session = state
             .sessions
             .values_mut()
+            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now_secs())
             .max_by_key(|session| session.last_seen)
             .ok_or_else(|| anyhow!("Apple Music companion is not paired"))?;
         if session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() <= now_secs() {
@@ -198,6 +211,7 @@ impl AppleBridgeRegistry {
             command_id: command_id.clone(),
             command,
             expires_at,
+            delivered: false,
         });
         session.results.insert(command_id.clone(), None);
         Ok(command_id)
@@ -207,15 +221,20 @@ impl AppleBridgeRegistry {
         self.with_session(token, |session| {
             let now = now_secs();
             session.commands.retain(|command| command.expires_at > now);
-            session
+            let commands = session
                 .commands
-                .iter()
-                .map(|command| BridgeCommand {
-                    command_id: command.command_id.clone(),
-                    command: command.command.clone(),
-                    expires_at: command.expires_at,
+                .iter_mut()
+                .filter(|command| !command.delivered)
+                .map(|command| {
+                    command.delivered = true;
+                    BridgeCommand {
+                        command_id: command.command_id.clone(),
+                        command: command.command.clone(),
+                        expires_at: command.expires_at,
+                    }
                 })
-                .collect()
+                .collect();
+            commands
         })
         .await
     }
@@ -278,6 +297,7 @@ impl AppleBridgeRegistry {
         let session = state
             .sessions
             .values()
+            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now_secs())
             .max_by_key(|session| session.last_seen);
         BridgeStatus {
             paired: session
@@ -563,5 +583,65 @@ mod tests {
             .wait_for_result(&command_id, Duration::from_millis(100))
             .await
             .expect("adapter sees acknowledgement");
+    }
+
+    #[tokio::test]
+    async fn polling_delivers_each_command_once() {
+        let registry = AppleBridgeRegistry::default();
+        let pairing = registry.create_pairing("iphone".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+        registry
+            .update_snapshot(&claim.access_token, snapshot())
+            .await
+            .expect("bridge is live");
+        registry
+            .enqueue(MusicKitCommand::Next)
+            .await
+            .expect("command queued");
+
+        assert_eq!(
+            registry
+                .poll_commands(&claim.access_token)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(registry
+            .poll_commands(&claim.access_token)
+            .await
+            .expect("second poll succeeds")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn re_pairing_a_bridge_identity_revokes_the_previous_session() {
+        let registry = AppleBridgeRegistry::default();
+        let first = registry.create_pairing("iphone".to_string()).await;
+        let first_claim = registry
+            .claim(ClaimRequest {
+                bridge_id: first.bridge_id,
+                pairing_code: first.pairing_code,
+            })
+            .await
+            .expect("first claim succeeds");
+        let second = registry.create_pairing("iphone".to_string()).await;
+        registry
+            .claim(ClaimRequest {
+                bridge_id: second.bridge_id,
+                pairing_code: second.pairing_code,
+            })
+            .await
+            .expect("second claim succeeds");
+        assert!(registry
+            .update_snapshot(&first_claim.access_token, snapshot())
+            .await
+            .is_err());
     }
 }
