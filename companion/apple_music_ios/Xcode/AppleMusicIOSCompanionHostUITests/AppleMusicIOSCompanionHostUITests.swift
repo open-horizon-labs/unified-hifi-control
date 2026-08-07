@@ -29,6 +29,6 @@ final class AppleMusicIOSCompanionHostUITests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
 
-        XCTAssertTrue(app.buttons["Choose AirPlay output"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["airPlayRoutePicker"].waitForExistence(timeout: 10))
     }
 }

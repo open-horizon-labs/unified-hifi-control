@@ -109,6 +109,7 @@ private struct AirPlayRoutePicker: UIViewRepresentable {
         let picker = AVRoutePickerView()
         picker.prioritizesVideoDevices = false
         picker.accessibilityLabel = "Choose AirPlay output"
+        picker.accessibilityIdentifier = "airPlayRoutePicker"
         return picker
     }
 
