@@ -9,6 +9,7 @@
     "favorite_add",
     "play_ref",
     "queue_plan",
+    "queue_read",
     "playlist_create",
     "playlist_add",
     "playlist_update",

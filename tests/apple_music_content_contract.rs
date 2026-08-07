@@ -16,6 +16,7 @@ const OPERATIONS: &[&str] = &[
     "recommendations",
     "play_ref",
     "queue_plan",
+    "queue_read",
     "playlist_create",
     "playlist_add",
     "playlist_update",
@@ -175,4 +176,6 @@ fn proposal_document_mentions_every_fixture_vocabulary_value() {
             "proposal is missing refusal guardrail {value}"
         );
     }
+    assert!(document.contains("`queue_read` may return"));
+    assert!(document.contains("SystemMusicPlayer"));
 }
