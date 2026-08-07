@@ -315,11 +315,12 @@ pub async fn handle_apple_music(
             );
         };
         let mut plan_items = Vec::with_capacity(items.len());
+        let mut companion_items = Vec::with_capacity(items.len());
         for token in items {
             let Some(crate::mcp::refs::RefTarget::AppleMusic {
                 title,
                 companion_id,
-                ..
+                handle,
             }) = state.mcp_refs.resolve(token).await
             else {
                 return Envelope::write("hifi_apple_music", "queue_plan").refused(
@@ -348,10 +349,11 @@ pub async fn handle_apple_music(
                 reference: token.clone(),
                 title,
             });
+            companion_items.push(handle);
         }
         let params = json!({
             "zone_id": zone_id,
-            "items": items,
+            "items": companion_items,
             "confirm": confirmed,
         });
         let env = Envelope::write("hifi_apple_music", "queue_plan")

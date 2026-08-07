@@ -793,6 +793,12 @@ public actor SystemMusicPlayerCompanion {
                 offset: intParam(request.params, "offset") ?? 0
             )
             return MusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "recommendations":
+            let items = try await recommendationsForBridge(
+                limit: intParam(request.params, "limit") ?? 10,
+                offset: intParam(request.params, "offset") ?? 0
+            )
+            return MusicKitContentResult(outcome: "success", data: try jsonValue(items))
         case "playlists":
             let items = try await playlistsForBridge(
                 limit: intParam(request.params, "limit") ?? 25,
@@ -808,9 +814,18 @@ public actor SystemMusicPlayerCompanion {
                 )
             }
             let loaded = try await playlist.with([.entries], preferredSource: .library)
-            let entries = (loaded.entries ?? []).compactMap { entry -> AppleMusicBridgeSearchItem? in
-                guard let song = entry.item as? Song else { return nil }
-                return AppleMusicBridgeSearchItem(title: song.title, subtitle: song.artistName, uri: mintHandle(for: song))
+            let entries = (loaded.entries ?? []).map { entry in
+                let song = entry.item.flatMap { item -> Song? in
+                    if case let .song(song) = item { return song }
+                    return nil
+                }
+                return AppleMusicBridgePlaylistEntry(
+                    title: entry.title,
+                    subtitle: entry.artistName,
+                    uri: song.map { mintHandle(for: $0) },
+                    position: entry.position,
+                    isPlayable: song != nil
+                )
             }
             return MusicKitContentResult(outcome: "success", data: try jsonValue(entries))
         case "playlist_create":
@@ -865,6 +880,29 @@ public actor SystemMusicPlayerCompanion {
             return MusicKitContentResult(
                 outcome: "success",
                 data: try jsonValue(AppleMusicBridgePlaylistSummary(ref: handle, title: updated.name))
+            )
+        case "queue_plan":
+            guard case let .array(values)? = request.params["items"] else {
+                return invalidContentResult("items is required")
+            }
+            let references = values.compactMap { value -> String? in
+                guard case let .string(reference) = value else { return nil }
+                return reference
+            }
+            guard references.count == values.count, !references.isEmpty, references.count <= 200 else {
+                return invalidContentResult("items must contain between 1 and 200 song handles")
+            }
+            let songs = references.compactMap { handles[$0] }
+            guard songs.count == references.count else {
+                return MusicKitContentResult(
+                    outcome: "not_found",
+                    error: MusicKitContentError(code: "unknown_ref", message: "One or more song handles are unknown or expired.", retryable: false)
+                )
+            }
+            try await replaceQueue(with: songs)
+            return MusicKitContentResult(
+                outcome: "success",
+                data: .object(["queued": .number(Double(songs.count))])
             )
         case "play_uri", "queue_uri":
             guard let handle = stringParam(request.params, "uri") else {
@@ -925,6 +963,21 @@ public actor SystemMusicPlayerCompanion {
         let response = try await request.response()
         return response.items.map { song in
             AppleMusicBridgeSearchItem(title: song.title, subtitle: song.artistName, uri: mintHandle(for: song))
+        }
+    }
+
+    private func recommendationsForBridge(limit: Int, offset: Int) async throws -> [AppleMusicBridgeRecommendation] {
+        var request = MusicPersonalRecommendationsRequest()
+        request.limit = min(max(limit, 1), 25)
+        request.offset = max(offset, 0)
+        let response = try await request.response()
+        return response.recommendations.map { recommendation in
+            AppleMusicBridgeRecommendation(
+                ref: "apple_recommendation_\(UUID().uuidString.lowercased())",
+                title: recommendation.title ?? "Apple Music recommendation",
+                reason: recommendation.reason,
+                nextRefreshAt: recommendation.nextRefreshDate?.timeIntervalSince1970
+            )
         }
     }
 
@@ -1096,6 +1149,43 @@ public struct AppleMusicBridgePlaylistSummary: Codable, Sendable, Equatable {
     public init(ref: String, title: String) {
         self.ref = ref
         self.title = title
+    }
+}
+
+@available(iOS 17.0, *)
+public struct AppleMusicBridgePlaylistEntry: Codable, Sendable, Equatable {
+    public let title: String
+    public let subtitle: String
+    public let uri: String?
+    public let position: Int
+    public let isPlayable: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case title, subtitle, uri, position
+        case isPlayable = "is_playable"
+    }
+
+    public init(title: String, subtitle: String, uri: String?, position: Int, isPlayable: Bool) {
+        self.title = title
+        self.subtitle = subtitle
+        self.uri = uri
+        self.position = position
+        self.isPlayable = isPlayable
+    }
+}
+
+@available(iOS 17.0, *)
+public struct AppleMusicBridgeRecommendation: Codable, Sendable, Equatable {
+    public let ref: String
+    public let title: String
+    public let reason: String?
+    public let nextRefreshAt: Double?
+
+    public init(ref: String, title: String, reason: String?, nextRefreshAt: Double?) {
+        self.ref = ref
+        self.title = title
+        self.reason = reason
+        self.nextRefreshAt = nextRefreshAt
     }
 }
 
