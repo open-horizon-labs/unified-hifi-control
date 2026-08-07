@@ -13,6 +13,8 @@ public actor ApplicationMusicPlayerCompanion {
     public let companionID: String
     private var handles: [String: Song] = [:]
     private var handleOrder: [String] = []
+    private var playlistHandles: [String: Playlist] = [:]
+    private var playlistHandleOrder: [String] = []
     private static let maxHandles = 256
 
     public init(companionID: String) {
@@ -87,6 +89,75 @@ public actor ApplicationMusicPlayerCompanion {
                 MacAppleMusicBridgeItem(title: song.title, subtitle: song.artistName, uri: mintHandle(for: song))
             }
             return MacMusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "recent":
+            var recent = MusicRecentlyPlayedRequest<Song>()
+            recent.limit = min(max(intParam(request.params, "limit") ?? 25, 1), 50)
+            recent.offset = max(intParam(request.params, "offset") ?? 0, 0)
+            let response = try await recent.response()
+            let items = response.items.map { song in
+                MacAppleMusicBridgeItem(title: song.title, subtitle: song.artistName, uri: mintHandle(for: song))
+            }
+            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "recommendations":
+            var recommendations = MusicPersonalRecommendationsRequest()
+            recommendations.limit = min(max(intParam(request.params, "limit") ?? 10, 1), 25)
+            recommendations.offset = max(intParam(request.params, "offset") ?? 0, 0)
+            let response = try await recommendations.response()
+            let items = response.recommendations.map { recommendation in
+                MacAppleMusicBridgeRecommendation(
+                    ref: "apple_mac_recommendation_\(UUID().uuidString.lowercased())",
+                    title: recommendation.title ?? "Apple Music recommendation",
+                    reason: recommendation.reason,
+                    nextRefreshAt: recommendation.nextRefreshDate?.timeIntervalSince1970
+                )
+            }
+            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "playlists":
+            var playlists = MusicLibraryRequest<Playlist>()
+            playlists.limit = min(max(intParam(request.params, "limit") ?? 25, 1), 50)
+            playlists.offset = max(intParam(request.params, "offset") ?? 0, 0)
+            let response = try await playlists.response()
+            let items = response.items.map { playlist in
+                MacAppleMusicBridgePlaylistSummary(ref: mintPlaylistHandle(for: playlist), title: playlist.name)
+            }
+            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "playlist_tracks":
+            guard let reference = stringParam(request.params, "id") ?? stringParam(request.params, "uri"),
+                  let playlist = playlistHandles[reference] else {
+                return MacMusicKitContentResult(outcome: "not_found", error: MacMusicKitContentError(code: "unknown_ref", message: "Playlist handle is unknown or expired.", retryable: false))
+            }
+            let loaded = try await playlist.with([.entries], preferredSource: .library)
+            let entries = (loaded.entries ?? []).map { entry in
+                let song = entry.item.flatMap { item -> Song? in
+                    if case let .song(song) = item { return song }
+                    return nil
+                }
+                return MacAppleMusicBridgePlaylistEntry(
+                    title: entry.title,
+                    subtitle: entry.artistName,
+                    uri: song.map { mintHandle(for: $0) },
+                    position: entry.position,
+                    isPlayable: song != nil
+                )
+            }
+            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(entries))
+        case "playlist_create":
+            guard let name = stringParam(request.params, "name"), !name.isEmpty else { return invalidContentResult("name is required") }
+            let playlist = try await MusicLibrary.shared.createPlaylist(name: String(name.prefix(200)), description: stringParam(request.params, "description"), authorDisplayName: nil)
+            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(MacAppleMusicBridgePlaylistSummary(ref: mintPlaylistHandle(for: playlist), title: playlist.name)))
+        case "playlist_update":
+            guard let reference = stringParam(request.params, "id") ?? stringParam(request.params, "uri"), let playlist = playlistHandles[reference] else {
+                return MacMusicKitContentResult(outcome: "not_found", error: MacMusicKitContentError(code: "unknown_ref", message: "Playlist handle is unknown or expired.", retryable: false))
+            }
+            let updated = try await MusicLibrary.shared.edit(playlist, name: stringParam(request.params, "name"), description: stringParam(request.params, "description"), authorDisplayName: nil)
+            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(MacAppleMusicBridgePlaylistSummary(ref: mintPlaylistHandle(for: updated), title: updated.name)))
+        case "playlist_add":
+            guard let playlistReference = stringParam(request.params, "id") ?? stringParam(request.params, "playlist_ref"), let playlist = playlistHandles[playlistReference],
+                  let songReference = stringParam(request.params, "uri") ?? stringParam(request.params, "item_ref"), let song = handles[songReference] else {
+                return MacMusicKitContentResult(outcome: "not_found", error: MacMusicKitContentError(code: "unknown_ref", message: "Playlist or song handle is unknown or expired.", retryable: false))
+            }
+            let updated = try await MusicLibrary.shared.add(song, to: playlist)
+            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(MacAppleMusicBridgePlaylistSummary(ref: mintPlaylistHandle(for: updated), title: updated.name)))
         case "play_uri", "queue_uri":
             guard let uri = stringParam(request.params, "uri"), let song = handles[uri] else {
                 return MacMusicKitContentResult(outcome: "not_found", error: MacMusicKitContentError(code: "unknown_ref", message: "Apple Music handle is unknown or expired.", retryable: false))
@@ -122,6 +193,15 @@ public actor ApplicationMusicPlayerCompanion {
         handleOrder.removeAll { $0 == handle }
         handleOrder.append(handle)
         while handleOrder.count > Self.maxHandles { handles.removeValue(forKey: handleOrder.removeFirst()) }
+        return handle
+    }
+
+    private func mintPlaylistHandle(for playlist: Playlist) -> String {
+        let handle = "apple_mac_playlist_\(UUID().uuidString.lowercased())"
+        playlistHandles[handle] = playlist
+        playlistHandleOrder.removeAll { $0 == handle }
+        playlistHandleOrder.append(handle)
+        while playlistHandleOrder.count > Self.maxHandles { playlistHandles.removeValue(forKey: playlistHandleOrder.removeFirst()) }
         return handle
     }
 
@@ -274,6 +354,37 @@ public struct MacAppleMusicBridgeItem: Codable, Sendable, Equatable {
     public let uri: String
     public init(title: String, subtitle: String?, uri: String) {
         self.title = title; self.subtitle = subtitle; self.uri = uri
+    }
+}
+
+@available(macOS 14.0, *)
+public struct MacAppleMusicBridgePlaylistSummary: Codable, Sendable, Equatable {
+    public let ref: String
+    public let title: String
+    public init(ref: String, title: String) { self.ref = ref; self.title = title }
+}
+
+@available(macOS 14.0, *)
+public struct MacAppleMusicBridgePlaylistEntry: Codable, Sendable, Equatable {
+    public let title: String
+    public let subtitle: String
+    public let uri: String?
+    public let position: Int
+    public let isPlayable: Bool
+    enum CodingKeys: String, CodingKey { case title, subtitle, uri, position; case isPlayable = "is_playable" }
+    public init(title: String, subtitle: String, uri: String?, position: Int, isPlayable: Bool) {
+        self.title = title; self.subtitle = subtitle; self.uri = uri; self.position = position; self.isPlayable = isPlayable
+    }
+}
+
+@available(macOS 14.0, *)
+public struct MacAppleMusicBridgeRecommendation: Codable, Sendable, Equatable {
+    public let ref: String
+    public let title: String
+    public let reason: String?
+    public let nextRefreshAt: Double?
+    public init(ref: String, title: String, reason: String?, nextRefreshAt: Double?) {
+        self.ref = ref; self.title = title; self.reason = reason; self.nextRefreshAt = nextRefreshAt
     }
 }
 
