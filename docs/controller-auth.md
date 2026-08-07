@@ -15,8 +15,9 @@ UHC must never treat one credential as another audience's credential:
 2. **MCP/controller bearer** — a scoped, expiring token for native or hosted
    clients. It has explicit `read`, `control`, and `configure` scopes and is
    revocable. `MCP-Session-ID` remains protocol correlation, not authority.
-3. **Apple bridge bearer** — the existing short-lived companion credential,
-   bound to one bridge installation and one execution-owner player. It may
+3. **Apple bridge bearer** — the existing ephemeral, in-memory companion
+   credential, liveness-bounded and bound to one bridge installation and one
+   execution-owner player. It may
    publish state, poll commands, acknowledge commands, and revoke itself; it
    cannot configure UHC, read Spotify identity, or mint another bridge.
 

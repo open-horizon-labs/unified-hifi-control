@@ -222,6 +222,16 @@ impl AppleBridgeRegistry {
         f: impl FnOnce(&mut BridgeSession) -> R,
     ) -> Result<R> {
         let mut state = self.inner.write().await;
+        let now = now_secs();
+        let stale = state
+            .sessions
+            .get(token)
+            .map(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() <= now)
+            .unwrap_or(false);
+        if stale {
+            state.sessions.remove(token);
+            bail!("bridge token is stale");
+        }
         let session = state
             .sessions
             .get_mut(token)
@@ -1067,6 +1077,14 @@ mod tests {
         assert!(registry.snapshot_for_player("player").await.is_err());
         assert!(registry
             .enqueue_for_player("player", MusicKitCommand::Play)
+            .await
+            .is_err());
+        assert!(registry
+            .update_snapshot(&claim.access_token, snapshot_for("player"))
+            .await
+            .is_err());
+        assert!(registry
+            .poll_commands(&claim.access_token)
             .await
             .is_err());
     }
