@@ -137,6 +137,33 @@ async fn adapter_translates_unified_commands_to_musickit_commands() {
 }
 
 #[tokio::test]
+async fn volume_commands_are_refused_without_a_companion_volume_observation() {
+    let bus = create_bus();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let mut snapshot = snapshot();
+    snapshot.volume = None;
+    let adapter = AppleMusicAdapter::with_companion(
+        bus,
+        Arc::new(FakeCompanion {
+            snapshot,
+            commands: commands.clone(),
+        }),
+        Duration::from_millis(5),
+    );
+
+    let response = adapter
+        .handle_command("applemusic:application", AdapterCommand::VolumeAbsolute(42))
+        .await
+        .expect("missing volume should be classified, not panic");
+    assert!(!response.success);
+    assert!(response
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("unavailable")));
+    assert!(commands.lock().expect("fake companion lock").is_empty());
+}
+
+#[tokio::test]
 async fn adapter_rejects_zone_owned_by_another_provider() {
     let bus = create_bus();
     let adapter = adapter(bus, Arc::new(Mutex::new(Vec::new())));

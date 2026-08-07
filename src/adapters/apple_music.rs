@@ -467,10 +467,35 @@ impl AdapterLogic for AppleMusicAdapter {
             });
         }
 
-        let command = Self::command_for(command)?;
         let player_id = zone_id
             .strip_prefix("applemusic:")
             .ok_or_else(|| anyhow::anyhow!("invalid Apple Music zone id `{zone_id}`"))?;
+        if matches!(
+            &command,
+            AdapterCommand::VolumeAbsolute(_)
+                | AdapterCommand::VolumeRelative(_)
+                | AdapterCommand::Mute(_)
+        ) {
+            let has_volume = self
+                .companion
+                .snapshots()
+                .await?
+                .into_iter()
+                .find(|snapshot| snapshot.player_id == player_id)
+                .and_then(|snapshot| snapshot.volume)
+                .is_some();
+            if !has_volume {
+                return Ok(AdapterCommandResponse {
+                    success: false,
+                    error: Some(
+                        "Apple Music volume/mute is unavailable until the companion publishes a validated volume control"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+
+        let command = Self::command_for(command)?;
         self.companion
             .execute_for_player(player_id, command)
             .await?;
