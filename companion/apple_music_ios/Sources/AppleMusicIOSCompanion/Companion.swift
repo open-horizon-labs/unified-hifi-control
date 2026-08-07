@@ -120,7 +120,7 @@ public struct MusicKitContentCommand: Codable, Sendable {
     }
 }
 
-public struct MusicKitContentError: Codable, Sendable {
+public struct MusicKitContentError: Codable, Sendable, Equatable {
     public let code: String
     public let message: String
     public let retryable: Bool
@@ -132,7 +132,7 @@ public struct MusicKitContentError: Codable, Sendable {
     }
 }
 
-public struct MusicKitContentResult: Codable, Sendable {
+public struct MusicKitContentResult: Codable, Sendable, Equatable {
     /// The bridge vocabulary is intentionally closed. Provider-specific
     /// errors must be translated before they are persisted or acknowledged.
     public static let allowedOutcomes: Set<String> = [
@@ -854,12 +854,13 @@ public actor SystemMusicPlayerCompanion {
             }
             return MusicKitContentResult(outcome: "success", data: try jsonValue(entries))
         case "playlist_create":
-            guard let name = stringParam(request.params, "name") else {
+            guard let name = stringParam(request.params, "name"), !name.isEmpty else {
                 return invalidContentResult("name is required")
             }
-            let playlist = try await createPlaylist(
-                name: name,
-                description: stringParam(request.params, "description")
+            let playlist = try await MusicLibrary.shared.createPlaylist(
+                name: String(name.prefix(200)),
+                description: stringParam(request.params, "description").map { String($0.prefix(500)) },
+                authorDisplayName: nil
             )
             let handle = mintPlaylistHandle(for: playlist)
             return MusicKitContentResult(
@@ -900,7 +901,7 @@ public actor SystemMusicPlayerCompanion {
                     error: MusicKitContentError(code: "unknown_ref", message: "Song handle is unknown or expired.", retryable: false)
                 )
             }
-            let updated = try await add(song: song, to: playlist)
+            let updated = try await MusicLibrary.shared.add(song, to: playlist)
             let handle = mintPlaylistHandle(for: updated)
             return MusicKitContentResult(
                 outcome: "success",
