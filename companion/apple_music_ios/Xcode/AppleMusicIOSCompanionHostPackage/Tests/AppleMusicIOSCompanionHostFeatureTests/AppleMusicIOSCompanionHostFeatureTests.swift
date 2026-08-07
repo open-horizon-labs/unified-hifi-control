@@ -29,3 +29,10 @@ import AppleMusicIOSCompanion
     #expect(result.outcome == "unsupported")
     #expect(result.error?.code == "queue_visibility_unavailable")
 }
+
+@Test func playlistTracksPaginationIsBoundedAndOffset() {
+    #expect(Array(playlistEntryRange(limit: 50, offset: 3, count: 100)) == Array(3..<53))
+    #expect(Array(playlistEntryRange(limit: 500, offset: 98, count: 100)) == Array(98..<100))
+    #expect(playlistEntryRange(limit: 0, offset: 0, count: 10).isEmpty)
+    #expect(playlistEntryRange(limit: 50, offset: 100, count: 100).isEmpty)
+}

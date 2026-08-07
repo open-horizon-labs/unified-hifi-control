@@ -1,6 +1,17 @@
 import Foundation
 import MusicKit
 
+/// Return the bounded slice requested by a playlist-tracks bridge operation.
+/// The bridge contract caps every page at 50 entries and treats non-positive
+/// limits as an empty page rather than accidentally returning the whole list.
+public func playlistEntryRange(limit: Int, offset: Int, count: Int) -> Range<Int> {
+    guard limit > 0, count > 0 else { return 0..<0 }
+    let start = min(max(offset, 0), count)
+    let pageSize = min(limit, 50)
+    let end = min(count, start + pageSize)
+    return start..<end
+}
+
 /// The only authorization operation the host app needs from this package.
 /// MusicKit keeps the credential/token lifecycle inside the signed app; this
 /// package never returns or serializes either to UHC.
@@ -907,7 +918,13 @@ public actor SystemMusicPlayerCompanion {
                 )
             }
             let loaded = try await playlist.with([.entries], preferredSource: .library)
-            let entries = (loaded.entries ?? []).map { entry in
+            let allEntries = loaded.entries ?? []
+            let range = playlistEntryRange(
+                limit: intParam(request.params, "limit") ?? 50,
+                offset: intParam(request.params, "offset") ?? 0,
+                count: allEntries.count
+            )
+            let entries = allEntries[range].map { entry in
                 let song = entry.item.flatMap { item -> Song? in
                     if case let .song(song) = item { return song }
                     return nil
