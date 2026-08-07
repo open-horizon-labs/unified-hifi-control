@@ -107,26 +107,45 @@ impl AdapterCoordinator {
     pub async fn start_all_enabled(&self, adapters: &[Arc<dyn Startable>]) {
         for adapter in adapters {
             let name = adapter.name();
-            if !self.is_enabled(name).await {
-                debug!("Adapter {} is disabled, skipping", name);
-                continue;
-            }
-            if !adapter.can_start().await {
-                debug!("Adapter {} cannot start (not configured?), skipping", name);
-                continue;
-            }
-            match adapter.start().await {
-                Ok(()) => info!("Started adapter: {}", name),
-                Err(e) => warn!("Failed to start adapter {}: {}", name, e),
+            match self.start_enabled(adapter).await {
+                Ok(()) if self.is_enabled(name).await && adapter.can_start().await => {
+                    info!("Started adapter: {}", name)
+                }
+                Ok(()) => {}
+                Err(error) => warn!("Failed to start adapter {}: {}", name, error),
             }
         }
+    }
+
+    /// Start one adapter under the coordinator's feature-toggle decision.
+    ///
+    /// Dynamic settings changes and provider re-authorization use this same
+    /// path as process startup.  Keeping the decision here prevents a
+    /// credentialed provider from quietly growing a second lifecycle policy
+    /// that bypasses the coordinator.
+    pub async fn start_enabled(&self, adapter: &Arc<dyn Startable>) -> anyhow::Result<()> {
+        let name = adapter.name();
+        if !self.is_enabled(name).await {
+            debug!("Adapter {} is disabled, skipping", name);
+            return Ok(());
+        }
+        if !adapter.can_start().await {
+            debug!("Adapter {} cannot start (not configured?), skipping", name);
+            return Ok(());
+        }
+        adapter.start().await
+    }
+
+    /// Stop one adapter through the coordinator-owned lifecycle path.
+    pub async fn stop_one(&self, adapter: &Arc<dyn Startable>) {
+        adapter.stop().await;
+        debug!("Stopped adapter: {}", adapter.name());
     }
 
     /// Stop all adapters from the provided list.
     pub async fn stop_all(&self, adapters: &[Arc<dyn Startable>]) {
         for adapter in adapters {
-            adapter.stop().await;
-            debug!("Stopped adapter: {}", adapter.name());
+            self.stop_one(adapter).await;
         }
     }
 

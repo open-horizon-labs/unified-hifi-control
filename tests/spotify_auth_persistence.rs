@@ -27,21 +27,37 @@ fn encrypted_credentials_survive_restart_without_plaintext_leakage() {
 }
 
 #[test]
-fn revoke_clears_durable_credentials() {
+fn revoke_clears_token_but_preserves_durable_client_configuration() {
     let directory = tempdir().expect("temporary credential directory");
     let credential_path = directory.path().join("spotify.enc");
     let store = EncryptedCredentialStore::new(credential_path.clone(), [9_u8; 32]);
     store
-        .save(&SpotifyToken {
-            access_token: "access".to_string(),
-            refresh_token: Some("refresh".to_string()),
-            expires_at: Some(1234),
+        .save_record(&SpotifyCredentialRecord {
+            token: Some(SpotifyToken {
+                access_token: "access".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: Some(1234),
+            }),
+            client_id: "client-id".to_string(),
+            client_secret: Some("client-secret".to_string()),
+            redirect_uri: "https://uhc.example/callback".to_string(),
         })
         .expect("save credentials");
 
-    store.clear().expect("clear credentials");
-    assert_eq!(store.load().expect("load after revoke"), None);
-    assert!(!credential_path.exists());
+    // Disconnecting an account must remove only the access/refresh token.
+    // The OAuth client setup is durable configuration and must survive a
+    // restart so the user can reconnect without re-entering it.
+    store.clear_token().expect("clear token");
+    let restarted = EncryptedCredentialStore::new(credential_path.clone(), [9_u8; 32]);
+    let record = restarted
+        .load_record()
+        .expect("load after revoke")
+        .expect("client configuration remains");
+    assert_eq!(record.token, None);
+    assert_eq!(record.client_id, "client-id");
+    assert_eq!(record.client_secret.as_deref(), Some("client-secret"));
+    assert_eq!(record.redirect_uri, "https://uhc.example/callback");
+    assert!(credential_path.exists());
 }
 
 #[test]

@@ -495,13 +495,21 @@ async fn oauth_callback_json(
     }
     adapter.set_token(spotify_token).await;
     if state.coordinator.is_enabled("spotify").await {
-        state.adapter_registry.start("spotify").await.map_err(|e| {
-            error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &format!("Spotify adapter failed to start: {e}"),
-                "adapter_start_failed",
-            )
-        })?;
+        // Re-authorization is a lifecycle transition too.  Route it through
+        // the coordinator so Spotify follows the same enable/can_start policy
+        // as startup and settings changes.
+        let startable: Arc<dyn crate::adapters::Startable> = adapter.clone();
+        state
+            .coordinator
+            .start_enabled(&startable)
+            .await
+            .map_err(|start_error| {
+                error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("Spotify adapter failed to start: {start_error}"),
+                    "adapter_start_failed",
+                )
+            })?;
     } else {
         tracing::info!("Spotify authorization completed while adapter is disabled");
     }
@@ -543,7 +551,8 @@ pub async fn oauth_revoke(
         })?;
     }
     adapter.clear_token().await;
-    state.adapter_registry.stop("spotify").await;
+    let startable: Arc<dyn crate::adapters::Startable> = adapter.clone();
+    state.coordinator.stop_one(&startable).await;
     Ok(Json(ProviderAuthResponse {
         provider,
         authorized: false,

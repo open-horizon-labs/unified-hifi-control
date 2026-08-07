@@ -2549,14 +2549,12 @@ pub async fn api_settings_post_handler(
         if let Some(adapter) = adapters_list.iter().find(|a| a.name() == name) {
             if now_enabled {
                 tracing::info!("Dynamically enabling adapter: {}", name);
-                if adapter.can_start().await {
-                    if let Err(e) = adapter.start().await {
-                        tracing::warn!("Failed to start adapter {}: {}", name, e);
-                    }
+                if let Err(error) = coord.start_enabled(adapter).await {
+                    tracing::warn!("Failed to start adapter {}: {}", name, error);
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
-                adapter.stop().await;
+                coord.stop_one(adapter).await;
             }
         }
     }
