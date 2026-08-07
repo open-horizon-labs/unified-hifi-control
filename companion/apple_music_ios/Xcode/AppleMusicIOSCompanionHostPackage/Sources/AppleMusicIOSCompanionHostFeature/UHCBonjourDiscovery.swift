@@ -11,15 +11,26 @@ final class UHCBonjourDiscovery: NSObject, NetServiceBrowserDelegate, NetService
     private let browser = NetServiceBrowser()
     private var services: [NetService] = []
     private var finished = false
+    private var timeoutWork: DispatchWorkItem?
 
     func start() {
         finished = false
         services.removeAll()
         browser.delegate = self
         browser.searchForServices(ofType: "_uhc._tcp.", inDomain: "local.")
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, !self.finished else { return }
+            self.finished = true
+            self.stop()
+            self.onFailure?("No UHC server was found on the local network.")
+        }
+        timeoutWork = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: timeout)
     }
 
     func stop() {
+        timeoutWork?.cancel()
+        timeoutWork = nil
         browser.stop()
         services.forEach { $0.stop() }
         services.removeAll()
