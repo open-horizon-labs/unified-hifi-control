@@ -21,9 +21,7 @@ struct AppleMusicCompanionApp: App {
                     .textFieldStyle(.roundedBorder)
                 TextField("Short-lived pairing code", text: $model.pairingCodeInput)
                     .textFieldStyle(.roundedBorder)
-                Button("Claim this companion") {
-                    model.claim(bridgeID: model.bridgeID, pairingCode: model.pairingCodeInput)
-                }
+                Button("Claim this companion", action: model.claim)
                     .disabled(model.bridgeID.isEmpty || model.pairingCodeInput.isEmpty)
                 if model.isPaired {
                     Button("Revoke pairing", role: .destructive, action: model.revoke)

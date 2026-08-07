@@ -8,8 +8,9 @@ be stable across relaunches (store it in Keychain).
 
 The host flow is:
 
-1. Enable the MusicKit capability and include `Info.plist` and the entitlements
-   file here.
+1. Enable the MusicKit App Service for the explicit bundle ID in Certificates,
+   Identifiers & Profiles and include `Info.plist` here. MusicKit manages the
+   Music User Token automatically; no custom MusicKit entitlement is required.
 2. Authorize Apple Music in the app.
 3. Generate a short-lived pairing code from the app or UHC, then claim it.
 4. Keep command polling in the foreground and publish the bounded

@@ -1,9 +1,15 @@
 # macOS Apple Music companion host scaffold
 
-Create a signed macOS 14+ SwiftUI app, add the sibling
-`AppleMusicCompanion` package, enable MusicKit, and include the example
-`CompanionModel.swift` and `AppleMusicCompanionApp.swift` files in the app
-target. The model restores (or creates) its installation with
+The repository now includes a buildable `AppleMusicCompanionApp` executable
+target. For a local signed bundle, run `./build-app.sh` from this directory;
+it wraps the SwiftPM executable as a macOS `.app` and ad-hoc signs it. Set
+`CODE_SIGN_IDENTITY` to an Apple Development or Developer ID identity when
+using a real signing team. Enable the MusicKit App Service for the explicit
+bundle ID in Certificates, Identifiers & Profiles; MusicKit is associated with
+the App ID at runtime and does not require a custom entitlement key. For a
+polished distribution target, create a macOS 14+ SwiftUI app in Xcode, add the
+sibling package, and include these host files in the app target. The model
+restores (or creates) its installation with
 `KeychainAppleMusicCompanionInstallationStore`, so the companion ID survives
 relaunches. The host flow is:
 

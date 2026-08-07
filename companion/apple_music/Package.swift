@@ -20,7 +20,7 @@ let package = Package(
             name: "AppleMusicCompanionApp",
             dependencies: ["AppleMusicCompanion"],
             path: "Host",
-            exclude: ["Info.plist", "AppleMusicCompanion.entitlements", "README.md"]
+            exclude: ["Info.plist", "README.md"]
         ),
     ]
 )
