@@ -15,7 +15,7 @@ use serde_json::json;
 
 #[mcp_tool(
     name = "hifi_apple_music",
-    description = "Apple Music catalog, library, playlist, feedback, and bounded adaptation context through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, context, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Feedback accepts explicit user signals only; skips and manual changes are not inferred as dislike. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback."
+    description = "Apple Music catalog, library, playlist, feedback, and bounded adaptation context through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, context, clear_feedback, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Feedback accepts explicit user signals only; skips and manual changes are not inferred as dislike. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiAppleMusicTool {
@@ -83,6 +83,7 @@ pub async fn handle_apple_music(
         "favorite_add",
         "favorite_remove",
         "feedback",
+        "clear_feedback",
         "context",
     ];
     if !ACTIONS.contains(&args.action.as_str()) {
@@ -105,6 +106,7 @@ pub async fn handle_apple_music(
             | "favorite_add"
             | "favorite_remove"
             | "feedback"
+            | "clear_feedback"
     );
     let confirmed = args.confirm.unwrap_or(false);
     if mutation && !confirmed {
@@ -139,8 +141,9 @@ pub async fn handle_apple_music(
                     &["applemusic:<companion>"],
                     "AirPlay routes are destinations, not execution-owner zones.",
                 ),
-            );
-        }
+        );
+    }
+
         let limit = args.limit.unwrap_or(10) as usize;
         let feedback = state.apple_feedback.recent(zone_id, limit).await;
         let plan = state.listening_plans.get(zone_id).await;
@@ -150,6 +153,38 @@ pub async fn handle_apple_music(
             .json_result(
                 &json!({"zone_id": zone_id, "feedback": feedback, "listening_plan": plan}),
             ));
+    }
+
+    if args.action == "clear_feedback" {
+        let Some(zone_id) = args.zone_id.as_deref() else {
+            return Envelope::write("hifi_apple_music", "clear_feedback").refused(
+                "clear_feedback requires an applemusic execution-owner zone_id.",
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "Choose the companion whose bounded feedback history should be deleted.",
+                ),
+            );
+        };
+        if !zone_id.starts_with("applemusic:") {
+            return Envelope::write("hifi_apple_music", "clear_feedback").refused(
+                "clear_feedback can target only an applemusic zone.",
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "AirPlay routes are destinations, not feedback owners.",
+                ),
+            );
+        }
+        let env = Envelope::write("hifi_apple_music", "clear_feedback")
+            .param("action", "clear_feedback")
+            .param("zone_id", zone_id);
+        return match state.apple_feedback.clear_zone(zone_id).await {
+            Ok(()) => Ok(env.json_result(&json!({"cleared": true, "zone_id": zone_id}))),
+            Err(error) => env.failed(format!(
+                "Apple Music feedback could not be deleted: {error}"
+            )),
+        };
     }
 
     let feedback_record = if args.action == "feedback" {
