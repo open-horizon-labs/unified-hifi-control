@@ -419,21 +419,25 @@ impl AdapterLogic for AppleMusicAdapter {
 
     async fn run(&self, ctx: AdapterContext) -> Result<()> {
         let mut ticker = interval(self.poll_interval);
-        let mut discovered = std::collections::HashSet::new();
+        let mut discovered = std::collections::HashMap::<String, String>::new();
         loop {
             tokio::select! {
                 _ = ctx.shutdown.cancelled() => return Ok(()),
                 _ = ticker.tick() => {
                     match self.companion.snapshots().await {
                         Ok(snapshots) => {
-                            let mut seen = std::collections::HashSet::new();
+                            let mut seen = std::collections::HashMap::<String, String>::new();
+                            let mut published = discovered.keys().cloned().collect();
                             for snapshot in snapshots {
-                                match self.publish_snapshot(&ctx.bus, snapshot, &mut seen).await {
-                                    Ok(_) => {}
+                                let display_name = snapshot.display_name.clone();
+                                match self.publish_snapshot(&ctx.bus, snapshot, &mut published).await {
+                                    Ok(zone_id) => {
+                                        seen.insert(zone_id.to_string(), display_name);
+                                    }
                                     Err(error) => tracing::debug!("invalid Apple Music companion snapshot: {error}"),
                                 }
                             }
-                            for zone_id in discovered.difference(&seen) {
+                            for zone_id in discovered.keys().filter(|zone_id| !seen.contains_key(*zone_id)) {
                                 ctx.bus.publish(BusEvent::ZoneRemoved {
                                     zone_id: PrefixedZoneId::parse(zone_id)
                                         .expect("discovered Apple Music zone is prefixed"),
@@ -442,13 +446,24 @@ impl AdapterLogic for AppleMusicAdapter {
                             discovered = seen;
                         }
                         Err(error) => {
-                            for zone_id in &discovered {
-                                ctx.bus.publish(BusEvent::ZoneRemoved {
+                            // A failed refresh is a recoverable liveness
+                            // transition, not proof that the execution owner
+                            // disappeared. Retain the aggregator zone and its
+                            // private history until a later successful poll
+                            // confirms removal or the adapter is stopped.
+                            for (zone_id, display_name) in &discovered {
+                                ctx.bus.publish(BusEvent::ZoneUpdated {
                                     zone_id: PrefixedZoneId::parse(zone_id)
                                         .expect("discovered Apple Music zone is prefixed"),
+                                    display_name: display_name.clone(),
+                                    state: "unknown".to_string(),
                                 });
                             }
-                            discovered.clear();
+                            let detail = error.to_string().chars().take(256).collect::<String>();
+                            ctx.bus.publish(BusEvent::AdapterError {
+                                adapter: APPLE_MUSIC_PREFIX.to_string(),
+                                error: format!("companion refresh unavailable: {detail}"),
+                            });
                             tracing::debug!("Apple Music companion unavailable: {error}");
                         }
                     }

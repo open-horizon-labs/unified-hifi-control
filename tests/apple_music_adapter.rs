@@ -5,6 +5,7 @@
 //! the companion is tested separately on macOS.
 
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +26,31 @@ use unified_hifi_control::mcp::observation_history::PlaybackObservationHistory;
 struct FakeCompanion {
     snapshot: MusicKitSnapshot,
     commands: Arc<Mutex<Vec<MusicKitCommand>>>,
+}
+
+#[derive(Clone)]
+struct FlakyCompanion {
+    snapshot: MusicKitSnapshot,
+    responses: Arc<Mutex<VecDeque<anyhow::Result<Vec<MusicKitSnapshot>>>>>,
+}
+
+#[async_trait]
+impl MusicKitCompanion for FlakyCompanion {
+    async fn snapshot(&self) -> anyhow::Result<MusicKitSnapshot> {
+        Ok(self.snapshot.clone())
+    }
+
+    async fn execute(&self, _command: MusicKitCommand) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn snapshots(&self) -> anyhow::Result<Vec<MusicKitSnapshot>> {
+        self.responses
+            .lock()
+            .map_err(|_| anyhow::anyhow!("flaky companion lock poisoned"))?
+            .pop_front()
+            .unwrap_or_else(|| Ok(vec![self.snapshot.clone()]))
+    }
 }
 
 #[async_trait]
@@ -207,6 +233,77 @@ async fn companion_snapshot_flows_through_aggregator_and_flushes_on_stop() {
     aggregator_task
         .await
         .expect("aggregator task must join");
+}
+
+#[tokio::test]
+async fn transient_companion_failure_retains_zone_until_recovery() {
+    let bus = create_bus();
+    let mut events = bus.subscribe();
+    let responses = Arc::new(Mutex::new(VecDeque::from([
+        Ok(vec![snapshot()]),
+        Err(anyhow::anyhow!("temporary timeout")),
+        Ok(vec![snapshot()]),
+    ])));
+    let adapter = AppleMusicAdapter::with_companion(
+        bus.clone(),
+        Arc::new(FlakyCompanion {
+            snapshot: snapshot(),
+            responses,
+        }),
+        Duration::from_millis(5),
+    );
+    let shutdown = CancellationToken::new();
+    let task = {
+        let adapter = adapter.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { adapter.run(AdapterContext { bus, shutdown }).await })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(events.recv().await.expect("bus event"), BusEvent::ZoneDiscovered { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("initial snapshot must discover the zone");
+
+    let mut removed = false;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match events.recv().await.expect("bus event") {
+                BusEvent::ZoneRemoved { .. } => removed = true,
+                BusEvent::ZoneUpdated { zone_id, state, .. }
+                    if zone_id.to_string() == "applemusic:application" && state == "unknown" =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("temporary failure must mark the retained zone unknown");
+    assert!(!removed, "a transient refresh failure must not remove the zone");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                events.recv().await.expect("bus event"),
+                BusEvent::ZoneUpdated { state, .. } if state == "playing"
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("a later snapshot must recover the zone");
+
+    shutdown.cancel();
+    task.await
+        .expect("adapter task must join")
+        .expect("adapter must stop cleanly");
 }
 
 #[tokio::test]
