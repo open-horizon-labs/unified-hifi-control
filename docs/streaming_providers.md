@@ -15,7 +15,7 @@ only when a tested adapter and routed MCP path exist.
 | Provider | Direct device control | UHC disposition | Why |
 |---|---|---|---|
 | Spotify | Yes, through Spotify Connect | **Direct adapter** | The Web API discovers Connect devices and can control a selected device. OAuth and Spotify Premium are required for playback control. |
-| Apple Music | Only on the device running MusicKit/Music.app | **Direct adapter with a macOS bridge** | Apple has no cloud API for remote control of arbitrary Apple Music sessions. A local or paired macOS companion owns authorization and controls its MusicKit/Music.app playback session. |
+| Apple Music | Only on the device running MusicKit | **Direct adapter with an iPhone companion (Wave 1)** | Apple has no cloud API for remote control of arbitrary Apple Music sessions. A signed iPhone companion owns authorization and the `SystemMusicPlayer` session. A native Mac companion and truthful AirPlay destination model are separate Wave 2 validation work. |
 | TIDAL | No public general-purpose remote-device control | **Device/protocol adapter, or obtain written vendor approval** | The public API supplies metadata and the Player SDK supplies playback, but playback must remain in TIDAL's official Player module. TIDAL Connect integrations are device-partner only. UHC must not become a TIDAL player or bypass that SDK. |
 | Qobuz | No public self-service remote-device control | **Partner-gated** | Qobuz has a third-party API programme, but its integration material directs prospective integrations to Qobuz. Existing device/server integrations remain controllable through their own UHC adapters. |
 | Amazon Music | Not established | **Access-gated discovery** | Amazon documents search, library, playlist, and playback APIs, but labels the Web Playback API closed beta and preview. Confirm production access and device semantics before an adapter is proposed. |
@@ -33,9 +33,11 @@ real playback zones, publishes their state to the event bus, and sends commands
 to the provider/device that owns audio playback.
 
 - `spotify:` can represent Spotify Connect devices.
-- `applemusic:` can represent a paired Mac companion's MusicKit/Music.app
-  session.  It is local when UHC runs on that Mac and remote when the companion
-  is paired on another Mac.
+- `applemusic:` represents a paired native companion's MusicKit session. Wave
+  1 is an iPhone `SystemMusicPlayer` companion; Wave 2 separately validates a
+  Mac execution owner and AirPlay destination observations. A route or speaker
+  is never published as a second Apple Music zone merely because it is where
+  the companion sends audio.
 
 The Apple companion is a control bridge, not an audio proxy.  Apple credentials
 and authorization remain on the companion; audio never travels through UHC.

@@ -1,9 +1,15 @@
-# Apple Music MusicKit companion
+# Apple Music macOS companion (deferred)
 
-This macOS 14+ Swift Package is the native side of UHC's `applemusic:`
-adapter. It owns an `ApplicationMusicPlayer` session on macOS and must be embedded by a
-signed host app (inline with UHC on macOS, or as a paired bridge when UHC runs
-elsewhere).
+This macOS 14+ Swift Package is a deferred execution-owner experiment for
+UHC's `applemusic:` adapter. It must not be presented as the current Apple
+Music setup path: the v1 companion is the iOS package in
+`companion/apple_music_ios`, using `SystemMusicPlayer` on a physical iPhone.
+Mac support is tracked separately in #486 and needs signed-app, lifecycle, and
+physical-device validation before it can be enabled.
+
+The current implementation wraps an app-private `ApplicationMusicPlayer`
+session. That is not the same thing as controlling the user's Music.app
+session, so this package does not claim Music.app control or AirPlay control.
 
 The Rust boundary is in `src/adapters/apple_music.rs`:
 

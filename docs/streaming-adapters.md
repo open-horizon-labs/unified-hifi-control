@@ -89,8 +89,12 @@ client configuration in the encrypted credential envelope, after which
 after authorization; reauthorization creates a new callback URL. This is the
 first-run onboarding path tracked in #469.
 
-Apple Music authorization remains native to the companion. A macOS companion
-can run in-process, or a separate Mac can pair through the same bridge contract:
+Apple Music authorization remains native to the companion. The v1 execution
+owner is a signed iPhone app using `SystemMusicPlayer`; the iOS package and its
+deliberately narrow transport wrapper live in `companion/apple_music_ios`.
+The existing macOS package is deferred until #486 validates a supported Mac
+session on physical hardware. A future iPhone or Mac companion can pair
+through the same bridge contract:
 
 - `POST /api/bridges/applemusic/pair` creates a five-minute one-time pairing
   code for a companion id.
@@ -105,12 +109,14 @@ can run in-process, or a separate Mac can pair through the same bridge contract:
 Pending OAuth states and bridge tokens are intentionally in-memory in this
 first slice, so a restart invalidates those short-lived values. Spotify's
 provider token is persisted through the encrypted credential boundary above;
-the companion still owns MusicKit authorization and uses the dedicated
-`ApplicationMusicPlayer` session on macOS (the installed macOS MusicKit SDK
-marks `SystemMusicPlayer` unavailable). A `SystemMusicPlayer` implementation
-would require an iOS-family companion rather than the requested Mac bridge.
-Deploy these endpoints behind HTTPS and a
-trusted identity boundary.
+the companion owns MusicKit authorization and UHC receives no Apple token or
+audio. Deploy these endpoints behind HTTPS and a trusted identity boundary.
+
+The companion owns the playback session; an AirPlay route is only an output
+destination observed by that owner. Routes are not duplicate UHC zones and do
+not prove that UHC can select or command the destination. HomePod and Apple TV
+remain destination contexts until a supported host/control path is separately
+validated under #487.
 
 ## QNAP x86_64
 
