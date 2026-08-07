@@ -244,22 +244,26 @@ public actor AppleMusicCompanionHost {
     public let bridge: AppleMusicBridgeClient
 
     public let companionID: String
-    private let installation: AppleMusicCompanionInstallation
+    private var installation: AppleMusicCompanionInstallation
     private let installationStore: any AppleMusicCompanionInstallationStore
-    /// Outcomes remembered for the lifetime of this host process. The bridge
-    /// is at-least-once, so this prevents a lease redelivery from driving a
-    /// non-idempotent command twice after an acknowledgement race. A process
-    /// crash still requires the command handler to use a durable/idempotent
-    /// boundary before claiming exactly-once behavior.
-    private var commandOutcomes: [String: Bool] = [:]
+    /// Outcomes are retained in the bounded installation store. The bridge is
+    /// at-least-once, so this prevents lease redelivery from driving a
+    /// non-idempotent command twice across normal relaunches. It is still not
+    /// exactly-once: a crash during the handler before persistence can retry.
+    private var commandOutcomes: [String: Bool]
     private var commandOutcomeOrder: [String] = []
 
-    public init(bridgeBaseURL: URL, companionID: String) {
+    public init(
+        bridgeBaseURL: URL,
+        companionID: String,
+        store: any AppleMusicCompanionInstallationStore = KeychainAppleMusicCompanionInstallationStore()
+    ) {
         precondition(!companionID.isEmpty && !companionID.contains(":"), "companionID must be a non-empty owner-safe identifier")
         self.companionID = companionID
         bridge = AppleMusicBridgeClient(baseURL: bridgeBaseURL)
         installation = AppleMusicCompanionInstallation(baseURL: bridgeBaseURL, companionID: companionID)
-        installationStore = InMemoryAppleMusicCompanionInstallationStore()
+        installationStore = store
+        commandOutcomes = [:]
     }
 
     /// Restore a paired installation from secure host storage. The default
@@ -274,6 +278,8 @@ public actor AppleMusicCompanionHost {
         self.installation = installation
         self.installationStore = store
         bridge = AppleMusicBridgeClient(baseURL: installation.baseURL, accessToken: installation.accessToken)
+        commandOutcomes = Array(installation.commandOutcomes.prefix(Self.maxRememberedCommandOutcomes)).reduce(into: [:]) { $0[$1.key] = $1.value }
+        commandOutcomeOrder = Array(commandOutcomes.keys)
     }
 
     @discardableResult
@@ -289,6 +295,10 @@ public actor AppleMusicCompanionHost {
         var saved = installation
         saved.bridgeID = bridgeID
         saved.accessToken = response.accessToken
+        saved.commandOutcomes = [:]
+        commandOutcomes.removeAll(keepingCapacity: true)
+        commandOutcomeOrder.removeAll(keepingCapacity: true)
+        installation = saved
         try installationStore.save(saved)
         return response
     }
@@ -319,28 +329,28 @@ public actor AppleMusicCompanionHost {
                 try await bridge.acknowledge(commandID: command.commandID, ok: priorOutcome)
                 continue
             }
+            var outcome = true
+            var errorDescription: String?
             do {
                 try await handler(command.command)
-                rememberCommandOutcome(command.commandID, ok: true)
-                try await bridge.acknowledge(commandID: command.commandID, ok: true)
             } catch {
-                rememberCommandOutcome(command.commandID, ok: false)
-                try await bridge.acknowledge(
-                    commandID: command.commandID,
-                    ok: false,
-                    error: String(describing: error)
-                )
+                outcome = false
+                errorDescription = String(describing: error)
             }
+            try await rememberCommandOutcome(command.commandID, ok: outcome)
+            try await bridge.acknowledge(commandID: command.commandID, ok: outcome, error: errorDescription)
         }
     }
 
-    private func rememberCommandOutcome(_ commandID: String, ok: Bool) {
+    private func rememberCommandOutcome(_ commandID: String, ok: Bool) async throws {
         commandOutcomes[commandID] = ok
         commandOutcomeOrder.removeAll { $0 == commandID }
         commandOutcomeOrder.append(commandID)
         while commandOutcomeOrder.count > Self.maxRememberedCommandOutcomes {
             commandOutcomes.removeValue(forKey: commandOutcomeOrder.removeFirst())
         }
+        installation.commandOutcomes = commandOutcomes
+        try installationStore.save(installation)
     }
 
     public func revoke() async throws {

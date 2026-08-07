@@ -13,12 +13,29 @@ public struct AppleMusicCompanionInstallation: Codable, Sendable, Equatable {
     public let companionID: String
     public var bridgeID: String?
     public var accessToken: String?
+    /// Bounded command outcomes survive a host restart so at-least-once bridge
+    /// redelivery does not repeat a non-idempotent transport command.
+    public var commandOutcomes: [String: Bool]
 
-    public init(baseURL: URL, companionID: String, bridgeID: String? = nil, accessToken: String? = nil) {
+    public init(baseURL: URL, companionID: String, bridgeID: String? = nil, accessToken: String? = nil, commandOutcomes: [String: Bool] = [:]) {
         self.baseURL = baseURL
         self.companionID = companionID
         self.bridgeID = bridgeID
         self.accessToken = accessToken
+        self.commandOutcomes = commandOutcomes
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case baseURL, companionID, bridgeID, accessToken, commandOutcomes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        baseURL = try values.decode(URL.self, forKey: .baseURL)
+        companionID = try values.decode(String.self, forKey: .companionID)
+        bridgeID = try values.decodeIfPresent(String.self, forKey: .bridgeID)
+        accessToken = try values.decodeIfPresent(String.self, forKey: .accessToken)
+        commandOutcomes = try values.decodeIfPresent([String: Bool].self, forKey: .commandOutcomes) ?? [:]
     }
 }
 
