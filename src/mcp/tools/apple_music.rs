@@ -771,7 +771,7 @@ mod retrieval_tests {
     fn retrieval_actions_have_stable_source_kinds() {
         assert_eq!(retrieval_source_kind("library"), "library");
         assert_eq!(retrieval_source_kind("playlist_tracks"), "playlist");
-        assert_eq!(retrieval_source_kind("recent"), "history");
+        assert_eq!(retrieval_source_kind("recent"), "recent");
         assert_eq!(retrieval_source_kind("recommendations"), "recommendation");
     }
 
