@@ -46,7 +46,10 @@ control are the initial capabilities; search, queue, and playlist operations
 remain separate follow-on capabilities so that MA's own library and queue
 semantics are not silently projected onto native provider adapters.  See the
 [MA API documentation](https://www.music-assistant.io/api/) for the token and
-command contract.
+command contract. HTTPS is required by default. For a deliberately trusted
+local-development-only MA instance, set `MUSIC_ASSISTANT_INSECURE_HTTP=1`
+alongside `MUSIC_ASSISTANT_TLS=false`; never use that override across an
+untrusted LAN or tunnel because the bearer token is sent on the wire.
 
 ## Authorization and the Apple Music bridge
 

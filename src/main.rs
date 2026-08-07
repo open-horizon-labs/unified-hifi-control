@@ -387,6 +387,9 @@ mod server {
                     .unwrap_or(8095);
                 let tls = std::env::var("MUSIC_ASSISTANT_TLS")
                     .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(true);
+                let allow_insecure_http = std::env::var("MUSIC_ASSISTANT_INSECURE_HTTP")
+                    .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
                     .unwrap_or(false);
                 match adapters::musicassistant::MusicAssistantAdapter::new(
                     bus.clone(),
@@ -395,6 +398,7 @@ mod server {
                         port,
                         token,
                         tls,
+                        allow_insecure_http,
                     },
                 ) {
                     Ok(adapter) => Some(Arc::new(adapter)),

@@ -39,12 +39,20 @@ pub struct MusicAssistantConfig {
     /// A long-lived MA access token.  The token is never emitted in logs or
     /// zone state; callers are responsible for storing it securely.
     pub token: String,
-    #[serde(default)]
+    #[serde(default = "default_tls")]
     pub tls: bool,
+    /// Permit plaintext HTTP only when the operator has explicitly opted in
+    /// for a trusted local development network.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 fn default_port() -> u16 {
     DEFAULT_PORT
+}
+
+fn default_tls() -> bool {
+    true
 }
 
 impl MusicAssistantConfig {
@@ -100,6 +108,11 @@ impl MusicAssistantAdapter {
         }
         if config.token.trim().is_empty() {
             return Err(anyhow!("Music Assistant access token cannot be empty"));
+        }
+        if !config.tls && !config.allow_insecure_http {
+            return Err(anyhow!(
+                "Music Assistant requires HTTPS; set MUSIC_ASSISTANT_INSECURE_HTTP=1 only for a trusted local development network"
+            ));
         }
 
         Ok(Self {
@@ -495,14 +508,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_defaults_to_ma_port_and_builds_api_url() {
+    fn config_defaults_to_ma_port_and_https() {
         let config: MusicAssistantConfig = serde_json::from_value(json!({
             "host": "ma.local",
             "token": "secret"
         }))
         .unwrap_or_default();
         assert_eq!(config.port, DEFAULT_PORT);
-        assert_eq!(config.base_url(), "http://ma.local:8095/api");
+        assert_eq!(config.base_url(), "https://ma.local:8095/api");
+        assert!(!config.allow_insecure_http);
+    }
+
+    #[test]
+    fn plaintext_requires_explicit_development_opt_in() {
+        let config = MusicAssistantConfig {
+            host: "ma.local".to_string(),
+            port: DEFAULT_PORT,
+            token: "secret".to_string(),
+            tls: false,
+            allow_insecure_http: false,
+        };
+        assert!(MusicAssistantAdapter::new(crate::bus::create_bus(), config).is_err());
+    }
+
+    #[test]
+    fn explicit_plaintext_opt_in_builds_http_url() {
+        let config = MusicAssistantConfig {
+            host: "127.0.0.1".to_string(),
+            port: DEFAULT_PORT,
+            token: "secret".to_string(),
+            tls: false,
+            allow_insecure_http: true,
+        };
+        assert_eq!(config.base_url(), "http://127.0.0.1:8095/api");
+        assert!(MusicAssistantAdapter::new(crate::bus::create_bus(), config).is_ok());
     }
 
     #[test]
