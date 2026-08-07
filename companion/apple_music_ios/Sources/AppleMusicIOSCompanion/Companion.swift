@@ -238,9 +238,17 @@ public actor AppleMusicBridgeClient {
 /// execution, acknowledgement, and revoke consistent for a real host app.
 @available(iOS 17.0, *)
 public actor AppleMusicCompanionHost {
+    private static let maxRememberedCommandOutcomes = 128
     public let bridge: AppleMusicBridgeClient
 
     public let companionID: String
+    /// Outcomes remembered for the lifetime of this host process. The bridge
+    /// is at-least-once, so this prevents a lease redelivery from driving a
+    /// non-idempotent command twice after an acknowledgement race. A process
+    /// crash still requires the command handler to use a durable/idempotent
+    /// boundary before claiming exactly-once behavior.
+    private var commandOutcomes: [String: Bool] = [:]
+    private var commandOutcomeOrder: [String] = []
 
     public init(bridgeBaseURL: URL, companionID: String) {
         precondition(!companionID.isEmpty && !companionID.contains(":"), "companionID must be a non-empty owner-safe identifier")
@@ -264,6 +272,15 @@ public actor AppleMusicCompanionHost {
         try await bridge.publish(snapshot: snapshot)
     }
 
+    /// Read and publish one bounded projection of the system player. The
+    /// projection intentionally leaves volume/route unavailable; those fields
+    /// are not part of the documented shared SystemMusicPlayer state and must
+    /// not be inferred by the host.
+    @available(iOS 17.0, *)
+    public func publishCurrentSnapshot(from player: SystemMusicPlayerCompanion) async throws {
+        try await publish(snapshot: player.snapshotPayload(companionID: companionID))
+    }
+
     /// Poll once and execute each command at least once from the host's point
     /// of view. The server's acknowledgement removes the command from its
     /// delivery queue; a crash before acknowledgement may cause a redelivery,
@@ -273,16 +290,31 @@ public actor AppleMusicCompanionHost {
         _ handler: @Sendable (MusicKitWireCommand) async throws -> Void
     ) async throws {
         for command in try await bridge.pollCommands() {
+            if let priorOutcome = commandOutcomes[command.commandID] {
+                try await bridge.acknowledge(commandID: command.commandID, ok: priorOutcome)
+                continue
+            }
             do {
                 try await handler(command.command)
+                rememberCommandOutcome(command.commandID, ok: true)
                 try await bridge.acknowledge(commandID: command.commandID, ok: true)
             } catch {
+                rememberCommandOutcome(command.commandID, ok: false)
                 try await bridge.acknowledge(
                     commandID: command.commandID,
                     ok: false,
                     error: String(describing: error)
                 )
             }
+        }
+    }
+
+    private func rememberCommandOutcome(_ commandID: String, ok: Bool) {
+        commandOutcomes[commandID] = ok
+        commandOutcomeOrder.removeAll { $0 == commandID }
+        commandOutcomeOrder.append(commandID)
+        while commandOutcomeOrder.count > Self.maxRememberedCommandOutcomes {
+            commandOutcomes.removeValue(forKey: commandOutcomeOrder.removeFirst())
         }
     }
 
@@ -401,6 +433,56 @@ public actor SystemMusicPlayerCompanion {
         case .previous: try await skipToPreviousItem()
         case .toggle, .stop, .setVolume, .adjustVolume, .setMute:
             throw CompanionCommandError.notValidated(command)
+        }
+    }
+
+    /// Project only the documented/readable system-player state. Current-item
+    /// album/artist fields are included when MusicKit resolves a Song; an
+    /// unresolved queue entry remains a truthful title-only observation.
+    public func snapshotPayload(companionID: String) -> MusicKitSnapshotPayload {
+        let entry = player.queue.currentEntry
+        let track: MusicKitTrackPayload?
+        if let entry, case let .song(song) = entry.item {
+            track = MusicKitTrackPayload(
+                title: song.title,
+                artist: song.artistName,
+                album: song.albumTitle ?? "",
+                artworkURL: song.artwork?.url(width: 512, height: 512)?.absoluteString,
+                positionSeconds: finite(player.playbackTime),
+                durationSeconds: song.duration
+            )
+        } else if let entry {
+            track = MusicKitTrackPayload(
+                title: entry.title,
+                artist: entry.subtitle ?? "",
+                album: "",
+                positionSeconds: finite(player.playbackTime)
+            )
+        } else {
+            track = nil
+        }
+        return MusicKitSnapshotPayload(
+            playerID: companionID,
+            displayName: "iPhone Apple Music",
+            state: playbackState(player.state.playbackStatus),
+            track: track,
+            volume: nil,
+            isMuted: false
+        )
+    }
+
+    private func finite(_ value: TimeInterval) -> Double? {
+        value.isFinite && value >= 0 ? value : nil
+    }
+
+    private func playbackState(_ status: MusicPlayer.PlaybackStatus) -> String {
+        switch status {
+        case .playing: "playing"
+        case .paused: "paused"
+        case .stopped: "stopped"
+        case .interrupted: "interrupted"
+        case .seekingForward, .seekingBackward: "seeking"
+        @unknown default: "unknown"
         }
     }
 

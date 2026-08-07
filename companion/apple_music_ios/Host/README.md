@@ -12,10 +12,12 @@ The host flow is:
    file here.
 2. Authorize Apple Music in the app.
 3. Generate a short-lived pairing code from the app or UHC, then claim it.
-4. Keep command polling in the foreground and publish validated snapshots.
+4. Keep command polling in the foreground and publish the bounded
+   `SystemMusicPlayer` snapshot projection.
 5. Stop polling when suspended; UHC should report the companion stale rather
    than implying an always-on iPhone service.
 
-This repository currently has command-line tools only, so host validation here
-is syntax-only. Build, signing, Keychain persistence, and the MusicKit
-observation matrix require Xcode and a physical iPhone (#465).
+The scaffold does not yet implement Keychain persistence or a polished QR
+onboarding flow. This repository currently has command-line tools only, so
+host validation here is syntax-only. Build, signing, Keychain persistence, and
+the MusicKit observation matrix require Xcode and a physical iPhone (#465).

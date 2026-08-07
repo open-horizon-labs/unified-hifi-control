@@ -65,6 +65,7 @@ final class CompanionModel: ObservableObject {
         pollTask = Task { [host, player] in
             while !Task.isCancelled {
                 do {
+                    try await host.publishCurrentSnapshot(from: player)
                     try await host.pollAndHandle { command in
                         try await player.execute(command)
                     }
