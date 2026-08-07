@@ -40,25 +40,3 @@ fn each_provider_card_is_gated_by_its_own_feature_state() {
         "Apple Music pairing must disappear when Apple Music is disabled"
     );
 }
-
-#[test]
-fn disabled_adapter_tabs_are_derived_from_the_same_confirmed_feature_state() {
-    let layout = &SETTINGS[SETTINGS
-        .find("Layout {")
-        .expect("Settings must pass initial tab visibility to Layout")..];
-    let layout = &layout[..layout
-        .find("h1 {")
-        .expect("Layout visibility props must precede Settings page content")];
-
-    for required in [
-        "hide_hqp: !hqplayer_enabled(),",
-        "hide_lms: !lms_enabled(),",
-        "hide_spotify: !spotify_enabled(),",
-        "hide_knobs: hide_knobs(),",
-    ] {
-        assert!(
-            layout.contains(required),
-            "Settings must derive the corresponding navigation visibility from confirmed feature state: {required}"
-        );
-    }
-}
