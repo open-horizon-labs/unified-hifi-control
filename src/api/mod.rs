@@ -221,6 +221,8 @@ pub struct AppState {
     /// UHC-owned requested listening sequences, separate from provider queue
     /// observations (#483).
     pub listening_plans: crate::mcp::listening_plan::ListeningPlanStore,
+    /// Explicit Apple Music feedback and bounded adaptation context (#485).
+    pub apple_feedback: crate::mcp::feedback::FeedbackStore,
 }
 
 impl AppState {
@@ -262,6 +264,7 @@ impl AppState {
             sse_connections: Arc::new(AtomicUsize::new(0)),
             mcp_refs: crate::mcp::refs::RefTable::new(),
             listening_plans: crate::mcp::listening_plan::ListeningPlanStore::from_config(),
+            apple_feedback: crate::mcp::feedback::FeedbackStore::from_config(),
         }
     }
 

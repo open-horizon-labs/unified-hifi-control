@@ -48,6 +48,19 @@ pub struct HifiAppleMusicTool {
     /// Ordered short-lived opaque refs for queue_plan.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<Vec<String>>,
+    /// Explicit feedback signal: favorite, unfavorite, rating, skip,
+    /// more_like_this, or less_like_this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    /// Rating value from 1 through 5 when signal is rating.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<u8>,
+    /// Optional human-provided reason for explicit feedback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Provenance of the signal; feedback_record accepts user only for now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 pub async fn handle_apple_music(
@@ -70,6 +83,7 @@ pub async fn handle_apple_music(
         "favorite_add",
         "favorite_remove",
         "feedback",
+        "context",
     ];
     if !ACTIONS.contains(&args.action.as_str()) {
         return Envelope::read("hifi_apple_music", "invalid_action").refused(
@@ -105,6 +119,119 @@ pub async fn handle_apple_music(
                 },
             );
     }
+
+    if args.action == "context" {
+        let Some(zone_id) = args.zone_id.as_deref() else {
+            return Envelope::read("hifi_apple_music", "context").refused(
+                "context requires an applemusic execution-owner zone_id.",
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "Choose the named Apple Music companion whose context is needed.",
+                ),
+            );
+        };
+        if !zone_id.starts_with("applemusic:") {
+            return Envelope::read("hifi_apple_music", "context").refused(
+                "context can target only an applemusic zone.",
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "AirPlay routes are destinations, not execution-owner zones.",
+                ),
+            );
+        }
+        let limit = args.limit.unwrap_or(10) as usize;
+        let feedback = state.apple_feedback.recent(zone_id, limit).await;
+        let plan = state.listening_plans.get(zone_id).await;
+        return Ok(Envelope::read("hifi_apple_music", "context")
+            .param("action", "context")
+            .param("zone_id", zone_id)
+            .json_result(
+                &json!({"zone_id": zone_id, "feedback": feedback, "listening_plan": plan}),
+            ));
+    }
+
+    let feedback_record = if args.action == "feedback" {
+        let Some(zone_id) = args.zone_id.as_deref() else {
+            return Envelope::write("hifi_apple_music", "feedback").refused(
+                "feedback requires an applemusic execution-owner zone_id.",
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "zone_id",
+                    &["applemusic:<companion>"],
+                    "Choose the named Apple Music companion receiving the signal.",
+                ),
+            );
+        };
+        let Some(signal) = args.signal.as_deref() else {
+            return Envelope::write("hifi_apple_music", "feedback").refused(
+                "feedback requires an explicit signal.",
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "signal",
+                    &[
+                        "favorite",
+                        "unfavorite",
+                        "rating",
+                        "skip",
+                        "more_like_this",
+                        "less_like_this",
+                    ],
+                    "Do not infer dislike from an absent signal or a skip.",
+                ),
+            );
+        };
+        let signal = match signal {
+            "favorite" => crate::mcp::feedback::FeedbackSignal::Favorite,
+            "unfavorite" => crate::mcp::feedback::FeedbackSignal::Unfavorite,
+            "rating" => crate::mcp::feedback::FeedbackSignal::Rating,
+            "skip" => crate::mcp::feedback::FeedbackSignal::Skip,
+            "more_like_this" => crate::mcp::feedback::FeedbackSignal::MoreLikeThis,
+            "less_like_this" => crate::mcp::feedback::FeedbackSignal::LessLikeThis,
+            _ => {
+                return Envelope::write("hifi_apple_music", "feedback").refused(
+                    "feedback signal is not recognized.",
+                    crate::mcp::envelope::Refusal::invalid_parameter(
+                        "signal",
+                        &[
+                            "favorite",
+                            "unfavorite",
+                            "rating",
+                            "skip",
+                            "more_like_this",
+                            "less_like_this",
+                        ],
+                        "Use an explicit signal; skips are observations, not inferred dislike.",
+                    ),
+                )
+            }
+        };
+        if args.source.as_deref().unwrap_or("user") != "user" {
+            return Envelope::write("hifi_apple_music", "feedback").refused(
+                "Only explicit user feedback can be recorded by this surface.",
+                crate::mcp::envelope::Refusal::invalid_parameter(
+                    "source",
+                    &["user"],
+                    "Observed skips and manual changes will be modeled separately from explicit feedback.",
+                ),
+            );
+        }
+        Some(crate::mcp::feedback::FeedbackRecord {
+            zone_id: zone_id.to_string(),
+            reference: args
+                .uri
+                .clone()
+                .or_else(|| args.id.clone())
+                .unwrap_or_default(),
+            signal,
+            source: crate::mcp::feedback::FeedbackSource::User,
+            rating: args.rating,
+            reason: args.reason.clone(),
+            explicit: true,
+            recorded_at: crate::mcp::feedback::now_secs(),
+        })
+    } else {
+        None
+    };
 
     if args.action == "queue_plan" {
         let Some(zone_id) = args.zone_id.as_deref() else {
@@ -191,6 +318,10 @@ pub async fn handle_apple_music(
         "confirm": confirmed,
         "limit": args.limit,
         "items": args.items,
+        "signal": args.signal,
+        "rating": args.rating,
+        "reason": args.reason,
+        "source": args.source,
     });
     let env =
         Envelope::write("hifi_apple_music", "apple_music_content").param("action", &*args.action);
@@ -199,7 +330,20 @@ pub async fn handle_apple_music(
         .library_content("applemusic", &args.action, &params)
         .await
     {
-        Ok(value) => Ok(env.json_result(&value)),
+        Ok(value) => {
+            if let Some(record) = feedback_record {
+                match state.apple_feedback.record(record).await {
+                    Ok(record) => {
+                        Ok(env.json_result(&json!({"companion": value, "feedback": record})))
+                    }
+                    Err(error) => env.failed(format!(
+                        "Apple Music feedback was applied but could not be persisted: {error}"
+                    )),
+                }
+            } else {
+                Ok(env.json_result(&value))
+            }
+        }
         Err(e) => env.failed(format!("Apple Music {} failed: {}", args.action, e)),
     }
 }

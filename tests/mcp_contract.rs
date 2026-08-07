@@ -801,6 +801,10 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("confirm", false),
             ("limit", false),
             ("items", false),
+            ("signal", false),
+            ("rating", false),
+            ("reason", false),
+            ("source", false),
         ],
     ),
 ];

@@ -45,6 +45,26 @@
           "nullable": true,
           "type": "string"
         },
+        "rating": {
+          "description": "Rating value from 1 through 5 when signal is rating.",
+          "nullable": true,
+          "type": "integer"
+        },
+        "reason": {
+          "description": "Optional human-provided reason for explicit feedback.",
+          "nullable": true,
+          "type": "string"
+        },
+        "signal": {
+          "description": "Explicit feedback signal: favorite, unfavorite, rating, skip,\nmore_like_this, or less_like_this.",
+          "nullable": true,
+          "type": "string"
+        },
+        "source": {
+          "description": "Provenance of the signal; feedback_record accepts user only for now.",
+          "nullable": true,
+          "type": "string"
+        },
         "uri": {
           "description": "Opaque Apple Music ref or provider URI for a content operation.",
           "nullable": true,
