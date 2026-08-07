@@ -72,6 +72,10 @@ pub struct HifiAppleMusicTool {
     /// Maximum number of entries to return.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Number of entries to skip for paged library, playlist, history, and
+    /// recommendation retrieval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
     /// Ordered short-lived opaque refs for queue_plan or queue_append.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<Vec<String>>,
@@ -611,6 +615,7 @@ pub async fn handle_apple_music(
         "idempotency_key": args.idempotency_key,
         "precondition": args.precondition,
         "limit": args.limit,
+        "offset": args.offset,
         "items": args.items,
         "signal": args.signal,
         "rating": args.rating,

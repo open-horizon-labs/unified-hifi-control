@@ -45,6 +45,11 @@
           "nullable": true,
           "type": "string"
         },
+        "offset": {
+          "description": "Number of entries to skip for paged library, playlist, history, and\nrecommendation retrieval.",
+          "nullable": true,
+          "type": "integer"
+        },
         "precondition": {
           "description": "Read-before-write revision or ownership precondition.",
           "nullable": true,

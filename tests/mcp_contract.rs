@@ -808,6 +808,7 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("confirm", false),
             ("idempotency_key", false),
             ("limit", false),
+            ("offset", false),
             ("items", false),
             ("precondition", false),
             ("signal", false),
