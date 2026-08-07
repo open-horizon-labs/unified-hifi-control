@@ -67,6 +67,83 @@ public struct BridgeCommand: Codable, Sendable {
     }
 }
 
+public enum MusicKitJSONValue: Codable, Sendable, Equatable {
+    case null
+    case bool(Bool)
+    case number(Double)
+    case string(String)
+    case array([MusicKitJSONValue])
+    case object([String: MusicKitJSONValue])
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() { self = .null }
+        else if let value = try? container.decode(Bool.self) { self = .bool(value) }
+        else if let value = try? container.decode(Double.self) { self = .number(value) }
+        else if let value = try? container.decode(String.self) { self = .string(value) }
+        else if let value = try? container.decode([MusicKitJSONValue].self) { self = .array(value) }
+        else { self = .object(try container.decode([String: MusicKitJSONValue].self)) }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null: try container.encodeNil()
+        case let .bool(value): try container.encode(value)
+        case let .number(value): try container.encode(value)
+        case let .string(value): try container.encode(value)
+        case let .array(value): try container.encode(value)
+        case let .object(value): try container.encode(value)
+        }
+    }
+}
+
+public struct MusicKitContentCommand: Codable, Sendable {
+    public let requestID: String
+    public let ownerID: String
+    public let operation: String
+    public let params: [String: MusicKitJSONValue]
+    public let idempotencyKey: String?
+    public let precondition: MusicKitJSONValue?
+    public let confirm: Bool
+    public let expiresAt: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case requestID = "request_id"
+        case ownerID = "owner_id"
+        case operation
+        case params
+        case idempotencyKey = "idempotency_key"
+        case precondition
+        case confirm
+        case expiresAt = "expires_at"
+    }
+}
+
+public struct MusicKitContentError: Codable, Sendable {
+    public let code: String
+    public let message: String
+    public let retryable: Bool
+
+    public init(code: String, message: String, retryable: Bool) {
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+    }
+}
+
+public struct MusicKitContentResult: Codable, Sendable {
+    public let outcome: String
+    public let data: MusicKitJSONValue?
+    public let error: MusicKitContentError?
+
+    public init(outcome: String, data: MusicKitJSONValue? = nil, error: MusicKitContentError? = nil) {
+        self.outcome = outcome
+        self.data = data
+        self.error = error
+    }
+}
+
 /// Codable command shape used by the existing UHC bridge contract.
 public enum MusicKitWireCommand: Codable, Sendable, Equatable {
     case play
@@ -167,11 +244,23 @@ public actor AppleMusicBridgeClient {
         try await request(path: "api/bridges/applemusic/commands", method: "GET")
     }
 
+    public func pollContent() async throws -> [MusicKitContentCommand] {
+        try await request(path: "api/bridges/applemusic/content", method: "GET")
+    }
+
     public func acknowledge(commandID: String, ok: Bool, error: String? = nil) async throws {
         try await requestEmpty(
             path: "api/bridges/applemusic/commands/\(commandID)",
             method: "POST",
             body: CommandAcknowledgement(ok: ok, error: error)
+        )
+    }
+
+    public func acknowledgeContent(_ requestID: String, result: MusicKitContentResult) async throws {
+        try await requestEmpty(
+            path: "api/bridges/applemusic/content/\(requestID)",
+            method: "POST",
+            body: result
         )
     }
 
@@ -357,6 +446,28 @@ public actor AppleMusicCompanionHost {
         try await bridge.revoke()
         try installationStore.clear()
     }
+
+    public func pollAndHandleContent(
+        _ handler: @Sendable (MusicKitContentCommand) async throws -> MusicKitContentResult
+    ) async throws {
+        for request in try await bridge.pollContent() {
+            do {
+                try await bridge.acknowledgeContent(request.requestID, result: try await handler(request))
+            } catch {
+                try await bridge.acknowledgeContent(
+                    request.requestID,
+                    result: MusicKitContentResult(
+                        outcome: "failed",
+                        error: MusicKitContentError(
+                            code: "companion_failed",
+                            message: String(error.localizedDescription.prefix(512)),
+                            retryable: true
+                        )
+                    )
+                )
+            }
+        }
+    }
 }
 
 public enum CompanionHostError: Error, LocalizedError, Sendable {
@@ -444,6 +555,9 @@ public actor SystemMusicPlayerCompanion {
     public static let playerID = "system"
 
     private let player = SystemMusicPlayer.shared
+    private var handles: [String: Song] = [:]
+    private var handleOrder: [String] = []
+    private static let maxHandles = 256
 
     public init() {}
 
@@ -629,6 +743,89 @@ public actor SystemMusicPlayerCompanion {
         try await player.play()
     }
 
+    /// Handle one approved bridge content request. Apple identifiers remain
+    /// inside this actor; UHC receives only a companion-local opaque handle.
+    public func executeContent(_ request: MusicKitContentCommand) async throws -> MusicKitContentResult {
+        switch request.operation {
+        case "catalog_search":
+            let query = stringParam(request.params, "query") ?? ""
+            let limit = intParam(request.params, "limit") ?? 25
+            let items = try await searchForBridge(term: query, limit: limit)
+            return MusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "play_uri", "queue_uri":
+            guard let handle = stringParam(request.params, "uri") else {
+                return invalidContentResult("uri is required")
+            }
+            guard let song = handles[handle] else {
+                return MusicKitContentResult(
+                    outcome: "not_found",
+                    error: MusicKitContentError(code: "unknown_ref", message: "Apple Music handle is unknown or expired.", retryable: false)
+                )
+            }
+            if request.operation == "play_uri" {
+                try await play(song: song)
+            } else {
+                try await playNext(song: song)
+            }
+            return MusicKitContentResult(
+                outcome: "success",
+                data: .object(["message": .string(request.operation == "play_uri" ? "Apple Music item started" : "Apple Music item queued")])
+            )
+        default:
+            return MusicKitContentResult(
+                outcome: "unsupported",
+                error: MusicKitContentError(code: "unsupported", message: "This Apple Music content operation is not enabled on the iPhone companion.", retryable: false)
+            )
+        }
+    }
+
+    private func searchForBridge(term: String, limit: Int) async throws -> [AppleMusicBridgeSearchItem] {
+        let boundedLimit = min(max(limit, 1), 50)
+        var request = MusicCatalogSearchRequest(term: term, types: [Song.self])
+        request.limit = boundedLimit
+        let response = try await request.response()
+        return response.songs.map { song in
+            let handle = mintHandle(for: song)
+            return AppleMusicBridgeSearchItem(
+                title: song.title,
+                subtitle: song.artistName,
+                uri: handle
+            )
+        }
+    }
+
+    private func mintHandle(for song: Song) -> String {
+        let handle = "apple_handle_\(UUID().uuidString.lowercased())"
+        handles[handle] = song
+        handleOrder.removeAll { $0 == handle }
+        handleOrder.append(handle)
+        while handleOrder.count > Self.maxHandles {
+            handles.removeValue(forKey: handleOrder.removeFirst())
+        }
+        return handle
+    }
+
+    private func stringParam(_ params: [String: MusicKitJSONValue], _ key: String) -> String? {
+        guard case let .string(value) = params[key] else { return nil }
+        return value
+    }
+
+    private func intParam(_ params: [String: MusicKitJSONValue], _ key: String) -> Int? {
+        guard case let .number(value) = params[key] else { return nil }
+        return Int(value)
+    }
+
+    private func jsonValue<T: Encodable>(_ value: T) throws -> MusicKitJSONValue {
+        try JSONDecoder().decode(MusicKitJSONValue.self, from: JSONEncoder().encode(value))
+    }
+
+    private func invalidContentResult(_ message: String) -> MusicKitContentResult {
+        MusicKitContentResult(
+            outcome: "invalid",
+            error: MusicKitContentError(code: "invalid", message: message, retryable: false)
+        )
+    }
+
     /// Replace the requested system-player queue. SystemMusicPlayer queue
     /// visibility and persistence must still be proven on physical hardware.
     public func replaceQueue(with songs: [Song]) async throws {
@@ -719,6 +916,19 @@ public struct AppleMusicRecommendationSummary: Sendable, Equatable {
         title = recommendation.title ?? "Apple Music recommendation"
         reason = recommendation.reason
         nextRefreshDate = recommendation.nextRefreshDate
+    }
+}
+
+@available(iOS 17.0, *)
+public struct AppleMusicBridgeSearchItem: Codable, Sendable, Equatable {
+    public let title: String
+    public let subtitle: String?
+    public let uri: String
+
+    public init(title: String, subtitle: String?, uri: String) {
+        self.title = title
+        self.subtitle = subtitle
+        self.uri = uri
     }
 }
 

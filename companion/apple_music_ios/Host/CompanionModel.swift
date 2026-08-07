@@ -81,6 +81,9 @@ final class CompanionModel: ObservableObject {
                     try await host.pollAndHandle { command in
                         try await player.execute(command)
                     }
+                    try await host.pollAndHandleContent { request in
+                        try await player.executeContent(request)
+                    }
                 } catch {
                     await MainActor.run { self.status = error.localizedDescription }
                 }
