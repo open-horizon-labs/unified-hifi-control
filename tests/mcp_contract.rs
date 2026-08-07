@@ -54,7 +54,9 @@ use unified_hifi_control::bus::create_bus;
 use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp;
-use unified_hifi_control::mcp::types::{McpPipelineStatus, McpPlayResult, McpSearchResult};
+use unified_hifi_control::mcp::types::{
+    McpHqpOptions, McpHqpSelection, McpPipelineStatus, McpPlayResult, McpSearchResult,
+};
 
 use mock_servers::{MockHqpServer, MockLmsServer, MockOpenHomeDevice, MockUpnpRenderer};
 
@@ -204,14 +206,15 @@ async fn build_state_with_bus(
 ) -> AppState {
     let coordinator = Arc::new(AdapterCoordinator::new(bus.clone()));
     let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
-    let hqp_instances = Arc::new(HqpInstanceManager::new(bus.clone()));
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
+        bus.clone(), aggregator.clone(),
+    ));
     let hqplayer = hqp_instances.get_default().await;
     let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
     let lms = lms.unwrap_or_else(|| Arc::new(LmsAdapter::new(bus.clone())));
     let openhome = Arc::new(OpenHomeAdapter::new(bus.clone()));
     let upnp = Arc::new(UPnPAdapter::new(bus.clone()));
-    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
-
     let startable_adapters: Vec<Arc<dyn Startable>> =
         vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
@@ -760,12 +763,15 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
         ],
     ),
     ("hifi_status", &[]),
-    ("hifi_hqplayer_status", &[]),
-    ("hifi_hqplayer_profiles", &[]),
-    ("hifi_hqplayer_load_profile", &[("profile", true)]),
+    ("hifi_hqplayer_status", &[("zone_id", false)]),
+    ("hifi_hqplayer_profiles", &[("zone_id", false)]),
+    (
+        "hifi_hqplayer_load_profile",
+        &[("profile", true), ("zone_id", false)],
+    ),
     (
         "hifi_hqplayer_set_pipeline",
-        &[("setting", true), ("value", true)],
+        &[("setting", true), ("value", true), ("zone_id", false)],
     ),
     // #396. `ref` is required; `zone_id` is required (must match the ref's
     // provider); `action` is optional and defaults to "play".
@@ -1263,21 +1269,27 @@ async fn hifi_hqplayer_status_shape_is_pinned() {
 
     assert_eq!(
         parsed,
-        json!({ "connected": false, "host": null, "pipeline": null }),
+        json!({
+            "connected": false,
+            "host": null,
+            "pipeline": null,
+            "options": null,
+            "options_unavailable_reason": null
+        }),
         "hifi_hqplayer_status payload drifted"
     );
 }
 
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn hifi_hqplayer_profiles_returns_an_array() {
+async fn hifi_hqplayer_profiles_surfaces_a_fresh_read_failure() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
     let text = result_text(&app.call_tool("hifi_hqplayer_profiles", json!({})).await);
     assert_eq!(
-        text, "[]",
-        "hifi_hqplayer_profiles must return a JSON array"
+        text, "Error: Failed to list profiles: Web credentials not configured",
+        "an empty cache must not masquerade as an authoritative empty profile list"
     );
 }
 
@@ -1374,7 +1386,7 @@ async fn hqplayer_set_pipeline_alias_table_is_pinned() {
     );
     assert_eq!(
         text,
-        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither",
+        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, random",
         "the refusal must enumerate the valid settings"
     );
 }
@@ -1398,7 +1410,7 @@ async fn hifi_control_volume_argument_handling_is_pinned() {
         .await,
     );
     assert_eq!(
-        text, "Error: volume_set requires a value (0-100)",
+        text, "Error: volume_set requires a value (0-100, or dB for HQPlayer)",
         "volume_set without a value must be refused with its documented range"
     );
 
@@ -1870,12 +1882,22 @@ async fn hqplayer_round_trip_reports_a_live_connection() {
         .connect()
         .await
         .expect("HQPlayer must connect to the mock");
+    state
+        .hqp_instances
+        .refresh_instance("default")
+        .await
+        .expect("the coherent observation must reach the aggregator");
 
     let app = TestApp::with_state(state.clone());
 
     let mut connected = false;
     for _ in 0..50 {
-        if state.hqplayer.get_status().await.connected {
+        if state
+            .aggregator
+            .get_hqplayer_snapshot("default")
+            .await
+            .is_some_and(|snapshot| snapshot.observation.connection.connected)
+        {
             connected = true;
             break;
         }
@@ -2074,6 +2096,26 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
         "pipeline",
         DisplayOnly("hifi_hqplayer_status grouping key wrapping the pipeline readout"),
     ),
+    (
+        "options",
+        DisplayOnly("HQPlayer current choices; clients use them to choose a value for hifi_hqplayer_set_pipeline"),
+    ),
+    (
+        "options_unavailable_reason",
+        DisplayOnly("reason HQPlayer choices are unavailable; clients must not infer choices from absence"),
+    ),
+    ("current", Consumed("hifi_hqplayer_set_pipeline.value")),
+    ("choices", Consumed("hifi_hqplayer_set_pipeline.value")),
+    ("mode", Consumed("hifi_hqplayer_set_pipeline.setting='mode'")),
+    ("samplerate", Consumed("hifi_hqplayer_set_pipeline.setting='samplerate'")),
+    ("filter1x", Consumed("hifi_hqplayer_set_pipeline.setting='filter1x'")),
+    ("filterNx", Consumed("hifi_hqplayer_set_pipeline.setting='filterNx'")),
+    ("junk_filter", Consumed("hifi_hqplayer_set_pipeline.setting='junk_filter'")),
+    ("matrix_profile", Consumed("hifi_hqplayer_set_pipeline.setting='matrix_profile'")),
+    ("convolution", Consumed("hifi_hqplayer_set_pipeline.setting='convolution'")),
+    ("adaptive_volume", Consumed("hifi_hqplayer_set_pipeline.setting='adaptive_volume'")),
+    ("repeat", Consumed("hifi_hqplayer_set_pipeline.setting='repeat'")),
+    ("random", Consumed("hifi_hqplayer_set_pipeline.setting='random'")),
     (
         "filter",
         DisplayOnly(
@@ -2422,6 +2464,27 @@ async fn no_tool_returns_an_unclassified_field() {
         .expect("McpPipelineStatus must serialize"),
         &mut returned,
     );
+    let selection = || McpHqpSelection {
+        current: String::new(),
+        choices: Vec::new(),
+    };
+    collect_keys(
+        &serde_json::to_value(McpHqpOptions {
+            mode: selection(),
+            samplerate: selection(),
+            filter1x: selection(),
+            filter_nx: selection(),
+            shaper: selection(),
+            junk_filter: selection(),
+            matrix_profile: selection(),
+            convolution: false,
+            adaptive_volume: false,
+            repeat: String::new(),
+            random: false,
+        })
+        .expect("McpHqpOptions must serialize"),
+        &mut returned,
+    );
     // #395: hifi_play's success payload. Same reasoning — its success path needs a
     // live music library, which no mock provides, so serialize the production type
     // rather than trusting a comment.
@@ -2681,6 +2744,11 @@ const TEXT_ADDITIONS: &[(&str, &str)] = &[(
 ///
 /// `(fixture key, the string #395 froze, the string #398 replaces it with)`
 const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
+    (
+        "hifi_control/volume_set_without_value",
+        "Error: volume_set requires a value (0-100)",
+        "Error: volume_set requires a value (0-100, or dB for HQPlayer)",
+    ),
     // #398 wires the MCP volume path to the OpenHome and UPnP adapters, which
     // implement vol_abs/vol_rel and have been reachable over HTTP all along. The
     // old string claimed a provider limitation that does not exist.
@@ -2713,6 +2781,21 @@ const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
         "Error: Unknown action 'frobnicate'. Valid actions: play, pause, playpause, next, \
          previous, prev, volume_set, volume_up, volume_down, repeat_off, repeat_context, \
          repeat_track, shuffle_on, shuffle_off.",
+    ),
+    (
+        "hifi_hqplayer_set_pipeline/unknown_setting",
+        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither",
+        "Error: Unknown setting: oversampling. Valid: mode, samplerate, filter1x, filterNx, shaper, dither, junk_filter, matrix_profile, convolution, adaptive_volume, repeat, random",
+    ),
+    (
+        "hifi_hqplayer_profiles/empty",
+        "[]",
+        "Error: Failed to list profiles: Web credentials not configured",
+    ),
+    (
+        "hifi_hqplayer_status/disconnected",
+        "{\n  \"connected\": false,\n  \"host\": null,\n  \"pipeline\": null\n}",
+        "{\n  \"connected\": false,\n  \"host\": null,\n  \"pipeline\": null,\n  \"options\": null,\n  \"options_unavailable_reason\": null\n}",
     ),
 ];
 
@@ -2956,7 +3039,11 @@ const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
     ),
     ("hifi_status/disconnected", "ok", None),
     ("hifi_hqplayer_status/disconnected", "ok", None),
-    ("hifi_hqplayer_profiles/empty", "ok", None),
+    (
+        "hifi_hqplayer_profiles/empty",
+        "error",
+        Some("backend_error"),
+    ),
     (
         "hifi_hqplayer_load_profile/disconnected",
         "error",
@@ -3172,7 +3259,6 @@ async fn envelope_data_parses_equal_to_the_text_payload() {
         "hifi_zones/empty",
         "hifi_status/disconnected",
         "hifi_hqplayer_status/disconnected",
-        "hifi_hqplayer_profiles/empty",
     ];
 
     let cases = all_cases(&app).await;
@@ -5200,12 +5286,22 @@ async fn hqplayer_status_resource_agrees_with_the_tool_for_a_live_connection() {
         .connect()
         .await
         .expect("HQPlayer must connect to the mock");
+    state
+        .hqp_instances
+        .refresh_instance("default")
+        .await
+        .expect("the coherent observation must reach the aggregator");
 
     let app = TestApp::with_state(state.clone());
 
     let mut connected = false;
     for _ in 0..50 {
-        if state.hqplayer.get_status().await.connected {
+        if state
+            .aggregator
+            .get_hqplayer_snapshot("default")
+            .await
+            .is_some_and(|snapshot| snapshot.observation.connection.connected)
+        {
             connected = true;
             break;
         }
@@ -5250,20 +5346,12 @@ async fn hqplayer_profiles_resource_agrees_with_hifi_hqplayer_profiles_tool() {
     let app = TestApp::new().await;
 
     let tool_text = result_text(&app.call_tool("hifi_hqplayer_profiles", json!({})).await);
-    let tool_value: Value =
-        serde_json::from_str(&tool_text).expect("hifi_hqplayer_profiles must return JSON");
-
+    assert!(tool_text.contains("Web credentials not configured"));
     let read = app.read_resource("hifi://hqplayer/profiles").await;
-    let resource_text = read
-        .pointer("/result/contents/0/text")
-        .and_then(Value::as_str)
-        .expect("hifi://hqplayer/profiles must return text contents");
-    let resource_value: Value =
-        serde_json::from_str(resource_text).expect("resource contents must be JSON");
-
     assert_eq!(
-        tool_value, resource_value,
-        "hifi://hqplayer/profiles must carry exactly the hifi_hqplayer_profiles tool's payload"
+        read.pointer("/error/data/reason").and_then(Value::as_str),
+        Some("Web credentials not configured"),
+        "hifi://hqplayer/profiles must expose the same unavailable reason as the tool: {read}"
     );
 }
 

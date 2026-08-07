@@ -122,7 +122,7 @@ pub async fn handle_control(
                     .await,
                 )
                 .refused(
-                    "volume_set requires a value (0-100)",
+                    "volume_set requires a value (0-100, or dB for HQPlayer)",
                     Refusal::invalid_parameter(
                         "value",
                         &["0-100"],
