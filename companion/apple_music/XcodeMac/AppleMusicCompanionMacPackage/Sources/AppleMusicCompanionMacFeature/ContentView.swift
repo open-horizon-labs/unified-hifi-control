@@ -5,17 +5,19 @@ import SwiftUI
 @MainActor
 private final class CompanionModel: ObservableObject {
     @Published private(set) var status = "Not authorized"
+    @Published var uhcURL = "http://127.0.0.1:18088"
     @Published var bridgeID = ""
     @Published var pairingCodeInput = ""
     @Published private(set) var isPaired = false
-    private let host: MacAppleMusicCompanionHost
+    private var host: MacAppleMusicCompanionHost?
     private let player: ApplicationMusicPlayerCompanion
     private var pollTask: Task<Void, Never>?
 
     init() {
         let store = KeychainAppleMusicCompanionInstallationStore()
         let installation = store.load() ?? AppleMusicCompanionInstallation(
-            baseURL: URL(string: "https://uhc.example.invalid")!, companionID: "replace-from-keychain")
+            baseURL: URL(string: "http://127.0.0.1:18088")!, companionID: "macos-companion")
+        uhcURL = installation.baseURL.absoluteString
         host = MacAppleMusicCompanionHost(installation: installation, store: store)
         player = ApplicationMusicPlayerCompanion(companionID: installation.companionID)
         bridgeID = installation.bridgeID ?? ""
@@ -25,6 +27,7 @@ private final class CompanionModel: ObservableObject {
 
     func authorize() {
         Task { @MainActor in
+            guard let host else { status = "Configure the UHC server URL first"; return }
             let result = await host.authorize()
             status = result == .authorized ? "Authorized; enter a UHC pairing code" : "Apple Music authorization status: \(result)"
         }
@@ -32,10 +35,17 @@ private final class CompanionModel: ObservableObject {
 
     func claim() {
         guard !bridgeID.isEmpty, !pairingCodeInput.isEmpty else { status = "Enter the bridge ID and pairing code"; return }
+        guard let baseURL = URL(string: uhcURL), ["http", "https"].contains(baseURL.scheme?.lowercased()) else {
+            status = "Enter a valid UHC server URL"
+            return
+        }
         let bridgeID = bridgeID, pairingCode = pairingCodeInput
         Task { @MainActor in
             do {
-                try await host.claim(bridgeID: bridgeID, pairingCode: pairingCode)
+                let installation = AppleMusicCompanionInstallation(baseURL: baseURL, companionID: "macos-companion")
+                let newHost = MacAppleMusicCompanionHost(installation: installation)
+                try await newHost.claim(bridgeID: bridgeID, pairingCode: pairingCode)
+                host = newHost
                 isPaired = true; status = "Paired; waiting for snapshots"; startPolling()
             } catch { status = error.localizedDescription }
         }
@@ -44,6 +54,7 @@ private final class CompanionModel: ObservableObject {
     func startPolling() {
         guard isPaired else { return }
         pollTask?.cancel()
+        guard let host else { return }
         pollTask = Task { [host, player] in
             while !Task.isCancelled {
                 do {
@@ -59,7 +70,7 @@ private final class CompanionModel: ObservableObject {
     func stopPolling() { pollTask?.cancel(); pollTask = nil }
     func revoke() {
         Task { @MainActor in
-            do { try await host.revoke(); isPaired = false; stopPolling(); status = "Revoked" }
+            do { guard let host else { return }; try await host.revoke(); isPaired = false; stopPolling(); status = "Revoked" }
             catch { status = error.localizedDescription }
         }
     }
@@ -75,6 +86,7 @@ public struct ContentView: View {
             Text("Controls this Mac's app-private Apple Music session; it does not automate Music.app.").font(.callout).foregroundStyle(.secondary)
             Text(model.status).font(.footnote)
             Button("Authorize Apple Music", action: model.authorize)
+            TextField("UHC server URL", text: $model.uhcURL)
             TextField("UHC bridge ID", text: $model.bridgeID)
             TextField("Short-lived pairing code", text: $model.pairingCodeInput)
             Button("Claim this companion", action: model.claim).disabled(model.bridgeID.isEmpty || model.pairingCodeInput.isEmpty)
