@@ -96,6 +96,8 @@ pub struct McpHqpStatus {
     pub connected: bool,
     pub host: Option<String>,
     pub pipeline: Option<McpPipelineStatus>,
+    pub options: Option<McpHqpOptions>,
+    pub options_unavailable_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +106,28 @@ pub struct McpPipelineStatus {
     pub filter: String,
     pub shaper: String,
     pub rate: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct McpHqpSelection {
+    pub current: String,
+    pub choices: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct McpHqpOptions {
+    pub mode: McpHqpSelection,
+    pub samplerate: McpHqpSelection,
+    pub filter1x: McpHqpSelection,
+    #[serde(rename = "filterNx")]
+    pub filter_nx: McpHqpSelection,
+    pub shaper: McpHqpSelection,
+    pub junk_filter: McpHqpSelection,
+    pub matrix_profile: McpHqpSelection,
+    pub convolution: bool,
+    pub adaptive_volume: bool,
+    pub repeat: String,
+    pub random: bool,
 }
 
 // =============================================================================

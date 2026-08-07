@@ -1,6 +1,17 @@
 //! Mock HQPlayer for testing
 //!
 //! Simulates the TCP/XML protocol on port 4321
+//!
+//! `MockHqpServer` below is the long-standing facade used by `tests/adapter_integration.rs` and
+//! `tests/zones_sha_integration.rs`; it is left untouched. The submodules are the issue #322
+//! conformance boundary, which separates the document layer ([`corpus`]) from the byte/timing
+//! layer ([`wire`]) so a test can vary one while pinning the other.
+
+pub mod corpus;
+pub mod model;
+pub mod raw;
+pub mod tier1;
+pub mod wire;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -160,8 +171,8 @@ async fn process_command(command: &str, state: &Arc<RwLock<MockHqpState>>) -> St
             "<?xml version=\"1.0\"?>\n<GetInfo name=\"MockHQPlayer\" product=\"HQPlayer\" version=\"5.0.0\" platform=\"mock\" engine=\"mock\"/>\n"
         ),
         "State" => format!(
-            "<?xml version=\"1.0\"?>\n<State state=\"{}\" mode=\"{}\" filter=\"{}\" shaper=\"{}\" rate=\"{}\" volume=\"{}\"/>\n",
-            state.state, state.mode, state.filter, state.shaper, state.rate, state.volume
+            "<?xml version=\"1.0\"?>\n<State state=\"{}\" mode=\"{}\" filter=\"{}\" filter1x=\"{}\" filterNx=\"{}\" filter_junk=\"0\" shaper=\"{}\" rate=\"{}\" volume=\"{}\" convolution=\"0\" adaptive=\"0\" repeat=\"0\" random=\"0\" matrix_profile=\"Default\"/>\n",
+            state.state, state.mode, state.filter, state.filter, state.filter, state.shaper, state.rate, state.volume
         ),
         "Status" => format!(
             "<?xml version=\"1.0\"?>\n<Status state=\"{}\" track=\"0\" track_id=\"\" position=\"{}\" length=\"{}\" volume=\"{}\" active_mode=\"PCM\" active_filter=\"poly-sinc-xtr\" active_shaper=\"NS9\" active_rate=\"352800\"/>\n",
@@ -181,6 +192,9 @@ async fn process_command(command: &str, state: &Arc<RwLock<MockHqpState>>) -> St
         }
         "GetRates" => {
             "<?xml version=\"1.0\"?>\n<GetRates><RatesItem index=\"0\" rate=\"352800\"/><RatesItem index=\"1\" rate=\"705600\"/></GetRates>\n".to_string()
+        }
+        "GetJunkFilters" => {
+            "<?xml version=\"1.0\"?>\n<GetJunkFilters><JunkFiltersItem index=\"0\" name=\"off\" value=\"0\"/><JunkFiltersItem index=\"1\" name=\"on\" value=\"1\"/></GetJunkFilters>\n".to_string()
         }
         "MatrixListProfiles" => {
             "<?xml version=\"1.0\"?>\n<MatrixListProfiles><MatrixProfile index=\"0\" name=\"Default\"/><MatrixProfile index=\"1\" name=\"Night\"/></MatrixListProfiles>\n".to_string()

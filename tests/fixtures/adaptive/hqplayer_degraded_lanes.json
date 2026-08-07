@@ -1,0 +1,144 @@
+{
+  "schema_version": "1.0",
+  "producer": {
+    "producer_id": "hqplayer:study",
+    "producer_type": "hqplayer",
+    "instance_label": "HQP-Study",
+    "epoch": 3
+  },
+  "target": {
+    "role": "playback",
+    "zone_id": "hqplayer:study"
+  },
+  "revisions": {
+    "control_plane": 4,
+    "state": 991
+  },
+  "lanes": [
+    {
+      "lane": "native",
+      "state": "connected",
+      "last_success": "2026-07-30T11:05:00Z",
+      "freshness": { "observed_at": "2026-07-30T11:05:00Z", "age_ms": 90 }
+    },
+    {
+      "lane": "persistent",
+      "state": "degraded",
+      "last_success": "2026-07-30T09:12:44Z",
+      "last_error": {
+        "code": "requires_connection",
+        "scope": "lane",
+        "display_text_key": "reason.persistent_lane_unreachable",
+        "detail": "settings interface returned 503 on the last 4 attempts"
+      },
+      "freshness": { "observed_at": "2026-07-30T09:12:44Z", "age_ms": 6736000, "stale": true }
+    },
+    {
+      "lane": "telemetry",
+      "state": "disconnected",
+      "last_error": {
+        "code": "not_supported",
+        "scope": "lane",
+        "display_text_key": "reason.telemetry_not_offered"
+      }
+    }
+  ],
+  "controls": [
+    {
+      "id": "hqplayer.volume.level",
+      "kind": "numeric_range",
+      "label_key": "control.volume.level",
+      "unit": "dB",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "decimal", "value": -24.0 },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 991 },
+          "freshness": { "observed_at": "2026-07-30T11:05:00Z", "age_ms": 90 }
+        },
+        {
+          "lane": "persisted",
+          "grounding": "ungrounded",
+          "ungrounded_reason": "requires_connection",
+          "provenance": { "authority": "persisted_config", "source": "config_file" },
+          "freshness": { "observed_at": "2026-07-30T09:12:44Z", "stale": true }
+        }
+      ],
+      "range": {
+        "min": -60.0,
+        "max": 0.0,
+        "step": 0.5,
+        "unit": "dB",
+        "authority": "runtime",
+        "revision": 4
+      },
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "immediate",
+        "effect": "verified_pending",
+        "disruption": "none",
+        "risk": "caution",
+        "verification": {
+          "verify_via": "hqplayer.volume.level",
+          "verify_lane": "observed",
+          "provisional_ack": true
+        }
+      }
+    },
+    {
+      "id": "hqplayer.settings.buffer_time",
+      "kind": "numeric_range",
+      "label_key": "control.settings.buffer_time",
+      "unit": "ms",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "integer", "value": 120 },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 991 }
+        },
+        {
+          "lane": "persisted",
+          "grounding": "ungrounded",
+          "ungrounded_reason": "requires_connection",
+          "provenance": { "authority": "persisted_config", "source": "config_file" }
+        }
+      ],
+      "availability": {
+        "state": "read_only",
+        "reasons": [
+          {
+            "code": "requires_connection",
+            "scope": "lane",
+            "display_text_key": "reason.persistent_lane_unreachable"
+          }
+        ]
+      }
+    },
+    {
+      "id": "hqplayer.pipeline.active_rate",
+      "kind": "text",
+      "label_key": "control.pipeline.active_rate",
+      "unit": "Hz",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "ungrounded",
+          "ungrounded_reason": "unobservable",
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 991 }
+        }
+      ],
+      "availability": {
+        "state": "unavailable",
+        "reasons": [
+          {
+            "code": "unobservable",
+            "scope": "observed",
+            "display_text_key": "reason.no_active_stream"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+<!--
+  provenance:
+    source: UHC-SALVAGE-UI-DATA-INTEGRATION.md and UHC-SALVAGE-BETA-DEV.md (2026-07-29 comparative salvage reports), which cite https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 6, SetShaping / GetShapers)
+    source_chain: read-via-report
+    daemon: hqplayerd 6.0.4 (Opal), SDM mode
+    status: derived-excerpt
+    date: 2026-07-29
+    playback: unknown
+    notes: SDM modulators. Verified anchor preserved exactly: SetShaping value=5 selects the entry at INDEX 5 (ASDM5EC), not the entry whose enum ID is 5 (ASDM5, at index 4). Positions are excerpt-local within a 36-entry live list. Source chain: read-via-report - the upstream file was NOT read directly for this fixture; the salvage report is the immediate source and the upstream ref is the report's own citation, recorded because two errors in this amendment came from treating a report's citation as if it had been read (a path that did not exist at the ref given, and a superseded claim the report's own newer companion had already corrected).
+-->
+<GetShapers>
+<ShapersItem index="0" name="none" value="0"/>
+<ShapersItem index="1" name="ASDM1" value="1"/>
+<ShapersItem index="2" name="ASDM2" value="2"/>
+<ShapersItem index="3" name="ASDM3" value="3"/>
+<ShapersItem index="4" name="ASDM5" value="5"/>
+<ShapersItem index="5" name="ASDM5EC" value="12"/>
+<ShapersItem index="6" name="ASDM7" value="7"/>
+<ShapersItem index="7" name="ASDM7EC" value="14"/>
+<ShapersItem index="8" name="DSD7" value="20"/>
+</GetShapers>

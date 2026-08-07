@@ -1,0 +1,404 @@
+{
+  "schema_version": "1.0",
+  "producer": {
+    "producer_id": "hqplayer:living-room",
+    "producer_type": "hqplayer",
+    "epoch": 7
+  },
+  "target": {
+    "role": "room_correction",
+    "zone_id": "roon:1601bb42ed14351b99c2926214f6cbb80724"
+  },
+  "revisions": {
+    "control_plane": 12,
+    "state": 4207
+  },
+  "lanes": [{ "lane": "native", "state": "connected", "last_success": "2026-07-30T11:06:10Z" }],
+  "controls": [
+    {
+      "id": "hqplayer.pipeline.mode",
+      "kind": "enumeration",
+      "label_key": "control.pipeline.mode",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "pcm" },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4207 }
+        },
+        {
+          "lane": "desired",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "sdm" },
+          "provenance": { "authority": "staged_intent", "source": "consumer", "revision": 4193 }
+        },
+        {
+          "lane": "effective",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "sdm" },
+          "provenance": { "authority": "editor_projection", "source": "consumer" }
+        }
+      ],
+      "choices": {
+        "authority": "runtime",
+        "source": "live_protocol",
+        "revision": 12,
+        "choices": [
+          { "id": "pcm", "engine_name": "PCM" },
+          { "id": "sdm", "engine_name": "SDM" }
+        ]
+      },
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "staged",
+        "effect": "live_immediate",
+        "disruption": "playback_interruption",
+        "risk": "disruptive",
+        "verification": { "verify_via": "hqplayer.pipeline.mode", "verify_lane": "observed" }
+      }
+    },
+    {
+      "id": "hqplayer.volume.level",
+      "kind": "numeric_range",
+      "label_key": "control.volume.level",
+      "unit": "dB",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "decimal", "value": -14.0 },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4207 }
+        },
+        {
+          "lane": "persisted",
+          "grounding": "grounded",
+          "value": { "type": "decimal", "value": -14.0 },
+          "provenance": { "authority": "persisted_config", "source": "config_file", "revision": 12 }
+        },
+        {
+          "lane": "desired",
+          "grounding": "grounded",
+          "value": { "type": "decimal", "value": -12.0 },
+          "provenance": { "authority": "staged_intent", "source": "consumer", "revision": 4193 }
+        }
+      ],
+      "range": {
+        "min": -60.0,
+        "max": 0.0,
+        "step": 0.5,
+        "unit": "dB",
+        "authority": "runtime",
+        "revision": 12
+      },
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "staged",
+        "effect": "verified_pending",
+        "disruption": "none",
+        "risk": "caution",
+        "verification": { "verify_via": "hqplayer.volume.level", "verify_lane": "observed" }
+      },
+      "divergences": [
+        {
+          "kind": "persisted_vs_desired",
+          "lanes": ["persisted", "desired"],
+          "display_text_key": "divergence.volume_staged_not_persisted"
+        }
+      ]
+    },
+    {
+      "id": "hqplayer.pipeline.rate.exact",
+      "kind": "enumeration",
+      "label_key": "control.pipeline.rate_exact",
+      "unit": "Hz",
+      "values": [
+        {
+          "lane": "observed",
+          "grounding": "grounded",
+          "value": { "type": "choice", "value": "352800" },
+          "provenance": { "authority": "runtime", "source": "live_protocol", "revision": 4207 }
+        }
+      ],
+      "choices": {
+        "authority": "runtime",
+        "source": "live_protocol",
+        "revision": 12,
+        "choices": [
+          { "id": "352800", "engine_name": "352.8 kHz" },
+          { "id": "384000", "engine_name": "384 kHz" }
+        ]
+      },
+      "availability": { "state": "available" },
+      "apply": {
+        "lane": "staged",
+        "effect": "verified_pending",
+        "disruption": "playback_interruption",
+        "risk": "disruptive",
+        "verification": { "verify_via": "hqplayer.pipeline.rate.exact", "verify_lane": "observed" }
+      }
+    }
+  ],
+  "constraints": [
+    {
+      "id": "hqplayer.constraint.pcm_rate_invalid_in_sdm",
+      "applies_to": ["hqplayer.pipeline.rate.exact"],
+      "when": {
+        "op": "eq",
+        "control": "hqplayer.pipeline.mode",
+        "lane": "effective",
+        "value": { "type": "choice", "value": "sdm" }
+      },
+      "effect": "invalidates",
+      "reason": {
+        "code": "draft_invalid",
+        "scope": "draft",
+        "display_text_key": "reason.pcm_rate_invalid_in_sdm"
+      }
+    }
+  ],
+  "draft_policy": {
+    "mode": "shared",
+    "on_conflict": "merge_non_overlapping",
+    "retention": {
+      "survives_reconnect": true,
+      "survives_producer_restart": true,
+      "on_epoch_change": "retain",
+      "expires_at": "2026-07-30T12:00:00Z",
+      "apply_requires_authorization": true
+    }
+  },
+  "change_sets": [
+    {
+      "id": "cs-web-3f9a",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "human", "surface": "web", "actor_id": "session-91c2" },
+      "base": { "epoch": 7, "control_plane": 12, "state": 4193 },
+      "generation": 3,
+      "state": "draft",
+      "created_at": "2026-07-30T11:02:00Z",
+      "updated_at": "2026-07-30T11:05:41Z",
+      "entries": [
+        {
+          "control": "hqplayer.pipeline.mode",
+          "lane": "staged",
+          "desired": { "type": "choice", "value": "sdm" },
+          "base_observed": { "type": "choice", "value": "pcm" },
+          "validity": { "state": "valid" }
+        },
+        {
+          "control": "hqplayer.volume.level",
+          "lane": "staged",
+          "desired": { "type": "decimal", "value": -12.0 },
+          "base_observed": { "type": "decimal", "value": -18.5 },
+          "validity": {
+            "state": "stale_base",
+            "observed_now": { "type": "decimal", "value": -14.0 }
+          }
+        },
+        {
+          "control": "hqplayer.pipeline.rate.exact",
+          "lane": "staged",
+          "desired": { "type": "choice", "value": "352800" },
+          "validity": {
+            "state": "draft_invalid",
+            "reason": {
+              "code": "draft_invalid",
+              "scope": "draft",
+              "display_text_key": "reason.pcm_rate_invalid_in_sdm",
+              "detail": "staged mode sdm makes this PCM rate invalid"
+            }
+          }
+        }
+      ],
+      "retention": {
+        "survives_reconnect": true,
+        "survives_producer_restart": true,
+        "on_epoch_change": "retain",
+        "expires_at": "2026-07-30T12:00:00Z",
+        "apply_requires_authorization": true
+      },
+      "contributors": [
+        { "actor_class": "human", "surface": "web", "actor_id": "session-91c2" },
+        { "actor_class": "device", "surface": "device", "actor_id": "knob-kitchen-01" }
+      ]
+    },
+    {
+      "id": "cs-mcp-7b21",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "agent", "surface": "mcp", "actor_id": "assistant-4" },
+      "base": { "epoch": 7, "control_plane": 12, "state": 4207 },
+      "generation": 1,
+      "state": "validating",
+      "created_at": "2026-07-30T11:06:02Z",
+      "updated_at": "2026-07-30T11:06:02Z",
+      "entries": [
+        {
+          "control": "hqplayer.volume.level",
+          "lane": "staged",
+          "desired": { "type": "decimal", "value": -20.0 },
+          "base_observed": { "type": "decimal", "value": -14.0 },
+          "validity": {
+            "state": "conflicts",
+            "with": ["hqplayer.volume.level"]
+          }
+        }
+      ],
+      "retention": {
+        "survives_reconnect": false,
+        "survives_producer_restart": false,
+        "on_epoch_change": "expire"
+      }
+    },
+    {
+      "id": "cs-auto-1104",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "automation", "surface": "http", "actor_id": "night-mode" },
+      "base": { "epoch": 6, "control_plane": 11, "state": 3902 },
+      "generation": 5,
+      "state": "expired",
+      "created_at": "2026-07-29T23:00:00Z",
+      "updated_at": "2026-07-30T07:00:00Z",
+      "retention": {
+        "survives_reconnect": true,
+        "survives_producer_restart": false,
+        "on_epoch_change": "expire",
+        "expires_at": "2026-07-30T07:00:00Z"
+      }
+    },
+    {
+      "id": "cs-internal-0007",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "automation", "surface": "internal" },
+      "base": { "epoch": 7, "control_plane": 12, "state": 4200 },
+      "generation": 2,
+      "state": "detached",
+      "created_at": "2026-07-30T11:05:50Z",
+      "updated_at": "2026-07-30T11:05:55Z",
+      "entries": [
+        {
+          "control": "hqplayer.volume.level",
+          "lane": "staged",
+          "desired": { "type": "decimal", "value": -30.0 },
+          "validity": {
+            "state": "requires_producer_validation",
+            "reason": {
+              "code": "unknown_constraint",
+              "scope": "draft",
+              "display_text_key": "reason.constraint_not_evaluatable_here"
+            }
+          }
+        }
+      ],
+      "retention": {
+        "survives_reconnect": false,
+        "survives_producer_restart": false,
+        "on_epoch_change": "revalidate"
+      }
+    },
+    {
+      "id": "cs-web-2c10",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "human", "surface": "web", "actor_id": "session-4410" },
+      "base": { "epoch": 7, "control_plane": 12, "state": 4188 },
+      "generation": 1,
+      "state": "superseded",
+      "created_at": "2026-07-30T10:59:00Z",
+      "updated_at": "2026-07-30T11:02:00Z",
+      "retention": {
+        "survives_reconnect": true,
+        "survives_producer_restart": false,
+        "on_epoch_change": "expire"
+      }
+    },
+    {
+      "id": "cs-web-2c11",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "human", "surface": "web", "actor_id": "session-4410" },
+      "base": { "epoch": 7, "control_plane": 12, "state": 4190 },
+      "generation": 1,
+      "state": "applying",
+      "created_at": "2026-07-30T11:00:00Z",
+      "updated_at": "2026-07-30T11:00:30Z",
+      "retention": {
+        "survives_reconnect": true,
+        "survives_producer_restart": false,
+        "on_epoch_change": "revalidate"
+      }
+    },
+    {
+      "id": "cs-web-2c12",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "human", "surface": "web", "actor_id": "session-4410" },
+      "base": { "epoch": 7, "control_plane": 12, "state": 4191 },
+      "generation": 1,
+      "state": "applied",
+      "created_at": "2026-07-30T11:01:00Z",
+      "updated_at": "2026-07-30T11:01:20Z",
+      "retention": {
+        "survives_reconnect": true,
+        "survives_producer_restart": false,
+        "on_epoch_change": "revalidate"
+      }
+    },
+    {
+      "id": "cs-web-2c13",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "human", "surface": "web", "actor_id": "session-4410" },
+      "base": { "epoch": 7, "control_plane": 12, "state": 4192 },
+      "generation": 2,
+      "state": "partially_applied",
+      "created_at": "2026-07-30T11:01:40Z",
+      "updated_at": "2026-07-30T11:02:10Z",
+      "retention": {
+        "survives_reconnect": true,
+        "survives_producer_restart": false,
+        "on_epoch_change": "revalidate"
+      }
+    },
+    {
+      "id": "cs-device-0042",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "device", "surface": "device", "actor_id": "knob-kitchen-01" },
+      "base": { "epoch": 7, "control_plane": 12, "state": 4189 },
+      "generation": 1,
+      "state": "rejected",
+      "created_at": "2026-07-30T10:58:00Z",
+      "updated_at": "2026-07-30T10:58:05Z",
+      "entries": [
+        {
+          "control": "hqplayer.volume.level",
+          "lane": "staged",
+          "desired": { "type": "decimal", "value": 6.0 },
+          "validity": {
+            "state": "draft_invalid",
+            "reason": {
+              "code": "requires_authorization",
+              "scope": "producer",
+              "display_text_key": "reason.positive_gain_requires_authorization"
+            }
+          }
+        }
+      ],
+      "retention": {
+        "survives_reconnect": false,
+        "survives_producer_restart": false,
+        "on_epoch_change": "expire"
+      }
+    },
+    {
+      "id": "cs-mcp-7b20",
+      "producer_id": "hqplayer:living-room",
+      "origin": { "actor_class": "agent", "surface": "mcp", "actor_id": "assistant-4" },
+      "base": { "epoch": 7, "control_plane": 12, "state": 4187 },
+      "generation": 1,
+      "state": "discarded",
+      "created_at": "2026-07-30T10:57:00Z",
+      "updated_at": "2026-07-30T10:57:30Z",
+      "retention": {
+        "survives_reconnect": false,
+        "survives_producer_restart": false,
+        "on_epoch_change": "expire"
+      }
+    }
+  ]
+}

@@ -158,6 +158,7 @@ async fn create_test_app() -> Router {
         .route("/knob/now_playing", get(knobs::knob_now_playing_handler))
         .route("/knob/config", get(knobs::knob_config_handler))
         .route("/knob/devices", get(knobs::knob_devices_handler))
+        .route("/knobs/flash", get(api::knob_flasher_redirect_handler))
         // Web UI routes (MUST return HTML) - using stubs for testing
         .route("/", get(ui_stubs::stub_page))
         .route("/ui/zones", get(ui_stubs::stub_page))
@@ -440,6 +441,46 @@ mod api_endpoints {
 
 mod ui_endpoints {
     use super::*;
+
+    #[tokio::test]
+    async fn knob_flash_route_always_redirects_to_the_https_flasher() {
+        let app = create_test_app().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/knobs/flash")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_redirection());
+        assert_eq!(
+            response.headers().get(axum::http::header::LOCATION),
+            Some(&axum::http::HeaderValue::from_static(
+                "https://roon-knob.muness.com/"
+            ))
+        );
+    }
+
+    #[test]
+    fn knob_page_links_directly_to_the_https_flasher() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/app/pages/knobs.rs"
+        ))
+        .unwrap();
+
+        assert!(
+            source.contains("href: crate::app::KNOB_FLASHER_URL"),
+            "Flash a new knob must link directly to the shared HTTPS flasher URL"
+        );
+        assert!(
+            !source.contains("href: \"/knobs/flash\", \"Flash a new knob\""),
+            "the UI must not bounce through the bridge's HTTP origin"
+        );
+    }
 
     #[tokio::test]
     async fn root_returns_html() {

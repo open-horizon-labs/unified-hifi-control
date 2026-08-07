@@ -50,7 +50,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -61,7 +61,13 @@ use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
 };
 use crate::adapters::Startable;
-use crate::bus::{BusEvent, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl, Zone};
+use crate::bus::runtime::{
+    CommandEndpoint, CommandGateway, NativeResult, ProjectionEntry, ProjectionIngress,
+    ProjectionKind, ProjectionPayload, ProjectionSource, ProjectionUpdate, RuntimeCommand,
+};
+use crate::bus::{
+    BusEvent, Command, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl, Zone,
+};
 use crate::config::{get_config_file_path, read_config_file};
 
 const LMS_CONFIG_FILE: &str = "lms-config.json";
@@ -914,6 +920,105 @@ struct LmsState {
     cli_subscription_active: bool,
 }
 
+/// The one lossless ingress for LMS facts when the reliable runtime is composed.
+///
+/// LMS has two observers -- the HTTP poller and the CLI subscription.  They intentionally share
+/// this bridge rather than each owning a source cursor: a full player snapshot from either path is
+/// an observation of the same server/player state.  Serializing sequence allocation *and* ingress
+/// admission prevents a scheduler race from making a newer CLI update look stale behind an older
+/// poll result.  Every LMS publication is a Snapshot, so an interrupted observer can reconcile a
+/// detected sequence gap with its next complete player readback.
+#[derive(Clone)]
+pub struct LmsRuntimeBridge {
+    ingress: ProjectionIngress,
+    commands: CommandGateway,
+    publication: Arc<Mutex<LmsPublicationCursor>>,
+    publication_gate: Arc<Semaphore>,
+}
+
+#[derive(Default)]
+struct LmsPublicationCursor {
+    epoch: u64,
+    sequence: u64,
+}
+
+impl LmsRuntimeBridge {
+    pub fn new(ingress: ProjectionIngress, commands: CommandGateway) -> Self {
+        Self {
+            ingress,
+            commands,
+            publication: Arc::new(Mutex::new(LmsPublicationCursor::default())),
+            publication_gate: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    fn commands(&self) -> CommandGateway {
+        self.commands.clone()
+    }
+
+    async fn publish_zone(
+        &self,
+        zone: Zone,
+        caused_by: Option<crate::bus::runtime::CommandId>,
+    ) -> Result<()> {
+        self.publish(
+            ProjectionPayload::Zone(Box::new(zone.clone())),
+            format!("zone:{}", zone.zone_id),
+            caused_by,
+        )
+        .await
+    }
+
+    async fn publish_removed(&self, zone_id: PrefixedZoneId) -> Result<()> {
+        self.publish(
+            ProjectionPayload::ZoneRemoved {
+                zone_id: zone_id.clone(),
+            },
+            format!("zone:{zone_id}"),
+            None,
+        )
+        .await
+    }
+
+    async fn publish(
+        &self,
+        payload: ProjectionPayload,
+        key: String,
+        caused_by: Option<crate::bus::runtime::CommandId>,
+    ) -> Result<()> {
+        // Keep the single-owner permit through admission. A sequence is only meaningful in the
+        // order the actor receives it; allocating under one task and admitting under another
+        // permits exactly the dual-ingestion inversion this bridge exists to remove. The data lock
+        // itself is released before awaiting ingress, satisfying the no-await-under-lock invariant.
+        let _publication_permit = self
+            .publication_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("LMS publication lane closed"))?;
+        let (epoch, sequence) = {
+            let mut cursor = self.publication.lock().await;
+            cursor.sequence = cursor.sequence.saturating_add(1);
+            (cursor.epoch, cursor.sequence)
+        };
+        self.ingress
+            .submit(ProjectionUpdate {
+                source: ProjectionSource {
+                    adapter: "lms".to_string(),
+                    instance: None,
+                    epoch,
+                },
+                sequence,
+                kind: ProjectionKind::Snapshot,
+                caused_by,
+                entries: vec![ProjectionEntry { key, payload }],
+            })
+            .await
+            .map_err(|_| anyhow!("LMS reliable projection ingress stopped"))?;
+        Ok(())
+    }
+}
+
 impl Default for LmsState {
     fn default() -> Self {
         Self {
@@ -935,12 +1040,20 @@ pub struct LmsAdapter {
     state: Arc<RwLock<LmsState>>,
     rpc: LmsRpc,
     bus: SharedBus,
+    runtime_bridge: Option<Arc<LmsRuntimeBridge>>,
     /// Wrapped in RwLock to allow creating fresh token on restart
     shutdown: Arc<RwLock<CancellationToken>>,
+    /// The polling supervisor.  Stop waits for this task so a readback from an
+    /// old LMS server cannot cross a reconfiguration projection retirement.
+    task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl LmsAdapter {
     pub fn new(bus: SharedBus) -> Self {
+        Self::new_with_runtime(bus, None)
+    }
+
+    fn new_with_runtime(bus: SharedBus, runtime_bridge: Option<Arc<LmsRuntimeBridge>>) -> Self {
         let state = Arc::new(RwLock::new(LmsState::default()));
         #[allow(clippy::expect_used)] // HTTP client creation only fails if TLS setup fails
         let client = Client::builder()
@@ -952,7 +1065,9 @@ impl LmsAdapter {
             state,
             rpc,
             bus,
+            runtime_bridge,
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
+            task: Arc::new(Mutex::new(None)),
         };
         // Load saved config synchronously at startup
         adapter.load_config_sync();
@@ -1153,20 +1268,38 @@ impl LmsAdapter {
         let bus = self.bus.clone();
         let handle = AdapterHandle::new(adapter, bus, shutdown);
 
-        tokio::spawn(async move { handle.run_with_retry(RetryConfig::default()).await });
+        let task = tokio::spawn(async move {
+            let _ = handle.run_with_retry(RetryConfig::default()).await;
+        });
+        *self.task.lock().await = Some(task);
 
         Ok(())
     }
 
     /// Update cached player information (delegates to shared helper)
     pub async fn update_players(&self) -> Result<()> {
-        update_players_internal(&self.rpc, &self.state, &self.bus).await
+        update_players_internal(
+            &self.rpc,
+            &self.state,
+            &self.bus,
+            self.runtime_bridge.as_deref(),
+        )
+        .await
     }
 
     /// Stop polling (internal - use Startable trait)
     async fn stop_internal(&self) {
         // Cancel background tasks first
         self.shutdown.read().await.cancel();
+
+        // Do not let a request already in flight publish a snapshot from the
+        // old server after the paired LMS projection has been retired.
+        let task = self.task.lock().await.take();
+        if let Some(task) = task {
+            if let Err(error) = task.await {
+                warn!(%error, "LMS polling supervisor did not stop cleanly");
+            }
+        }
 
         let host = {
             let mut state = self.state.write().await;
@@ -1182,6 +1315,42 @@ impl LmsAdapter {
 
     /// Control player
     pub async fn control(&self, player_id: &str, command: &str, value: Option<i32>) -> Result<()> {
+        self.execute_control_native(player_id, command, value)
+            .await?;
+
+        // Compatibility-only optimistic cache refresh. Runtime-routed commands instead perform a
+        // synchronous coherent readback and publish that full observation with their correlation.
+        let player_id = strip_lms_prefix(player_id).to_string();
+        let state = self.state.clone();
+        let rpc = self.rpc.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(status) = rpc.get_player_status(&player_id).await {
+                let mut state = state.write().await;
+                if let Some(player) = state.players.get_mut(&player_id) {
+                    player.state = status.state;
+                    player.mode = status.mode;
+                    player.volume = status.volume;
+                    player.time = status.time;
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Execute one LMS control write without claiming that the visible projection changed.
+    ///
+    /// The reliable endpoint owns the required readback and correlated projection. Keeping this
+    /// native-only primitive separate prevents an acknowledgement from becoming an accidental
+    /// second state authority.
+    async fn execute_control_native(
+        &self,
+        player_id: &str,
+        command: &str,
+        value: Option<i32>,
+    ) -> Result<()> {
         let player_id = strip_lms_prefix(player_id);
         let params: Vec<Value> = match command {
             // Per real-world testing (issue #68), "play" handles both start and resume.
@@ -1210,26 +1379,44 @@ impl LmsAdapter {
         };
 
         self.rpc.execute(Some(player_id), params).await?;
-
-        // Update status after command
-        let player_id = player_id.to_string();
-        let state = self.state.clone();
-        let rpc = self.rpc.clone();
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Ok(status) = rpc.get_player_status(&player_id).await {
-                let mut state = state.write().await;
-                if let Some(player) = state.players.get_mut(&player_id) {
-                    player.state = status.state;
-                    player.mode = status.mode;
-                    player.volume = status.volume;
-                    player.time = status.time;
-                }
-            }
-        });
-
         Ok(())
+    }
+
+    /// Fetch and cache one complete player observation after a native write.  `players` supplies
+    /// stable identity/capability fields (including mute pref); `status` supplies transport and
+    /// now-playing state.  The returned Zone is the exact fact the reliable runtime commits.
+    async fn coherent_player_readback(&self, player_id: &str) -> Result<Zone> {
+        let player_id = strip_lms_prefix(player_id);
+        let mut player = self
+            .rpc
+            .get_players()
+            .await?
+            .into_iter()
+            .find(|candidate| candidate.playerid == player_id)
+            .ok_or_else(|| anyhow!("LMS player '{}' is no longer available", player_id))?;
+        let status = self.rpc.get_player_status(player_id).await?;
+        player.state = status.state;
+        player.mode = status.mode;
+        player.power = status.power;
+        player.volume = status.volume;
+        player.muted = player.muted || status.muted;
+        player.playlist_tracks = status.playlist_tracks;
+        player.playlist_cur_index = status.playlist_cur_index;
+        player.time = status.time;
+        player.duration = status.duration;
+        player.title = status.title;
+        player.artist = status.artist;
+        player.album = status.album;
+        player.artwork_track_id = status.artwork_track_id;
+        player.coverid = status.coverid;
+        player.artwork_url = status.artwork_url;
+        let zone = lms_player_to_zone(&player);
+        self.state
+            .write()
+            .await
+            .players
+            .insert(player.playerid.clone(), player);
+        Ok(zone)
     }
 
     /// Get artwork URL for a track
@@ -1982,13 +2169,20 @@ async fn update_players_internal(
     rpc: &LmsRpc,
     state: &Arc<RwLock<LmsState>>,
     bus: &SharedBus,
+    runtime_bridge: Option<&LmsRuntimeBridge>,
 ) -> Result<()> {
     let players = rpc.get_players().await?;
+    let observed_ids: std::collections::HashSet<String> = players
+        .iter()
+        .map(|player| player.playerid.clone())
+        .collect();
 
     let previous_ids: std::collections::HashSet<String> =
         { state.read().await.players.keys().cloned().collect() };
 
-    // Collect updates to emit after releasing the lock
+    // Collect legacy deltas to emit after releasing the lock. In a reliable-runtime composition
+    // they are replaced with full zone snapshots below; the aggregator must not reconstruct LMS
+    // state from an independently lossy CLI/poll stream.
     let mut now_playing_updates: Vec<NowPlayingUpdate> = Vec::new();
     // State updates: (player_id, player_name, state)
     let mut state_updates: Vec<(String, String, String)> = Vec::new();
@@ -2057,7 +2251,7 @@ async fn update_players_internal(
             }
         };
 
-        if now_playing_changed {
+        if runtime_bridge.is_none() && now_playing_changed {
             // Emit even when metadata clears (all fields empty) so UI can update
             now_playing_updates.push(NowPlayingUpdate {
                 player_id: player.playerid.clone(),
@@ -2068,7 +2262,7 @@ async fn update_players_internal(
             });
         }
 
-        if state_changed {
+        if runtime_bridge.is_none() && state_changed {
             state_updates.push((
                 player.playerid.clone(),
                 player.name.clone(),
@@ -2076,7 +2270,7 @@ async fn update_players_internal(
             ));
         }
 
-        if volume_changed {
+        if runtime_bridge.is_none() && volume_changed {
             volume_updates.push((player.playerid.clone(), player.volume, player.muted));
         }
 
@@ -2084,7 +2278,33 @@ async fn update_players_internal(
         s.players.insert(player.playerid.clone(), player);
     }
 
-    // Emit NowPlayingChanged events for updated players (including metadata clearing)
+    // `players` is LMS's authoritative server inventory. Keep the last observation for a player
+    // whose follow-up status call failed, but retire ids the inventory itself no longer reports.
+    // Without this retain, `current_ids` was always a superset of `previous_ids`, making the
+    // ZoneRemoved path below unreachable and leaving disconnected players in the aggregator.
+    state
+        .write()
+        .await
+        .players
+        .retain(|player_id, _| observed_ids.contains(player_id));
+
+    if let Some(bridge) = runtime_bridge {
+        // Every HTTP read is a complete player observation. Publishing unchanged snapshots is the
+        // intentional reconciliation behaviour after a CLI disconnect or sequence gap.
+        let snapshots: Vec<Zone> = state
+            .read()
+            .await
+            .players
+            .values()
+            .map(lms_player_to_zone)
+            .collect();
+        for zone in snapshots {
+            bridge.publish_zone(zone, None).await?;
+        }
+    }
+
+    // Emit NowPlayingChanged events for updated players (including metadata clearing) only for
+    // legacy compositions without reliable projection ingress.
     for update in now_playing_updates {
         debug!(
             "Polling detected now_playing change for {}: {:?}",
@@ -2135,21 +2355,27 @@ async fn update_players_internal(
         let added: Vec<_> = current_ids.difference(&previous_ids).cloned().collect();
         let removed: Vec<_> = previous_ids.difference(&current_ids).cloned().collect();
 
-        // Emit zone discovered events for new players
-        for player_id in &added {
-            if let Some(player) = state.read().await.players.get(player_id) {
-                tracing::debug!("LMS player discovered: {}", player_id);
-                let zone = lms_player_to_zone(player);
-                bus.publish(BusEvent::ZoneDiscovered { zone });
+        if runtime_bridge.is_none() {
+            // Emit zone discovered events for new players
+            for player_id in &added {
+                if let Some(player) = state.read().await.players.get(player_id) {
+                    tracing::debug!("LMS player discovered: {}", player_id);
+                    let zone = lms_player_to_zone(player);
+                    bus.publish(BusEvent::ZoneDiscovered { zone });
+                }
             }
         }
 
-        // Emit zone removed events
+        // Removal is also a canonical projection under the reliable runtime. The aggregator emits
+        // its existing compatibility BusEvent only after the removal has committed.
         for player_id in &removed {
             tracing::debug!("LMS player removed: {}", player_id);
-            bus.publish(BusEvent::ZoneRemoved {
-                zone_id: PrefixedZoneId::lms(player_id),
-            });
+            let zone_id = PrefixedZoneId::lms(player_id);
+            if let Some(bridge) = runtime_bridge {
+                bridge.publish_removed(zone_id).await?;
+            } else {
+                bus.publish(BusEvent::ZoneRemoved { zone_id });
+            }
         }
     }
 
@@ -2170,6 +2396,7 @@ async fn run_polling_loop(
     bus: SharedBus,
     rpc: LmsRpc,
     shutdown: CancellationToken,
+    runtime_bridge: Option<Arc<LmsRuntimeBridge>>,
 ) -> Result<()> {
     // Start with fast polling; will switch to slow when subscription is active
     let mut current_interval = get_poll_interval();
@@ -2200,7 +2427,7 @@ async fn run_polling_loop(
                     poll_timer = interval(current_interval);
                 }
 
-                match update_players_internal(&rpc, &state, &bus).await {
+                match update_players_internal(&rpc, &state, &bus, runtime_bridge.as_deref()).await {
                     Ok(()) => {
                         // Reset failure counter on success
                         if consecutive_failures > 0 {
@@ -2239,9 +2466,10 @@ async fn run_cli_subscription_once(
     bus: &SharedBus,
     rpc: &LmsRpc,
     shutdown: &CancellationToken,
+    runtime_bridge: Option<&LmsRuntimeBridge>,
 ) -> Result<()> {
     info!("[CLI] Connecting to LMS CLI at {}:{}", host, CLI_PORT);
-    connect_and_subscribe(host, state, bus, rpc, shutdown).await
+    connect_and_subscribe(host, state, bus, rpc, shutdown, runtime_bridge).await
 }
 
 /// Connect to LMS CLI and process events
@@ -2251,6 +2479,7 @@ async fn connect_and_subscribe(
     bus: &SharedBus,
     rpc: &LmsRpc,
     shutdown: &CancellationToken,
+    runtime_bridge: Option<&LmsRuntimeBridge>,
 ) -> Result<()> {
     let addr = format!("{}:{}", host, CLI_PORT);
     let stream = TcpStream::connect(&addr).await?;
@@ -2295,7 +2524,7 @@ async fn connect_and_subscribe(
                         let trimmed = line.trim();
                         if !trimmed.is_empty() {
                             debug!("CLI event: {}", trimmed);
-                            handle_cli_event(trimmed, state, bus, rpc).await;
+                            handle_cli_event(trimmed, state, bus, rpc, runtime_bridge).await;
                         }
                     }
                     Ok(Err(e)) => {
@@ -2311,12 +2540,38 @@ async fn connect_and_subscribe(
     }
 }
 
+/// Project the cached complete LMS player through the shared observer bridge.
+///
+/// CLI messages are deltas, but the cache is hydrated by polling and the specific CLI readback
+/// before this helper is called.  Sending a reconstructed `Zone` from here means the aggregator
+/// never has to merge a playlist event from one source with a volume event from the other.
+async fn publish_cached_lms_zone(
+    state: &Arc<RwLock<LmsState>>,
+    bridge: &LmsRuntimeBridge,
+    player_id: &str,
+) -> Result<bool> {
+    let zone = state
+        .read()
+        .await
+        .players
+        .get(player_id)
+        .map(lms_player_to_zone);
+    match zone {
+        Some(zone) => {
+            bridge.publish_zone(zone, None).await?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 /// Handle a parsed CLI event
 async fn handle_cli_event(
     line: &str,
     state: &Arc<RwLock<LmsState>>,
     bus: &SharedBus,
     rpc: &LmsRpc,
+    runtime_bridge: Option<&LmsRuntimeBridge>,
 ) {
     let event = parse_cli_event(line);
 
@@ -2351,21 +2606,28 @@ async fn handle_cli_event(
                         }
                     };
 
-                    // Publish ZoneUpdated so aggregator updates state (SSE uses zone_id prefix to refresh LMS page)
-                    bus.publish(BusEvent::ZoneUpdated {
-                        zone_id: zone_id.clone(),
-                        display_name: player_name,
-                        state: status.state.clone(),
-                    });
-
-                    if !status.title.is_empty() {
-                        bus.publish(BusEvent::NowPlayingChanged {
-                            zone_id,
-                            title: Some(status.title),
-                            artist: Some(status.artist),
-                            album: Some(status.album),
-                            image_key: status.artwork_url.or(status.coverid),
+                    if let Some(bridge) = runtime_bridge {
+                        if let Err(error) = publish_cached_lms_zone(state, bridge, &player_id).await
+                        {
+                            warn!(%error, player = %player_id, "could not project LMS CLI playlist readback");
+                        }
+                    } else {
+                        // Legacy event-bus embedding: retain the exact prior delta contract.
+                        bus.publish(BusEvent::ZoneUpdated {
+                            zone_id: zone_id.clone(),
+                            display_name: player_name,
+                            state: status.state.clone(),
                         });
+
+                        if !status.title.is_empty() {
+                            bus.publish(BusEvent::NowPlayingChanged {
+                                zone_id,
+                                title: Some(status.title),
+                                artist: Some(status.artist),
+                                album: Some(status.album),
+                                image_key: status.artwork_url.or(status.coverid),
+                            });
+                        }
                     }
                 }
                 Err(e) => {
@@ -2431,12 +2693,17 @@ async fn handle_cli_event(
                     false
                 };
 
-                // Publish volume changed event with prefixed output_id
-                bus.publish(BusEvent::VolumeChanged {
-                    output_id: PrefixedZoneId::lms(&player_id).to_string(),
-                    value: absolute_volume,
-                    is_muted,
-                });
+                if let Some(bridge) = runtime_bridge {
+                    if let Err(error) = publish_cached_lms_zone(state, bridge, &player_id).await {
+                        warn!(%error, player = %player_id, "could not project LMS CLI volume readback");
+                    }
+                } else {
+                    bus.publish(BusEvent::VolumeChanged {
+                        output_id: PrefixedZoneId::lms(&player_id).to_string(),
+                        value: absolute_volume,
+                        is_muted,
+                    });
+                }
             } else if param == "muting" {
                 let is_muted = value != 0.0;
                 debug!("Mute change for {}: {}", player_id, is_muted);
@@ -2454,12 +2721,17 @@ async fn handle_cli_event(
                     }
                 };
 
-                // Publish volume changed event with mute state and prefixed output_id
-                bus.publish(BusEvent::VolumeChanged {
-                    output_id: PrefixedZoneId::lms(&player_id).to_string(),
-                    value: current_volume as f32,
-                    is_muted,
-                });
+                if let Some(bridge) = runtime_bridge {
+                    if let Err(error) = publish_cached_lms_zone(state, bridge, &player_id).await {
+                        warn!(%error, player = %player_id, "could not project LMS CLI mute readback");
+                    }
+                } else {
+                    bus.publish(BusEvent::VolumeChanged {
+                        output_id: PrefixedZoneId::lms(&player_id).to_string(),
+                        value: current_volume as f32,
+                        is_muted,
+                    });
+                }
             }
         }
         CliEvent::Power {
@@ -2479,13 +2751,14 @@ async fn handle_cli_event(
                 }
             };
 
-            // Publish state change
-            // When power turns on, we don't know the actual playback state yet
-            // When power turns off, playback is effectively stopped
-            if !power_state {
+            if let Some(bridge) = runtime_bridge {
+                if let Err(error) = publish_cached_lms_zone(state, bridge, &player_id).await {
+                    warn!(%error, player = %player_id, "could not project LMS CLI power readback");
+                }
+            // Legacy event-bus projection only learned a state change when power went off.
+            // Preserve that compatibility behaviour for non-runtime embeddings.
+            } else if !power_state {
                 let zone_id = PrefixedZoneId::lms(&player_id);
-                // Publish ZoneUpdated so aggregator updates state
-                // Publish ZoneUpdated so aggregator updates state (SSE uses zone_id prefix to refresh LMS page)
                 bus.publish(BusEvent::ZoneUpdated {
                     zone_id,
                     display_name: player_name,
@@ -2548,7 +2821,13 @@ async fn handle_cli_event(
                     s.players.insert(player_id.clone(), player.clone());
                     drop(s);
 
-                    if is_new {
+                    if let Some(bridge) = runtime_bridge {
+                        if let Err(error) =
+                            bridge.publish_zone(lms_player_to_zone(&player), None).await
+                        {
+                            warn!(%error, player = %player_id, "could not project LMS CLI client readback");
+                        }
+                    } else if is_new {
                         let zone = lms_player_to_zone(&player);
                         bus.publish(BusEvent::ZoneDiscovered { zone });
                     }
@@ -2558,6 +2837,13 @@ async fn handle_cli_event(
                     let mut s = state.write().await;
                     if let Some(player) = s.players.get_mut(&player_id) {
                         player.connected = false;
+                    }
+                    drop(s);
+                    if let Some(bridge) = runtime_bridge {
+                        if let Err(error) = publish_cached_lms_zone(state, bridge, &player_id).await
+                        {
+                            warn!(%error, player = %player_id, "could not project LMS CLI disconnect readback");
+                        }
                     }
                 }
                 _ => {}
@@ -2623,6 +2909,27 @@ impl AdapterLogic for LmsAdapter {
         ctx.bus
             .publish(BusEvent::LmsConnected { host: host.clone() });
 
+        // One provider endpoint owns all LMS player commands.  Unlike HQPlayer, LMS's server
+        // protocol serializes its own players adequately, so provider scope is intentional; the
+        // correlated readback still targets the exact player and commits one complete Zone.
+        let command_shutdown = ctx.shutdown.child_token();
+        let command_join = self.runtime_bridge.as_ref().and_then(|bridge| {
+            match bridge.commands().register_provider("lms", 32) {
+                Ok(endpoint) => {
+                    let adapter = self.clone();
+                    let bridge = bridge.clone();
+                    let shutdown = command_shutdown.clone();
+                    Some(tokio::spawn(async move {
+                        run_lms_command_endpoint(adapter, endpoint, shutdown, bridge).await;
+                    }))
+                }
+                Err(error) => {
+                    tracing::error!(?error, "LMS reliable endpoint registration failed");
+                    None
+                }
+            }
+        });
+
         // Run polling loop directly
         // CLI subscription is now handled by separate LmsCliAdapter (Issue #165)
         // Polling reads cli_subscription_active flag to adjust interval:
@@ -2633,8 +2940,15 @@ impl AdapterLogic for LmsAdapter {
             ctx.bus.clone(),
             self.rpc.clone(),
             ctx.shutdown.clone(),
+            self.runtime_bridge.clone(),
         )
         .await;
+        command_shutdown.cancel();
+        if let Some(join) = command_join {
+            if let Err(error) = join.await {
+                tracing::warn!(%error, "LMS reliable command endpoint failed to join");
+            }
+        }
 
         // Clean up state on exit
         {
@@ -2711,6 +3025,119 @@ impl AdapterLogic for LmsAdapter {
 // Startable trait implementation via macro
 crate::impl_startable!(LmsAdapter, "lms", is_configured);
 
+/// Consume the provider-scoped LMS reliable endpoint.
+///
+/// A successful JSON-RPC write is only native acceptance.  The endpoint then obtains a fresh
+/// `players` + `status` observation for the exact player and submits the complete Zone with the
+/// command id.  `ProjectionActor` (and therefore the aggregator) is the only code that can turn
+/// that observation into a confirmed command result.
+async fn run_lms_command_endpoint(
+    adapter: LmsAdapter,
+    mut endpoint: CommandEndpoint,
+    shutdown: CancellationToken,
+    bridge: Arc<LmsRuntimeBridge>,
+) {
+    loop {
+        let work = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            work = endpoint.recv() => work,
+        };
+        let Some(work) = work else { break };
+        let permit = match work.begin_dispatch() {
+            Ok(permit) => permit,
+            Err(_) => continue,
+        };
+        let command_id = permit.id();
+        let target = permit.request().target.to_string();
+        let player_id = strip_lms_prefix(&target).to_string();
+        let native = match permit.request().command.clone() {
+            RuntimeCommand::Control(command) => {
+                execute_lms_runtime_command(&adapter, &player_id, command).await
+            }
+            RuntimeCommand::Hqplayer(_) => {
+                Err(anyhow!("HQPlayer runtime command routed to LMS endpoint"))
+            }
+        };
+        if let Err(error) = native {
+            permit.complete_native(NativeResult::Failed(error.to_string()));
+            continue;
+        }
+
+        permit.complete_native(NativeResult::Accepted);
+        match adapter.coherent_player_readback(&player_id).await {
+            Ok(zone) => {
+                if let Err(error) = bridge.publish_zone(zone, Some(command_id)).await {
+                    tracing::warn!(%error, command_id = command_id.get(), "LMS native write accepted but readback projection could not commit");
+                }
+            }
+            Err(error) => {
+                // Native acceptance is retained as an explicit indeterminate operation until its
+                // deadline; the command may have applied even though LMS did not serve readback.
+                tracing::warn!(%error, command_id = command_id.get(), "LMS native write accepted but coherent player readback failed");
+            }
+        }
+    }
+}
+
+async fn execute_lms_runtime_command(
+    adapter: &LmsAdapter,
+    player_id: &str,
+    command: Command,
+) -> Result<()> {
+    match command {
+        Command::Play => {
+            adapter
+                .execute_control_native(player_id, "play", None)
+                .await
+        }
+        Command::Pause => {
+            adapter
+                .execute_control_native(player_id, "pause", None)
+                .await
+        }
+        Command::PlayPause => {
+            adapter
+                .execute_control_native(player_id, "play_pause", None)
+                .await
+        }
+        Command::Stop => {
+            adapter
+                .execute_control_native(player_id, "stop", None)
+                .await
+        }
+        Command::Next => {
+            adapter
+                .execute_control_native(player_id, "next", None)
+                .await
+        }
+        Command::Previous => {
+            adapter
+                .execute_control_native(player_id, "previous", None)
+                .await
+        }
+        Command::VolumeAbsolute { value, output_id } if output_id.is_none() => {
+            adapter
+                .execute_control_native(player_id, "vol_abs", Some(value.round() as i32))
+                .await
+        }
+        Command::VolumeRelative { delta, output_id } if output_id.is_none() => {
+            adapter
+                .execute_control_native(player_id, "vol_rel", Some(delta.round() as i32))
+                .await
+        }
+        Command::Mute { .. }
+        | Command::MuteToggle { .. }
+        | Command::Seek { .. }
+        | Command::SeekRelative { .. }
+        | Command::Shuffle { .. }
+        | Command::Repeat { .. }
+        | Command::VolumeAbsolute { .. }
+        | Command::VolumeRelative { .. } => Err(anyhow!(
+            "LMS command was not resolved to a supported native operation before dispatch"
+        )),
+    }
+}
+
 // =============================================================================
 // LMS CLI Adapter - Handles real-time event subscription (Issue #165)
 // =============================================================================
@@ -2731,22 +3158,34 @@ pub struct LmsCliAdapter {
     rpc: LmsRpc,
     /// Event bus for publishing updates
     bus: SharedBus,
+    /// Same reliable publication bridge as the poller. CLI events are translated into a complete
+    /// cached player snapshot before entering it; neither observer gets a private aggregator path.
+    runtime_bridge: Option<Arc<LmsRuntimeBridge>>,
     /// Shutdown token (separate from LmsAdapter's)
     shutdown: Arc<RwLock<CancellationToken>>,
     /// Guard against duplicate start() calls
     running: Arc<RwLock<bool>>,
+    /// CLI supervisor, joined on stop to fence in-flight CLI readbacks.
+    task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl LmsCliAdapter {
     /// Create CLI adapter with shared state from LmsAdapter
     /// Use `create_lms_adapters()` factory function instead of calling directly.
-    fn new(state: Arc<RwLock<LmsState>>, rpc: LmsRpc, bus: SharedBus) -> Self {
+    fn new(
+        state: Arc<RwLock<LmsState>>,
+        rpc: LmsRpc,
+        bus: SharedBus,
+        runtime_bridge: Option<Arc<LmsRuntimeBridge>>,
+    ) -> Self {
         Self {
             state,
             rpc,
             bus,
+            runtime_bridge,
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
             running: Arc::new(RwLock::new(false)),
+            task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2775,8 +3214,15 @@ impl AdapterLogic for LmsCliAdapter {
         info!("[CLI] LMS CLI adapter starting for {}", host);
 
         // Run CLI subscription - this will retry via AdapterHandle on failure
-        let result =
-            run_cli_subscription_once(&host, &self.state, &ctx.bus, &self.rpc, &ctx.shutdown).await;
+        let result = run_cli_subscription_once(
+            &host,
+            &self.state,
+            &ctx.bus,
+            &self.rpc,
+            &ctx.shutdown,
+            self.runtime_bridge.as_deref(),
+        )
+        .await;
 
         // Always reset flag on exit so polling switches to fast interval
         {
@@ -2834,17 +3280,24 @@ impl Startable for LmsCliAdapter {
         let running_flag = self.running.clone();
         let handle = AdapterHandle::new(adapter, bus, shutdown);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _ = handle.run_with_retry(RetryConfig::default()).await;
             // Reset running flag when task completes
             *running_flag.write().await = false;
         });
+        *self.task.lock().await = Some(task);
 
         Ok(())
     }
 
     async fn stop(&self) {
         self.shutdown.read().await.cancel();
+        let task = self.task.lock().await.take();
+        if let Some(task) = task {
+            if let Err(error) = task.await {
+                warn!(%error, "LMS CLI supervisor did not stop cleanly");
+            }
+        }
     }
 
     async fn can_start(&self) -> bool {
@@ -2857,10 +3310,29 @@ impl Startable for LmsCliAdapter {
 /// Returns (LmsAdapter, LmsCliAdapter) that share state and can be
 /// registered independently with the coordinator.
 pub fn create_lms_adapters(bus: SharedBus) -> (Arc<LmsAdapter>, Arc<LmsCliAdapter>) {
-    let lms = Arc::new(LmsAdapter::new(bus.clone()));
+    create_lms_adapters_with_runtime(bus, None)
+}
 
-    // Create CLI adapter with shared state
-    let cli = Arc::new(LmsCliAdapter::new(lms.state.clone(), lms.rpc.clone(), bus));
+/// Construct the two LMS observers with one shared reliable command/projection bridge.
+///
+/// Kept as a separate factory so old test/embedding call sites retain their legacy event-bus
+/// behaviour until composition explicitly installs the runtime.
+pub fn create_lms_adapters_with_runtime(
+    bus: SharedBus,
+    runtime_bridge: Option<Arc<LmsRuntimeBridge>>,
+) -> (Arc<LmsAdapter>, Arc<LmsCliAdapter>) {
+    let lms = Arc::new(LmsAdapter::new_with_runtime(
+        bus.clone(),
+        runtime_bridge.clone(),
+    ));
+
+    // Create CLI adapter with shared state and the same publication source.
+    let cli = Arc::new(LmsCliAdapter::new(
+        lms.state.clone(),
+        lms.rpc.clone(),
+        bus,
+        runtime_bridge,
+    ));
 
     (lms, cli)
 }

@@ -7,6 +7,10 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 pub mod events;
+// The reliable ingress runtime is deliberately separate from `EventBus`. `EventBus` feeds the
+// public SSE projection and is lossy under receiver lag; it must never become command or
+// canonical-projection ingress. See `runtime` for the bounded request/reply lanes.
+pub mod runtime;
 pub use events::*;
 
 /// Event bus handle for publishing and subscribing

@@ -1,0 +1,13 @@
+<!--
+  provenance:
+    source: UHC-SALVAGE-UI-DATA-INTEGRATION.md and UHC-SALVAGE-BETA-DEV.md (2026-07-29 comparative salvage reports), which cite https://github.com/ohshitgorillas/hqptuner/blob/67557939ae04b157b47cb67bd651b72c3140bcdd/docs/protocol.md (section 1 transport and framing, section 6 Status)
+    source_chain: read-via-report
+    daemon: hqplayerd 6.0.4 (Opal), engine 6.0.4
+    status: derived-shape
+    date: 2026-07-29
+    playback: unknown
+    notes: SOURCE CHAIN. The upstream file was NOT read directly for this fixture; the salvage report is the immediate source and the upstream ref is the report's own citation. Recorded because two errors in this amendment came from treating a report's citation as if it had been read: a path that does not exist at the ref given, and a superseded claim the report's own newer companion had already corrected. -- Status document for a playing engine with a track loaded. Two verified facts are encoded structurally. (1) Status carries an optional SELF-CLOSING <metadata .../> child when a track is loaded, so the document's end is </Status> and not the first '/>'; the reference notes that a parser must match the closing </Status> and not the metadata element's '/>'. (2) Documents are newline-TERMINATED but may contain internal newlines: the reference client splits its receive buffer on newlines and feeds each line to a streaming parser, treating a premature end-of-document as 'keep reading', which is only necessary because documents span lines. Attribute VALUES here are representative rather than captured; the document SHAPE and newline placement are what this fixture exists to assert. volume is a double in dB per section 6.
+-->
+<Status state="2" track="3" track_id="t-3" position="42" length="215" volume="-23.5" active_mode="PCM" active_filter="poly-sinc-lp" active_shaper="NS9" active_rate="352800" active_bits="24" active_channels="2" samplerate="44100" bitrate="1411" filter_junk="0" random="0" repeat="0">
+<metadata artist="Bill Evans" album="Sunday at the Village Vanguard" song="Gloria&apos;s Step" samplerate="44100" bits="24" channels="2" bitrate="1411"/>
+</Status>

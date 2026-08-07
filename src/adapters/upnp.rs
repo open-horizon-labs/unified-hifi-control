@@ -13,9 +13,14 @@ use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
 };
 use crate::bus::{
-    BusEvent, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl as BusVolumeControl, Zone,
+    runtime::{
+        CommandEndpoint, CommandGateway, NativeResult, ProjectionEntry, ProjectionIngress,
+        ProjectionKind, ProjectionPayload, ProjectionSource, ProjectionUpdate, RuntimeCommand,
+    },
+    BusEvent, Command, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl as BusVolumeControl,
+    Zone,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use quick_xml::de::from_str as xml_from_str;
@@ -25,7 +30,7 @@ use ssdp_client::{SearchTarget, URN};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
@@ -166,11 +171,116 @@ pub struct UPnPAdapter {
     http: Client,
     /// Wrapped in RwLock to allow creating fresh token on restart
     shutdown: Arc<RwLock<CancellationToken>>,
+    /// Composed-server-only reliable lanes. When present, adapter observations
+    /// never mutate visible state through the lossy notification broadcast.
+    runtime_bridge: Option<Arc<UPnPRuntimeBridge>>,
+}
+
+/// One ordered source for UPnP discovery, polling, removal, and command
+/// readbacks. The aggregator owns all canonical state; this owns admission only.
+#[derive(Clone)]
+pub struct UPnPRuntimeBridge {
+    ingress: ProjectionIngress,
+    commands: CommandGateway,
+    publication: Arc<Mutex<u64>>,
+    publication_gate: Arc<Semaphore>,
+}
+
+impl UPnPRuntimeBridge {
+    pub fn new(ingress: ProjectionIngress, commands: CommandGateway) -> Self {
+        Self {
+            ingress,
+            commands,
+            publication: Arc::new(Mutex::new(0)),
+            publication_gate: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    fn commands(&self) -> CommandGateway {
+        self.commands.clone()
+    }
+
+    async fn publish_zone(
+        &self,
+        zone: Zone,
+        caused_by: Option<crate::bus::runtime::CommandId>,
+    ) -> Result<()> {
+        let _permit = self
+            .publication_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("UPnP reliable publication lane closed"))?;
+        let sequence = {
+            let mut sequence = self.publication.lock().await;
+            *sequence = sequence.saturating_add(1);
+            *sequence
+        };
+        self.ingress
+            .submit(ProjectionUpdate {
+                source: ProjectionSource {
+                    adapter: "upnp".to_string(),
+                    instance: None,
+                    epoch: 0,
+                },
+                sequence,
+                kind: ProjectionKind::Snapshot,
+                caused_by,
+                entries: vec![ProjectionEntry {
+                    key: format!("zone:{}", zone.zone_id),
+                    payload: ProjectionPayload::Zone(Box::new(zone)),
+                }],
+            })
+            .await
+            .map_err(|_| anyhow!("UPnP reliable projection ingress stopped"))?;
+        Ok(())
+    }
+
+    async fn publish_removed(&self, zone_id: PrefixedZoneId) -> Result<()> {
+        let _permit = self
+            .publication_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("UPnP reliable publication lane closed"))?;
+        let sequence = {
+            let mut sequence = self.publication.lock().await;
+            *sequence = sequence.saturating_add(1);
+            *sequence
+        };
+        self.ingress
+            .submit(ProjectionUpdate {
+                source: ProjectionSource {
+                    adapter: "upnp".to_string(),
+                    instance: None,
+                    epoch: 0,
+                },
+                sequence,
+                kind: ProjectionKind::Snapshot,
+                caused_by: None,
+                entries: vec![ProjectionEntry {
+                    key: format!("zone:{zone_id}"),
+                    payload: ProjectionPayload::ZoneRemoved { zone_id },
+                }],
+            })
+            .await
+            .map_err(|_| anyhow!("UPnP reliable projection ingress stopped"))?;
+        Ok(())
+    }
 }
 
 impl UPnPAdapter {
     /// Create new UPnP adapter
     pub fn new(bus: SharedBus) -> Self {
+        Self::new_with_runtime(bus, None)
+    }
+
+    /// Compose with private reliable command/projection lanes while preserving
+    /// legacy standalone construction for existing embedders and fixtures.
+    pub fn new_with_runtime(
+        bus: SharedBus,
+        runtime_bridge: Option<Arc<UPnPRuntimeBridge>>,
+    ) -> Self {
         Self {
             state: Arc::new(RwLock::new(UPnPState {
                 renderers: HashMap::new(),
@@ -182,6 +292,7 @@ impl UPnPAdapter {
                 .build()
                 .unwrap_or_default(),
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
+            runtime_bridge,
         }
     }
 
@@ -222,6 +333,7 @@ impl UPnPAdapter {
         bus: SharedBus,
         http: Client,
         shutdown: CancellationToken,
+        runtime_bridge: Option<Arc<UPnPRuntimeBridge>>,
     ) {
         let mut search_interval = interval(SSDP_SEARCH_INTERVAL);
 
@@ -233,12 +345,12 @@ impl UPnPAdapter {
                 }
                 _ = search_interval.tick() => {
                     // Perform SSDP search
-                    if let Err(e) = Self::perform_search(&state, &bus, &http).await {
+                    if let Err(e) = Self::perform_search(&state, &bus, &http, runtime_bridge.clone()).await {
                         tracing::warn!("SSDP search failed: {}", e);
                     }
 
                     // Cleanup stale renderers
-                    Self::cleanup_stale(&state, &bus).await;
+                    Self::cleanup_stale(&state, &bus, runtime_bridge.clone()).await;
                 }
             }
         }
@@ -250,6 +362,7 @@ impl UPnPAdapter {
         state: &Arc<RwLock<UPnPState>>,
         bus: &SharedBus,
         http: &Client,
+        runtime_bridge: Option<Arc<UPnPRuntimeBridge>>,
     ) -> anyhow::Result<()> {
         let urn: URN = MEDIA_RENDERER_URN.parse()?;
         let search_target = SearchTarget::URN(urn);
@@ -310,6 +423,7 @@ impl UPnPAdapter {
             let state_clone = state.clone();
             let http_clone = http.clone();
             let bus_clone = bus.clone();
+            let bridge_clone = runtime_bridge.clone();
             let uuid_clone = uuid.clone();
 
             tokio::spawn(async move {
@@ -319,10 +433,21 @@ impl UPnPAdapter {
                     tracing::warn!("Failed to fetch device info for {}: {}", uuid_clone, e);
                 }
                 // Emit ZoneDiscovered with full zone info
-                let s = state_clone.read().await;
-                if let Some(renderer) = s.renderers.get(&uuid_clone) {
-                    let zone = upnp_renderer_to_zone(renderer);
-                    bus_clone.publish(BusEvent::ZoneDiscovered { zone });
+                let zone = {
+                    let renderers = state_clone.read().await;
+                    renderers
+                        .renderers
+                        .get(&uuid_clone)
+                        .map(upnp_renderer_to_zone)
+                };
+                if let Some(zone) = zone {
+                    if let Some(bridge) = bridge_clone {
+                        if let Err(error) = bridge.publish_zone(zone, None).await {
+                            tracing::warn!(%error, "UPnP discovery projection failed");
+                        }
+                    } else {
+                        bus_clone.publish(BusEvent::ZoneDiscovered { zone });
+                    }
                 }
             });
         }
@@ -409,23 +534,37 @@ impl UPnPAdapter {
         Ok(())
     }
 
-    async fn cleanup_stale(state: &Arc<RwLock<UPnPState>>, bus: &SharedBus) {
-        let mut s = state.write().await;
-        let now = std::time::Instant::now();
-
-        let stale: Vec<String> = s
-            .renderers
-            .iter()
-            .filter(|(_, r)| now.duration_since(r.last_seen) > STALE_THRESHOLD)
-            .map(|(uuid, _)| uuid.clone())
-            .collect();
-
-        for uuid in stale {
-            tracing::info!("Removing stale UPnP renderer: {}", uuid);
-            s.renderers.remove(&uuid);
-            bus.publish(BusEvent::ZoneRemoved {
-                zone_id: PrefixedZoneId::upnp(&uuid),
-            });
+    async fn cleanup_stale(
+        state: &Arc<RwLock<UPnPState>>,
+        bus: &SharedBus,
+        runtime_bridge: Option<Arc<UPnPRuntimeBridge>>,
+    ) {
+        let removed: Vec<PrefixedZoneId> = {
+            let mut renderers = state.write().await;
+            let now = std::time::Instant::now();
+            let stale: Vec<String> = renderers
+                .renderers
+                .iter()
+                .filter(|(_, r)| now.duration_since(r.last_seen) > STALE_THRESHOLD)
+                .map(|(uuid, _)| uuid.clone())
+                .collect();
+            stale
+                .into_iter()
+                .map(|uuid| {
+                    tracing::info!("Removing stale UPnP renderer: {}", uuid);
+                    renderers.renderers.remove(&uuid);
+                    PrefixedZoneId::upnp(uuid)
+                })
+                .collect()
+        };
+        for zone_id in removed {
+            if let Some(bridge) = runtime_bridge.as_ref() {
+                if let Err(error) = bridge.publish_removed(zone_id).await {
+                    tracing::warn!(%error, "UPnP stale-removal projection failed");
+                }
+            } else {
+                bus.publish(BusEvent::ZoneRemoved { zone_id });
+            }
         }
     }
 
@@ -434,6 +573,7 @@ impl UPnPAdapter {
         bus: SharedBus,
         http: Client,
         shutdown: CancellationToken,
+        runtime_bridge: Option<Arc<UPnPRuntimeBridge>>,
     ) {
         let mut poll_interval = interval(POLL_INTERVAL);
 
@@ -467,6 +607,7 @@ impl UPnPAdapter {
                             &uuid,
                             av_url.as_deref(),
                             rc_url.as_deref(),
+                            runtime_bridge.clone(),
                         )
                         .await
                         {
@@ -487,6 +628,7 @@ impl UPnPAdapter {
         uuid: &str,
         av_url: Option<&str>,
         rc_url: Option<&str>,
+        runtime_bridge: Option<Arc<UPnPRuntimeBridge>>,
     ) -> anyhow::Result<()> {
         // Poll transport state
         if let Some(url) = av_url {
@@ -515,11 +657,13 @@ impl UPnPAdapter {
                     if let Some(renderer) = s.renderers.get_mut(uuid) {
                         if renderer.state != new_state {
                             renderer.state = new_state.clone();
-                            bus.publish(BusEvent::ZoneUpdated {
-                                zone_id: PrefixedZoneId::upnp(uuid),
-                                display_name: renderer.name.clone(),
-                                state: new_state,
-                            });
+                            if runtime_bridge.is_none() {
+                                bus.publish(BusEvent::ZoneUpdated {
+                                    zone_id: PrefixedZoneId::upnp(uuid),
+                                    display_name: renderer.name.clone(),
+                                    state: new_state,
+                                });
+                            }
                         }
                     }
                 }
@@ -568,19 +712,22 @@ impl UPnPAdapter {
                                     );
                                     let image_key = track.album_art_uri.clone();
                                     renderer.track_info = Some(track);
-                                    bus.publish(BusEvent::NowPlayingChanged {
-                                        zone_id: PrefixedZoneId::upnp(uuid),
-                                        title,
-                                        artist,
-                                        album,
-                                        image_key,
-                                    });
+                                    if runtime_bridge.is_none() {
+                                        bus.publish(BusEvent::NowPlayingChanged {
+                                            zone_id: PrefixedZoneId::upnp(uuid),
+                                            title,
+                                            artist,
+                                            album,
+                                            image_key,
+                                        });
+                                    }
                                 }
                             }
                             // A renderer that reports no metadata (commonly when
                             // stopped) clears rather than retaining a stale track.
                             None => {
-                                if renderer.track_info.take().is_some() {
+                                if renderer.track_info.take().is_some() && runtime_bridge.is_none()
+                                {
                                     bus.publish(BusEvent::NowPlayingChanged {
                                         zone_id: PrefixedZoneId::upnp(uuid),
                                         title: None,
@@ -638,6 +785,18 @@ impl UPnPAdapter {
             }
         }
 
+        if let Some(bridge) = runtime_bridge {
+            let zone = {
+                let renderers = state.read().await;
+                renderers
+                    .renderers
+                    .get(uuid)
+                    .map(upnp_renderer_to_zone)
+                    .ok_or_else(|| anyhow!("Renderer not found: {}", uuid))?
+            };
+            bridge.publish_zone(zone, None).await?;
+        }
+
         Ok(())
     }
 
@@ -677,7 +836,11 @@ impl UPnPAdapter {
             .header("SOAPAction", format!("\"{}#{}\"", service_type, action))
             .body(soap_body)
             .send()
-            .await?;
+            .await?
+            // A SOAP fault is usually an HTTP error. Treating its body as a
+            // successful read is how a failed renderer command could otherwise
+            // be confirmed from stale local state.
+            .error_for_status()?;
 
         Ok(response.text().await?)
     }
@@ -806,6 +969,7 @@ impl UPnPAdapter {
             uuid,
             Some(av_url),
             Some(rc_url),
+            self.runtime_bridge.clone(),
         )
         .await
     }
@@ -838,6 +1002,219 @@ impl UPnPAdapter {
         })
     }
 
+    /// Read every renderer fact represented in a Zone after a native write.
+    /// Unlike the periodic poller, a command confirmation requires each SOAP
+    /// read to succeed: accepted bytes plus a stale cache is never success.
+    async fn coherent_zone_readback(&self, uuid: &str) -> Result<Zone> {
+        let uuid = strip_upnp_prefix(uuid);
+        let (av_url, rc_url) = {
+            let state = self.state.read().await;
+            let renderer = state
+                .renderers
+                .get(uuid)
+                .ok_or_else(|| anyhow!("Renderer not found: {}", uuid))?;
+            (
+                renderer
+                    .av_transport_url
+                    .clone()
+                    .ok_or_else(|| anyhow!("No AVTransport URL"))?,
+                renderer
+                    .rendering_control_url
+                    .clone()
+                    .ok_or_else(|| anyhow!("No RenderingControl URL"))?,
+            )
+        };
+        let transport = Self::soap_call(
+            &self.http,
+            &av_url,
+            AV_TRANSPORT_URN,
+            "GetTransportInfo",
+            "<InstanceID>0</InstanceID>",
+        )
+        .await?;
+        let state =
+            didl::extract_xml_value(&transport, "CurrentTransportState").ok_or_else(|| {
+                anyhow!("UPnP GetTransportInfo response had no CurrentTransportState")
+            })?;
+        let state = match state.as_str() {
+            "PLAYING" => "playing",
+            "PAUSED_PLAYBACK" => "paused",
+            "STOPPED" => "stopped",
+            "TRANSITIONING" => "loading",
+            _ => "stopped",
+        }
+        .to_string();
+        let position = Self::soap_call(
+            &self.http,
+            &av_url,
+            AV_TRANSPORT_URN,
+            "GetPositionInfo",
+            "<InstanceID>0</InstanceID>",
+        )
+        .await?;
+        let track_uri =
+            didl::extract_xml_value(&position, "TrackURI").filter(|uri| !uri.is_empty());
+        let metadata =
+            didl::extract_xml_value(&position, "TrackMetaData").filter(|meta| !meta.is_empty());
+        let track_info = metadata
+            .as_deref()
+            .map(didl::html_decode)
+            .and_then(|decoded| didl::parse_didl_lite(&decoded));
+        let volume = Self::soap_call(
+            &self.http,
+            &rc_url,
+            RENDERING_CONTROL_URN,
+            "GetVolume",
+            "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+        )
+        .await?;
+        let volume = didl::extract_xml_value(&volume, "CurrentVolume")
+            .ok_or_else(|| anyhow!("UPnP GetVolume response had no CurrentVolume"))?
+            .parse::<i32>()?;
+        let mute = Self::soap_call(
+            &self.http,
+            &rc_url,
+            RENDERING_CONTROL_URN,
+            "GetMute",
+            "<InstanceID>0</InstanceID><Channel>Master</Channel>",
+        )
+        .await?;
+        let muted = didl::extract_xml_value(&mute, "CurrentMute")
+            .ok_or_else(|| anyhow!("UPnP GetMute response had no CurrentMute"))?;
+        let muted = muted == "1" || muted.eq_ignore_ascii_case("true");
+
+        let mut renderers = self.state.write().await;
+        let renderer = renderers
+            .renderers
+            .get_mut(uuid)
+            .ok_or_else(|| anyhow!("Renderer not found: {}", uuid))?;
+        renderer.state = state;
+        renderer.volume = Some(volume);
+        renderer.muted = muted;
+        renderer.last_track_uri = track_uri;
+        renderer.last_track_metadata = metadata;
+        renderer.track_info = track_info;
+        Ok(upnp_renderer_to_zone(renderer))
+    }
+
+    /// Issue only the native SOAP write. Cache changes are reserved for an
+    /// authoritative observation, either periodic polling or a required command
+    /// readback in the runtime endpoint.
+    async fn execute_control_native(
+        &self,
+        uuid: &str,
+        action: &str,
+        value: Option<i32>,
+    ) -> Result<()> {
+        let uuid = strip_upnp_prefix(uuid);
+        let (av_url, rc_url, current_volume, is_playing) = {
+            let state = self.state.read().await;
+            let renderer = state
+                .renderers
+                .get(uuid)
+                .ok_or_else(|| anyhow!("Renderer not found: {}", uuid))?;
+            (
+                renderer.av_transport_url.clone(),
+                renderer.rendering_control_url.clone(),
+                renderer.volume,
+                renderer.state == "playing",
+            )
+        };
+        match action {
+            "play" => {
+                Self::soap_call(
+                    &self.http,
+                    av_url
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("No AVTransport URL"))?,
+                    AV_TRANSPORT_URN,
+                    "Play",
+                    "<InstanceID>0</InstanceID><Speed>1</Speed>",
+                )
+                .await?;
+            }
+            "pause" => {
+                Self::soap_call(
+                    &self.http,
+                    av_url
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("No AVTransport URL"))?,
+                    AV_TRANSPORT_URN,
+                    "Pause",
+                    "<InstanceID>0</InstanceID>",
+                )
+                .await?;
+            }
+            "play_pause" => {
+                let (action, body) = if is_playing {
+                    ("Pause", "<InstanceID>0</InstanceID>")
+                } else {
+                    ("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+                };
+                Self::soap_call(
+                    &self.http,
+                    av_url
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("No AVTransport URL"))?,
+                    AV_TRANSPORT_URN,
+                    action,
+                    body,
+                )
+                .await?;
+            }
+            "stop" => {
+                Self::soap_call(
+                    &self.http,
+                    av_url
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("No AVTransport URL"))?,
+                    AV_TRANSPORT_URN,
+                    "Stop",
+                    "<InstanceID>0</InstanceID>",
+                )
+                .await?;
+            }
+            refused if REFUSED_TRANSPORT_ACTIONS.contains(&refused) => {
+                anyhow::bail!("{}", refused_transport_action_message(refused));
+            }
+            "vol_abs" | "volume" | "vol_rel" => {
+                let desired = match action {
+                    "vol_rel" => {
+                        // The last observer snapshot is the only local input;
+                        // the readback below remains the confirmation authority.
+                        (current_volume.unwrap_or(50) + value.unwrap_or(0)).clamp(0, 100)
+                    }
+                    _ => value.unwrap_or(50).clamp(0, 100),
+                };
+                Self::soap_call(
+                    &self.http,
+                    rc_url
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("No RenderingControl URL"))?,
+                    RENDERING_CONTROL_URN,
+                    "SetVolume",
+                    &format!("<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{desired}</DesiredVolume>"),
+                )
+                .await?;
+            }
+            "mute" => {
+                let mute = value.map(|v| v != 0).unwrap_or(true);
+                Self::soap_call(
+                    &self.http,
+                    rc_url
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("No RenderingControl URL"))?,
+                    RENDERING_CONTROL_URN,
+                    "SetMute",
+                    &format!("<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>{}</DesiredMute>", if mute { "1" } else { "0" }),
+                )
+                .await?;
+            }
+            _ => anyhow::bail!("Unknown action: {}", action),
+        }
+        Ok(())
+    }
+
     /// Send control command to a renderer
     pub async fn control(
         &self,
@@ -857,159 +1234,14 @@ impl UPnPAdapter {
                 renderer.rendering_control_url.clone(),
             )
         };
-
-        match action {
-            "play" => {
-                let url = av_url
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No AVTransport URL"))?;
-                Self::soap_call(
-                    &self.http,
-                    url,
-                    AV_TRANSPORT_URN,
-                    "Play",
-                    "<InstanceID>0</InstanceID><Speed>1</Speed>",
-                )
-                .await?;
-            }
-            "pause" => {
-                let url = av_url
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No AVTransport URL"))?;
-                Self::soap_call(
-                    &self.http,
-                    url,
-                    AV_TRANSPORT_URN,
-                    "Pause",
-                    "<InstanceID>0</InstanceID>",
-                )
-                .await?;
-            }
-            "play_pause" => {
-                let url = av_url
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No AVTransport URL"))?;
-                let is_playing = {
-                    let state = self.state.read().await;
-                    state
-                        .renderers
-                        .get(uuid)
-                        .map(|r| r.state == "playing")
-                        .unwrap_or(false)
-                };
-
-                if is_playing {
-                    Self::soap_call(
-                        &self.http,
-                        url,
-                        AV_TRANSPORT_URN,
-                        "Pause",
-                        "<InstanceID>0</InstanceID>",
-                    )
-                    .await?;
-                } else {
-                    Self::soap_call(
-                        &self.http,
-                        url,
-                        AV_TRANSPORT_URN,
-                        "Play",
-                        "<InstanceID>0</InstanceID><Speed>1</Speed>",
-                    )
-                    .await?;
-                }
-            }
-            "stop" => {
-                let url = av_url
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No AVTransport URL"))?;
-                Self::soap_call(
-                    &self.http,
-                    url,
-                    AV_TRANSPORT_URN,
-                    "Stop",
-                    "<InstanceID>0</InstanceID>",
-                )
-                .await?;
-            }
-            // Driven by REFUSED_TRANSPORT_ACTIONS so the capability report and
-            // this refusal cannot disagree. Same strings as before.
-            refused if REFUSED_TRANSPORT_ACTIONS.contains(&refused) => {
-                anyhow::bail!("{}", refused_transport_action_message(refused));
-            }
-            "vol_abs" | "volume" => {
-                let url = rc_url
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No RenderingControl URL"))?;
-                let vol = value.unwrap_or(50).clamp(0, 100);
-                Self::soap_call(
-                    &self.http,
-                    url,
-                    RENDERING_CONTROL_URN,
-                    "SetVolume",
-                    &format!("<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{}</DesiredVolume>", vol),
-                ).await?;
-
-                let mut state = self.state.write().await;
-                if let Some(renderer) = state.renderers.get_mut(uuid) {
-                    renderer.volume = Some(vol);
-                }
-            }
-            "vol_rel" => {
-                let url = rc_url
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No RenderingControl URL"))?;
-                let delta = value.unwrap_or(0);
-                let current = {
-                    let state = self.state.read().await;
-                    state
-                        .renderers
-                        .get(uuid)
-                        .and_then(|r| r.volume)
-                        .unwrap_or(50)
-                };
-                let new_vol = (current + delta).clamp(0, 100);
-
-                Self::soap_call(
-                    &self.http,
-                    url,
-                    RENDERING_CONTROL_URN,
-                    "SetVolume",
-                    &format!("<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredVolume>{}</DesiredVolume>", new_vol),
-                ).await?;
-
-                let mut state = self.state.write().await;
-                if let Some(renderer) = state.renderers.get_mut(uuid) {
-                    renderer.volume = Some(new_vol);
-                }
-            }
-            "mute" => {
-                let url = rc_url
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("No RenderingControl URL"))?;
-                let mute = value.map(|v| v != 0).unwrap_or(true);
-                Self::soap_call(
-                    &self.http,
-                    url,
-                    RENDERING_CONTROL_URN,
-                    "SetMute",
-                    &format!("<InstanceID>0</InstanceID><Channel>Master</Channel><DesiredMute>{}</DesiredMute>", if mute { "1" } else { "0" }),
-                ).await?;
-
-                let mut state = self.state.write().await;
-                if let Some(renderer) = state.renderers.get_mut(uuid) {
-                    renderer.muted = mute;
-                }
-            }
-            _ => {
-                anyhow::bail!("Unknown action: {}", action);
-            }
-        }
+        self.execute_control_native(uuid, action, value).await?;
 
         // Trigger immediate poll
         let state = self.state.clone();
         let bus = self.bus.clone();
         let http = self.http.clone();
         let uuid = uuid.to_string();
+        let runtime_bridge = self.runtime_bridge.clone();
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1020,6 +1252,7 @@ impl UPnPAdapter {
                 &uuid,
                 av_url.as_deref(),
                 rc_url.as_deref(),
+                runtime_bridge,
             )
             .await;
         });
@@ -1085,6 +1318,26 @@ impl AdapterLogic for UPnPAdapter {
             state.running = true;
         }
 
+        // One provider endpoint serializes native writes. A SOAP acknowledgement
+        // is only acceptance; the matching coherent Zone projection confirms it.
+        let command_shutdown = ctx.shutdown.child_token();
+        let command_join = self.runtime_bridge.as_ref().and_then(|bridge| {
+            match bridge.commands().register_provider("upnp", 32) {
+                Ok(endpoint) => {
+                    let adapter = self.clone();
+                    let bridge = bridge.clone();
+                    let shutdown = command_shutdown.clone();
+                    Some(tokio::spawn(async move {
+                        run_upnp_command_endpoint(adapter, endpoint, shutdown, bridge).await;
+                    }))
+                }
+                Err(error) => {
+                    tracing::error!(?error, "UPnP reliable endpoint registration failed");
+                    None
+                }
+            }
+        });
+
         // Run discovery and poll loops concurrently with shutdown check
         let state = self.state.clone();
         let bus = ctx.bus.clone();
@@ -1095,11 +1348,13 @@ impl AdapterLogic for UPnPAdapter {
         let discovery_bus = bus.clone();
         let discovery_http = http.clone();
         let discovery_shutdown = shutdown.clone();
+        let discovery_bridge = self.runtime_bridge.clone();
 
         let poll_state = state.clone();
         let poll_bus = bus.clone();
         let poll_http = http.clone();
         let poll_shutdown = shutdown.clone();
+        let poll_bridge = self.runtime_bridge.clone();
 
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -1107,10 +1362,17 @@ impl AdapterLogic for UPnPAdapter {
             }
             _ = async {
                 tokio::join!(
-                    Self::discovery_loop(discovery_state, discovery_bus, discovery_http, discovery_shutdown),
-                    Self::poll_loop(poll_state, poll_bus, poll_http, poll_shutdown)
+                    Self::discovery_loop(discovery_state, discovery_bus, discovery_http, discovery_shutdown, discovery_bridge),
+                    Self::poll_loop(poll_state, poll_bus, poll_http, poll_shutdown, poll_bridge)
                 );
             } => {}
+        }
+
+        command_shutdown.cancel();
+        if let Some(join) = command_join {
+            if let Err(error) = join.await {
+                tracing::warn!(%error, "UPnP reliable command endpoint failed to join");
+            }
         }
 
         // Cleanup state on exit
@@ -1181,3 +1443,166 @@ impl AdapterLogic for UPnPAdapter {
 
 // Startable trait implementation via macro
 crate::impl_startable!(UPnPAdapter, "upnp");
+
+/// Native acknowledgement crosses exactly one confirmation edge: the complete
+/// SOAP readback committed by [`UPnPRuntimeBridge`].
+async fn run_upnp_command_endpoint(
+    adapter: UPnPAdapter,
+    mut endpoint: CommandEndpoint,
+    shutdown: CancellationToken,
+    bridge: Arc<UPnPRuntimeBridge>,
+) {
+    loop {
+        let work = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            work = endpoint.recv() => work,
+        };
+        let Some(work) = work else { break };
+        let permit = match work.begin_dispatch() {
+            Ok(permit) => permit,
+            Err(_) => continue,
+        };
+        let command_id = permit.id();
+        let target = permit.request().target.to_string();
+        let uuid = strip_upnp_prefix(&target).to_string();
+        let native = match permit.request().command.clone() {
+            RuntimeCommand::Control(command) => {
+                execute_upnp_runtime_command(&adapter, &uuid, command).await
+            }
+            RuntimeCommand::Hqplayer(_) => {
+                Err(anyhow!("HQPlayer runtime command routed to UPnP endpoint"))
+            }
+        };
+        if let Err(error) = native {
+            permit.complete_native(NativeResult::Failed(error.to_string()));
+            continue;
+        }
+        permit.complete_native(NativeResult::Accepted);
+        match adapter.coherent_zone_readback(&uuid).await {
+            Ok(zone) => {
+                if let Err(error) = bridge.publish_zone(zone, Some(command_id)).await {
+                    tracing::warn!(%error, command_id = command_id.get(), "UPnP native write accepted but readback projection could not commit");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, command_id = command_id.get(), "UPnP native write accepted but coherent readback failed");
+            }
+        }
+    }
+}
+
+async fn execute_upnp_runtime_command(
+    adapter: &UPnPAdapter,
+    uuid: &str,
+    command: Command,
+) -> Result<()> {
+    match command {
+        Command::Play => adapter.execute_control_native(uuid, "play", None).await,
+        Command::Pause => adapter.execute_control_native(uuid, "pause", None).await,
+        Command::PlayPause => {
+            adapter
+                .execute_control_native(uuid, "play_pause", None)
+                .await
+        }
+        Command::Stop => adapter.execute_control_native(uuid, "stop", None).await,
+        Command::Next => adapter.execute_control_native(uuid, "next", None).await,
+        Command::Previous => adapter.execute_control_native(uuid, "previous", None).await,
+        Command::VolumeAbsolute { value, output_id } if output_id.is_none() => {
+            adapter
+                .execute_control_native(uuid, "vol_abs", Some(value.round() as i32))
+                .await
+        }
+        Command::VolumeRelative { delta, output_id } if output_id.is_none() => {
+            adapter
+                .execute_control_native(uuid, "vol_rel", Some(delta.round() as i32))
+                .await
+        }
+        Command::Mute { muted, output_id } if output_id.is_none() => {
+            adapter
+                .execute_control_native(uuid, "mute", Some(if muted { 1 } else { 0 }))
+                .await
+        }
+        Command::MuteToggle { .. }
+        | Command::Mute { .. }
+        | Command::Seek { .. }
+        | Command::SeekRelative { .. }
+        | Command::Shuffle { .. }
+        | Command::Repeat { .. }
+        | Command::VolumeAbsolute { .. }
+        | Command::VolumeRelative { .. } => Err(anyhow!(
+            "UPnP command was not resolved to a supported native operation before dispatch"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aggregator::ZoneAggregator;
+    use crate::bus::runtime::build_runtime;
+
+    fn zone() -> Zone {
+        Zone {
+            zone_id: "upnp:living-room".to_string(),
+            zone_name: "Living room".to_string(),
+            state: PlaybackState::Playing,
+            volume_control: Some(BusVolumeControl {
+                value: 42.0,
+                min: 0.0,
+                max: 100.0,
+                step: 1.0,
+                is_muted: false,
+                scale: crate::bus::VolumeScale::Percentage,
+                output_id: Some(PrefixedZoneId::upnp("living-room").to_string()),
+            }),
+            now_playing: None,
+            source: "upnp".to_string(),
+            is_controllable: true,
+            is_seekable: false,
+            last_updated: 0,
+            is_play_allowed: false,
+            is_pause_allowed: true,
+            is_next_allowed: false,
+            is_previous_allowed: false,
+        }
+    }
+
+    /// TDD guard for the migration: a composed UPnP observer cannot make a
+    /// notification visible before its complete Zone is canonical.
+    #[tokio::test]
+    async fn reliable_upnp_observations_commit_before_compatibility_notification() {
+        let bus = crate::bus::create_bus();
+        let mut notifications = bus.subscribe();
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let runtime = build_runtime(aggregator.clone(), 2, 4);
+        let bridge =
+            UPnPRuntimeBridge::new(runtime.projection_ingress.clone(), runtime.commands.clone());
+        let actor = tokio::spawn(runtime.projection_actor.run());
+
+        bridge.publish_zone(zone(), None).await.expect("projection");
+        assert_eq!(
+            aggregator
+                .get_zone("upnp:living-room")
+                .await
+                .expect("canonical zone")
+                .volume_control
+                .expect("volume")
+                .value,
+            42.0
+        );
+        match notifications
+            .recv()
+            .await
+            .expect("post-commit notification")
+        {
+            BusEvent::ZoneUpdated { zone_id, .. } => {
+                assert_eq!(zone_id.as_str(), "upnp:living-room")
+            }
+            BusEvent::ZoneDiscovered { zone } => assert_eq!(zone.zone_id, "upnp:living-room"),
+            event => panic!("expected post-commit UPnP notification, got {event:?}"),
+        }
+
+        drop(bridge);
+        actor.abort();
+    }
+}

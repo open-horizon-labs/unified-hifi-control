@@ -4,7 +4,7 @@
 //! OpenHome is an extension of UPnP that provides richer metadata and more
 //! control actions (next/previous track, playlists, etc.)
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use quick_xml::de::from_str as xml_from_str;
@@ -14,7 +14,7 @@ use ssdp_client::{SearchTarget, URN};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
@@ -24,7 +24,12 @@ use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
 };
 use crate::bus::{
-    BusEvent, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl as BusVolumeControl, Zone,
+    runtime::{
+        CommandEndpoint, CommandGateway, NativeResult, ProjectionEntry, ProjectionIngress,
+        ProjectionKind, ProjectionPayload, ProjectionSource, ProjectionUpdate, RuntimeCommand,
+    },
+    BusEvent, Command, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl as BusVolumeControl,
+    Zone,
 };
 
 /// OpenHome URNs to search for - devices may advertise different services
@@ -140,11 +145,120 @@ pub struct OpenHomeAdapter {
     http: Client,
     /// Wrapped in RwLock to allow creating fresh token on restart
     shutdown: Arc<RwLock<CancellationToken>>,
+    /// Present only in the composed server.  It makes command readbacks enter the
+    /// aggregator through one serial, lossless source instead of mutating visible
+    /// state through the broadcast notification bus.
+    runtime_bridge: Option<Arc<OpenHomeRuntimeBridge>>,
+}
+
+/// One ordered projection source for OpenHome's polling and command readbacks.
+///
+/// OpenHome has one discovery/poll observer, but retaining the same admission
+/// discipline as LMS means a command's readback cannot be reordered behind a
+/// concurrent poll snapshot.  The aggregator, not this bridge, owns the data.
+#[derive(Clone)]
+pub struct OpenHomeRuntimeBridge {
+    ingress: ProjectionIngress,
+    commands: CommandGateway,
+    publication: Arc<Mutex<u64>>,
+    publication_gate: Arc<Semaphore>,
+}
+
+impl OpenHomeRuntimeBridge {
+    pub fn new(ingress: ProjectionIngress, commands: CommandGateway) -> Self {
+        Self {
+            ingress,
+            commands,
+            publication: Arc::new(Mutex::new(0)),
+            publication_gate: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    fn commands(&self) -> CommandGateway {
+        self.commands.clone()
+    }
+
+    async fn publish_zone(
+        &self,
+        zone: Zone,
+        caused_by: Option<crate::bus::runtime::CommandId>,
+    ) -> Result<()> {
+        let _permit = self
+            .publication_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("OpenHome reliable publication lane closed"))?;
+        let sequence = {
+            let mut sequence = self.publication.lock().await;
+            *sequence = sequence.saturating_add(1);
+            *sequence
+        };
+        self.ingress
+            .submit(ProjectionUpdate {
+                source: ProjectionSource {
+                    adapter: "openhome".to_string(),
+                    instance: None,
+                    epoch: 0,
+                },
+                sequence,
+                kind: ProjectionKind::Snapshot,
+                caused_by,
+                entries: vec![ProjectionEntry {
+                    key: format!("zone:{}", zone.zone_id),
+                    payload: ProjectionPayload::Zone(Box::new(zone)),
+                }],
+            })
+            .await
+            .map_err(|_| anyhow!("OpenHome reliable projection ingress stopped"))?;
+        Ok(())
+    }
+
+    async fn publish_removed(&self, zone_id: PrefixedZoneId) -> Result<()> {
+        let _permit = self
+            .publication_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("OpenHome reliable publication lane closed"))?;
+        let sequence = {
+            let mut sequence = self.publication.lock().await;
+            *sequence = sequence.saturating_add(1);
+            *sequence
+        };
+        self.ingress
+            .submit(ProjectionUpdate {
+                source: ProjectionSource {
+                    adapter: "openhome".to_string(),
+                    instance: None,
+                    epoch: 0,
+                },
+                sequence,
+                kind: ProjectionKind::Snapshot,
+                caused_by: None,
+                entries: vec![ProjectionEntry {
+                    key: format!("zone:{zone_id}"),
+                    payload: ProjectionPayload::ZoneRemoved { zone_id },
+                }],
+            })
+            .await
+            .map_err(|_| anyhow!("OpenHome reliable projection ingress stopped"))?;
+        Ok(())
+    }
 }
 
 impl OpenHomeAdapter {
     /// Create new OpenHome adapter
     pub fn new(bus: SharedBus) -> Self {
+        Self::new_with_runtime(bus, None)
+    }
+
+    /// Compose this adapter with the private reliable command/projection lanes.
+    /// The public HTTP, knob and MCP shapes remain unchanged.
+    pub fn new_with_runtime(
+        bus: SharedBus,
+        runtime_bridge: Option<Arc<OpenHomeRuntimeBridge>>,
+    ) -> Self {
         Self {
             state: Arc::new(RwLock::new(OpenHomeState {
                 devices: HashMap::new(),
@@ -156,6 +270,7 @@ impl OpenHomeAdapter {
                 .build()
                 .unwrap_or_default(),
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
+            runtime_bridge,
         }
     }
 
@@ -194,6 +309,7 @@ impl OpenHomeAdapter {
         bus: SharedBus,
         http: Client,
         shutdown: CancellationToken,
+        runtime_bridge: Option<Arc<OpenHomeRuntimeBridge>>,
     ) {
         let mut search_interval = interval(SSDP_SEARCH_INTERVAL);
 
@@ -205,12 +321,12 @@ impl OpenHomeAdapter {
                 }
                 _ = search_interval.tick() => {
                     // Perform SSDP search
-                    if let Err(e) = Self::perform_search(&state, &bus, &http).await {
+                    if let Err(e) = Self::perform_search(&state, &bus, &http, runtime_bridge.clone()).await {
                         tracing::warn!("SSDP search failed: {}", e);
                     }
 
                     // Cleanup stale devices
-                    Self::cleanup_stale(&state, &bus).await;
+                    Self::cleanup_stale(&state, &bus, runtime_bridge.clone()).await;
                 }
             }
         }
@@ -222,6 +338,7 @@ impl OpenHomeAdapter {
         state: &Arc<RwLock<OpenHomeState>>,
         bus: &SharedBus,
         http: &Client,
+        runtime_bridge: Option<Arc<OpenHomeRuntimeBridge>>,
     ) -> anyhow::Result<()> {
         // Search for all known OpenHome URNs - devices may advertise different services
         for urn_str in OPENHOME_URNS {
@@ -299,6 +416,7 @@ impl OpenHomeAdapter {
                         let state_clone = state.clone();
                         let http_clone = http.clone();
                         let bus_clone = bus.clone();
+                        let bridge_clone = runtime_bridge.clone();
                         let uuid_clone = uuid.clone();
 
                         tokio::spawn(async move {
@@ -316,11 +434,24 @@ impl OpenHomeAdapter {
                                     e
                                 );
                             }
-                            // Emit ZoneDiscovered with full zone info
-                            let s = state_clone.read().await;
-                            if let Some(device) = s.devices.get(&uuid_clone) {
-                                let zone = openhome_device_to_zone(device);
-                                bus_clone.publish(BusEvent::ZoneDiscovered { zone });
+                            // In composed mode, this is a full snapshot through
+                            // the reliable ingress.  Standalone construction
+                            // retains the legacy notification for old embedders.
+                            let zone = {
+                                let devices = state_clone.read().await;
+                                devices
+                                    .devices
+                                    .get(&uuid_clone)
+                                    .map(openhome_device_to_zone)
+                            };
+                            if let Some(zone) = zone {
+                                if let Some(bridge) = bridge_clone {
+                                    if let Err(error) = bridge.publish_zone(zone, None).await {
+                                        tracing::warn!(%error, "OpenHome discovery projection failed");
+                                    }
+                                } else {
+                                    bus_clone.publish(BusEvent::ZoneDiscovered { zone });
+                                }
                             }
                         });
                     }
@@ -380,23 +511,38 @@ impl OpenHomeAdapter {
         Ok(())
     }
 
-    async fn cleanup_stale(state: &Arc<RwLock<OpenHomeState>>, bus: &SharedBus) {
-        let mut s = state.write().await;
-        let now = std::time::Instant::now();
+    async fn cleanup_stale(
+        state: &Arc<RwLock<OpenHomeState>>,
+        bus: &SharedBus,
+        runtime_bridge: Option<Arc<OpenHomeRuntimeBridge>>,
+    ) {
+        let removed: Vec<PrefixedZoneId> = {
+            let mut devices = state.write().await;
+            let now = std::time::Instant::now();
+            let stale: Vec<String> = devices
+                .devices
+                .iter()
+                .filter(|(_, d)| now.duration_since(d.last_seen) > STALE_THRESHOLD)
+                .map(|(uuid, _)| uuid.clone())
+                .collect();
+            stale
+                .into_iter()
+                .map(|uuid| {
+                    tracing::info!("Removing stale OpenHome device: {}", uuid);
+                    devices.devices.remove(&uuid);
+                    PrefixedZoneId::openhome(uuid)
+                })
+                .collect()
+        };
 
-        let stale: Vec<String> = s
-            .devices
-            .iter()
-            .filter(|(_, d)| now.duration_since(d.last_seen) > STALE_THRESHOLD)
-            .map(|(uuid, _)| uuid.clone())
-            .collect();
-
-        for uuid in stale {
-            tracing::info!("Removing stale OpenHome device: {}", uuid);
-            s.devices.remove(&uuid);
-            bus.publish(BusEvent::ZoneRemoved {
-                zone_id: PrefixedZoneId::openhome(&uuid),
-            });
+        for zone_id in removed {
+            if let Some(bridge) = runtime_bridge.as_ref() {
+                if let Err(error) = bridge.publish_removed(zone_id).await {
+                    tracing::warn!(%error, "OpenHome stale-removal projection failed");
+                }
+            } else {
+                bus.publish(BusEvent::ZoneRemoved { zone_id });
+            }
         }
     }
 
@@ -405,6 +551,7 @@ impl OpenHomeAdapter {
         bus: SharedBus,
         http: Client,
         shutdown: CancellationToken,
+        runtime_bridge: Option<Arc<OpenHomeRuntimeBridge>>,
     ) {
         let mut poll_interval = interval(POLL_INTERVAL);
 
@@ -425,7 +572,7 @@ impl OpenHomeAdapter {
                     };
 
                     for (uuid, location) in devices {
-                        if let Err(e) = Self::poll_device(&state, &bus, &http, &uuid, &location).await {
+                        if let Err(e) = Self::poll_device(&state, &bus, &http, &uuid, &location, runtime_bridge.clone()).await {
                             tracing::debug!("Failed to poll {}: {}", uuid, e);
                         }
                     }
@@ -442,6 +589,7 @@ impl OpenHomeAdapter {
         http: &Client,
         uuid: &str,
         location: &str,
+        runtime_bridge: Option<Arc<OpenHomeRuntimeBridge>>,
     ) -> anyhow::Result<()> {
         let base_url = Self::get_base_url(location)?;
 
@@ -462,11 +610,13 @@ impl OpenHomeAdapter {
                 if let Some(device) = s.devices.get_mut(uuid) {
                     if device.state != new_state {
                         device.state = new_state.clone();
-                        bus.publish(BusEvent::ZoneUpdated {
-                            zone_id: PrefixedZoneId::openhome(uuid),
-                            display_name: device.name.clone(),
-                            state: new_state,
-                        });
+                        if runtime_bridge.is_none() {
+                            bus.publish(BusEvent::ZoneUpdated {
+                                zone_id: PrefixedZoneId::openhome(uuid),
+                                display_name: device.name.clone(),
+                                state: new_state,
+                            });
+                        }
                     }
                 }
             }
@@ -565,17 +715,31 @@ impl OpenHomeAdapter {
                             let album = Some(track_info.album.clone());
                             let image_key = track_info.album_art_uri.clone();
                             device.track_info = Some(track_info);
-                            bus.publish(BusEvent::NowPlayingChanged {
-                                zone_id: PrefixedZoneId::openhome(uuid),
-                                title,
-                                artist,
-                                album,
-                                image_key,
-                            });
+                            if runtime_bridge.is_none() {
+                                bus.publish(BusEvent::NowPlayingChanged {
+                                    zone_id: PrefixedZoneId::openhome(uuid),
+                                    title,
+                                    artist,
+                                    album,
+                                    image_key,
+                                });
+                            }
                         }
                     }
                 }
             }
+        }
+
+        if let Some(bridge) = runtime_bridge {
+            let zone = {
+                let devices = state.read().await;
+                devices
+                    .devices
+                    .get(uuid)
+                    .map(openhome_device_to_zone)
+                    .ok_or_else(|| anyhow!("Device not found: {}", uuid))?
+            };
+            bridge.publish_zone(zone, None).await?;
         }
 
         Ok(())
@@ -617,7 +781,8 @@ impl OpenHomeAdapter {
             .header("SOAPAction", format!("\"{}#{}\"", service_type, action))
             .body(soap_body)
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
 
         Ok(response.text().await?)
     }
@@ -713,13 +878,15 @@ impl OpenHomeAdapter {
         })
     }
 
-    /// Send control command to a zone
-    pub async fn control(
+    /// Issue one native OpenHome transport/volume write without mutating the
+    /// adapter cache.  Native acceptance is deliberately not a visible success:
+    /// the reliable endpoint follows this with [`Self::coherent_zone_readback`].
+    async fn execute_control_native(
         &self,
         uuid: &str,
         action: &str,
         value: Option<i32>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         let uuid = strip_openhome_prefix(uuid);
         let location = {
             let state = self.state.read().await;
@@ -727,9 +894,8 @@ impl OpenHomeAdapter {
                 .devices
                 .get(uuid)
                 .map(|d| d.location.clone())
-                .ok_or_else(|| anyhow::anyhow!("Device not found: {}", uuid))?
+                .ok_or_else(|| anyhow!("Device not found: {}", uuid))?
         };
-
         let base_url = Self::get_base_url(&location)?;
         let transport_url = format!("{}/Transport", base_url);
         let volume_url = format!("{}/Volume", base_url);
@@ -756,14 +922,13 @@ impl OpenHomeAdapter {
                 .await?;
             }
             "play_pause" => {
-                let state = self.state.read().await;
-                let is_playing = state
+                let is_playing = self
+                    .state
+                    .read()
+                    .await
                     .devices
                     .get(uuid)
-                    .map(|d| d.state == "playing")
-                    .unwrap_or(false);
-                drop(state);
-
+                    .is_some_and(|device| device.state == "playing");
                 let action = if is_playing { "Pause" } else { "Play" };
                 Self::soap_call(
                     &self.http,
@@ -805,58 +970,128 @@ impl OpenHomeAdapter {
                 .await?;
             }
             "vol_abs" | "volume" => {
-                let vol = value.unwrap_or(50).clamp(0, 100);
+                let volume = value.unwrap_or(50).clamp(0, 100);
                 Self::soap_call(
                     &self.http,
                     &volume_url,
                     "urn:av-openhome-org:service:Volume:1",
                     "SetVolume",
-                    &format!("<Value>{}</Value>", vol),
+                    &format!("<Value>{volume}</Value>"),
                 )
                 .await?;
-
-                let mut state = self.state.write().await;
-                if let Some(device) = state.devices.get_mut(uuid) {
-                    device.volume = Some(vol);
-                }
             }
             "vol_rel" => {
-                let delta = value.unwrap_or(0);
-                let current = {
-                    let state = self.state.read().await;
-                    state.devices.get(uuid).and_then(|d| d.volume).unwrap_or(50)
-                };
-                let new_vol = (current + delta).clamp(0, 100);
-
+                let current = self
+                    .state
+                    .read()
+                    .await
+                    .devices
+                    .get(uuid)
+                    .and_then(|device| device.volume)
+                    .unwrap_or(50);
+                let volume = (current + value.unwrap_or(0)).clamp(0, 100);
                 Self::soap_call(
                     &self.http,
                     &volume_url,
                     "urn:av-openhome-org:service:Volume:1",
                     "SetVolume",
-                    &format!("<Value>{}</Value>", new_vol),
+                    &format!("<Value>{volume}</Value>"),
                 )
                 .await?;
-
-                let mut state = self.state.write().await;
-                if let Some(device) = state.devices.get_mut(uuid) {
-                    device.volume = Some(new_vol);
-                }
             }
-            _ => {
-                anyhow::bail!("Unknown action: {}", action);
-            }
+            _ => anyhow::bail!("Unknown action: {}", action),
         }
+        Ok(())
+    }
+
+    /// Read the authoritative transport/volume facts needed to reconstruct one
+    /// complete Zone after a write.  It never publishes an optimistic cache
+    /// mutation, and failures are returned so the command remains indeterminate
+    /// rather than being confirmed from a stale snapshot.
+    async fn coherent_zone_readback(&self, uuid: &str) -> Result<Zone> {
+        let uuid = strip_openhome_prefix(uuid);
+        let location = {
+            let state = self.state.read().await;
+            state
+                .devices
+                .get(uuid)
+                .map(|d| d.location.clone())
+                .ok_or_else(|| anyhow!("Device not found: {}", uuid))?
+        };
+        let base_url = Self::get_base_url(&location)?;
+        let transport = Self::soap_call(
+            &self.http,
+            &format!("{}/Transport", base_url),
+            "urn:av-openhome-org:service:Transport:1",
+            "TransportState",
+            "",
+        )
+        .await?;
+        let state = didl::extract_xml_value(&transport, "Value")
+            .ok_or_else(|| anyhow!("OpenHome TransportState response had no Value"))?
+            .to_lowercase();
+        let volume = Self::soap_call(
+            &self.http,
+            &format!("{}/Volume", base_url),
+            "urn:av-openhome-org:service:Volume:1",
+            "Volume",
+            "",
+        )
+        .await?;
+        let volume = didl::extract_xml_value(&volume, "Value")
+            .ok_or_else(|| anyhow!("OpenHome Volume response had no Value"))?
+            .parse::<i32>()?;
+        let mute = Self::soap_call(
+            &self.http,
+            &format!("{}/Volume", base_url),
+            "urn:av-openhome-org:service:Volume:1",
+            "Mute",
+            "",
+        )
+        .await?;
+        let muted = didl::extract_xml_value(&mute, "Value")
+            .ok_or_else(|| anyhow!("OpenHome Mute response had no Value"))?;
+        let muted = muted == "true" || muted == "1";
+
+        let mut devices = self.state.write().await;
+        let device = devices
+            .devices
+            .get_mut(uuid)
+            .ok_or_else(|| anyhow!("Device not found: {}", uuid))?;
+        device.state = state;
+        device.volume = Some(volume);
+        device.muted = muted;
+        Ok(openhome_device_to_zone(device))
+    }
+
+    /// Send control command to a zone
+    pub async fn control(
+        &self,
+        uuid: &str,
+        action: &str,
+        value: Option<i32>,
+    ) -> anyhow::Result<()> {
+        let uuid = strip_openhome_prefix(uuid);
+        self.execute_control_native(uuid, action, value).await?;
 
         // Trigger immediate poll
         let state = self.state.clone();
         let bus = self.bus.clone();
         let http = self.http.clone();
         let uuid = uuid.to_string();
-        let location = location.clone();
+        let runtime_bridge = self.runtime_bridge.clone();
+        let location = {
+            let state = self.state.read().await;
+            state
+                .devices
+                .get(&uuid)
+                .map(|device| device.location.clone())
+                .ok_or_else(|| anyhow!("Device not found: {}", uuid))?
+        };
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = Self::poll_device(&state, &bus, &http, &uuid, &location).await;
+            let _ = Self::poll_device(&state, &bus, &http, &uuid, &location, runtime_bridge).await;
         });
 
         Ok(())
@@ -955,26 +1190,55 @@ impl AdapterLogic for OpenHomeAdapter {
             state.running = true;
         }
 
+        // One provider endpoint serializes writes; each write is confirmed only
+        // by an exact-device SOAP readback committed through the aggregator.
+        let command_shutdown = ctx.shutdown.child_token();
+        let command_join = self.runtime_bridge.as_ref().and_then(|bridge| {
+            match bridge.commands().register_provider("openhome", 32) {
+                Ok(endpoint) => {
+                    let adapter = self.clone();
+                    let bridge = bridge.clone();
+                    let shutdown = command_shutdown.clone();
+                    Some(tokio::spawn(async move {
+                        run_openhome_command_endpoint(adapter, endpoint, shutdown, bridge).await;
+                    }))
+                }
+                Err(error) => {
+                    tracing::error!(?error, "OpenHome reliable endpoint registration failed");
+                    None
+                }
+            }
+        });
+
         // Run discovery and poll loops concurrently with shutdown check
         let discovery_state = self.state.clone();
         let discovery_bus = self.bus.clone();
         let discovery_http = self.http.clone();
         let discovery_shutdown = ctx.shutdown.clone();
+        let discovery_bridge = self.runtime_bridge.clone();
 
         let poll_state = self.state.clone();
         let poll_bus = self.bus.clone();
         let poll_http = self.http.clone();
         let poll_shutdown = ctx.shutdown.clone();
+        let poll_bridge = self.runtime_bridge.clone();
 
         tokio::select! {
             _ = ctx.shutdown.cancelled() => {
                 tracing::info!("OpenHome adapter received shutdown signal");
             }
-            _ = Self::discovery_loop(discovery_state, discovery_bus, discovery_http, discovery_shutdown) => {
+            _ = Self::discovery_loop(discovery_state, discovery_bus, discovery_http, discovery_shutdown, discovery_bridge) => {
                 tracing::info!("OpenHome discovery loop ended");
             }
-            _ = Self::poll_loop(poll_state, poll_bus, poll_http, poll_shutdown) => {
+            _ = Self::poll_loop(poll_state, poll_bus, poll_http, poll_shutdown, poll_bridge) => {
                 tracing::info!("OpenHome poll loop ended");
+            }
+        }
+
+        command_shutdown.cancel();
+        if let Some(join) = command_join {
+            if let Err(error) = join.await {
+                tracing::warn!(%error, "OpenHome reliable command endpoint failed to join");
             }
         }
 
@@ -1039,3 +1303,158 @@ impl AdapterLogic for OpenHomeAdapter {
 
 // Startable trait implementation via macro
 crate::impl_startable!(OpenHomeAdapter, "openhome");
+
+/// Consume OpenHome's provider endpoint.  A SOAP success is native acceptance
+/// only; `publish_zone(... caused_by)` is the singular confirmation edge.
+async fn run_openhome_command_endpoint(
+    adapter: OpenHomeAdapter,
+    mut endpoint: CommandEndpoint,
+    shutdown: CancellationToken,
+    bridge: Arc<OpenHomeRuntimeBridge>,
+) {
+    loop {
+        let work = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            work = endpoint.recv() => work,
+        };
+        let Some(work) = work else { break };
+        let permit = match work.begin_dispatch() {
+            Ok(permit) => permit,
+            Err(_) => continue,
+        };
+        let command_id = permit.id();
+        let target = permit.request().target.to_string();
+        let uuid = strip_openhome_prefix(&target).to_string();
+        let native = match permit.request().command.clone() {
+            RuntimeCommand::Control(command) => {
+                execute_openhome_runtime_command(&adapter, &uuid, command).await
+            }
+            RuntimeCommand::Hqplayer(_) => Err(anyhow!(
+                "HQPlayer runtime command routed to OpenHome endpoint"
+            )),
+        };
+        if let Err(error) = native {
+            permit.complete_native(NativeResult::Failed(error.to_string()));
+            continue;
+        }
+        permit.complete_native(NativeResult::Accepted);
+        match adapter.coherent_zone_readback(&uuid).await {
+            Ok(zone) => {
+                if let Err(error) = bridge.publish_zone(zone, Some(command_id)).await {
+                    tracing::warn!(%error, command_id = command_id.get(), "OpenHome native write accepted but readback projection could not commit");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, command_id = command_id.get(), "OpenHome native write accepted but coherent readback failed")
+            }
+        }
+    }
+}
+
+async fn execute_openhome_runtime_command(
+    adapter: &OpenHomeAdapter,
+    uuid: &str,
+    command: Command,
+) -> Result<()> {
+    match command {
+        Command::Play => adapter.execute_control_native(uuid, "play", None).await,
+        Command::Pause => adapter.execute_control_native(uuid, "pause", None).await,
+        Command::PlayPause => {
+            adapter
+                .execute_control_native(uuid, "play_pause", None)
+                .await
+        }
+        Command::Stop => adapter.execute_control_native(uuid, "stop", None).await,
+        Command::Next => adapter.execute_control_native(uuid, "next", None).await,
+        Command::Previous => adapter.execute_control_native(uuid, "previous", None).await,
+        Command::VolumeAbsolute { value, output_id } if output_id.is_none() => {
+            adapter
+                .execute_control_native(uuid, "vol_abs", Some(value.round() as i32))
+                .await
+        }
+        Command::VolumeRelative { delta, output_id } if output_id.is_none() => {
+            adapter
+                .execute_control_native(uuid, "vol_rel", Some(delta.round() as i32))
+                .await
+        }
+        Command::Mute { .. }
+        | Command::MuteToggle { .. }
+        | Command::Seek { .. }
+        | Command::SeekRelative { .. }
+        | Command::Shuffle { .. }
+        | Command::Repeat { .. }
+        | Command::VolumeAbsolute { .. }
+        | Command::VolumeRelative { .. } => Err(anyhow!(
+            "OpenHome command was not resolved to a supported native operation before dispatch"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aggregator::ZoneAggregator;
+    use crate::bus::runtime::build_runtime;
+
+    fn zone() -> Zone {
+        Zone {
+            zone_id: "openhome:living-room".to_string(),
+            zone_name: "Living room".to_string(),
+            state: PlaybackState::Playing,
+            volume_control: Some(BusVolumeControl {
+                value: 42.0,
+                min: 0.0,
+                max: 100.0,
+                step: 1.0,
+                is_muted: false,
+                scale: crate::bus::VolumeScale::Percentage,
+                output_id: Some(PrefixedZoneId::openhome("living-room").to_string()),
+            }),
+            now_playing: None,
+            source: "openhome".to_string(),
+            is_controllable: true,
+            is_seekable: false,
+            last_updated: 0,
+            is_play_allowed: false,
+            is_pause_allowed: true,
+            is_next_allowed: true,
+            is_previous_allowed: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn reliable_openhome_observations_commit_before_compatibility_notification() {
+        let bus = crate::bus::create_bus();
+        let mut notifications = bus.subscribe();
+        let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+        let runtime = build_runtime(aggregator.clone(), 2, 4);
+        let bridge = OpenHomeRuntimeBridge::new(
+            runtime.projection_ingress.clone(),
+            runtime.commands.clone(),
+        );
+        let actor = tokio::spawn(runtime.projection_actor.run());
+
+        bridge.publish_zone(zone(), None).await.expect("projection");
+        assert_eq!(
+            aggregator
+                .get_zone("openhome:living-room")
+                .await
+                .expect("canonical zone")
+                .volume_control
+                .expect("volume")
+                .value,
+            42.0
+        );
+        match notifications
+            .recv()
+            .await
+            .expect("post-commit notification")
+        {
+            BusEvent::ZoneDiscovered { zone } => assert_eq!(zone.zone_id, "openhome:living-room"),
+            event => panic!("expected post-commit ZoneDiscovered, got {event:?}"),
+        }
+
+        drop(bridge);
+        actor.abort();
+    }
+}

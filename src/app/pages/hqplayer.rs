@@ -69,6 +69,76 @@ struct ControlRequest {
     value: Option<f64>,
 }
 
+/// Gate slow advanced-state reads so rerenders or mutation bursts cannot overlap requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CoalescingRefresh {
+    initial_requested: bool,
+    in_flight: bool,
+    dirty: bool,
+}
+
+impl CoalescingRefresh {
+    /// `use_effect` may run after unrelated renders. Only the first mounted-page invocation is an
+    /// initial read; later explicit mutations still use [`Self::request`].
+    fn request_initial(&mut self) -> bool {
+        if self.initial_requested {
+            return false;
+        }
+        self.initial_requested = true;
+        self.request()
+    }
+
+    /// Returns true when the caller owns the single fetch loop.
+    fn request(&mut self) -> bool {
+        if self.in_flight {
+            self.dirty = true;
+            false
+        } else {
+            self.in_flight = true;
+            true
+        }
+    }
+
+    /// Returns true when one coalesced follow-up read is required.
+    fn complete(&mut self) -> bool {
+        if self.dirty {
+            self.dirty = false;
+            true
+        } else {
+            self.in_flight = false;
+            false
+        }
+    }
+}
+
+fn refresh_advanced_projection(
+    mut snapshot: Signal<Option<HqpMatrixProfilesResponse>>,
+    mut refresh: Signal<CoalescingRefresh>,
+    initial: bool,
+) {
+    let should_start = if initial {
+        refresh.write().request_initial()
+    } else {
+        refresh.write().request()
+    };
+    if !should_start {
+        return;
+    }
+
+    spawn(async move {
+        loop {
+            if let Ok(next) =
+                api::fetch_json::<HqpMatrixProfilesResponse>("/hqplayer/matrix/profiles").await
+            {
+                snapshot.set(Some(next));
+            }
+            if !refresh.write().complete() {
+                break;
+            }
+        }
+    });
+}
+
 /// HQPlayer page component.
 #[component]
 pub fn HqPlayer() -> Element {
@@ -110,12 +180,11 @@ pub fn HqPlayer() -> Element {
             .ok()
     });
 
-    // Load matrix profiles
-    let mut matrix = use_resource(|| async {
-        api::fetch_json::<HqpMatrixProfilesResponse>("/hqplayer/matrix/profiles")
-            .await
-            .ok()
-    });
+    // Advanced state is intentionally not a restartable Resource: its slow read is coalesced so
+    // rerenders or mutation bursts cannot starve rendering or exhaust the browser's request pool.
+    let matrix = use_signal(|| None::<HqpMatrixProfilesResponse>);
+    let matrix_refresh = use_signal(CoalescingRefresh::default);
+    use_effect(move || refresh_advanced_projection(matrix, matrix_refresh, true));
 
     // Load zones resource
     let mut zones =
@@ -164,22 +233,40 @@ pub fn HqPlayer() -> Element {
             .unwrap_or_default()
     });
 
-    // Fetch now playing for linked zones
-    use_effect(move || {
+    // Direct HQPlayer zones and any source zones explicitly linked to HQPlayer share this surface.
+    // Deduplicate by zone id so a direct zone cannot appear twice if it is also linked.
+    let controlled_zones_signal = use_memo(move || {
+        let all_zones = zones_list_signal();
         let links = links_signal();
-        if links.is_empty() {
+        all_zones
+            .into_iter()
+            .filter(|zone| {
+                zone.source.as_deref() == Some("hqplayer")
+                    || links.iter().any(|link| link.zone_id == zone.zone_id)
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let event_count = sse.event_count;
+
+    // Fetch now playing for every zone controlled from this page and refresh it after aggregator
+    // events. A zone's identity does not change when its playback or volume state does.
+    use_effect(move || {
+        let _ = event_count();
+        let controlled_zones = controlled_zones_signal();
+        if controlled_zones.is_empty() {
             now_playing_map.set(std::collections::HashMap::new());
             return;
         }
         spawn(async move {
             let mut np_map = std::collections::HashMap::new();
-            for link in links {
+            for zone in controlled_zones {
                 let url = format!(
                     "/now_playing?zone_id={}",
-                    urlencoding::encode(&link.zone_id)
+                    urlencoding::encode(&zone.zone_id)
                 );
                 if let Ok(np) = api::fetch_json::<NowPlaying>(&url).await {
-                    np_map.insert(link.zone_id, np);
+                    np_map.insert(zone.zone_id, np);
                 }
             }
             now_playing_map.set(np_map);
@@ -187,12 +274,16 @@ pub fn HqPlayer() -> Element {
     });
 
     // Refresh on SSE events
-    let event_count = sse.event_count;
     use_effect(move || {
         let _ = event_count();
         if sse.should_refresh_hqp() {
             status.restart();
             pipeline.restart();
+            // Do not refresh the advanced endpoint from its own compatibility events. That read
+            // publishes HqpStateChanged/HqpPipelineChanged after committing its aggregator
+            // snapshot, so feeding either event back into the same read creates an endless native
+            // refresh loop. Advanced state is loaded on page entry and explicitly after every
+            // successful mutation/configuration change below.
         }
         if sse.should_refresh_zones() {
             zones.restart();
@@ -234,7 +325,7 @@ pub fn HqPlayer() -> Element {
                     status.restart();
                     pipeline.restart();
                     profiles.restart();
-                    matrix.restart();
+                    refresh_advanced_projection(matrix, matrix_refresh, false);
                 }
                 Err(e) => {
                     config_status.set(Some(format!("Error: {}", e)));
@@ -244,14 +335,17 @@ pub fn HqPlayer() -> Element {
     };
 
     // Zone control handler
-    let control = move |(zone_id, action): (String, String)| {
+    let control = move |(zone_id, action, value): (String, String, Option<f64>)| {
+        hqp_error.set(None);
         spawn(async move {
             let req = ControlRequest {
                 zone_id,
                 action,
-                value: None,
+                value,
             };
-            let _ = api::post_json_no_response("/control", &req).await;
+            if let Err(error) = api::post_json_no_response("/control", &req).await {
+                hqp_error.set(Some(format!("Playback control failed: {error}")));
+            }
         });
     };
 
@@ -272,6 +366,7 @@ pub fn HqPlayer() -> Element {
                 // Server now returns fresh state after setting, so HQPlayer has processed
                 // the change before we refresh
                 pipeline.restart();
+                refresh_advanced_projection(matrix, matrix_refresh, false);
             }
             hqp_loading.set(false);
         });
@@ -291,6 +386,7 @@ pub fn HqPlayer() -> Element {
                 hqp_error.set(Some(format!("Profile load failed: {e}")));
             } else {
                 pipeline.restart();
+                refresh_advanced_projection(matrix, matrix_refresh, false);
             }
             hqp_loading.set(false);
         });
@@ -311,7 +407,7 @@ pub fn HqPlayer() -> Element {
             if let Err(e) = api::post_json_no_response("/hqplayer/matrix/profile", &req).await {
                 hqp_error.set(Some(format!("Matrix profile failed: {e}")));
             } else {
-                matrix.restart();
+                refresh_advanced_projection(matrix, matrix_refresh, false);
             }
             hqp_loading.set(false);
         });
@@ -339,7 +435,7 @@ pub fn HqPlayer() -> Element {
     let current_status = status.read().clone().flatten();
     let current_pipeline = pipeline.read().clone().flatten();
     let profiles_list = profiles.read().clone().flatten().unwrap_or_default();
-    let matrix_data = matrix.read().clone().flatten();
+    let matrix_data = matrix.read().clone();
     let zones_list = zones_list_signal();
     let links_list = links_signal();
     let instances_list = instances
@@ -350,16 +446,7 @@ pub fn HqPlayer() -> Element {
         .unwrap_or_default();
     let np_map = now_playing_map();
 
-    // Get linked zones with their data
-    let linked_zones: Vec<_> = links_list
-        .iter()
-        .filter_map(|link| {
-            zones_list
-                .iter()
-                .find(|z| z.zone_id == link.zone_id)
-                .cloned()
-        })
-        .collect();
+    let controlled_zones = controlled_zones_signal();
 
     let is_connected = current_status
         .as_ref()
@@ -429,12 +516,12 @@ pub fn HqPlayer() -> Element {
                 }
             }
 
-            // Linked Zone Controls (only if connected and has linked zones)
-            if is_connected && !linked_zones.is_empty() {
-                section { id: "linked-zones", class: "mb-8",
-                    h2 { class: "text-lg font-semibold mb-4", "Now Playing" }
+            // Every direct or linked HQPlayer zone uses the same aggregator-backed control path.
+            if is_connected && !controlled_zones.is_empty() {
+                section { id: "hqp-zones", class: "mb-8",
+                    h2 { class: "text-lg font-semibold mb-4", "HQPlayer Zones" }
                     div { class: "grid gap-4 grid-cols-1",
-                        for zone in linked_zones.iter() {
+                        for zone in controlled_zones.iter() {
                             LinkedZoneCard {
                                 key: "{zone.zone_id}",
                                 zone: zone.clone(),
@@ -479,17 +566,93 @@ pub fn HqPlayer() -> Element {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{hqplayer_mute_control, CoalescingRefresh};
+
+    #[test]
+    fn advanced_refreshes_never_overlap_and_coalesce_bursts() {
+        let mut refresh = CoalescingRefresh::default();
+
+        assert!(
+            refresh.request_initial(),
+            "the mounted page starts one initial fetch"
+        );
+        assert!(
+            !refresh.request_initial(),
+            "rerenders cannot restart the initial fetch"
+        );
+        assert!(!refresh.request(), "an in-flight fetch is not duplicated");
+        assert!(
+            !refresh.request(),
+            "a burst still queues only one follow-up"
+        );
+        assert!(
+            refresh.complete(),
+            "one dirty follow-up starts after completion"
+        );
+        assert!(!refresh.complete(), "the clean follow-up settles the gate");
+        assert!(
+            !refresh.request_initial(),
+            "settling cannot turn a rerender into another initial fetch"
+        );
+        assert!(refresh.request(), "a later event can start a fresh fetch");
+    }
+
+    #[test]
+    fn hqplayer_mute_matches_the_native_volume_floor_semantics() {
+        let audible = hqplayer_mute_control(Some(-3.0), Some(-60.0));
+        assert_eq!(audible.label, "Mute to minimum volume");
+        assert!(!audible.disabled);
+
+        let floored = hqplayer_mute_control(Some(-60.0), Some(-60.0));
+        assert_eq!(floored.label, "At minimum volume");
+        assert!(floored.disabled);
+    }
+}
+
 /// Linked zone card with playback controls
+#[derive(Debug, PartialEq, Eq)]
+struct HqplayerMuteControl {
+    label: &'static str,
+    title: &'static str,
+    disabled: bool,
+}
+
+fn hqplayer_mute_control(volume: Option<f32>, volume_min: Option<f32>) -> HqplayerMuteControl {
+    let at_volume_floor = match (volume, volume_min) {
+        (Some(value), Some(minimum)) => value <= minimum + 0.01,
+        _ => false,
+    };
+
+    if at_volume_floor {
+        HqplayerMuteControl {
+            label: "At minimum volume",
+            title: "HQPlayer represents mute as its minimum volume",
+            disabled: true,
+        }
+    } else {
+        HqplayerMuteControl {
+            label: "Mute to minimum volume",
+            title: "Mute to HQPlayer's minimum volume",
+            disabled: false,
+        }
+    }
+}
+
 #[component]
 fn LinkedZoneCard(
     zone: Zone,
     now_playing: Option<NowPlaying>,
-    on_control: EventHandler<(String, String)>,
+    on_control: EventHandler<(String, String, Option<f64>)>,
 ) -> Element {
     let zone_id = zone.zone_id.clone();
     let zone_id_prev = zone_id.clone();
     let zone_id_play = zone_id.clone();
     let zone_id_next = zone_id.clone();
+    let zone_id_stop = zone_id.clone();
+    let zone_id_mute = zone_id.clone();
+    let zone_id_seek = zone_id.clone();
     let zone_id_vol_down = zone_id.clone();
     let zone_id_vol_up = zone_id.clone();
 
@@ -497,8 +660,15 @@ fn LinkedZoneCard(
     let is_playing = np.map(|n| n.is_playing).unwrap_or(false);
 
     let volume = np.and_then(|n| n.volume);
+    let volume_min = np.and_then(|n| n.volume_min);
     let volume_type = np.and_then(|n| n.volume_type.clone());
     let volume_step = np.and_then(|n| n.volume_step);
+    let seek_position = np.and_then(|n| n.seek_position).unwrap_or(0).max(0) as u32;
+    let length = np.and_then(|n| n.length).unwrap_or(0);
+    let can_seek = length > 0;
+    let can_previous = np.map(|n| n.is_previous_allowed).unwrap_or(false);
+    let can_next = np.map(|n| n.is_next_allowed).unwrap_or(false);
+    let mute_control = hqplayer_mute_control(volume, volume_min);
 
     // Album art
     let base_image_url = np.and_then(|n| n.image_url.clone()).unwrap_or_default();
@@ -529,8 +699,8 @@ fn LinkedZoneCard(
         .unwrap_or_default();
 
     rsx! {
-        article { class: "card p-4",
-            div { class: "flex gap-4 items-start",
+        article { class: "card p-4 sm:p-5",
+            div { class: "flex flex-col gap-4 sm:flex-row sm:items-start",
                 // Album art
                 if has_image {
                     img {
@@ -556,11 +726,12 @@ fn LinkedZoneCard(
                     }
 
                     // Transport controls
-                    div { class: "flex items-center gap-2 mt-3",
+                    div { class: "flex flex-wrap items-center gap-2 mt-3",
                         button {
                             class: "btn btn-ghost btn-sm",
                             "aria-label": "Previous track",
-                            onclick: move |_| on_control.call((zone_id_prev.clone(), "previous".to_string())),
+                            disabled: !can_previous,
+                            onclick: move |_| on_control.call((zone_id_prev.clone(), "previous".to_string(), None)),
                             svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
                                 path { d: "M6 6h2v12H6zm3.5 6l8.5 6V6z" }
                             }
@@ -568,7 +739,7 @@ fn LinkedZoneCard(
                         button {
                             class: "btn btn-primary btn-sm",
                             "aria-label": if is_playing { "Pause" } else { "Play" },
-                            onclick: move |_| on_control.call((zone_id_play.clone(), "play_pause".to_string())),
+                            onclick: move |_| on_control.call((zone_id_play.clone(), "play_pause".to_string(), None)),
                             if is_playing {
                                 svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
                                     path { d: "M6 19h4V5H6v14zm8-14v14h4V5h-4z" }
@@ -582,9 +753,30 @@ fn LinkedZoneCard(
                         button {
                             class: "btn btn-ghost btn-sm",
                             "aria-label": "Next track",
-                            onclick: move |_| on_control.call((zone_id_next.clone(), "next".to_string())),
+                            disabled: !can_next,
+                            onclick: move |_| on_control.call((zone_id_next.clone(), "next".to_string(), None)),
                             svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
                                 path { d: "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z" }
+                            }
+                        }
+                        button {
+                            class: "btn btn-ghost btn-sm",
+                            "aria-label": "Stop playback",
+                            title: "Stop playback",
+                            onclick: move |_| on_control.call((zone_id_stop.clone(), "stop".to_string(), None)),
+                            svg { class: "w-4 h-4", fill: "currentColor", view_box: "0 0 24 24",
+                                rect { x: "6", y: "6", width: "12", height: "12", rx: "1" }
+                            }
+                        }
+                        button {
+                            class: "btn btn-ghost btn-sm",
+                            "aria-label": mute_control.label,
+                            title: mute_control.title,
+                            disabled: mute_control.disabled,
+                            onclick: move |_| on_control.call((zone_id_mute.clone(), "mute".to_string(), None)),
+                            svg { class: "w-4 h-4", fill: "none", stroke: "currentColor", stroke_width: "2", view_box: "0 0 24 24",
+                                path { d: "M11 5 6 9H3v6h3l5 4V5Z" }
+                                path { d: "m19 9-6 6m0-6 6 6" }
                             }
                         }
 
@@ -592,14 +784,44 @@ fn LinkedZoneCard(
                             volume: volume,
                             volume_type: volume_type,
                             volume_step: volume_step,
-                            on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string())),
-                            on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string())),
+                            on_vol_down: move |_| on_control.call((zone_id_vol_down.clone(), "vol_down".to_string(), None)),
+                            on_vol_up: move |_| on_control.call((zone_id_vol_up.clone(), "vol_up".to_string(), None)),
                         }
                     }
                 }
             }
+            div { class: "mt-4 pt-4 border-t border-subtle",
+                div { class: "flex items-center justify-between gap-4 mb-2",
+                    label { class: "text-sm font-medium", r#for: "seek-{zone_id}", "Position" }
+                    span { class: "text-xs text-muted tabular-nums",
+                        "{format_hqp_time(seek_position)} / {format_hqp_time(length)}"
+                    }
+                }
+                input {
+                    id: "seek-{zone_id}",
+                    class: "hqp-seek",
+                    r#type: "range",
+                    min: "0",
+                    max: "{length.max(1)}",
+                    value: "{seek_position.min(length)}",
+                    disabled: !can_seek,
+                    "aria-label": "Seek position",
+                    onchange: move |event| {
+                        if let Ok(position) = event.value().parse::<f64>() {
+                            on_control.call((zone_id_seek.clone(), "seek".to_string(), Some(position)));
+                        }
+                    }
+                }
+                if !can_seek {
+                    p { class: "text-xs text-muted mt-2", "Seek becomes available when HQPlayer reports a track duration." }
+                }
+            }
         }
     }
+}
+
+fn format_hqp_time(seconds: u32) -> String {
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 /// Configuration form component
@@ -725,7 +947,60 @@ fn DspSettings(
         .as_ref()
         .map(|m| m.profiles.clone())
         .unwrap_or_default();
-    let matrix_current = matrix.as_ref().and_then(|m| m.current);
+    let matrix_current = matrix
+        .as_ref()
+        .and_then(|m| m.current.as_ref().map(|profile| profile.index));
+    let junk_filter_opts = matrix.as_ref().and_then(|advanced| {
+        if advanced.junk_filters.is_empty() {
+            return None;
+        }
+        let selected = advanced.junk_filter.and_then(|selected_index| {
+            advanced
+                .junk_filters
+                .iter()
+                .find(|choice| choice.index == selected_index)
+                .map(|choice| crate::app::api::HqpOption {
+                    value: choice.name.clone(),
+                    label: Some(choice.name.clone()),
+                })
+        });
+        Some(crate::app::api::HqpSettingOptions {
+            options: advanced
+                .junk_filters
+                .iter()
+                .map(|choice| crate::app::api::HqpOption {
+                    value: choice.name.clone(),
+                    label: Some(choice.name.clone()),
+                })
+                .collect(),
+            selected,
+        })
+    });
+    let repeat_opts = matrix.as_ref().and_then(|advanced| {
+        advanced.repeat.map(|selected| {
+            let choices = [("off", "Off"), ("one", "Current track"), ("all", "All")];
+            crate::app::api::HqpSettingOptions {
+                options: choices
+                    .iter()
+                    .map(|(value, label)| crate::app::api::HqpOption {
+                        value: (*value).to_string(),
+                        label: Some((*label).to_string()),
+                    })
+                    .collect(),
+                selected: choices.get(usize::from(selected)).map(|(value, label)| {
+                    crate::app::api::HqpOption {
+                        value: (*value).to_string(),
+                        label: Some((*label).to_string()),
+                    }
+                }),
+            }
+        })
+    });
+    let convolution = matrix.as_ref().and_then(|advanced| advanced.convolution);
+    let adaptive_volume = matrix
+        .as_ref()
+        .and_then(|advanced| advanced.adaptive_volume);
+    let random = matrix.as_ref().and_then(|advanced| advanced.random);
 
     // Dynamic shaper label based on mode
     // SDM/DSD mode = "Modulator", PCM mode = "Shaper" (not "Dither")
@@ -749,6 +1024,19 @@ fn DspSettings(
             if loading {
                 div { class: "flex items-center gap-2 mb-4",
                     span { class: "text-muted text-sm", aria_busy: "true", "Updating..." }
+                }
+            }
+
+            if let Some(status) = pipe.status.as_ref() {
+                div { class: "mb-6 pb-6 border-b border-subtle",
+                    h3 { class: "text-sm font-semibold mb-3", "Live engine state" }
+                    dl { class: "grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3 lg:grid-cols-5",
+                        HqpReadout { label: "Engine", value: status.state.clone().unwrap_or_else(|| "Unknown".to_string()) }
+                        HqpReadout { label: "Mode", value: status.active_mode.clone().or_else(|| status.mode.clone()).unwrap_or_else(|| "—".to_string()) }
+                        HqpReadout { label: "Filter", value: status.active_filter.clone().unwrap_or_else(|| "—".to_string()) }
+                        HqpReadout { label: "Modulator / shaper", value: status.active_shaper.clone().unwrap_or_else(|| "—".to_string()) }
+                        HqpReadout { label: "Output", value: status.active_rate.map(format_hqp_rate).unwrap_or_else(|| "—".to_string()) }
+                    }
                 }
             }
 
@@ -779,7 +1067,7 @@ fn DspSettings(
                 }
             }
 
-            // Pipeline settings grid - responsive
+            h3 { class: "text-sm font-semibold mb-3", "Core pipeline" }
             div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4",
                 HqpSelect {
                     id: "hqp-mode",
@@ -821,6 +1109,113 @@ fn DspSettings(
                     disabled: loading,
                     on_change: on_set_pipeline,
                 }
+            }
+
+            if junk_filter_opts.is_some() || convolution.is_some() || adaptive_volume.is_some() || repeat_opts.is_some() || random.is_some() {
+                div { class: "mt-6 pt-6 border-t border-subtle",
+                    div { class: "mb-4",
+                        h3 { class: "text-sm font-semibold", "Advanced processing" }
+                        p { class: "text-sm text-muted mt-1 max-w-prose",
+                            "Immediate HQPlayer engine controls. Changes are verified against the live native state before the UI refreshes."
+                        }
+                    }
+                    div { class: "grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3",
+                        HqpSelect {
+                            id: "hqp-junk-filter",
+                            label: "Junk filter",
+                            setting: "junk_filter",
+                            options: junk_filter_opts,
+                            disabled: loading,
+                            on_change: on_set_pipeline,
+                        }
+                        HqpSelect {
+                            id: "hqp-repeat",
+                            label: "Repeat",
+                            setting: "repeat",
+                            options: repeat_opts,
+                            disabled: loading,
+                            on_change: on_set_pipeline,
+                        }
+                        if let Some(enabled) = convolution {
+                            HqpToggle {
+                                label: "Convolution",
+                                description: "Apply the active convolution engine.",
+                                setting: "convolution",
+                                enabled,
+                                disabled: loading,
+                                on_change: on_set_pipeline,
+                            }
+                        }
+                        if let Some(enabled) = adaptive_volume {
+                            HqpToggle {
+                                label: "Adaptive volume",
+                                description: "Allow HQPlayer to adjust level dynamically.",
+                                setting: "adaptive_volume",
+                                enabled,
+                                disabled: loading,
+                                on_change: on_set_pipeline,
+                            }
+                        }
+                        if let Some(enabled) = random {
+                            HqpToggle {
+                                label: "Random",
+                                description: "Randomize HQPlayer playlist playback.",
+                                setting: "random",
+                                enabled,
+                                disabled: loading,
+                                on_change: on_set_pipeline,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn HqpReadout(label: &'static str, value: String) -> Element {
+    rsx! {
+        div { class: "min-w-0",
+            dt { class: "text-xs text-muted", "{label}" }
+            dd { class: "mt-1 text-sm font-medium truncate", title: "{value}", "{value}" }
+        }
+    }
+}
+
+fn format_hqp_rate(rate: u64) -> String {
+    if rate >= 1_000_000 && rate.is_multiple_of(1_000_000) {
+        format!("{} MHz", rate / 1_000_000)
+    } else if rate >= 1_000 && rate.is_multiple_of(1_000) {
+        format!("{} kHz", rate / 1_000)
+    } else {
+        format!("{rate} Hz")
+    }
+}
+
+#[component]
+fn HqpToggle(
+    label: &'static str,
+    description: &'static str,
+    setting: &'static str,
+    enabled: bool,
+    disabled: bool,
+    on_change: EventHandler<(String, String)>,
+) -> Element {
+    let state_label = if enabled { "on" } else { "off" };
+    rsx! {
+        div { class: "hqp-toggle",
+            div { class: "min-w-0 pr-3",
+                p { class: "text-sm font-medium", "{label}" }
+                p { class: "text-xs text-muted mt-1", "{description}" }
+            }
+            button {
+                class: if enabled { "btn btn-primary btn-sm min-w-16" } else { "btn btn-outline btn-sm min-w-16" },
+                disabled,
+                "aria-pressed": enabled,
+                "aria-label": "{label}: {state_label}",
+                onclick: move |_| on_change.call((setting.to_string(), (!enabled).to_string())),
+                if enabled { "On" } else { "Off" }
             }
         }
     }

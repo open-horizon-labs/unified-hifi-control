@@ -19,7 +19,8 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
+use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::handle::{AdapterHandle, RetryConfig};
@@ -27,7 +28,12 @@ use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic,
 };
 use crate::bus::{
-    BusEvent, NowPlaying as BusNowPlaying, PlaybackState, PrefixedZoneId, SharedBus,
+    runtime::{
+        CommandEndpoint, CommandGateway, CommandId, NativeResult, ProjectionCommit,
+        ProjectionEntry, ProjectionIngress, ProjectionKind, ProjectionPayload, ProjectionSource,
+        ProjectionUpdate, RuntimeCommand,
+    },
+    BusEvent, Command, NowPlaying as BusNowPlaying, PlaybackState, PrefixedZoneId, SharedBus,
     VolumeControl as BusVolumeControl, Zone as BusZone,
 };
 use crate::config::get_config_file_path;
@@ -675,6 +681,20 @@ struct RoonState {
     pending_loads: HashMap<usize, (Option<String>, LoadRequest)>,
 }
 
+async fn clear_roon_runtime_state(state: &Arc<RwLock<RoonState>>) {
+    let mut state = state.write().await;
+    state.connected = false;
+    state.core_name = None;
+    state.core_version = None;
+    state.zones.clear();
+    state.transport = None;
+    state.image = None;
+    state.browse = None;
+    state.pending_images.clear();
+    state.pending_browses.clear();
+    state.pending_loads.clear();
+}
+
 impl RoonState {
     /// Route a Core browse/load rejection to the exact request waiting on it.
     ///
@@ -818,6 +838,215 @@ impl RoonState {
     }
 }
 
+/// One serialized reliable ingress for Roon's authoritative Core callbacks.
+///
+/// Roon transport commands do not produce a readback response.  The Core sends complete zone
+/// callbacks afterwards instead.  A single provider endpoint therefore admits one native command
+/// at a time, arms this bridge *before* dispatch, and waits for the matching zone callback before
+/// it allows another command through.  That temporal fence is the strongest correlation the
+/// protocol exposes: it never invents a synchronous readback, and it never treats an update for a
+/// different zone as confirmation.
+#[derive(Clone)]
+pub struct RoonRuntimeBridge {
+    ingress: ProjectionIngress,
+    commands: CommandGateway,
+    publication: Arc<Mutex<u64>>,
+    publication_gate: Arc<Semaphore>,
+    pending: Arc<Mutex<Option<PendingRoonCommand>>>,
+}
+
+struct PendingRoonCommand {
+    target: PrefixedZoneId,
+    command_id: CommandId,
+    expectation: RoonObservationExpectation,
+    observed: oneshot::Sender<()>,
+}
+
+#[derive(Clone, Debug)]
+enum RoonObservationExpectation {
+    Playback(PlaybackState),
+    TrackChanged(Option<(String, String, String, Option<String>)>),
+    PreviousApplied {
+        track: Option<(String, String, String, Option<String>)>,
+        seek_position: Option<f64>,
+    },
+    Volume(f32),
+}
+
+impl RoonObservationExpectation {
+    fn matches(&self, zone: &BusZone) -> bool {
+        match self {
+            Self::Playback(expected) => zone.state == *expected,
+            Self::TrackChanged(previous) => {
+                let observed = roon_track_identity(zone);
+                observed.is_some() && &observed != previous
+            }
+            Self::PreviousApplied {
+                track,
+                seek_position,
+            } => {
+                let observed_track = roon_track_identity(zone);
+                if observed_track.is_some() && &observed_track != track {
+                    return true;
+                }
+
+                matches!(
+                    (seek_position, zone.now_playing.as_ref().and_then(|np| np.seek_position)),
+                    (Some(before), Some(after)) if *before > 2.0 && after <= 2.0
+                )
+            }
+            Self::Volume(expected) => zone
+                .volume_control
+                .as_ref()
+                .is_some_and(|volume| (volume.value - expected).abs() <= 0.01),
+        }
+    }
+}
+
+fn roon_track_identity(zone: &BusZone) -> Option<(String, String, String, Option<String>)> {
+    zone.now_playing.as_ref().map(|now_playing| {
+        (
+            now_playing.title.clone(),
+            now_playing.artist.clone(),
+            now_playing.album.clone(),
+            now_playing.image_key.clone(),
+        )
+    })
+}
+
+impl RoonRuntimeBridge {
+    pub fn new(ingress: ProjectionIngress, commands: CommandGateway) -> Self {
+        Self {
+            ingress,
+            commands,
+            publication: Arc::new(Mutex::new(0)),
+            publication_gate: Arc::new(Semaphore::new(1)),
+            pending: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn commands(&self) -> CommandGateway {
+        self.commands.clone()
+    }
+
+    /// Start associating the next matching Core zone callback with one native command.
+    ///
+    /// The endpoint serializes calls to this method; refusing a second arm is intentional defence
+    /// in depth, because Roon does not attach the originating command id to a callback.
+    async fn arm(
+        &self,
+        target: PrefixedZoneId,
+        command_id: CommandId,
+        expectation: RoonObservationExpectation,
+    ) -> Result<oneshot::Receiver<()>> {
+        let (observed, receiver) = oneshot::channel();
+        let mut pending = self.pending.lock().await;
+        if pending.is_some() {
+            anyhow::bail!("Roon command confirmation is already awaiting a Core zone callback")
+        }
+        *pending = Some(PendingRoonCommand {
+            target,
+            command_id,
+            expectation,
+            observed,
+        });
+        Ok(receiver)
+    }
+
+    /// Forget an unobserved command after a native dispatch failure or confirmation timeout.
+    async fn disarm(&self, command_id: CommandId) {
+        let mut pending = self.pending.lock().await;
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.command_id == command_id)
+        {
+            pending.take();
+        }
+    }
+
+    /// Commit a full authoritative zone callback, associating it with an armed command only when
+    /// the callback is for that exact zone.  The projection actor decides whether the commit is
+    /// actually accepted; only a committed projection can resolve the operation.
+    async fn publish_zone(&self, zone: BusZone) -> Result<()> {
+        let matched = {
+            let mut pending = self.pending.lock().await;
+            if pending.as_ref().is_some_and(|pending| {
+                pending.target.as_str() == zone.zone_id && pending.expectation.matches(&zone)
+            }) {
+                pending.take()
+            } else {
+                None
+            }
+        };
+        self.publish(
+            ProjectionPayload::Zone(Box::new(zone.clone())),
+            format!("zone:{}", zone.zone_id),
+            matched.as_ref().map(|pending| pending.command_id),
+            matched.map(|pending| pending.observed),
+        )
+        .await
+    }
+
+    async fn publish_removed(&self, zone_id: PrefixedZoneId) -> Result<()> {
+        self.publish(
+            ProjectionPayload::ZoneRemoved {
+                zone_id: zone_id.clone(),
+            },
+            format!("zone:{zone_id}"),
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn publish(
+        &self,
+        payload: ProjectionPayload,
+        key: String,
+        caused_by: Option<CommandId>,
+        observed: Option<oneshot::Sender<()>>,
+    ) -> Result<()> {
+        // Allocate and admit in one serialized lane.  Do not hold the data mutex over the await:
+        // the semaphore establishes source order while retaining the no-await-under-lock rule.
+        let _publication_permit = self
+            .publication_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("Roon reliable publication lane closed"))?;
+        let sequence = {
+            let mut sequence = self.publication.lock().await;
+            *sequence = sequence.saturating_add(1);
+            *sequence
+        };
+        let commit = self
+            .ingress
+            .submit(ProjectionUpdate {
+                source: ProjectionSource {
+                    adapter: "roon".to_string(),
+                    instance: None,
+                    epoch: 0,
+                },
+                sequence,
+                kind: ProjectionKind::Snapshot,
+                caused_by,
+                entries: vec![ProjectionEntry { key, payload }],
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Roon reliable projection ingress stopped"))?;
+        if matches!(commit, ProjectionCommit::Committed { .. }) {
+            if let Some(observed) = observed {
+                if observed.send(()).is_err() {
+                    tracing::debug!(
+                        "Roon command observer was dropped after its projection committed"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Roon adapter
 #[derive(Clone)]
 pub struct RoonAdapter {
@@ -831,6 +1060,9 @@ pub struct RoonAdapter {
     started: Arc<std::sync::atomic::AtomicBool>,
     /// Knob store for displaying controller count in Roon extension
     knob_store: Option<KnobStore>,
+    /// Present only in the composed server.  It routes complete Core callbacks into the
+    /// aggregator-owned projection and owns command/callback correlation.
+    runtime_bridge: Option<Arc<RoonRuntimeBridge>>,
 }
 
 impl RoonAdapter {
@@ -843,6 +1075,7 @@ impl RoonAdapter {
             base_url: Arc::new(RwLock::new(None)),
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             knob_store: None,
+            runtime_bridge: None,
         }
     }
 
@@ -851,6 +1084,17 @@ impl RoonAdapter {
     /// `base_url` is shown in Roon Settings → Extensions (e.g., "http://hostname:3000")
     /// `knob_store` is used to display controller count in Roon extension status
     pub fn new_configured(bus: SharedBus, base_url: String, knob_store: KnobStore) -> Self {
+        Self::new_configured_with_runtime(bus, base_url, knob_store, None)
+    }
+
+    /// Compose Roon with the private reliable command/projection lanes while keeping every public
+    /// HTTP/MCP route exactly as it is.
+    pub fn new_configured_with_runtime(
+        bus: SharedBus,
+        base_url: String,
+        knob_store: KnobStore,
+        runtime_bridge: Option<Arc<RoonRuntimeBridge>>,
+    ) -> Self {
         Self {
             state: Arc::new(RwLock::new(RoonState::default())),
             bus,
@@ -858,6 +1102,7 @@ impl RoonAdapter {
             base_url: Arc::new(RwLock::new(Some(base_url))),
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             knob_store: Some(knob_store),
+            runtime_bridge,
         }
     }
 
@@ -942,6 +1187,7 @@ impl RoonAdapter {
             base_url,
             shutdown,
             self.knob_store.clone(),
+            self.runtime_bridge.clone(),
             CoreConnect::Direct {
                 ip,
                 port: port.to_string(),
@@ -956,6 +1202,11 @@ impl RoonAdapter {
 
         // Cancel background tasks
         self.shutdown.read().await.cancel();
+
+        // The discovery/event-loop task may take time to observe cancellation. Clear the
+        // user-visible runtime cache synchronously so an explicit disable cannot continue to
+        // report a connected Core and stale zones during that shutdown window.
+        clear_roon_runtime_state(&self.state).await;
 
         // Reset started flag so we can restart later
         self.started.store(false, Ordering::SeqCst);
@@ -2030,15 +2281,45 @@ impl AdapterLogic for RoonAdapter {
                 .ok_or_else(|| anyhow::anyhow!("Roon base_url not configured"))?
         };
 
-        run_roon_loop(
+        // Roon callbacks are the provider's authoritative state observation.  Register one
+        // endpoint for transport/volume writes before consuming that callback stream; it waits
+        // for a matching full-zone callback rather than manufacturing a readback response.
+        let command_shutdown = ctx.shutdown.child_token();
+        let command_join = self.runtime_bridge.as_ref().and_then(|bridge| {
+            match bridge.commands().register_provider("roon", 16) {
+                Ok(endpoint) => {
+                    let adapter = self.clone();
+                    let bridge = bridge.clone();
+                    let shutdown = command_shutdown.clone();
+                    Some(tokio::spawn(async move {
+                        run_roon_command_endpoint(adapter, endpoint, shutdown, bridge).await;
+                    }))
+                }
+                Err(error) => {
+                    tracing::error!(?error, "Roon reliable endpoint registration failed");
+                    None
+                }
+            }
+        });
+
+        let result = run_roon_loop(
             self.state.clone(),
             ctx.bus,
             base_url,
-            ctx.shutdown,
+            ctx.shutdown.clone(),
             self.knob_store.clone(),
+            self.runtime_bridge.clone(),
             CoreConnect::Discovery,
         )
-        .await
+        .await;
+        command_shutdown.cancel();
+        if let Some(join) = command_join {
+            if let Err(error) = join.await {
+                tracing::warn!(%error, "Roon reliable command endpoint failed to join");
+            }
+        }
+        clear_roon_runtime_state(&self.state).await;
+        result
     }
 
     async fn handle_command(
@@ -2082,6 +2363,208 @@ impl AdapterLogic for RoonAdapter {
                 error: Some(e.to_string()),
             }),
         }
+    }
+}
+
+/// Consume Roon's provider endpoint.  `transport.control` and `change_volume` only establish
+/// that a command was sent to the Core; the confirmed result is a subsequent full-zone callback
+/// committed through [`RoonRuntimeBridge`].  Roon's callback has no request id, so this worker
+/// deliberately holds the provider lane until its matching observation arrives or times out.
+async fn run_roon_command_endpoint(
+    adapter: RoonAdapter,
+    mut endpoint: CommandEndpoint,
+    shutdown: CancellationToken,
+    bridge: Arc<RoonRuntimeBridge>,
+) {
+    loop {
+        let work = tokio::select! {
+            _ = shutdown.cancelled() => break,
+            work = endpoint.recv() => work,
+        };
+        let Some(work) = work else { break };
+        let permit = match work.begin_dispatch() {
+            Ok(permit) => permit,
+            Err(_) => continue,
+        };
+        let command_id = permit.id();
+        let target = permit.request().target.clone();
+        let confirm_by = permit.request().deadlines.confirm_by;
+        let command = permit.request().command.clone();
+        // Arm before native I/O: the Core is allowed to notify immediately after accepting a
+        // command, and arming afterwards would create a real race that looks like a timeout.
+        let expectation = match roon_expectation(&adapter, target.raw_id(), &command).await {
+            Ok(expectation) => expectation,
+            Err(error) => {
+                permit.complete_native(NativeResult::Failed(error.to_string()));
+                continue;
+            }
+        };
+        let mut observed = match bridge.arm(target.clone(), command_id, expectation).await {
+            Ok(observed) => observed,
+            Err(error) => {
+                permit.complete_native(NativeResult::Failed(error.to_string()));
+                continue;
+            }
+        };
+        let native = match command {
+            RuntimeCommand::Control(command) => {
+                execute_roon_runtime_command(&adapter, target.raw_id(), command).await
+            }
+            RuntimeCommand::Hqplayer(_) => Err(anyhow::anyhow!(
+                "HQPlayer runtime command routed to Roon endpoint"
+            )),
+        };
+        if let Err(error) = native {
+            bridge.disarm(command_id).await;
+            permit.complete_native(NativeResult::Failed(error.to_string()));
+            continue;
+        }
+        permit.complete_native(NativeResult::Accepted);
+
+        // The command ledger independently transitions this command to Indeterminate at the same
+        // deadline.  This await only keeps later provider writes out of Roon's uncorrelatable
+        // callback window; it never turns a timeout into a failed native operation.
+        match timeout_at(confirm_by, &mut observed).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => tracing::warn!(
+                command_id = command_id.get(),
+                "Roon command observation waiter closed before its projection committed"
+            ),
+            Err(_) => {
+                bridge.disarm(command_id).await;
+                tracing::debug!(
+                    command_id = command_id.get(),
+                    "Roon command remains indeterminate until a later Core observation arrives"
+                );
+            }
+        }
+    }
+}
+
+async fn roon_expectation(
+    adapter: &RoonAdapter,
+    zone_id: &str,
+    command: &RuntimeCommand,
+) -> Result<RoonObservationExpectation> {
+    let zone = adapter
+        .get_zone(zone_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Zone not found: {zone_id}"))?;
+    match command {
+        RuntimeCommand::Control(Command::Play) => {
+            Ok(RoonObservationExpectation::Playback(PlaybackState::Playing))
+        }
+        RuntimeCommand::Control(Command::Pause) => {
+            Ok(RoonObservationExpectation::Playback(PlaybackState::Paused))
+        }
+        RuntimeCommand::Control(Command::Stop) => {
+            Ok(RoonObservationExpectation::Playback(PlaybackState::Stopped))
+        }
+        RuntimeCommand::Control(Command::PlayPause) => {
+            let expected = if PlaybackState::from(zone.state.as_str()) == PlaybackState::Playing {
+                PlaybackState::Paused
+            } else {
+                PlaybackState::Playing
+            };
+            Ok(RoonObservationExpectation::Playback(expected))
+        }
+        RuntimeCommand::Control(Command::Next) => {
+            let previous = zone.now_playing.map(|now_playing| {
+                (
+                    now_playing.title,
+                    now_playing.artist,
+                    now_playing.album,
+                    now_playing.image_key,
+                )
+            });
+            Ok(RoonObservationExpectation::TrackChanged(previous))
+        }
+        RuntimeCommand::Control(Command::Previous) => {
+            let track = zone.now_playing.as_ref().map(|now_playing| {
+                (
+                    now_playing.title.clone(),
+                    now_playing.artist.clone(),
+                    now_playing.album.clone(),
+                    now_playing.image_key.clone(),
+                )
+            });
+            let seek_position = zone
+                .now_playing
+                .as_ref()
+                .and_then(|now_playing| now_playing.seek_position.map(|position| position as f64));
+            Ok(RoonObservationExpectation::PreviousApplied {
+                track,
+                seek_position,
+            })
+        }
+        RuntimeCommand::Control(Command::VolumeAbsolute {
+            value,
+            output_id: None,
+        }) => {
+            let output = zone
+                .outputs
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("Zone has no outputs"))?;
+            let (min, max) = get_volume_range(Some(output));
+            Ok(RoonObservationExpectation::Volume(clamp(*value, min, max)))
+        }
+        RuntimeCommand::Control(Command::VolumeRelative {
+            delta,
+            output_id: None,
+        }) => {
+            let output = zone
+                .outputs
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("Zone has no outputs"))?;
+            let volume = output
+                .volume
+                .as_ref()
+                .and_then(|volume| volume.value)
+                .ok_or_else(|| anyhow::anyhow!("Zone volume is unavailable"))?;
+            let (min, max) = get_volume_range(Some(output));
+            let delta = clamp(*delta, -MAX_RELATIVE_STEP, MAX_RELATIVE_STEP);
+            Ok(RoonObservationExpectation::Volume(clamp(
+                volume + delta,
+                min,
+                max,
+            )))
+        }
+        RuntimeCommand::Control(_) | RuntimeCommand::Hqplayer(_) => {
+            anyhow::bail!("Roon command has no authoritative observation predicate")
+        }
+    }
+}
+
+async fn execute_roon_runtime_command(
+    adapter: &RoonAdapter,
+    zone_id: &str,
+    command: Command,
+) -> Result<()> {
+    match command {
+        Command::Play => adapter.control(zone_id, "play").await,
+        Command::Pause => adapter.control(zone_id, "pause").await,
+        Command::PlayPause => adapter.control(zone_id, "play_pause").await,
+        Command::Stop => adapter.control(zone_id, "stop").await,
+        Command::Next => adapter.control(zone_id, "next").await,
+        Command::Previous => adapter.control(zone_id, "previous").await,
+        Command::VolumeAbsolute {
+            value,
+            output_id: None,
+        } => adapter.change_volume(zone_id, value, false).await,
+        Command::VolumeRelative {
+            delta,
+            output_id: None,
+        } => adapter.change_volume(zone_id, delta, true).await,
+        Command::Mute { .. }
+        | Command::MuteToggle { .. }
+        | Command::Seek { .. }
+        | Command::SeekRelative { .. }
+        | Command::Shuffle { .. }
+        | Command::Repeat { .. }
+        | Command::VolumeAbsolute { .. }
+        | Command::VolumeRelative { .. } => anyhow::bail!(
+            "Roon command was not resolved to a supported native operation before dispatch"
+        ),
     }
 }
 
@@ -2224,6 +2707,7 @@ async fn run_roon_loop(
     base_url: String,
     shutdown: CancellationToken,
     knob_store: Option<KnobStore>,
+    runtime_bridge: Option<Arc<RoonRuntimeBridge>>,
     connect: CoreConnect,
 ) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
@@ -2314,6 +2798,7 @@ async fn run_roon_loop(
     let shutdown_for_events = shutdown.clone();
     let restart_needed_for_events = restart_needed.clone();
     let knob_store_for_events = knob_store;
+    let runtime_bridge_for_events = runtime_bridge;
     handles.spawn(async move {
         loop {
             // Use select! to allow cancellation and handle channel close
@@ -2415,18 +2900,27 @@ async fn run_roon_loop(
                             .await;
                     }
 
-                    {
-                        let mut s = state_for_events.write().await;
-                        s.connected = false;
-                        s.core_name = None;
-                        s.core_version = None;
-                        s.zones.clear();
-                        s.transport = None;
-                        s.image = None;
-                        s.browse = None;
-                        s.pending_images.clear();
-                        s.pending_browses.clear();
-                        s.pending_loads.clear();
+                    // Losing the Core invalidates every zone it supplied. Capture their
+                    // prefixed identities before clearing the operational cache, then retire
+                    // the canonical projection. A later reconnect commonly reuses the same
+                    // zone IDs, so merely clearing local state leaves controllers displaying
+                    // controllable ghosts until some unrelated update happens.
+                    let removed_zone_ids: Vec<PrefixedZoneId> = state_for_events
+                        .read()
+                        .await
+                        .zones
+                        .keys()
+                        .map(PrefixedZoneId::roon)
+                        .collect();
+                    clear_roon_runtime_state(&state_for_events).await;
+                    for zone_id in removed_zone_ids {
+                        if let Some(bridge) = runtime_bridge_for_events.as_ref() {
+                            if let Err(error) = bridge.publish_removed(zone_id).await {
+                                tracing::warn!(%error, "Roon Core-loss projection removal failed");
+                            }
+                        } else {
+                            bus_for_events.publish(BusEvent::ZoneRemoved { zone_id });
+                        }
                     }
 
                     // Publish disconnected event
@@ -2455,8 +2949,13 @@ async fn run_roon_loop(
                         }
                     }
                     Parsed::Zones(zones) => {
-                        let mut s = state_for_events.write().await;
-                        for zone in zones {
+                        // Roon sends full zone facts here. In the reliable composition they are
+                        // the one projection source; legacy partial BusEvents are deliberately
+                        // suppressed so the aggregator cannot merge two independent lanes.
+                        let complete_zones = {
+                            let mut s = state_for_events.write().await;
+                            let mut complete_zones = Vec::new();
+                            for zone in zones {
                             tracing::debug!(
                                 "Zone update: {} ({}) - now_playing: {:?}",
                                 zone.display_name,
@@ -2480,7 +2979,7 @@ async fn run_roon_loop(
                                 .is_some();
                             let gained_volume = !old_had_volume && new_has_volume;
 
-                            if is_new || gained_volume {
+                            if runtime_bridge_for_events.is_none() && (is_new || gained_volume) {
                                 // New zone or zone gained volume - emit ZoneDiscovered
                                 // This ensures aggregator gets the full zone with volume_control
                                 if gained_volume {
@@ -2491,7 +2990,7 @@ async fn run_roon_loop(
                                 }
                                 let bus_zone = roon_zone_to_bus_zone(&converted);
                                 bus_for_events.publish(BusEvent::ZoneDiscovered { zone: bus_zone });
-                            } else {
+                            } else if runtime_bridge_for_events.is_none() {
                                 // Existing zone - emit ZoneUpdated
                                 // Use prefixed zone_id to match ZoneDiscovered format
                                 let prefixed_zone_id = PrefixedZoneId::roon(&converted.zone_id);
@@ -2505,7 +3004,8 @@ async fn run_roon_loop(
                             // Publish now playing changed if present
                             // Use prefixed zone_id to match aggregator's stored format
                             let prefixed_zone_id = PrefixedZoneId::roon(&converted.zone_id);
-                            if let Some(ref np) = converted.now_playing {
+                            if runtime_bridge_for_events.is_none() {
+                                if let Some(ref np) = converted.now_playing {
                                 bus_for_events.publish(BusEvent::NowPlayingChanged {
                                     zone_id: prefixed_zone_id.clone(),
                                     title: Some(np.title.clone()),
@@ -2513,9 +3013,11 @@ async fn run_roon_loop(
                                     album: Some(np.album.clone()),
                                     image_key: np.image_key.clone(),
                                 });
+                                }
                             }
 
                             // Publish volume changed for each output with changed volume
+                            if runtime_bridge_for_events.is_none() {
                             for output in &converted.outputs {
                                 if let Some(ref vol) = output.volume {
                                     let old_vol = old_zone.as_ref().and_then(|oz| {
@@ -2551,40 +3053,84 @@ async fn run_roon_loop(
                                     }
                                 }
                             }
+                            }
 
-                            s.zones.insert(zone.zone_id.clone(), converted);
+                            s.zones.insert(zone.zone_id.clone(), converted.clone());
+                            if runtime_bridge_for_events.is_some() {
+                                complete_zones.push(roon_zone_to_bus_zone(&converted));
+                            }
+                            }
+                            complete_zones
+                        };
+                        if let Some(bridge) = runtime_bridge_for_events.as_ref() {
+                            for zone in complete_zones {
+                                if let Err(error) = bridge.publish_zone(zone).await {
+                                    tracing::warn!(%error, "Roon zone callback could not enter reliable projection");
+                                }
+                            }
                         }
                     }
                     Parsed::ZonesSeek(zones_seek) => {
-                        let mut s = state_for_events.write().await;
-                        for seek in zones_seek {
-                            if let Some(zone) = s.zones.get_mut(&seek.zone_id) {
+                        let complete_zones = {
+                            let mut s = state_for_events.write().await;
+                            let mut complete_zones = Vec::new();
+                            for seek in zones_seek {
+                                if let Some(zone) = s.zones.get_mut(&seek.zone_id) {
                                 if let Some(np) = &mut zone.now_playing {
                                     np.seek_position = seek.seek_position;
 
                                     // Publish seek position changed
                                     // Use prefixed zone_id to match aggregator's stored format
+                                    if runtime_bridge_for_events.is_none() {
                                     if let Some(pos) = seek.seek_position {
                                         bus_for_events.publish(BusEvent::SeekPositionChanged {
                                             zone_id: PrefixedZoneId::roon(&seek.zone_id),
                                             position: pos,
                                         });
                                     }
+                                    } else {
+                                        complete_zones.push(roon_zone_to_bus_zone(zone));
+                                    }
+                                }
+                            }
+                            }
+                            complete_zones
+                        };
+                        if let Some(bridge) = runtime_bridge_for_events.as_ref() {
+                            for zone in complete_zones {
+                                if let Err(error) = bridge.publish_zone(zone).await {
+                                    tracing::warn!(%error, "Roon seek callback could not enter reliable projection");
                                 }
                             }
                         }
                     }
                     Parsed::ZonesRemoved(zone_ids) => {
-                        let mut s = state_for_events.write().await;
-                        for zone_id in zone_ids {
+                        let removed_zones = {
+                            let mut s = state_for_events.write().await;
+                            let mut removed_zones = Vec::new();
+                            for zone_id in zone_ids {
                             tracing::debug!("Zone removed: {}", zone_id);
                             s.zones.remove(&zone_id);
 
                             // Publish zone removed event
                             // Use prefixed zone_id to match aggregator's stored format
-                            bus_for_events.publish(BusEvent::ZoneRemoved {
-                                zone_id: PrefixedZoneId::roon(&zone_id),
-                            });
+                            let prefixed_zone_id = PrefixedZoneId::roon(&zone_id);
+                            if runtime_bridge_for_events.is_none() {
+                                bus_for_events.publish(BusEvent::ZoneRemoved {
+                                    zone_id: prefixed_zone_id,
+                                });
+                            } else {
+                                removed_zones.push(prefixed_zone_id);
+                            }
+                            }
+                            removed_zones
+                        };
+                        if let Some(bridge) = runtime_bridge_for_events.as_ref() {
+                            for zone_id in removed_zones {
+                                if let Err(error) = bridge.publish_removed(zone_id).await {
+                                    tracing::warn!(%error, "Roon removal callback could not enter reliable projection");
+                                }
+                            }
                         }
                     }
                     // Issue #416 checked these two arms and deliberately left them
@@ -2910,6 +3456,177 @@ mod tests {
             bus_zone.volume_control.is_none(),
             "should be None when output has no volume"
         );
+    }
+
+    fn test_bus_zone_with_track(title: &str, seek_position: f64) -> BusZone {
+        let mut zone =
+            roon_zone_to_bus_zone(&make_test_zone("output", Some(5.0), Some(0.0), Some(100.0)));
+        zone.now_playing = Some(BusNowPlaying {
+            title: title.to_string(),
+            artist: "John Coltrane".to_string(),
+            album: "Blue Train".to_string(),
+            image_key: Some("cover".to_string()),
+            seek_position: Some(seek_position),
+            duration: Some(645.0),
+            metadata: None,
+        });
+        zone
+    }
+
+    #[test]
+    fn roon_previous_confirms_same_track_restart_or_track_change() {
+        let previous = RoonObservationExpectation::PreviousApplied {
+            track: Some((
+                "Blue Train".to_string(),
+                "John Coltrane".to_string(),
+                "Blue Train".to_string(),
+                Some("cover".to_string()),
+            )),
+            seek_position: Some(37.0),
+        };
+
+        assert!(previous.matches(&test_bus_zone_with_track("Blue Train", 0.0)));
+        assert!(!previous.matches(&test_bus_zone_with_track("Blue Train", 20.0)));
+        assert!(previous.matches(&test_bus_zone_with_track("Moment's Notice", 0.0)));
+    }
+
+    #[test]
+    fn roon_next_still_requires_a_track_identity_change() {
+        let next = RoonObservationExpectation::TrackChanged(Some((
+            "Blue Train".to_string(),
+            "John Coltrane".to_string(),
+            "Blue Train".to_string(),
+            Some("cover".to_string()),
+        )));
+
+        assert!(!next.matches(&test_bus_zone_with_track("Blue Train", 0.0)));
+        assert!(next.matches(&test_bus_zone_with_track("Moment's Notice", 0.0)));
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_clears_cached_roon_connection_state() {
+        let adapter = RoonAdapter::new_disconnected(crate::bus::create_bus());
+        {
+            let mut state = adapter.state.write().await;
+            state.connected = true;
+            state.core_name = Some("nuc14".to_string());
+            state.core_version = Some("test".to_string());
+            state.zones.insert(
+                "test-zone".to_string(),
+                make_test_zone("output", Some(5.0), Some(0.0), Some(100.0)),
+            );
+        }
+
+        adapter.stop_internal().await;
+
+        let cleared = adapter.state.read().await;
+        assert!(!cleared.connected);
+        assert!(cleared.core_name.is_none());
+        assert!(cleared.core_version.is_none());
+        assert!(cleared.zones.is_empty());
+    }
+
+    /// A Roon control has no synchronous state readback.  Its confirmation must
+    /// therefore wait for the Core's subsequent full-zone callback, and that
+    /// callback must name the same zone -- a callback for another zone cannot
+    /// accidentally confirm the write.
+    #[tokio::test]
+    async fn roon_runtime_confirms_only_the_matching_authoritative_zone_callback() {
+        use crate::bus::runtime::{
+            build_runtime, CommandDeadlines, CommandLane, CommandRequest, CommandStatus,
+            NativeResult, ProjectionCommit, ProjectionCommitter, RuntimeCommand,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        #[derive(Default)]
+        struct Committer(AtomicU64);
+
+        #[async_trait::async_trait]
+        impl ProjectionCommitter for Committer {
+            async fn commit_projection(
+                &self,
+                _update: crate::bus::runtime::ProjectionUpdate,
+            ) -> ProjectionCommit {
+                ProjectionCommit::Committed {
+                    revision: self.0.fetch_add(1, Ordering::Relaxed) + 1,
+                }
+            }
+        }
+
+        let parts = build_runtime(Arc::new(Committer::default()), 2, 4);
+        let bridge =
+            RoonRuntimeBridge::new(parts.projection_ingress.clone(), parts.commands.clone());
+        let actor = tokio::spawn(parts.projection_actor.run());
+        let mut endpoint = parts
+            .commands
+            .register_provider("roon", 1)
+            .expect("the test owns the Roon endpoint");
+        let now = tokio::time::Instant::now();
+        let mut ticket = parts
+            .commands
+            .submit(CommandRequest {
+                target: PrefixedZoneId::roon("target"),
+                command: RuntimeCommand::Control(Command::Play),
+                correlation_id: None,
+                lane: CommandLane::Interactive,
+                deadlines: CommandDeadlines {
+                    dispatch_by: now + Duration::from_secs(1),
+                    confirm_by: now + Duration::from_secs(5),
+                },
+            })
+            .await
+            .expect("command admission");
+        let work = endpoint.recv().await.expect("admitted work");
+        let permit = work.begin_dispatch().expect("dispatch permit");
+        let command_id = permit.id();
+        let mut observed = bridge
+            .arm(
+                PrefixedZoneId::roon("target"),
+                command_id,
+                RoonObservationExpectation::Playback(PlaybackState::Playing),
+            )
+            .await
+            .expect("first command can arm the confirmation bridge");
+        permit.complete_native(NativeResult::Accepted);
+
+        bridge
+            .publish_zone(roon_zone_to_bus_zone(&make_test_zone(
+                "other-output",
+                Some(20.0),
+                Some(0.0),
+                Some(100.0),
+            )))
+            .await
+            .expect("unrelated callback still projects");
+        assert_eq!(ticket.status(), CommandStatus::AwaitingProjection);
+        assert!(
+            observed.try_recv().is_err(),
+            "wrong-zone callback must not confirm"
+        );
+
+        let mut target_zone = make_test_zone("target-output", Some(25.0), Some(0.0), Some(100.0));
+        target_zone.zone_id = "target".to_string();
+        bridge
+            .publish_zone(roon_zone_to_bus_zone(&target_zone))
+            .await
+            .expect("same-zone callback with the wrong state still projects");
+        assert_eq!(ticket.status(), CommandStatus::AwaitingProjection);
+        assert!(
+            observed.try_recv().is_err(),
+            "same-zone callback without the requested effect must not confirm"
+        );
+
+        target_zone.state = "playing".to_string();
+        bridge
+            .publish_zone(roon_zone_to_bus_zone(&target_zone))
+            .await
+            .expect("matching state callback projects");
+        observed.await.expect("matching callback acknowledgement");
+        assert!(matches!(
+            ticket.wait_for_observable_result().await,
+            CommandStatus::Confirmed { .. }
+        ));
+        actor.abort();
     }
 
     // =========================================================================

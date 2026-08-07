@@ -148,6 +148,11 @@ impl MockLmsServer {
             .insert(playerid.to_string(), MockPlayer::new(playerid, name));
     }
 
+    /// Remove a player from the authoritative `players` inventory.
+    pub async fn remove_player(&self, playerid: &str) {
+        self.state.write().await.players.remove(playerid);
+    }
+
     /// Set player state (play/pause/stop)
     pub async fn set_mode(&self, playerid: &str, mode: &str) {
         let mut state = self.state.write().await;
@@ -333,6 +338,31 @@ async fn handle_jsonrpc(
             let mut state = state.write().await;
             if let Some(player) = state.players.get_mut(player_id) {
                 player.mode = "stop".to_string();
+            }
+            return Ok(Json(JsonRpcResponse {
+                id: request.id,
+                result: json!({}),
+            }));
+        }
+        "mixer"
+            if commands.get(1).and_then(Value::as_str) == Some("volume")
+                && commands.get(2).is_some() =>
+        {
+            let requested = commands.get(2).expect("guarded volume value");
+            let rendered = requested
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| requested.to_string());
+            let relative = rendered.starts_with('+') || rendered.starts_with('-');
+            let value = rendered.parse::<i32>().unwrap_or_default();
+            let mut state = state.write().await;
+            if let Some(player) = state.players.get_mut(player_id) {
+                player.volume = if relative {
+                    player.volume.saturating_add(value)
+                } else {
+                    value
+                }
+                .clamp(0, 100);
             }
             return Ok(Json(JsonRpcResponse {
                 id: request.id,
