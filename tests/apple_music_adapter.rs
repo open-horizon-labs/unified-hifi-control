@@ -83,6 +83,8 @@ fn snapshot() -> MusicKitSnapshot {
         }),
         volume: Some(0.75),
         is_muted: false,
+        repeat_mode: None,
+        shuffle: None,
     }
 }
 

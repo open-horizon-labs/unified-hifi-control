@@ -121,9 +121,12 @@ different item.
 ## Operations
 
 The initial operation names are `catalog_search`, `library`, `playlists`,
-`playlist_tracks`, `recent`, `recommendations`, `play_ref`, `queue_plan`,
-`playlist_create`, `playlist_add`, `playlist_update`, `favorite_add`,
-`rating_set`, and `context`. Each operation has its own capability result.
+`playlist_tracks`, `recent`, `recommendations`, `play_uri`, `queue_uri`,
+`queue_plan`, `queue_read`, `playlist_create`, `playlist_add`,
+`playlist_update`, `favorite_add`, `rating_set`, and `context`. Each operation
+has its own capability result. `queue_read` may return `unsupported` for
+SystemMusicPlayer because MusicKit exposes the current entry but not a readable
+native queue; UHC's listening plan remains the authoritative UHC-owned intent.
 
 `playlist_remove`, arbitrary reorder/delete, `favorite_remove` (unfavorite),
 and broad library removal remain refused until Apple documents a safe operation

@@ -22,6 +22,11 @@ The content/queue methods are exposed through UHC's approved bridge transport.
 Their queue, route, artwork, volume, and now-playing behavior remains subject
 to physical-device acceptance (#465). Apple identifiers stay inside the
 companion; results cross the bridge only as owner-scoped opaque references.
+SystemMusicPlayer exposes `currentEntry` and supports replacing/inserting queue
+items, but does not expose a readable entries collection. Accordingly,
+`queue_read` returns an explicit `unsupported/queue_visibility_unavailable`
+outcome rather than inventing provider queue state; UHC's listening plan remains
+separate and truthful.
 
 The package also exposes narrowly scoped native mutations for confirmed
 playlist creation, metadata editing, and appending an exact song. It

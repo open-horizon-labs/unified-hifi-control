@@ -1107,6 +1107,8 @@ mod tests {
             track: None,
             volume: Some(0.5),
             is_muted: false,
+            repeat_mode: None,
+            shuffle: None,
         }
     }
 

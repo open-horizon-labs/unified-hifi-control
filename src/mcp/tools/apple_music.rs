@@ -285,6 +285,23 @@ pub async fn handle_apple_music(
         None
     };
 
+    // Feedback is UHC-owned adaptation input, not a prerequisite for a
+    // provider-side MusicKit mutation. Persist the explicit user signal first
+    // so an unavailable companion or unsupported provider operation cannot
+    // silently discard the learning signal.
+    let persisted_feedback = if let Some(record) = feedback_record {
+        match state.apple_feedback.record(record).await {
+            Ok(record) => Some(record),
+            Err(error) => {
+                return Envelope::write("hifi_apple_music", "feedback").failed(format!(
+                    "Apple Music feedback could not be persisted: {error}"
+                ))
+            }
+        }
+    } else {
+        None
+    };
+
     if args.action == "queue_plan" {
         let Some(zone_id) = args.zone_id.as_deref() else {
             return Envelope::write("hifi_apple_music", "queue_plan").refused(
@@ -399,7 +416,10 @@ pub async fn handle_apple_music(
     if matches!(args.action.as_str(), "queue_append" | "play_next") {
         let Some(zone_id) = args.zone_id.as_deref() else {
             return Envelope::write("hifi_apple_music", &args.action).refused(
-                format!("{} requires an applemusic execution-owner zone_id.", args.action),
+                format!(
+                    "{} requires an applemusic execution-owner zone_id.",
+                    args.action
+                ),
                 crate::mcp::envelope::Refusal::invalid_parameter(
                     "zone_id",
                     &["applemusic:<companion>"],
@@ -418,15 +438,26 @@ pub async fn handle_apple_music(
             );
         }
         let refs = if args.action == "play_next" {
-            args.uri.clone().or_else(|| args.id.clone()).into_iter().collect()
+            args.uri
+                .clone()
+                .or_else(|| args.id.clone())
+                .into_iter()
+                .collect()
         } else {
             args.items.clone().unwrap_or_default()
         };
         if refs.is_empty() || (args.action == "play_next" && refs.len() != 1) {
             return Envelope::write("hifi_apple_music", &args.action).refused(
-                format!("{} requires one or more opaque refs returned by hifi_search.", args.action),
+                format!(
+                    "{} requires one or more opaque refs returned by hifi_search.",
+                    args.action
+                ),
                 crate::mcp::envelope::Refusal::invalid_parameter(
-                    if args.action == "play_next" { "uri" } else { "items" },
+                    if args.action == "play_next" {
+                        "uri"
+                    } else {
+                        "items"
+                    },
                     &["opaque Apple Music refs returned by hifi_search"],
                     "Search first, then use the refs for this execution owner.",
                 ),
@@ -436,13 +467,20 @@ pub async fn handle_apple_music(
         let mut plan_items = Vec::with_capacity(refs.len());
         let mut handles = Vec::with_capacity(refs.len());
         for token in &refs {
-            let Some(crate::mcp::refs::RefTarget::AppleMusic { title, companion_id, handle }) =
-                state.mcp_refs.resolve(token).await
+            let Some(crate::mcp::refs::RefTarget::AppleMusic {
+                title,
+                companion_id,
+                handle,
+            }) = state.mcp_refs.resolve(token).await
             else {
                 return Envelope::write("hifi_apple_music", &args.action).refused(
                     "The Apple Music ref is unknown, expired, or from another provider.",
                     crate::mcp::envelope::Refusal::UnknownTarget {
-                        parameter: if args.action == "play_next" { "uri" } else { "items" },
+                        parameter: if args.action == "play_next" {
+                            "uri"
+                        } else {
+                            "items"
+                        },
                         discover_with: "hifi_search",
                         detail: "Search again for a fresh owner-scoped ref.".to_string(),
                     },
@@ -452,31 +490,49 @@ pub async fn handle_apple_music(
                 return Envelope::write("hifi_apple_music", &args.action).refused(
                     "The Apple Music ref belongs to a different execution owner.",
                     crate::mcp::envelope::Refusal::InvalidParameter {
-                        parameter: if args.action == "play_next" { "uri" } else { "items" },
-                        accepted: vec!["refs minted for this applemusic:<companion> zone".to_string()],
+                        parameter: if args.action == "play_next" {
+                            "uri"
+                        } else {
+                            "items"
+                        },
+                        accepted: vec![
+                            "refs minted for this applemusic:<companion> zone".to_string()
+                        ],
                         detail: "Search against the selected execution owner first.".to_string(),
                     },
                 );
             }
-            plan_items.push(crate::mcp::listening_plan::ListeningPlanItem { reference: token.clone(), title });
+            plan_items.push(crate::mcp::listening_plan::ListeningPlanItem {
+                reference: token.clone(),
+                title,
+            });
             handles.push(handle);
         }
         let plan = if args.action == "play_next" {
-            state.listening_plans.play_next(zone_id, plan_items[0].clone()).await
+            state
+                .listening_plans
+                .play_next(zone_id, plan_items[0].clone())
+                .await
         } else {
             state.listening_plans.append(zone_id, plan_items).await
         };
         let plan = match plan {
             Ok(plan) => plan,
-            Err(error) => return Envelope::write("hifi_apple_music", &args.action).failed(error.to_string()),
+            Err(error) => {
+                return Envelope::write("hifi_apple_music", &args.action).failed(error.to_string())
+            }
         };
         let mut accepted = 0usize;
         for handle in handles {
-            if let Err(error) = state.adapter_registry.library_content(
-                "applemusic",
-                "queue_uri",
-                &json!({"zone_id": zone_id, "uri": handle}),
-            ).await {
+            if let Err(error) = state
+                .adapter_registry
+                .library_content(
+                    "applemusic",
+                    "queue_uri",
+                    &json!({"zone_id": zone_id, "uri": handle}),
+                )
+                .await
+            {
                 return Ok(Envelope::write("hifi_apple_music", &args.action).json_result(&json!({
                     "plan": plan,
                     "provider": {"outcome": "refused", "accepted": accepted, "detail": error.to_string()}
@@ -484,10 +540,12 @@ pub async fn handle_apple_music(
             }
             accepted += 1;
         }
-        return Ok(Envelope::write("hifi_apple_music", &args.action).json_result(&json!({
-            "plan": plan,
-            "provider": {"outcome": "accepted", "accepted": accepted}
-        })));
+        return Ok(
+            Envelope::write("hifi_apple_music", &args.action).json_result(&json!({
+                "plan": plan,
+                "provider": {"outcome": "accepted", "accepted": accepted}
+            })),
+        );
     }
 
     let params = json!({
@@ -515,19 +573,16 @@ pub async fn handle_apple_music(
         .await
     {
         Ok(value) => {
-            if let Some(record) = feedback_record {
-                match state.apple_feedback.record(record).await {
-                    Ok(record) => {
-                        Ok(env.json_result(&json!({"companion": value, "feedback": record})))
-                    }
-                    Err(error) => env.failed(format!(
-                        "Apple Music feedback was applied but could not be persisted: {error}"
-                    )),
-                }
+            if let Some(record) = persisted_feedback {
+                Ok(env.json_result(&json!({"companion": value, "feedback": record})))
             } else {
                 Ok(env.json_result(&value))
             }
         }
-        Err(e) => env.failed(format!("Apple Music {} failed: {}", args.action, e)),
+        Err(error) if persisted_feedback.is_some() => Ok(env.json_result(&json!({
+            "feedback": persisted_feedback,
+            "provider": {"outcome": "refused", "detail": error.to_string()}
+        }))),
+        Err(error) => env.failed(format!("Apple Music {} failed: {}", args.action, error)),
     }
 }

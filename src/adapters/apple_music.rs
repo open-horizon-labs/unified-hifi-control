@@ -27,7 +27,8 @@ use crate::adapters::traits::{
     LibrarySearchResult,
 };
 use crate::bus::{
-    BusEvent, NowPlaying, PlaybackState, PrefixedZoneId, VolumeControl, VolumeScale, Zone,
+    BusEvent, NowPlaying, PlaybackState, PrefixedZoneId, RepeatMode, VolumeControl, VolumeScale,
+    Zone,
 };
 
 /// UHC adapter prefix for Apple Music zones.
@@ -148,6 +149,12 @@ pub struct MusicKitSnapshot {
     pub volume: Option<f32>,
     #[serde(default)]
     pub is_muted: bool,
+    /// Current repeat mode when the native player exposes it.
+    #[serde(default)]
+    pub repeat_mode: Option<RepeatMode>,
+    /// Current shuffle state when the native player exposes it.
+    #[serde(default)]
+    pub shuffle: Option<bool>,
 }
 
 /// Commands understood by the native companion.
@@ -163,6 +170,8 @@ pub enum MusicKitCommand {
     SetVolume { value: f32 },
     AdjustVolume { delta: f32 },
     SetMute { muted: bool },
+    SetRepeat { mode: RepeatMode },
+    SetShuffle { enabled: bool },
 }
 
 /// Request sent over a future in-process/paired companion transport.
@@ -282,8 +291,8 @@ impl AppleMusicAdapter {
             seek_position: track.position_seconds,
             duration: track.duration_seconds,
             metadata: None,
-            repeat_mode: None,
-            shuffle: None,
+            repeat_mode: snapshot.repeat_mode,
+            shuffle: snapshot.shuffle,
         });
         let volume_control = snapshot.volume.map(|value| VolumeControl {
             value: value * 100.0,
@@ -397,9 +406,8 @@ impl AppleMusicAdapter {
                 })
             }
             AdapterCommand::Mute(muted) => Ok(MusicKitCommand::SetMute { muted }),
-            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
-                bail!("Apple Music repeat and shuffle are not implemented by the adapter")
-            }
+            AdapterCommand::SetRepeat(mode) => Ok(MusicKitCommand::SetRepeat { mode }),
+            AdapterCommand::SetShuffle(enabled) => Ok(MusicKitCommand::SetShuffle { enabled }),
         }
     }
 
@@ -717,6 +725,8 @@ mod tests {
             track: None,
             volume: Some(1.5),
             is_muted: false,
+            repeat_mode: None,
+            shuffle: None,
         };
         assert!(AppleMusicAdapter::zone_from_snapshot(&snapshot).is_err());
         snapshot.volume = Some(0.5);
@@ -732,6 +742,8 @@ mod tests {
             track: None,
             volume: None,
             is_muted: false,
+            repeat_mode: None,
+            shuffle: None,
         };
         assert!(AppleMusicAdapter::zone_from_snapshot(&snapshot).is_err());
     }
@@ -751,5 +763,61 @@ mod tests {
             &serde_json::json!({"zone_id": "applemusic:iphone"})
         )
         .is_ok());
+    }
+
+    #[test]
+    fn repeat_and_shuffle_commands_use_the_shared_wire_vocabulary() {
+        assert_eq!(
+            serde_json::to_value(MusicKitCommand::SetRepeat {
+                mode: RepeatMode::All
+            })
+            .unwrap(),
+            serde_json::json!({"command": "set_repeat", "mode": "all"})
+        );
+        assert_eq!(
+            serde_json::to_value(MusicKitCommand::SetShuffle { enabled: true }).unwrap(),
+            serde_json::json!({"command": "set_shuffle", "enabled": true})
+        );
+        assert_eq!(
+            AppleMusicAdapter::command_for(AdapterCommand::SetRepeat(RepeatMode::One)).unwrap(),
+            MusicKitCommand::SetRepeat {
+                mode: RepeatMode::One
+            }
+        );
+        assert_eq!(
+            AppleMusicAdapter::command_for(AdapterCommand::SetShuffle(false)).unwrap(),
+            MusicKitCommand::SetShuffle { enabled: false }
+        );
+    }
+
+    #[test]
+    fn snapshot_projects_repeat_and_shuffle_into_now_playing() {
+        let mut snapshot = MusicKitSnapshot {
+            player_id: APPLICATION_PLAYER_ID.to_string(),
+            display_name: "Apple Music".to_string(),
+            state: MusicKitPlaybackState::Paused,
+            track: Some(MusicKitTrack {
+                title: "Song".to_string(),
+                artist: "Artist".to_string(),
+                album: "Album".to_string(),
+                artwork_url: None,
+                position_seconds: None,
+                duration_seconds: None,
+            }),
+            volume: None,
+            is_muted: false,
+            repeat_mode: Some(RepeatMode::One),
+            shuffle: Some(true),
+        };
+        let zone = AppleMusicAdapter::zone_from_snapshot(&snapshot).unwrap();
+        let now_playing = zone.now_playing.unwrap();
+        assert_eq!(now_playing.repeat_mode, Some(RepeatMode::One));
+        assert_eq!(now_playing.shuffle, Some(true));
+        snapshot.repeat_mode = None;
+        snapshot.shuffle = None;
+        let zone = AppleMusicAdapter::zone_from_snapshot(&snapshot).unwrap();
+        let now_playing = zone.now_playing.unwrap();
+        assert_eq!(now_playing.repeat_mode, None);
+        assert_eq!(now_playing.shuffle, None);
     }
 }

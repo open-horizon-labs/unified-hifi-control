@@ -179,12 +179,16 @@ public enum MusicKitWireCommand: Codable, Sendable, Equatable {
     case setVolume(value: Float)
     case adjustVolume(delta: Float)
     case setMute(muted: Bool)
+    case setRepeat(mode: MusicPlayer.RepeatMode)
+    case setShuffle(enabled: Bool)
 
     private enum CodingKeys: String, CodingKey {
         case command
         case value
         case delta
         case muted
+        case mode
+        case enabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -199,6 +203,14 @@ public enum MusicKitWireCommand: Codable, Sendable, Equatable {
         case "set_volume": self = .setVolume(value: try values.decode(Float.self, forKey: .value))
         case "adjust_volume": self = .adjustVolume(delta: try values.decode(Float.self, forKey: .delta))
         case "set_mute": self = .setMute(muted: try values.decode(Bool.self, forKey: .muted))
+        case "set_repeat":
+            switch try values.decode(String.self, forKey: .mode) {
+            case "off": self = .setRepeat(mode: .none)
+            case "one": self = .setRepeat(mode: .one)
+            case "all": self = .setRepeat(mode: .all)
+            default: throw BridgeClientError.invalidResponse
+            }
+        case "set_shuffle": self = .setShuffle(enabled: try values.decode(Bool.self, forKey: .enabled))
         default: throw BridgeClientError.invalidResponse
         }
     }
@@ -221,6 +233,21 @@ public enum MusicKitWireCommand: Codable, Sendable, Equatable {
         case let .setMute(muted):
             try values.encode("set_mute", forKey: .command)
             try values.encode(muted, forKey: .muted)
+        case let .setRepeat(mode):
+            try values.encode("set_repeat", forKey: .command)
+            try values.encode(Self.repeatWireValue(mode), forKey: .mode)
+        case let .setShuffle(enabled):
+            try values.encode("set_shuffle", forKey: .command)
+            try values.encode(enabled, forKey: .enabled)
+        }
+    }
+
+    private static func repeatWireValue(_ mode: MusicPlayer.RepeatMode) -> String {
+        switch mode {
+        case .none: "off"
+        case .one: "one"
+        case .all: "all"
+        @unknown default: "off"
         }
     }
 }
@@ -545,16 +572,20 @@ public struct MusicKitSnapshotPayload: Codable, Sendable {
     public let track: MusicKitTrackPayload?
     public let volume: Float?
     public let isMuted: Bool
+    public let repeatMode: String?
+    public let shuffle: Bool?
 
     public init(playerID: String, displayName: String, state: String,
                 track: MusicKitTrackPayload? = nil, volume: Float? = nil,
-                isMuted: Bool = false) {
+                isMuted: Bool = false, repeatMode: String? = nil, shuffle: Bool? = nil) {
         self.playerID = playerID
         self.displayName = displayName
         self.state = state
         self.track = track
         self.volume = volume
         self.isMuted = isMuted
+        self.repeatMode = repeatMode
+        self.shuffle = shuffle
     }
 
     enum CodingKeys: String, CodingKey {
@@ -564,6 +595,8 @@ public struct MusicKitSnapshotPayload: Codable, Sendable {
         case track
         case volume
         case isMuted = "is_muted"
+        case repeatMode = "repeat_mode"
+        case shuffle
     }
 }
 
@@ -645,6 +678,8 @@ public actor SystemMusicPlayerCompanion {
         case .previous: try await skipToPreviousItem()
         case .stop, .setVolume, .adjustVolume, .setMute:
             throw CompanionCommandError.notValidated(command)
+        case let .setRepeat(mode): player.state.repeatMode = mode
+        case let .setShuffle(enabled): player.state.shuffleMode = enabled ? .songs : .off
         }
     }
 
@@ -679,7 +714,9 @@ public actor SystemMusicPlayerCompanion {
             state: playbackState(player.state.playbackStatus),
             track: track,
             volume: nil,
-            isMuted: false
+            isMuted: false,
+            repeatMode: repeatWireValue(player.state.repeatMode),
+            shuffle: shuffleWireValue(player.state.shuffleMode)
         )
     }
 
@@ -698,6 +735,25 @@ public actor SystemMusicPlayerCompanion {
         // settles instead of emitting an undocumented value.
         case .seekingForward, .seekingBackward: "unknown"
         @unknown default: "unknown"
+        }
+    }
+
+    private func repeatWireValue(_ mode: MusicPlayer.RepeatMode?) -> String? {
+        guard let mode else { return nil }
+        switch mode {
+        case .none: return "off"
+        case .one: return "one"
+        case .all: return "all"
+        @unknown default: return nil
+        }
+    }
+
+    private func shuffleWireValue(_ mode: MusicPlayer.ShuffleMode?) -> Bool? {
+        guard let mode else { return nil }
+        switch mode {
+        case .off: return false
+        case .songs: return true
+        @unknown default: return nil
         }
     }
 
@@ -801,6 +857,18 @@ public actor SystemMusicPlayerCompanion {
     /// inside this actor; UHC receives only a companion-local opaque handle.
     public func executeContent(_ request: MusicKitContentCommand) async throws -> MusicKitContentResult {
         switch request.operation {
+        case "queue_read":
+            // SystemMusicPlayer intentionally exposes only currentEntry; unlike
+            // ApplicationMusicPlayer it has no readable entries collection.
+            // Never fabricate a queue from the local listening plan.
+            return MusicKitContentResult(
+                outcome: "unsupported",
+                error: MusicKitContentError(
+                    code: "queue_visibility_unavailable",
+                    message: "SystemMusicPlayer does not expose the provider queue for reading.",
+                    retryable: false
+                )
+            )
         case "catalog_search":
             let query = stringParam(request.params, "query") ?? ""
             let limit = intParam(request.params, "limit") ?? 25
