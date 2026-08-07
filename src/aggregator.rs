@@ -213,39 +213,52 @@ impl ZoneAggregator {
                     let state = {
                         let mut aggregate = self.state.write().await;
                         if let Some(zone) = aggregate.zones.get_mut(zone_id.as_str()) {
-                            // Preserve fields this compatibility event cannot carry when it describes
-                            // the same track as the canonical snapshot. A changed identity drops
-                            // metadata so details from the previous track cannot leak forward.
-                            let same_track = zone.now_playing.as_ref().is_some_and(|np| {
-                                title.as_deref().unwrap_or_default() == np.title
-                                    && artist.as_deref().unwrap_or_default() == np.artist
-                                    && album.as_deref().unwrap_or_default() == np.album
-                            });
-                            let (seek_position, duration, metadata, repeat_mode, shuffle) = zone
-                                .now_playing
-                                .as_ref()
-                                .map(|np| {
-                                    (
-                                        np.seek_position,
-                                        np.duration,
-                                        same_track.then(|| np.metadata.clone()).flatten(),
-                                        np.repeat_mode,
-                                        np.shuffle,
-                                    )
-                                })
-                                .unwrap_or((None, None, None, None, None));
-                            zone.now_playing = Some(NowPlaying {
-                                title: title.unwrap_or_default(),
-                                artist: artist.unwrap_or_default(),
-                                album: album.unwrap_or_default(),
-                                image_key,
-                                seek_position,
-                                duration,
-                                metadata,
-                                repeat_mode,
-                                shuffle,
-                            });
-                            (zone.state, zone.now_playing.clone())
+                            // All fields absent is the explicit clear sentinel emitted by
+                            // adapters whose complete snapshot reports no current track. Do
+                            // not turn it into an empty `Some(NowPlaying)`: that would retain a
+                            // phantom track in every API projection until the next song starts.
+                            if title.is_none()
+                                && artist.is_none()
+                                && album.is_none()
+                                && image_key.is_none()
+                            {
+                                zone.now_playing = None;
+                                (zone.state, None)
+                            } else {
+                                // Preserve fields this compatibility event cannot carry when it describes
+                                // the same track as the canonical snapshot. A changed identity drops
+                                // metadata so details from the previous track cannot leak forward.
+                                let same_track = zone.now_playing.as_ref().is_some_and(|np| {
+                                    title.as_deref().unwrap_or_default() == np.title
+                                        && artist.as_deref().unwrap_or_default() == np.artist
+                                        && album.as_deref().unwrap_or_default() == np.album
+                                });
+                                let (seek_position, duration, metadata, repeat_mode, shuffle) =
+                                    zone.now_playing
+                                        .as_ref()
+                                        .map(|np| {
+                                            (
+                                                np.seek_position,
+                                                np.duration,
+                                                same_track.then(|| np.metadata.clone()).flatten(),
+                                                np.repeat_mode,
+                                                np.shuffle,
+                                            )
+                                        })
+                                        .unwrap_or((None, None, None, None, None));
+                                zone.now_playing = Some(NowPlaying {
+                                    title: title.unwrap_or_default(),
+                                    artist: artist.unwrap_or_default(),
+                                    album: album.unwrap_or_default(),
+                                    image_key,
+                                    seek_position,
+                                    duration,
+                                    metadata,
+                                    repeat_mode,
+                                    shuffle,
+                                });
+                                (zone.state, zone.now_playing.clone())
+                            }
                         } else {
                             (crate::bus::PlaybackState::Unknown, None)
                         }

@@ -348,6 +348,18 @@ impl AppleMusicAdapter {
                         position: position as i64,
                     });
                 }
+            } else {
+                // A successful snapshot with no current entry is authoritative: the
+                // companion has observed an idle/empty player, so clear any track
+                // metadata retained by the aggregator rather than leaving the last
+                // song visible indefinitely.
+                bus.publish(BusEvent::NowPlayingChanged {
+                    zone_id: zone_id.clone(),
+                    title: None,
+                    artist: None,
+                    album: None,
+                    image_key: None,
+                });
             }
             if let Some(volume) = snapshot.volume {
                 bus.publish(BusEvent::VolumeChanged {

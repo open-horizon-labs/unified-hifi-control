@@ -239,6 +239,90 @@ async fn companion_snapshot_flows_through_aggregator_and_flushes_on_stop() {
 }
 
 #[tokio::test]
+async fn companion_snapshot_without_a_track_clears_stale_now_playing_metadata() {
+    let bus = create_bus();
+    let observations = PlaybackObservationHistory::new_for_test();
+    let aggregator = Arc::new(ZoneAggregator::new_with_observation_history(
+        bus.clone(),
+        observations,
+    ));
+    let aggregator_task = {
+        let aggregator = aggregator.clone();
+        tokio::spawn(async move { aggregator.run().await })
+    };
+
+    let mut cleared = snapshot();
+    cleared.state = MusicKitPlaybackState::Paused;
+    cleared.track = None;
+    let responses = Arc::new(Mutex::new(VecDeque::from([
+        Ok(vec![snapshot()]),
+        Ok(vec![cleared.clone()]),
+    ])));
+    let adapter = AppleMusicAdapter::with_companion(
+        bus.clone(),
+        Arc::new(FlakyCompanion {
+            snapshot: cleared.clone(),
+            responses,
+        }),
+        Duration::from_millis(5),
+    );
+    let shutdown = CancellationToken::new();
+    let adapter_task = {
+        let adapter = adapter.clone();
+        let adapter_bus = bus.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            adapter
+                .run(AdapterContext {
+                    bus: adapter_bus,
+                    shutdown,
+                })
+                .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if aggregator
+                .get_zone("applemusic:application")
+                .await
+                .and_then(|zone| zone.now_playing)
+                .is_some_and(|track| track.title == "Song")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("initial snapshot must publish now-playing metadata");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if aggregator
+                .get_zone("applemusic:application")
+                .await
+                .is_some_and(|zone| zone.now_playing.is_none())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a snapshot without a current track must clear stale metadata");
+
+    shutdown.cancel();
+    adapter_task
+        .await
+        .expect("adapter task must join")
+        .expect("adapter must stop cleanly");
+    adapter.stop().await;
+    bus.publish(BusEvent::ShuttingDown { reason: None });
+    aggregator_task.await.expect("aggregator task must join");
+}
+
+#[tokio::test]
 async fn transient_companion_failure_retains_zone_until_recovery() {
     let bus = create_bus();
     let mut events = bus.subscribe();
