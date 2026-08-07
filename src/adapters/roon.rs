@@ -3469,6 +3469,8 @@ mod tests {
             seek_position: Some(seek_position),
             duration: Some(645.0),
             metadata: None,
+            repeat_mode: None,
+            shuffle: None,
         });
         zone
     }

@@ -1140,13 +1140,7 @@ pub async fn hqp_setting_handler(
     let value_str = req.value.to_string();
     let result = match req.name.as_str() {
         "mode" => state.hqplayer.set_mode(&value_str).await,
-        "filter" => {
-            // Sets both 1x and Nx to the same filter - propagate first error if any
-            match state.hqplayer.set_filter_1x(&value_str).await {
-                Ok(()) => state.hqplayer.set_filter_nx(&value_str).await,
-                Err(e) => Err(e),
-            }
-        }
+        "filter" => state.hqplayer.set_filter_pair(&value_str).await,
         "filter1x" => state.hqplayer.set_filter_1x(&value_str).await,
         "filterNx" | "filternx" => state.hqplayer.set_filter_nx(&value_str).await,
         "shaper" => state.hqplayer.set_shaper(&value_str).await,
@@ -1155,7 +1149,10 @@ pub async fn hqp_setting_handler(
     };
 
     match result {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(outcome) => match outcome.into_applied_result() {
+            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })).into_response(),
+        },
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1229,7 +1226,8 @@ pub async fn hqp_pipeline_update_handler(
     };
 
     match result {
-        Ok(()) => {
+        Ok(outcome) => match outcome.into_applied_result() {
+            Ok(()) => {
             // After setting, fetch and return the fresh pipeline state
             // This ensures the UI gets the updated state immediately
             match state.hqplayer.get_pipeline_status().await {
@@ -1239,7 +1237,12 @@ pub async fn hqp_pipeline_update_handler(
                     (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
                 }
             }
-        }
+            }
+            Err(e) => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: e.to_string() }),
+            ).into_response(),
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1336,7 +1339,10 @@ pub async fn hqp_set_matrix_profile_handler(
     Json(req): Json<HqpMatrixProfileRequest>,
 ) -> impl IntoResponse {
     match state.hqplayer.set_matrix_profile(req.profile).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(outcome) => match outcome.into_applied_result() {
+            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })).into_response(),
+        },
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -1703,8 +1709,7 @@ pub async fn lms_configure_handler(
                 "host": req.host,
                 "port": req.port.unwrap_or(9000)
             })),
-        )
-            .into_response(),
+            ).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -2054,8 +2059,7 @@ pub async fn hqp_instance_load_profile_handler(
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"ok": true, "instance": name, "profile": req.profile})),
-        )
-            .into_response(),
+        ).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -2133,11 +2137,13 @@ pub async fn hqp_instance_set_matrix_profile_handler(
     };
 
     match adapter.set_matrix_profile(req.value).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"ok": true, "instance": name, "value": req.value})),
-        )
-            .into_response(),
+        Ok(outcome) => match outcome.into_applied_result() {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "instance": name, "value": req.value})),
+            ).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })).into_response(),
+        },
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {

@@ -1014,6 +1014,8 @@ mod tests {
             seek_position: Some(12.0),
             duration: Some(120.0),
             metadata: None,
+            repeat_mode: None,
+            shuffle: None,
         });
         zone.volume_control = Some(crate::bus::VolumeControl {
             output_id: Some("hqplayer:main".to_string()),
