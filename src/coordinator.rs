@@ -108,10 +108,8 @@ impl AdapterCoordinator {
         for adapter in adapters {
             let name = adapter.name();
             match self.start_enabled(adapter).await {
-                Ok(()) if self.is_enabled(name).await && adapter.can_start().await => {
-                    info!("Started adapter: {}", name)
-                }
-                Ok(()) => {}
+                Ok(true) => info!("Started adapter: {}", name),
+                Ok(false) => {}
                 Err(error) => warn!("Failed to start adapter {}: {}", name, error),
             }
         }
@@ -123,17 +121,17 @@ impl AdapterCoordinator {
     /// path as process startup.  Keeping the decision here prevents a
     /// credentialed provider from quietly growing a second lifecycle policy
     /// that bypasses the coordinator.
-    pub async fn start_enabled(&self, adapter: &Arc<dyn Startable>) -> anyhow::Result<()> {
+    pub async fn start_enabled(&self, adapter: &Arc<dyn Startable>) -> anyhow::Result<bool> {
         let name = adapter.name();
         if !self.is_enabled(name).await {
             debug!("Adapter {} is disabled, skipping", name);
-            return Ok(());
+            return Ok(false);
         }
         if !adapter.can_start().await {
             debug!("Adapter {} cannot start (not configured?), skipping", name);
-            return Ok(());
+            return Ok(false);
         }
-        adapter.start().await
+        adapter.start().await.map(|()| true)
     }
 
     /// Stop one adapter through the coordinator-owned lifecycle path.
