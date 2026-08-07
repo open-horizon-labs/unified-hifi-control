@@ -62,6 +62,8 @@ struct BridgeSession {
     results: HashMap<String, Option<std::result::Result<(), String>>>,
     content_commands: VecDeque<QueuedContentCommand>,
     content_results: HashMap<String, Option<std::result::Result<Value, String>>>,
+    content_idempotency: HashMap<String, String>,
+    content_completed: HashMap<String, std::result::Result<Value, String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -250,6 +252,8 @@ impl AppleBridgeRegistry {
                 results: HashMap::new(),
                 content_commands: VecDeque::new(),
                 content_results: HashMap::new(),
+                content_idempotency: HashMap::new(),
+                content_completed: HashMap::new(),
             },
         );
         Ok(ClaimResponse {
@@ -556,8 +560,17 @@ impl AppleBridgeRegistry {
             {
                 let mut state = self.inner.write().await;
                 for session in state.sessions.values_mut() {
+                    if let Some(result) = session.content_completed.get(request_id) {
+                        return result.clone().map_err(anyhow::Error::msg);
+                    }
                     if let Some(Some(result)) = session.content_results.get(request_id) {
                         let result = result.clone();
+                        if session.content_completed.len() >= MAX_CONTENT_RESULTS {
+                            if let Some(oldest) = session.content_completed.keys().next().cloned() {
+                                session.content_completed.remove(&oldest);
+                            }
+                        }
+                        session.content_completed.insert(request_id.to_string(), result.clone());
                         session.content_results.remove(request_id);
                         return result.map_err(anyhow::Error::msg);
                     }
@@ -953,6 +966,36 @@ fn enqueue_content_in_session(
     {
         bail!("Apple Music content parameters are too large");
     }
+    let idempotency_key = params
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Some(key) = &idempotency_key {
+        if key.is_empty() || key.chars().count() > 128 {
+            bail!("Apple Music idempotency_key is empty or too long");
+        }
+        if let Some(request_id) = session.content_idempotency.get(key) {
+            return Ok(request_id.clone());
+        }
+    }
+    let mutation = matches!(
+        operation,
+        "playlist_create"
+            | "playlist_add"
+            | "playlist_update"
+            | "playlist_remove"
+            | "favorite_add"
+            | "favorite_remove"
+            | "rating_set"
+    );
+    if mutation && !params.get("confirm").and_then(Value::as_bool).unwrap_or(false) {
+        bail!("Apple Music mutation requires confirm=true");
+    }
+    if mutation && idempotency_key.is_none() {
+        bail!("Apple Music mutation requires idempotency_key");
+    }
+    let precondition = params.get("precondition").cloned();
+    let confirm = params.get("confirm").and_then(Value::as_bool).unwrap_or(false);
     if session.content_commands.len() >= MAX_CONTENT_COMMANDS
         || session.content_results.len() >= MAX_CONTENT_RESULTS
     {
@@ -968,9 +1011,9 @@ fn enqueue_content_in_session(
         owner_id,
         operation: operation.to_string(),
         params,
-        idempotency_key: None,
-        precondition: None,
-        confirm: false,
+        idempotency_key: idempotency_key.clone(),
+        precondition,
+        confirm,
         expires_at: now_secs() + COMMAND_TTL.as_secs(),
     };
     session.content_commands.push_back(QueuedContentCommand {
@@ -978,6 +1021,9 @@ fn enqueue_content_in_session(
         delivered_at: None,
     });
     session.content_results.insert(request_id.clone(), None);
+    if let Some(key) = idempotency_key {
+        session.content_idempotency.insert(key, request_id.clone());
+    }
     Ok(request_id)
 }
 
@@ -1168,6 +1214,92 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn content_mutations_require_confirmation_and_are_idempotent() {
+        let registry = AppleBridgeRegistry::default();
+        let pairing = registry.create_pairing("iphone".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+        registry
+            .update_snapshot(&claim.access_token, snapshot())
+            .await
+            .expect("owner snapshot binds the session");
+
+        let missing_confirmation = registry
+            .enqueue_content_for_player(
+                "application",
+                "playlist_add",
+                serde_json::json!({"playlist_ref": "playlist:1", "item_ref": "song:1", "idempotency_key": "add-1"}),
+            )
+            .await
+            .expect_err("mutations must be explicitly confirmed");
+        assert!(missing_confirmation.to_string().contains("confirm=true"));
+
+        let missing_key = registry
+            .enqueue_content_for_player(
+                "application",
+                "playlist_add",
+                serde_json::json!({"playlist_ref": "playlist:1", "item_ref": "song:1", "confirm": true}),
+            )
+            .await
+            .expect_err("mutations must carry an idempotency key");
+        assert!(missing_key.to_string().contains("idempotency_key"));
+
+        let params = serde_json::json!({
+            "playlist_ref": "playlist:1",
+            "item_ref": "song:1",
+            "confirm": true,
+            "idempotency_key": "add-1",
+            "precondition": {"playlist_version": 3}
+        });
+        let request_id = registry
+            .enqueue_content_for_player("application", "playlist_add", params.clone())
+            .await
+            .expect("confirmed mutation queues");
+        let retry_id = registry
+            .enqueue_content_for_player("application", "playlist_add", params)
+            .await
+            .expect("retry is accepted");
+        assert_eq!(retry_id, request_id, "same idempotency key must not duplicate work");
+
+        let requests = registry
+            .poll_content(&claim.access_token)
+            .await
+            .expect("content poll succeeds");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].request_id, request_id);
+        assert!(requests[0].confirm);
+        assert_eq!(requests[0].idempotency_key.as_deref(), Some("add-1"));
+        assert_eq!(requests[0].precondition, Some(serde_json::json!({"playlist_version": 3})));
+
+        registry
+            .acknowledge_content(
+                &claim.access_token,
+                &request_id,
+                ContentResult {
+                    outcome: "success".to_string(),
+                    data: Some(serde_json::json!({"changed": true})),
+                    error: None,
+                },
+            )
+            .await
+            .expect("mutation acknowledgement succeeds");
+        let first = registry
+            .wait_for_content_result(&request_id, Duration::from_millis(100))
+            .await
+            .expect("first caller receives result");
+        let second = registry
+            .wait_for_content_result(&retry_id, Duration::from_millis(100))
+            .await
+            .expect("idempotent retry receives the cached result");
+        assert_eq!(first, second);
     }
 
     #[tokio::test]

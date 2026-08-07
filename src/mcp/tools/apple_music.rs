@@ -42,6 +42,12 @@ pub struct HifiAppleMusicTool {
     /// Explicit confirmation for destructive account mutations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirm: Option<bool>,
+    /// Stable retry key required for Apple Music account mutations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    /// Read-before-write revision or ownership precondition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precondition: Option<serde_json::Value>,
     /// Maximum number of entries to return.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -389,6 +395,8 @@ pub async fn handle_apple_music(
         "name": args.name,
         "description": args.description,
         "confirm": confirmed,
+        "idempotency_key": args.idempotency_key,
+        "precondition": args.precondition,
         "limit": args.limit,
         "items": args.items,
         "signal": args.signal,

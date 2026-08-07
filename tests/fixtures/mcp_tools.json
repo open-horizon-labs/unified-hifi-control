@@ -22,6 +22,11 @@
           "nullable": true,
           "type": "string"
         },
+        "idempotency_key": {
+          "description": "Stable retry key required for Apple Music account mutations.",
+          "nullable": true,
+          "type": "string"
+        },
         "items": {
           "description": "Ordered short-lived opaque refs for queue_plan.",
           "items": {
@@ -39,6 +44,11 @@
           "description": "Optional user-facing name/description for playlist operations.",
           "nullable": true,
           "type": "string"
+        },
+        "precondition": {
+          "description": "Read-before-write revision or ownership precondition.",
+          "nullable": true,
+          "type": "unknown"
         },
         "query": {
           "description": "Search/query text.",
