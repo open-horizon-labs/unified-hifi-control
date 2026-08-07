@@ -25,6 +25,7 @@ use super::AppState;
 const PAIRING_TTL: Duration = Duration::from_secs(300);
 const COMMAND_TTL: Duration = Duration::from_secs(30);
 const BRIDGE_LIVENESS_TTL: Duration = Duration::from_secs(30);
+const COMMAND_DELIVERY_LEASE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Default)]
 pub struct AppleBridgeRegistry {
@@ -46,6 +47,9 @@ struct BridgeSession {
     bridge_id: String,
     last_seen: u64,
     snapshot: Option<MusicKitSnapshot>,
+    /// The first player identity published by this companion. A paired
+    /// companion may not later claim a second execution-owner zone.
+    bound_player_id: Option<String>,
     commands: VecDeque<QueuedCommand>,
     results: HashMap<String, Option<std::result::Result<(), String>>>,
 }
@@ -98,7 +102,7 @@ struct QueuedCommand {
     /// This prevents a reconnecting companion from executing a transport
     /// command such as Next more than once. The result remains tracked until
     /// the adapter observes the acknowledgement or the command expires.
-    delivered: bool,
+    delivered_at: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,6 +152,7 @@ impl AppleBridgeRegistry {
                 bridge_id: request.bridge_id.clone(),
                 last_seen: now_secs(),
                 snapshot: None,
+                bound_player_id: None,
                 commands: VecDeque::new(),
                 results: HashMap::new(),
             },
@@ -173,8 +178,22 @@ impl AppleBridgeRegistry {
     }
 
     pub async fn update_snapshot(&self, token: &str, snapshot: MusicKitSnapshot) -> Result<()> {
-        self.with_session(token, |session| session.snapshot = Some(snapshot))
-            .await
+        self.with_session(token, |session| {
+            if let Some(bound) = &session.bound_player_id {
+                if bound != &snapshot.player_id {
+                    return Err(anyhow!(
+                        "companion is already bound to player `{bound}`, not `{}`",
+                        snapshot.player_id
+                    ));
+                }
+            } else {
+                session.bound_player_id = Some(snapshot.player_id.clone());
+            }
+            session.snapshot = Some(snapshot);
+            Ok(())
+        })
+        .await
+        .and_then(|result| result)
     }
 
     pub async fn snapshot(&self) -> Result<MusicKitSnapshot> {
@@ -211,7 +230,7 @@ impl AppleBridgeRegistry {
             command_id: command_id.clone(),
             command,
             expires_at,
-            delivered: false,
+            delivered_at: None,
         });
         session.results.insert(command_id.clone(), None);
         Ok(command_id)
@@ -224,9 +243,16 @@ impl AppleBridgeRegistry {
             let commands = session
                 .commands
                 .iter_mut()
-                .filter(|command| !command.delivered)
+                .filter(|command| {
+                    command
+                        .delivered_at
+                        .map(|delivered_at| {
+                            now.saturating_sub(delivered_at) >= COMMAND_DELIVERY_LEASE.as_secs()
+                        })
+                        .unwrap_or(true)
+                })
                 .map(|command| {
-                    command.delivered = true;
+                    command.delivered_at = Some(now);
                     BridgeCommand {
                         command_id: command.command_id.clone(),
                         command: command.command.clone(),
@@ -641,6 +667,29 @@ mod tests {
             .expect("second claim succeeds");
         assert!(registry
             .update_snapshot(&first_claim.access_token, snapshot())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_companion_cannot_claim_a_second_player_zone() {
+        let registry = AppleBridgeRegistry::default();
+        let pairing = registry.create_pairing("iphone".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+        registry
+            .update_snapshot(&claim.access_token, snapshot())
+            .await
+            .expect("first player identity binds");
+        let mut other = snapshot();
+        other.player_id = "another-player".to_string();
+        assert!(registry
+            .update_snapshot(&claim.access_token, other)
             .await
             .is_err());
     }
