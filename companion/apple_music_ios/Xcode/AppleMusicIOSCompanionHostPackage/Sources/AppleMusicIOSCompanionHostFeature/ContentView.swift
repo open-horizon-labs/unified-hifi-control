@@ -69,9 +69,10 @@ private final class CompanionModel: ObservableObject {
         companionID = installation.companionID
         host = AppleMusicCompanionHost(installation: installation, store: store)
         bridgeID = installation.bridgeID ?? companionID
-        isPaired = installation.accessToken != nil
-        stage = isPaired ? .connected : .authorize
-        message = isPaired ? "This companion is connected to UHC." : nil
+        let alreadyPaired = installation.accessToken != nil
+        isPaired = alreadyPaired
+        stage = alreadyPaired ? .connected : .authorize
+        message = alreadyPaired ? "This companion is connected to UHC." : nil
     }
 
     func authorize() {
