@@ -2538,11 +2538,6 @@ pub async fn api_settings_post_handler(
     // Load current settings to compare
     let old_settings = load_app_settings();
 
-    // Save the new settings
-    if !save_app_settings(&new_settings) {
-        return Json(serde_json::json!({"ok": false, "error": "Failed to save settings"}));
-    }
-
     // Compare adapter enabled states and start/stop as needed
     let old_adapters = &old_settings.adapters;
     let new_adapters = &new_settings.adapters;
@@ -2569,13 +2564,14 @@ pub async fn api_settings_post_handler(
         ),
     ];
 
-    for (name, changed) in adapter_changes {
+    let mut applied_transitions = Vec::new();
+    for (name, changed) in &adapter_changes {
         if !changed {
             continue;
         }
 
         // Get the new enabled state
-        let now_enabled = match name {
+        let now_enabled = match *name {
             "roon" => new_adapters.roon,
             "lms" => new_adapters.lms,
             "openhome" => new_adapters.openhome,
@@ -2589,13 +2585,28 @@ pub async fn api_settings_post_handler(
 
         // Update coordinator state
         coord.set_enabled(name, now_enabled).await;
+        applied_transitions.push(*name);
 
         // Find the adapter and start/stop it
-        if let Some(adapter) = adapters_list.iter().find(|a| a.name() == name) {
+        if let Some(adapter) = adapters_list.iter().find(|a| a.name() == *name) {
             if now_enabled {
                 tracing::info!("Dynamically enabling adapter: {}", name);
                 if let Err(error) = coord.start_adapter_and_companions(adapter.as_ref()).await {
                     tracing::warn!("Failed to start adapter {}: {}", name, error);
+                    // Do not persist a feature as enabled when its runtime
+                    // could not be started. The Settings client will restore
+                    // its last confirmed switch position from this response.
+                    rollback_adapter_transitions(
+                        &coord,
+                        adapters_list.as_ref(),
+                        old_adapters,
+                        &applied_transitions,
+                    )
+                    .await;
+                    return Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!("Could not enable {name}: {error}"),
+                    }));
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
@@ -2610,7 +2621,70 @@ pub async fn api_settings_post_handler(
         }
     }
 
+    // Persist only after every requested runtime transition succeeded.
+    if !save_app_settings(&new_settings) {
+        rollback_adapter_transitions(
+            &coord,
+            adapters_list.as_ref(),
+            old_adapters,
+            &applied_transitions,
+        )
+        .await;
+        return Json(serde_json::json!({"ok": false, "error": "Failed to save settings"}));
+    }
+
     Json(serde_json::json!({"ok": true}))
+}
+
+fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
+    match name {
+        "roon" => Some(settings.roon),
+        "lms" => Some(settings.lms),
+        "openhome" => Some(settings.openhome),
+        "upnp" => Some(settings.upnp),
+        "hqplayer" => Some(settings.hqplayer),
+        "spotify" => Some(settings.spotify),
+        "applemusic" => Some(settings.applemusic),
+        "musicassistant" => Some(settings.musicassistant),
+        _ => None,
+    }
+}
+
+/// Reconcile the runtime with the last persisted settings after a failed
+/// settings transaction. This is deliberately best-effort: the original
+/// adapter start error is the actionable result, while rollback errors are
+/// recorded for diagnostics rather than obscuring it.
+async fn rollback_adapter_transitions(
+    coordinator: &AdapterCoordinator,
+    adapters: &[Arc<dyn Startable>],
+    previous: &AdapterSettings,
+    transitions: &[&str],
+) {
+    for name in transitions.iter().rev().copied() {
+        let Some(was_enabled) = adapter_enabled(previous, name) else {
+            continue;
+        };
+        coordinator.set_enabled(name, was_enabled).await;
+        let Some(adapter) = adapters.iter().find(|adapter| adapter.name() == name) else {
+            continue;
+        };
+        if was_enabled {
+            if let Err(error) = coordinator
+                .start_adapter_and_companions(adapter.as_ref())
+                .await
+            {
+                tracing::error!("Failed to roll back adapter {}: {}", name, error);
+            }
+        } else {
+            coordinator
+                .stop_adapter_and_companions_then_flush(
+                    adapter.as_ref(),
+                    name,
+                    "settings transaction rollback",
+                )
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2661,5 +2735,32 @@ mod tests {
         assert!(!settings.adapters.spotify);
         assert!(!settings.adapters.applemusic);
         assert!(!settings.adapters.musicassistant);
+    }
+
+    #[test]
+    fn adapter_setting_covers_each_transactional_adapter() {
+        let settings = AdapterSettings {
+            roon: true,
+            lms: true,
+            openhome: true,
+            upnp: true,
+            hqplayer: true,
+            spotify: true,
+            applemusic: true,
+            musicassistant: true,
+        };
+        for name in [
+            "roon",
+            "lms",
+            "openhome",
+            "upnp",
+            "hqplayer",
+            "spotify",
+            "applemusic",
+            "musicassistant",
+        ] {
+            assert_eq!(adapter_enabled(&settings, name), Some(true), "{name}");
+        }
+        assert_eq!(adapter_enabled(&settings, "not-an-adapter"), None);
     }
 }
