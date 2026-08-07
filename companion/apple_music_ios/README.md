@@ -9,12 +9,14 @@ Apple Music session the listener is using on the iPhone. The package wraps
 the documented transport calls (`play`, `pause`, next, and previous), provides
 the typed bridge client (pair/claim, snapshot publication, command polling,
 acknowledgement, and revoke), exposes the MusicKit authorization request, and
-contains native catalog/library search plus exact-play and queue primitives,
-and can project a bounded current-player snapshot.
+contains native catalog/library search, playlist/recent/recommendation
+retrieval, exact-play and queue primitives, and can project a bounded
+current-player snapshot.
 The content/queue methods are companion-local building blocks: they are not
 yet exposed through UHC's bridge transport, and their queue, route, artwork,
 volume, and now-playing behavior remains unclaimed until demonstrated on a
-physical device (#465).
+physical device (#465). Their Apple identifiers must become owner-scoped
+opaque references before any result crosses the bridge (#463).
 
 The host app owns authorization, lifecycle, snapshot publication, and the
 bridge transport. Apple credentials and tokens stay in the app's secure

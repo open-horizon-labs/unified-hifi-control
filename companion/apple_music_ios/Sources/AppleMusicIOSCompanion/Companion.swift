@@ -508,6 +508,37 @@ public actor SystemMusicPlayerCompanion {
         return response.items.map(AppleMusicSearchItem.init)
     }
 
+    /// Read the listener's library playlists locally. Apple identifiers stay
+    /// inside the companion until the approved content bridge defines scoped
+    /// opaque references.
+    public func libraryPlaylists(limit: Int = 25, offset: Int = 0) async throws -> [AppleMusicPlaylistSummary] {
+        var request = MusicLibraryRequest<Playlist>()
+        request.limit = min(max(limit, 1), 50)
+        request.offset = max(offset, 0)
+        let response = try await request.response()
+        return response.items.map(AppleMusicPlaylistSummary.init)
+    }
+
+    /// Read a bounded recent-song view. A mixed recent-items request can be
+    /// added when the content contract needs albums/playlists/stations too.
+    public func recentlyPlayedSongs(limit: Int = 25, offset: Int = 0) async throws -> [AppleMusicSearchItem] {
+        var request = MusicRecentlyPlayedRequest<Song>()
+        request.limit = min(max(limit, 1), 50)
+        request.offset = max(offset, 0)
+        let response = try await request.response()
+        return response.items.map(AppleMusicSearchItem.init)
+    }
+
+    /// Retrieve Apple's bounded personalized recommendation containers. This
+    /// is provider context for a future curator, not an autonomous DJ result.
+    public func personalRecommendations(limit: Int = 10, offset: Int = 0) async throws -> [AppleMusicRecommendationSummary] {
+        var request = MusicPersonalRecommendationsRequest()
+        request.limit = min(max(limit, 1), 25)
+        request.offset = max(offset, 0)
+        let response = try await request.response()
+        return response.recommendations.map(AppleMusicRecommendationSummary.init)
+    }
+
     /// Start an exact catalog/library result on the iPhone's system player.
     public func play(song: Song) async throws {
         player.queue = MusicPlayer.Queue(for: [song], startingAt: song)
@@ -557,5 +588,31 @@ public struct AppleMusicSearchItem: Sendable, Equatable {
         artist = song.artistName
         album = song.albumTitle ?? ""
         artworkURL = song.artwork?.url(width: 512, height: 512)
+    }
+}
+
+@available(iOS 17.0, *)
+public struct AppleMusicPlaylistSummary: Sendable, Equatable {
+    public let id: String
+    public let title: String
+
+    public init(playlist: Playlist) {
+        id = playlist.id.rawValue
+        title = playlist.name
+    }
+}
+
+@available(iOS 17.0, *)
+public struct AppleMusicRecommendationSummary: Sendable, Equatable {
+    public let id: String
+    public let title: String
+    public let reason: String?
+    public let nextRefreshDate: Date?
+
+    public init(recommendation: MusicPersonalRecommendation) {
+        id = recommendation.id.rawValue
+        title = recommendation.title ?? "Apple Music recommendation"
+        reason = recommendation.reason
+        nextRefreshDate = recommendation.nextRefreshDate
     }
 }
