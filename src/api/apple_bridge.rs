@@ -379,6 +379,9 @@ impl AppleBridgeRegistry {
             if !session.results.contains_key(command_id) {
                 return Err(anyhow!("command id is unknown or expired"));
             }
+            session
+                .commands
+                .retain(|command| command.command_id != command_id);
             session.results.insert(
                 command_id.to_string(),
                 Some(if result.ok {
@@ -730,6 +733,11 @@ mod tests {
             .wait_for_result(&command_id, Duration::from_millis(100))
             .await
             .expect("adapter sees acknowledgement");
+        assert!(registry
+            .poll_commands(&claim.access_token)
+            .await
+            .expect("poll after acknowledgement succeeds")
+            .is_empty());
     }
 
     #[tokio::test]
