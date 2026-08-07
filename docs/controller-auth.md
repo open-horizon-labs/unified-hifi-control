@@ -58,11 +58,14 @@ The following additive routes are candidates for the approved implementation:
 - `POST /api/controller/tokens`
 - `DELETE /api/controller/tokens/{token_id}`
 
-The controller middleware then protects provider configuration/OAuth/revoke/
-account, Apple pairing/status/revoke, `/api/settings`, MCP, and all mutating
-legacy playback/configuration routes. `/status`, static assets, and the UI shell
-may remain public. Apple `claim` remains pairing-code bootstrap for the native
-companion; it is not a generic controller login.
+The controller middleware then protects provider configuration/OAuth-start/
+revoke/account, Apple pairing/status/revoke, `/api/settings`, MCP, and all
+mutating legacy playback/configuration routes. The Spotify OAuth callback is
+the deliberate exception: it is a cross-site redirect, so the browser's
+`SameSite=Strict` cookie is absent; its single-use pending state and PKCE
+exchange are the authority for that one callback. `/status`, static assets,
+and the UI shell may remain public. Apple `claim` remains pairing-code
+bootstrap for the native companion; it is not a generic controller login.
 
 Hosted UI later exchanges its hosted identity for a short-lived,
 installation-scoped controller token. It does not receive or replay the local
@@ -76,7 +79,9 @@ The controller boundary is implemented behind the explicit
 for existing LAN installs while the Settings UI gains its bootstrap screen;
 when unset, the historical LAN browser flow remains available. Tunnel or
 hosted deployments must set the switch before exposing UHC. With enforcement
-enabled, provider configuration/OAuth/account, Apple pairing management, MCP,
-and mutating playback/configuration routes require the browser session and
-CSRF checks. Read-only device/status pages remain available, and native Apple
-bridge bearer routes remain independent.
+enabled, provider configuration/OAuth-start/revoke/account, Apple pairing
+management, MCP, and mutating playback/configuration routes require the
+browser session and CSRF checks. The Spotify OAuth callback is authenticated
+by its pending state/PKCE exchange instead of the browser cookie. Read-only
+device/status pages remain available, and native Apple bridge bearer routes
+remain independent.
