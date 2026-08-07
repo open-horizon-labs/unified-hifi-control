@@ -25,6 +25,21 @@ pub struct ListeningPlan {
     pub current_index: Option<usize>,
     pub generation: u64,
     pub updated_at: u64,
+    /// Bounded UHC-owned intent history. These revisions describe what UHC
+    /// requested, not what Music.app confirmed; observed playback remains a
+    /// separate aggregator fact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<ListeningPlanRevision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListeningPlanRevision {
+    pub generation: u64,
+    pub operation: String,
+    pub items: Vec<ListeningPlanItem>,
+    pub source: String,
+    pub confidence: String,
+    pub recorded_at: u64,
 }
 
 #[derive(Clone, Default)]
@@ -77,7 +92,13 @@ impl ListeningPlanStore {
             current_index: None,
             generation,
             updated_at: now_secs(),
+            history: previous
+                .as_ref()
+                .map(|plan| plan.history.clone())
+                .unwrap_or_default(),
         };
+        let mut plan = plan;
+        record_revision(&mut plan, "replace");
         plans.insert(zone_id.to_string(), plan.clone());
         trim_plans(&mut plans);
         if let Some(path) = &self.path {
@@ -114,6 +135,7 @@ impl ListeningPlanStore {
             current_index: None,
             generation: 0,
             updated_at: 0,
+            history: Vec::new(),
         });
         if plan.items.len().saturating_add(items.len()) > MAX_ITEMS {
             anyhow::bail!("listening plan is limited to {MAX_ITEMS} items");
@@ -121,6 +143,7 @@ impl ListeningPlanStore {
         plan.items.extend(items);
         plan.generation = plan.generation.saturating_add(1).max(1);
         plan.updated_at = now_secs();
+        record_revision(&mut plan, "append");
         plans.insert(zone_id.to_string(), plan.clone());
         trim_plans(&mut plans);
         if let Some(path) = &self.path {
@@ -149,6 +172,7 @@ impl ListeningPlanStore {
             current_index: None,
             generation: 0,
             updated_at: 0,
+            history: Vec::new(),
         });
         if plan.items.len() >= MAX_ITEMS {
             anyhow::bail!("listening plan is limited to {MAX_ITEMS} items");
@@ -160,6 +184,7 @@ impl ListeningPlanStore {
         plan.items.insert(index, item);
         plan.generation = plan.generation.saturating_add(1).max(1);
         plan.updated_at = now_secs();
+        record_revision(&mut plan, "play_next");
         plans.insert(zone_id.to_string(), plan.clone());
         trim_plans(&mut plans);
         if let Some(path) = &self.path {
@@ -174,6 +199,7 @@ impl ListeningPlanStore {
 
 const MAX_PLANS: usize = 32;
 const MAX_ITEMS: usize = 200;
+const MAX_HISTORY: usize = 16;
 const MAX_REFERENCE_LENGTH: usize = 512;
 const MAX_TITLE_LENGTH: usize = 512;
 
@@ -187,6 +213,36 @@ fn trim_plans(plans: &mut HashMap<String, ListeningPlan>) {
             break;
         };
         plans.remove(&oldest);
+    }
+}
+
+fn record_revision(plan: &mut ListeningPlan, operation: &str) {
+    plan.history.push(ListeningPlanRevision {
+        generation: plan.generation,
+        operation: operation.to_string(),
+        items: plan.items.clone(),
+        source: "uhc_mcp".to_string(),
+        confidence: "planned".to_string(),
+        recorded_at: plan.updated_at,
+    });
+    trim_history(plan);
+}
+
+fn trim_history(plan: &mut ListeningPlan) {
+    plan.history.retain(|revision| {
+        revision.items.len() <= MAX_ITEMS
+            && revision.items.iter().all(|item| {
+                !item.reference.is_empty()
+                    && item.reference.len() <= MAX_REFERENCE_LENGTH
+                    && item.title.len() <= MAX_TITLE_LENGTH
+            })
+            && revision.operation.len() <= 64
+            && revision.source.len() <= 64
+            && revision.confidence.len() <= 64
+    });
+    if plan.history.len() > MAX_HISTORY {
+        let excess = plan.history.len() - MAX_HISTORY;
+        plan.history.drain(0..excess);
     }
 }
 
@@ -237,7 +293,10 @@ fn load_plans(path: &PathBuf) -> anyhow::Result<HashMap<String, ListeningPlan>> 
                         && item.title.len() <= MAX_TITLE_LENGTH
                 })
         })
-        .map(|plan| (plan.zone_id.clone(), plan))
+        .map(|mut plan| {
+            trim_history(&mut plan);
+            (plan.zone_id.clone(), plan)
+        })
         .collect();
     trim_plans(&mut plans);
     Ok(plans)
@@ -294,6 +353,9 @@ mod tests {
         assert_eq!(first.generation, 1);
         assert_eq!(second.generation, 2);
         assert_eq!(second.current_index, None);
+        assert_eq!(second.history.len(), 2);
+        assert_eq!(second.history[0].operation, "replace");
+        assert_eq!(second.history[1].confidence, "planned");
         assert_eq!(store.get("applemusic:iphone").await, Some(second));
     }
 
@@ -350,7 +412,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(appended.generation, first.generation + 1);
-        assert_eq!(appended.items.iter().map(|i| i.reference.as_str()).collect::<Vec<_>>(), ["one", "two"]);
+        assert_eq!(
+            appended
+                .items
+                .iter()
+                .map(|i| i.reference.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
         let next = store
             .play_next(
                 "applemusic:iphone",
@@ -363,5 +432,38 @@ mod tests {
             .unwrap();
         assert_eq!(next.items[0].reference, "next");
         assert_eq!(next.generation, appended.generation + 1);
+        assert_eq!(
+            next.history
+                .iter()
+                .map(|entry| entry.operation.as_str())
+                .collect::<Vec<_>>(),
+            ["replace", "append", "play_next",]
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_history_is_bounded_and_keeps_newest_intent() {
+        let store = ListeningPlanStore::default();
+        for index in 0..(MAX_HISTORY + 4) {
+            store
+                .replace(
+                    "applemusic:iphone",
+                    vec![ListeningPlanItem {
+                        reference: format!("ref-{index}"),
+                        title: format!("Track {index}"),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        let plan = store.get("applemusic:iphone").await.unwrap();
+        assert_eq!(plan.history.len(), MAX_HISTORY);
+        assert_eq!(plan.history.first().unwrap().generation, 5);
+        assert_eq!(
+            plan.history.last().unwrap().generation,
+            MAX_HISTORY as u64 + 4
+        );
+        assert_eq!(plan.history.last().unwrap().source, "uhc_mcp");
+        assert_eq!(plan.history.last().unwrap().confidence, "planned");
     }
 }
