@@ -107,26 +107,45 @@ impl AdapterCoordinator {
     pub async fn start_all_enabled(&self, adapters: &[Arc<dyn Startable>]) {
         for adapter in adapters {
             let name = adapter.name();
-            if !self.is_enabled(name).await {
-                debug!("Adapter {} is disabled, skipping", name);
-                continue;
-            }
-            if !adapter.can_start().await {
-                debug!("Adapter {} cannot start (not configured?), skipping", name);
-                continue;
-            }
-            match adapter.start().await {
-                Ok(()) => info!("Started adapter: {}", name),
-                Err(e) => warn!("Failed to start adapter {}: {}", name, e),
+            match self.start_enabled(adapter).await {
+                Ok(()) if self.is_enabled(name).await && adapter.can_start().await => {
+                    info!("Started adapter: {}", name)
+                }
+                Ok(()) => {}
+                Err(error) => warn!("Failed to start adapter {}: {}", name, error),
             }
         }
+    }
+
+    /// Start one adapter under the coordinator's feature-toggle decision.
+    ///
+    /// Dynamic settings changes and provider re-authorization use this same
+    /// path as process startup.  Keeping the decision here prevents a
+    /// credentialed provider from quietly growing a second lifecycle policy
+    /// that bypasses the coordinator.
+    pub async fn start_enabled(&self, adapter: &Arc<dyn Startable>) -> anyhow::Result<()> {
+        let name = adapter.name();
+        if !self.is_enabled(name).await {
+            debug!("Adapter {} is disabled, skipping", name);
+            return Ok(());
+        }
+        if !adapter.can_start().await {
+            debug!("Adapter {} cannot start (not configured?), skipping", name);
+            return Ok(());
+        }
+        adapter.start().await
+    }
+
+    /// Stop one adapter through the coordinator-owned lifecycle path.
+    pub async fn stop_one(&self, adapter: &Arc<dyn Startable>) {
+        adapter.stop().await;
+        debug!("Stopped adapter: {}", adapter.name());
     }
 
     /// Stop all adapters from the provided list.
     pub async fn stop_all(&self, adapters: &[Arc<dyn Startable>]) {
         for adapter in adapters {
-            adapter.stop().await;
-            debug!("Stopped adapter: {}", adapter.name());
+            self.stop_one(adapter).await;
         }
     }
 
@@ -470,6 +489,49 @@ mod tests {
 
         assert!(!started.load(Ordering::SeqCst));
         assert!(!coord.is_running("disabled").await);
+    }
+
+    struct LifecycleProbe {
+        started: Arc<AtomicBool>,
+        stopped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Startable for LifecycleProbe {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+
+        async fn start(&self) -> anyhow::Result<()> {
+            self.started.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn stop(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn dynamic_provider_lifecycle_uses_coordinator_decision() {
+        let coord = AdapterCoordinator::new(create_bus());
+        coord.register("probe", true).await;
+        let started = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let adapter: Arc<dyn Startable> = Arc::new(LifecycleProbe {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        });
+
+        coord.start_enabled(&adapter).await.expect("start succeeds");
+        assert!(started.load(Ordering::SeqCst));
+        coord.stop_one(&adapter).await;
+        assert!(stopped.load(Ordering::SeqCst));
+
+        coord.set_enabled("probe", false).await;
+        started.store(false, Ordering::SeqCst);
+        coord.start_enabled(&adapter).await.expect("disabled is no-op");
+        assert!(!started.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
