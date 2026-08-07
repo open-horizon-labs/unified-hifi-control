@@ -116,7 +116,8 @@ pub fn static_name(name: &str) -> Option<&'static str> {
 /// what is advertised.
 pub fn declared_params(tool: &str) -> &'static [&'static str] {
     match tool {
-        "hifi_zones" | "hifi_status" | "hifi_hqplayer_status" | "hifi_hqplayer_profiles" => &[],
+        "hifi_zones" | "hifi_status" => &[],
+        "hifi_hqplayer_status" | "hifi_hqplayer_profiles" => &["zone_id"],
         "hifi_now_playing" => &["zone_id"],
         "hifi_capabilities" => &["zone_id"],
         "hifi_control" => &["zone_id", "action", "value"],
@@ -153,8 +154,8 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
             "reason",
             "source",
         ],
-        "hifi_hqplayer_load_profile" => &["profile"],
-        "hifi_hqplayer_set_pipeline" => &["setting", "value"],
+        "hifi_hqplayer_load_profile" => &["profile", "zone_id"],
+        "hifi_hqplayer_set_pipeline" => &["setting", "value", "zone_id"],
         _ => &[],
     }
 }

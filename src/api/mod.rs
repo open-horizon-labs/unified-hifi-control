@@ -24,7 +24,7 @@ use axum::{
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Redirect,
     },
     Json,
 };
@@ -41,6 +41,12 @@ use tokio_util::sync::CancellationToken;
 pub mod apple_bridge;
 pub mod credentials;
 pub mod provider_auth;
+
+/// Preserve the legacy flash-page bookmark while sending users to the secure
+/// Web Serial flasher origin.
+pub async fn knob_flasher_redirect_handler() -> Redirect {
+    Redirect::permanent(crate::app::KNOB_FLASHER_URL)
+}
 
 /// Registry for provider adapters whose transport is not represented by a
 /// dedicated field on `AppState` (for example cloud and bridge-backed sources).
