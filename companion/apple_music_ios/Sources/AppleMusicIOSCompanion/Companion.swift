@@ -539,6 +539,28 @@ public actor SystemMusicPlayerCompanion {
         return response.recommendations.map(AppleMusicRecommendationSummary.init)
     }
 
+    /// Create a playlist explicitly requested by the signed host. UHC must
+    /// require confirmation and retain the returned owner-scoped reference
+    /// before invoking this mutation.
+    public func createPlaylist(name: String, description: String? = nil) async throws -> AppleMusicPlaylistSummary {
+        let boundedName = String(name.prefix(200))
+        guard !boundedName.isEmpty else { throw CompanionContentError.invalidName }
+        let playlist = try await MusicLibrary.shared.createPlaylist(
+            name: boundedName,
+            description: description.map { String($0.prefix(500)) },
+            authorDisplayName: nil
+        )
+        return AppleMusicPlaylistSummary(playlist: playlist)
+    }
+
+    /// Append one exact song to a playlist. Apple Music itself rejects
+    /// playlists that are not available in the listener's library; arbitrary
+    /// remove/reorder/delete operations are intentionally not provided here.
+    public func add(song: Song, to playlist: Playlist) async throws -> AppleMusicPlaylistSummary {
+        let updated = try await MusicLibrary.shared.add(song, to: playlist)
+        return AppleMusicPlaylistSummary(playlist: updated)
+    }
+
     /// Start an exact catalog/library result on the iPhone's system player.
     public func play(song: Song) async throws {
         player.queue = MusicPlayer.Queue(for: [song], startingAt: song)
@@ -614,5 +636,16 @@ public struct AppleMusicRecommendationSummary: Sendable, Equatable {
         title = recommendation.title ?? "Apple Music recommendation"
         reason = recommendation.reason
         nextRefreshDate = recommendation.nextRefreshDate
+    }
+}
+
+@available(iOS 17.0, *)
+public enum CompanionContentError: Error, LocalizedError, Sendable {
+    case invalidName
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidName: "Apple Music playlist name must not be empty."
+        }
     }
 }

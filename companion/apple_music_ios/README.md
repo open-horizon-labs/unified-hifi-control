@@ -18,6 +18,11 @@ volume, and now-playing behavior remains unclaimed until demonstrated on a
 physical device (#465). Their Apple identifiers must become owner-scoped
 opaque references before any result crosses the bridge (#463).
 
+The package also exposes narrowly scoped native mutations for confirmed
+playlist creation and appending an exact song. It deliberately does not offer
+generic playlist deletion/reorder/removal; those operations need a separate
+approved content contract and ownership/conflict checks (#484).
+
 The host app owns authorization, lifecycle, snapshot publication, and the
 bridge transport. Apple credentials and tokens stay in the app's secure
 storage; UHC receives only the explicitly paired snapshot/command contract.
