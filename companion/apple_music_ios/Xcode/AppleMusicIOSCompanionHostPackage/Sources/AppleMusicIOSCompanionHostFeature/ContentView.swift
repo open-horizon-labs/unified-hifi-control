@@ -1,4 +1,5 @@
 import AppleMusicIOSCompanion
+import AVKit
 import SwiftUI
 
 @MainActor
@@ -79,6 +80,13 @@ public struct ContentView: View {
                 Text(model.status).font(.footnote)
                 Button("Authorize Apple Music", action: model.authorize)
             }
+            Section("AirPlay output") {
+                Text("Choose an AirPlay speaker or HomePod in Apple's route picker. UHC will control the selected SystemMusicPlayer session; the selected route is owned by iOS and is not reported as a UHC zone until a companion observes it.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                AirPlayRoutePicker()
+                    .frame(minHeight: 44)
+            }
             Section("Pair with UHC") {
                 TextField("UHC server URL", text: $model.uhcURL).textInputAutocapitalization(.never).autocorrectionDisabled()
                 TextField("UHC bridge ID", text: $model.bridgeID).textInputAutocapitalization(.never).autocorrectionDisabled()
@@ -90,4 +98,19 @@ public struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.startPolling() } else { model.stopPolling() } }
         .task { model.startPolling() }
     }
+}
+
+/// Native route selection deliberately stays outside the UHC bridge contract.
+/// AVRoutePickerView is Apple's supported way to choose HomePod/AirPlay
+/// destinations from an iPhone; UHC must not infer or persist route state from
+/// the picker alone.
+private struct AirPlayRoutePicker: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.prioritizesVideoDevices = false
+        picker.accessibilityLabel = "Choose AirPlay output"
+        return picker
+    }
+
+    func updateUIView(_ picker: AVRoutePickerView, context: Context) {}
 }

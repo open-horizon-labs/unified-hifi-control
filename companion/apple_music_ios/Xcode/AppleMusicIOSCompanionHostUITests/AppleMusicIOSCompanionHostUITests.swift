@@ -23,4 +23,12 @@ final class AppleMusicIOSCompanionHostUITests: XCTestCase {
         // Use XCTAssert and related functions to verify your tests produce the correct results.
         XCTAssertTrue(true)
     }
+
+    @MainActor
+    func testAirPlayRoutePickerIsAvailable() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        XCTAssertTrue(app.buttons["Choose AirPlay output"].waitForExistence(timeout: 5))
+    }
 }
