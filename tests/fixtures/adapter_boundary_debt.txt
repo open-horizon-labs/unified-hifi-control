@@ -91,7 +91,6 @@ src/api/mod.rs|hqp_pipeline_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_pipeline_update_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_profiles_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_set_matrix_profile_handler|direct-field-access|hqplayer
-src/api/mod.rs|hqp_setting_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_volume_handler|direct-field-access|hqplayer
 src/api/mod.rs|lms_control_handler|direct-field-access|lms
 src/api/mod.rs|lms_volume_handler|direct-field-access|lms
@@ -100,6 +99,8 @@ src/api/mod.rs|register_with_lifecycle|concrete-adapter-type|Startable
 src/api/mod.rs|roon_control_handler|direct-field-access|roon
 src/api/mod.rs|roon_volume_handler|direct-field-access|roon
 src/api/mod.rs|upnp_control_handler|direct-field-access|upnp
+src/api/provider_auth.rs|oauth_callback_json|concrete-adapter-type|Startable
+src/api/provider_auth.rs|oauth_revoke|concrete-adapter-type|Startable
 src/knobs/routes.rs|control_lms|direct-field-access|lms
 src/knobs/routes.rs|control_openhome|direct-field-access|openhome
 src/knobs/routes.rs|control_roon|direct-field-access|roon
