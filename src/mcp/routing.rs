@@ -529,11 +529,10 @@ mod tests {
             ZoneTarget::classify("upnp:x").for_transport(),
             TransportRoute::Upnp
         );
-        // Recognised but not wired — and it must carry which provider it was, or
-        // the refusal cannot say #328.
+        // Direct HQPlayer control is wired through the managed instance runtime.
         assert_eq!(
             ZoneTarget::classify("hqplayer:x").for_transport(),
-            TransportRoute::Refused(ZoneTarget::HqPlayer)
+            TransportRoute::HqPlayer
         );
     }
 

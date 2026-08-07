@@ -1031,9 +1031,9 @@ mod tests {
     /// differently is the defect this module exists to remove.
     #[test]
     fn refusals_carry_the_same_classification_as_the_report() {
-        let gap = support(ZoneTarget::HqPlayer, Capability::Transport);
-        match gap.refusal(Capability::Transport, vec![]) {
-            Some(Refusal::NotImplemented { tracked_by, .. }) => assert_eq!(tracked_by, "#328"),
+        let gap = support(ZoneTarget::HqPlayer, Capability::Search);
+        match gap.refusal(Capability::Search, vec![]) {
+            Some(Refusal::NotImplemented { tracked_by, .. }) => assert_eq!(tracked_by, "#209"),
             other => panic!("expected a not_implemented refusal, got {other:?}"),
         }
 
