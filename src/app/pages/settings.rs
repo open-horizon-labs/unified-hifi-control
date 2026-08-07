@@ -1249,6 +1249,16 @@ pub fn Settings() -> Element {
                             }
                         }
                         p { class: "mt-4 text-sm text-secondary", "Run the companion on your iPhone or Mac, authorize Apple Music there, then pair it with UHC using a short-lived code. The companion keeps Apple credentials local; UHC receives only playback state and commands." }
+                        p { class: "mt-3 text-sm text-secondary",
+                            "Catalog and library requests also require MusicKit enabled for the companion's explicit App ID. "
+                            a {
+                                class: "link",
+                                href: "https://developer.apple.com/account/resources/identifiers/list",
+                                target: "_blank",
+                                rel: "noopener noreferrer",
+                                "Enable MusicKit in Apple Developer"
+                            }
+                        }
                         if let Some(status) = apple_st {
                             if status.paired {
                                 p { class: "mt-4 text-sm", "Bridge: {apple_bridge_label}" }
