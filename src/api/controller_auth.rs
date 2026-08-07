@@ -291,7 +291,8 @@ fn is_public(path: &str) -> bool {
 }
 
 fn is_native_bridge(path: &str) -> bool {
-    path == "/api/bridges/applemusic/claim"
+    path == "/api/bridges/applemusic/discover"
+        || path == "/api/bridges/applemusic/claim"
         || path == "/api/bridges/applemusic/revoke"
         || path == "/api/bridges/applemusic/state"
         || path == "/api/bridges/applemusic/commands"

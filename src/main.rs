@@ -567,6 +567,7 @@ mod server {
         let api_spotify_configure = api::provider_auth::configure_spotify;
         let api_spotify_account = api::spotify_account_handler;
         let api_bridge_pair = api::apple_bridge::pair;
+        let api_bridge_discover_pairing = api::apple_bridge::discover_pairing;
         let api_bridge_claim = api::apple_bridge::claim;
         let api_bridge_revoke = api::apple_bridge::revoke;
         let api_bridge_status = api::apple_bridge::status;
@@ -591,6 +592,7 @@ mod server {
             .route("/api/providers/{provider}/configure", post(api_spotify_configure))
             .route("/api/providers/spotify/account", get(api_spotify_account))
             .route("/api/bridges/applemusic/pair", post(api_bridge_pair))
+            .route("/api/bridges/applemusic/discover", post(api_bridge_discover_pairing))
             .route("/api/bridges/applemusic/claim", post(api_bridge_claim))
             .route("/api/bridges/applemusic/revoke", post(api_bridge_revoke))
             .route("/api/bridges/applemusic/status", get(api_bridge_status))

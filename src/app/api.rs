@@ -134,6 +134,15 @@ pub struct AppleBridgeStatus {
     pub bridge_id: Option<String>,
     pub last_seen: Option<u64>,
     pub has_snapshot: bool,
+    #[serde(default)]
+    pub pending_pairings: Vec<AppleBridgePendingPairing>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppleBridgePendingPairing {
+    pub bridge_id: String,
+    pub pairing_code: String,
+    pub expires_at: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

@@ -48,6 +48,7 @@ struct BridgeState {
 
 struct Pairing {
     bridge_id: String,
+    code: String,
     expires_at: u64,
 }
 
@@ -99,6 +100,15 @@ pub struct BridgeStatus {
     /// Every live companion, rather than only the freshest one. The legacy
     /// fields above remain for older clients that only know one companion.
     pub companions: Vec<BridgeCompanionStatus>,
+    #[serde(default)]
+    pub pending_pairings: Vec<PendingPairing>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct PendingPairing {
+    pub bridge_id: String,
+    pub pairing_code: String,
+    pub expires_at: u64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -237,7 +247,7 @@ impl AppleBridgeRegistry {
             .chars()
             .take(MAX_BRIDGE_ID_LENGTH)
             .collect::<String>();
-        let pairing_code = random_token(24);
+        let pairing_code = format!("{:06}", rand::thread_rng().gen_range(0..1_000_000));
         let expires_at = now_secs() + PAIRING_TTL.as_secs();
         let mut state = self.inner.write().await;
         let now = now_secs();
@@ -259,6 +269,7 @@ impl AppleBridgeRegistry {
             pairing_code.clone(),
             Pairing {
                 bridge_id: bridge_id.clone(),
+                code: pairing_code.clone(),
                 expires_at,
             },
         );
@@ -769,6 +780,16 @@ impl AppleBridgeRegistry {
                 .and_then(|session| session.snapshot.as_ref())
                 .is_some(),
             companions,
+            pending_pairings: state
+                .pairings
+                .values()
+                .filter(|pairing| pairing.expires_at > now)
+                .map(|pairing| PendingPairing {
+                    bridge_id: pairing.bridge_id.clone(),
+                    pairing_code: pairing.code.clone(),
+                    expires_at: pairing.expires_at,
+                })
+                .collect(),
         }
     }
 }
@@ -835,6 +856,20 @@ impl MusicKitCompanion for PairedMusicKitCompanion {
 }
 
 pub async fn pair(
+    State(state): State<AppState>,
+    Json(request): Json<PairRequest>,
+) -> Result<Json<PairingResponse>, (StatusCode, Json<ErrorBody>)> {
+    validate_bridge_id(&request.bridge_id)
+        .map_err(|message| error(StatusCode::BAD_REQUEST, &message, "pairing_failed"))?;
+    Ok(Json(
+        state.apple_bridges.create_pairing(request.bridge_id).await,
+    ))
+}
+
+/// Native companions use mDNS to find this server, then request a short-lived
+/// numeric confirmation code. The code is deliberately the only value exposed
+/// before the user confirms the matching code shown in UHC Settings.
+pub async fn discover_pairing(
     State(state): State<AppState>,
     Json(request): Json<PairRequest>,
 ) -> Result<Json<PairingResponse>, (StatusCode, Json<ErrorBody>)> {

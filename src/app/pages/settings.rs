@@ -1233,7 +1233,7 @@ pub fn Settings() -> Element {
                         div { class: "flex items-start justify-between gap-3",
                             div {
                                 h3 { id: "apple-music-heading", class: "text-lg font-semibold", "Apple Music" }
-                                p { class: "mt-1 text-sm text-secondary", "Use a signed native MusicKit companion. An iPhone or Mac owns the Apple Music session; UHC aggregates its state and commands." }
+                                p { class: "mt-1 text-sm text-secondary", "Control Apple Music from your iPhone, iPad, or Mac through UHC." }
                             }
                             if !applemusic_enabled() {
                                 span { class: "badge badge-secondary shrink-0", "Disabled" }
@@ -1245,8 +1245,8 @@ pub fn Settings() -> Element {
                                 span { class: "badge badge-secondary shrink-0", "Not paired" }
                             }
                         }
-                        p { class: "mt-4 text-sm text-secondary", "Run companions on your iPhone, iPad, or Mac, authorize Apple Music on each device, then pair each one with UHC using a short-lived code. Each companion is an independent Apple Music zone; credentials stay on the device." }
-                        p { class: "mt-3 text-sm text-secondary", "Catalog and library access uses the same signed companion and Apple Music account." }
+                        p { class: "mt-4 text-sm text-secondary", "Authorize Apple Music on a companion device, then pair it with UHC. Each companion is an independent Apple Music zone; your credentials stay on the device." }
+                        p { class: "mt-3 text-sm text-secondary", "Catalog and library access use the same Apple Music account." }
                         if let Some(ref status) = apple_st {
                             if status.companions.is_empty() {
                                 p { class: "mt-4 text-sm text-muted", role: "status", aria_live: "polite", "No companion is paired yet." }
@@ -1304,6 +1304,13 @@ pub fn Settings() -> Element {
                                     },
                                     "Generate pairing code"
                                 }
+                        }
+                        if let Some(pending) = apple_st.as_ref().and_then(|status| status.pending_pairings.iter().find(|p| p.bridge_id == apple_bridge_id().trim())) {
+                            div { class: "mt-4 rounded-lg border border-default bg-surface-muted p-4",
+                                p { class: "text-sm font-medium", "Confirm this code in the companion" }
+                                p { class: "mt-2 font-mono text-2xl tracking-[0.35em]", aria_label: "Apple Music pairing confirmation code", "{pending.pairing_code}" }
+                                p { class: "mt-2 text-xs text-secondary", "The companion will discover this UHC server automatically. Confirm that both screens show the same code; nothing needs to be typed." }
+                            }
                         }
                         if let Some(pairing) = apple_pairing() {
                                 div { class: "mt-4 rounded-lg border border-default bg-surface-muted p-4",

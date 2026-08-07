@@ -1,18 +1,18 @@
-# API Routes Contract
-# This file is the source of truth for API endpoints.
-# Changes require 'api-change-approved' label on PR.
+
 #
-# Format: METHOD /path
 #
-# Note: UI routes (/, /ui/zones, /zone, /hqplayer, /lms, /knobs, /settings)
-# are served by Dioxus SPA router (fallback handler), not explicit Axum routes.
-# They still work but aren't detected by the route extraction logic.
 #
-# Note: Embedded asset routes (/favicon.ico, /tailwind.css, /dx-components-theme.css,
 # /apple-touch-icon.png) are implementation details, not API contracts. They use
+# API Routes Contract
+# Changes require 'api-change-approved' label on PR.
+# Format: METHOD /path
+# Note: Embedded asset routes (/favicon.ico, /tailwind.css, /dx-components-theme.css,
+# Note: UI routes (/, /ui/zones, /zone, /hqplayer, /lms, /knobs, /settings)
+# They still work but aren't detected by the route extraction logic.
+# This file is the source of truth for API endpoints.
+# are served by Dioxus SPA router (fallback handler), not explicit Axum routes.
 # multi-line closures that the route extractor doesn't detect, and they may change
 # with build configuration.
-
 DELETE /mcp
 GET /admin
 GET /api/bridges/applemusic/commands
@@ -69,6 +69,7 @@ GET /zones
 POST /api/bridges/applemusic/claim
 POST /api/bridges/applemusic/commands/{command_id}
 POST /api/bridges/applemusic/content/{request_id}
+POST /api/bridges/applemusic/discover
 POST /api/bridges/applemusic/pair
 POST /api/bridges/applemusic/revoke
 POST /api/bridges/applemusic/state

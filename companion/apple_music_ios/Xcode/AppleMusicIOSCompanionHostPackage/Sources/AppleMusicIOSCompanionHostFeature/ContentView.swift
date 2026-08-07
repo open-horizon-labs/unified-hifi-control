@@ -13,7 +13,7 @@ private final class CompanionModel: ObservableObject {
     @Published private(set) var status = "Not authorized"
     @Published var uhcURL = "http://127.0.0.1:18088"
     @Published var bridgeID = ""
-    @Published var pairingCode = ""
+    @Published private(set) var pairingCode = ""
     @Published private(set) var isPaired = false
     private let installationStore: KeychainAppleMusicCompanionInstallationStore
     private let companionID: String
@@ -38,14 +38,14 @@ private final class CompanionModel: ObservableObject {
         companionID = installation.companionID
         uhcURL = installation.baseURL.absoluteString
         host = AppleMusicCompanionHost(installation: installation, store: store)
-        bridgeID = installation.bridgeID ?? ""
+        bridgeID = installation.bridgeID ?? companionID
         isPaired = installation.accessToken != nil
         status = isPaired ? "Paired; waiting for snapshots" : "Not authorized"
     }
 
     func authorize() { Task { @MainActor in do { _ = try await host.authorize(); status = "Authorized; enter a UHC pairing code" } catch { status = error.localizedDescription } } }
-    func claim() {
-        guard !bridgeID.isEmpty, !pairingCode.isEmpty else { status = "Enter the bridge ID and pairing code"; return }
+    func discover() {
+        guard !bridgeID.isEmpty else { status = "Enter the companion ID"; return }
         guard let baseURL = Self.validatedURL(uhcURL) else {
             status = "Enter a valid UHC URL (http:// or https://)"
             return
@@ -58,6 +58,11 @@ private final class CompanionModel: ObservableObject {
             companionID: companionID,
             store: installationStore
         )
+        let discoverHost = host
+        Task { @MainActor in do { let pairing = try await discoverHost.discoverPairing(bridgeID: bridgeID); pairingCode = pairing.pairingCode; status = "Confirm that UHC shows the same code: (pairing.pairingCode)" } catch { status = error.localizedDescription } }
+    }
+    func confirm() {
+        guard !bridgeID.isEmpty, !pairingCode.isEmpty else { status = "Discover UHC first"; return }
         let claimHost = host
         Task { @MainActor in do { _ = try await claimHost.claim(bridgeID: bridgeID, pairingCode: pairingCode); isPaired = true; status = "Paired; waiting for snapshots"; startPolling() } catch { status = error.localizedDescription } }
     }
@@ -105,10 +110,14 @@ public struct ContentView: View {
                     .frame(minHeight: 44)
             }
             Section("Pair with UHC") {
-                TextField("UHC server URL", text: $model.uhcURL).textInputAutocapitalization(.never).autocorrectionDisabled()
-                TextField("UHC bridge ID", text: $model.bridgeID).textInputAutocapitalization(.never).autocorrectionDisabled()
-                TextField("Short-lived pairing code", text: $model.pairingCode).textInputAutocapitalization(.never).autocorrectionDisabled()
-                Button("Claim this companion", action: model.claim).disabled(model.bridgeID.isEmpty || model.pairingCode.isEmpty)
+                Text("UHC is discovered on your local network. The companion and UHC will show the same short code.").font(.footnote).foregroundStyle(.secondary)
+                if model.pairingCode.isEmpty {
+                    Button("Find UHC and show code", action: model.discover)
+                } else {
+                    Text(model.pairingCode).font(.system(size: 32, weight: .semibold, design: .monospaced)).tracking(8)
+                    Text("Confirm the codes match, then tap Confirm.").font(.footnote).foregroundStyle(.secondary)
+                    Button("Confirm pairing", action: model.confirm)
+                }
                 if model.isPaired { Button("Revoke pairing", role: .destructive, action: model.revoke) }
             }
         }

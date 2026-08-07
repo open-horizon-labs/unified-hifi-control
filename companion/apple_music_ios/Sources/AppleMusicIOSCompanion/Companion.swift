@@ -287,6 +287,13 @@ public actor AppleMusicBridgeClient {
         )
     }
 
+    /// Ask a discovered UHC server for a short-lived numeric confirmation
+    /// code. This endpoint does not grant access; the one-time claim still
+    /// happens only after the user confirms the matching code.
+    public func discoverPairing(bridgeID: String) async throws -> PairingResponse {
+        try await request(path: "api/bridges/applemusic/discover", method: "POST", body: ["bridge_id": bridgeID])
+    }
+
     @discardableResult
     public func claim(bridgeID: String, pairingCode: String) async throws -> ClaimResponse {
         let response: ClaimResponse = try await request(
@@ -461,6 +468,10 @@ public actor AppleMusicCompanionHost {
         installation = saved
         try installationStore.save(saved)
         return response
+    }
+
+    public func discoverPairing(bridgeID: String) async throws -> PairingResponse {
+        try await bridge.discoverPairing(bridgeID: bridgeID)
     }
 
     public func publish(snapshot: MusicKitSnapshotPayload) async throws {
