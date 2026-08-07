@@ -1137,35 +1137,91 @@ pub struct HqpSettingRequest {
     pub value: u32,
 }
 
+/// Resolve and dispatch the legacy numeric HQPlayer setting contract.  Numbers are
+/// list positions for enumerated controls (and Hz for samplerate); the runtime
+/// gateway performs the live enumeration before sending the semantic command.
+async fn hqp_apply_legacy_setting(
+    state: &AppState,
+    setting: &str,
+    value: u32,
+) -> anyhow::Result<()> {
+    crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        state,
+        "default",
+        HqpRuntimeCommand::LegacyPipelineIndex {
+            setting: setting.to_string(),
+            index: value,
+        },
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message().to_string()))
+}
+
+/// Apply a semantic HQPlayer setting through the runtime gateway.
+async fn hqp_apply_named_setting(
+    state: &AppState,
+    setting: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let normalized = match setting {
+        "mode" | "filter" | "filter1x" | "filterNx" | "filternx" | "shaper" | "dither"
+        | "junk_filter" => value.to_string(),
+        "convolution" | "adaptive_volume" | "random" => parse_hqp_bool(value)?.to_string(),
+        "repeat" => parse_hqp_repeat(value)?.to_string(),
+        "samplerate" | "rate" => value.parse::<u32>().map_err(|_| {
+            anyhow::anyhow!("Invalid rate value (expected Hz like 48000, 96000): {value}")
+        })?.to_string(),
+        other => return Err(anyhow::anyhow!("Unknown setting: {other}")),
+    };
+    crate::knobs::routes::dispatch_hqplayer_reconfiguration(
+        state,
+        "default",
+        HqpRuntimeCommand::Pipeline {
+            setting: setting.to_string(),
+            value: normalized,
+        },
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.message().to_string()))
+}
+
+fn parse_hqp_bool(value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Ok(true),
+        "false" | "0" | "off" | "no" => Ok(false),
+        _ => Err(anyhow::anyhow!("Invalid boolean value {value:?}; expected true or false")),
+    }
+}
+
+fn parse_hqp_repeat(value: &str) -> anyhow::Result<u8> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "0" => Ok(0),
+        "one" | "track" | "1" => Ok(1),
+        "all" | "2" => Ok(2),
+        _ => Err(anyhow::anyhow!("Invalid repeat value {value:?}; expected off, one, or all")),
+    }
+}
+
 /// POST /hqplayer/setting - Change HQPlayer pipeline setting (legacy endpoint)
 pub async fn hqp_setting_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpSettingRequest>,
 ) -> impl IntoResponse {
-    // Legacy endpoint - convert numeric value to string for name-based lookups
-    let value_str = req.value.to_string();
-    let result = match req.name.as_str() {
-        "mode" => state.hqplayer.set_mode(&value_str).await,
-        "filter" => state.hqplayer.set_filter_pair(&value_str).await,
-        "filter1x" => state.hqplayer.set_filter_1x(&value_str).await,
-        "filterNx" | "filternx" => state.hqplayer.set_filter_nx(&value_str).await,
-        "shaper" => state.hqplayer.set_shaper(&value_str).await,
-        "samplerate" | "rate" => state.hqplayer.set_rate(req.value).await,
-        _ => Err(anyhow::anyhow!("Unknown setting: {}", req.name)),
-    };
-
-    match result {
-        Ok(outcome) => match outcome.into_applied_result() {
-            Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
-            Err(e) => (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })).into_response(),
-        },
+    const ACCEPTED: [&str; 8] = [
+        "mode", "filter", "filter1x", "filterNx", "filternx", "shaper", "samplerate", "rate",
+    ];
+    if !ACCEPTED.contains(&req.name.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: format!("Unknown setting: {}", req.name) }),
+        ).into_response();
+    }
+    match hqp_apply_legacy_setting(&state, &req.name, req.value).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+            Json(ErrorResponse { error: e.to_string() }),
+        ).into_response(),
     }
 }
 
@@ -1181,28 +1237,6 @@ pub async fn hqp_pipeline_update_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpPipelineRequest>,
 ) -> impl IntoResponse {
-    // Convert value to string - all settings now use name-based lookups
-    let value_str: String = match &req.value {
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::String(s) => s.clone(),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: "Invalid value type".to_string(),
-                }),
-            )
-                .into_response()
-        }
-    };
-
-    // For samplerate, we still need the numeric Hz value
-    let rate_value: u32 = match &req.value {
-        serde_json::Value::Number(n) => n.as_u64().unwrap_or(0) as u32,
-        serde_json::Value::String(s) => s.parse::<u32>().unwrap_or(0),
-        _ => 0,
-    };
-
     let valid_settings = [
         "mode",
         "samplerate",
@@ -1210,6 +1244,11 @@ pub async fn hqp_pipeline_update_handler(
         "filterNx",
         "shaper",
         "dither",
+        "junk_filter",
+        "convolution",
+        "adaptive_volume",
+        "repeat",
+        "random",
     ];
     if !valid_settings.contains(&req.setting.as_str()) {
         return (
@@ -1221,33 +1260,19 @@ pub async fn hqp_pipeline_update_handler(
             .into_response();
     }
 
-    let result = match req.setting.as_str() {
-        "mode" => state.hqplayer.set_mode(&value_str).await,
-        "filter1x" => state.hqplayer.set_filter_1x(&value_str).await,
-        "filterNx" | "filternx" => state.hqplayer.set_filter_nx(&value_str).await,
-        "shaper" => state.hqplayer.set_shaper(&value_str).await,
-        "samplerate" => state.hqplayer.set_rate(rate_value).await,
-        "dither" => state.hqplayer.set_shaper(&value_str).await, // dither uses same API
-        _ => Err(anyhow::anyhow!("Unknown setting: {}", req.setting)),
+    let result = match &req.value {
+        serde_json::Value::Number(n) => match n.as_u64() {
+            Some(v) if v <= u64::from(u32::MAX) => hqp_apply_legacy_setting(&state, &req.setting, v as u32).await,
+            _ => Err(anyhow::anyhow!("Invalid numeric value for {}: {n}", req.setting)),
+        },
+        serde_json::Value::String(value) => hqp_apply_named_setting(&state, &req.setting, value).await,
+        _ => Err(anyhow::anyhow!("Invalid value type")),
     };
 
     match result {
-        Ok(outcome) => match outcome.into_applied_result() {
-            Ok(()) => {
-            // After setting, fetch and return the fresh pipeline state
-            // This ensures the UI gets the updated state immediately
-            match state.hqplayer.get_pipeline_status().await {
-                Ok(pipeline) => (StatusCode::OK, Json(pipeline)).into_response(),
-                Err(_) => {
-                    // If fetching fresh state fails, still return ok
-                    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-                }
-            }
-            }
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse { error: e.to_string() }),
-            ).into_response(),
+        Ok(()) => match state.hqplayer.get_pipeline_status().await {
+            Ok(pipeline) => (StatusCode::OK, Json(pipeline)).into_response(),
+            Err(_) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1311,25 +1336,27 @@ pub async fn hqp_matrix_profiles_handler(State(state): State<AppState>) -> impl 
             .into_response();
     }
 
-    let profiles = state.hqplayer.get_matrix_profiles().await;
-    let current = state.hqplayer.get_matrix_profile().await;
-
-    match (profiles, current) {
-        (Ok(profiles), Ok(current)) => (
+    match state.hqplayer.get_advanced_options_snapshot().await {
+        Ok(snapshot) => (
             StatusCode::OK,
             Json(serde_json::json!({
-                "profiles": profiles,
-                "current": current
+                "profiles": snapshot.matrix_profiles,
+                "current": snapshot.current_matrix_profile,
+                "junk_filters": snapshot.junk_filters,
+                "junk_filter": snapshot.state.filter_junk,
+                "convolution": snapshot.state.convolution,
+                "adaptive_volume": snapshot.state.adaptive,
+                "repeat": snapshot.state.repeat,
+                "random": snapshot.state.random,
+                "native_state": snapshot.state,
             })),
-        )
-            .into_response(),
-        (Err(e), _) | (_, Err(e)) => (
+        ).into_response(),
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: e.to_string(),
             }),
-        )
-            .into_response(),
+        ).into_response(),
     }
 }
 
