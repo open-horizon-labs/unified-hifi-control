@@ -9,8 +9,6 @@ import MusicKit
 /// MusicKit authorization stay inside that host app.
 @available(macOS 14.0, *)
 public actor ApplicationMusicPlayerCompanion {
-    public static let playerID = "application"
-
     private let player = ApplicationMusicPlayer.shared
     public let companionID: String
 
