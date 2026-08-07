@@ -12,8 +12,11 @@ use unified_hifi_control::adapters::apple_music::{
     AppleMusicAdapter, CompanionPlatform, ExecutionOwner, MusicKitCommand, MusicKitCompanion,
     MusicKitPlaybackState, MusicKitSnapshot, MusicKitTrack, PlaybackRoute,
 };
-use unified_hifi_control::adapters::{AdapterCommand, AdapterContext, AdapterLogic, Startable};
+use unified_hifi_control::adapters::{
+    AdapterCommand, AdapterContext, AdapterLogic, LibraryAdapter, Startable,
+};
 use unified_hifi_control::aggregator::ZoneAggregator;
+use unified_hifi_control::api::apple_bridge::{AppleBridgeRegistry, PairedMusicKitCompanion};
 use unified_hifi_control::bus::SharedBus;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState};
 
@@ -250,6 +253,24 @@ async fn adapter_rejects_zone_owned_by_another_provider() {
         .error
         .as_deref()
         .is_some_and(|error| error.contains("applemusic")));
+}
+
+#[tokio::test]
+async fn paired_companion_truthfully_refuses_content_until_bridge_contract_exists() {
+    let bus = create_bus();
+    let adapter = AppleMusicAdapter::with_companion(
+        bus,
+        Arc::new(PairedMusicKitCompanion::new(AppleBridgeRegistry::default())),
+        Duration::from_millis(5),
+    );
+
+    let error = adapter
+        .search("Miles Davis", 10)
+        .await
+        .expect_err("content must remain gated until the approved bridge transport exists");
+    assert!(error
+        .to_string()
+        .contains("content operations are not implemented"));
 }
 
 #[tokio::test]
