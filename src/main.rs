@@ -531,6 +531,8 @@ mod server {
         let api_bridge_state = api::apple_bridge::state;
         let api_bridge_commands = api::apple_bridge::commands;
         let api_bridge_ack = api::apple_bridge::acknowledge;
+        let api_bridge_content = api::apple_bridge::content;
+        let api_bridge_content_ack = api::apple_bridge::acknowledge_content;
         #[rustfmt::skip]
         let router = Router::new()
             // Health check
@@ -548,6 +550,8 @@ mod server {
             .route("/api/bridges/applemusic/state", post(api_bridge_state))
             .route("/api/bridges/applemusic/commands", get(api_bridge_commands))
             .route("/api/bridges/applemusic/commands/{command_id}", post(api_bridge_ack))
+            .route("/api/bridges/applemusic/content", get(api_bridge_content))
+            .route("/api/bridges/applemusic/content/{request_id}", post(api_bridge_content_ack))
             // Roon routes
             .route("/roon/status", get(api::roon_status_handler))
             .route("/roon/zones", get(api::roon_zones_handler))

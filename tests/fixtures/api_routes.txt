@@ -16,6 +16,7 @@
 DELETE /mcp
 GET /admin
 GET /api/bridges/applemusic/commands
+GET /api/bridges/applemusic/content
 GET /api/bridges/applemusic/status
 GET /api/providers/spotify/account
 GET /api/providers/{provider}/oauth/callback
@@ -66,6 +67,7 @@ GET /upnp/zones
 GET /zones
 POST /api/bridges/applemusic/claim
 POST /api/bridges/applemusic/commands/{command_id}
+POST /api/bridges/applemusic/content/{request_id}
 POST /api/bridges/applemusic/pair
 POST /api/bridges/applemusic/revoke
 POST /api/bridges/applemusic/state

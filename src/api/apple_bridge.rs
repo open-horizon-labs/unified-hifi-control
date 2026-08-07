@@ -13,6 +13,7 @@ use axum::{
 };
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -30,6 +31,8 @@ const MAX_PAIRINGS: usize = 64;
 const MAX_SESSIONS: usize = 16;
 const MAX_COMMANDS: usize = 64;
 const MAX_RESULTS: usize = 128;
+const MAX_CONTENT_COMMANDS: usize = 32;
+const MAX_CONTENT_RESULTS: usize = 64;
 const MAX_BRIDGE_ID_LENGTH: usize = 128;
 
 #[derive(Clone, Default)]
@@ -57,6 +60,8 @@ struct BridgeSession {
     bound_player_id: Option<String>,
     commands: VecDeque<QueuedCommand>,
     results: HashMap<String, Option<std::result::Result<(), String>>>,
+    content_commands: VecDeque<QueuedContentCommand>,
+    content_results: HashMap<String, Option<std::result::Result<Value, String>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +142,41 @@ pub struct CommandResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentCommand {
+    pub request_id: String,
+    pub owner_id: String,
+    pub operation: String,
+    pub params: Value,
+    pub idempotency_key: Option<String>,
+    pub precondition: Option<Value>,
+    pub confirm: bool,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedContentCommand {
+    request: ContentCommand,
+    delivered_at: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContentResult {
+    pub outcome: String,
+    #[serde(default)]
+    pub data: Option<Value>,
+    #[serde(default)]
+    pub error: Option<ContentError>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ContentError {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
 impl AppleBridgeRegistry {
     pub async fn create_pairing(&self, bridge_id: String) -> PairingResponse {
         let bridge_id = bridge_id
@@ -208,6 +248,8 @@ impl AppleBridgeRegistry {
                 bound_player_id: None,
                 commands: VecDeque::new(),
                 results: HashMap::new(),
+                content_commands: VecDeque::new(),
+                content_results: HashMap::new(),
             },
         );
         Ok(ClaimResponse {
@@ -403,6 +445,131 @@ impl AppleBridgeRegistry {
         Ok(command_id)
     }
 
+    pub async fn enqueue_content(
+        &self,
+        operation: &str,
+        params: Value,
+    ) -> Result<String> {
+        let mut state = self.inner.write().await;
+        let now = now_secs();
+        let session = state
+            .sessions
+            .values_mut()
+            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now)
+            .max_by_key(|session| session.last_seen)
+            .ok_or_else(|| anyhow!("Apple Music companion is not paired or live"))?;
+        enqueue_content_in_session(session, operation, params)
+    }
+
+    pub async fn enqueue_content_for_player(
+        &self,
+        player_id: &str,
+        operation: &str,
+        params: Value,
+    ) -> Result<String> {
+        let mut state = self.inner.write().await;
+        let now = now_secs();
+        let session = state
+            .sessions
+            .values_mut()
+            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now)
+            .filter(|session| session.bound_player_id.as_deref() == Some(player_id))
+            .max_by_key(|session| session.last_seen)
+            .ok_or_else(|| anyhow!("Apple Music player `{player_id}` is not paired or live"))?;
+        enqueue_content_in_session(session, operation, params)
+    }
+
+    pub async fn poll_content(&self, token: &str) -> Result<Vec<ContentCommand>> {
+        self.with_session(token, |session| {
+            let now = now_secs();
+            let expired = session
+                .content_commands
+                .iter()
+                .filter(|command| command.request.expires_at <= now)
+                .map(|command| command.request.request_id.clone())
+                .collect::<Vec<_>>();
+            session
+                .content_commands
+                .retain(|command| command.request.expires_at > now);
+            for request_id in expired {
+                session.content_results.remove(&request_id);
+            }
+            session
+                .content_commands
+                .iter_mut()
+                .filter(|command| {
+                    command
+                        .delivered_at
+                        .map(|delivered_at| {
+                            now.saturating_sub(delivered_at) >= COMMAND_DELIVERY_LEASE.as_secs()
+                        })
+                        .unwrap_or(true)
+                })
+                .map(|command| {
+                    command.delivered_at = Some(now);
+                    command.request.clone()
+                })
+                .collect()
+        })
+        .await
+    }
+
+    pub async fn acknowledge_content(
+        &self,
+        token: &str,
+        request_id: &str,
+        result: ContentResult,
+    ) -> Result<()> {
+        self.with_session(token, |session| {
+            if !session.content_results.contains_key(request_id) {
+                return Err(anyhow!("content request id is unknown or expired"));
+            }
+            session
+                .content_commands
+                .retain(|command| command.request.request_id != request_id);
+            let outcome = result.outcome.as_str();
+            let stored = if outcome == "success" {
+                Ok(result.data.unwrap_or(Value::Null))
+            } else {
+                let message = result
+                    .error
+                    .map(|error| format!("{}: {}", error.code, error.message))
+                    .unwrap_or_else(|| format!("Apple Music content outcome: {outcome}"));
+                Err(message)
+            };
+            session
+                .content_results
+                .insert(request_id.to_string(), Some(stored));
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    pub async fn wait_for_content_result(
+        &self,
+        request_id: &str,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            {
+                let mut state = self.inner.write().await;
+                for session in state.sessions.values_mut() {
+                    if let Some(Some(result)) = session.content_results.get(request_id) {
+                        let result = result.clone();
+                        session.content_results.remove(request_id);
+                        return result.map_err(anyhow::Error::msg);
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("Apple Music companion did not acknowledge content request");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     pub async fn poll_commands(&self, token: &str) -> Result<Vec<BridgeCommand>> {
         self.with_session(token, |session| {
             let now = now_secs();
@@ -553,6 +720,35 @@ impl MusicKitCompanion for PairedMusicKitCompanion {
             .wait_for_result(&command_id, COMMAND_TTL)
             .await
     }
+
+    async fn content(
+        &self,
+        operation: &str,
+        params: &Value,
+    ) -> Result<Value> {
+        let request_id = self
+            .registry
+            .enqueue_content(operation, params.clone())
+            .await?;
+        self.registry
+            .wait_for_content_result(&request_id, COMMAND_TTL)
+            .await
+    }
+
+    async fn content_for_player(
+        &self,
+        player_id: &str,
+        operation: &str,
+        params: &Value,
+    ) -> Result<Value> {
+        let request_id = self
+            .registry
+            .enqueue_content_for_player(player_id, operation, params.clone())
+            .await?;
+        self.registry
+            .wait_for_content_result(&request_id, COMMAND_TTL)
+            .await
+    }
 }
 
 pub async fn pair(
@@ -646,6 +842,19 @@ pub async fn commands(
         })
 }
 
+pub async fn content(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ContentCommand>>, (StatusCode, Json<ErrorBody>)> {
+    let token = bearer(&headers)?;
+    state
+        .apple_bridges
+        .poll_content(&token)
+        .await
+        .map(Json)
+        .map_err(|e| error(StatusCode::UNAUTHORIZED, &e.to_string(), "bridge_unauthorized"))
+}
+
 pub async fn acknowledge(
     State(state): State<AppState>,
     Path(command_id): Path<String>,
@@ -665,6 +874,21 @@ pub async fn acknowledge(
                 "command_ack_failed",
             )
         })
+}
+
+pub async fn acknowledge_content(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+    Json(result): Json<ContentResult>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    let token = bearer(&headers)?;
+    state
+        .apple_bridges
+        .acknowledge_content(&token, &request_id, result)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| error(StatusCode::BAD_REQUEST, &e.to_string(), "content_ack_failed"))
 }
 
 #[derive(Debug, Serialize)]
@@ -713,6 +937,48 @@ fn validate_bridge_id(value: &str) -> Result<(), String> {
         return Err("bridge_id must not contain whitespace or control characters".to_string());
     }
     Ok(())
+}
+
+fn enqueue_content_in_session(
+    session: &mut BridgeSession,
+    operation: &str,
+    params: Value,
+) -> Result<String> {
+    if operation.is_empty() || operation.chars().count() > 128 {
+        bail!("Apple Music content operation is empty or too long");
+    }
+    if serde_json::to_vec(&params)
+        .map(|bytes| bytes.len() > 16 * 1024)
+        .unwrap_or(true)
+    {
+        bail!("Apple Music content parameters are too large");
+    }
+    if session.content_commands.len() >= MAX_CONTENT_COMMANDS
+        || session.content_results.len() >= MAX_CONTENT_RESULTS
+    {
+        bail!("Apple Music content command capacity is full");
+    }
+    let request_id = random_token(20);
+    let owner_id = session
+        .bound_player_id
+        .clone()
+        .unwrap_or_else(|| session.bridge_id.clone());
+    let request = ContentCommand {
+        request_id: request_id.clone(),
+        owner_id,
+        operation: operation.to_string(),
+        params,
+        idempotency_key: None,
+        precondition: None,
+        confirm: false,
+        expires_at: now_secs() + COMMAND_TTL.as_secs(),
+    };
+    session.content_commands.push_back(QueuedContentCommand {
+        request,
+        delivered_at: None,
+    });
+    session.content_results.insert(request_id.clone(), None);
+    Ok(request_id)
 }
 
 fn now_secs() -> u64 {
@@ -840,6 +1106,68 @@ mod tests {
             .await
             .expect("poll after acknowledgement succeeds")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn content_requests_are_owner_scoped_and_return_normalized_data() {
+        let registry = AppleBridgeRegistry::default();
+        let pairing = registry.create_pairing("iphone".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+        registry
+            .update_snapshot(&claim.access_token, snapshot())
+            .await
+            .expect("owner snapshot binds the session");
+
+        let request_id = registry
+            .enqueue_content_for_player(
+                "application",
+                "catalog_search",
+                serde_json::json!({"query": "Miles Davis", "limit": 10}),
+            )
+            .await
+            .expect("content request queues for its owner");
+        let requests = registry
+            .poll_content(&claim.access_token)
+            .await
+            .expect("content poll succeeds");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].request_id, request_id);
+        assert_eq!(requests[0].owner_id, "application");
+        assert_eq!(requests[0].operation, "catalog_search");
+
+        registry
+            .acknowledge_content(
+                &claim.access_token,
+                &request_id,
+                ContentResult {
+                    outcome: "success".to_string(),
+                    data: Some(serde_json::json!({"items": []})),
+                    error: None,
+                },
+            )
+            .await
+            .expect("content acknowledgement succeeds");
+        assert_eq!(
+            registry
+                .wait_for_content_result(&request_id, Duration::from_millis(100))
+                .await
+                .expect("adapter receives content result"),
+            serde_json::json!({"items": []})
+        );
+        assert!(registry
+            .enqueue_content_for_player(
+                "other-owner",
+                "catalog_search",
+                serde_json::json!({"query": "x"}),
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]

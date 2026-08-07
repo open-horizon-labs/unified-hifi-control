@@ -378,7 +378,7 @@ async fn adapter_rejects_zone_owned_by_another_provider() {
 }
 
 #[tokio::test]
-async fn paired_companion_truthfully_refuses_content_until_bridge_contract_exists() {
+async fn paired_companion_requires_a_live_owner_for_content() {
     let bus = create_bus();
     let adapter = AppleMusicAdapter::with_companion(
         bus,
@@ -389,10 +389,8 @@ async fn paired_companion_truthfully_refuses_content_until_bridge_contract_exist
     let error = adapter
         .search("Miles Davis", 10)
         .await
-        .expect_err("content must remain gated until the approved bridge transport exists");
-    assert!(error
-        .to_string()
-        .contains("content operations are not implemented"));
+        .expect_err("content must require a live paired companion");
+    assert!(error.to_string().contains("not paired or live"));
 }
 
 #[tokio::test]

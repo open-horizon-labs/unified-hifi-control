@@ -218,6 +218,18 @@ pub trait MusicKitCompanion: Send + Sync {
     ) -> Result<serde_json::Value> {
         bail!("Apple Music content operations are not implemented by this companion")
     }
+
+    /// Owner-scoped content dispatch. The legacy method remains for catalog
+    /// calls that have no zone context; paired companions override this method
+    /// for playback, queue, library, and mutation operations.
+    async fn content_for_player(
+        &self,
+        _player_id: &str,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.content(operation, params).await
+    }
 }
 
 /// Apple Music adapter backed by a native MusicKit companion.
@@ -531,7 +543,7 @@ impl LibraryAdapter for AppleMusicAdapter {
         let value = self
             .companion
             .content(
-                "search",
+                "catalog_search",
                 &serde_json::json!({"query": query, "limit": limit.clamp(1, 50)}),
             )
             .await?;
@@ -542,7 +554,11 @@ impl LibraryAdapter for AppleMusicAdapter {
         self.validate_content_zone(zone_id)?;
         let value = self
             .companion
-            .content("play_uri", &serde_json::json!({"uri": uri}))
+            .content_for_player(
+                zone_id.strip_prefix("applemusic:").unwrap_or_default(),
+                "play_uri",
+                &serde_json::json!({"uri": uri, "zone_id": zone_id}),
+            )
             .await?;
         content_message(value, "Apple Music item started")
     }
@@ -550,7 +566,11 @@ impl LibraryAdapter for AppleMusicAdapter {
     async fn queue_uri(&self, zone_id: &str, uri: &str) -> Result<()> {
         self.validate_content_zone(zone_id)?;
         self.companion
-            .content("queue_uri", &serde_json::json!({"uri": uri}))
+            .content_for_player(
+                zone_id.strip_prefix("applemusic:").unwrap_or_default(),
+                "queue_uri",
+                &serde_json::json!({"uri": uri, "zone_id": zone_id}),
+            )
             .await
             .map(|_| ())
     }
@@ -558,7 +578,11 @@ impl LibraryAdapter for AppleMusicAdapter {
     async fn read_queue(&self, zone_id: &str) -> Result<serde_json::Value> {
         self.validate_content_zone(zone_id)?;
         self.companion
-            .content("queue_read", &serde_json::json!({}))
+            .content_for_player(
+                zone_id.strip_prefix("applemusic:").unwrap_or_default(),
+                "queue_read",
+                &serde_json::json!({"zone_id": zone_id}),
+            )
             .await
     }
 
@@ -568,7 +592,17 @@ impl LibraryAdapter for AppleMusicAdapter {
         params: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         validate_content_request(operation, params)?;
-        self.companion.content(operation, params).await
+        if let Some(zone_id) = params.get("zone_id").and_then(serde_json::Value::as_str) {
+            self.companion
+                .content_for_player(
+                    zone_id.strip_prefix("applemusic:").unwrap_or_default(),
+                    operation,
+                    params,
+                )
+                .await
+        } else {
+            self.companion.content(operation, params).await
+        }
     }
 }
 
