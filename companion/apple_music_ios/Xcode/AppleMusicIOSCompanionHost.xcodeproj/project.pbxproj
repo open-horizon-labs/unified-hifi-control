@@ -186,6 +186,9 @@
 			);
 			mainGroup = 8B41F63C2DEDD0D5001A66F9;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				8BD71C0B2DEE41E000CEDD92 /* XCLocalSwiftPackageReference */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 8B41F6462DEDD0D5001A66F9 /* Products */;
 			projectDirPath = "";
@@ -467,13 +470,22 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		8BD71C0B2DEE41E000CEDD92 /* XCLocalSwiftPackageReference */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = AppleMusicIOSCompanionHostPackage;
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		8B41F6822DEDD23B001A66F9 /* AppleMusicIOSCompanionHostFeature */ = {
 			isa = XCSwiftPackageProductDependency;
+			package = 8BD71C0B2DEE41E000CEDD92 /* XCLocalSwiftPackageReference */;
 			productName = AppleMusicIOSCompanionHostFeature;
 		};
 		8B41F6842DEDD25C001A66F9 /* AppleMusicIOSCompanionHostFeature */ = {
 			isa = XCSwiftPackageProductDependency;
+			package = 8BD71C0B2DEE41E000CEDD92 /* XCLocalSwiftPackageReference */;
 			productName = AppleMusicIOSCompanionHostFeature;
 		};
 /* End XCSwiftPackageProductDependency section */

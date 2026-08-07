@@ -8,12 +8,14 @@ private final class CompanionModel: ObservableObject {
     @Published var bridgeID = ""
     @Published var pairingCode = ""
     @Published private(set) var isPaired = false
-    private let host: AppleMusicCompanionHost
+    private let installationStore: KeychainAppleMusicCompanionInstallationStore
+    private var host: AppleMusicCompanionHost
     private let player = SystemMusicPlayerCompanion()
     private var pollTask: Task<Void, Never>?
 
     init() {
         let store = KeychainAppleMusicCompanionInstallationStore()
+        installationStore = store
         let installation = store.load() ?? AppleMusicCompanionInstallation(
             baseURL: URL(string: "http://127.0.0.1:18088")!, companionID: "ios-companion")
         uhcURL = installation.baseURL.absoluteString
@@ -26,7 +28,27 @@ private final class CompanionModel: ObservableObject {
     func authorize() { Task { @MainActor in do { _ = try await host.authorize(); status = "Authorized; enter a UHC pairing code" } catch { status = error.localizedDescription } } }
     func claim() {
         guard !bridgeID.isEmpty, !pairingCode.isEmpty else { status = "Enter the bridge ID and pairing code"; return }
-        Task { @MainActor in do { _ = try await host.claim(bridgeID: bridgeID, pairingCode: pairingCode); isPaired = true; status = "Paired; waiting for snapshots"; startPolling() } catch { status = error.localizedDescription } }
+        guard let baseURL = Self.validatedURL(uhcURL) else {
+            status = "Enter a valid UHC URL (http:// or https://)"
+            return
+        }
+        // The setup field is authoritative. Rebuild the bridge client before
+        // claiming so a phone can pair to a LAN/tunnel UHC server instead of
+        // silently sending the claim to the localhost default.
+        host = AppleMusicCompanionHost(
+            bridgeBaseURL: baseURL,
+            companionID: "ios-companion",
+            store: installationStore
+        )
+        let claimHost = host
+        Task { @MainActor in do { _ = try await claimHost.claim(bridgeID: bridgeID, pairingCode: pairingCode); isPaired = true; status = "Paired; waiting for snapshots"; startPolling() } catch { status = error.localizedDescription } }
+    }
+    private static func validatedURL(_ raw: String) -> URL? {
+        guard let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              url.host != nil else { return nil }
+        return url
     }
     func startPolling() {
         guard isPaired else { return }
@@ -66,5 +88,6 @@ public struct ContentView: View {
             }
         }
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.startPolling() } else { model.stopPolling() } }
+        .task { model.startPolling() }
     }
 }
