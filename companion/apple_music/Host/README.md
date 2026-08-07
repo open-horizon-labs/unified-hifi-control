@@ -1,12 +1,14 @@
 # macOS Apple Music companion host scaffold
 
 Create a signed macOS 14+ SwiftUI app, add the sibling
-`AppleMusicCompanion` package, enable MusicKit, and restore (or create) its
-installation with `KeychainAppleMusicCompanionInstallationStore`. The host
-flow is:
+`AppleMusicCompanion` package, enable MusicKit, and include the example
+`CompanionModel.swift` and `AppleMusicCompanionApp.swift` files in the app
+target. The model restores (or creates) its installation with
+`KeychainAppleMusicCompanionInstallationStore`, so the companion ID survives
+relaunches. The host flow is:
 
 1. Request MusicKit authorization in the signed app.
-2. Claim the short-lived bridge code shown by UHC.
+2. Generate/claim the short-lived bridge code shown by UHC.
 3. Poll and acknowledge transport commands while the app is active.
 4. Publish `ApplicationMusicPlayerCompanion.snapshot()` on a foreground
    cadence.
@@ -19,4 +21,5 @@ The repository has no macOS SDK/Xcode target, so local validation is syntax
 only. Signing, Keychain behavior, authorization failures, background
 lifecycle, and AirPlay-route observations require a physical Mac (#486/#487).
 Keep the bridge behind HTTPS and an authenticated controller boundary until
-#488 is implemented.
+#488 is implemented. The example deliberately uses a placeholder endpoint;
+replace it during onboarding and do not ship that URL.
