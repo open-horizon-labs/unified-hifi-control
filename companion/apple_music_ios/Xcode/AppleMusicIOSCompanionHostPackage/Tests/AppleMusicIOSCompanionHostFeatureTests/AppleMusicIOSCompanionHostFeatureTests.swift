@@ -44,3 +44,12 @@ import AppleMusicIOSCompanion
     #expect(!first.companionID.contains(":"))
     #expect(first.companionID != second.companionID)
 }
+
+@Test func usedOrExpiredPairingCodeOffersAPlainLanguageRetry() {
+    let error = BridgeClientError.httpStatus(
+        400,
+        #"{\"error\":\"pairing code is unknown or already used\",\"code\":\"pairing_failed\"}"#
+    )
+
+    #expect(pairingRecoveryMessage(for: error) == "That confirmation code has expired or was already used. Find UHC again to get a new code.")
+}
