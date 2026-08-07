@@ -28,8 +28,53 @@ mod server {
     use std::time::Instant;
     use tokio::signal;
     use tokio_util::sync::CancellationToken;
-    use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
+    use tower_http::{
+        compression::CompressionLayer,
+        cors::{AllowOrigin, Any, CorsLayer},
+        trace::TraceLayer,
+    };
     use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    /// Same-origin browser requests do not need CORS. Cross-origin browser
+    /// access is opt-in because this server also exposes playback, OAuth, and
+    /// companion authority endpoints; a global permissive policy would let
+    /// arbitrary sites issue those requests through a tunnel. Operators that
+    /// intentionally host a separate UI must set `UHC_ALLOWED_ORIGINS` to a
+    /// comma-separated list of exact origins.
+    fn configured_cors_layer() -> CorsLayer {
+        let origins = std::env::var("UHC_ALLOWED_ORIGINS")
+            .ok()
+            .into_iter()
+            .flat_map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|origin| !origin.is_empty())
+            .filter_map(|origin| match axum::http::HeaderValue::from_str(&origin) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::warn!(
+                        origin,
+                        "Ignoring invalid UHC_ALLOWED_ORIGINS entry: {error}"
+                    );
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if origins.is_empty() {
+            tracing::info!("CORS disabled; same-origin access remains available");
+            CorsLayer::new()
+        } else {
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods(Any)
+                .allow_headers(Any)
+        }
+    }
 
     /// Flash page - redirects to external web flasher
     async fn flash_page() -> impl IntoResponse {
@@ -652,7 +697,7 @@ mod server {
             .route("/mcp", delete(mcp::handle_mcp_delete))
             // Middleware
             .layer(mcp_extension)
-            .layer(CorsLayer::permissive())
+            .layer(configured_cors_layer())
             .layer(CompressionLayer::new())
             .layer(TraceLayer::new_for_http())
             .with_state(state);

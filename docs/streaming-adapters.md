@@ -50,6 +50,15 @@ command contract.
 
 ## Authorization and the Apple Music bridge
 
+The embedded UI is same-origin. Cross-origin browser access is disabled by
+default because this server also exposes playback, OAuth, and companion
+authority endpoints. If a separately hosted UI is intentionally deployed, set
+`UHC_ALLOWED_ORIGINS` to an exact comma-separated origin allowlist (for
+example `https://uhc.example.test`). Do not use `*` for an installation that
+is reachable through a tunnel; put authentication and access control at the
+tunnel/reverse-proxy boundary until the controller-auth contract in #463 is
+implemented.
+
 The first authorization contract is now implemented in UHC. Spotify uses the
 standard authorization-code flow:
 
