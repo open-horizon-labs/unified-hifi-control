@@ -28,6 +28,7 @@ use tokio::sync::RwLock;
 use super::AppState;
 
 const OAUTH_TTL: Duration = Duration::from_secs(600);
+const MAX_PENDING_OAUTH: usize = 64;
 const SPOTIFY_AUTHORIZE_URL: &str = "https://accounts.spotify.com/authorize";
 const SPOTIFY_TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
 const SPOTIFY_SCOPE: &str = "user-read-playback-state user-modify-playback-state user-read-private user-read-email playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private user-library-read user-library-modify";
@@ -305,7 +306,17 @@ pub async fn oauth_start(
     let code_challenge = code_verifier.as_deref().map(pkce_challenge);
     let state_token = random_token(32);
     let expires_at = now_secs() + OAUTH_TTL.as_secs();
-    state.provider_auth.pending.write().await.insert(
+    let mut pending = state.provider_auth.pending.write().await;
+    let now = now_secs();
+    pending.retain(|_, item| item.expires_at > now);
+    if pending.len() >= MAX_PENDING_OAUTH {
+        return Err(error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many pending Spotify authorizations; finish or wait for one to expire",
+            "oauth_capacity_exceeded",
+        ));
+    }
+    pending.insert(
         state_token.clone(),
         PendingOAuth {
             provider: provider.clone(),

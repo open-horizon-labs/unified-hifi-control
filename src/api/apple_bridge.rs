@@ -26,6 +26,11 @@ const PAIRING_TTL: Duration = Duration::from_secs(300);
 const COMMAND_TTL: Duration = Duration::from_secs(30);
 const BRIDGE_LIVENESS_TTL: Duration = Duration::from_secs(30);
 const COMMAND_DELIVERY_LEASE: Duration = Duration::from_secs(5);
+const MAX_PAIRINGS: usize = 64;
+const MAX_SESSIONS: usize = 16;
+const MAX_COMMANDS: usize = 64;
+const MAX_RESULTS: usize = 128;
+const MAX_BRIDGE_ID_LENGTH: usize = 128;
 
 #[derive(Clone, Default)]
 pub struct AppleBridgeRegistry {
@@ -114,9 +119,29 @@ pub struct CommandResult {
 
 impl AppleBridgeRegistry {
     pub async fn create_pairing(&self, bridge_id: String) -> PairingResponse {
+        let bridge_id = bridge_id
+            .chars()
+            .take(MAX_BRIDGE_ID_LENGTH)
+            .collect::<String>();
         let pairing_code = random_token(24);
         let expires_at = now_secs() + PAIRING_TTL.as_secs();
-        self.inner.write().await.pairings.insert(
+        let mut state = self.inner.write().await;
+        let now = now_secs();
+        state.pairings.retain(|_, pairing| pairing.expires_at > now);
+        state
+            .sessions
+            .retain(|_, session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now);
+        if state.pairings.len() >= MAX_PAIRINGS {
+            let oldest = state
+                .pairings
+                .iter()
+                .min_by_key(|(_, pairing)| pairing.expires_at)
+                .map(|(code, _)| code.clone());
+            if let Some(oldest) = oldest {
+                state.pairings.remove(&oldest);
+            }
+        }
+        state.pairings.insert(
             pairing_code.clone(),
             Pairing {
                 bridge_id: bridge_id.clone(),
@@ -132,6 +157,11 @@ impl AppleBridgeRegistry {
 
     pub async fn claim(&self, request: ClaimRequest) -> Result<ClaimResponse> {
         let mut state = self.inner.write().await;
+        let now = now_secs();
+        state.pairings.retain(|_, pairing| pairing.expires_at > now);
+        state
+            .sessions
+            .retain(|_, session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now);
         let pairing = state
             .pairings
             .remove(&request.pairing_code)
@@ -146,6 +176,9 @@ impl AppleBridgeRegistry {
         state
             .sessions
             .retain(|_, session| session.bridge_id != request.bridge_id);
+        if state.sessions.len() >= MAX_SESSIONS {
+            bail!("Apple Music companion session capacity is full");
+        }
         state.sessions.insert(
             access_token.clone(),
             BridgeSession {
@@ -283,6 +316,9 @@ impl AppleBridgeRegistry {
             .filter(|session| session.bound_player_id.as_deref() == Some(player_id))
             .max_by_key(|session| session.last_seen)
             .ok_or_else(|| anyhow!("Apple Music player `{player_id}` is not paired or live"))?;
+        if session.commands.len() >= MAX_COMMANDS || session.results.len() >= MAX_RESULTS {
+            bail!("Apple Music companion command capacity is full");
+        }
         let command_id = random_token(20);
         let expires_at = now + COMMAND_TTL.as_secs();
         session.commands.push_back(QueuedCommand {
@@ -298,7 +334,16 @@ impl AppleBridgeRegistry {
     pub async fn poll_commands(&self, token: &str) -> Result<Vec<BridgeCommand>> {
         self.with_session(token, |session| {
             let now = now_secs();
+            let expired = session
+                .commands
+                .iter()
+                .filter(|command| command.expires_at <= now)
+                .map(|command| command.command_id.clone())
+                .collect::<Vec<_>>();
             session.commands.retain(|command| command.expires_at > now);
+            for command_id in expired {
+                session.results.remove(&command_id);
+            }
             let commands = session
                 .commands
                 .iter_mut()
@@ -354,10 +399,12 @@ impl AppleBridgeRegistry {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             {
-                let state = self.inner.read().await;
-                for session in state.sessions.values() {
+                let mut state = self.inner.write().await;
+                for session in state.sessions.values_mut() {
                     if let Some(Some(result)) = session.results.get(command_id) {
-                        return result.clone().map_err(anyhow::Error::msg);
+                        let result = result.clone();
+                        session.results.remove(command_id);
+                        return result.map_err(anyhow::Error::msg);
                     }
                 }
             }
@@ -892,5 +939,14 @@ mod tests {
             .enqueue_for_player("player", MusicKitCommand::Play)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn abandoned_pairings_are_pruned_and_bounded() {
+        let registry = AppleBridgeRegistry::default();
+        for index in 0..(MAX_PAIRINGS + 8) {
+            registry.create_pairing(format!("bridge-{index}")).await;
+        }
+        assert!(registry.inner.read().await.pairings.len() <= MAX_PAIRINGS);
     }
 }
