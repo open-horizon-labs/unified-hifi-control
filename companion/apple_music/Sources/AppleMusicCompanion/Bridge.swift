@@ -119,11 +119,31 @@ public struct MacMusicKitContentError: Codable, Sendable {
 
 @available(macOS 14.0, *)
 public struct MacMusicKitContentResult: Codable, Sendable {
+    /// The bridge vocabulary is intentionally closed. Provider-specific
+    /// errors must be translated before they are persisted or acknowledged.
+    public static let allowedOutcomes: Set<String> = [
+        "success", "unsupported", "unauthorized", "subscription_required",
+        "restricted", "not_found", "offline", "rate_limited", "stale_owner",
+        "conflict", "invalid", "failed"
+    ]
+
     public let outcome: String
     public let data: MacMusicKitJSONValue?
     public let error: MacMusicKitContentError?
     public init(outcome: String, data: MacMusicKitJSONValue? = nil, error: MacMusicKitContentError? = nil) {
         self.outcome = outcome; self.data = data; self.error = error
+    }
+
+    /// Converts an unrecognized provider outcome into a durable, truthful
+    /// bridge error instead of allowing an unknown string onto the wire.
+    public static func validated(_ result: MacMusicKitContentResult) -> MacMusicKitContentResult {
+        guard allowedOutcomes.contains(result.outcome) else {
+            return MacMusicKitContentResult(
+                outcome: "invalid",
+                error: MacMusicKitContentError(code: "invalid_outcome", message: "Companion returned an unsupported content outcome.", retryable: false)
+            )
+        }
+        return result
     }
 }
 
@@ -337,7 +357,8 @@ public actor MacAppleMusicCompanionHost {
                     error: MacMusicKitContentError(code: "companion_failed", message: String(error.localizedDescription.prefix(512)), retryable: true)
                 )
             }
-            contentOutcomes[request.requestID] = result
+            let validatedResult = MacMusicKitContentResult.validated(result)
+            contentOutcomes[request.requestID] = validatedResult
             contentOutcomeOrder.removeAll { $0 == request.requestID }
             contentOutcomeOrder.append(request.requestID)
             while contentOutcomeOrder.count > Self.maxRememberedContentOutcomes {
@@ -345,7 +366,7 @@ public actor MacAppleMusicCompanionHost {
             }
             installation.contentOutcomes = contentOutcomes
             try installationStore.save(installation)
-            try await bridge.acknowledgeContent(request.requestID, result: result)
+            try await bridge.acknowledgeContent(request.requestID, result: validatedResult)
         }
     }
 

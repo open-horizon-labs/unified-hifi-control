@@ -179,6 +179,29 @@ pub struct ContentError {
     pub retryable: bool,
 }
 
+/// Outcomes accepted from a native Apple companion. Keep this vocabulary
+/// aligned with `docs/apple-music-content-bridge.md` and the companion
+/// packages. Rejecting unknown values at the bridge boundary prevents a
+/// provider-specific string from becoming a durable UHC outcome.
+const APPLE_CONTENT_OUTCOMES: &[&str] = &[
+    "success",
+    "unsupported",
+    "unauthorized",
+    "subscription_required",
+    "restricted",
+    "not_found",
+    "offline",
+    "rate_limited",
+    "stale_owner",
+    "conflict",
+    "invalid",
+    "failed",
+];
+
+fn is_apple_content_outcome(outcome: &str) -> bool {
+    APPLE_CONTENT_OUTCOMES.contains(&outcome)
+}
+
 impl AppleBridgeRegistry {
     pub async fn create_pairing(&self, bridge_id: String) -> PairingResponse {
         let bridge_id = bridge_id
@@ -523,6 +546,12 @@ impl AppleBridgeRegistry {
         self.with_session(token, |session| {
             if !session.content_results.contains_key(request_id) {
                 return Err(anyhow!("content request id is unknown or expired"));
+            }
+            if !is_apple_content_outcome(&result.outcome) {
+                return Err(anyhow!(
+                    "unknown Apple Music content outcome `{}`",
+                    result.outcome
+                ));
             }
             session
                 .content_commands
@@ -1232,6 +1261,82 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn content_acknowledgement_rejects_unknown_outcomes_before_storage() {
+        let registry = AppleBridgeRegistry::default();
+        let pairing = registry.create_pairing("iphone".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+        registry
+            .update_snapshot(&claim.access_token, snapshot())
+            .await
+            .expect("owner snapshot binds the session");
+        let request_id = registry
+            .enqueue_content_for_player(
+                "application",
+                "catalog_search",
+                serde_json::json!({"query": "Miles Davis"}),
+            )
+            .await
+            .expect("content request queues");
+        registry
+            .poll_content(&claim.access_token)
+            .await
+            .expect("content poll succeeds");
+
+        let error = registry
+            .acknowledge_content(
+                &claim.access_token,
+                &request_id,
+                ContentResult {
+                    outcome: "provider_specific_error".to_string(),
+                    data: None,
+                    error: None,
+                },
+            )
+            .await
+            .expect_err("unknown outcome must be rejected at the bridge boundary");
+        assert!(error.to_string().contains("unknown Apple Music content outcome"));
+
+        // Rejection does not consume the request or create a durable result;
+        // the companion can retry with a member of the documented vocabulary.
+        assert_eq!(
+            registry
+                .poll_content(&claim.access_token)
+                .await
+                .expect("request remains available")
+                .len(),
+            0,
+            "the delivery lease suppresses an immediate duplicate poll"
+        );
+        registry
+            .acknowledge_content(
+                &claim.access_token,
+                &request_id,
+                ContentResult {
+                    outcome: "offline".to_string(),
+                    data: None,
+                    error: Some(ContentError {
+                        code: "offline".to_string(),
+                        message: "companion offline".to_string(),
+                        retryable: true,
+                    }),
+                },
+            )
+            .await
+            .expect("documented outcome is accepted");
+        let error = registry
+            .wait_for_content_result(&request_id, Duration::from_millis(100))
+            .await
+            .expect_err("offline is a refusal, not successful data");
+        assert!(error.to_string().contains("offline: companion offline"));
     }
 
     #[tokio::test]

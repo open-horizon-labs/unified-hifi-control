@@ -133,6 +133,14 @@ public struct MusicKitContentError: Codable, Sendable {
 }
 
 public struct MusicKitContentResult: Codable, Sendable {
+    /// The bridge vocabulary is intentionally closed. Provider-specific
+    /// errors must be translated before they are persisted or acknowledged.
+    public static let allowedOutcomes: Set<String> = [
+        "success", "unsupported", "unauthorized", "subscription_required",
+        "restricted", "not_found", "offline", "rate_limited", "stale_owner",
+        "conflict", "invalid", "failed"
+    ]
+
     public let outcome: String
     public let data: MusicKitJSONValue?
     public let error: MusicKitContentError?
@@ -141,6 +149,22 @@ public struct MusicKitContentResult: Codable, Sendable {
         self.outcome = outcome
         self.data = data
         self.error = error
+    }
+
+    /// Converts an unrecognized provider outcome into a durable, truthful
+    /// bridge error instead of allowing an unknown string onto the wire.
+    public static func validated(_ result: MusicKitContentResult) -> MusicKitContentResult {
+        guard allowedOutcomes.contains(result.outcome) else {
+            return MusicKitContentResult(
+                outcome: "invalid",
+                error: MusicKitContentError(
+                    code: "invalid_outcome",
+                    message: "Companion returned an unsupported content outcome.",
+                    retryable: false
+                )
+            )
+        }
+        return result
     }
 }
 
@@ -477,11 +501,12 @@ public actor AppleMusicCompanionHost {
                     )
                 )
             }
+            let validatedResult = MusicKitContentResult.validated(result)
             // Persist before acknowledging. If the HTTP acknowledgement is
             // lost, the bridge may redeliver, but the native mutation will not
             // run twice; the cached result is replayed instead.
-            try await rememberContentOutcome(request.requestID, result: result)
-            try await bridge.acknowledgeContent(request.requestID, result: result)
+            try await rememberContentOutcome(request.requestID, result: validatedResult)
+            try await bridge.acknowledgeContent(request.requestID, result: validatedResult)
         }
     }
 
