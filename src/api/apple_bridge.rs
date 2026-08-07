@@ -348,6 +348,9 @@ impl AppleBridgeRegistry {
         if session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() <= now_secs() {
             bail!("Apple Music companion is not live");
         }
+        if session.commands.len() >= MAX_COMMANDS || session.results.len() >= MAX_RESULTS {
+            bail!("Apple Music companion command capacity is full");
+        }
         let command_id = random_token(20);
         let expires_at = now_secs() + COMMAND_TTL.as_secs();
         session.commands.push_back(QueuedCommand {
@@ -797,6 +800,35 @@ mod tests {
             .await
             .expect("poll after acknowledgement succeeds")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_enqueue_is_bounded_like_owner_scoped_enqueue() {
+        let registry = AppleBridgeRegistry::default();
+        let pairing = registry.create_pairing("iphone".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+        registry
+            .update_snapshot(&claim.access_token, snapshot())
+            .await
+            .expect("bridge is live");
+
+        for _ in 0..MAX_COMMANDS {
+            registry
+                .enqueue(MusicKitCommand::Play)
+                .await
+                .expect("command remains within the bounded capacity");
+        }
+        let error = registry
+            .enqueue(MusicKitCommand::Play)
+            .await
+            .expect_err("legacy enqueue must reject an unbounded queue");
+        assert!(error.to_string().contains("capacity is full"));
     }
 
     #[tokio::test]
