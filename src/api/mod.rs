@@ -1764,8 +1764,17 @@ pub async fn lms_configure_handler(
     State(state): State<AppState>,
     Json(req): Json<LmsConfigRequest>,
 ) -> impl IntoResponse {
-    // Stop existing connection if any
-    state.lms.stop().await;
+    // LMS polling and the CLI subscription share one `lms:` projection. Stop
+    // both observers before changing credentials so the old server cannot
+    // republish a stale snapshot during reconfiguration.
+    state
+        .coordinator
+        .stop_adapter_and_companions_then_flush(
+            state.lms.as_ref(),
+            "lms",
+            "LMS reconfiguration",
+        )
+        .await;
 
     // Configure new connection
     state
@@ -1773,8 +1782,13 @@ pub async fn lms_configure_handler(
         .configure(req.host.clone(), req.port, req.username, req.password)
         .await;
 
-    // Start the adapter
-    match state.lms.start().await {
+    // Restart the adapter and its registered CLI companion through the same
+    // coordinator lifecycle path used at process startup.
+    match state
+        .coordinator
+        .start_adapter_and_companions(state.lms.as_ref())
+        .await
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2598,12 +2612,18 @@ pub async fn api_settings_post_handler(
         if let Some(adapter) = adapters_list.iter().find(|a| a.name() == name) {
             if now_enabled {
                 tracing::info!("Dynamically enabling adapter: {}", name);
-                if let Err(error) = coord.start_enabled(adapter).await {
+                if let Err(error) = coord.start_adapter_and_companions(adapter.as_ref()).await {
                     tracing::warn!("Failed to start adapter {}: {}", name, error);
                 }
             } else {
                 tracing::info!("Dynamically disabling adapter: {}", name);
-                coord.stop_one(adapter).await;
+                coord
+                    .stop_adapter_and_companions_then_flush(
+                        adapter.as_ref(),
+                        name,
+                        "settings disable",
+                    )
+                    .await;
             }
         }
     }

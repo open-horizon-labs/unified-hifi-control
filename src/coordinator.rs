@@ -40,6 +40,9 @@ struct RegisteredAdapter {
     enabled: bool,
     /// Running task handle (if started)
     handle: Option<JoinHandle<()>>,
+    /// Startable adapters own their child tasks internally rather than exposing
+    /// a JoinHandle through the coordinator.
+    direct_running: bool,
     /// Cancellation token for this adapter
     cancel: CancellationToken,
 }
@@ -50,6 +53,10 @@ struct RegisteredAdapter {
 /// - Coordinate graceful shutdown
 pub struct AdapterCoordinator {
     adapters: RwLock<HashMap<String, RegisteredAdapter>>,
+    /// Companion workers grouped under their provider's one client-visible
+    /// projection.  Lifecycle operations cancel the whole group before the
+    /// shared projection is retired.
+    companions: RwLock<HashMap<String, Vec<Arc<dyn Startable>>>>,
     bus: SharedBus,
     /// Global shutdown token (parent of all adapter tokens)
     shutdown: CancellationToken,
@@ -61,6 +68,7 @@ impl AdapterCoordinator {
     pub fn new(bus: SharedBus) -> Self {
         Self {
             adapters: RwLock::new(HashMap::new()),
+            companions: RwLock::new(HashMap::new()),
             bus,
             shutdown: CancellationToken::new(),
             shutdown_timeout: Duration::from_secs(5),
@@ -71,6 +79,7 @@ impl AdapterCoordinator {
     pub fn with_shutdown_timeout(bus: SharedBus, timeout: Duration) -> Self {
         Self {
             adapters: RwLock::new(HashMap::new()),
+            companions: RwLock::new(HashMap::new()),
             bus,
             shutdown: CancellationToken::new(),
             shutdown_timeout: timeout,
@@ -105,11 +114,14 @@ impl AdapterCoordinator {
     /// Start all enabled adapters from the provided list.
     /// This is the single codepath for starting adapters.
     pub async fn start_all_enabled(&self, adapters: &[Arc<dyn Startable>]) {
+        let companion_names = self.companion_names().await;
         for adapter in adapters {
             let name = adapter.name();
-            match self.start_enabled(adapter).await {
-                Ok(true) => info!("Started adapter: {}", name),
-                Ok(false) => {}
+            if companion_names.iter().any(|companion| companion == name) {
+                continue;
+            }
+            match self.start_adapter_and_companions(adapter.as_ref()).await {
+                Ok(()) => info!("Started adapter: {}", name),
                 Err(error) => warn!("Failed to start adapter {}: {}", name, error),
             }
         }
@@ -131,20 +143,140 @@ impl AdapterCoordinator {
             debug!("Adapter {} cannot start (not configured?), skipping", name);
             return Ok(false);
         }
-        adapter.start().await.map(|()| true)
+        self.start_adapter_and_companions(adapter.as_ref()).await?;
+        Ok(true)
     }
 
     /// Stop one adapter through the coordinator-owned lifecycle path.
     pub async fn stop_one(&self, adapter: &Arc<dyn Startable>) {
-        adapter.stop().await;
-        debug!("Stopped adapter: {}", adapter.name());
+        self.stop_adapter_and_companions_then_flush(
+            adapter.as_ref(),
+            adapter.name(),
+            "settings disable",
+        )
+        .await;
     }
 
     /// Stop all adapters from the provided list.
     pub async fn stop_all(&self, adapters: &[Arc<dyn Startable>]) {
+        let companion_names = self.companion_names().await;
         for adapter in adapters {
-            self.stop_one(adapter).await;
+            if companion_names.iter().any(|companion| companion == adapter.name()) {
+                continue;
+            }
+            self.stop_adapter_and_companions_then_flush(
+                adapter.as_ref(),
+                adapter.name(),
+                "coordinator shutdown",
+            )
+            .await;
         }
+    }
+
+    /// Start one direct adapter and record its lifecycle state.
+    pub async fn start_adapter_and_track(&self, adapter: &dyn Startable) -> Result<()> {
+        if !adapter.can_start().await {
+            return Err(anyhow::anyhow!("adapter cannot start"));
+        }
+        adapter.start().await?;
+        self.set_running(adapter.name(), true).await;
+        Ok(())
+    }
+
+    /// Retire one adapter projection before stopping its worker.
+    pub async fn stop_adapter_and_flush(&self, adapter: &dyn Startable, reason: &str) {
+        self.bus.publish(BusEvent::AdapterStopping {
+            adapter: adapter.name().to_string(),
+            reason: Some(reason.to_string()),
+        });
+        adapter.stop().await;
+        self.set_running(adapter.name(), false).await;
+        debug!("Stopped adapter: {}", adapter.name());
+    }
+
+    /// Stop all observers sharing one provider projection before retiring it.
+    pub async fn stop_adapters_then_flush(
+        &self,
+        adapters: &[&dyn Startable],
+        projection_adapter: &str,
+        reason: &str,
+    ) {
+        for adapter in adapters {
+            adapter.stop().await;
+        }
+        self.bus.publish(BusEvent::AdapterStopping {
+            adapter: projection_adapter.to_string(),
+            reason: Some(reason.to_string()),
+        });
+        for adapter in adapters {
+            self.set_running(adapter.name(), false).await;
+            debug!("Stopped adapter: {}", adapter.name());
+        }
+    }
+
+    pub async fn register_companion(&self, provider: &str, companion: Arc<dyn Startable>) {
+        self.companions
+            .write()
+            .await
+            .entry(provider.to_string())
+            .or_default()
+            .push(companion);
+    }
+
+    pub async fn start_adapter_and_companions(&self, adapter: &dyn Startable) -> Result<()> {
+        self.start_adapter_and_track(adapter).await?;
+        let companions = self
+            .companions
+            .read()
+            .await
+            .get(adapter.name())
+            .cloned()
+            .unwrap_or_default();
+        for companion in companions {
+            if let Err(error) = self.start_adapter_and_track(companion.as_ref()).await {
+                self.stop_adapters_then_flush(
+                    &[adapter],
+                    adapter.name(),
+                    "companion start failure",
+                )
+                .await;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn stop_adapter_and_companions_then_flush(
+        &self,
+        adapter: &dyn Startable,
+        projection_adapter: &str,
+        reason: &str,
+    ) {
+        let companions = self
+            .companions
+            .read()
+            .await
+            .get(projection_adapter)
+            .cloned()
+            .unwrap_or_default();
+        let mut observers: Vec<&dyn Startable> = vec![adapter];
+        observers.extend(
+            companions
+                .iter()
+                .map(|companion| companion.as_ref() as &dyn Startable),
+        );
+        self.stop_adapters_then_flush(&observers, projection_adapter, reason)
+            .await;
+    }
+
+    async fn companion_names(&self) -> Vec<String> {
+        self.companions
+            .read()
+            .await
+            .values()
+            .flatten()
+            .map(|companion| companion.name().to_string())
+            .collect()
     }
 
     /// Register an adapter without starting it
@@ -156,6 +288,7 @@ impl AdapterCoordinator {
                 prefix: prefix.to_string(),
                 enabled,
                 handle: None,
+                direct_running: false,
                 cancel: self.shutdown.child_token(),
             },
         );
@@ -215,8 +348,14 @@ impl AdapterCoordinator {
         let adapters = self.adapters.read().await;
         adapters
             .get(prefix)
-            .map(|a| a.handle.is_some())
+            .map(|a| a.handle.is_some() || a.direct_running)
             .unwrap_or(false)
+    }
+
+    async fn set_running(&self, prefix: &str, running: bool) {
+        if let Some(adapter) = self.adapters.write().await.get_mut(prefix) {
+            adapter.direct_running = running;
+        }
     }
 
     /// Stop a single adapter

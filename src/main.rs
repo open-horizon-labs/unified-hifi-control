@@ -342,6 +342,10 @@ mod server {
         // LMS adapters (polling + CLI subscription with shared state)
         // Issue #165: Split into two adapters with independent retry
         let (lms, lms_cli) = adapters::lms::create_lms_adapters(bus.clone());
+        // Both LMS observers publish the same `lms:` projection.  Register the
+        // companion with the coordinator so reconfiguration and shutdown stop
+        // both workers before retiring that shared projection.
+        coord.register_companion("lms", lms_cli.clone()).await;
         if let Some(ref lms_config) = config.lms {
             lms.configure(
                 lms_config.host.clone(),
@@ -435,17 +439,24 @@ mod server {
         let mut startable_adapters = legacy_startables.clone();
         startable_adapters.extend(provider_startables.iter().cloned());
 
-        // Start local adapters first. Provider adapters start after the
-        // aggregator and registry are ready, through the same path below.
-        coord.start_all_enabled(&legacy_startables).await;
-
         // Initialize ZoneAggregator for unified zone state
         let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
         let aggregator_for_spawn = zone_aggregator.clone();
+        let (aggregator_ready_tx, aggregator_ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            aggregator_for_spawn.run().await;
+            aggregator_for_spawn.run_with_ready(aggregator_ready_tx).await;
         });
+        // The event bus does not replay.  Do not let any adapter publish its
+        // initial snapshot until the aggregator has subscribed.
+        aggregator_ready_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("zone aggregator failed to initialize"))?;
         tracing::info!("ZoneAggregator started");
+
+        // Start local adapters only after the aggregator readiness barrier.
+        // Provider adapters start after the registry is ready, through the
+        // same coordinator-owned lifecycle path below.
+        coord.start_all_enabled(&legacy_startables).await;
 
         // Create shutdown token for graceful SSE termination (fixes #73)
         let shutdown_token = CancellationToken::new();
