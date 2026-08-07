@@ -94,6 +94,7 @@ pub fn App() -> Element {
     let navigation_visibility = use_settings_provider();
     let navigation_visibility_json =
         serde_json::to_string(&navigation_visibility).unwrap_or_else(|_| "{}".to_string());
+    let settings_bootstrap_json = settings_context::settings_bootstrap_json();
 
     rsx! {
         document::Meta {
@@ -103,6 +104,10 @@ pub fn App() -> Element {
         document::Meta {
             name: "uhc-navigation-visibility",
             content: "{navigation_visibility_json}"
+        }
+        document::Meta {
+            name: "uhc-settings-bootstrap",
+            content: "{settings_bootstrap_json}"
         }
         Router::<Route> {}
     }

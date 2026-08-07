@@ -208,6 +208,13 @@ public actor MacAppleMusicBridgeClient {
         try await request(path: "api/bridges/applemusic/pair", method: "POST", body: ["bridge_id": bridgeID])
     }
 
+    /// Request the short-lived confirmation code after Bonjour discovery.
+    /// Discovery and confirmation are separate from the legacy manual pair
+    /// endpoint so the host never needs to ask users for a URL or bridge ID.
+    public func discoverPairing(bridgeID: String) async throws -> MacPairingResponse {
+        try await request(path: "api/bridges/applemusic/discover", method: "POST", body: ["bridge_id": bridgeID])
+    }
+
     @discardableResult
     public func claim(bridgeID: String, pairingCode: String) async throws -> MacClaimResponse {
         let response: MacClaimResponse = try await request(path: "api/bridges/applemusic/claim", method: "POST", body: ["bridge_id": bridgeID, "pairing_code": pairingCode])
@@ -407,12 +414,26 @@ public actor MacAppleMusicCompanionHost {
         try await bridge.revoke()
         try installationStore.clear()
     }
+
+    /// Forget a credential only after the server explicitly rejects it. This
+    /// is deliberately separate from transport recovery: a timeout, DNS
+    /// failure, or 5xx must never destroy a valid Keychain pairing.
+    public func forgetAuthorization() throws {
+        try installationStore.clear()
+    }
 }
 
 @available(macOS 14.0, *)
 public enum MacBridgeError: Error, LocalizedError, Sendable {
     case invalidResponse
     case httpStatus(Int, String)
+
+    /// A bearer is invalid or no longer authorized. Transport errors and
+    /// server failures must remain retryable and must not erase Keychain state.
+    public var isAuthorizationFailure: Bool {
+        if case let .httpStatus(status, _) = self { return status == 401 || status == 403 }
+        return false
+    }
 
     public var errorDescription: String? {
         switch self {

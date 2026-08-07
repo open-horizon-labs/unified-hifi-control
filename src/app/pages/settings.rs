@@ -5,12 +5,12 @@
 use dioxus::prelude::*;
 
 use crate::app::api::{
-    AdapterSettings, AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, ProviderAuthResponse,
-    ProviderOAuthStart, RoonStatus, SpotifyAccountResponse, SpotifyConfigureRequest,
-    SpotifyConfigureResponse, ZonesResponse,
+    AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, ProviderAuthResponse, ProviderOAuthStart,
+    RoonStatus, SpotifyAccountResponse, SpotifyConfigureRequest, SpotifyConfigureResponse,
+    ZonesResponse,
 };
 use crate::app::components::Layout;
-use crate::app::settings_context::use_settings;
+use crate::app::settings_context::{initial_app_settings, use_settings};
 use crate::app::sse::use_sse;
 use crate::app::theme::{use_theme, Theme};
 use crate::app::McpEndpoint;
@@ -111,16 +111,115 @@ enum ProviderActionState {
     Failed,
 }
 
-/// Settings writes are explicit transactions: a switch is provisional until
-/// the server persists and applies it. This avoids a cheerful UI when an
-/// adapter failed to start (and makes a failed switch safe to retry).
-#[derive(Clone, Copy, Default, PartialEq)]
-enum SettingsSaveState {
-    #[default]
-    Idle,
-    Saving,
-    Saved,
-    Failed,
+/// A Settings switch is persisted server-side before the page is refreshed.
+/// This keeps adapter lifecycle changes transactional and gives the next page
+/// render one authoritative configuration to hydrate from.
+#[derive(Clone, Copy)]
+enum SettingsToggle {
+    Adapter(AdapterToggle, bool),
+    HideKnobs(bool),
+}
+
+#[derive(Clone, Copy)]
+enum AdapterToggle {
+    Roon,
+    Lms,
+    OpenHome,
+    Upnp,
+    HqPlayer,
+    Spotify,
+    AppleMusic,
+}
+
+fn settings_with_toggle(mut settings: AppSettings, toggle: SettingsToggle) -> AppSettings {
+    match toggle {
+        SettingsToggle::Adapter(AdapterToggle::Roon, enabled) => settings.adapters.roon = enabled,
+        SettingsToggle::Adapter(AdapterToggle::Lms, enabled) => settings.adapters.lms = enabled,
+        SettingsToggle::Adapter(AdapterToggle::OpenHome, enabled) => {
+            settings.adapters.openhome = enabled
+        }
+        SettingsToggle::Adapter(AdapterToggle::Upnp, enabled) => settings.adapters.upnp = enabled,
+        SettingsToggle::Adapter(AdapterToggle::HqPlayer, enabled) => {
+            settings.adapters.hqplayer = enabled;
+            settings.hide_hqp_page = !enabled;
+        }
+        SettingsToggle::Adapter(AdapterToggle::Spotify, enabled) => {
+            settings.adapters.spotify = enabled
+        }
+        SettingsToggle::Adapter(AdapterToggle::AppleMusic, enabled) => {
+            settings.adapters.applemusic = enabled
+        }
+        SettingsToggle::HideKnobs(enabled) => settings.hide_knobs_page = !enabled,
+    }
+    settings
+}
+
+#[cfg(target_arch = "wasm32")]
+fn reload_settings_page() {
+    if let Some(window) = web_sys::window() {
+        let _ = window.location().reload();
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reload_settings_page() {}
+
+#[cfg(target_arch = "wasm32")]
+fn show_settings_save_error(error: &str) {
+    if let Some(window) = web_sys::window() {
+        let _ = window.alert_with_message(&format!(
+            "UHC could not apply that change. Your previous setting is still active.\n\n{error}"
+        ));
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn show_settings_save_error(_error: &str) {}
+
+fn persist_settings_then_reload(requested: AppSettings) {
+    spawn(async move {
+        let result = crate::app::api::post_json::<AppSettings, serde_json::Value>(
+            "/api/settings",
+            &requested,
+        )
+        .await
+        .and_then(|response| settings_write_error(&response).map_or(Ok(()), Err));
+
+        if let Err(error) = result {
+            show_settings_save_error(&error);
+        }
+        reload_settings_page();
+    });
+}
+
+#[component]
+fn FeatureToggle(label: &'static str, enabled: bool, onclick: EventHandler<MouseEvent>) -> Element {
+    rsx! {
+        button {
+            r#type: "button",
+            class: "feature-toggle",
+            role: "switch",
+            aria_label: label,
+            // ARIA attributes are string-valued. Keeping this explicit avoids
+            // Dioxus interpreting a Rust bool differently between SSR and the
+            // browser's hydration pass.
+            aria_checked: if enabled { "true" } else { "false" },
+            "data-settings-toggle": match label {
+                "Enable Roon" => "adapters.roon",
+                "Enable OpenHome" => "adapters.openhome",
+                "Enable UPnP/DLNA" => "adapters.upnp",
+                "Enable LMS" => "adapters.lms",
+                "Enable HQPlayer" => "adapters.hqplayer",
+                "Enable Spotify" => "adapters.spotify",
+                "Enable Apple Music" => "adapters.applemusic",
+                "Show Knobs page" => "hide_knobs_page",
+                _ => "",
+            },
+            onclick: move |event| onclick.call(event),
+            span { class: "feature-toggle__knob", aria_hidden: "true" }
+            span { class: "sr-only", "{label}" }
+        }
+    }
 }
 
 fn settings_write_error(response: &serde_json::Value) -> Option<String> {
@@ -173,58 +272,11 @@ fn callback_feedback() -> Option<&'static str> {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+const DEFAULT_SPOTIFY_REDIRECT_URI: &str =
+    "http://127.0.0.1:8088/api/providers/spotify/oauth/callback";
+
 fn default_spotify_redirect_uri() -> String {
-    let fallback = "http://127.0.0.1:8088/api/providers/spotify/oauth/callback";
-    let Some(window) = web_sys::window() else {
-        return fallback.to_string();
-    };
-    let Ok(origin) = window.location().origin() else {
-        return fallback.to_string();
-    };
-    if origin.is_empty() {
-        fallback.to_string()
-    } else {
-        format!("{origin}/api/providers/spotify/oauth/callback")
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn default_spotify_redirect_uri() -> String {
-    "http://127.0.0.1:8088/api/providers/spotify/oauth/callback".to_string()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn initial_spotify_enabled() -> bool {
-    crate::api::load_app_settings().adapters.spotify
-}
-
-#[cfg(target_arch = "wasm32")]
-fn initial_spotify_enabled() -> bool {
-    initial_adapter_enabled_from_ssr("spotify")
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn initial_applemusic_enabled() -> bool {
-    crate::api::load_app_settings().adapters.applemusic
-}
-
-#[cfg(target_arch = "wasm32")]
-fn initial_applemusic_enabled() -> bool {
-    initial_adapter_enabled_from_ssr("applemusic")
-}
-
-#[cfg(target_arch = "wasm32")]
-fn initial_adapter_enabled_from_ssr(adapter: &str) -> bool {
-    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
-        return false;
-    };
-    let Some(marker) = document.get_element_by_id("settings-adapter-hydration") else {
-        return false;
-    };
-    marker
-        .get_attribute(&format!("data-{adapter}-enabled"))
-        .is_some_and(|value| value == "true")
+    DEFAULT_SPOTIFY_REDIRECT_URI.to_string()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -243,6 +295,45 @@ fn spotify_device_state_label(zone: &crate::app::api::Zone) -> &str {
         "unknown" => "No playback reported",
         state => state,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppleMusicStatusState {
+    Unpaired,
+    PairedWaiting,
+    Live,
+}
+
+fn apple_music_status_state(status: Option<&AppleBridgeStatus>) -> AppleMusicStatusState {
+    let Some(status) = status else {
+        return AppleMusicStatusState::Unpaired;
+    };
+
+    let companion_paired = status.companions.iter().any(|companion| companion.paired);
+    let companion_live = status
+        .companions
+        .iter()
+        .any(|companion| companion.paired && companion.live);
+
+    if status.live || companion_live {
+        AppleMusicStatusState::Live
+    } else if status.paired || companion_paired {
+        AppleMusicStatusState::PairedWaiting
+    } else {
+        AppleMusicStatusState::Unpaired
+    }
+}
+
+fn apple_music_live_companion_count(status: Option<&AppleBridgeStatus>) -> usize {
+    status
+        .map(|status| {
+            status
+                .companions
+                .iter()
+                .filter(|companion| companion.paired && companion.live)
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -311,15 +402,17 @@ pub fn Settings() -> Element {
     let config_copy_state = use_signal(CopyState::default);
     let url_copy_state = use_signal(CopyState::default);
 
-    // Adapter toggle signals
-    let mut roon_enabled = use_signal(|| true);
-    let mut lms_enabled = use_signal(|| false);
-    let mut openhome_enabled = use_signal(|| false);
-    let mut upnp_enabled = use_signal(|| false);
-    let mut hqplayer_enabled = use_signal(|| false);
-    let mut spotify_enabled = use_signal(initial_spotify_enabled);
-    let mut applemusic_enabled = use_signal(initial_applemusic_enabled);
-    let mut musicassistant_enabled = use_signal(|| false);
+    let initial_settings = initial_app_settings();
+    // Adapter toggle signals all begin from the same app-root snapshot SSR
+    // used, so the first client tree has the same topology as the server tree.
+    let mut roon_enabled = use_signal(|| initial_settings.adapters.roon);
+    let mut lms_enabled = use_signal(|| initial_settings.adapters.lms);
+    let mut openhome_enabled = use_signal(|| initial_settings.adapters.openhome);
+    let mut upnp_enabled = use_signal(|| initial_settings.adapters.upnp);
+    let mut hqplayer_enabled = use_signal(|| initial_settings.adapters.hqplayer);
+    let mut spotify_enabled = use_signal(|| initial_settings.adapters.spotify);
+    let mut applemusic_enabled = use_signal(|| initial_settings.adapters.applemusic);
+    let mut musicassistant_enabled = use_signal(|| initial_settings.adapters.musicassistant);
 
     // Streaming-provider onboarding state. Provider credentials are never
     // rendered or stored in the browser; the backend owns OAuth tokens.
@@ -330,15 +423,13 @@ pub fn Settings() -> Element {
     let mut spotify_client_id = use_signal(String::new);
     let mut spotify_client_secret = use_signal(String::new);
     let mut spotify_redirect_uri = use_signal(default_spotify_redirect_uri);
-    let mut settings_save_state = use_signal(SettingsSaveState::default);
-    let mut settings_save_error = use_signal(|| None::<String>);
     let mut confirmed_settings = use_signal(|| None::<AppSettings>);
 
     // Hide knobs signal (LMS/HQPlayer visibility follows adapter enabled state)
-    let mut hide_knobs = use_signal(|| false);
+    let mut hide_knobs = use_signal(|| initial_settings.hide_knobs_page);
 
     // Load settings resource
-    let mut settings = use_resource(|| async {
+    let settings = use_resource(|| async {
         crate::app::api::fetch_json::<AppSettings>("/api/settings")
             .await
             .ok()
@@ -542,75 +633,11 @@ pub fn Settings() -> Element {
         apple_bridge_status.restart();
     };
 
-    // Persist feature changes as a transaction. The UI switches optimistically
-    // for responsiveness, but restores the last confirmed server state when
-    // persistence or adapter startup fails.
-    let mut save_settings = move || {
-        if settings_save_state() == SettingsSaveState::Saving {
+    let toggle_setting = move |toggle: SettingsToggle| {
+        let Some(settings) = confirmed_settings() else {
             return;
-        }
-        let hk = hide_knobs();
-        let hqp = hqplayer_enabled();
-        let lms = lms_enabled();
-        let requested = AppSettings {
-            adapters: AdapterSettings {
-                roon: roon_enabled(),
-                lms,
-                openhome: openhome_enabled(),
-                upnp: upnp_enabled(),
-                hqplayer: hqp,
-                spotify: spotify_enabled(),
-                applemusic: applemusic_enabled(),
-                musicassistant: musicassistant_enabled(),
-            },
-            hide_knobs_page: hk,
-            // These are now derived from adapter state but we keep them for API compat
-            hide_hqp_page: !hqp,
-            hide_lms_page: !lms,
         };
-        let rollback = confirmed_settings().unwrap_or_else(|| requested.clone());
-        settings_save_state.set(SettingsSaveState::Saving);
-        settings_save_error.set(None);
-        spawn(async move {
-            match crate::app::api::post_json::<AppSettings, serde_json::Value>(
-                "/api/settings",
-                &requested,
-            )
-            .await
-            .and_then(|response| settings_write_error(&response).map_or(Ok(()), Err))
-            {
-                Ok(()) => {
-                    confirmed_settings.set(Some(requested.clone()));
-                    settings_ctx.update(
-                        requested.hide_knobs_page,
-                        requested.adapters.hqplayer,
-                        requested.adapters.lms,
-                        requested.adapters.spotify,
-                    );
-                    settings_save_state.set(SettingsSaveState::Saved);
-                    settings.restart();
-                }
-                Err(error) => {
-                    roon_enabled.set(rollback.adapters.roon);
-                    lms_enabled.set(rollback.adapters.lms);
-                    openhome_enabled.set(rollback.adapters.openhome);
-                    upnp_enabled.set(rollback.adapters.upnp);
-                    hqplayer_enabled.set(rollback.adapters.hqplayer);
-                    spotify_enabled.set(rollback.adapters.spotify);
-                    applemusic_enabled.set(rollback.adapters.applemusic);
-                    musicassistant_enabled.set(rollback.adapters.musicassistant);
-                    hide_knobs.set(rollback.hide_knobs_page);
-                    settings_ctx.update(
-                        rollback.hide_knobs_page,
-                        rollback.adapters.hqplayer,
-                        rollback.adapters.lms,
-                        rollback.adapters.spotify,
-                    );
-                    settings_save_error.set(Some(error));
-                    settings_save_state.set(SettingsSaveState::Failed);
-                }
-            }
-        });
+        persist_settings_then_reload(settings_with_toggle(settings, toggle));
     };
 
     let roon_st = roon_status.read().clone().flatten();
@@ -641,6 +668,8 @@ pub fn Settings() -> Element {
         || spotify_connected
         || spotify_local_setup_saved();
     let apple_st = apple_bridge_status.read().clone().and_then(Result::ok);
+    let apple_music_state = apple_music_status_state(apple_st.as_ref());
+    let apple_music_live_count = apple_music_live_companion_count(apple_st.as_ref());
     let callback_message = callback_feedback();
     let spotify_status_is_error = spotify_error().is_some();
     let spotify_status_message =
@@ -674,6 +703,12 @@ pub fn Settings() -> Element {
         Layout {
             title: "Settings".to_string(),
             nav_active: "settings".to_string(),
+            // Disabled adapters must not leak dead top-level tabs while the
+            // browser finishes loading its Settings context.
+            hide_hqp: !hqplayer_enabled(),
+            hide_lms: !lms_enabled(),
+            hide_spotify: !spotify_enabled(),
+            hide_knobs: hide_knobs(),
 
             h1 { class: "text-2xl font-bold mb-6", "Settings" }
 
@@ -697,17 +732,11 @@ pub fn Settings() -> Element {
                             // Roon (adapter only, no dedicated page)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "checkbox",
-                                            aria_label: "Enable Roon",
-                                            checked: roon_enabled(),
-                                            disabled: settings_save_state() == SettingsSaveState::Saving,
-                                            onchange: move |_| {
-                                                roon_enabled.toggle();
-                                                save_settings();
-                                            }
+                                    FeatureToggle {
+                                        label: "Enable Roon",
+                                        enabled: roon_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::Roon, !roon_enabled()));
                                         }
                                     }
                                 }
@@ -735,17 +764,11 @@ pub fn Settings() -> Element {
                             // OpenHome (adapter only, no dedicated page)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "checkbox",
-                                            aria_label: "Enable OpenHome",
-                                            checked: openhome_enabled(),
-                                            disabled: settings_save_state() == SettingsSaveState::Saving,
-                                            onchange: move |_| {
-                                                openhome_enabled.toggle();
-                                                save_settings();
-                                            }
+                                    FeatureToggle {
+                                        label: "Enable OpenHome",
+                                        enabled: openhome_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::OpenHome, !openhome_enabled()));
                                         }
                                     }
                                 }
@@ -769,17 +792,11 @@ pub fn Settings() -> Element {
                             // UPnP/DLNA
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "checkbox",
-                                            aria_label: "Enable UPnP/DLNA",
-                                            checked: upnp_enabled(),
-                                            disabled: settings_save_state() == SettingsSaveState::Saving,
-                                            onchange: move |_| {
-                                                upnp_enabled.toggle();
-                                                save_settings();
-                                            }
+                                    FeatureToggle {
+                                        label: "Enable UPnP/DLNA",
+                                        enabled: upnp_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::Upnp, !upnp_enabled()));
                                         }
                                     }
                                 }
@@ -803,17 +820,11 @@ pub fn Settings() -> Element {
                             // LMS (adapter + page)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "checkbox",
-                                            aria_label: "Enable LMS",
-                                            checked: lms_enabled(),
-                                            disabled: settings_save_state() == SettingsSaveState::Saving,
-                                            onchange: move |_| {
-                                                lms_enabled.toggle();
-                                                save_settings();
-                                            }
+                                    FeatureToggle {
+                                        label: "Enable LMS",
+                                        enabled: lms_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::Lms, !lms_enabled()));
                                         }
                                     }
                                 }
@@ -841,17 +852,11 @@ pub fn Settings() -> Element {
                             // HQPlayer (adapter + page)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "checkbox",
-                                            aria_label: "Enable HQPlayer",
-                                            checked: hqplayer_enabled(),
-                                            disabled: settings_save_state() == SettingsSaveState::Saving,
-                                            onchange: move |_| {
-                                                hqplayer_enabled.toggle();
-                                                save_settings();
-                                            }
+                                    FeatureToggle {
+                                        label: "Enable HQPlayer",
+                                        enabled: hqplayer_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::HqPlayer, !hqplayer_enabled()));
                                         }
                                     }
                                 }
@@ -876,21 +881,20 @@ pub fn Settings() -> Element {
                             // Spotify (controller adapter; zones arrive through the bus)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "checkbox",
-                                            aria_label: "Enable Spotify",
-                                            checked: spotify_enabled(),
-                                            disabled: settings_save_state() == SettingsSaveState::Saving,
-                                            onchange: move |_| {
-                                                spotify_enabled.toggle();
-                                                save_settings();
-                                            }
+                                    FeatureToggle {
+                                        label: "Enable Spotify",
+                                        enabled: spotify_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::Spotify, !spotify_enabled()));
                                         }
                                     }
                                 }
-                                td { class: "py-2 px-3", "Spotify" }
+                                td { class: "py-2 px-3",
+                                    div { class: "flex items-center gap-2",
+                                        "Spotify"
+                                        span { class: "badge badge-secondary", "Alpha" }
+                                    }
+                                }
                                 td { class: "py-2 px-3",
                                     if spotify_enabled() {
                                         if let Some(ref devices) = spotify_devices {
@@ -910,27 +914,26 @@ pub fn Settings() -> Element {
                             // Apple Music (native companion adapter; zones arrive through the bus)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "checkbox",
-                                            aria_label: "Enable Apple Music",
-                                            checked: applemusic_enabled(),
-                                            disabled: settings_save_state() == SettingsSaveState::Saving,
-                                            onchange: move |_| {
-                                                applemusic_enabled.toggle();
-                                                save_settings();
-                                            }
+                                    FeatureToggle {
+                                        label: "Enable Apple Music",
+                                        enabled: applemusic_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::AppleMusic, !applemusic_enabled()));
                                         }
                                     }
                                 }
-                                td { class: "py-2 px-3", "Apple Music" }
+                                td { class: "py-2 px-3",
+                                    div { class: "flex items-center gap-2",
+                                        "Apple Music"
+                                        span { class: "badge badge-secondary", "Alpha" }
+                                    }
+                                }
                                 td { class: "py-2 px-3",
                                     if applemusic_enabled() {
-                                        if let Some(ref status) = apple_st {
-                                            if status.paired && status.has_snapshot {
+                                        if apple_st.is_some() {
+                                            if matches!(apple_music_state, AppleMusicStatusState::Live) {
                                                 span { class: "status-ok", "✓ Companion live" }
-                                            } else if status.paired {
+                                            } else if matches!(apple_music_state, AppleMusicStatusState::PairedWaiting) {
                                                 span { class: "text-yellow-500", "⚠ Paired · waiting" }
                                             } else {
                                                 span { class: "text-muted", "Not paired" }
@@ -946,17 +949,11 @@ pub fn Settings() -> Element {
                             // Knobs (page only, no adapter)
                             tr { class: "border-b border-default",
                                 td { class: "py-2 px-3",
-                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "checkbox",
-                                            aria_label: "Show Knobs page",
-                                            checked: !hide_knobs(),
-                                            disabled: settings_save_state() == SettingsSaveState::Saving,
-                                            onchange: move |_| {
-                                                hide_knobs.toggle();
-                                                save_settings();
-                                            }
+                                    FeatureToggle {
+                                        label: "Show Knobs page",
+                                        enabled: !hide_knobs(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::HideKnobs(hide_knobs()));
                                         }
                                     }
                                 }
@@ -965,26 +962,12 @@ pub fn Settings() -> Element {
                             }
                         }
                 }
-                if settings_save_state() == SettingsSaveState::Saving {
-                    p { class: "mt-3 text-sm text-secondary", role: "status", aria_live: "polite", "Saving feature change…" }
-                } else if settings_save_state() == SettingsSaveState::Saved {
-                    p { class: "mt-3 text-sm status-ok", role: "status", aria_live: "polite", "Feature change saved." }
-                } else if let Some(error) = settings_save_error() {
-                    p { class: "mt-3 status-err", role: "alert", "Could not save feature change: {error}" }
-                }
             }
 
-            // Keep a stable SSR marker and anchor so hydration cannot insert the provider
-            // section into a later sibling when no provider is enabled yet.
-            div {
-                id: "settings-adapter-hydration",
-                hidden: true,
-                "data-spotify-enabled": if initial_spotify_enabled() { "true" } else { "false" },
-                "data-applemusic-enabled": if initial_applemusic_enabled() { "true" } else { "false" },
-            }
             div { id: "streaming-providers-anchor",
                 section {
-                    class: if spotify_enabled() || applemusic_enabled() { "mb-8" } else { "hidden" },
+                    class: "mb-8",
+                    hidden: !(spotify_enabled() || applemusic_enabled()),
                     aria_labelledby: "streaming-heading",
                 div { class: "mb-4",
                     h2 { id: "streaming-heading", class: "text-xl font-semibold", "Streaming providers" }
@@ -999,11 +982,15 @@ pub fn Settings() -> Element {
                     // Keep authorization and client settings as separate
                     // actions so the credential boundary stays explicit.
                     div {
-                        class: if spotify_enabled() { "card p-5 sm:p-6" } else { "hidden" },
+                        class: "card p-5 sm:p-6",
+                        hidden: !spotify_enabled(),
                         aria_labelledby: "spotify-heading",
                         div { class: "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between",
                             div {
-                                h3 { id: "spotify-heading", class: "text-lg font-semibold", "Spotify Connect" }
+                                h3 { id: "spotify-heading", class: "text-lg font-semibold flex items-center gap-2",
+                                    "Spotify Connect"
+                                    span { class: "badge badge-secondary", "Alpha" }
+                                }
                                 p { class: "mt-1 text-sm text-secondary", "Control existing Spotify Connect devices. UHC does not act as a receiver." }
                                 div {
                                     class: "mt-2",
@@ -1290,18 +1277,22 @@ pub fn Settings() -> Element {
                     // Bonjour discovery. Settings is a calm confirmation
                     // surface, never a second setup form.
                     div {
-                        class: if applemusic_enabled() { "card p-5 sm:p-6" } else { "hidden" },
+                        class: "card p-5 sm:p-6",
+                        hidden: !applemusic_enabled(),
                         aria_labelledby: "apple-music-heading",
                         div { class: "flex items-start justify-between gap-3",
                             div {
-                                h3 { id: "apple-music-heading", class: "text-lg font-semibold", "Apple Music" }
-                                p { class: "mt-1 text-sm text-secondary", "Control Apple Music from your iPhone, iPad, or Mac through UHC." }
+                                h3 { id: "apple-music-heading", class: "text-lg font-semibold flex items-center gap-2",
+                                    "Apple Music"
+                                    span { class: "badge badge-secondary", "Alpha" }
+                                }
+                                p { class: "mt-1 text-sm text-secondary", "Connect Apple Music on a Mac, iPhone, or iPad, then control that session from UHC." }
                             }
                             if !applemusic_enabled() {
                                 span { class: "badge badge-secondary shrink-0", "Disabled" }
-                            } else if apple_st.as_ref().map(|status| status.companions.iter().any(|companion| companion.has_snapshot)).unwrap_or(false) {
-                                span { class: "badge badge-success shrink-0", "{apple_st.as_ref().map(|status| status.companions.len()).unwrap_or(0)} companions live" }
-                            } else if apple_st.as_ref().map(|status| !status.companions.is_empty()).unwrap_or(false) {
+                            } else if matches!(apple_music_state, AppleMusicStatusState::Live) {
+                                span { class: "badge badge-success shrink-0", "{apple_music_live_count} companions live" }
+                            } else if matches!(apple_music_state, AppleMusicStatusState::PairedWaiting) {
                                 span { class: "badge badge-secondary shrink-0", "Paired · waiting" }
                             } else {
                                 span { class: "badge badge-secondary shrink-0", "Not paired" }
@@ -1316,9 +1307,16 @@ pub fn Settings() -> Element {
                                     p { class: "mt-3 text-xs text-muted", "Waiting for {pending.bridge_id} to confirm. This request expires automatically if it is not confirmed." }
                                 }
                             } else if status.companions.is_empty() {
-                                div { class: "mt-5 rounded-lg bg-surface-muted p-5",
-                                    p { class: "font-medium", "Pair a companion" }
-                                    p { class: "mt-2 text-sm text-secondary", "Open the UHC Apple Music Companion on your iPhone, iPad, or Mac. Authorize Apple Music, then choose Find UHC and show code. The matching code will appear here." }
+                                if status.paired {
+                                    div { class: "mt-5 rounded-lg bg-surface-muted p-5",
+                                        p { class: "font-medium", "Paired; waiting for companion" }
+                                        p { class: "mt-2 text-sm text-secondary", "Pairing is saved. UHC is waiting for the companion to reconnect over Bonjour." }
+                                    }
+                                } else {
+                                    div { class: "mt-5 rounded-lg bg-surface-muted p-5",
+                                        p { class: "font-medium", "Pair a companion" }
+                                        p { class: "mt-2 text-sm text-secondary", "Open the UHC Apple Music Companion on your iPhone, iPad, or Mac. Authorize Apple Music, then choose Find UHC and show code. The matching code will appear here." }
+                                    }
                                 }
                             } else {
                                 div { class: "mt-4 grid gap-3 sm:grid-cols-2",
@@ -1326,9 +1324,9 @@ pub fn Settings() -> Element {
                                         div { class: "rounded-lg bg-surface-muted p-4",
                                             div { class: "flex items-center justify-between gap-3",
                                                 p { class: "font-medium truncate", "{companion.bridge_id}" }
-                                                span { class: if companion.has_snapshot { "badge badge-success" } else { "badge badge-secondary" }, if companion.has_snapshot { "Live" } else { "Waiting" } }
+                                                span { class: if companion.paired && companion.live { "badge badge-success" } else { "badge badge-secondary" }, if companion.paired && companion.live { "Live" } else { "Offline · paired" } }
                                             }
-                                            p { class: "mt-2 text-xs text-secondary", if companion.has_snapshot { "Ready for playback through UHC." } else { "Paired. Open the companion to finish Apple Music authorization." } }
+                                            p { class: "mt-2 text-xs text-secondary", if companion.paired && companion.live { "Ready for playback through UHC." } else if companion.paired { "Pairing is saved. Open the companion app to reconnect it to UHC." } else { "Waiting for this companion to finish pairing." } }
                                         }
                                     }
                                 }
@@ -1481,7 +1479,31 @@ pub fn Settings() -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::settings_write_error;
+    use super::{
+        apple_music_live_companion_count, apple_music_status_state, AppleMusicStatusState,
+    };
+    use super::{settings_with_toggle, settings_write_error, AdapterToggle, SettingsToggle};
+    use crate::app::api::{
+        AdapterSettings, AppSettings, AppleBridgeCompanionStatus, AppleBridgeStatus,
+    };
+
+    fn settings_fixture() -> AppSettings {
+        AppSettings {
+            adapters: AdapterSettings {
+                roon: true,
+                lms: false,
+                openhome: false,
+                upnp: true,
+                hqplayer: false,
+                spotify: false,
+                applemusic: true,
+                musicassistant: false,
+            },
+            hide_knobs_page: false,
+            hide_hqp_page: true,
+            hide_lms_page: true,
+        }
+    }
 
     #[test]
     fn settings_write_requires_an_explicit_success_acknowledgement() {
@@ -1493,5 +1515,84 @@ mod tests {
             Some("Apple Music could not start".to_string())
         );
         assert!(settings_write_error(&serde_json::json!({})).is_some());
+    }
+
+    #[test]
+    fn provider_toggle_changes_only_the_requested_provider() {
+        let updated = settings_with_toggle(
+            settings_fixture(),
+            SettingsToggle::Adapter(AdapterToggle::AppleMusic, false),
+        );
+
+        assert!(!updated.adapters.applemusic);
+        assert!(updated.adapters.roon);
+        assert!(updated.adapters.upnp);
+        assert!(!updated.adapters.spotify);
+    }
+
+    #[test]
+    fn hqplayer_toggle_keeps_its_derived_page_visibility_in_sync() {
+        let updated = settings_with_toggle(
+            settings_fixture(),
+            SettingsToggle::Adapter(AdapterToggle::HqPlayer, true),
+        );
+
+        assert!(updated.adapters.hqplayer);
+        assert!(!updated.hide_hqp_page);
+    }
+
+    #[test]
+    fn apple_music_status_projection_distinguishes_unpaired_from_saved_pairing() {
+        let unpaired = AppleBridgeStatus::default();
+        assert_eq!(
+            apple_music_status_state(Some(&unpaired)),
+            AppleMusicStatusState::Unpaired
+        );
+
+        let paired_waiting = AppleBridgeStatus {
+            paired: true,
+            ..AppleBridgeStatus::default()
+        };
+        assert_eq!(
+            apple_music_status_state(Some(&paired_waiting)),
+            AppleMusicStatusState::PairedWaiting
+        );
+    }
+
+    #[test]
+    fn apple_music_status_projection_uses_live_companion_state_not_snapshot_presence() {
+        let waiting = AppleBridgeStatus {
+            paired: true,
+            companions: vec![AppleBridgeCompanionStatus {
+                bridge_id: "mac".to_string(),
+                paired: true,
+                live: false,
+                has_snapshot: true,
+                ..AppleBridgeCompanionStatus::default()
+            }],
+            ..AppleBridgeStatus::default()
+        };
+        assert_eq!(
+            apple_music_status_state(Some(&waiting)),
+            AppleMusicStatusState::PairedWaiting
+        );
+        assert_eq!(apple_music_live_companion_count(Some(&waiting)), 0);
+
+        let live = AppleBridgeStatus {
+            paired: true,
+            live: true,
+            companions: vec![AppleBridgeCompanionStatus {
+                bridge_id: "mac".to_string(),
+                paired: true,
+                live: true,
+                ..AppleBridgeCompanionStatus::default()
+            }],
+            ..AppleBridgeStatus::default()
+        };
+        assert_eq!(
+            apple_music_status_state(Some(&live)),
+            AppleMusicStatusState::Live
+        );
+        assert_eq!(apple_music_live_companion_count(Some(&live)), 1);
     }
 }

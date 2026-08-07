@@ -15,7 +15,7 @@ const README: &str = include_str!("../README.md");
 #[test]
 fn make_web_run_is_the_single_fullstack_entrypoint() {
     let target = MAKEFILE
-        .split_once("web-run:\n")
+        .split_once("web-run: web-prereqs\n")
         .expect("Makefile must define the supported web-run target")
         .1
         .lines()
@@ -29,6 +29,22 @@ fn make_web_run_is_the_single_fullstack_entrypoint() {
     assert!(
         README.contains("Never use `cargo run` for the web UI"),
         "the development instructions must warn that cargo run cannot refresh the hydrated WASM client"
+    );
+}
+
+#[test]
+fn web_run_requires_the_wasm_target_and_uses_rustup_toolchain() {
+    assert!(
+        MAKEFILE.contains("web-run: web-prereqs"),
+        "web-run must verify its Rust/WASM prerequisites before building"
+    );
+    assert!(
+        MAKEFILE.contains("rustup target add wasm32-unknown-unknown"),
+        "web-prereqs must install the WASM target through rustup"
+    );
+    assert!(
+        MAKEFILE.contains("rustup which cargo"),
+        "web-run must put the active rustup toolchain ahead of another cargo on PATH"
     );
 }
 

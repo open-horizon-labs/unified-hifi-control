@@ -207,6 +207,28 @@
     outline-offset: 2px;
   }
 
+  /* Feature switches are buttons rather than controlled checkbox inputs so
+     their state remains stable across the server-rendered Settings hydrate. */
+  .feature-toggle {
+    @apply inline-flex h-6 w-11 items-center rounded-full p-0.5 transition-colors;
+    background: var(--surface-muted);
+    border: 1px solid var(--border-default);
+  }
+  .feature-toggle[aria-checked="true"] {
+    background: var(--accent-color);
+    border-color: var(--accent-color);
+  }
+  .feature-toggle__knob {
+    @apply block size-5 rounded-full bg-white shadow-sm transition-transform;
+  }
+  .feature-toggle[aria-checked="true"] .feature-toggle__knob {
+    transform: translateX(1.25rem);
+  }
+  .feature-toggle:focus-visible {
+    outline: 2px solid var(--accent-color);
+    outline-offset: 2px;
+  }
+
   /* Form input styling */
   .input {
     @apply block min-h-11 w-full rounded-md border-0 py-2 px-3 shadow-sm ring-1 ring-inset sm:text-sm sm:leading-6;

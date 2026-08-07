@@ -21,6 +21,7 @@ use std::{
 };
 use tokio::sync::RwLock;
 
+use super::credentials::{AppleBridgeCredentialRecord, AppleBridgeCredentialStore};
 use super::AppState;
 
 const PAIRING_TTL: Duration = Duration::from_secs(300);
@@ -44,6 +45,8 @@ pub struct AppleBridgeRegistry {
 struct BridgeState {
     pairings: HashMap<String, Pairing>,
     sessions: HashMap<String, BridgeSession>,
+    credentials: HashMap<String, AppleBridgeCredentialRecord>,
+    credential_store: Option<AppleBridgeCredentialStore>,
 }
 
 struct Pairing {
@@ -93,7 +96,12 @@ pub struct ClaimResponse {
 
 #[derive(Debug, Serialize)]
 pub struct BridgeStatus {
+    /// A durable companion credential is present. This remains true while
+    /// the companion is offline or before it has published its first snapshot.
     pub paired: bool,
+    /// A runtime session has authenticated recently enough to receive
+    /// commands. This is intentionally distinct from durable pairing.
+    pub live: bool,
     pub bridge_id: Option<String>,
     pub last_seen: Option<u64>,
     pub has_snapshot: bool,
@@ -114,6 +122,8 @@ pub struct PendingPairing {
 #[derive(Debug, Serialize, Clone)]
 pub struct BridgeCompanionStatus {
     pub bridge_id: String,
+    pub paired: bool,
+    pub live: bool,
     pub last_seen: u64,
     pub has_snapshot: bool,
 }
@@ -242,6 +252,29 @@ fn is_apple_content_outcome(outcome: &str) -> bool {
 }
 
 impl AppleBridgeRegistry {
+    /// Construct the production registry and reconstruct known companion
+    /// identities without recreating transient command queues.
+    pub fn from_env() -> Result<Self> {
+        let store = AppleBridgeCredentialStore::from_env()?;
+        Self::with_credential_store(store)
+    }
+
+    pub fn with_credential_store(store: AppleBridgeCredentialStore) -> Result<Self> {
+        let credentials = store
+            .load()?
+            .into_iter()
+            .map(|record| (record.access_token.clone(), record))
+            .collect();
+        Ok(Self {
+            inner: Arc::new(RwLock::new(BridgeState {
+                pairings: HashMap::new(),
+                sessions: HashMap::new(),
+                credentials,
+                credential_store: Some(store),
+            })),
+        })
+    }
+
     pub async fn create_pairing(&self, bridge_id: String) -> PairingResponse {
         let bridge_id = bridge_id
             .chars()
@@ -301,9 +334,19 @@ impl AppleBridgeRegistry {
         state
             .sessions
             .retain(|_, session| session.bridge_id != request.bridge_id);
+        state
+            .credentials
+            .retain(|_, record| record.bridge_id != request.bridge_id);
         if state.sessions.len() >= MAX_SESSIONS {
             bail!("Apple Music companion session capacity is full");
         }
+        let record = AppleBridgeCredentialRecord {
+            bridge_id: request.bridge_id.clone(),
+            access_token: access_token.clone(),
+            bound_player_id: None,
+        };
+        persist_credentials(&state, record.clone())?;
+        state.credentials.insert(access_token.clone(), record);
         state.sessions.insert(
             access_token.clone(),
             BridgeSession {
@@ -338,34 +381,78 @@ impl AppleBridgeRegistry {
             .map(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() <= now)
             .unwrap_or(false);
         if stale {
+            // Liveness is runtime state, not authorization. A companion that
+            // was asleep or offline past the TTL must be able to rebuild its
+            // empty session from the durable credential when it reconnects.
+            // Commands and snapshots are intentionally discarded here.
             state.sessions.remove(token);
-            bail!("bridge token is stale");
+        }
+        if !state.sessions.contains_key(token) {
+            let record = state
+                .credentials
+                .get(token)
+                .cloned()
+                .ok_or_else(|| anyhow!("bridge token is invalid"))?;
+            // A known bearer may recreate only its own empty runtime session.
+            // Queues and acknowledgements intentionally do not survive restart.
+            if state.sessions.len() >= MAX_SESSIONS {
+                bail!("Apple Music companion session capacity is full");
+            }
+            state.sessions.insert(
+                token.to_string(),
+                BridgeSession {
+                    bridge_id: record.bridge_id,
+                    last_seen: now,
+                    snapshot: None,
+                    bound_player_id: record.bound_player_id,
+                    commands: VecDeque::new(),
+                    results: HashMap::new(),
+                    content_commands: VecDeque::new(),
+                    content_results: HashMap::new(),
+                    content_idempotency: HashMap::new(),
+                    content_completed: HashMap::new(),
+                },
+            );
         }
         let session = state
             .sessions
             .get_mut(token)
-            .ok_or_else(|| anyhow!("bridge token is invalid"))?;
+            .expect("session was inserted or present");
         session.last_seen = now_secs();
         Ok(f(session))
     }
 
     pub async fn update_snapshot(&self, token: &str, snapshot: MusicKitSnapshot) -> Result<()> {
-        self.with_session(token, |session| {
-            if let Some(bound) = &session.bound_player_id {
-                if bound != &snapshot.player_id {
-                    return Err(anyhow!(
-                        "companion is already bound to player `{bound}`, not `{}`",
-                        snapshot.player_id
-                    ));
+        let newly_bound = self
+            .with_session(token, |session| {
+                let was_unbound = session.bound_player_id.is_none();
+                if let Some(bound) = &session.bound_player_id {
+                    if bound != &snapshot.player_id {
+                        return Err(anyhow!(
+                            "companion is already bound to player `{bound}`, not `{}`",
+                            snapshot.player_id
+                        ));
+                    }
+                } else {
+                    session.bound_player_id = Some(snapshot.player_id.clone());
                 }
-            } else {
-                session.bound_player_id = Some(snapshot.player_id.clone());
+                session.snapshot = Some(snapshot);
+                Ok(was_unbound)
+            })
+            .await??;
+        if newly_bound {
+            let mut state = self.inner.write().await;
+            let player_id = state
+                .sessions
+                .get(token)
+                .and_then(|session| session.bound_player_id.clone())
+                .ok_or_else(|| anyhow!("reconnected companion has no player identity"))?;
+            if let Some(record) = state.credentials.get_mut(token) {
+                record.bound_player_id = Some(player_id);
+                persist_all_credentials(&state)?;
             }
-            session.snapshot = Some(snapshot);
-            Ok(())
-        })
-        .await
-        .and_then(|result| result)
+        }
+        Ok(())
     }
 
     pub async fn snapshot(&self) -> Result<MusicKitSnapshot> {
@@ -745,6 +832,11 @@ impl AppleBridgeRegistry {
 
     pub async fn revoke(&self, token: &str) -> Result<()> {
         let mut state = self.inner.write().await;
+        if !state.credentials.contains_key(token) && !state.sessions.contains_key(token) {
+            bail!("bridge token is invalid");
+        }
+        state.credentials.remove(token);
+        persist_all_credentials(&state)?;
         state
             .sessions
             .remove(token)
@@ -755,26 +847,43 @@ impl AppleBridgeRegistry {
     pub async fn status(&self) -> BridgeStatus {
         let state = self.inner.read().await;
         let now = now_secs();
-        let companions = state
-            .sessions
+        let mut companions = state
+            .credentials
             .values()
-            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now)
-            .map(|session| BridgeCompanionStatus {
-                bridge_id: session.bridge_id.clone(),
-                last_seen: session.last_seen,
-                has_snapshot: session.snapshot.is_some(),
+            .map(|record| {
+                let session = state
+                    .sessions
+                    .get(&record.access_token)
+                    .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now);
+                BridgeCompanionStatus {
+                    bridge_id: record.bridge_id.clone(),
+                    paired: true,
+                    live: session.is_some(),
+                    last_seen: session.map(|session| session.last_seen).unwrap_or(0),
+                    has_snapshot: session
+                        .and_then(|session| session.snapshot.as_ref())
+                        .is_some(),
+                }
             })
             .collect::<Vec<_>>();
+        companions.sort_by(|left, right| left.bridge_id.cmp(&right.bridge_id));
         let session = state
             .sessions
             .values()
             .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now)
             .max_by_key(|session| session.last_seen);
         BridgeStatus {
-            paired: session
-                .map(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now_secs())
-                .unwrap_or(false),
-            bridge_id: session.map(|session| session.bridge_id.clone()),
+            paired: !state.credentials.is_empty(),
+            live: session.is_some(),
+            bridge_id: session
+                .map(|session| session.bridge_id.clone())
+                .or_else(|| {
+                    state
+                        .credentials
+                        .values()
+                        .next()
+                        .map(|record| record.bridge_id.clone())
+                }),
             last_seen: session.map(|session| session.last_seen),
             has_snapshot: session
                 .and_then(|session| session.snapshot.as_ref())
@@ -792,6 +901,22 @@ impl AppleBridgeRegistry {
                 .collect(),
         }
     }
+}
+
+fn persist_credentials(state: &BridgeState, record: AppleBridgeCredentialRecord) -> Result<()> {
+    let mut records = state.credentials.values().cloned().collect::<Vec<_>>();
+    records.push(record);
+    if let Some(store) = &state.credential_store {
+        store.save(&records)?;
+    }
+    Ok(())
+}
+
+fn persist_all_credentials(state: &BridgeState) -> Result<()> {
+    if let Some(store) = &state.credential_store {
+        store.save(&state.credentials.values().cloned().collect::<Vec<_>>())?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1741,6 +1866,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn known_credential_reconstructs_a_fresh_session_after_registry_restart() {
+        let directory = tempfile::tempdir().expect("temporary credential directory");
+        let store = crate::api::credentials::AppleBridgeCredentialStore::new(
+            directory.path().join("apple-bridges.enc"),
+            [7; 32],
+        );
+        let registry = AppleBridgeRegistry::with_credential_store(store.clone()).unwrap();
+        let pairing = registry.create_pairing("macbook".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .unwrap();
+        registry
+            .update_snapshot(&claim.access_token, snapshot_for("mac-player"))
+            .await
+            .unwrap();
+        registry.enqueue(MusicKitCommand::Next).await.unwrap();
+
+        // A new registry has no runtime session or command queue, but it does
+        // know the encrypted bearer and the already-bound player identity.
+        let restarted = AppleBridgeRegistry::with_credential_store(store).unwrap();
+        let before_reconnect = restarted.status().await;
+        assert!(before_reconnect.paired);
+        assert!(!before_reconnect.live);
+        assert_eq!(before_reconnect.bridge_id.as_deref(), Some("macbook"));
+        assert!(!before_reconnect.has_snapshot);
+        assert_eq!(before_reconnect.companions.len(), 1);
+        assert!(before_reconnect.companions[0].paired);
+        assert!(!before_reconnect.companions[0].live);
+        assert!(!before_reconnect.companions[0].has_snapshot);
+
+        assert!(restarted
+            .poll_commands(&claim.access_token)
+            .await
+            .unwrap()
+            .is_empty());
+        let after_authentication = restarted.status().await;
+        assert!(after_authentication.paired);
+        assert!(after_authentication.live);
+        assert!(!after_authentication.has_snapshot);
+
+        restarted
+            .update_snapshot(&claim.access_token, snapshot_for("mac-player"))
+            .await
+            .unwrap();
+        let after_snapshot = restarted.status().await;
+        assert!(after_snapshot.paired);
+        assert!(after_snapshot.live);
+        assert!(after_snapshot.has_snapshot);
+        assert_eq!(
+            restarted.snapshot_for_player("mac-player").await.unwrap(),
+            snapshot_for("mac-player")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_identity_cannot_reconstruct_or_pair_by_publishing_state() {
+        let directory = tempfile::tempdir().expect("temporary credential directory");
+        let store = crate::api::credentials::AppleBridgeCredentialStore::new(
+            directory.path().join("apple-bridges.enc"),
+            [8; 32],
+        );
+        let registry = AppleBridgeRegistry::with_credential_store(store).unwrap();
+
+        let error = registry
+            .update_snapshot("forged-bearer", snapshot_for("forged-player"))
+            .await
+            .expect_err("unknown bearer must not create a session");
+        assert!(error.to_string().contains("bridge token is invalid"));
+        assert_eq!(registry.status().await.companions.len(), 0);
+    }
+
+    #[tokio::test]
     async fn live_companions_are_scoped_by_player_for_snapshots_and_commands() {
         let registry = AppleBridgeRegistry::default();
         let first = registry.create_pairing("iphone-a".to_string()).await;
@@ -1815,7 +2016,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoked_or_stale_owner_cannot_receive_scoped_commands() {
+    async fn revoked_owner_cannot_receive_scoped_commands_but_stale_owner_reconnects() {
         let registry = AppleBridgeRegistry::default();
         let pairing = registry.create_pairing("iphone".to_string()).await;
         let claim = registry
@@ -1864,11 +2065,11 @@ mod tests {
             .enqueue_for_player("player", MusicKitCommand::Play)
             .await
             .is_err());
-        assert!(registry
+        registry
             .update_snapshot(&claim.access_token, snapshot_for("player"))
             .await
-            .is_err());
-        assert!(registry.poll_commands(&claim.access_token).await.is_err());
+            .expect("durable pairing rehydrates a stale runtime session");
+        assert!(registry.poll_commands(&claim.access_token).await.is_ok());
     }
 
     #[tokio::test]

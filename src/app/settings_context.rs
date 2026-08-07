@@ -5,6 +5,38 @@
 
 use dioxus::prelude::*;
 
+use crate::app::api::AppSettings;
+
+#[cfg(target_arch = "wasm32")]
+const SETTINGS_BOOTSTRAP_SELECTOR: &str = "meta[name=\"uhc-settings-bootstrap\"]";
+
+/// Return the exact settings JSON embedded in the app root. Keeping this
+/// string identical on SSR and the first WASM render prevents hydration from
+/// seeing a different Settings tree while the route-local API request loads.
+pub fn settings_bootstrap_json() -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let settings = crate::api::load_app_settings();
+        serde_json::to_string(&settings).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|window| window.document())
+            .and_then(|document| document.query_selector(SETTINGS_BOOTSTRAP_SELECTOR).ok()?)
+            .and_then(|element| element.get_attribute("content"))
+            .unwrap_or_else(|| "{}".to_string())
+    }
+}
+
+/// Read the server-confirmed settings snapshot used for the first Settings
+/// render. The browser reads the app-root meta tag, not a marker emitted by
+/// the Settings route itself.
+pub fn initial_app_settings() -> AppSettings {
+    serde_json::from_str(&settings_bootstrap_json()).unwrap_or_default()
+}
+
 /// The optional-page visibility snapshot embedded in the server-rendered
 /// document.  It is deliberately separate from the reactive context: this is
 /// the value both SSR and WASM use *before* the browser can fetch settings.

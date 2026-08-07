@@ -29,6 +29,7 @@ const NONCE_BYTES: usize = 12;
 const CREDENTIAL_FILE_ENV: &str = "UHC_SPOTIFY_CREDENTIAL_FILE";
 const KEY_FILE_ENV: &str = "UHC_CREDENTIAL_KEY_FILE";
 const KEY_ENV: &str = "UHC_CREDENTIAL_KEY";
+const APPLE_BRIDGE_FILE_ENV: &str = "UHC_APPLE_BRIDGE_CREDENTIAL_FILE";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EncryptedEnvelope {
@@ -188,6 +189,103 @@ impl EncryptedCredentialStore {
     /// Path used for diagnostics; never includes credential contents.
     pub fn path(&self) -> &Path {
         &self.credential_path
+    }
+}
+
+/// Durable identity and bearer records for native Apple Music companions.
+///
+/// This intentionally stores no MusicKit authorization or transient bridge
+/// queues.  The bearer is encrypted with the same externally-held key as the
+/// provider credential store, and the file is replaced atomically.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct AppleBridgeCredentialRecord {
+    pub bridge_id: String,
+    pub access_token: String,
+    #[serde(default)]
+    pub bound_player_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct AppleBridgeCredentialStore {
+    credential_path: PathBuf,
+    key: [u8; KEY_BYTES],
+}
+
+impl AppleBridgeCredentialStore {
+    pub fn new(credential_path: PathBuf, key: [u8; KEY_BYTES]) -> Self {
+        Self {
+            credential_path,
+            key,
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let credential_path = std::env::var_os(APPLE_BRIDGE_FILE_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| get_config_file_path("applemusic-bridges.enc"));
+        let key = if let Ok(value) = std::env::var(KEY_ENV) {
+            parse_key(&value).context("UHC_CREDENTIAL_KEY must be 32-byte hex or base64url")?
+        } else {
+            let key_path = std::env::var_os(KEY_FILE_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| get_config_file_path("credential.key"));
+            load_or_create_key(&key_path)?
+        };
+        Ok(Self::new(credential_path, key))
+    }
+
+    pub fn load(&self) -> Result<Vec<AppleBridgeCredentialRecord>> {
+        let bytes = match std::fs::read(&self.credential_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let envelope: EncryptedEnvelope = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow!("Apple bridge credential envelope is invalid: {error}"))?;
+        if envelope.version != 1 || envelope.cipher != "chacha20poly1305" {
+            return Err(anyhow!("unsupported Apple bridge credential envelope"));
+        }
+        let nonce = URL_SAFE_NO_PAD
+            .decode(envelope.nonce)
+            .context("Apple bridge nonce is invalid")?;
+        let ciphertext = URL_SAFE_NO_PAD
+            .decode(envelope.ciphertext)
+            .context("Apple bridge ciphertext is invalid")?;
+        if nonce.len() != NONCE_BYTES {
+            return Err(anyhow!("Apple bridge nonce has an invalid length"));
+        }
+        let plaintext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
+            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .map_err(|_| anyhow!("Apple bridge credential decryption failed"))?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|error| anyhow!("Apple bridge credential payload is invalid: {error}"))
+    }
+
+    pub fn save(&self, records: &[AppleBridgeCredentialRecord]) -> Result<()> {
+        let parent = self
+            .credential_path
+            .parent()
+            .ok_or_else(|| anyhow!("Apple bridge credential path has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let plaintext =
+            serde_json::to_vec(records).context("serialize Apple bridge credentials")?;
+        let mut nonce = [0_u8; NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .map_err(|_| anyhow!("encrypt Apple bridge credentials"))?;
+        let envelope = EncryptedEnvelope {
+            version: 1,
+            cipher: "chacha20poly1305".to_string(),
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+        };
+        let encoded = serde_json::to_vec(&envelope).context("serialize Apple bridge envelope")?;
+        let temporary = self.credential_path.with_extension("enc.tmp");
+        write_private_file(&temporary, &encoded)?;
+        std::fs::rename(temporary, &self.credential_path)
+            .context("replace Apple bridge credentials")?;
+        Ok(())
     }
 }
 

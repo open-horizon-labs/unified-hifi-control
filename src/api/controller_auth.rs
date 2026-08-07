@@ -266,10 +266,7 @@ fn requires_controller_auth(path: &str) -> bool {
     // and PKCE exchange instead of the browser session. Start/configure,
     // account, and revoke remain controller-owned operations.
     (path.starts_with("/api/providers/") && path != "/api/providers/spotify/oauth/callback")
-        || matches!(
-            path,
-            "/api/bridges/applemusic/pair" | "/api/bridges/applemusic/status"
-        )
+        || matches!(path, "/api/bridges/applemusic/pair")
 }
 
 fn controller_auth_required() -> bool {
@@ -310,10 +307,7 @@ fn is_protected(path: &str, method: &axum::http::Method) -> bool {
     if path == "/api/settings" {
         return method != axum::http::Method::GET;
     }
-    if path == "/api/bridges/applemusic/pair"
-        || path == "/api/bridges/applemusic/status"
-        || path == "/api/bridges/applemusic/revoke"
-    {
+    if path == "/api/bridges/applemusic/pair" || path == "/api/bridges/applemusic/revoke" {
         return true;
     }
     if *method == axum::http::Method::GET || *method == axum::http::Method::HEAD {
@@ -486,7 +480,7 @@ mod tests {
         ));
         assert!(requires_controller_auth("/api/providers/spotify/account"));
         assert!(requires_controller_auth("/api/bridges/applemusic/pair"));
-        assert!(requires_controller_auth("/api/bridges/applemusic/status"));
+        assert!(!requires_controller_auth("/api/bridges/applemusic/status"));
         assert!(!requires_controller_auth("/api/bridges/applemusic/claim"));
         assert!(!requires_controller_auth("/zones"));
     }

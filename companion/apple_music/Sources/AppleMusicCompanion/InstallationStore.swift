@@ -8,7 +8,7 @@ import Security
 /// bearer is only the paired UHC bridge credential, never an Apple token.
 @available(macOS 14.0, *)
 public struct AppleMusicCompanionInstallation: Codable, Sendable, Equatable {
-    public let baseURL: URL
+    public var baseURL: URL
     public let companionID: String
     public var bridgeID: String?
     public var accessToken: String?

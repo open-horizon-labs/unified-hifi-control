@@ -73,6 +73,7 @@ private final class CompanionModel: ObservableObject {
         isPaired = alreadyPaired
         stage = alreadyPaired ? .connected : .authorize
         message = alreadyPaired ? "This companion is connected to UHC." : nil
+        if alreadyPaired { reconnect() }
     }
 
     func authorize() {
@@ -113,6 +114,29 @@ private final class CompanionModel: ObservableObject {
             Task { @MainActor in self?.requestPairing(at: baseURL) }
         }
         browser.start()
+    }
+
+    /// Restore the Keychain bearer, then use Bonjour to find UHC's current
+    /// address after a server restart or network/OS change.
+    private func reconnect() {
+        let browser = UHCBonjourDiscovery()
+        discovery = browser
+        browser.onFailure = { [weak self] _ in
+            Task { @MainActor in self?.message = "UHC was not found on this local network. It will reconnect when available." }
+        }
+        browser.onBaseURL = { [weak self] baseURL in
+            Task { @MainActor in self?.useReconnectedUHC(at: baseURL) }
+        }
+        browser.start()
+    }
+
+    private func useReconnectedUHC(at baseURL: URL) {
+        discovery?.stop(); discovery = nil
+        guard var installation = installationStore.load(), installation.accessToken != nil else { return }
+        installation.baseURL = baseURL
+        try? installationStore.save(installation)
+        host = AppleMusicCompanionHost(installation: installation, store: installationStore)
+        startPolling()
     }
     private func requestPairing(at baseURL: URL) {
         discovery?.stop(); discovery = nil
@@ -164,6 +188,7 @@ private final class CompanionModel: ObservableObject {
                     try await host.publishCurrentSnapshot(from: player)
                     try await host.pollAndHandle { command in try await player.execute(command) }
                     try await host.pollAndHandleContent { request in try await player.executeContent(request) }
+                    await MainActor.run { self.message = "This companion is connected to UHC." }
                 } catch {
                     await MainActor.run {
                         self.message = "UHC is temporarily unavailable. It will keep trying while this app is open."

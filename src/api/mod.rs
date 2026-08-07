@@ -292,7 +292,8 @@ impl AppState {
             adapter_registry: Arc::new(AdapterRegistry::default()),
             provider_auth: Arc::new(provider_auth::ProviderAuthState::default()),
             controller_auth: controller_auth::ControllerAuthState::new(),
-            apple_bridges: apple_bridge::AppleBridgeRegistry::default(),
+            apple_bridges: apple_bridge::AppleBridgeRegistry::from_env()
+                .expect("Apple Music companion credential store must be available"),
             knobs,
             bus,
             aggregator,
