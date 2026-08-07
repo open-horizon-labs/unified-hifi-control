@@ -13,6 +13,7 @@ use unified_hifi_control::adapters::apple_music::{
     MusicKitPlaybackState, MusicKitSnapshot, MusicKitTrack, PlaybackRoute,
 };
 use unified_hifi_control::adapters::{AdapterCommand, AdapterContext, AdapterLogic, Startable};
+use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::bus::SharedBus;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState};
 
@@ -106,6 +107,78 @@ async fn companion_snapshot_maps_to_an_applemusic_zone() {
     run.await
         .expect("adapter task must join")
         .expect("adapter must stop cleanly");
+}
+
+#[tokio::test]
+async fn companion_snapshot_flows_through_aggregator_and_flushes_on_stop() {
+    let bus = create_bus();
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let aggregator_task = {
+        let aggregator = aggregator.clone();
+        tokio::spawn(async move { aggregator.run().await })
+    };
+    let adapter = adapter(bus.clone(), Arc::new(Mutex::new(Vec::new())));
+    let shutdown = CancellationToken::new();
+    let adapter_task = {
+        let adapter = adapter.clone();
+        let adapter_bus = bus.clone();
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            adapter
+                .run(AdapterContext {
+                    bus: adapter_bus,
+                    shutdown,
+                })
+                .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if aggregator.get_zone("applemusic:application").await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("aggregator must receive the companion zone");
+
+    let zone = aggregator
+        .get_zone("applemusic:application")
+        .await
+        .expect("Apple Music zone must be addressable through the aggregator");
+    assert_eq!(zone.source, "applemusic");
+    assert_eq!(
+        zone.now_playing.as_ref().map(|track| track.title.as_str()),
+        Some("Song")
+    );
+
+    shutdown.cancel();
+    adapter_task
+        .await
+        .expect("adapter task must join")
+        .expect("adapter must stop cleanly");
+    adapter.stop().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if aggregator
+                .get_zone("applemusic:application")
+                .await
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("stopping the adapter must flush its aggregator zones");
+
+    bus.publish(BusEvent::ShuttingDown { reason: None });
+    aggregator_task
+        .await
+        .expect("aggregator task must join");
 }
 
 #[tokio::test]

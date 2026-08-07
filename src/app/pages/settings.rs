@@ -1201,7 +1201,7 @@ pub fn Settings() -> Element {
                         div { class: "flex items-start justify-between gap-3",
                             div {
                                 h3 { id: "apple-music-heading", class: "text-lg font-semibold", "Apple Music" }
-                                p { class: "mt-1 text-sm text-secondary", "Use a signed native MusicKit companion. On macOS it controls the ApplicationMusicPlayer session; SystemMusicPlayer is unavailable in the macOS SDK." }
+                                p { class: "mt-1 text-sm text-secondary", "Use a signed native MusicKit companion. The v1 execution owner is an iPhone controlling its SystemMusicPlayer session." }
                             }
                             if !applemusic_enabled() {
                                 span { class: "badge badge-secondary shrink-0", "Disabled" }
@@ -1213,7 +1213,7 @@ pub fn Settings() -> Element {
                                 span { class: "badge badge-secondary shrink-0", "Not paired" }
                             }
                         }
-                        p { class: "mt-4 text-sm text-secondary", "On this Mac, run the native companion and authorize Apple Music there. When UHC runs elsewhere, pair that companion with a short-lived code." }
+                        p { class: "mt-4 text-sm text-secondary", "On an iPhone, run the companion and authorize Apple Music there. When UHC runs elsewhere, pair that companion with a short-lived code. A signed Mac companion is a later Wave 2 path." }
                         if let Some(status) = apple_st {
                             if status.paired {
                                 p { class: "mt-4 text-sm", "Bridge: {apple_bridge_label}" }
