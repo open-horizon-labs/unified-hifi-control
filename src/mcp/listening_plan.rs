@@ -74,7 +74,7 @@ impl ListeningPlanStore {
         zone_id: &str,
         items: Vec<ListeningPlanItem>,
     ) -> anyhow::Result<ListeningPlan> {
-        if zone_id.is_empty() || !zone_id.starts_with("applemusic:") {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
             anyhow::bail!("listening plan zone must be an applemusic execution-owner zone");
         }
         if items.len() > MAX_ITEMS {
@@ -268,7 +268,7 @@ fn trim_history(plan: &mut ListeningPlan) {
 }
 
 fn validate_items(zone_id: &str, items: &[ListeningPlanItem]) -> anyhow::Result<()> {
-    if zone_id.is_empty() || !zone_id.starts_with("applemusic:") {
+    if !crate::bus::is_applemusic_zone_id(zone_id) {
         anyhow::bail!("listening plan zone must be an applemusic execution-owner zone");
     }
     if items.len() > MAX_ITEMS {
@@ -306,7 +306,7 @@ fn load_plans(path: &PathBuf) -> anyhow::Result<HashMap<String, ListeningPlan>> 
     let mut plans = persisted
         .into_iter()
         .filter(|plan| {
-            plan.zone_id.starts_with("applemusic:")
+            crate::bus::is_applemusic_zone_id(&plan.zone_id)
                 && plan.items.len() <= MAX_ITEMS
                 && plan.items.iter().all(|item| {
                     !item.reference.is_empty()
@@ -378,6 +378,23 @@ mod tests {
         assert_eq!(second.history[0].operation, "replace");
         assert_eq!(second.history[1].confidence, "planned");
         assert_eq!(store.get("applemusic:iphone").await, Some(second));
+    }
+
+    #[tokio::test]
+    async fn nested_or_empty_apple_owner_ids_cannot_create_plans() {
+        let store = ListeningPlanStore::default();
+        let item = ListeningPlanItem {
+            reference: "ref".into(),
+            title: "Track".into(),
+        };
+        assert!(store
+            .replace("applemusic:", vec![item.clone()])
+            .await
+            .is_err());
+        assert!(store
+            .replace("applemusic:owner:child", vec![item])
+            .await
+            .is_err());
     }
 
     #[tokio::test]

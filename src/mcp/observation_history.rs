@@ -49,7 +49,7 @@ impl PlaybackObservationHistory {
     }
 
     pub async fn record_zone(&self, zone: &Zone, observed_at: u64) {
-        if !zone.zone_id.starts_with("applemusic:") {
+        if !crate::bus::is_applemusic_zone_id(&zone.zone_id) {
             return;
         }
         self.record(
@@ -62,7 +62,7 @@ impl PlaybackObservationHistory {
     }
 
     pub async fn record_state(&self, zone_id: &str, state: PlaybackState, observed_at: u64) {
-        if !zone_id.starts_with("applemusic:") {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
             return;
         }
         self.record(zone_id, state, None, observed_at).await;
@@ -75,7 +75,7 @@ impl PlaybackObservationHistory {
         now_playing: Option<&NowPlaying>,
         observed_at: u64,
     ) {
-        if !zone_id.starts_with("applemusic:") {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
             return;
         }
         self.record(zone_id, state, now_playing, observed_at).await;
@@ -97,7 +97,7 @@ impl PlaybackObservationHistory {
     /// This prevents a new owner reusing the same player id from inheriting
     /// the previous owner's private listening context.
     pub async fn clear_zone(&self, zone_id: &str) {
-        if !zone_id.starts_with("applemusic:") {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
             return;
         }
         self.records.write().await.remove(zone_id);
@@ -219,9 +219,13 @@ mod tests {
             .record_zone(&zone("spotify:device", "Ignored"), 1)
             .await;
         store
+            .record_zone(&zone("applemusic:owner:child", "Ignored"), 1)
+            .await;
+        store
             .record_state("applemusic:iphone", PlaybackState::Paused, 2)
             .await;
         assert!(store.recent("spotify:device", 10).await.is_empty());
+        assert!(store.recent("applemusic:owner:child", 10).await.is_empty());
         assert_eq!(store.recent("applemusic:iphone", 10).await.len(), 1);
     }
 

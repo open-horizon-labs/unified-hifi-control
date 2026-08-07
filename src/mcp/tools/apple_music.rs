@@ -133,7 +133,7 @@ pub async fn handle_apple_music(
                 ),
             );
         };
-        if !zone_id.starts_with("applemusic:") {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
             return Envelope::read("hifi_apple_music", "context").refused(
                 "context can target only an applemusic zone.",
                 crate::mcp::envelope::Refusal::invalid_parameter(
@@ -175,7 +175,7 @@ pub async fn handle_apple_music(
                 ),
             );
         };
-        if !zone_id.starts_with("applemusic:") {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
             return Envelope::write("hifi_apple_music", "clear_feedback").refused(
                 "clear_feedback can target only an applemusic zone.",
                 crate::mcp::envelope::Refusal::invalid_parameter(
@@ -290,7 +290,7 @@ pub async fn handle_apple_music(
                 ),
             );
         };
-        if !zone_id.starts_with("applemusic:") {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
             return Envelope::write("hifi_apple_music", "queue_plan").refused(
                 "queue_plan can target only an applemusic zone.",
                 crate::mcp::envelope::Refusal::invalid_parameter(

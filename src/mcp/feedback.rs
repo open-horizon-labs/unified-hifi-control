@@ -119,6 +119,9 @@ impl FeedbackStore {
     }
 
     pub async fn clear_zone(&self, zone_id: &str) -> anyhow::Result<()> {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
+            anyhow::bail!("feedback requires an applemusic execution-owner zone");
+        }
         let mut records = self.records.write().await;
         let previous = records.clone();
         records.retain(|record| record.zone_id != zone_id);
@@ -133,7 +136,7 @@ impl FeedbackStore {
 }
 
 pub fn validate(record: &FeedbackRecord) -> anyhow::Result<()> {
-    if !record.zone_id.starts_with("applemusic:") {
+    if !crate::bus::is_applemusic_zone_id(&record.zone_id) {
         anyhow::bail!("feedback requires an applemusic execution-owner zone");
     }
     if record.reference.is_empty() || record.reference.len() > MAX_REFERENCE_LENGTH {
@@ -240,6 +243,15 @@ mod tests {
         assert!(validate(&value).is_err());
         value.rating = Some(5);
         value.explicit = false;
+        assert!(validate(&value).is_err());
+    }
+
+    #[test]
+    fn nested_or_empty_apple_owner_ids_are_refused() {
+        let mut value = record(FeedbackSignal::Favorite);
+        value.zone_id = "applemusic:".into();
+        assert!(validate(&value).is_err());
+        value.zone_id = "applemusic:owner:child".into();
         assert!(validate(&value).is_err());
     }
 

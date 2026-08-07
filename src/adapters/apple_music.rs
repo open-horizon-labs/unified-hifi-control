@@ -462,7 +462,7 @@ impl AdapterLogic for AppleMusicAdapter {
         zone_id: &str,
         command: AdapterCommand,
     ) -> Result<AdapterCommandResponse> {
-        if !zone_id.starts_with("applemusic:") {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
             return Ok(AdapterCommandResponse {
                 success: false,
                 error: Some(format!(
@@ -559,7 +559,7 @@ impl LibraryAdapter for AppleMusicAdapter {
 
 impl AppleMusicAdapter {
     fn validate_content_zone(&self, zone_id: &str) -> Result<()> {
-        if !zone_id.starts_with("applemusic:") {
+        if !crate::bus::is_applemusic_zone_id(zone_id) {
             bail!("zone `{zone_id}` is not owned by the applemusic adapter");
         }
         Ok(())
@@ -577,8 +577,7 @@ fn validate_content_request(operation: &str, params: &serde_json::Value) -> Resu
         .get("zone_id")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("Apple Music content operation requires zone_id"))?;
-    let player_id = zone_id.strip_prefix("applemusic:");
-    if player_id.is_none_or(str::is_empty) || player_id.is_some_and(|value| value.contains(':')) {
+    if !crate::bus::is_applemusic_zone_id(zone_id) {
         bail!("zone `{zone_id}` is not an Apple Music execution-owner zone");
     }
     Ok(())

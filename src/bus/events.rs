@@ -108,6 +108,18 @@ impl PrefixedZoneId {
     }
 }
 
+/// Whether a string names exactly one Apple Music execution owner.
+///
+/// Apple companion state is owner-scoped. A bare prefix or a nested prefix
+/// would allow unrelated sessions to share private context, so every layer
+/// uses this same predicate rather than a loose `starts_with` check.
+pub fn is_applemusic_zone_id(value: &str) -> bool {
+    let Some(owner) = value.strip_prefix("applemusic:") else {
+        return false;
+    };
+    !owner.is_empty() && !owner.contains(':')
+}
+
 impl fmt::Display for PrefixedZoneId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -863,5 +875,13 @@ mod tests {
         // Invalid - no prefix
         assert!(PrefixedZoneId::parse("abc123").is_none());
         assert!(PrefixedZoneId::parse("unknown:abc").is_none());
+    }
+
+    #[test]
+    fn apple_music_execution_owner_ids_are_exactly_scoped() {
+        assert!(is_applemusic_zone_id("applemusic:iphone"));
+        assert!(!is_applemusic_zone_id("applemusic:"));
+        assert!(!is_applemusic_zone_id("applemusic:owner:child"));
+        assert!(!is_applemusic_zone_id("spotify:device"));
     }
 }
