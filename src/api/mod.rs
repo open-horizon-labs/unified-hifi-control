@@ -261,7 +261,7 @@ impl AppState {
             shutdown,
             sse_connections: Arc::new(AtomicUsize::new(0)),
             mcp_refs: crate::mcp::refs::RefTable::new(),
-            listening_plans: crate::mcp::listening_plan::ListeningPlanStore::default(),
+            listening_plans: crate::mcp::listening_plan::ListeningPlanStore::from_config(),
         }
     }
 

@@ -171,10 +171,12 @@ pub async fn handle_apple_music(
             .library_content("applemusic", "queue_plan", &params)
             .await
         {
-            Ok(value) => {
-                let plan = state.listening_plans.replace(zone_id, plan_items).await;
-                Ok(env.json_result(&json!({"plan": plan, "companion": value})))
-            }
+            Ok(value) => match state.listening_plans.replace(zone_id, plan_items).await {
+                Ok(plan) => Ok(env.json_result(&json!({"plan": plan, "companion": value}))),
+                Err(error) => env.failed(format!(
+                    "Apple Music listening plan could not be persisted: {error}"
+                )),
+            },
             Err(e) => env.failed(format!("Apple Music queue plan failed: {}", e)),
         };
     }
