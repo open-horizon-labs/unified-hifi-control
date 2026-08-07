@@ -467,9 +467,15 @@ public actor SystemMusicPlayerCompanion {
         switch command {
         case .play: try await play()
         case .pause: pause()
+        case .toggle:
+            if player.state.playbackStatus == .playing {
+                pause()
+            } else {
+                try await play()
+            }
         case .next: try await skipToNextItem()
         case .previous: try await skipToPreviousItem()
-        case .toggle, .stop, .setVolume, .adjustVolume, .setMute:
+        case .stop, .setVolume, .adjustVolume, .setMute:
             throw CompanionCommandError.notValidated(command)
         }
     }

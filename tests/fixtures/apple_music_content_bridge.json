@@ -1,0 +1,95 @@
+{
+  "operations": [
+    "catalog_search",
+    "library",
+    "playlists",
+    "playlist_tracks",
+    "recent",
+    "recommendations",
+    "favorite_add",
+    "play_ref",
+    "queue_plan",
+    "playlist_create",
+    "playlist_add",
+    "playlist_update",
+    "rating_set",
+    "context"
+  ],
+  "outcomes": [
+    "success",
+    "unsupported",
+    "unauthorized",
+    "subscription_required",
+    "restricted",
+    "not_found",
+    "offline",
+    "rate_limited",
+    "stale_owner",
+    "conflict",
+    "invalid",
+    "failed"
+  ],
+  "refused_operations": [
+    "playlist_remove",
+    "playlist_reorder",
+    "playlist_delete",
+    "favorite_remove",
+    "library_remove"
+  ],
+  "success": {
+    "request": {
+      "kind": "content",
+      "request_id": "req_example",
+      "owner_id": "iphone-01",
+      "operation": "catalog_search",
+      "params": {"query": "Miles Davis", "limit": 25, "offset": 0},
+      "idempotency_key": null,
+      "precondition": null,
+      "confirm": false
+    },
+    "response": {
+      "request_id": "req_example",
+      "owner_id": "iphone-01",
+      "operation": "catalog_search",
+      "outcome": "success",
+      "data": {
+        "items": [{
+          "ref": "ref_opaque_example",
+          "provider": "applemusic",
+          "source_kind": "catalog",
+          "title": "So What",
+          "artist": "Miles Davis",
+          "album": "Kind of Blue"
+        }],
+        "has_more": false,
+        "next_offset": null
+      },
+      "error": null
+    }
+  },
+  "mutation": {
+    "request": {
+      "kind": "content",
+      "request_id": "req_mutation",
+      "owner_id": "iphone-01",
+      "operation": "playlist_add",
+      "params": {"playlist_ref": "ref_playlist_example", "item_refs": ["ref_opaque_example"]},
+      "idempotency_key": "idem_mutation_example",
+      "precondition": {"revision": "opaque_revision"},
+      "confirm": true
+    }
+  },
+  "outcome_examples": [
+    {"outcome": "unsupported", "error": {"code": "unsupported", "message": "not available", "retryable": false}},
+    {"outcome": "unauthorized", "error": {"code": "authorization_needed", "message": "authorize companion", "retryable": false}},
+    {"outcome": "subscription_required", "error": {"code": "subscription_required", "message": "subscription required", "retryable": false}},
+    {"outcome": "restricted", "error": {"code": "restricted", "message": "item restricted", "retryable": false}},
+    {"outcome": "not_found", "error": {"code": "not_found", "message": "item unavailable", "retryable": false}},
+    {"outcome": "offline", "error": {"code": "offline", "message": "companion offline", "retryable": true}},
+    {"outcome": "rate_limited", "error": {"code": "rate_limited", "message": "try later", "retryable": true}},
+    {"outcome": "stale_owner", "error": {"code": "stale_owner", "message": "owner is stale", "retryable": true}},
+    {"outcome": "conflict", "error": {"code": "conflict", "message": "precondition changed", "retryable": false}},
+    {"outcome": "invalid", "error": {"code": "invalid", "message": "invalid request", "retryable": false}},
+    {"outcome": "failed", "error": {"code": "failed", "message": "provider failed", "retryable": true}}
+  ]
+}

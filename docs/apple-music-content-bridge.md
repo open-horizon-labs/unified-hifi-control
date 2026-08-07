@@ -117,10 +117,10 @@ The initial operation names are `catalog_search`, `library`, `playlists`,
 `playlist_create`, `playlist_add`, `playlist_update`, `favorite_add`,
 `rating_set`, and `context`. Each operation has its own capability result.
 
-`playlist_remove`, arbitrary reorder/delete, unfavorite, and broad library
-removal remain refused until Apple documents a safe operation and UHC has an
-ownership/precondition model. A listening plan is UHC's durable intent; it is
-never presented as full visibility into the iPhone system queue.
+`playlist_remove`, arbitrary reorder/delete, `favorite_remove` (unfavorite),
+and broad library removal remain refused until Apple documents a safe operation
+and UHC has an ownership/precondition model. A listening plan is UHC's durable
+intent; it is never presented as full visibility into the iPhone system queue.
 
 ## Approval boundary
 
