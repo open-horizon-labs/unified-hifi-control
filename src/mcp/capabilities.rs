@@ -652,6 +652,23 @@ pub fn support(target: ZoneTarget, capability: Capability) -> Support {
             evidence: "the native iPhone companion path is implemented, but this capability remains pending signed physical-device validation of SystemMusicPlayer behavior.",
         };
     }
+    if target == ZoneTarget::AppleMusic {
+        let tracked_by = match capability {
+            Capability::Search | Capability::PlayByQuery | Capability::PlayByRef => "#481",
+            Capability::Browse | Capability::SavedPlaylists | Capability::Favorites => "#482",
+            Capability::QueueRead
+            | Capability::QueueJump
+            | Capability::QueueReorder
+            | Capability::QueueRemove
+            | Capability::QueueClear
+            | Capability::PlayNext => "#483",
+            _ => "#462",
+        };
+        return Support::NotImplemented {
+            tracked_by,
+            evidence: "the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.",
+        };
+    }
     if let Some(supported) = routed(target, capability) {
         return supported;
     }
