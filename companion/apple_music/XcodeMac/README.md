@@ -73,6 +73,29 @@ targets: [
 
 ## Configuration
 
+### Apple Developer setup (required for catalog and library requests)
+
+The Apple Music subscription does not by itself provision the developer
+token used by `MusicCatalogSearchRequest` and `MusicLibraryRequest`. Register
+the explicit bundle identifier below under the Apple Developer account that
+will sign the app, then enable **MusicKit** in the App Services tab:
+
+```
+com.openhorizonlabs.uhc.applemusiccompanion
+```
+
+In Xcode, set the target's Team to the same account (the display name may be
+“Muness Castle”; signing uses its Team ID). Rebuild and reinstall after the
+App ID change, then authorize Apple Music again. MusicKit will generate the
+developer token automatically once the App ID's MusicKit service is enabled;
+UHC must never be given that token.
+
+The iPhone host uses a separate explicit identifier and must be enabled too:
+
+```
+com.openhorizonlabs.uhc.applemusiccompanion.ios
+```
+
 ### XCConfig Build Settings
 Build settings are managed through **XCConfig files** in `Config/`:
 - `Config/Shared.xcconfig` - Common settings (bundle ID, versions, deployment target)

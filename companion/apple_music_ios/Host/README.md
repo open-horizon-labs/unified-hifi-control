@@ -8,9 +8,12 @@ be stable across relaunches (store it in Keychain).
 
 The host flow is:
 
-1. Enable the MusicKit App Service for the explicit bundle ID in Certificates,
-   Identifiers & Profiles and include `Info.plist` here. MusicKit manages the
-   Music User Token automatically; no custom MusicKit entitlement is required.
+1. Register the explicit bundle ID
+   `com.openhorizonlabs.uhc.applemusiccompanion.ios` under the signing team in
+   Certificates, Identifiers & Profiles, enable the **MusicKit** App Service,
+   and include `Info.plist` here. MusicKit manages both token lifecycles inside
+   the signed app; no custom MusicKit entitlement is required. A subscription
+   alone is not enough for catalog/library requests.
 2. Authorize Apple Music in the app.
 3. Generate a short-lived pairing code from the app or UHC, then claim it.
 4. Keep command polling in the foreground and publish the bounded
