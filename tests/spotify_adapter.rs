@@ -845,3 +845,22 @@ fn token_expiry_is_detected() {
     };
     assert!(token.is_expired(1));
 }
+
+#[tokio::test]
+async fn stopping_adapter_flushes_spotify_zones() {
+    let bus = create_bus();
+    let mut events = bus.subscribe();
+    let adapter = SpotifyAdapter::new(bus);
+
+    adapter.stop().await;
+
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("stop must publish a lifecycle event")
+        .expect("bus must remain open");
+    assert!(matches!(
+        event,
+        BusEvent::AdapterStopping { adapter, reason }
+            if adapter == "spotify" && reason.as_deref() == Some("requested")
+    ));
+}

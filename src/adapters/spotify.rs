@@ -1310,6 +1310,10 @@ impl SpotifyAdapter {
     async fn stop_internal(&self) {
         self.shutdown.read().await.cancel();
         self.state.write().await.running = false;
+        self.bus.publish(BusEvent::AdapterStopping {
+            adapter: "spotify".to_string(),
+            reason: Some("requested".to_string()),
+        });
     }
 }
 

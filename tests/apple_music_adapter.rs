@@ -12,7 +12,7 @@ use unified_hifi_control::adapters::apple_music::{
     AppleMusicAdapter, CompanionPlatform, ExecutionOwner, MusicKitCommand, MusicKitCompanion,
     MusicKitPlaybackState, MusicKitSnapshot, MusicKitTrack, PlaybackRoute,
 };
-use unified_hifi_control::adapters::{AdapterCommand, AdapterContext, AdapterLogic};
+use unified_hifi_control::adapters::{AdapterCommand, AdapterContext, AdapterLogic, Startable};
 use unified_hifi_control::bus::SharedBus;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState};
 
@@ -177,6 +177,25 @@ async fn adapter_rejects_zone_owned_by_another_provider() {
         .error
         .as_deref()
         .is_some_and(|error| error.contains("applemusic")));
+}
+
+#[tokio::test]
+async fn stopping_adapter_flushes_apple_music_zones() {
+    let bus = create_bus();
+    let mut events = bus.subscribe();
+    let adapter = adapter(bus, Arc::new(Mutex::new(Vec::new())));
+
+    adapter.stop().await;
+
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("stop must publish a lifecycle event")
+        .expect("bus must remain open");
+    assert!(matches!(
+        event,
+        BusEvent::AdapterStopping { adapter, reason }
+            if adapter == "applemusic" && reason.as_deref() == Some("requested")
+    ));
 }
 
 #[test]

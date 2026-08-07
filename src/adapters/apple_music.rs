@@ -404,6 +404,10 @@ impl AppleMusicAdapter {
     async fn stop_internal(&self) {
         self.shutdown.read().await.cancel();
         self.running.store(false, Ordering::SeqCst);
+        self.bus.publish(BusEvent::AdapterStopping {
+            adapter: APPLE_MUSIC_PREFIX.to_string(),
+            reason: Some("requested".to_string()),
+        });
     }
 }
 
