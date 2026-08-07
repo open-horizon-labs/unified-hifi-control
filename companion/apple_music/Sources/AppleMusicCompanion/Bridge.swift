@@ -62,6 +62,72 @@ public struct MacCommandAcknowledgement: Codable, Sendable {
 }
 
 @available(macOS 14.0, *)
+public enum MacMusicKitJSONValue: Codable, Sendable, Equatable {
+    case null, bool(Bool), number(Double), string(String)
+    case array([MacMusicKitJSONValue])
+    case object([String: MacMusicKitJSONValue])
+
+    public init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer()
+        if value.decodeNil() { self = .null }
+        else if let value = try? value.decode(Bool.self) { self = .bool(value) }
+        else if let value = try? value.decode(Double.self) { self = .number(value) }
+        else if let value = try? value.decode(String.self) { self = .string(value) }
+        else if let value = try? value.decode([MacMusicKitJSONValue].self) { self = .array(value) }
+        else { self = .object(try value.decode([String: MacMusicKitJSONValue].self)) }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var value = encoder.singleValueContainer()
+        switch self {
+        case .null: try value.encodeNil()
+        case let .bool(item): try value.encode(item)
+        case let .number(item): try value.encode(item)
+        case let .string(item): try value.encode(item)
+        case let .array(item): try value.encode(item)
+        case let .object(item): try value.encode(item)
+        }
+    }
+}
+
+@available(macOS 14.0, *)
+public struct MacMusicKitContentCommand: Codable, Sendable {
+    public let requestID: String
+    public let ownerID: String
+    public let operation: String
+    public let params: [String: MacMusicKitJSONValue]
+    public let idempotencyKey: String?
+    public let precondition: MacMusicKitJSONValue?
+    public let confirm: Bool
+    public let expiresAt: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case requestID = "request_id", ownerID = "owner_id", operation, params
+        case idempotencyKey = "idempotency_key", precondition, confirm, expiresAt = "expires_at"
+    }
+}
+
+@available(macOS 14.0, *)
+public struct MacMusicKitContentError: Codable, Sendable {
+    public let code: String
+    public let message: String
+    public let retryable: Bool
+    public init(code: String, message: String, retryable: Bool) {
+        self.code = code; self.message = message; self.retryable = retryable
+    }
+}
+
+@available(macOS 14.0, *)
+public struct MacMusicKitContentResult: Codable, Sendable {
+    public let outcome: String
+    public let data: MacMusicKitJSONValue?
+    public let error: MacMusicKitContentError?
+    public init(outcome: String, data: MacMusicKitJSONValue? = nil, error: MacMusicKitContentError? = nil) {
+        self.outcome = outcome; self.data = data; self.error = error
+    }
+}
+
+@available(macOS 14.0, *)
 public struct MacPairingResponse: Codable, Sendable {
     public let bridgeID: String
     public let pairingCode: String
@@ -115,8 +181,16 @@ public actor MacAppleMusicBridgeClient {
         try await request(path: "api/bridges/applemusic/commands", method: "GET")
     }
 
+    public func pollContent() async throws -> [MacMusicKitContentCommand] {
+        try await request(path: "api/bridges/applemusic/content", method: "GET")
+    }
+
     public func acknowledge(commandID: String, ok: Bool, error: String? = nil) async throws {
         try await requestEmpty(path: "api/bridges/applemusic/commands/\(commandID)", method: "POST", body: MacCommandAcknowledgement(ok: ok, error: error))
+    }
+
+    public func acknowledgeContent(_ requestID: String, result: MacMusicKitContentResult) async throws {
+        try await requestEmpty(path: "api/bridges/applemusic/content/\(requestID)", method: "POST", body: result)
     }
 
     public func revoke() async throws {
@@ -159,12 +233,15 @@ public actor MacAppleMusicBridgeClient {
 @available(macOS 14.0, *)
 public actor MacAppleMusicCompanionHost {
     private static let maxRememberedCommandOutcomes = 128
+    private static let maxRememberedContentOutcomes = 128
     public let companionID: String
     public let bridge: MacAppleMusicBridgeClient
     private var installation: AppleMusicCompanionInstallation
     private let installationStore: any AppleMusicCompanionInstallationStore
     private var commandOutcomes: [String: Bool]
     private var commandOutcomeOrder: [String] = []
+    private var contentOutcomes: [String: MacMusicKitContentResult]
+    private var contentOutcomeOrder: [String] = []
 
     public init(
         bridgeBaseURL: URL,
@@ -177,6 +254,7 @@ public actor MacAppleMusicCompanionHost {
         installation = AppleMusicCompanionInstallation(baseURL: bridgeBaseURL, companionID: companionID)
         installationStore = store
         commandOutcomes = [:]
+        contentOutcomes = [:]
     }
 
     /// Restore a paired installation from secure host storage. A host can
@@ -192,6 +270,8 @@ public actor MacAppleMusicCompanionHost {
         bridge = MacAppleMusicBridgeClient(baseURL: installation.baseURL, accessToken: installation.accessToken)
         commandOutcomes = Array(installation.commandOutcomes.prefix(Self.maxRememberedCommandOutcomes)).reduce(into: [:]) { $0[$1.key] = $1.value }
         commandOutcomeOrder = Array(commandOutcomes.keys)
+        contentOutcomes = Array(installation.contentOutcomes.prefix(Self.maxRememberedContentOutcomes)).reduce(into: [:]) { $0[$1.key] = $1.value }
+        contentOutcomeOrder = Array(contentOutcomes.keys)
     }
 
     @discardableResult
@@ -205,8 +285,11 @@ public actor MacAppleMusicCompanionHost {
         saved.bridgeID = bridgeID
         saved.accessToken = response.accessToken
         saved.commandOutcomes = [:]
+        saved.contentOutcomes = [:]
         commandOutcomes.removeAll(keepingCapacity: true)
         commandOutcomeOrder.removeAll(keepingCapacity: true)
+        contentOutcomes.removeAll(keepingCapacity: true)
+        contentOutcomeOrder.removeAll(keepingCapacity: true)
         installation = saved
         try installationStore.save(saved)
     }
@@ -234,6 +317,35 @@ public actor MacAppleMusicCompanionHost {
             }
             try await remember(command.commandID, ok: outcome)
             try await bridge.acknowledge(commandID: command.commandID, ok: outcome, error: errorDescription)
+        }
+    }
+
+    public func pollAndHandleContent(
+        _ handler: @Sendable (MacMusicKitContentCommand) async throws -> MacMusicKitContentResult
+    ) async throws {
+        for request in try await bridge.pollContent() {
+            if let priorOutcome = contentOutcomes[request.requestID] {
+                try await bridge.acknowledgeContent(request.requestID, result: priorOutcome)
+                continue
+            }
+            let result: MacMusicKitContentResult
+            do {
+                result = try await handler(request)
+            } catch {
+                result = MacMusicKitContentResult(
+                    outcome: "failed",
+                    error: MacMusicKitContentError(code: "companion_failed", message: String(error.localizedDescription.prefix(512)), retryable: true)
+                )
+            }
+            contentOutcomes[request.requestID] = result
+            contentOutcomeOrder.removeAll { $0 == request.requestID }
+            contentOutcomeOrder.append(request.requestID)
+            while contentOutcomeOrder.count > Self.maxRememberedContentOutcomes {
+                contentOutcomes.removeValue(forKey: contentOutcomeOrder.removeFirst())
+            }
+            installation.contentOutcomes = contentOutcomes
+            try installationStore.save(installation)
+            try await bridge.acknowledgeContent(request.requestID, result: result)
         }
     }
 

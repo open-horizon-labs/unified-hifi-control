@@ -11,6 +11,9 @@ import MusicKit
 public actor ApplicationMusicPlayerCompanion {
     private let player = ApplicationMusicPlayer.shared
     public let companionID: String
+    private var handles: [String: Song] = [:]
+    private var handleOrder: [String] = []
+    private static let maxHandles = 256
 
     public init(companionID: String) {
         precondition(!companionID.isEmpty && !companionID.contains(":"), "companionID must be a non-empty owner-safe identifier")
@@ -60,6 +63,84 @@ public actor ApplicationMusicPlayerCompanion {
         request.offset = max(offset, 0)
         let response = try await request.response()
         return response.items.map(MacAppleMusicItem.init)
+    }
+
+    /// Execute the owner-scoped content operations used by the approved UHC
+    /// bridge. Apple identifiers remain in this actor; only companion-local
+    /// opaque handles cross the bridge.
+    public func executeContent(_ request: MacMusicKitContentCommand) async throws -> MacMusicKitContentResult {
+        switch request.operation {
+        case "catalog_search":
+            var search = MusicCatalogSearchRequest(term: stringParam(request.params, "query") ?? "", types: [Song.self])
+            search.limit = min(max(intParam(request.params, "limit") ?? 25, 1), 50)
+            let response = try await search.response()
+            let items = response.songs.map { song in
+                MacAppleMusicBridgeItem(title: song.title, subtitle: song.artistName, uri: mintHandle(for: song))
+            }
+            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "library":
+            var library = MusicLibraryRequest<Song>()
+            library.limit = min(max(intParam(request.params, "limit") ?? 25, 1), 50)
+            library.offset = max(intParam(request.params, "offset") ?? 0, 0)
+            let response = try await library.response()
+            let items = response.items.map { song in
+                MacAppleMusicBridgeItem(title: song.title, subtitle: song.artistName, uri: mintHandle(for: song))
+            }
+            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(items))
+        case "play_uri", "queue_uri":
+            guard let uri = stringParam(request.params, "uri"), let song = handles[uri] else {
+                return MacMusicKitContentResult(outcome: "not_found", error: MacMusicKitContentError(code: "unknown_ref", message: "Apple Music handle is unknown or expired.", retryable: false))
+            }
+            if request.operation == "play_uri" { try await play(song: song) }
+            else { try await playNext(song: song) }
+            return MacMusicKitContentResult(outcome: "success", data: .object(["uri": .string(uri)]))
+        case "queue_plan":
+            guard case let .array(values)? = request.params["items"] else {
+                return invalidContentResult("items is required")
+            }
+            let references = values.compactMap { value -> String? in
+                guard case let .string(reference) = value else { return nil }
+                return reference
+            }
+            guard references.count == values.count, !references.isEmpty, references.count <= 200 else {
+                return invalidContentResult("items must contain between 1 and 200 song handles")
+            }
+            let songs = references.compactMap { handles[$0] }
+            guard songs.count == references.count else {
+                return MacMusicKitContentResult(outcome: "not_found", error: MacMusicKitContentError(code: "unknown_ref", message: "One or more song handles are unknown or expired.", retryable: false))
+            }
+            try await replaceQueue(with: songs)
+            return MacMusicKitContentResult(outcome: "success", data: .object(["queued": .number(Double(songs.count))]))
+        default:
+            return MacMusicKitContentResult(outcome: "unsupported", error: MacMusicKitContentError(code: "unsupported", message: "This operation is not enabled on the macOS companion.", retryable: false))
+        }
+    }
+
+    private func mintHandle(for song: Song) -> String {
+        let handle = "apple_mac_handle_\(UUID().uuidString.lowercased())"
+        handles[handle] = song
+        handleOrder.removeAll { $0 == handle }
+        handleOrder.append(handle)
+        while handleOrder.count > Self.maxHandles { handles.removeValue(forKey: handleOrder.removeFirst()) }
+        return handle
+    }
+
+    private func stringParam(_ params: [String: MacMusicKitJSONValue], _ key: String) -> String? {
+        guard case let .string(value) = params[key] else { return nil }
+        return value
+    }
+
+    private func intParam(_ params: [String: MacMusicKitJSONValue], _ key: String) -> Int? {
+        guard case let .number(value) = params[key] else { return nil }
+        return Int(value)
+    }
+
+    private func jsonValue<T: Encodable>(_ value: T) throws -> MacMusicKitJSONValue {
+        try JSONDecoder().decode(MacMusicKitJSONValue.self, from: JSONEncoder().encode(value))
+    }
+
+    private func invalidContentResult(_ message: String) -> MacMusicKitContentResult {
+        MacMusicKitContentResult(outcome: "invalid", error: MacMusicKitContentError(code: "invalid", message: message, retryable: false))
     }
 
     public func play(song: Song) async throws {
@@ -183,6 +264,16 @@ public struct MacAppleMusicItem: Sendable, Equatable {
         artist = song.artistName
         album = song.albumTitle ?? ""
         artworkURL = song.artwork?.url(width: 512, height: 512)
+    }
+}
+
+@available(macOS 14.0, *)
+public struct MacAppleMusicBridgeItem: Codable, Sendable, Equatable {
+    public let title: String
+    public let subtitle: String?
+    public let uri: String
+    public init(title: String, subtitle: String?, uri: String) {
+        self.title = title; self.subtitle = subtitle; self.uri = uri
     }
 }
 

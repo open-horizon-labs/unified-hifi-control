@@ -1,15 +1,15 @@
-# Apple Music macOS companion (deferred)
+# Apple Music macOS companion
 
-This macOS 14+ Swift Package is a deferred execution-owner experiment for
-UHC's `applemusic:` adapter. It must not be presented as the current Apple
-Music setup path: the v1 companion is the iOS package in
+This macOS 14+ Swift Package is a native execution owner for UHC's
+`applemusic:` adapter. It is not the default v1 setup path: the primary
+companion is the iOS package in
 `companion/apple_music_ios`, using `SystemMusicPlayer` on a physical iPhone.
 Mac support is tracked separately in #486 and needs signed-app, lifecycle, and
 physical-device validation before it can be enabled.
 
-The current implementation wraps an app-private `ApplicationMusicPlayer`
-session. That is not the same thing as controlling the user's Music.app
-session, so this package does not claim Music.app control or AirPlay control.
+The implementation wraps an app-private `ApplicationMusicPlayer` session.
+That is not the same thing as controlling the user's Music.app session, so
+this package does not claim Music.app control or AirPlay control.
 
 The Rust boundary is in `src/adapters/apple_music.rs`:
 
@@ -27,8 +27,9 @@ authorized player's metadata into the Rust `MusicKitSnapshot` shape.
 projection for its own app-private session. The projection deliberately leaves
 volume and route unknown; it does not claim Music.app or AirPlay control.
 `Bridge.swift` supplies the existing pairing, snapshot publication, command
-polling/acknowledgement, revoke, and bounded command-deduplication lifecycle
-for a signed Mac host. `InstallationStore.swift` persists the bridge bearer,
+polling/acknowledgement, owner-scoped content polling/acknowledgement,
+revoke, and bounded command/content deduplication lifecycle for a signed Mac
+host. `InstallationStore.swift` persists the bridge bearer,
 stable companion ID, bridge ID, and UHC URL in Keychain; inject
 `InMemoryAppleMusicCompanionInstallationStore` for previews/tests.
 Signed-host lifecycle, Keychain identity, and physical validation remain

@@ -15,17 +15,21 @@ public struct AppleMusicCompanionInstallation: Codable, Sendable, Equatable {
     /// Bounded command outcomes survive a host restart so at-least-once bridge
     /// redelivery does not repeat a non-idempotent transport command.
     public var commandOutcomes: [String: Bool]
+    /// Bounded content outcomes make playlist and queue requests replay-safe
+    /// when the bridge lease is redelivered after an acknowledgement failure.
+    public var contentOutcomes: [String: MacMusicKitContentResult]
 
-    public init(baseURL: URL, companionID: String, bridgeID: String? = nil, accessToken: String? = nil, commandOutcomes: [String: Bool] = [:]) {
+    public init(baseURL: URL, companionID: String, bridgeID: String? = nil, accessToken: String? = nil, commandOutcomes: [String: Bool] = [:], contentOutcomes: [String: MacMusicKitContentResult] = [:]) {
         self.baseURL = baseURL
         self.companionID = companionID
         self.bridgeID = bridgeID
         self.accessToken = accessToken
         self.commandOutcomes = commandOutcomes
+        self.contentOutcomes = contentOutcomes
     }
 
     private enum CodingKeys: String, CodingKey {
-        case baseURL, companionID, bridgeID, accessToken, commandOutcomes
+        case baseURL, companionID, bridgeID, accessToken, commandOutcomes, contentOutcomes
     }
 
     public init(from decoder: Decoder) throws {
@@ -35,6 +39,7 @@ public struct AppleMusicCompanionInstallation: Codable, Sendable, Equatable {
         bridgeID = try values.decodeIfPresent(String.self, forKey: .bridgeID)
         accessToken = try values.decodeIfPresent(String.self, forKey: .accessToken)
         commandOutcomes = try values.decodeIfPresent([String: Bool].self, forKey: .commandOutcomes) ?? [:]
+        contentOutcomes = try values.decodeIfPresent([String: MacMusicKitContentResult].self, forKey: .contentOutcomes) ?? [:]
     }
 }
 
