@@ -147,6 +147,7 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
             "confirm",
             "idempotency_key",
             "limit",
+            "offset",
             "items",
             "precondition",
             "signal",
