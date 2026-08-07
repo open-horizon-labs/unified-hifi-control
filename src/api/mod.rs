@@ -126,6 +126,23 @@ impl AdapterRegistry {
         adapter.search(query, limit).await
     }
 
+    pub async fn search_library_for_zone(
+        &self,
+        prefix: &str,
+        zone_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<LibrarySearchResult>> {
+        let adapter = self
+            .libraries
+            .read()
+            .await
+            .get(prefix)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
+        adapter.search_for_zone(zone_id, query, limit).await
+    }
+
     pub async fn play_library_uri(
         &self,
         prefix: &str,

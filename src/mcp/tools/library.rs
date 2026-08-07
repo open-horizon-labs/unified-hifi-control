@@ -247,7 +247,12 @@ pub async fn handle_search(
         LibraryRoute::AppleMusic => {
             match state
                 .adapter_registry
-                .search_library("applemusic", &args.query, SPOTIFY_SEARCH_LIMIT)
+                .search_library_for_zone(
+                    "applemusic",
+                    args.zone_id.as_deref().unwrap_or_default(),
+                    &args.query,
+                    SPOTIFY_SEARCH_LIMIT,
+                )
                 .await
             {
                 Ok(results) => {

@@ -134,6 +134,18 @@ pub struct LibrarySearchResult {
 pub trait LibraryAdapter: Send + Sync + 'static {
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<LibrarySearchResult>>;
 
+    /// Search in the context of one execution owner. Providers with
+    /// companion-scoped libraries should override this; the default preserves
+    /// the legacy provider-wide search behavior.
+    async fn search_for_zone(
+        &self,
+        _zone_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<LibrarySearchResult>> {
+        self.search(query, limit).await
+    }
+
     async fn play_uri(&self, zone_id: &str, uri: &str) -> Result<String>;
 
     /// Add one URI to a provider's playback queue when the provider exposes a

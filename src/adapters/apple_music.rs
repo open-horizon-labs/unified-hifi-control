@@ -550,6 +550,24 @@ impl LibraryAdapter for AppleMusicAdapter {
         serde_json::from_value(value).map_err(Into::into)
     }
 
+    async fn search_for_zone(
+        &self,
+        zone_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<LibrarySearchResult>> {
+        self.validate_content_zone(zone_id)?;
+        let value = self
+            .companion
+            .content_for_player(
+                zone_id.strip_prefix("applemusic:").unwrap_or_default(),
+                "catalog_search",
+                &serde_json::json!({"query": query, "limit": limit.clamp(1, 50), "zone_id": zone_id}),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
     async fn play_uri(&self, zone_id: &str, uri: &str) -> Result<String> {
         self.validate_content_zone(zone_id)?;
         let value = self
