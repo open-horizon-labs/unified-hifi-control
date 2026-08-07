@@ -519,6 +519,21 @@ public actor SystemMusicPlayerCompanion {
         return response.items.map(AppleMusicPlaylistSummary.init)
     }
 
+    /// Load ordered playlist entries, retaining position and unavailable-entry
+    /// information needed for truthful read/mutation preconditions.
+    public func playlistEntries(
+        _ playlist: Playlist,
+        limit: Int = 50,
+        offset: Int = 0
+    ) async throws -> [AppleMusicPlaylistEntrySummary] {
+        let loaded = try await playlist.with([.entries], preferredSource: .library)
+        let boundedLimit = min(max(limit, 1), 50)
+        let start = max(offset, 0)
+        guard let entries = loaded.entries else { return [] }
+        return Array(entries.dropFirst(start).prefix(boundedLimit))
+            .map(AppleMusicPlaylistEntrySummary.init)
+    }
+
     /// Read a bounded recent-song view. A mixed recent-items request can be
     /// added when the content contract needs albums/playlists/stations too.
     public func recentlyPlayedSongs(limit: Int = 25, offset: Int = 0) async throws -> [AppleMusicSearchItem] {
@@ -621,6 +636,27 @@ public struct AppleMusicPlaylistSummary: Sendable, Equatable {
     public init(playlist: Playlist) {
         id = playlist.id.rawValue
         title = playlist.name
+    }
+}
+
+@available(iOS 17.0, *)
+public struct AppleMusicPlaylistEntrySummary: Sendable, Equatable {
+    public let id: String
+    public let position: Int
+    public let title: String
+    public let artist: String
+    public let album: String
+    public let artworkURL: URL?
+    public let isPlayable: Bool
+
+    public init(entry: Playlist.Entry) {
+        id = entry.id.rawValue
+        position = entry.position
+        title = entry.title
+        artist = entry.artistName
+        album = entry.albumTitle ?? ""
+        artworkURL = entry.artwork?.url(width: 512, height: 512)
+        isPlayable = entry.item != nil
     }
 }
 
