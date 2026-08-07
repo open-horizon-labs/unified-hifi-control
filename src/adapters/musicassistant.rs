@@ -31,7 +31,7 @@ const DEFAULT_PORT: u16 = 8095;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Configuration for a Music Assistant server.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MusicAssistantConfig {
     pub host: String,
     #[serde(default = "default_port")]
@@ -53,6 +53,18 @@ fn default_port() -> u16 {
 
 fn default_tls() -> bool {
     true
+}
+
+impl Default for MusicAssistantConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: DEFAULT_PORT,
+            token: String::new(),
+            tls: true,
+            allow_insecure_http: false,
+        }
+    }
 }
 
 impl MusicAssistantConfig {
