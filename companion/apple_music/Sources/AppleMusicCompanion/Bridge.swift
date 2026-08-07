@@ -80,18 +80,21 @@ public struct MacClaimResponse: Codable, Sendable {
     enum CodingKeys: String, CodingKey { case bridgeID = "bridge_id", accessToken = "access_token" }
 }
 
-/// Authenticated client for the existing Apple transport bridge. The bearer
-/// remains process-local; a signed embedding app should persist it in Keychain.
+/// Authenticated client for the existing Apple transport bridge. A signed host
+/// may restore a paired bearer from its Keychain.
 @available(macOS 14.0, *)
 public actor MacAppleMusicBridgeClient {
     private let baseURL: URL
     private let session: URLSession
     private var accessToken: String?
 
-    public init(baseURL: URL, session: URLSession = .shared) {
+    public init(baseURL: URL, accessToken: String? = nil, session: URLSession = .shared) {
         self.baseURL = baseURL
         self.session = session
+        self.accessToken = accessToken
     }
+
+    public func currentAccessToken() -> String? { accessToken }
 
     public func pair(bridgeID: String) async throws -> MacPairingResponse {
         try await request(path: "api/bridges/applemusic/pair", method: "POST", body: ["bridge_id": bridgeID])
@@ -158,6 +161,8 @@ public actor MacAppleMusicCompanionHost {
     private static let maxRememberedCommandOutcomes = 128
     public let companionID: String
     public let bridge: MacAppleMusicBridgeClient
+    private let installation: AppleMusicCompanionInstallation
+    private let installationStore: any AppleMusicCompanionInstallationStore
     private var commandOutcomes: [String: Bool] = [:]
     private var commandOutcomeOrder: [String] = []
 
@@ -165,6 +170,21 @@ public actor MacAppleMusicCompanionHost {
         precondition(!companionID.isEmpty && !companionID.contains(":"), "companionID must be owner-safe")
         self.companionID = companionID
         bridge = MacAppleMusicBridgeClient(baseURL: bridgeBaseURL)
+        installation = AppleMusicCompanionInstallation(baseURL: bridgeBaseURL, companionID: companionID)
+        installationStore = InMemoryAppleMusicCompanionInstallationStore()
+    }
+
+    /// Restore a paired installation from secure host storage. A host can
+    /// inject the in-memory implementation in previews/tests.
+    public init(
+        installation: AppleMusicCompanionInstallation,
+        store: any AppleMusicCompanionInstallationStore = KeychainAppleMusicCompanionInstallationStore()
+    ) {
+        precondition(!installation.companionID.isEmpty && !installation.companionID.contains(":"), "companionID must be owner-safe")
+        self.companionID = installation.companionID
+        self.installation = installation
+        self.installationStore = store
+        bridge = MacAppleMusicBridgeClient(baseURL: installation.baseURL, accessToken: installation.accessToken)
     }
 
     @discardableResult
@@ -173,7 +193,11 @@ public actor MacAppleMusicCompanionHost {
     }
 
     public func claim(bridgeID: String, pairingCode: String) async throws {
-        _ = try await bridge.claim(bridgeID: bridgeID, pairingCode: pairingCode)
+        let response = try await bridge.claim(bridgeID: bridgeID, pairingCode: pairingCode)
+        var saved = installation
+        saved.bridgeID = bridgeID
+        saved.accessToken = response.accessToken
+        try installationStore.save(saved)
     }
 
     public func publishCurrentSnapshot(from player: ApplicationMusicPlayerCompanion) async throws {
@@ -208,7 +232,10 @@ public actor MacAppleMusicCompanionHost {
         }
     }
 
-    public func revoke() async throws { try await bridge.revoke() }
+    public func revoke() async throws {
+        try await bridge.revoke()
+        try installationStore.clear()
+    }
 }
 
 @available(macOS 14.0, *)

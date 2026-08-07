@@ -17,7 +17,9 @@ The host flow is:
 5. Stop polling when suspended; UHC should report the companion stale rather
    than implying an always-on iPhone service.
 
-The scaffold does not yet implement Keychain persistence or a polished QR
-onboarding flow. This repository currently has command-line tools only, so
-host validation here is syntax-only. Build, signing, Keychain persistence, and
-the MusicKit observation matrix require Xcode and a physical iPhone (#465).
+The package provides `KeychainAppleMusicCompanionInstallationStore` for the
+stable companion identity, UHC URL, bridge ID, and paired bridge bearer. The
+host app still owns signing, entitlements, and any polished QR onboarding
+flow. This repository currently has command-line tools only, so host
+validation here is syntax-only. Keychain behavior, signing, and the MusicKit
+observation matrix require Xcode and a physical iPhone (#465).

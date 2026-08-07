@@ -28,8 +28,9 @@ projection for its own app-private session. The projection deliberately leaves
 volume and route unknown; it does not claim Music.app or AirPlay control.
 `Bridge.swift` supplies the existing pairing, snapshot publication, command
 polling/acknowledgement, revoke, and bounded command-deduplication lifecycle
-for a signed Mac host. Its bearer is process-local until the embedding app
-adds Keychain persistence.
+for a signed Mac host. `InstallationStore.swift` persists the bridge bearer,
+stable companion ID, bridge ID, and UHC URL in Keychain; inject
+`InMemoryAppleMusicCompanionInstallationStore` for previews/tests.
 Signed-host lifecycle, Keychain identity, and physical validation remain
 required by #486/#487. Linux, QNAP, and other non-macOS builds do not compile
 this package.

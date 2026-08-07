@@ -125,18 +125,20 @@ public enum MusicKitWireCommand: Codable, Sendable, Equatable {
 }
 
 /// Minimal authenticated client for the already-approved UHC bridge routes.
-/// It stores the bearer only in this process; callers should place it in the
-/// host app's Keychain if they need to survive app restarts.
+/// A signed host may restore a paired bearer from its Keychain.
 @available(iOS 17.0, *)
 public actor AppleMusicBridgeClient {
     private let baseURL: URL
     private let session: URLSession
     private var accessToken: String?
 
-    public init(baseURL: URL, session: URLSession = .shared) {
+    public init(baseURL: URL, accessToken: String? = nil, session: URLSession = .shared) {
         self.baseURL = baseURL
         self.session = session
+        self.accessToken = accessToken
     }
+
+    public func currentAccessToken() -> String? { accessToken }
 
     public func pair(bridgeID: String) async throws -> PairingResponse {
         try await request(
@@ -242,6 +244,8 @@ public actor AppleMusicCompanionHost {
     public let bridge: AppleMusicBridgeClient
 
     public let companionID: String
+    private let installation: AppleMusicCompanionInstallation
+    private let installationStore: any AppleMusicCompanionInstallationStore
     /// Outcomes remembered for the lifetime of this host process. The bridge
     /// is at-least-once, so this prevents a lease redelivery from driving a
     /// non-idempotent command twice after an acknowledgement race. A process
@@ -254,6 +258,22 @@ public actor AppleMusicCompanionHost {
         precondition(!companionID.isEmpty && !companionID.contains(":"), "companionID must be a non-empty owner-safe identifier")
         self.companionID = companionID
         bridge = AppleMusicBridgeClient(baseURL: bridgeBaseURL)
+        installation = AppleMusicCompanionInstallation(baseURL: bridgeBaseURL, companionID: companionID)
+        installationStore = InMemoryAppleMusicCompanionInstallationStore()
+    }
+
+    /// Restore a paired installation from secure host storage. The default
+    /// store is Keychain-backed; callers can inject an in-memory store for
+    /// previews/tests.
+    public init(
+        installation: AppleMusicCompanionInstallation,
+        store: any AppleMusicCompanionInstallationStore = KeychainAppleMusicCompanionInstallationStore()
+    ) {
+        precondition(!installation.companionID.isEmpty && !installation.companionID.contains(":"), "companionID must be a non-empty owner-safe identifier")
+        self.companionID = installation.companionID
+        self.installation = installation
+        self.installationStore = store
+        bridge = AppleMusicBridgeClient(baseURL: installation.baseURL, accessToken: installation.accessToken)
     }
 
     @discardableResult
@@ -265,7 +285,12 @@ public actor AppleMusicCompanionHost {
 
     @discardableResult
     public func claim(bridgeID: String, pairingCode: String) async throws -> ClaimResponse {
-        try await bridge.claim(bridgeID: bridgeID, pairingCode: pairingCode)
+        let response = try await bridge.claim(bridgeID: bridgeID, pairingCode: pairingCode)
+        var saved = installation
+        saved.bridgeID = bridgeID
+        saved.accessToken = response.accessToken
+        try installationStore.save(saved)
+        return response
     }
 
     public func publish(snapshot: MusicKitSnapshotPayload) async throws {
@@ -318,7 +343,10 @@ public actor AppleMusicCompanionHost {
         }
     }
 
-    public func revoke() async throws { try await bridge.revoke() }
+    public func revoke() async throws {
+        try await bridge.revoke()
+        try installationStore.clear()
+    }
 }
 
 public enum CompanionHostError: Error, LocalizedError, Sendable {

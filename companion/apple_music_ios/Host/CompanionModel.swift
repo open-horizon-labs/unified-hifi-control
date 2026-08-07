@@ -15,8 +15,17 @@ final class CompanionModel: ObservableObject {
     private let player = SystemMusicPlayerCompanion()
     private var pollTask: Task<Void, Never>?
 
-    init(baseURL: URL, companionID: String) {
-        host = AppleMusicCompanionHost(bridgeBaseURL: baseURL, companionID: companionID)
+    init(
+        baseURL: URL,
+        companionID: String,
+        installationStore: any AppleMusicCompanionInstallationStore = KeychainAppleMusicCompanionInstallationStore()
+    ) {
+        let installation = installationStore.load()
+            ?? AppleMusicCompanionInstallation(baseURL: baseURL, companionID: companionID)
+        host = AppleMusicCompanionHost(installation: installation, store: installationStore)
+        bridgeID = installation.bridgeID ?? ""
+        isPaired = installation.accessToken != nil
+        status = isPaired ? "Paired; waiting for snapshots" : "Not authorized"
     }
 
     func authorize() {

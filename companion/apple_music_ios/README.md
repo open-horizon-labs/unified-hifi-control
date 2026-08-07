@@ -24,8 +24,10 @@ generic playlist deletion/reorder/removal; those operations need a separate
 approved content contract and ownership/conflict checks (#484).
 
 The host app owns authorization, lifecycle, snapshot publication, and the
-bridge transport. Apple credentials and tokens stay in the app's secure
-storage; UHC receives only the explicitly paired snapshot/command contract.
+bridge transport. `KeychainAppleMusicCompanionInstallationStore` persists the
+stable installation identity and paired bridge bearer; Apple credentials and
+tokens stay in the app's secure storage. UHC receives only the explicitly
+paired snapshot/command contract.
 UHC never receives or relays audio.
 
 `AppleMusicCompanionHost` provides the host lifecycle: request authorization,
