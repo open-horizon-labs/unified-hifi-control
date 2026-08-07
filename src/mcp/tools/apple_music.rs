@@ -15,7 +15,7 @@ use serde_json::json;
 
 #[mcp_tool(
     name = "hifi_apple_music",
-    description = "Apple Music catalog, library, playlist, and feedback access through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback."
+    description = "Apple Music catalog, library, playlist, feedback, and bounded adaptation context through a paired native companion. Actions include catalog_search, library, playlists, playlist_tracks, recent, recommendations, favorites, queue_plan, context, playlist_create, playlist_update, playlist_add, playlist_remove, favorite_add/remove, and feedback. Feedback accepts explicit user signals only; skips and manual changes are not inferred as dislike. Apple authorization stays on the companion; operations are limited to documented MusicKit capabilities and may be refused when the companion or account cannot perform them. Use hifi_search/hifi_play for exact content selection and playback."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiAppleMusicTool {
