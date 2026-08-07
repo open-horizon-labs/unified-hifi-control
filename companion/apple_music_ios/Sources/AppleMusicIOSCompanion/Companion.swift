@@ -230,6 +230,70 @@ public actor AppleMusicBridgeClient {
     }
 }
 
+/// Host-app lifecycle coordinator for the signed iPhone companion.
+///
+/// Snapshot projection remains an injected closure because the exact
+/// SystemMusicPlayer observation surface is an acceptance question for #465.
+/// This coordinator still makes authorization, claim, publication, command
+/// execution, acknowledgement, and revoke consistent for a real host app.
+@available(iOS 17.0, *)
+public actor AppleMusicCompanionHost {
+    public let bridge: AppleMusicBridgeClient
+
+    public init(bridgeBaseURL: URL) {
+        bridge = AppleMusicBridgeClient(baseURL: bridgeBaseURL)
+    }
+
+    @discardableResult
+    public func authorize() async throws -> MusicAuthorization.Status {
+        let status = await AppleMusicAuthorization.request()
+        guard status == .authorized else { throw CompanionHostError.authorizationDenied(status) }
+        return status
+    }
+
+    @discardableResult
+    public func claim(bridgeID: String, pairingCode: String) async throws -> ClaimResponse {
+        try await bridge.claim(bridgeID: bridgeID, pairingCode: pairingCode)
+    }
+
+    public func publish(snapshot: MusicKitSnapshotPayload) async throws {
+        try await bridge.publish(snapshot: snapshot)
+    }
+
+    /// Poll once and execute each command exactly once from the host's point
+    /// of view. The server's acknowledgement removes the command from its
+    /// delivery queue; a rejected command is still acknowledged with `ok=false`.
+    public func pollAndHandle(
+        _ handler: @Sendable (MusicKitWireCommand) async throws -> Void
+    ) async throws {
+        for command in try await bridge.pollCommands() {
+            do {
+                try await handler(command.command)
+                try await bridge.acknowledge(commandID: command.commandID, ok: true)
+            } catch {
+                try await bridge.acknowledge(
+                    commandID: command.commandID,
+                    ok: false,
+                    error: String(describing: error)
+                )
+            }
+        }
+    }
+
+    public func revoke() async throws { try await bridge.revoke() }
+}
+
+public enum CompanionHostError: Error, LocalizedError, Sendable {
+    case authorizationDenied(MusicAuthorization.Status)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .authorizationDenied(status):
+            "Apple Music authorization is not available (status: \(status))."
+        }
+    }
+}
+
 public struct CommandAcknowledgement: Codable, Sendable {
     public let ok: Bool
     public let error: String?
