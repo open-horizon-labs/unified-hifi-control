@@ -35,6 +35,17 @@ public actor ApplicationMusicPlayerCompanion {
         try await player.skipToPreviousEntry()
     }
 
+    public func execute(_ command: MacMusicKitCommand) async throws {
+        switch command {
+        case .play: try await play()
+        case .pause: pause()
+        case .next: try await skipToNextItem()
+        case .previous: try await skipToPreviousItem()
+        case .toggle, .stop, .setVolume, .adjustVolume, .setMute:
+            throw CompanionError.commandNotValidated
+        }
+    }
+
     /// Catalog and library access remains inside the signed host app. These
     /// methods mirror the iPhone companion's documented MusicKit primitives;
     /// the macOS session is still app-private until #486 validates it.
@@ -115,13 +126,17 @@ public actor ApplicationMusicPlayerCompanion {
 }
 
 @available(macOS 14.0, *)
-public struct MacMusicKitSnapshot: Sendable, Equatable {
+public struct MacMusicKitSnapshot: Codable, Sendable, Equatable {
     public let playerID: String
     public let displayName: String
     public let state: String
     public let track: MacMusicKitTrack?
     public let volume: Float?
     public let isMuted: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case playerID = "player_id", displayName = "display_name", state, track, volume, isMuted = "is_muted"
+    }
 
     public init(playerID: String, displayName: String, state: String, track: MacMusicKitTrack? = nil, volume: Float? = nil, isMuted: Bool = false) {
         self.playerID = playerID
@@ -134,13 +149,17 @@ public struct MacMusicKitSnapshot: Sendable, Equatable {
 }
 
 @available(macOS 14.0, *)
-public struct MacMusicKitTrack: Sendable, Equatable {
+public struct MacMusicKitTrack: Codable, Sendable, Equatable {
     public let title: String
     public let artist: String
     public let album: String
     public let artworkURL: String?
     public let positionSeconds: Double?
     public let durationSeconds: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case title, artist, album, artworkURL = "artwork_url", positionSeconds = "position_seconds", durationSeconds = "duration_seconds"
+    }
 
     public init(title: String, artist: String, album: String, artworkURL: String? = nil, positionSeconds: Double? = nil, durationSeconds: Double? = nil) {
         self.title = title
@@ -171,11 +190,14 @@ public struct MacAppleMusicItem: Sendable, Equatable {
 
 public enum CompanionError: Error, LocalizedError {
     case hostIntegrationRequired
+    case commandNotValidated
 
     public var errorDescription: String? {
         switch self {
         case .hostIntegrationRequired:
             "The embedding macOS app must provide MusicKit authorization and state projection."
+        case .commandNotValidated:
+            "This Apple Music command is not validated for the macOS companion."
         }
     }
 }
