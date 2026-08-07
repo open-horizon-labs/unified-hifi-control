@@ -113,6 +113,16 @@ async fn companion_snapshot_maps_to_an_applemusic_zone() {
         .expect("adapter must stop cleanly");
 }
 
+#[test]
+fn transient_companion_states_use_the_shared_unknown_state() {
+    let mut snapshot = snapshot();
+    snapshot.state = MusicKitPlaybackState::Unknown;
+
+    let zone = AppleMusicAdapter::zone_from_snapshot(&snapshot)
+        .expect("unknown is a valid transient companion state");
+    assert_eq!(zone.state, PlaybackState::Unknown);
+}
+
 #[tokio::test]
 async fn companion_snapshot_flows_through_aggregator_and_flushes_on_stop() {
     let bus = create_bus();

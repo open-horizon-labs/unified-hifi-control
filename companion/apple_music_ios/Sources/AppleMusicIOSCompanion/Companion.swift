@@ -519,7 +519,10 @@ public actor SystemMusicPlayerCompanion {
         case .paused: "paused"
         case .stopped: "stopped"
         case .interrupted: "interrupted"
-        case .seekingForward, .seekingBackward: "seeking"
+        // UHC's shared wire enum intentionally has no transient seeking
+        // state. Keep the snapshot decodable and truthful while the player
+        // settles instead of emitting an undocumented value.
+        case .seekingForward, .seekingBackward: "unknown"
         @unknown default: "unknown"
         }
     }
