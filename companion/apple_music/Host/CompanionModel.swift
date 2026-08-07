@@ -29,6 +29,9 @@ final class CompanionModel: ObservableObject {
         bridgeID = installation.bridgeID ?? ""
         isPaired = installation.accessToken != nil
         status = isPaired ? "Paired; waiting for snapshots" : "Not authorized"
+        if isPaired {
+            startPolling()
+        }
     }
 
     func authorize() {
