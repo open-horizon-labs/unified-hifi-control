@@ -468,7 +468,7 @@ async fn an_unknown_prefix_is_refused_but_a_legacy_unprefixed_id_still_means_roo
     let rig = Rig::new().await;
 
     let (status, body) = rig
-        .post_control(json!({"zone_id":"spotify:abc","action":"play"}))
+        .post_control(json!({"zone_id":"unknown:abc","action":"play"}))
         .await;
     assert_eq!(
         status,

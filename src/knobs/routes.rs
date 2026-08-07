@@ -28,7 +28,7 @@ use crate::bus::runtime::{
     CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
     HqpRuntimeCommand, RuntimeCommand,
 };
-use crate::bus::PrefixedZoneId;
+use crate::bus::{Command, PrefixedZoneId};
 use crate::bus::VolumeControl;
 use crate::knobs::image::placeholder_svg;
 use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
@@ -168,7 +168,7 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
                 adapters.openhome
             } else if z.zone_id.starts_with("upnp:") {
                 adapters.upnp
-            } else if z.zone_id.starts_with("hqp:") {
+            } else if z.zone_id.starts_with("hqplayer:") {
                 adapters.hqplayer
             } else {
                 true // Unknown prefix, include by default
@@ -548,8 +548,29 @@ pub async fn knob_control_handler(
         // UPnP zone control
         let udn = req.zone_id.trim_start_matches("upnp:");
         return control_upnp(&state, udn, &req.action).await;
+    } else if req.zone_id.starts_with("hqplayer:") {
+        let instance = req.zone_id.trim_start_matches("hqplayer:");
+        return control_hqplayer(
+            &state,
+            &req.zone_id,
+            instance,
+            &req.action,
+            req.value.as_ref(),
+        )
+        .await;
     } else if req.zone_id.starts_with("spotify:") {
         return control_spotify(&state, &req.zone_id, &req.action, req.value.as_ref()).await;
+    }
+
+    if !req.zone_id.starts_with("roon:") && req.zone_id.contains(':') {
+        let prefix = req.zone_id.split(':').next().unwrap_or_default();
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Unsupported zone source: {prefix}"),
+                "error_code": "UNSUPPORTED_ZONE_SOURCE",
+            })),
+        ));
     }
 
     // Roon zone (or legacy zone_id without prefix)
@@ -576,6 +597,39 @@ impl HqpDispatchError {
             Self::BadRequest { message, .. } => message,
         }
     }
+}
+
+/// Resolve a direct HQPlayer instance against the aggregator's published zone and dispatch one
+/// serialized command through the reliable provider runtime.  The aggregator is deliberately the
+/// only state source consulted by this surface: capabilities and liveness must not drift from what
+/// clients were shown by the zones endpoint.
+pub(crate) async fn dispatch_hqplayer_action(
+    state: &AppState,
+    zone_id: &str,
+    instance: &str,
+    action: &str,
+    value: Option<f64>,
+) -> Result<(), HqpDispatchError> {
+    let Some(zone) = state.aggregator.get_zone(zone_id).await else {
+        let target = PrefixedZoneId::hqplayer(instance);
+        let message = match &state.reliable_commands {
+            Some(gateway) if gateway.has_endpoint(&target) => {
+                format!("zone {zone_id} is not currently published")
+            }
+            _ => format!("HQPlayer instance '{instance}' is not configured"),
+        };
+        return Err(HqpDispatchError::NotFound(message));
+    };
+
+    let command = hqp_command_from_published_zone(&zone, action, value)?;
+    dispatch_hqplayer_runtime_command(
+        state,
+        instance,
+        RuntimeCommand::Control(command),
+        CommandLane::Interactive,
+        std::time::Duration::from_secs(10),
+    )
+    .await
 }
 
 /// Submit HQPlayer reconfiguration through the reliable provider runtime.
@@ -683,6 +737,114 @@ async fn dispatch_hqplayer_runtime_command(
     }
 }
 
+fn hqp_command_from_published_zone(
+    zone: &crate::bus::Zone,
+    action: &str,
+    value: Option<f64>,
+) -> Result<Command, HqpDispatchError> {
+    match action {
+        "play" => Ok(Command::Play),
+        "pause" => Ok(Command::Pause),
+        "stop" => Ok(Command::Stop),
+        "next" if zone.is_next_allowed => Ok(Command::Next),
+        "previous" | "prev" if zone.is_previous_allowed => Ok(Command::Previous),
+        "next" | "previous" | "prev" => Err(HqpDispatchError::BadRequest {
+            message: format!("{action} is not available in the zone's current state"),
+            code: "ACTION_NOT_ALLOWED",
+        }),
+        "play_pause" | "playpause" => Ok(Command::PlayPause),
+        "seek" => {
+            if !zone.is_seekable {
+                return Err(HqpDispatchError::BadRequest {
+                    message: "this zone is not seekable in its current state".to_string(),
+                    code: "ACTION_NOT_ALLOWED",
+                });
+            }
+            let Some(position) = value else {
+                return Err(HqpDispatchError::BadRequest {
+                    message: "seek requires a numeric position in seconds".to_string(),
+                    code: "INVALID_VALUE",
+                });
+            };
+            if !position.is_finite() || position < 0.0 {
+                return Err(HqpDispatchError::BadRequest {
+                    message: "seek position must be a non-negative number of seconds".to_string(),
+                    code: "INVALID_VALUE",
+                });
+            }
+            let ceiling = zone
+                .now_playing
+                .as_ref()
+                .and_then(|np| np.duration)
+                .filter(|duration| *duration > 0.0);
+            Ok(Command::Seek {
+                position: ceiling.map_or(position, |duration| position.min(duration)),
+            })
+        }
+        "vol_up" | "volume_up" | "vol_down" | "volume_down" => {
+            let vc = require_volume_control(Some(zone))?;
+            let step = value
+                .map(f64::abs)
+                .filter(|step| step.is_finite() && *step > 0.0)
+                .unwrap_or(f64::from(vc.step));
+            let delta = if action.contains("down") { -step } else { step };
+            Ok(Command::VolumeRelative {
+                delta: quantise_db(delta) as f32,
+                output_id: None,
+            })
+        }
+        "vol_abs" | "volume" => {
+            let vc = require_volume_control(Some(zone))?;
+            let Some(value) = value.filter(|value| value.is_finite()) else {
+                return Err(HqpDispatchError::BadRequest {
+                    message: "an absolute volume requires a finite numeric level in dB".to_string(),
+                    code: "INVALID_VALUE",
+                });
+            };
+            Ok(Command::VolumeAbsolute {
+                value: quantise_db(value.clamp(f64::from(vc.min), f64::from(vc.max))) as f32,
+                output_id: None,
+            })
+        }
+        "mute" => {
+            require_volume_control(Some(zone))?;
+            Ok(Command::Mute {
+                muted: true,
+                output_id: None,
+            })
+        }
+        _ => Err(HqpDispatchError::BadRequest {
+            message: format!("Unknown action: {action}"),
+            code: "UNKNOWN_ACTION",
+        }),
+    }
+}
+
+async fn control_hqplayer(
+    state: &AppState,
+    zone_id: &str,
+    instance: &str,
+    action: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let value = value.and_then(|v| v.as_f64());
+    match dispatch_hqplayer_action(state, zone_id, instance, action, value).await {
+        Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
+        Err(HqpDispatchError::NotFound(message)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": message, "error_code": "ZONE_NOT_FOUND"})),
+        )),
+        Err(HqpDispatchError::BadRequest { message, code }) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": message, "error_code": code})),
+        )),
+        Err(HqpDispatchError::Backend(message)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": message})),
+        )),
+    }
+}
+
 /// Control a Spotify Connect device through the provider adapter registry.
 async fn control_spotify(
     state: &AppState,
@@ -731,6 +893,28 @@ async fn control_spotify(
             Json(serde_json::json!({"error": error.to_string()})),
         )),
     }
+}
+
+fn quantise_db(db: f64) -> f64 {
+    (db * 100.0).round() / 100.0
+}
+
+fn require_volume_control(
+    zone: Option<&crate::bus::Zone>,
+) -> Result<crate::bus::VolumeControl, HqpDispatchError> {
+    let refuse = |message: &str| HqpDispatchError::BadRequest {
+        message: message.to_string(),
+        code: "VOLUME_NOT_AVAILABLE",
+    };
+    let control = zone
+        .and_then(|z| z.volume_control.clone())
+        .ok_or_else(|| refuse("this zone has no volume control"))?;
+    if !(control.min.is_finite() && control.max.is_finite() && control.min < control.max) {
+        return Err(refuse(
+            "this zone's published volume range cannot bound a level",
+        ));
+    }
+    Ok(control)
 }
 
 /// Control Roon zone
