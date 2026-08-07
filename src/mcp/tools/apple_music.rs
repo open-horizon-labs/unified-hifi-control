@@ -341,19 +341,35 @@ pub async fn handle_apple_music(
         let env = Envelope::write("hifi_apple_music", "queue_plan")
             .param("action", "queue_plan")
             .param("zone_id", zone_id);
-        return match state
+        // The plan is UHC-owned intent, distinct from the provider's native
+        // queue. Persist it first so a companion refusal cannot erase the
+        // model/user's requested listening plan. The response reports the two
+        // outcomes separately and never claims that the provider accepted it.
+        let plan = match state.listening_plans.replace(zone_id, plan_items).await {
+            Ok(plan) => plan,
+            Err(error) => {
+                return env.failed(format!(
+                    "Apple Music listening plan could not be persisted: {error}"
+                ));
+            }
+        };
+        match state
             .adapter_registry
             .library_content("applemusic", "queue_plan", &params)
             .await
         {
-            Ok(value) => match state.listening_plans.replace(zone_id, plan_items).await {
-                Ok(plan) => Ok(env.json_result(&json!({"plan": plan, "companion": value}))),
-                Err(error) => env.failed(format!(
-                    "Apple Music listening plan could not be persisted: {error}"
-                )),
-            },
-            Err(e) => env.failed(format!("Apple Music queue plan failed: {}", e)),
-        };
+            Ok(value) => return Ok(env.json_result(&json!({
+                "plan": plan,
+                "provider": {"outcome": "accepted", "result": value}
+            }))),
+            Err(error) => return Ok(env.json_result(&json!({
+                "plan": plan,
+                "provider": {
+                    "outcome": "refused",
+                    "detail": error.to_string()
+                }
+            }))),
+        }
     }
 
     let params = json!({
