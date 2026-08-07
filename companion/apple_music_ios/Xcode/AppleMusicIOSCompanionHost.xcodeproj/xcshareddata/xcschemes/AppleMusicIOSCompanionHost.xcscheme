@@ -30,9 +30,6 @@
       shouldUseLaunchSchemeArgsEnv = "YES">
       <TestPlans>
          <TestPlanReference
-            reference = "container:AppleMusicIOSCompanionHost.xctestplan">
-         </TestPlanReference>
-         <TestPlanReference
             reference = "container:AppleMusicIOSCompanionHost/AppleMusicIOSCompanionHost.xctestplan"
             default = "YES">
          </TestPlanReference>
