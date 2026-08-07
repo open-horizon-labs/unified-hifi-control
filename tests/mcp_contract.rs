@@ -208,7 +208,8 @@ async fn build_state_with_bus(
     let roon = Arc::new(RoonAdapter::new_disconnected(bus.clone()));
     let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
     let hqp_instances = Arc::new(HqpInstanceManager::new_with_native_sink(
-        bus.clone(), aggregator.clone(),
+        bus.clone(),
+        aggregator.clone(),
     ));
     let hqplayer = hqp_instances.get_default().await;
     let hqp_zone_links = Arc::new(HqpZoneLinkService::new(hqp_instances.clone()));
@@ -1526,8 +1527,8 @@ async fn transport_routing_reaches_each_adapter_and_refuses_the_rest() {
         ("sonos:abc", "names no adapter", "unknown prefix -> refused"),
         (
             "hqplayer:desktop",
-            "hqplayer zones are not controllable from MCP yet",
-            "hqplayer: -> named, tracked by #328",
+            "HQPlayer instance 'desktop' is not configured",
+            "hqplayer: -> dispatched through the managed instance runtime",
         ),
     ];
 
@@ -1582,11 +1583,14 @@ async fn volume_routing_differs_from_transport_routing() {
     }
 
     // What volume refuses is now exactly what transport refuses: ids UHC cannot
-    // place, plus the one recognised provider with nothing wired.
+    // place. HQPlayer is dispatched through its instance runtime as well.
     for (zone_id, expected_fragment) in [
         ("1601a5d4bare", "has no provider prefix"),
         ("sonos:abc", "names no adapter"),
-        ("hqplayer:desktop", "not controllable from MCP yet"),
+        (
+            "hqplayer:desktop",
+            "HQPlayer instance 'desktop' is not configured",
+        ),
     ] {
         let text = result_text(
             &app.call_tool(
@@ -1602,7 +1606,8 @@ async fn volume_routing_differs_from_transport_routing() {
     }
 }
 
-/// Search and play route on `roon:` and `lms:`. Everything else is refused.
+/// Search and play route on `roon:` and `lms:`. Everything else is refused;
+/// HQPlayer remains content-unwired even though its transport route is live.
 ///
 /// **Behavior change (#398).** `openhome:`, `upnp:`, `hqplayer:` and unplaceable
 /// ids all reached Roon's library before — searching a library those zones cannot
@@ -2699,9 +2704,8 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
         || json!({ "setting": "samplerate", "value": "not-a-number" }),
     ),
     // Added by #398, so its expected text is in TEXT_ADDITIONS rather than in the
-    // pre-envelope fixture. It is the only case producing a `not_implemented`
-    // refusal now that OpenHome/UPnP volume is wired, so
-    // `every_refusal_reason_is_actually_produced` depends on it.
+    // pre-envelope fixture. This exercises the direct HQPlayer route when the
+    // requested instance is not configured.
     (
         "hifi_control/hqplayer_zone_not_wired",
         "hifi_control",
@@ -2717,11 +2721,7 @@ const TOOL_TEXT_CASES: &[(&str, &str, fn() -> Value)] = &[
 /// returns is therefore accounted for in exactly one of the three places.
 const TEXT_ADDITIONS: &[(&str, &str)] = &[(
     "hifi_control/hqplayer_zone_not_wired",
-    "Error: hqplayer zones are not controllable from MCP yet: HqpAdapter implements play, \
-     pause, stop, next, previous, seek, set_volume and volume_up/down \
-     (src/adapters/hqplayer.rs), and HqpAdapter publishes hqplayer: zones that hifi_zones \
-     lists -- but MCP's routing has no HQPlayer arm, so hifi_control cannot reach them. \
-     hifi_capabilities reports what each provider supports.",
+    "Error: HQPlayer instance 'desktop' is not configured",
 )];
 
 /// Every string #398 changes, with the value it replaces.
@@ -3064,12 +3064,12 @@ const EXPECTED_ENVELOPES: &[(&str, &str, Option<&str>)] = &[
         "invalid",
         Some("invalid_parameter"),
     ),
-    // The only `not_implemented` left once OpenHome/UPnP volume is wired: a zone
-    // type hifi_zones advertises that hifi_control cannot reach.
+    // HQPlayer transport is routed through the instance runtime; this fixture
+    // deliberately uses an unconfigured instance, so it reports backend_error.
     (
         "hifi_control/hqplayer_zone_not_wired",
-        "unsupported",
-        Some("not_implemented"),
+        "error",
+        Some("backend_error"),
     ),
 ];
 
@@ -3229,7 +3229,6 @@ async fn every_refusal_reason_is_actually_produced() {
 
     for reason in [
         "provider_limitation",
-        "not_implemented",
         "invalid_parameter",
         "unknown_target",
         "backend_error",
@@ -4728,11 +4727,11 @@ async fn an_unrecognised_zone_prefix_is_refused_instead_of_routed_to_roon() {
     }
 }
 
-/// HQPlayer zones are listed by `hifi_zones` and were being forwarded to Roon.
-/// They are now recognised, and reported as a UHC gap with a tracking issue.
+/// HQPlayer zones are listed by `hifi_zones` and dispatched through the managed
+/// instance runtime rather than being forwarded to Roon.
 #[tokio::test]
 #[serial_test::serial(uhc_config_dir)]
-async fn hqplayer_zones_are_recognised_and_reported_as_not_wired() {
+async fn hqplayer_zones_are_recognised_and_report_missing_configuration() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let app = TestApp::new().await;
 
@@ -4750,23 +4749,18 @@ async fn hqplayer_zones_are_recognised_and_reported_as_not_wired() {
         let env = envelope(&result, "hifi_control");
         assert_eq!(
             env.get("outcome").and_then(Value::as_str),
-            Some("unsupported"),
-            "the zone id is valid and the operation is not wired: {env}"
+            Some("error"),
+            "the zone id is valid and the missing instance is a backend error: {env}"
         );
         assert_eq!(
             env.pointer("/refusal/reason").and_then(Value::as_str),
-            Some("not_implemented"),
-            "HQPlayer's adapter has play/pause/next/volume, so this is UHC's gap: {env}"
-        );
-        assert_eq!(
-            env.pointer("/refusal/tracked_by").and_then(Value::as_str),
-            Some("#328"),
-            "the gap must name the issue that closes it: {env}"
+            Some("backend_error"),
+            "the instance manager owns this configuration failure: {env}"
         );
         assert_eq!(
             env.pointer("/scope/provider").and_then(Value::as_str),
             Some("hqplayer"),
-            "the prefix identifies the provider even though nothing is wired: {env}"
+            "the prefix identifies the provider: {env}"
         );
     }
 }

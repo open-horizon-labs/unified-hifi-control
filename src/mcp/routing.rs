@@ -36,11 +36,10 @@
 //! it should reach has the whole surface (`play`, `pause`, `next`, `previous`,
 //! `set_volume`, `volume_up`/`down`, `seek`).
 //!
-//! #398 recognises the prefix and reports the gap honestly ([`HqPlayer`] routes
-//! to `Refused`, and the tools classify it as `not_implemented` tracked by #328).
-//! It does **not** wire it: the zone id is `hqplayer:<instance_name>`, so routing
-//! needs `HqpInstanceManager` resolution and there is no HQPlayer zone in any test
-//! fixture.
+//! HQPlayer zones now route through the managed `HqpInstanceManager` runtime. The
+//! instance name is taken from `hqplayer:<instance_name>`; an absent configuration
+//! is reported as a backend error by the control tool, while content operations
+//! remain separately tracked in #209.
 //!
 //! [`HqPlayer`]: ZoneTarget::HqPlayer
 //!
@@ -316,7 +315,7 @@ impl ZoneTarget {
             Self::AppleMusic => TransportRoute::AppleMusic,
             Self::Spotify => TransportRoute::Spotify,
             Self::MusicAssistant => TransportRoute::MusicAssistant,
-            // Recognised, and genuinely not wired. #328.
+            // Recognised and dispatched through the managed instance runtime.
             Self::HqPlayer => TransportRoute::HqPlayer,
             // #398: was Roon for both of these.
             Self::Unprefixed | Self::Unknown => TransportRoute::Refused(self),

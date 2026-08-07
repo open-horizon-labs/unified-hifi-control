@@ -109,7 +109,7 @@
     }
   },
   "hifi_control": {
-    "description": "Control playback: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, or adjust volume",
+    "description": "Control playback: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, or adjust volume. HQPlayer zones use the managed instance runtime.",
     "inputSchema": {
       "properties": {
         "action": {

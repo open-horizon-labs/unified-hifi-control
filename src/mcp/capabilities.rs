@@ -346,7 +346,8 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
             )
         }
         Capability::RepeatMode | Capability::ShuffleMode => {
-            (target == ZoneTarget::Spotify && matches!(target.for_transport(), TransportRoute::Spotify))
+            (target == ZoneTarget::Spotify
+                && matches!(target.for_transport(), TransportRoute::Spotify))
                 || target == ZoneTarget::HqPlayer
         }
         Capability::QueueRead
@@ -436,12 +437,6 @@ const HQPLAYER_CONTENT_UNVERIFIED: &str = "UHC's HQPlayer adapter speaks transpo
     seek and pipeline settings; whether HQPlayer's control protocol reaches content operations \
     has not been verified here. Reported as not-yet-implemented rather than as a provider \
     limit, because an unverified 'never' is the more expensive error.";
-
-/// HQPlayer transport and volume: the adapter has the methods, MCP has no route.
-const HQPLAYER_ADAPTER_HAS_IT: &str = "HqpAdapter implements play, pause, stop, next, previous, \
-    seek, set_volume and volume_up/down (src/adapters/hqplayer.rs), and HqpAdapter publishes \
-    hqplayer: zones that hifi_zones lists -- but MCP's routing has no HQPlayer arm, so \
-    hifi_control cannot reach them.";
 
 /// Every cell routing does not decide.
 ///
@@ -973,7 +968,10 @@ mod tests {
             Capability::TransportSkip,
             Capability::Volume,
         ] {
-            assert_eq!(support(ZoneTarget::HqPlayer, capability), Support::Supported);
+            assert_eq!(
+                support(ZoneTarget::HqPlayer, capability),
+                Support::Supported
+            );
         }
     }
 

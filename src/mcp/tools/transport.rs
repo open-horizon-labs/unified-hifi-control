@@ -29,8 +29,9 @@
 //!   two providers, and #395's envelope already flagged it `not_implemented`
 //!   tracked by #398. It is now simply implemented.
 //! - **An unplaceable zone id is refused instead of routed to Roon**, for both
-//!   transport and volume, and an `hqplayer:` zone is refused *as HQPlayer* with
-//!   #328 attached instead of being sent to Roon.
+//!   transport and volume. An `hqplayer:` zone is dispatched through the managed
+//!   HQPlayer instance runtime, so missing configuration is reported as a backend
+//!   error rather than as an unsupported capability.
 //!
 //! `operation` still reports the *normalized* action, so `prev` surfaces as
 //! `previous` and `playpause` as `play_pause`; `params.value` still reports the
@@ -54,8 +55,8 @@ use crate::adapters::AdapterCommand;
 use crate::api::AppState;
 use crate::knobs::routes::{dispatch_hqplayer_action, HqpDispatchError};
 use crate::mcp::capabilities::{support, Capability};
-use crate::mcp::envelope::{Envelope, Observed, Refusal, Scope};
 use crate::mcp::envelope::Provider;
+use crate::mcp::envelope::{Envelope, Observed, Refusal, Scope};
 use crate::mcp::routing::{
     unplaceable_zone_refusal, unplaceable_zone_text, TransportRoute, VolumeRoute, ZoneTarget,
     CONTROL_ACTIONS, TRANSPORT_ACTIONS,
@@ -66,10 +67,10 @@ use rust_mcp_sdk::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Control playback
+/// Control playback across the shared adapters, including direct HQPlayer zones.
 #[mcp_tool(
     name = "hifi_control",
-    description = "Control playback: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, or adjust volume"
+    description = "Control playback: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, or adjust volume. HQPlayer zones use the managed instance runtime."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiControlTool {
@@ -257,8 +258,18 @@ pub async fn handle_control(
 
 /// The action vocabulary a direct HQPlayer zone accepts through `hifi_control`.
 const HQPLAYER_CONTROL_ACTIONS: &[&str] = &[
-    "play", "pause", "playpause", "next", "previous", "prev", "stop", "seek", "mute",
-    "volume_set", "volume_up", "volume_down",
+    "play",
+    "pause",
+    "playpause",
+    "next",
+    "previous",
+    "prev",
+    "stop",
+    "seek",
+    "mute",
+    "volume_set",
+    "volume_up",
+    "volume_down",
 ];
 
 pub(crate) async fn handle_hqplayer_control(
@@ -266,39 +277,77 @@ pub(crate) async fn handle_hqplayer_control(
     args: HifiControlTool,
 ) -> Result<CallToolResult, CallToolError> {
     if !HQPLAYER_CONTROL_ACTIONS.contains(&args.action.as_str()) {
-        return unknown_action_with_accepted(state, &args.zone_id, &args.action, HQPLAYER_CONTROL_ACTIONS).await;
+        return unknown_action_with_accepted(
+            state,
+            &args.zone_id,
+            &args.action,
+            HQPLAYER_CONTROL_ACTIONS,
+        )
+        .await;
     }
     let env = Envelope::write("hifi_control", hqplayer_operation(&args.action))
         .param("zone_id", &*args.zone_id)
         .param("action", &*args.action)
         .scope(Scope::for_zone(state, &args.zone_id, Provider::HqPlayer).await);
-    let instance_name = args.zone_id.strip_prefix("hqplayer:").unwrap_or(&args.zone_id);
-    let dispatch_action = if args.action == "volume_set" { "volume" } else { args.action.as_str() };
+    let instance_name = args
+        .zone_id
+        .strip_prefix("hqplayer:")
+        .unwrap_or(&args.zone_id);
+    let dispatch_action = if args.action == "volume_set" {
+        "volume"
+    } else {
+        args.action.as_str()
+    };
     let resolved_value = match args.action.as_str() {
         "volume_up" | "volume_down" => Some(args.value.unwrap_or(DEFAULT_VOLUME_DELTA)),
         _ => args.value,
     };
-    let env = match resolved_value { Some(value) => env.param("value", value), None => env };
-    match dispatch_hqplayer_action(state, &args.zone_id, instance_name, dispatch_action, resolved_value).await {
+    let env = match resolved_value {
+        Some(value) => env.param("value", value),
+        None => env,
+    };
+    match dispatch_hqplayer_action(
+        state,
+        &args.zone_id,
+        instance_name,
+        dispatch_action,
+        resolved_value,
+    )
+    .await
+    {
         Ok(()) => {
             let observed = Observed::from_aggregator(state, &args.zone_id).await;
-            Ok(env.observed(observed).text_result(format!("Action '{}' executed and verified state was published.", args.action)))
+            Ok(env.observed(observed).text_result(format!(
+                "Action '{}' executed and verified state was published.",
+                args.action
+            )))
         }
         Err(HqpDispatchError::NotFound(message)) => env.failed(message),
-        Err(HqpDispatchError::BadRequest { message, .. }) => env.refused(message, Refusal::invalid_parameter(
-            "value", &["a value valid for the selected HQPlayer action"],
-            "The action was rejected against the zone state published by the aggregator.",
-        )),
+        Err(HqpDispatchError::BadRequest { message, .. }) => env.refused(
+            message,
+            Refusal::invalid_parameter(
+                "value",
+                &["a value valid for the selected HQPlayer action"],
+                "The action was rejected against the zone state published by the aggregator.",
+            ),
+        ),
         Err(HqpDispatchError::Backend(message)) => env.failed(message),
     }
 }
 
 fn hqplayer_operation(action: &str) -> &'static str {
     match action {
-        "play" => "play", "pause" => "pause", "stop" => "stop", "next" => "next",
-        "previous" | "prev" => "previous", "playpause" => "play_pause", "seek" => "seek",
-        "mute" => "mute", "volume_set" => "volume_absolute",
-        "volume_up" | "volume_down" => "volume_relative", _ => "unknown_action",
+        "play" => "play",
+        "pause" => "pause",
+        "stop" => "stop",
+        "next" => "next",
+        "previous" | "prev" => "previous",
+        "playpause" => "play_pause",
+        "seek" => "seek",
+        "mute" => "mute",
+        "volume_set" => "volume_absolute",
+        "volume_up" | "volume_down" => "volume_relative",
+        _ => "unknown_action",
     }
 }
 
