@@ -215,19 +215,25 @@ pub async fn middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Existing LAN installs keep their historical browser flow until the
-    // operator explicitly enables the controller boundary. This avoids
-    // silently breaking the settings bootstrap while packages add their
-    // bootstrap screen. Tunnel/hosted deployments should set this to `true`.
-    if !controller_auth_required() {
+    let path = request.uri().path();
+    // Provisioning and credential transitions are always installation-owner
+    // operations.  They must not inherit the opt-in compatibility switch:
+    // otherwise a fresh LAN/tunnel install lets any reachable client replace
+    // OAuth credentials or mint an Apple companion pairing before the owner
+    // has even completed bootstrap.  The switch remains for the broader
+    // playback/MCP surface while existing clients adopt the session cookie.
+    let owner_operation = requires_controller_auth(path);
+    if !controller_auth_required() && !owner_operation {
         return next.run(request).await;
     }
-    let path = request.uri().path();
     // The browser shell and hardware/status protocol remain reachable on a
     // LAN during migration. API and MCP surfaces are the protected boundary;
     // the UI obtains its cookie through the bootstrap screen before calling
     // those surfaces.
-    if is_public(path) || is_native_bridge(path) || !is_protected(path, request.method()) {
+    if is_public(path)
+        || is_native_bridge(path)
+        || (!owner_operation && !is_protected(path, request.method()))
+    {
         return next.run(request).await;
     }
     let headers = request.headers();
@@ -248,6 +254,17 @@ pub async fn middleware(
             .into_response();
     }
     next.run(request).await
+}
+
+/// Routes that establish or revoke authority are protected even when the
+/// compatibility mode for ordinary LAN playback is enabled.  The native
+/// companion bearer routes remain explicitly excluded by `is_native_bridge`.
+fn requires_controller_auth(path: &str) -> bool {
+    path.starts_with("/api/providers/")
+        || matches!(
+            path,
+            "/api/bridges/applemusic/pair" | "/api/bridges/applemusic/status"
+        )
 }
 
 fn controller_auth_required() -> bool {
@@ -445,5 +462,17 @@ mod tests {
         assert!(is_protected("/api/settings", &axum::http::Method::POST));
         assert!(!is_protected("/roon/zones", &axum::http::Method::GET));
         assert!(is_protected("/roon/control", &axum::http::Method::POST));
+    }
+
+    #[test]
+    fn authority_transitions_are_protected_in_compatibility_mode() {
+        assert!(requires_controller_auth(
+            "/api/providers/spotify/oauth/start"
+        ));
+        assert!(requires_controller_auth("/api/providers/spotify/account"));
+        assert!(requires_controller_auth("/api/bridges/applemusic/pair"));
+        assert!(requires_controller_auth("/api/bridges/applemusic/status"));
+        assert!(!requires_controller_auth("/api/bridges/applemusic/claim"));
+        assert!(!requires_controller_auth("/zones"));
     }
 }

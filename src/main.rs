@@ -455,6 +455,28 @@ mod server {
             .map_err(|_| anyhow::anyhow!("zone aggregator failed to initialize"))?;
         tracing::info!("ZoneAggregator started");
 
+        // Credential-backed providers historically started whenever their
+        // credentials were present, even before the settings toggle existed.
+        // Keep that compatibility while recording the decision in the same
+        // coordinator registry used by every other adapter.  Dynamic settings
+        // changes can subsequently disable them through the coordinator.
+        coord
+            .set_enabled(
+                "spotify",
+                app_settings.adapters.spotify || spotify.is_configured().await,
+            )
+            .await;
+        let music_assistant_configured = match music_assistant.as_ref() {
+            Some(adapter) => adapter.is_configured().await,
+            None => false,
+        };
+        coord
+            .set_enabled(
+                "musicassistant",
+                app_settings.adapters.musicassistant || music_assistant_configured,
+            )
+            .await;
+
         // Start local adapters only after the aggregator readiness barrier.
         // Provider adapters start after the registry is ready, through the
         // same coordinator-owned lifecycle path below.

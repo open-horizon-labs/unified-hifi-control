@@ -12,6 +12,7 @@ use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
@@ -72,6 +73,29 @@ impl MusicAssistantConfig {
         let scheme = if self.tls { "https" } else { "http" };
         format!("{}://{}:{}/api", scheme, self.host, self.port)
     }
+
+    fn permits_insecure_local_http(&self) -> bool {
+        if self.tls || !self.allow_insecure_http {
+            return false;
+        }
+        let host = self.host.trim().trim_matches(['[', ']']);
+        if host.eq_ignore_ascii_case("localhost") || host.ends_with(".local") {
+            return true;
+        }
+        let Ok(address) = host.parse::<IpAddr>() else {
+            return false;
+        };
+        match address {
+            IpAddr::V4(address) => {
+                address.is_loopback() || address.is_private() || address.is_link_local()
+            }
+            IpAddr::V6(address) => {
+                address.is_loopback()
+                    || address.is_unicast_link_local()
+                    || (address.segments()[0] & 0xfe00) == 0xfc00
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -121,9 +145,9 @@ impl MusicAssistantAdapter {
         if config.token.trim().is_empty() {
             return Err(anyhow!("Music Assistant access token cannot be empty"));
         }
-        if !config.tls && !config.allow_insecure_http {
+        if !config.tls && !config.permits_insecure_local_http() {
             return Err(anyhow!(
-                "Music Assistant requires HTTPS; set MUSIC_ASSISTANT_INSECURE_HTTP=1 only for a trusted local development network"
+                "Music Assistant requires HTTPS; plaintext is allowed only for an explicitly opted-in localhost, .local, private, or link-local development peer"
             ));
         }
 
@@ -554,6 +578,18 @@ mod tests {
         };
         assert_eq!(config.base_url(), "http://127.0.0.1:8095/api");
         assert!(MusicAssistantAdapter::new(crate::bus::create_bus(), config).is_ok());
+    }
+
+    #[test]
+    fn plaintext_opt_in_rejects_public_hosts() {
+        let config = MusicAssistantConfig {
+            host: "ma.example.com".to_string(),
+            port: DEFAULT_PORT,
+            token: "secret".to_string(),
+            tls: false,
+            allow_insecure_http: true,
+        };
+        assert!(MusicAssistantAdapter::new(crate::bus::create_bus(), config).is_err());
     }
 
     #[test]
