@@ -322,4 +322,65 @@ public actor SystemMusicPlayerCompanion {
     public func skipToPreviousItem() async throws {
         try await player.skipToPreviousEntry()
     }
+
+    /// Catalog search stays on the signed companion. The returned projection
+    /// contains only fields UHC needs for opaque-ref search results; Apple
+    /// identifiers remain inside the host app until #463's content transport
+    /// is explicitly extended.
+    public func searchCatalog(term: String, limit: Int = 25) async throws -> [AppleMusicSearchItem] {
+        let boundedLimit = min(max(limit, 1), 50)
+        var request = MusicCatalogSearchRequest(term: term, types: [Song.self])
+        request.limit = boundedLimit
+        let response = try await request.response()
+        return response.songs.map(AppleMusicSearchItem.init)
+    }
+
+    /// Read a bounded slice of the listener's library without returning
+    /// Apple credentials or raw provider responses to UHC.
+    public func librarySongs(limit: Int = 25, offset: Int = 0) async throws -> [AppleMusicSearchItem] {
+        var request = MusicLibraryRequest<Song>()
+        request.limit = min(max(limit, 1), 50)
+        request.offset = max(offset, 0)
+        let response = try await request.response()
+        return response.items.map(AppleMusicSearchItem.init)
+    }
+
+    /// Start an exact catalog/library result on the iPhone's system player.
+    public func play(song: Song) async throws {
+        player.queue = MusicPlayer.Queue(for: [song], startingAt: song)
+        try await player.play()
+    }
+
+    /// Replace the requested system-player queue. SystemMusicPlayer queue
+    /// visibility and persistence must still be proven on physical hardware.
+    public func replaceQueue(with songs: [Song]) async throws {
+        guard let first = songs.first else { return }
+        player.queue = MusicPlayer.Queue(for: songs, startingAt: first)
+        try await player.play()
+    }
+
+    /// Add one item after the current entry (the documented Play Next
+    /// position). This is intentionally not represented as confirmed queue
+    /// state until the companion publishes a validated snapshot.
+    public func playNext(song: Song) async throws {
+        try await player.queue.insert(song, position: .afterCurrentEntry)
+    }
+}
+
+/// Provider-neutral projection for native search/library results.
+@available(iOS 17.0, *)
+public struct AppleMusicSearchItem: Sendable, Equatable {
+    public let id: String
+    public let title: String
+    public let artist: String
+    public let album: String
+    public let artworkURL: URL?
+
+    public init(song: Song) {
+        id = song.id.rawValue
+        title = song.title
+        artist = song.artistName
+        album = song.albumTitle ?? ""
+        artworkURL = song.artwork?.url(width: 512, height: 512)
+    }
 }
