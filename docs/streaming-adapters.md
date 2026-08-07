@@ -145,3 +145,14 @@ the service defaults `UHC_CONFIG_DIR` to it, so the encrypted Spotify
 credential file and its key survive process restarts and package upgrades.
 Operators may override that variable to mount a secret-backed config volume;
 the package does not remove credentials during an upgrade or uninstall.
+
+The local release path is reproducible with:
+
+```sh
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+make qnap-test
+```
+
+The resulting server binary is a static PIE ELF suitable for the QNAP x86_64
+package. The package contains no Swift/MusicKit runtime; Apple Music remains a
+paired native-companion capability.
