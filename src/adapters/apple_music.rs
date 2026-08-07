@@ -192,6 +192,20 @@ pub trait MusicKitCompanion: Send + Sync {
     async fn snapshot(&self) -> Result<MusicKitSnapshot>;
     async fn execute(&self, command: MusicKitCommand) -> Result<()>;
 
+    /// Return every live execution-owner snapshot known to this companion
+    /// transport. Older single-owner companions keep working through the
+    /// default implementation.
+    async fn snapshots(&self) -> Result<Vec<MusicKitSnapshot>> {
+        Ok(vec![self.snapshot().await?])
+    }
+
+    /// Execute against the named player/execution owner. The default keeps
+    /// the historical single-owner behavior; paired transports override it
+    /// to prevent a command crossing companion boundaries.
+    async fn execute_for_player(&self, _player_id: &str, command: MusicKitCommand) -> Result<()> {
+        self.execute(command).await
+    }
+
     /// Execute an authenticated Apple Music content operation on the native
     /// companion. The companion owns the MusicKit token; UHC receives only the
     /// provider-neutral JSON result. Keeping this optional preserves playback
@@ -294,15 +308,14 @@ impl AppleMusicAdapter {
     async fn publish_snapshot(
         &self,
         bus: &crate::bus::SharedBus,
-        discovered: &mut bool,
+        snapshot: MusicKitSnapshot,
+        discovered: &mut std::collections::HashSet<String>,
     ) -> Result<PrefixedZoneId> {
-        let snapshot = self.companion.snapshot().await?;
         let zone = Self::zone_from_snapshot(&snapshot)?;
         let zone_id = PrefixedZoneId::applemusic(&snapshot.player_id);
 
-        if !*discovered {
+        if discovered.insert(zone_id.to_string()) {
             bus.publish(BusEvent::ZoneDiscovered { zone });
-            *discovered = true;
         } else {
             bus.publish(BusEvent::ZoneUpdated {
                 zone_id: zone_id.clone(),
@@ -402,19 +415,36 @@ impl AdapterLogic for AppleMusicAdapter {
 
     async fn run(&self, ctx: AdapterContext) -> Result<()> {
         let mut ticker = interval(self.poll_interval);
-        let mut discovered = false;
-        let mut zone_id: Option<PrefixedZoneId> = None;
+        let mut discovered = std::collections::HashSet::new();
         loop {
             tokio::select! {
                 _ = ctx.shutdown.cancelled() => return Ok(()),
                 _ = ticker.tick() => {
-                    match self.publish_snapshot(&ctx.bus, &mut discovered).await {
-                        Ok(id) => zone_id = Some(id),
-                        Err(error) => {
-                            if let Some(zone_id) = zone_id.take() {
-                                ctx.bus.publish(BusEvent::ZoneRemoved { zone_id });
+                    match self.companion.snapshots().await {
+                        Ok(snapshots) => {
+                            let mut seen = std::collections::HashSet::new();
+                            for snapshot in snapshots {
+                                match self.publish_snapshot(&ctx.bus, snapshot, &mut seen).await {
+                                    Ok(_) => {}
+                                    Err(error) => tracing::debug!("invalid Apple Music companion snapshot: {error}"),
+                                }
                             }
-                            discovered = false;
+                            for zone_id in discovered.difference(&seen) {
+                                ctx.bus.publish(BusEvent::ZoneRemoved {
+                                    zone_id: PrefixedZoneId::parse(zone_id)
+                                        .expect("discovered Apple Music zone is prefixed"),
+                                });
+                            }
+                            discovered = seen;
+                        }
+                        Err(error) => {
+                            for zone_id in &discovered {
+                                ctx.bus.publish(BusEvent::ZoneRemoved {
+                                    zone_id: PrefixedZoneId::parse(zone_id)
+                                        .expect("discovered Apple Music zone is prefixed"),
+                                });
+                            }
+                            discovered.clear();
                             tracing::debug!("Apple Music companion unavailable: {error}");
                         }
                     }
@@ -438,7 +468,12 @@ impl AdapterLogic for AppleMusicAdapter {
         }
 
         let command = Self::command_for(command)?;
-        self.companion.execute(command).await?;
+        let player_id = zone_id
+            .strip_prefix("applemusic:")
+            .ok_or_else(|| anyhow::anyhow!("invalid Apple Music zone id `{zone_id}`"))?;
+        self.companion
+            .execute_for_player(player_id, command)
+            .await?;
         Ok(AdapterCommandResponse {
             success: true,
             error: None,

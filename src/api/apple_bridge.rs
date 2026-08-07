@@ -213,6 +213,38 @@ impl AppleBridgeRegistry {
             .ok_or_else(|| anyhow!("Apple Music companion has not published a snapshot"))
     }
 
+    /// Return snapshots for every live paired execution owner. This is the
+    /// owner-scoped counterpart to [`Self::snapshot`], whose freshest-session
+    /// behavior is retained for legacy single-owner callers.
+    pub async fn snapshots(&self) -> Result<Vec<MusicKitSnapshot>> {
+        let now = now_secs();
+        let state = self.inner.read().await;
+        let snapshots = state
+            .sessions
+            .values()
+            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now)
+            .filter_map(|session| session.snapshot.clone())
+            .collect::<Vec<_>>();
+        if snapshots.is_empty() {
+            bail!("Apple Music companion is not paired");
+        }
+        Ok(snapshots)
+    }
+
+    /// Resolve the live companion bound to one player identity.
+    pub async fn snapshot_for_player(&self, player_id: &str) -> Result<MusicKitSnapshot> {
+        let now = now_secs();
+        let state = self.inner.read().await;
+        state
+            .sessions
+            .values()
+            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now)
+            .filter(|session| session.bound_player_id.as_deref() == Some(player_id))
+            .max_by_key(|session| session.last_seen)
+            .and_then(|session| session.snapshot.clone())
+            .ok_or_else(|| anyhow!("Apple Music player `{player_id}` is not paired or live"))
+    }
+
     pub async fn enqueue(&self, command: MusicKitCommand) -> Result<String> {
         let mut state = self.inner.write().await;
         let session = state
@@ -226,6 +258,33 @@ impl AppleBridgeRegistry {
         }
         let command_id = random_token(20);
         let expires_at = now_secs() + COMMAND_TTL.as_secs();
+        session.commands.push_back(QueuedCommand {
+            command_id: command_id.clone(),
+            command,
+            expires_at,
+            delivered_at: None,
+        });
+        session.results.insert(command_id.clone(), None);
+        Ok(command_id)
+    }
+
+    /// Queue a command only on the companion that owns `player_id`.
+    pub async fn enqueue_for_player(
+        &self,
+        player_id: &str,
+        command: MusicKitCommand,
+    ) -> Result<String> {
+        let mut state = self.inner.write().await;
+        let now = now_secs();
+        let session = state
+            .sessions
+            .values_mut()
+            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now)
+            .filter(|session| session.bound_player_id.as_deref() == Some(player_id))
+            .max_by_key(|session| session.last_seen)
+            .ok_or_else(|| anyhow!("Apple Music player `{player_id}` is not paired or live"))?;
+        let command_id = random_token(20);
+        let expires_at = now + COMMAND_TTL.as_secs();
         session.commands.push_back(QueuedCommand {
             command_id: command_id.clone(),
             command,
@@ -355,8 +414,19 @@ impl MusicKitCompanion for PairedMusicKitCompanion {
         self.registry.snapshot().await
     }
 
+    async fn snapshots(&self) -> Result<Vec<MusicKitSnapshot>> {
+        self.registry.snapshots().await
+    }
+
     async fn execute(&self, command: MusicKitCommand) -> Result<()> {
         let command_id = self.registry.enqueue(command).await?;
+        self.registry
+            .wait_for_result(&command_id, COMMAND_TTL)
+            .await
+    }
+
+    async fn execute_for_player(&self, player_id: &str, command: MusicKitCommand) -> Result<()> {
+        let command_id = self.registry.enqueue_for_player(player_id, command).await?;
         self.registry
             .wait_for_result(&command_id, COMMAND_TTL)
             .await
@@ -524,9 +594,13 @@ mod tests {
     use super::*;
 
     fn snapshot() -> MusicKitSnapshot {
+        snapshot_for("application")
+    }
+
+    fn snapshot_for(player_id: &str) -> MusicKitSnapshot {
         MusicKitSnapshot {
-            player_id: "application".to_string(),
-            display_name: "Mac Music".to_string(),
+            player_id: player_id.to_string(),
+            display_name: format!("Apple Music {player_id}"),
             state: crate::adapters::apple_music::MusicKitPlaybackState::Paused,
             track: None,
             volume: Some(0.5),
@@ -690,6 +764,132 @@ mod tests {
         other.player_id = "another-player".to_string();
         assert!(registry
             .update_snapshot(&claim.access_token, other)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn live_companions_are_scoped_by_player_for_snapshots_and_commands() {
+        let registry = AppleBridgeRegistry::default();
+        let first = registry.create_pairing("iphone-a".to_string()).await;
+        let first_claim = registry
+            .claim(ClaimRequest {
+                bridge_id: first.bridge_id,
+                pairing_code: first.pairing_code,
+            })
+            .await
+            .expect("first claim succeeds");
+        registry
+            .update_snapshot(&first_claim.access_token, snapshot_for("player-a"))
+            .await
+            .expect("first snapshot succeeds");
+
+        let second = registry.create_pairing("iphone-b".to_string()).await;
+        let second_claim = registry
+            .claim(ClaimRequest {
+                bridge_id: second.bridge_id,
+                pairing_code: second.pairing_code,
+            })
+            .await
+            .expect("second claim succeeds");
+        registry
+            .update_snapshot(&second_claim.access_token, snapshot_for("player-b"))
+            .await
+            .expect("second snapshot succeeds");
+
+        let snapshots = registry.snapshots().await.expect("both owners are live");
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.iter().any(|item| item.player_id == "player-a"));
+        assert!(snapshots.iter().any(|item| item.player_id == "player-b"));
+        assert_eq!(
+            registry
+                .snapshot_for_player("player-a")
+                .await
+                .expect("owner A snapshot")
+                .player_id,
+            "player-a"
+        );
+
+        registry
+            .enqueue_for_player("player-a", MusicKitCommand::Next)
+            .await
+            .expect("owner A command queues");
+        let first_commands = registry
+            .poll_commands(&first_claim.access_token)
+            .await
+            .expect("owner A polls");
+        assert_eq!(first_commands.len(), 1);
+        assert!(registry
+            .poll_commands(&second_claim.access_token)
+            .await
+            .expect("owner B poll")
+            .is_empty());
+
+        registry
+            .enqueue_for_player("player-b", MusicKitCommand::Previous)
+            .await
+            .expect("owner B command queues");
+        assert!(registry
+            .poll_commands(&first_claim.access_token)
+            .await
+            .expect("owner A second poll")
+            .is_empty());
+        let second_commands = registry
+            .poll_commands(&second_claim.access_token)
+            .await
+            .expect("owner B second poll");
+        assert_eq!(second_commands.len(), 1);
+        assert_eq!(second_commands[0].command, MusicKitCommand::Previous);
+    }
+
+    #[tokio::test]
+    async fn revoked_or_stale_owner_cannot_receive_scoped_commands() {
+        let registry = AppleBridgeRegistry::default();
+        let pairing = registry.create_pairing("iphone".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+        registry
+            .update_snapshot(&claim.access_token, snapshot_for("player"))
+            .await
+            .expect("snapshot succeeds");
+        registry
+            .revoke(&claim.access_token)
+            .await
+            .expect("revoke succeeds");
+        assert!(registry.snapshot_for_player("player").await.is_err());
+        assert!(registry
+            .enqueue_for_player("player", MusicKitCommand::Play)
+            .await
+            .is_err());
+
+        let pairing = registry.create_pairing("iphone".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("replacement claim succeeds");
+        registry
+            .update_snapshot(&claim.access_token, snapshot_for("player"))
+            .await
+            .expect("replacement snapshot succeeds");
+        registry
+            .inner
+            .write()
+            .await
+            .sessions
+            .get_mut(&claim.access_token)
+            .expect("session exists")
+            .last_seen = now_secs() - BRIDGE_LIVENESS_TTL.as_secs() - 1;
+        assert!(registry.snapshot_for_player("player").await.is_err());
+        assert!(registry
+            .enqueue_for_player("player", MusicKitCommand::Play)
             .await
             .is_err());
     }
