@@ -207,11 +207,7 @@ cp scripts/pre-commit .git/hooks/
 ### Build & Run
 
 ```bash
-make css                                              # Build Tailwind CSS
-dx build --release --platform web --features web      # Build server + WASM
-
-cd target/dx/unified-hifi-control/release/web
-PORT=8088 ./server                                    # Run at http://localhost:8088
+UHC_PORT=8088 make web-run   # Build matching server + WASM, then run
 ```
 
 For hot reload during development:
@@ -226,7 +222,8 @@ cargo test --workspace
 cargo fmt --check && cargo clippy -- -D warnings
 ```
 
-**Note:** Use `dx build`, not `cargo build` — the web UI requires the WASM bundle that only `dx` produces.
+**Note:** Never use `cargo run` for the web UI. `make web-run` is the only
+local runner: it always builds the server and its matching WASM bundle together.
 
 </details>
 
