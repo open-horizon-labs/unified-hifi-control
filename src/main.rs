@@ -444,7 +444,9 @@ mod server {
         let aggregator_for_spawn = zone_aggregator.clone();
         let (aggregator_ready_tx, aggregator_ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            aggregator_for_spawn.run_with_ready(aggregator_ready_tx).await;
+            aggregator_for_spawn
+                .run_with_ready(aggregator_ready_tx)
+                .await;
         });
         // The event bus does not replay.  Do not let any adapter publish its
         // initial snapshot until the aggregator has subscribed.

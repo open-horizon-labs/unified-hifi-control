@@ -28,8 +28,8 @@ use crate::bus::runtime::{
     CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
     HqpRuntimeCommand, RuntimeCommand,
 };
-use crate::bus::{Command, PrefixedZoneId};
 use crate::bus::VolumeControl;
+use crate::bus::{Command, PrefixedZoneId};
 use crate::knobs::image::placeholder_svg;
 use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
 

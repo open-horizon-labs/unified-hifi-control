@@ -1769,11 +1769,7 @@ pub async fn lms_configure_handler(
     // republish a stale snapshot during reconfiguration.
     state
         .coordinator
-        .stop_adapter_and_companions_then_flush(
-            state.lms.as_ref(),
-            "lms",
-            "LMS reconfiguration",
-        )
+        .stop_adapter_and_companions_then_flush(state.lms.as_ref(), "lms", "LMS reconfiguration")
         .await;
 
     // Configure new connection

@@ -169,7 +169,10 @@ impl AdapterCoordinator {
     pub async fn stop_all(&self, adapters: &[Arc<dyn Startable>]) {
         let companion_names = self.companion_names().await;
         for adapter in adapters {
-            if companion_names.iter().any(|companion| companion == adapter.name()) {
+            if companion_names
+                .iter()
+                .any(|companion| companion == adapter.name())
+            {
                 continue;
             }
             self.stop_adapter_and_companions_then_flush(
