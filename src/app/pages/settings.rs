@@ -563,11 +563,6 @@ pub fn Settings() -> Element {
                 .collect::<Vec<_>>()
         });
     let apple_st = apple_bridge_status.read().clone().and_then(Result::ok);
-    let apple_bridge_label = apple_st
-        .as_ref()
-        .and_then(|status| status.bridge_id.as_deref())
-        .unwrap_or("unknown")
-        .to_string();
     let callback_message = callback_feedback();
     let spotify_status_is_error = spotify_error().is_some();
     let spotify_status_message =
@@ -1242,15 +1237,15 @@ pub fn Settings() -> Element {
                             }
                             if !applemusic_enabled() {
                                 span { class: "badge badge-secondary shrink-0", "Disabled" }
-                            } else if apple_st.as_ref().map(|status| status.paired && status.has_snapshot).unwrap_or(false) {
-                                span { class: "badge badge-success shrink-0", "Companion live" }
-                            } else if apple_st.as_ref().map(|status| status.paired).unwrap_or(false) {
+                            } else if apple_st.as_ref().map(|status| status.companions.iter().any(|companion| companion.has_snapshot)).unwrap_or(false) {
+                                span { class: "badge badge-success shrink-0", "{apple_st.as_ref().map(|status| status.companions.len()).unwrap_or(0)} companions live" }
+                            } else if apple_st.as_ref().map(|status| !status.companions.is_empty()).unwrap_or(false) {
                                 span { class: "badge badge-secondary shrink-0", "Paired · waiting" }
                             } else {
                                 span { class: "badge badge-secondary shrink-0", "Not paired" }
                             }
                         }
-                        p { class: "mt-4 text-sm text-secondary", "Run the companion on your iPhone or Mac, authorize Apple Music there, then pair it with UHC using a short-lived code. The companion keeps Apple credentials local; UHC receives only playback state and commands." }
+                        p { class: "mt-4 text-sm text-secondary", "Run companions on your iPhone, iPad, or Mac, authorize Apple Music on each device, then pair each one with UHC using a short-lived code. Each companion is an independent Apple Music zone; credentials stay on the device." }
                         p { class: "mt-3 text-sm text-secondary",
                             "Catalog and library requests also require MusicKit enabled for the companion's explicit App ID. "
                             a {
@@ -1262,21 +1257,25 @@ pub fn Settings() -> Element {
                             }
                         }
                         if let Some(ref status) = apple_st {
-                            if status.paired {
-                                p { class: "mt-4 text-sm", "Bridge: {apple_bridge_label}" }
-                                if status.has_snapshot {
-                                    p { class: "mt-1 text-sm status-ok", role: "status", aria_live: "polite", "Apple Music state is available." }
-                                } else {
-                                    p { class: "mt-1 text-sm text-muted", role: "status", aria_live: "polite", "Waiting for the companion to publish playback state…" }
-                                }
-                            } else {
+                            if status.companions.is_empty() {
                                 p { class: "mt-4 text-sm text-muted", role: "status", aria_live: "polite", "No companion is paired yet." }
+                            } else {
+                                div { class: "mt-4 grid gap-3 sm:grid-cols-2",
+                                    for companion in status.companions.iter() {
+                                        div { class: "rounded-lg border border-default bg-surface-muted p-4",
+                                            div { class: "flex items-center justify-between gap-3",
+                                                p { class: "font-medium truncate", "{companion.bridge_id}" }
+                                                span { class: if companion.has_snapshot { "badge badge-success" } else { "badge badge-secondary" }, if companion.has_snapshot { "Live" } else { "Waiting" } }
+                                            }
+                                            p { class: "mt-2 text-xs text-secondary", "Independent Apple Music zone" }
+                                        }
+                                    }
+                                }
                             }
                         } else {
                             p { class: "mt-4 text-sm text-muted", role: "status", aria_live: "polite", "Checking for a paired companion…" }
                         }
-                        if !apple_st.as_ref().map(|status| status.paired).unwrap_or(false) {
-                            div { class: "mt-5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end",
+                        div { class: "mt-5 grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end",
                                 label { class: "block text-sm",
                                     span { class: "mb-1 block text-secondary", "Companion ID" }
                                     input {
@@ -1314,14 +1313,13 @@ pub fn Settings() -> Element {
                                     },
                                     "Generate pairing code"
                                 }
-                            }
-                            if let Some(pairing) = apple_pairing() {
+                        }
+                        if let Some(pairing) = apple_pairing() {
                                 div { class: "mt-4 rounded-lg border border-default bg-surface-muted p-4",
                                     p { class: "text-sm font-medium", "Enter this code in the companion" }
                                     p { class: "mt-2 break-all font-mono text-lg tracking-wide", aria_label: "Apple Music pairing code", "{pairing.pairing_code}" }
                                     p { class: "mt-2 text-xs text-secondary", "Bridge ID: {pairing.bridge_id} · Expires in about 5 minutes" }
                                 }
-                            }
                         }
                         if let Some(error) = apple_error() {
                             p { class: "mt-4 status-err", role: "alert", "{error}" }

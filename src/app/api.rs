@@ -128,9 +128,18 @@ pub struct SpotifyAccountResponse {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AppleBridgeStatus {
+    #[serde(default)]
+    pub companions: Vec<AppleBridgeCompanionStatus>,
     pub paired: bool,
     pub bridge_id: Option<String>,
     pub last_seen: Option<u64>,
+    pub has_snapshot: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppleBridgeCompanionStatus {
+    pub bridge_id: String,
+    pub last_seen: u64,
     pub has_snapshot: bool,
 }
 

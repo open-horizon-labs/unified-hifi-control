@@ -96,6 +96,16 @@ pub struct BridgeStatus {
     pub bridge_id: Option<String>,
     pub last_seen: Option<u64>,
     pub has_snapshot: bool,
+    /// Every live companion, rather than only the freshest one. The legacy
+    /// fields above remain for older clients that only know one companion.
+    pub companions: Vec<BridgeCompanionStatus>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct BridgeCompanionStatus {
+    pub bridge_id: String,
+    pub last_seen: u64,
+    pub has_snapshot: bool,
 }
 
 /// Internal owner-scoped liveness. The legacy HTTP status remains unchanged;
@@ -708,10 +718,21 @@ impl AppleBridgeRegistry {
 
     pub async fn status(&self) -> BridgeStatus {
         let state = self.inner.read().await;
+        let now = now_secs();
+        let companions = state
+            .sessions
+            .values()
+            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now)
+            .map(|session| BridgeCompanionStatus {
+                bridge_id: session.bridge_id.clone(),
+                last_seen: session.last_seen,
+                has_snapshot: session.snapshot.is_some(),
+            })
+            .collect::<Vec<_>>();
         let session = state
             .sessions
             .values()
-            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now_secs())
+            .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now)
             .max_by_key(|session| session.last_seen);
         BridgeStatus {
             paired: session
@@ -722,6 +743,7 @@ impl AppleBridgeRegistry {
             has_snapshot: session
                 .and_then(|session| session.snapshot.as_ref())
                 .is_some(),
+            companions,
         }
     }
 }
@@ -1522,6 +1544,35 @@ mod tests {
             .update_snapshot(&first_claim.access_token, snapshot())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn status_lists_all_live_companions() {
+        let registry = AppleBridgeRegistry::default();
+        for (bridge_id, player_id) in [("iphone", "ios"), ("ipad", "ipados")] {
+            let pairing = registry.create_pairing(bridge_id.to_string()).await;
+            let claim = registry
+                .claim(ClaimRequest {
+                    bridge_id: pairing.bridge_id,
+                    pairing_code: pairing.pairing_code,
+                })
+                .await
+                .expect("claim succeeds");
+            registry
+                .update_snapshot(&claim.access_token, snapshot_for(player_id))
+                .await
+                .expect("snapshot publishes");
+        }
+        let status = registry.status().await;
+        assert_eq!(status.companions.len(), 2);
+        assert!(status
+            .companions
+            .iter()
+            .any(|companion| companion.bridge_id == "iphone"));
+        assert!(status
+            .companions
+            .iter()
+            .any(|companion| companion.bridge_id == "ipad"));
     }
 
     #[tokio::test]
