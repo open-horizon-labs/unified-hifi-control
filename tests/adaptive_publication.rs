@@ -198,7 +198,7 @@ mod envelope {
     #[test]
     fn an_unknown_prefix_is_refused_even_though_it_looks_prefixed() {
         let mut document = pipeline();
-        document.target.zone_id = Some("spotify:abc123".to_string());
+        document.target.zone_id = Some("unknown:abc123".to_string());
         assert!(matches!(
             expect_refused(admit_fresh(document)),
             AdmissionRefusal::ZoneIdNotPrefixed { .. }
