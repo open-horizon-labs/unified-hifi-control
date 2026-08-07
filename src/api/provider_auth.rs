@@ -531,10 +531,13 @@ pub async fn oauth_revoke(
         )
     })?;
     if let Some(store) = &state.provider_auth.credentials {
-        store.clear().map_err(|e| {
+        // Disconnect the account without deleting the configured OAuth client.
+        // The user should be able to reconnect immediately, and the durable
+        // configuration must remain the authority reported by Settings.
+        store.clear_token().map_err(|e| {
             error(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("Spotify credentials could not be removed from storage: {e}"),
+                &format!("Spotify token could not be removed from storage: {e}"),
                 "token_storage_failed",
             )
         })?;
