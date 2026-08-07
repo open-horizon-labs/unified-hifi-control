@@ -6,8 +6,9 @@ import MusicKit
 public enum MacMusicKitCommand: Codable, Sendable, Equatable {
     case play, pause, toggle, stop, next, previous
     case setVolume(value: Float), adjustVolume(delta: Float), setMute(muted: Bool)
+    case setRepeat(mode: MusicPlayer.RepeatMode), setShuffle(enabled: Bool)
 
-    private enum CodingKeys: String, CodingKey { case command, value, delta, muted }
+    private enum CodingKeys: String, CodingKey { case command, value, delta, muted, mode, enabled }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -21,6 +22,14 @@ public enum MacMusicKitCommand: Codable, Sendable, Equatable {
         case "set_volume": self = .setVolume(value: try values.decode(Float.self, forKey: .value))
         case "adjust_volume": self = .adjustVolume(delta: try values.decode(Float.self, forKey: .delta))
         case "set_mute": self = .setMute(muted: try values.decode(Bool.self, forKey: .muted))
+        case "set_repeat":
+            switch try values.decode(String.self, forKey: .mode) {
+            case "off": self = .setRepeat(mode: .none)
+            case "one": self = .setRepeat(mode: .one)
+            case "all": self = .setRepeat(mode: .all)
+            default: throw MacBridgeError.invalidResponse
+            }
+        case "set_shuffle": self = .setShuffle(enabled: try values.decode(Bool.self, forKey: .enabled))
         default: throw MacBridgeError.invalidResponse
         }
     }
@@ -40,6 +49,19 @@ public enum MacMusicKitCommand: Codable, Sendable, Equatable {
             try values.encode("adjust_volume", forKey: .command); try values.encode(delta, forKey: .delta)
         case let .setMute(muted):
             try values.encode("set_mute", forKey: .command); try values.encode(muted, forKey: .muted)
+        case let .setRepeat(mode):
+            try values.encode("set_repeat", forKey: .command); try values.encode(Self.repeatWireValue(mode), forKey: .mode)
+        case let .setShuffle(enabled):
+            try values.encode("set_shuffle", forKey: .command); try values.encode(enabled, forKey: .enabled)
+        }
+    }
+
+    private static func repeatWireValue(_ mode: MusicPlayer.RepeatMode) -> String {
+        switch mode {
+        case .none: return "off"
+        case .one: return "one"
+        case .all: return "all"
+        @unknown default: return "off"
         }
     }
 }

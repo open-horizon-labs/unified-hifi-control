@@ -44,6 +44,8 @@ public actor ApplicationMusicPlayerCompanion {
         case .pause: pause()
         case .next: try await skipToNextItem()
         case .previous: try await skipToPreviousItem()
+        case .setRepeat(mode: let mode): player.state.repeatMode = mode
+        case .setShuffle(enabled: let enabled): player.state.shuffleMode = enabled ? .songs : .off
         case .toggle, .stop, .setVolume, .adjustVolume, .setMute:
             throw CompanionError.commandNotValidated
         }
@@ -259,7 +261,9 @@ public actor ApplicationMusicPlayerCompanion {
             state: playbackState(player.state.playbackStatus),
             track: track,
             volume: nil,
-            isMuted: false
+            isMuted: false,
+            repeatMode: repeatWireValue(player.state.repeatMode),
+            shuffle: shuffleWireValue(player.state.shuffleMode)
         )
     }
 
@@ -277,6 +281,25 @@ public actor ApplicationMusicPlayerCompanion {
         @unknown default: "unknown"
         }
     }
+
+    private func repeatWireValue(_ mode: MusicPlayer.RepeatMode?) -> String? {
+        guard let mode else { return nil }
+        switch mode {
+        case .none: return "off"
+        case .one: return "one"
+        case .all: return "all"
+        @unknown default: return nil
+        }
+    }
+
+    private func shuffleWireValue(_ mode: MusicPlayer.ShuffleMode?) -> Bool? {
+        guard let mode else { return nil }
+        switch mode {
+        case .off: return false
+        case .songs: return true
+        @unknown default: return nil
+        }
+    }
 }
 
 @available(macOS 14.0, *)
@@ -287,18 +310,22 @@ public struct MacMusicKitSnapshot: Codable, Sendable, Equatable {
     public let track: MacMusicKitTrack?
     public let volume: Float?
     public let isMuted: Bool
+    public let repeatMode: String?
+    public let shuffle: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case playerID = "player_id", displayName = "display_name", state, track, volume, isMuted = "is_muted"
+        case playerID = "player_id", displayName = "display_name", state, track, volume, isMuted = "is_muted", repeatMode = "repeat_mode", shuffle
     }
 
-    public init(playerID: String, displayName: String, state: String, track: MacMusicKitTrack? = nil, volume: Float? = nil, isMuted: Bool = false) {
+    public init(playerID: String, displayName: String, state: String, track: MacMusicKitTrack? = nil, volume: Float? = nil, isMuted: Bool = false, repeatMode: String? = nil, shuffle: Bool? = nil) {
         self.playerID = playerID
         self.displayName = displayName
         self.state = state
         self.track = track
         self.volume = volume
         self.isMuted = isMuted
+        self.repeatMode = repeatMode
+        self.shuffle = shuffle
     }
 }
 
