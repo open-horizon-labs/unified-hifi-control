@@ -85,6 +85,15 @@ impl FeedbackStore {
     pub async fn record(&self, record: FeedbackRecord) -> anyhow::Result<FeedbackRecord> {
         validate(&record)?;
         let mut records = self.records.write().await;
+        if let Some(existing) = records.iter().find(|item| item.event_id == record.event_id) {
+            if existing == &record {
+                return Ok(existing.clone());
+            }
+            anyhow::bail!(
+                "feedback event_id `{}` already exists with different data",
+                record.event_id
+            );
+        }
         let previous = records.clone();
         records.push(record.clone());
         trim(&mut records);
@@ -217,8 +226,10 @@ mod tests {
     #[tokio::test]
     async fn feedback_is_bounded_and_newest_first() {
         let store = FeedbackStore::default();
-        for _ in 0..260 {
-            store.record(record(FeedbackSignal::Skip)).await.unwrap();
+        for index in 0..260 {
+            let mut item = record(FeedbackSignal::Skip);
+            item.event_id = format!("test-event-{index}");
+            store.record(item).await.unwrap();
         }
         assert_eq!(store.recent("applemusic:iphone", 500).await.len(), 50);
     }
@@ -235,5 +246,19 @@ mod tests {
     #[test]
     fn event_ids_are_unique_within_the_same_second() {
         assert_ne!(next_event_id(), next_event_id());
+    }
+
+    #[tokio::test]
+    async fn duplicate_event_ids_are_idempotent_but_conflicts_are_refused() {
+        let store = FeedbackStore::default();
+        let first = record(FeedbackSignal::Favorite);
+        assert_eq!(store.record(first.clone()).await.unwrap(), first);
+        assert_eq!(store.record(first.clone()).await.unwrap(), first);
+        assert_eq!(store.recent("applemusic:iphone", 50).await.len(), 1);
+
+        let mut conflict = first;
+        conflict.signal = FeedbackSignal::Skip;
+        assert!(store.record(conflict).await.is_err());
+        assert_eq!(store.recent("applemusic:iphone", 50).await.len(), 1);
     }
 }
