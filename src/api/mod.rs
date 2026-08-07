@@ -120,6 +120,14 @@ impl AdapterRegistry {
         adapter.handle_command(zone_id, command).await
     }
 
+    /// Whether a provider owns transport commands through this registry.
+    /// Legacy adapters have dedicated fields and routes, so the shared knob
+    /// route uses this to distinguish registry-backed providers from unknown
+    /// zone prefixes without maintaining another hard-coded list.
+    pub async fn has_adapter(&self, prefix: &str) -> bool {
+        self.adapters.read().await.contains_key(prefix)
+    }
+
     pub async fn search_library(
         &self,
         prefix: &str,

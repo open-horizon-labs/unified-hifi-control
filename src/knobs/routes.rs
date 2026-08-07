@@ -557,12 +557,21 @@ pub async fn knob_control_handler(
             req.value.as_ref(),
         )
         .await;
-    } else if req.zone_id.starts_with("spotify:") {
-        return control_spotify(&state, &req.zone_id, &req.action, req.value.as_ref()).await;
     }
 
     if !req.zone_id.starts_with("roon:") && req.zone_id.contains(':') {
         let prefix = req.zone_id.split(':').next().unwrap_or_default();
+        if state.adapter_registry.has_adapter(prefix).await {
+            return control_registry_provider(
+                &state,
+                prefix,
+                &req.zone_id,
+                &req.action,
+                req.value.as_ref(),
+                prefix,
+            )
+            .await;
+        }
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -844,47 +853,59 @@ async fn control_hqplayer(
     }
 }
 
-/// Control a Spotify Connect device through the provider adapter registry.
-async fn control_spotify(
+fn adapter_command_for_action(
+    provider: &str,
+    action: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<AdapterCommand, String> {
+    match action {
+        "play" => Ok(AdapterCommand::Play),
+        "pause" => Ok(AdapterCommand::Pause),
+        "play_pause" | "playpause" => Ok(AdapterCommand::PlayPause),
+        "next" => Ok(AdapterCommand::Next),
+        "previous" | "prev" => Ok(AdapterCommand::Previous),
+        "stop" => Ok(AdapterCommand::Stop),
+        "vol_abs" | "volume" => Ok(AdapterCommand::VolumeAbsolute(
+            value.and_then(|v| v.as_f64()).unwrap_or(50.0) as i32,
+        )),
+        "vol_up" | "volume_up" => Ok(AdapterCommand::VolumeRelative(
+            value.and_then(|v| v.as_f64()).unwrap_or(1.0).round() as i32,
+        )),
+        "vol_down" | "volume_down" => Ok(AdapterCommand::VolumeRelative(
+            -(value.and_then(|v| v.as_f64()).unwrap_or(1.0).round() as i32),
+        )),
+        _ => Err(format!("Unknown {provider} action: {action}")),
+    }
+}
+
+async fn control_registry_provider(
     state: &AppState,
+    prefix: &str,
     zone_id: &str,
     action: &str,
     value: Option<&serde_json::Value>,
+    provider: &str,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let command = match action {
-        "play" => AdapterCommand::Play,
-        "pause" => AdapterCommand::Pause,
-        "play_pause" | "playpause" => AdapterCommand::PlayPause,
-        "next" => AdapterCommand::Next,
-        "previous" | "prev" => AdapterCommand::Previous,
-        "stop" => AdapterCommand::Stop,
-        "vol_abs" | "volume" => {
-            AdapterCommand::VolumeAbsolute(value.and_then(|v| v.as_f64()).unwrap_or(50.0) as i32)
-        }
-        "vol_up" | "volume_up" => AdapterCommand::VolumeRelative(
-            value.and_then(|v| v.as_f64()).unwrap_or(1.0).round() as i32,
-        ),
-        "vol_down" | "volume_down" => AdapterCommand::VolumeRelative(
-            -(value.and_then(|v| v.as_f64()).unwrap_or(1.0).round() as i32),
-        ),
-        _ => {
+    let command = match adapter_command_for_action(provider, action, value) {
+        Ok(command) => command,
+        Err(error) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Unknown Spotify action: {action}")})),
+                Json(serde_json::json!({"error": error})),
             ));
         }
     };
 
     match state
         .adapter_registry
-        .command("spotify", zone_id, command)
+        .command(prefix, zone_id, command)
         .await
     {
         Ok(response) if response.success => Ok(Json(serde_json::json!({"ok": true}))),
         Ok(response) => Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": response.error.unwrap_or_else(|| "Spotify command failed".to_string())
+                "error": response.error.unwrap_or_else(|| format!("{provider} command failed"))
             })),
         )),
         Err(error) => Err((
@@ -1668,5 +1689,17 @@ mod tests {
             sha_a, sha_b,
             "Special chars in names should not cause collision"
         );
+    }
+
+    #[test]
+    fn apple_music_web_controls_use_adapter_commands() {
+        assert!(matches!(
+            adapter_command_for_action("Apple Music", "pause", None),
+            Ok(AdapterCommand::Pause)
+        ));
+        assert!(matches!(
+            adapter_command_for_action("Apple Music", "next", None),
+            Ok(AdapterCommand::Next)
+        ));
     }
 }
