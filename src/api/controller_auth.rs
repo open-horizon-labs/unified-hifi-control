@@ -265,8 +265,7 @@ fn requires_controller_auth(path: &str) -> bool {
     // the callback must be authorized by its single-use pending OAuth state
     // and PKCE exchange instead of the browser session. Start/configure,
     // account, and revoke remain controller-owned operations.
-    (path.starts_with("/api/providers/")
-        && path != "/api/providers/spotify/oauth/callback")
+    (path.starts_with("/api/providers/") && path != "/api/providers/spotify/oauth/callback")
         || matches!(
             path,
             "/api/bridges/applemusic/pair" | "/api/bridges/applemusic/status"
@@ -302,7 +301,9 @@ fn is_native_bridge(path: &str) -> bool {
 }
 
 fn is_protected(path: &str, method: &axum::http::Method) -> bool {
-    if path.starts_with("/api/providers/") || path == "/mcp" {
+    if path.starts_with("/api/providers/") && path != "/api/providers/spotify/oauth/callback"
+        || path == "/mcp"
+    {
         return true;
     }
     if path == "/api/settings" {
@@ -477,6 +478,10 @@ mod tests {
         ));
         assert!(!requires_controller_auth(
             "/api/providers/spotify/oauth/callback"
+        ));
+        assert!(!is_protected(
+            "/api/providers/spotify/oauth/callback",
+            &axum::http::Method::GET
         ));
         assert!(requires_controller_auth("/api/providers/spotify/account"));
         assert!(requires_controller_auth("/api/bridges/applemusic/pair"));
