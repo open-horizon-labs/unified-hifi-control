@@ -198,6 +198,7 @@ pub enum TransportRoute {
     Lms,
     OpenHome,
     Upnp,
+    HqPlayer,
     AppleMusic,
     Spotify,
     MusicAssistant,
@@ -217,6 +218,7 @@ pub enum VolumeRoute {
     Lms,
     OpenHome,
     Upnp,
+    HqPlayer,
     AppleMusic,
     Spotify,
     MusicAssistant,
@@ -315,7 +317,7 @@ impl ZoneTarget {
             Self::Spotify => TransportRoute::Spotify,
             Self::MusicAssistant => TransportRoute::MusicAssistant,
             // Recognised, and genuinely not wired. #328.
-            Self::HqPlayer => TransportRoute::Refused(self),
+            Self::HqPlayer => TransportRoute::HqPlayer,
             // #398: was Roon for both of these.
             Self::Unprefixed | Self::Unknown => TransportRoute::Refused(self),
         }
@@ -332,7 +334,7 @@ impl ZoneTarget {
             Self::AppleMusic => VolumeRoute::AppleMusic,
             Self::Spotify => VolumeRoute::Spotify,
             Self::MusicAssistant => VolumeRoute::MusicAssistant,
-            Self::HqPlayer => VolumeRoute::Refused(self),
+            Self::HqPlayer => VolumeRoute::HqPlayer,
             Self::Unprefixed | Self::Unknown => VolumeRoute::Refused(self),
         }
     }

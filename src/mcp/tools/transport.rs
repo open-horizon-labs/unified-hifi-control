@@ -52,8 +52,10 @@
 
 use crate::adapters::AdapterCommand;
 use crate::api::AppState;
+use crate::knobs::routes::{dispatch_hqplayer_action, HqpDispatchError};
 use crate::mcp::capabilities::{support, Capability};
 use crate::mcp::envelope::{Envelope, Observed, Refusal, Scope};
+use crate::mcp::envelope::Provider;
 use crate::mcp::routing::{
     unplaceable_zone_refusal, unplaceable_zone_text, TransportRoute, VolumeRoute, ZoneTarget,
     CONTROL_ACTIONS, TRANSPORT_ACTIONS,
@@ -87,6 +89,12 @@ pub async fn handle_control(
     state: &AppState,
     args: HifiControlTool,
 ) -> Result<CallToolResult, CallToolError> {
+    // HQPlayer has a provider-specific action vocabulary and resolves through
+    // HqpInstanceManager rather than the shared adapter path.
+    if ZoneTarget::classify(&args.zone_id) == ZoneTarget::HqPlayer {
+        return handle_hqplayer_control(state, args).await;
+    }
+
     // The action is checked first, and before the zone is classified. It is a
     // closed set with no I/O behind it, so this is the cheapest fault to name —
     // and naming it does not depend on the zone id being right.
@@ -200,6 +208,8 @@ pub async fn handle_control(
             )
             .await
         }
+        // Handled before routing above; retained for exhaustiveness.
+        TransportRoute::HqPlayer => unreachable_refused(),
         // Handled above; kept exhaustive rather than caught by a wildcard so a
         // new route variant fails to compile instead of falling through.
         TransportRoute::Refused(_) => unreachable_refused(),
@@ -245,6 +255,53 @@ pub async fn handle_control(
     }
 }
 
+/// The action vocabulary a direct HQPlayer zone accepts through `hifi_control`.
+const HQPLAYER_CONTROL_ACTIONS: &[&str] = &[
+    "play", "pause", "playpause", "next", "previous", "prev", "stop", "seek", "mute",
+    "volume_set", "volume_up", "volume_down",
+];
+
+pub(crate) async fn handle_hqplayer_control(
+    state: &AppState,
+    args: HifiControlTool,
+) -> Result<CallToolResult, CallToolError> {
+    if !HQPLAYER_CONTROL_ACTIONS.contains(&args.action.as_str()) {
+        return unknown_action_with_accepted(state, &args.zone_id, &args.action, HQPLAYER_CONTROL_ACTIONS).await;
+    }
+    let env = Envelope::write("hifi_control", hqplayer_operation(&args.action))
+        .param("zone_id", &*args.zone_id)
+        .param("action", &*args.action)
+        .scope(Scope::for_zone(state, &args.zone_id, Provider::HqPlayer).await);
+    let instance_name = args.zone_id.strip_prefix("hqplayer:").unwrap_or(&args.zone_id);
+    let dispatch_action = if args.action == "volume_set" { "volume" } else { args.action.as_str() };
+    let resolved_value = match args.action.as_str() {
+        "volume_up" | "volume_down" => Some(args.value.unwrap_or(DEFAULT_VOLUME_DELTA)),
+        _ => args.value,
+    };
+    let env = match resolved_value { Some(value) => env.param("value", value), None => env };
+    match dispatch_hqplayer_action(state, &args.zone_id, instance_name, dispatch_action, resolved_value).await {
+        Ok(()) => {
+            let observed = Observed::from_aggregator(state, &args.zone_id).await;
+            Ok(env.observed(observed).text_result(format!("Action '{}' executed and verified state was published.", args.action)))
+        }
+        Err(HqpDispatchError::NotFound(message)) => env.failed(message),
+        Err(HqpDispatchError::BadRequest { message, .. }) => env.refused(message, Refusal::invalid_parameter(
+            "value", &["a value valid for the selected HQPlayer action"],
+            "The action was rejected against the zone state published by the aggregator.",
+        )),
+        Err(HqpDispatchError::Backend(message)) => env.failed(message),
+    }
+}
+
+fn hqplayer_operation(action: &str) -> &'static str {
+    match action {
+        "play" => "play", "pause" => "pause", "stop" => "stop", "next" => "next",
+        "previous" | "prev" => "previous", "playpause" => "play_pause", "seek" => "seek",
+        "mute" => "mute", "volume_set" => "volume_absolute",
+        "volume_up" | "volume_down" => "volume_relative", _ => "unknown_action",
+    }
+}
+
 /// Refuse an action outside [`CONTROL_ACTIONS`].
 ///
 /// `operation` is the literal `"unknown_action"` rather than the string the client
@@ -256,6 +313,15 @@ async fn unknown_action(
     zone_id: &str,
     action: &str,
 ) -> Result<CallToolResult, CallToolError> {
+    unknown_action_with_accepted(state, zone_id, action, CONTROL_ACTIONS).await
+}
+
+async fn unknown_action_with_accepted(
+    state: &AppState,
+    zone_id: &str,
+    action: &str,
+    accepted: &'static [&'static str],
+) -> Result<CallToolResult, CallToolError> {
     Envelope::write("hifi_control", "unknown_action")
         .param("zone_id", zone_id)
         .param("action", action)
@@ -263,11 +329,11 @@ async fn unknown_action(
         .refused(
             format!(
                 "Unknown action '{action}'. Valid actions: {}.",
-                CONTROL_ACTIONS.join(", ")
+                accepted.join(", ")
             ),
             Refusal::invalid_parameter(
                 "action",
-                CONTROL_ACTIONS,
+                accepted,
                 "hifi_control's action set is closed. Until #398 an unrecognised action was \
                  forwarded to the backend, which then answered about whatever it thought you \
                  meant; now it is refused here, with the whole set.",
@@ -316,6 +382,7 @@ async fn set_volume(
         | VolumeRoute::MusicAssistant
         | VolumeRoute::Lms
         | VolumeRoute::Roon
+        | VolumeRoute::HqPlayer
         | VolumeRoute::Refused(_) => env.param("value", value),
     };
 
@@ -366,6 +433,7 @@ async fn set_volume(
             )
             .await
         }
+        VolumeRoute::HqPlayer => unreachable_refused(),
         VolumeRoute::Refused(_) => unreachable_refused(),
     };
 

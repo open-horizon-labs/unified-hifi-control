@@ -301,6 +301,7 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 | (ZoneTarget::Lms, TransportRoute::Lms)
                 | (ZoneTarget::OpenHome, TransportRoute::OpenHome)
                 | (ZoneTarget::Upnp, TransportRoute::Upnp)
+                | (ZoneTarget::HqPlayer, TransportRoute::HqPlayer)
                 | (ZoneTarget::Spotify, TransportRoute::Spotify)
                 | (ZoneTarget::MusicAssistant, TransportRoute::MusicAssistant)
         ),
@@ -314,6 +315,7 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                     | (ZoneTarget::Lms, TransportRoute::Lms)
                     | (ZoneTarget::OpenHome, TransportRoute::OpenHome)
                     | (ZoneTarget::Upnp, TransportRoute::Upnp)
+                    | (ZoneTarget::HqPlayer, TransportRoute::HqPlayer)
                     | (ZoneTarget::Spotify, TransportRoute::Spotify)
                     | (ZoneTarget::MusicAssistant, TransportRoute::MusicAssistant)
             );
@@ -327,6 +329,7 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 | (ZoneTarget::Lms, VolumeRoute::Lms)
                 | (ZoneTarget::OpenHome, VolumeRoute::OpenHome)
                 | (ZoneTarget::Upnp, VolumeRoute::Upnp)
+                | (ZoneTarget::HqPlayer, VolumeRoute::HqPlayer)
                 | (ZoneTarget::Spotify, VolumeRoute::Spotify)
                 | (ZoneTarget::MusicAssistant, VolumeRoute::MusicAssistant)
         ),
@@ -343,8 +346,8 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
             )
         }
         Capability::RepeatMode | Capability::ShuffleMode => {
-            target == ZoneTarget::Spotify
-                && matches!(target.for_transport(), TransportRoute::Spotify)
+            (target == ZoneTarget::Spotify && matches!(target.for_transport(), TransportRoute::Spotify))
+                || target == ZoneTarget::HqPlayer
         }
         Capability::QueueRead
         | Capability::Browse
@@ -615,13 +618,9 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::AppleMusic, Capability::Volume, Gap::NotWired("#465", APPLE_TRANSPORT_NOT_VALIDATED)),
 
     // -------------------------------------------------------------------------
-    // HQPlayer. Nothing is routed -- hifi_zones lists these zones and
-    // hifi_control cannot reach any of them. The largest gap #398 found, and the
-    // one it does not close.
+    // HQPlayer content remains unverified; transport, volume, and pipeline mode
+    // control are routed through HqpInstanceManager.
     // -------------------------------------------------------------------------
-    (ZoneTarget::HqPlayer, Capability::Transport, Gap::NotWired("#328", HQPLAYER_ADAPTER_HAS_IT)),
-    (ZoneTarget::HqPlayer, Capability::TransportSkip, Gap::NotWired("#328", HQPLAYER_ADAPTER_HAS_IT)),
-    (ZoneTarget::HqPlayer, Capability::Volume, Gap::NotWired("#328", HQPLAYER_ADAPTER_HAS_IT)),
     (ZoneTarget::HqPlayer, Capability::Search, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::PlayByQuery, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::PlayByRef, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
@@ -632,8 +631,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::HqPlayer, Capability::QueueRemove, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::QueueClear, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::PlayNext, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
-    (ZoneTarget::HqPlayer, Capability::RepeatMode, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
-    (ZoneTarget::HqPlayer, Capability::ShuffleMode, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::SavedPlaylists, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::Favorites, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
     (ZoneTarget::HqPlayer, Capability::MultiroomSync, Gap::NotWired("#209", HQPLAYER_CONTENT_UNVERIFIED)),
@@ -968,23 +965,15 @@ mod tests {
         }
     }
 
-    /// HQPlayer zones appear in `hifi_zones` and nothing is wired to them. The
-    /// honest state is a gap with a tracking issue — never a provider limit,
-    /// since the adapter has the methods.
+    /// HQPlayer transport and volume are routed through its instance manager.
     #[test]
-    fn hqplayer_transport_and_volume_are_gaps_tracked_by_328() {
+    fn hqplayer_transport_and_volume_are_supported_since_328() {
         for capability in [
             Capability::Transport,
             Capability::TransportSkip,
             Capability::Volume,
         ] {
-            match support(ZoneTarget::HqPlayer, capability) {
-                Support::NotImplemented { tracked_by, .. } => assert_eq!(tracked_by, "#328"),
-                other => panic!(
-                    "hqplayer/{}: expected a gap tracked by #328, got {other:?}",
-                    capability.name()
-                ),
-            }
+            assert_eq!(support(ZoneTarget::HqPlayer, capability), Support::Supported);
         }
     }
 
