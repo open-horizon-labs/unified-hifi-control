@@ -26,7 +26,7 @@ public enum BridgeClientError: Error, LocalizedError, Sendable {
         case .invalidResponse:
             return "UHC returned an invalid Apple Music bridge response."
         case let .httpStatus(status, detail):
-            return "UHC Apple Music bridge returned HTTP (status): (detail)"
+            return "UHC Apple Music bridge returned HTTP \(status): \(detail)"
         case .notConfigured:
             return "The Apple Music bridge has not been claimed by this companion."
         }
@@ -240,7 +240,11 @@ public actor AppleMusicBridgeClient {
 public actor AppleMusicCompanionHost {
     public let bridge: AppleMusicBridgeClient
 
-    public init(bridgeBaseURL: URL) {
+    public let companionID: String
+
+    public init(bridgeBaseURL: URL, companionID: String) {
+        precondition(!companionID.isEmpty && !companionID.contains(":"), "companionID must be a non-empty owner-safe identifier")
+        self.companionID = companionID
         bridge = AppleMusicBridgeClient(baseURL: bridgeBaseURL)
     }
 
@@ -260,9 +264,11 @@ public actor AppleMusicCompanionHost {
         try await bridge.publish(snapshot: snapshot)
     }
 
-    /// Poll once and execute each command exactly once from the host's point
+    /// Poll once and execute each command at least once from the host's point
     /// of view. The server's acknowledgement removes the command from its
-    /// delivery queue; a rejected command is still acknowledged with `ok=false`.
+    /// delivery queue; a crash before acknowledgement may cause a redelivery,
+    /// so host command handlers must deduplicate by command ID before driving
+    /// non-idempotent operations.
     public func pollAndHandle(
         _ handler: @Sendable (MusicKitWireCommand) async throws -> Void
     ) async throws {
@@ -387,6 +393,17 @@ public actor SystemMusicPlayerCompanion {
         try await player.skipToPreviousEntry()
     }
 
+    public func execute(_ command: MusicKitWireCommand) async throws {
+        switch command {
+        case .play: try await play()
+        case .pause: pause()
+        case .next: try await skipToNextItem()
+        case .previous: try await skipToPreviousItem()
+        case .toggle, .stop, .setVolume, .adjustVolume, .setMute:
+            throw CompanionCommandError.notValidated(command)
+        }
+    }
+
     /// Catalog search stays on the signed companion. The returned projection
     /// contains only fields UHC needs for opaque-ref search results; Apple
     /// identifiers remain inside the host app until #463's content transport
@@ -428,6 +445,18 @@ public actor SystemMusicPlayerCompanion {
     /// state until the companion publishes a validated snapshot.
     public func playNext(song: Song) async throws {
         try await player.queue.insert(song, position: .afterCurrentEntry)
+    }
+}
+
+@available(iOS 17.0, *)
+public enum CompanionCommandError: Error, LocalizedError, Sendable {
+    case notValidated(MusicKitWireCommand)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .notValidated(command):
+            "Apple Music command is not validated on this companion: \(command)."
+        }
     }
 }
 
