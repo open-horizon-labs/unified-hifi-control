@@ -232,10 +232,10 @@ public actor AppleMusicBridgeClient {
 
 /// Host-app lifecycle coordinator for the signed iPhone companion.
 ///
-/// Snapshot projection remains an injected closure because the exact
-/// SystemMusicPlayer observation surface is an acceptance question for #465.
-/// This coordinator still makes authorization, claim, publication, command
-/// execution, acknowledgement, and revoke consistent for a real host app.
+/// The coordinator publishes a bounded documented player projection while
+/// leaving unvalidated volume/route details unknown. It makes authorization,
+/// claim, publication, command execution, acknowledgement, and revoke
+/// consistent for a real host app.
 @available(iOS 17.0, *)
 public actor AppleMusicCompanionHost {
     private static let maxRememberedCommandOutcomes = 128
