@@ -449,11 +449,7 @@ impl AppleBridgeRegistry {
         Ok(command_id)
     }
 
-    pub async fn enqueue_content(
-        &self,
-        operation: &str,
-        params: Value,
-    ) -> Result<String> {
+    pub async fn enqueue_content(&self, operation: &str, params: Value) -> Result<String> {
         let mut state = self.inner.write().await;
         let now = now_secs();
         let session = state
@@ -570,7 +566,9 @@ impl AppleBridgeRegistry {
                                 session.content_completed.remove(&oldest);
                             }
                         }
-                        session.content_completed.insert(request_id.to_string(), result.clone());
+                        session
+                            .content_completed
+                            .insert(request_id.to_string(), result.clone());
                         session.content_results.remove(request_id);
                         return result.map_err(anyhow::Error::msg);
                     }
@@ -734,11 +732,7 @@ impl MusicKitCompanion for PairedMusicKitCompanion {
             .await
     }
 
-    async fn content(
-        &self,
-        operation: &str,
-        params: &Value,
-    ) -> Result<Value> {
+    async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
         let request_id = self
             .registry
             .enqueue_content(operation, params.clone())
@@ -768,10 +762,11 @@ pub async fn pair(
     State(state): State<AppState>,
     Json(request): Json<PairRequest>,
 ) -> Result<Json<PairingResponse>, (StatusCode, Json<ErrorBody>)> {
-    validate_bridge_id(&request.bridge_id).map_err(|message| {
-        error(StatusCode::BAD_REQUEST, &message, "pairing_failed")
-    })?;
-    Ok(Json(state.apple_bridges.create_pairing(request.bridge_id).await))
+    validate_bridge_id(&request.bridge_id)
+        .map_err(|message| error(StatusCode::BAD_REQUEST, &message, "pairing_failed"))?;
+    Ok(Json(
+        state.apple_bridges.create_pairing(request.bridge_id).await,
+    ))
 }
 
 pub async fn claim(
@@ -865,7 +860,13 @@ pub async fn content(
         .poll_content(&token)
         .await
         .map(Json)
-        .map_err(|e| error(StatusCode::UNAUTHORIZED, &e.to_string(), "bridge_unauthorized"))
+        .map_err(|e| {
+            error(
+                StatusCode::UNAUTHORIZED,
+                &e.to_string(),
+                "bridge_unauthorized",
+            )
+        })
 }
 
 pub async fn acknowledge(
@@ -901,7 +902,13 @@ pub async fn acknowledge_content(
         .acknowledge_content(&token, &request_id, result)
         .await
         .map(|_| StatusCode::NO_CONTENT)
-        .map_err(|e| error(StatusCode::BAD_REQUEST, &e.to_string(), "content_ack_failed"))
+        .map_err(|e| {
+            error(
+                StatusCode::BAD_REQUEST,
+                &e.to_string(),
+                "content_ack_failed",
+            )
+        })
 }
 
 #[derive(Debug, Serialize)]
@@ -946,7 +953,10 @@ fn validate_bridge_id(value: &str) -> Result<(), String> {
     if value.contains(':') {
         return Err("bridge_id must not contain ':'".to_string());
     }
-    if value.chars().any(|character| character.is_whitespace() || character.is_control()) {
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
         return Err("bridge_id must not contain whitespace or control characters".to_string());
     }
     Ok(())
@@ -988,14 +998,22 @@ fn enqueue_content_in_session(
             | "favorite_remove"
             | "rating_set"
     );
-    if mutation && !params.get("confirm").and_then(Value::as_bool).unwrap_or(false) {
+    if mutation
+        && !params
+            .get("confirm")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
         bail!("Apple Music mutation requires confirm=true");
     }
     if mutation && idempotency_key.is_none() {
         bail!("Apple Music mutation requires idempotency_key");
     }
     let precondition = params.get("precondition").cloned();
-    let confirm = params.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+    let confirm = params
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if session.content_commands.len() >= MAX_CONTENT_COMMANDS
         || session.content_results.len() >= MAX_CONTENT_RESULTS
     {
@@ -1267,7 +1285,10 @@ mod tests {
             .enqueue_content_for_player("application", "playlist_add", params)
             .await
             .expect("retry is accepted");
-        assert_eq!(retry_id, request_id, "same idempotency key must not duplicate work");
+        assert_eq!(
+            retry_id, request_id,
+            "same idempotency key must not duplicate work"
+        );
 
         let requests = registry
             .poll_content(&claim.access_token)
@@ -1277,7 +1298,10 @@ mod tests {
         assert_eq!(requests[0].request_id, request_id);
         assert!(requests[0].confirm);
         assert_eq!(requests[0].idempotency_key.as_deref(), Some("add-1"));
-        assert_eq!(requests[0].precondition, Some(serde_json::json!({"playlist_version": 3})));
+        assert_eq!(
+            requests[0].precondition,
+            Some(serde_json::json!({"playlist_version": 3}))
+        );
 
         registry
             .acknowledge_content(
@@ -1573,10 +1597,7 @@ mod tests {
             .update_snapshot(&claim.access_token, snapshot_for("player"))
             .await
             .is_err());
-        assert!(registry
-            .poll_commands(&claim.access_token)
-            .await
-            .is_err());
+        assert!(registry.poll_commands(&claim.access_token).await.is_err());
     }
 
     #[tokio::test]

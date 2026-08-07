@@ -18,16 +18,16 @@ The iPhone command path synthesizes `toggle` from the documented
 Commands whose semantics are not exposed by the validated system-player
 surface—stop, volume, mute, and repeat/shuffle—remain explicit refusals rather
 than silently mapping to a different operation.
-The content/queue methods are companion-local building blocks: they are not
-yet exposed through UHC's bridge transport, and their queue, route, artwork,
-volume, and now-playing behavior remains unclaimed until demonstrated on a
-physical device (#465). Their Apple identifiers must become owner-scoped
-opaque references before any result crosses the bridge (#463).
+The content/queue methods are exposed through UHC's approved bridge transport.
+Their queue, route, artwork, volume, and now-playing behavior remains subject
+to physical-device acceptance (#465). Apple identifiers stay inside the
+companion; results cross the bridge only as owner-scoped opaque references.
 
 The package also exposes narrowly scoped native mutations for confirmed
-playlist creation and appending an exact song. It deliberately does not offer
-generic playlist deletion/reorder/removal; those operations need a separate
-approved content contract and ownership/conflict checks (#484).
+playlist creation, metadata editing, and appending an exact song. It
+deliberately does not offer generic playlist deletion/reorder/removal or
+unfavorite operations; those remain refused until Apple documents a safe
+operation and UHC has an ownership/conflict model (#484).
 
 The host app owns authorization, lifecycle, snapshot publication, and the
 bridge transport. `KeychainAppleMusicCompanionInstallationStore` persists the

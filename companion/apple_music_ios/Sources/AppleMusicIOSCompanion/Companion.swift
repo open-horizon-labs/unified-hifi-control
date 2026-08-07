@@ -330,6 +330,7 @@ public actor AppleMusicBridgeClient {
 @available(iOS 17.0, *)
 public actor AppleMusicCompanionHost {
     private static let maxRememberedCommandOutcomes = 128
+    private static let maxRememberedContentOutcomes = 128
     public let bridge: AppleMusicBridgeClient
 
     public let companionID: String
@@ -341,6 +342,8 @@ public actor AppleMusicCompanionHost {
     /// exactly-once: a crash during the handler before persistence can retry.
     private var commandOutcomes: [String: Bool]
     private var commandOutcomeOrder: [String] = []
+    private var contentOutcomes: [String: MusicKitContentResult]
+    private var contentOutcomeOrder: [String] = []
 
     public init(
         bridgeBaseURL: URL,
@@ -353,6 +356,7 @@ public actor AppleMusicCompanionHost {
         installation = AppleMusicCompanionInstallation(baseURL: bridgeBaseURL, companionID: companionID)
         installationStore = store
         commandOutcomes = [:]
+        contentOutcomes = [:]
     }
 
     /// Restore a paired installation from secure host storage. The default
@@ -369,6 +373,8 @@ public actor AppleMusicCompanionHost {
         bridge = AppleMusicBridgeClient(baseURL: installation.baseURL, accessToken: installation.accessToken)
         commandOutcomes = Array(installation.commandOutcomes.prefix(Self.maxRememberedCommandOutcomes)).reduce(into: [:]) { $0[$1.key] = $1.value }
         commandOutcomeOrder = Array(commandOutcomes.keys)
+        contentOutcomes = Array(installation.contentOutcomes.prefix(Self.maxRememberedContentOutcomes)).reduce(into: [:]) { $0[$1.key] = $1.value }
+        contentOutcomeOrder = Array(contentOutcomes.keys)
     }
 
     @discardableResult
@@ -385,8 +391,11 @@ public actor AppleMusicCompanionHost {
         saved.bridgeID = bridgeID
         saved.accessToken = response.accessToken
         saved.commandOutcomes = [:]
+        saved.contentOutcomes = [:]
         commandOutcomes.removeAll(keepingCapacity: true)
         commandOutcomeOrder.removeAll(keepingCapacity: true)
+        contentOutcomes.removeAll(keepingCapacity: true)
+        contentOutcomeOrder.removeAll(keepingCapacity: true)
         installation = saved
         try installationStore.save(saved)
         return response
@@ -451,22 +460,40 @@ public actor AppleMusicCompanionHost {
         _ handler: @Sendable (MusicKitContentCommand) async throws -> MusicKitContentResult
     ) async throws {
         for request in try await bridge.pollContent() {
+            if let priorOutcome = contentOutcomes[request.requestID] {
+                try await bridge.acknowledgeContent(request.requestID, result: priorOutcome)
+                continue
+            }
+            let result: MusicKitContentResult
             do {
-                try await bridge.acknowledgeContent(request.requestID, result: try await handler(request))
+                result = try await handler(request)
             } catch {
-                try await bridge.acknowledgeContent(
-                    request.requestID,
-                    result: MusicKitContentResult(
-                        outcome: "failed",
-                        error: MusicKitContentError(
-                            code: "companion_failed",
-                            message: String(error.localizedDescription.prefix(512)),
-                            retryable: true
-                        )
+                result = MusicKitContentResult(
+                    outcome: "failed",
+                    error: MusicKitContentError(
+                        code: "companion_failed",
+                        message: String(error.localizedDescription.prefix(512)),
+                        retryable: true
                     )
                 )
             }
+            // Persist before acknowledging. If the HTTP acknowledgement is
+            // lost, the bridge may redeliver, but the native mutation will not
+            // run twice; the cached result is replayed instead.
+            try await rememberContentOutcome(request.requestID, result: result)
+            try await bridge.acknowledgeContent(request.requestID, result: result)
         }
+    }
+
+    private func rememberContentOutcome(_ requestID: String, result: MusicKitContentResult) async throws {
+        contentOutcomes[requestID] = result
+        contentOutcomeOrder.removeAll { $0 == requestID }
+        contentOutcomeOrder.append(requestID)
+        while contentOutcomeOrder.count > Self.maxRememberedContentOutcomes {
+            contentOutcomes.removeValue(forKey: contentOutcomeOrder.removeFirst())
+        }
+        installation.contentOutcomes = contentOutcomes
+        try installationStore.save(installation)
     }
 }
 
@@ -786,6 +813,59 @@ public actor SystemMusicPlayerCompanion {
                 return AppleMusicBridgeSearchItem(title: song.title, subtitle: song.artistName, uri: mintHandle(for: song))
             }
             return MusicKitContentResult(outcome: "success", data: try jsonValue(entries))
+        case "playlist_create":
+            guard let name = stringParam(request.params, "name") else {
+                return invalidContentResult("name is required")
+            }
+            let playlist = try await createPlaylist(
+                name: name,
+                description: stringParam(request.params, "description")
+            )
+            let handle = mintPlaylistHandle(for: playlist)
+            return MusicKitContentResult(
+                outcome: "success",
+                data: try jsonValue(AppleMusicBridgePlaylistSummary(ref: handle, title: playlist.name))
+            )
+        case "playlist_update":
+            guard let reference = stringParam(request.params, "id") ?? stringParam(request.params, "uri"),
+                  let playlist = playlistHandles[reference] else {
+                return MusicKitContentResult(
+                    outcome: "not_found",
+                    error: MusicKitContentError(code: "unknown_ref", message: "Playlist handle is unknown or expired.", retryable: false)
+                )
+            }
+            let updated = try await MusicLibrary.shared.edit(
+                playlist,
+                name: stringParam(request.params, "name"),
+                description: stringParam(request.params, "description"),
+                authorDisplayName: nil
+            )
+            let handle = mintPlaylistHandle(for: updated)
+            return MusicKitContentResult(
+                outcome: "success",
+                data: try jsonValue(AppleMusicBridgePlaylistSummary(ref: handle, title: updated.name))
+            )
+        case "playlist_add":
+            guard let playlistReference = stringParam(request.params, "id") ?? stringParam(request.params, "playlist_ref"),
+                  let playlist = playlistHandles[playlistReference] else {
+                return MusicKitContentResult(
+                    outcome: "not_found",
+                    error: MusicKitContentError(code: "unknown_ref", message: "Playlist handle is unknown or expired.", retryable: false)
+                )
+            }
+            guard let songReference = stringParam(request.params, "uri") ?? stringParam(request.params, "item_ref"),
+                  let song = handles[songReference] else {
+                return MusicKitContentResult(
+                    outcome: "not_found",
+                    error: MusicKitContentError(code: "unknown_ref", message: "Song handle is unknown or expired.", retryable: false)
+                )
+            }
+            let updated = try await add(song: song, to: playlist)
+            let handle = mintPlaylistHandle(for: updated)
+            return MusicKitContentResult(
+                outcome: "success",
+                data: try jsonValue(AppleMusicBridgePlaylistSummary(ref: handle, title: updated.name))
+            )
         case "play_uri", "queue_uri":
             guard let handle = stringParam(request.params, "uri") else {
                 return invalidContentResult("uri is required")

@@ -1,10 +1,10 @@
 # Apple Music content bridge proposal (#463)
 
-This is a contract proposal, not an enabled API change. It extends the
-existing paired-companion command/acknowledgement envelopes only after #463 is
-approved and the repository's `api-change-approved` gate is applied. Until
-then, the iPhone package's catalog, library, recommendation, and playlist
-methods remain companion-local.
+This is the approved UHC companion content protocol. It extends the existing
+paired-companion command/acknowledgement envelopes; it is not Apple Music's
+API and it does not expose Apple credentials or raw Apple identifiers. The
+iPhone package uses this contract for catalog, library, recommendation,
+playlist retrieval, exact playback, and the supported playlist mutations.
 
 ## Companion readiness state
 
@@ -124,7 +124,8 @@ intent; it is never presented as full visibility into the iPhone system queue.
 
 ## Approval boundary
 
-This document records the proposed wire contract so #463 can review it. No
-route, HTTP method, or existing transport payload is changed by this file.
-Implementation begins only after explicit contract approval and the required
-repository label.
+The repository owner explicitly approved this additive UHC content protocol.
+The contract is intentionally separate from Apple's MusicKit API: the native
+companion translates these operations into documented MusicKit calls, while
+UHC owns routing, opaque references, bounded delivery, retries, and truthful
+outcomes.

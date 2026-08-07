@@ -147,8 +147,8 @@ pub async fn handle_apple_music(
                     &["applemusic:<companion>"],
                     "AirPlay routes are destinations, not execution-owner zones.",
                 ),
-        );
-    }
+            );
+        }
 
         let limit = args.limit.unwrap_or(10) as usize;
         let feedback = state.apple_feedback.recent(zone_id, limit).await;
@@ -160,14 +160,12 @@ pub async fn handle_apple_music(
         return Ok(Envelope::read("hifi_apple_music", "context")
             .param("action", "context")
             .param("zone_id", zone_id)
-            .json_result(
-                &json!({
-                    "zone_id": zone_id,
-                    "feedback": feedback,
-                    "listening_plan": plan,
-                    "observed_playback": observed_playback,
-                }),
-            ));
+            .json_result(&json!({
+                "zone_id": zone_id,
+                "feedback": feedback,
+                "listening_plan": plan,
+                "observed_playback": observed_playback,
+            })));
     }
 
     if args.action == "clear_feedback" {
@@ -318,8 +316,11 @@ pub async fn handle_apple_music(
         };
         let mut plan_items = Vec::with_capacity(items.len());
         for token in items {
-            let Some(crate::mcp::refs::RefTarget::AppleMusic { title, companion_id, .. }) =
-                state.mcp_refs.resolve(token).await
+            let Some(crate::mcp::refs::RefTarget::AppleMusic {
+                title,
+                companion_id,
+                ..
+            }) = state.mcp_refs.resolve(token).await
             else {
                 return Envelope::write("hifi_apple_music", "queue_plan").refused(
                     "queue_plan contains an unknown, expired, or cross-provider ref.",
@@ -373,17 +374,21 @@ pub async fn handle_apple_music(
             .library_content("applemusic", "queue_plan", &params)
             .await
         {
-            Ok(value) => return Ok(env.json_result(&json!({
-                "plan": plan,
-                "provider": {"outcome": "accepted", "result": value}
-            }))),
-            Err(error) => return Ok(env.json_result(&json!({
-                "plan": plan,
-                "provider": {
-                    "outcome": "refused",
-                    "detail": error.to_string()
-                }
-            }))),
+            Ok(value) => {
+                return Ok(env.json_result(&json!({
+                    "plan": plan,
+                    "provider": {"outcome": "accepted", "result": value}
+                })))
+            }
+            Err(error) => {
+                return Ok(env.json_result(&json!({
+                    "plan": plan,
+                    "provider": {
+                        "outcome": "refused",
+                        "detail": error.to_string()
+                    }
+                })))
+            }
         }
     }
 
