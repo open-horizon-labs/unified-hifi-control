@@ -6,12 +6,18 @@ API and it does not expose Apple credentials or raw Apple identifiers. The
 iPhone package uses this contract for catalog, library, recommendation,
 playlist retrieval, exact playback, and the supported playlist mutations.
 
-## Companion readiness state
+## Companion readiness state (future wire extension)
 
-The existing boolean HTTP status and internal liveness classification are not
-enough to explain why a paired owner cannot play. The approved bridge extension
-should carry a bounded, non-secret readiness value alongside each published
-snapshot (and in the status projection):
+The current bridge does **not** publish a readiness field. Its stable,
+owner-scoped internal status is limited to `unpaired`, `awaiting_snapshot`,
+`reachable`, and `stale`; the legacy HTTP status remains the boolean
+compatibility projection. Do not infer authorization, subscription, account,
+or playback state from those values. The signed companion's authorization and
+native playback validation are still an external #465 gate.
+
+If a later, separately approved bridge extension needs to explain why a paired
+owner cannot play, it may carry a bounded, non-secret readiness value alongside
+each published snapshot (and in the status projection):
 
 ```text
 unpaired | awaiting_snapshot | authorization_needed | subscription_required |
@@ -27,10 +33,12 @@ publish or report its current state. The companion maps native MusicKit
 authorization and playback errors to these values; UHC never infers them from
 an absent track, a timeout, or a generic HTTP error.
 
-The value is deliberately separate from `playback_state`, `route`, and
+That value is deliberately separate from `playback_state`, `route`, and
 `liveness` so a reachable but paused player cannot be mistaken for an
-unauthorized account. No Apple account email, token, raw provider error, or
-subscription metadata crosses the bridge.
+unauthorized account. Until that extension is implemented and validated, the
+values after `reachable` in the list above are design vocabulary only; they are
+not current owner-status responses. No Apple account email, token, raw
+provider error, or subscription metadata crosses the bridge.
 
 ## Request envelope
 
