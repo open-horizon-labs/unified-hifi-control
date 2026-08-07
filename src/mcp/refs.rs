@@ -325,6 +325,14 @@ mod tests {
         }
     }
 
+    fn apple_target(companion_id: &str, handle: &str, title: &str) -> RefTarget {
+        RefTarget::AppleMusic {
+            companion_id: companion_id.to_string(),
+            handle: handle.to_string(),
+            title: title.to_string(),
+        }
+    }
+
     // =========================================================================
     // Opacity: nothing about the target is derivable from the token
     // =========================================================================
@@ -600,6 +608,9 @@ mod tests {
         let table = RefTable::new();
         let roon_token = table.mint(roon_target("1:1", "s", "R")).await;
         let lms_token = table.mint(lms_target(1, "L")).await;
+        let apple_token = table
+            .mint(apple_target("iphone", "companion-handle-123", "A"))
+            .await;
 
         assert_eq!(
             table.resolve(&roon_token).await.unwrap().provider(),
@@ -609,5 +620,27 @@ mod tests {
             table.resolve(&lms_token).await.unwrap().provider(),
             Provider::Lms
         );
+        let apple = table.resolve(&apple_token).await.unwrap();
+        assert_eq!(apple.provider(), Provider::AppleMusic);
+        assert_eq!(apple.title(), "A");
+        assert!(matches!(
+            apple,
+            RefTarget::AppleMusic { companion_id, handle, .. }
+                if companion_id == "iphone" && handle == "companion-handle-123"
+        ));
+    }
+
+    #[tokio::test]
+    async fn apple_refs_are_opaque_and_companion_scoped_in_the_table() {
+        let table = RefTable::new();
+        let token = table
+            .mint(apple_target("iphone", "apple-catalog-id-should-not-leak", "Song"))
+            .await;
+        assert!(!token.contains("apple-catalog-id-should-not-leak"));
+        let target = table.resolve(&token).await.unwrap();
+        assert!(matches!(
+            target,
+            RefTarget::AppleMusic { companion_id, .. } if companion_id == "iphone"
+        ));
     }
 }
