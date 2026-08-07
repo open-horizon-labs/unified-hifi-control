@@ -694,7 +694,7 @@ fn retrieval_source_kind(action: &str) -> &'static str {
     match action {
         "library" | "favorites" => "library",
         "playlists" | "playlist_tracks" => "playlist",
-        "recent" => "history",
+        "recent" => "recent",
         "recommendations" => "recommendation",
         _ => "catalog",
     }
@@ -786,6 +786,20 @@ mod retrieval_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_content_failures_are_projected_without_losing_provider_outcome() {
+        let error = anyhow::Error::new(crate::api::apple_bridge::AppleContentFailure {
+            outcome: "unauthorized".to_string(),
+            code: "authorization_needed".to_string(),
+            message: "Authorize Apple Music on the companion.".to_string(),
+            retryable: true,
+        });
+        let payload = super::apple_content_failure_payload(&error).expect("typed failure");
+        assert_eq!(payload["outcome"], "unauthorized");
+        assert_eq!(payload["error"]["code"], "authorization_needed");
+        assert_eq!(payload["error"]["retryable"], true);
+    }
+
     #[test]
     fn owner_scoped_library_actions_require_a_companion_zone() {
         for action in [
