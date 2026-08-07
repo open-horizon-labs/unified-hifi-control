@@ -552,16 +552,6 @@ pub fn Settings() -> Element {
         .unwrap_or(false)
         || spotify_connected
         || spotify_local_setup_saved();
-    let musicassistant_zones = provider_zones_result
-        .as_ref()
-        .and_then(|result| result.as_ref().ok())
-        .map(|zones| {
-            zones
-                .iter()
-                .filter(|zone| zone.zone_id.starts_with("musicassistant:"))
-                .cloned()
-                .collect::<Vec<_>>()
-        });
     let apple_st = apple_bridge_status.read().clone().and_then(Result::ok);
     let callback_message = callback_feedback();
     let spotify_status_is_error = spotify_error().is_some();
@@ -852,39 +842,6 @@ pub fn Settings() -> Element {
                                             }
                                         } else {
                                             "Checking..."
-                                        }
-                                    } else {
-                                        span { class: "text-muted", "-" }
-                                    }
-                                }
-                            }
-                            // Music Assistant (remote adapter; zones arrive through the bus)
-                            tr { class: "border-b border-default",
-                                td { class: "py-2 px-3",
-                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-3",
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "checkbox",
-                                            aria_label: "Enable Music Assistant",
-                                            checked: musicassistant_enabled(),
-                                            onchange: move |_| {
-                                                musicassistant_enabled.toggle();
-                                                save_settings();
-                                            }
-                                        }
-                                    }
-                                }
-                                td { class: "py-2 px-3", "Music Assistant" }
-                                td { class: "py-2 px-3",
-                                    if musicassistant_enabled() {
-                                        if let Some(ref zones) = musicassistant_zones {
-                                            if zones.is_empty() {
-                                                span { class: "status-err", "✗ No players" }
-                                            } else {
-                                                span { class: "status-ok", "✓ {zones.len()} player(s)" }
-                                            }
-                                        } else {
-                                            "..."
                                         }
                                     } else {
                                         span { class: "text-muted", "-" }
