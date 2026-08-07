@@ -73,7 +73,7 @@ const SPOTIFY_SEARCH_LIMIT: usize = 10;
 /// Search for music
 #[mcp_tool(
     name = "hifi_search",
-    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins. Spotify: searches the Spotify catalog for a Spotify Connect zone. Apple Music: a paired companion catalog path is prepared but remains pending #481 and companion validation. Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play or queue that exact result.",
+    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins. Spotify: searches the Spotify catalog for a Spotify Connect zone. Apple Music: searches through a paired iPhone companion and returns owner-scoped opaque refs; physical companion validation remains tracked in #465. Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play or queue that exact result.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -91,7 +91,7 @@ pub struct HifiSearchTool {
 /// Search and play music in one command
 #[mcp_tool(
     name = "hifi_play",
-    description = "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. Apple Music play/queue through a paired companion is pending #481 and companion validation. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead."
+    description = "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. Apple Music play/queue uses a paired iPhone companion and owner-scoped opaque refs; physical validation remains tracked in #465. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiPlayTool {
@@ -110,7 +110,7 @@ pub struct HifiPlayTool {
 /// Play, queue, or start radio from a specific `hifi_search` result (#396)
 #[mcp_tool(
     name = "hifi_play_ref",
-    description = "Play or queue a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Refs are short-lived; call hifi_search again if one expires. zone_id must belong to the same provider (Roon, LMS, Spotify, or a paired Apple Music companion) the ref was minted for. Apple Music refs and play/queue remain pending #481 and companion validation.",
+    description = "Play or queue a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Refs are short-lived; call hifi_search again if one expires. zone_id must belong to the same provider (Roon, LMS, Spotify, or a paired Apple Music companion) the ref was minted for. Apple Music refs and play/queue use the paired iPhone companion; physical validation remains tracked in #465.",
     read_only_hint = false
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
