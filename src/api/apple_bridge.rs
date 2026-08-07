@@ -61,9 +61,9 @@ struct BridgeSession {
     commands: VecDeque<QueuedCommand>,
     results: HashMap<String, Option<std::result::Result<(), String>>>,
     content_commands: VecDeque<QueuedContentCommand>,
-    content_results: HashMap<String, Option<std::result::Result<Value, String>>>,
+    content_results: HashMap<String, Option<std::result::Result<Value, AppleContentFailure>>>,
     content_idempotency: HashMap<String, String>,
-    content_completed: HashMap<String, std::result::Result<Value, String>>,
+    content_completed: HashMap<String, std::result::Result<Value, AppleContentFailure>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,6 +188,25 @@ pub struct ContentError {
     #[serde(default)]
     pub retryable: bool,
 }
+
+/// A provider-declared content outcome preserved across the async bridge.
+/// Keeping this typed prevents actionable states such as `unauthorized` and
+/// `subscription_required` from collapsing into generic backend text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppleContentFailure {
+    pub outcome: String,
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl std::fmt::Display for AppleContentFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AppleContentFailure {}
 
 /// Outcomes accepted from a native Apple companion. Keep this vocabulary
 /// aligned with `docs/apple-music-content-bridge.md` and the companion
@@ -570,11 +589,17 @@ impl AppleBridgeRegistry {
             let stored = if outcome == "success" {
                 Ok(result.data.unwrap_or(Value::Null))
             } else {
-                let message = result
-                    .error
-                    .map(|error| format!("{}: {}", error.code, error.message))
-                    .unwrap_or_else(|| format!("Apple Music content outcome: {outcome}"));
-                Err(message)
+                let error = result.error.unwrap_or_else(|| ContentError {
+                    code: outcome.to_string(),
+                    message: format!("Apple Music content outcome: {outcome}"),
+                    retryable: false,
+                });
+                Err(AppleContentFailure {
+                    outcome: outcome.to_string(),
+                    code: error.code,
+                    message: error.message,
+                    retryable: error.retryable,
+                })
             };
             session
                 .content_results
@@ -596,7 +621,7 @@ impl AppleBridgeRegistry {
                 let mut state = self.inner.write().await;
                 for session in state.sessions.values_mut() {
                     if let Some(result) = session.content_completed.get(request_id) {
-                        return result.clone().map_err(anyhow::Error::msg);
+                        return result.clone().map_err(anyhow::Error::new);
                     }
                     if let Some(Some(result)) = session.content_results.get(request_id) {
                         let result = result.clone();
@@ -609,7 +634,7 @@ impl AppleBridgeRegistry {
                             .content_completed
                             .insert(request_id.to_string(), result.clone());
                         session.content_results.remove(request_id);
-                        return result.map_err(anyhow::Error::msg);
+                        return result.map_err(anyhow::Error::new);
                     }
                 }
             }
@@ -1363,6 +1388,57 @@ mod tests {
             .await
             .expect_err("offline is a refusal, not successful data");
         assert!(error.to_string().contains("offline: companion offline"));
+    }
+
+    #[tokio::test]
+    async fn content_failure_preserves_provider_outcome_and_error_fields() {
+        let registry = AppleBridgeRegistry::default();
+        let pairing = registry.create_pairing("iphone".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+        registry
+            .update_snapshot(&claim.access_token, snapshot())
+            .await
+            .expect("owner snapshot binds the session");
+        let request_id = registry
+            .enqueue_content_for_player(
+                "application",
+                "catalog_search",
+                serde_json::json!({"query": "x"}),
+            )
+            .await
+            .expect("content request queues");
+        registry
+            .acknowledge_content(
+                &claim.access_token,
+                &request_id,
+                ContentResult {
+                    outcome: "subscription_required".to_string(),
+                    data: None,
+                    error: Some(ContentError {
+                        code: "subscription".to_string(),
+                        message: "An Apple Music subscription is required.".to_string(),
+                        retryable: false,
+                    }),
+                },
+            )
+            .await
+            .expect("provider outcome is accepted");
+        let error = registry
+            .wait_for_content_result(&request_id, Duration::from_millis(100))
+            .await
+            .expect_err("provider failure is returned");
+        let failure = error
+            .downcast_ref::<AppleContentFailure>()
+            .expect("typed provider failure is preserved");
+        assert_eq!(failure.outcome, "subscription_required");
+        assert_eq!(failure.code, "subscription");
+        assert!(!failure.retryable);
     }
 
     #[tokio::test]

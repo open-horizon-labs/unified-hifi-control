@@ -630,6 +630,24 @@ pub async fn handle_apple_music(
         .await
     {
         Ok(value) => {
+            let value = if retrieval_action(&args.action) {
+                let Some(zone_id) = args.zone_id.as_deref() else {
+                    return env.failed(
+                        "Apple Music retrieval requires an execution-owner zone".to_string(),
+                    );
+                };
+                normalize_retrieval_result(
+                    state,
+                    &args.action,
+                    zone_id,
+                    value,
+                    args.offset.unwrap_or(0),
+                    args.limit.unwrap_or(25),
+                )
+                .await
+            } else {
+                value
+            };
             if let Some(record) = persisted_feedback {
                 Ok(env.json_result(&json!({"companion": value, "feedback": record})))
             } else {
@@ -638,9 +656,131 @@ pub async fn handle_apple_music(
         }
         Err(error) if persisted_feedback.is_some() => Ok(env.json_result(&json!({
             "feedback": persisted_feedback,
-            "provider": {"outcome": "refused", "detail": error.to_string()}
+            "provider": apple_content_failure_payload(&error).unwrap_or_else(|| json!({
+                "outcome": "refused",
+                "detail": error.to_string()
+            }))
         }))),
-        Err(error) => env.failed(format!("Apple Music {} failed: {}", args.action, error)),
+        Err(error) => {
+            if let Some(provider) = apple_content_failure_payload(&error) {
+                Ok(env.json_result(&json!({"provider": provider})))
+            } else {
+                env.failed(format!("Apple Music {} failed: {}", args.action, error))
+            }
+        }
+    }
+}
+
+fn apple_content_failure_payload(error: &anyhow::Error) -> Option<serde_json::Value> {
+    let failure = error.downcast_ref::<crate::api::apple_bridge::AppleContentFailure>()?;
+    Some(json!({
+        "outcome": failure.outcome,
+        "error": {
+            "code": failure.code,
+            "message": failure.message,
+            "retryable": failure.retryable,
+        }
+    }))
+}
+
+fn retrieval_action(action: &str) -> bool {
+    matches!(
+        action,
+        "library" | "playlists" | "playlist_tracks" | "recent" | "recommendations" | "favorites"
+    )
+}
+
+fn retrieval_source_kind(action: &str) -> &'static str {
+    match action {
+        "library" | "favorites" => "library",
+        "playlists" | "playlist_tracks" => "playlist",
+        "recent" => "history",
+        "recommendations" => "recommendation",
+        _ => "catalog",
+    }
+}
+
+/// Convert companion-local retrieval arrays into bounded UHC content pages.
+///
+/// Song-like entries expose `uri` only inside the bridge today. Those handles
+/// are minted into the server ref table before being returned, so the same
+/// owner-scoped ref can be passed to `hifi_play_ref` or queue operations. A
+/// playlist summary's existing `ref` remains a companion-local playlist handle
+/// because playlist traversal is dispatched through `hifi_apple_music`, not
+/// `hifi_play_ref`.
+async fn normalize_retrieval_result(
+    state: &AppState,
+    action: &str,
+    zone_id: &str,
+    value: serde_json::Value,
+    offset: u32,
+    limit: u32,
+) -> serde_json::Value {
+    let source_kind = retrieval_source_kind(action);
+    let Some(items) = value.as_array() else {
+        return value;
+    };
+    let bounded_limit = limit.clamp(1, 50) as usize;
+    let mut normalized = Vec::with_capacity(items.len());
+    let companion_id = zone_id.strip_prefix("applemusic:").unwrap_or_default();
+    for item in items.iter().take(bounded_limit) {
+        let Some(mut object) = item.as_object().cloned() else {
+            normalized.push(item.clone());
+            continue;
+        };
+        object.insert("provider".to_string(), json!("applemusic"));
+        object.insert("source_kind".to_string(), json!(source_kind));
+        if let Some(handle) = object
+            .remove("uri")
+            .and_then(|uri| uri.as_str().map(str::to_owned))
+        {
+            let title = object
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Apple Music item")
+                .to_string();
+            let reference = state
+                .mcp_refs
+                .mint(crate::mcp::refs::RefTarget::AppleMusic {
+                    companion_id: companion_id.to_string(),
+                    handle,
+                    title,
+                })
+                .await;
+            object.insert("ref".to_string(), json!(reference));
+        }
+        normalized.push(serde_json::Value::Object(object));
+    }
+    let count = normalized.len();
+    let has_more = count == bounded_limit;
+    json!({
+        "items": normalized,
+        "source_kind": source_kind,
+        "offset": offset,
+        "limit": bounded_limit,
+        "has_more": has_more,
+        "next_offset": has_more.then_some(offset.saturating_add(count as u32)),
+    })
+}
+
+#[cfg(test)]
+mod retrieval_tests {
+    use super::*;
+
+    #[test]
+    fn retrieval_actions_have_stable_source_kinds() {
+        assert_eq!(retrieval_source_kind("library"), "library");
+        assert_eq!(retrieval_source_kind("playlist_tracks"), "playlist");
+        assert_eq!(retrieval_source_kind("recent"), "history");
+        assert_eq!(retrieval_source_kind("recommendations"), "recommendation");
+    }
+
+    #[test]
+    fn retrieval_action_vocabulary_is_closed() {
+        assert!(retrieval_action("library"));
+        assert!(retrieval_action("playlist_tracks"));
+        assert!(!retrieval_action("catalog_search"));
+        assert!(!retrieval_action("playlist_add"));
     }
 }
 
