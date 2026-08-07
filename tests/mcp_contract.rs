@@ -4494,13 +4494,14 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
         }
     }
     // The routed Spotify content and mode cells add twelve probes to the
-    // original provider transport set.
+    // original provider transport set. Apple Music's transport/skip/volume
+    // cells remain gated until signed physical companion validation (#465).
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 33,
-        "{proved} supported cells were proved end to end, expected 15. If a capability was          deliberately wired or unwired, change this number in the same commit."
+        proved, 30,
+        "{proved} supported cells were proved end to end, expected 30. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 
