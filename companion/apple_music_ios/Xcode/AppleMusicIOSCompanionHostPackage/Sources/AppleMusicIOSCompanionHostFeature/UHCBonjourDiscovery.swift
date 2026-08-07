@@ -1,9 +1,10 @@
 import Foundation
 
 /// Discovers UHC servers advertising the native companion endpoint on the
-/// local network.  The server publishes its reachable base URL in TXT as
-/// `base=<url>`; this avoids guessing an address (and, importantly, avoids
-/// sending a pairing request to localhost on a phone).
+/// local network. The resolved service hostname is preferred over TXT: a
+/// server may be configured with a loopback or container hostname in its
+/// advertised base URL, while NetService has already resolved a LAN-reachable
+/// name for this phone.
 final class UHCBonjourDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     var onBaseURL: ((URL) -> Void)?
     var onFailure: ((String) -> Void)?
@@ -45,18 +46,18 @@ final class UHCBonjourDiscovery: NSObject, NetServiceBrowserDelegate, NetService
 
     func netServiceDidResolveAddress(_ sender: NetService) {
         guard !finished else { return }
-        let txt = sender.txtRecordData().map(NetService.dictionary(fromTXTRecord:)) ?? [:]
-        if let raw = txt["base"].flatMap({ String(data: $0, encoding: .utf8) }),
-           let url = URL(string: raw), url.host != nil {
+        if let host = sender.hostName?.trimmingCharacters(in: CharacterSet(charactersIn: ".")),
+           !host.isEmpty, sender.port > 0,
+           let url = URL(string: "http://\(host):\(sender.port)") {
             finish(url)
             return
         }
 
-        // Older UHC builds may not have the TXT URL.  A resolved service is
-        // still unambiguous on the LAN, so derive the normal HTTP endpoint.
-        if let host = sender.hostName?.trimmingCharacters(in: CharacterSet(charactersIn: ".")),
-           !host.isEmpty, sender.port > 0,
-           let url = URL(string: "http://\(host):\(sender.port)") {
+        // Fall back to the explicit base URL for proxies/tunnels where the
+        // service hostname is not usable as an HTTP host.
+        let txt = sender.txtRecordData().map(NetService.dictionary(fromTXTRecord:)) ?? [:]
+        if let raw = txt["base"].flatMap({ String(data: $0, encoding: .utf8) }),
+           let url = URL(string: raw), url.host != nil {
             finish(url)
         }
     }
