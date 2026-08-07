@@ -129,7 +129,11 @@ pub enum RefTarget {
     /// An Apple Music catalog/library identifier resolved by the paired native
     /// companion. Clients only receive the opaque token.
     AppleMusic {
-        uri: String,
+        /// The execution-owner suffix of the applemusic zone that minted it.
+        /// Apple library/catalog IDs are not portable across companions.
+        companion_id: String,
+        /// A companion-minted content handle, never a raw Apple ID or URI.
+        handle: String,
         title: String,
     },
 }

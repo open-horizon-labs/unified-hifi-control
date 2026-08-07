@@ -255,7 +255,13 @@ pub async fn handle_search(
                         let ref_token = state
                             .mcp_refs
                             .mint(RefTarget::AppleMusic {
-                                uri: item.uri,
+                                companion_id: args
+                                    .zone_id
+                                    .as_deref()
+                                    .and_then(|zone| zone.strip_prefix("applemusic:"))
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                handle: item.uri,
                                 title: item.title.clone(),
                             })
                             .await;
@@ -799,6 +805,20 @@ pub async fn handle_play_ref(
         );
     }
 
+    if let RefTarget::AppleMusic { companion_id, .. } = &ref_target {
+        let zone_companion = args.zone_id.strip_prefix("applemusic:").unwrap_or_default();
+        if companion_id != zone_companion {
+            return env.refused(
+                "this Apple Music ref belongs to a different companion execution owner.",
+                Refusal::InvalidParameter {
+                    parameter: "zone_id",
+                    accepted: vec!["the applemusic:<companion> zone used by hifi_search".to_string()],
+                    detail: "Apple Music catalog and library identifiers are scoped to the companion that minted the ref; search again for the selected companion.".to_string(),
+                },
+            );
+        }
+    }
+
     match (route, ref_target) {
         (LibraryRoute::Roon, RefTarget::Roon { target, title }) => {
             play_ref_roon(state, env, &args, target, title).await
@@ -809,8 +829,8 @@ pub async fn handle_play_ref(
         (LibraryRoute::Spotify, RefTarget::Spotify { uri, title }) => {
             play_ref_spotify(state, env, &args, uri, title).await
         }
-        (LibraryRoute::AppleMusic, RefTarget::AppleMusic { uri, title }) => {
-            play_ref_apple_music(state, env, &args, uri, title).await
+        (LibraryRoute::AppleMusic, RefTarget::AppleMusic { handle, title, .. }) => {
+            play_ref_apple_music(state, env, &args, handle, title).await
         }
         // Unreachable: the provider check above already refused any mismatch
         // between the zone's provider and the ref's. Kept exhaustive so a

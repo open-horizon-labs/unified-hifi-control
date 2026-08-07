@@ -266,7 +266,7 @@ pub async fn handle_apple_music(
         };
         let mut plan_items = Vec::with_capacity(items.len());
         for token in items {
-            let Some(crate::mcp::refs::RefTarget::AppleMusic { title, .. }) =
+            let Some(crate::mcp::refs::RefTarget::AppleMusic { title, companion_id, .. }) =
                 state.mcp_refs.resolve(token).await
             else {
                 return Envelope::write("hifi_apple_music", "queue_plan").refused(
@@ -280,6 +280,17 @@ pub async fn handle_apple_music(
                     },
                 );
             };
+            let zone_companion = zone_id.strip_prefix("applemusic:").unwrap_or_default();
+            if companion_id != zone_companion {
+                return Envelope::write("hifi_apple_music", "queue_plan").refused(
+                    "queue_plan contains a ref minted for a different Apple Music companion.",
+                    crate::mcp::envelope::Refusal::InvalidParameter {
+                        parameter: "items",
+                        accepted: vec!["refs returned for this applemusic:<companion> zone".to_string()],
+                        detail: "Search again against the selected Apple Music execution owner before replacing its plan.".to_string(),
+                    },
+                );
+            }
             plan_items.push(crate::mcp::listening_plan::ListeningPlanItem {
                 reference: token.clone(),
                 title,
