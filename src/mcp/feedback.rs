@@ -107,9 +107,13 @@ impl FeedbackStore {
 
     pub async fn clear_zone(&self, zone_id: &str) -> anyhow::Result<()> {
         let mut records = self.records.write().await;
+        let previous = records.clone();
         records.retain(|record| record.zone_id != zone_id);
         if let Some(path) = &self.path {
-            persist(path, &records)?;
+            if let Err(error) = persist(path, &records) {
+                *records = previous;
+                return Err(error);
+            }
         }
         Ok(())
     }
