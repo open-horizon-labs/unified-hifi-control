@@ -5,8 +5,39 @@
 
 use dioxus::prelude::*;
 
+/// The optional-page visibility snapshot embedded in the server-rendered
+/// document.  It is deliberately separate from the reactive context: this is
+/// the value both SSR and WASM use *before* the browser can fetch settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct NavigationVisibility {
+    pub hide_hqp: bool,
+    pub hide_lms: bool,
+    pub hide_spotify: bool,
+    pub hide_knobs: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn initial_navigation_visibility() -> Option<NavigationVisibility> {
+    let settings = crate::api::load_app_settings();
+    Some(NavigationVisibility {
+        hide_hqp: !settings.adapters.hqplayer,
+        hide_lms: !settings.adapters.lms,
+        hide_spotify: !settings.adapters.spotify,
+        hide_knobs: settings.hide_knobs_page,
+    })
+}
+
 #[cfg(target_arch = "wasm32")]
-use crate::app::api::AppSettings;
+fn initial_navigation_visibility() -> Option<NavigationVisibility> {
+    const META_SELECTOR: &str = "meta[name=\"uhc-navigation-visibility\"]";
+
+    let document = web_sys::window()?.document()?;
+    let content = document
+        .query_selector(META_SELECTOR)
+        .ok()??
+        .get_attribute("content")?;
+    serde_json::from_str(&content).ok()
+}
 
 /// Global settings state shared via context
 #[derive(Clone, Copy)]
@@ -74,12 +105,17 @@ impl SettingsContext {
 }
 
 /// Initialize settings context provider - call once at app root
-pub fn use_settings_provider() {
-    let hide_knobs = use_signal(|| false);
-    let hqp_enabled = use_signal(|| false);
-    let lms_enabled = use_signal(|| false);
-    let spotify_enabled = use_signal(|| false);
-    let loaded = use_signal(|| false);
+pub fn use_settings_provider() -> NavigationVisibility {
+    let initial = initial_navigation_visibility();
+    let visibility = initial.unwrap_or_default();
+    let hide_knobs = use_signal(move || visibility.hide_knobs);
+    let hqp_enabled = use_signal(move || !visibility.hide_hqp);
+    let lms_enabled = use_signal(move || !visibility.hide_lms);
+    let spotify_enabled = use_signal(move || !visibility.hide_spotify);
+    // When the SSR bootstrap marker is available, its settings are already
+    // authoritative for the first Nav render.  The browser still refreshes
+    // them below so another client can update visibility later.
+    let loaded = use_signal(move || initial.is_some());
 
     let ctx = SettingsContext {
         hide_knobs,
@@ -111,6 +147,8 @@ pub fn use_settings_provider() {
             });
         });
     }
+
+    visibility
 }
 
 /// Get settings context - use in any component

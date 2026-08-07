@@ -88,13 +88,21 @@ pub fn App() -> Element {
     // Initialize theme context at app root (handles localStorage + DOM class)
     use_theme_provider();
 
-    // Initialize settings context at app root (shared nav visibility state)
-    use_settings_provider();
+    // Initialize navigation visibility from the persisted server snapshot. The
+    // same snapshot is emitted below so WASM hydrates the exact tab set that
+    // SSR rendered, before its asynchronous settings refresh begins.
+    let navigation_visibility = use_settings_provider();
+    let navigation_visibility_json =
+        serde_json::to_string(&navigation_visibility).unwrap_or_else(|_| "{}".to_string());
 
     rsx! {
         document::Meta {
             name: "uhc-mcp-endpoint",
             content: "{mcp_endpoint.url}"
+        }
+        document::Meta {
+            name: "uhc-navigation-visibility",
+            content: "{navigation_visibility_json}"
         }
         Router::<Route> {}
     }
