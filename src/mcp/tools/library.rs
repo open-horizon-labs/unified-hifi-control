@@ -57,6 +57,7 @@ use rust_mcp_sdk::{
     schema::{schema_utils::CallToolError, CallToolResult},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 /// How many results to request from LMS.
 ///
@@ -573,6 +574,34 @@ pub async fn handle_play(
                 Ok(mut results) => match results.drain(..).next() {
                     Some(item) => {
                         let result = if action == "queue" {
+                            let companion_id = args
+                                .zone_id
+                                .strip_prefix("applemusic:")
+                                .unwrap_or_default()
+                                .to_string();
+                            let plan_ref = state
+                                .mcp_refs
+                                .mint(RefTarget::AppleMusic {
+                                    companion_id,
+                                    handle: item.uri.clone(),
+                                    title: item.title.clone(),
+                                })
+                                .await;
+                            if let Err(error) = state
+                                .listening_plans
+                                .append(
+                                    &args.zone_id,
+                                    vec![crate::mcp::listening_plan::ListeningPlanItem {
+                                        reference: plan_ref,
+                                        title: item.title.clone(),
+                                    }],
+                                )
+                                .await
+                            {
+                                return env.failed(format!(
+                                    "Apple Music listening plan could not be persisted: {error}"
+                                ));
+                            }
                             state
                                 .adapter_registry
                                 .queue_library_uri("applemusic", &args.zone_id, &item.uri)
@@ -981,6 +1010,28 @@ async fn play_ref_spotify(
     };
     let mut env = env.param("action", action_name);
     env.operation = action_name.to_string();
+    let plan = if action_name == "queue" {
+        match state
+            .listening_plans
+            .append(
+                &args.zone_id,
+                vec![crate::mcp::listening_plan::ListeningPlanItem {
+                    reference: args.r#ref.clone(),
+                    title: title.clone(),
+                }],
+            )
+            .await
+        {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                return env.failed(format!(
+                    "Apple Music listening plan could not be persisted: {error}"
+                ))
+            }
+        }
+    } else {
+        None
+    };
     let result = if action_name == "queue" {
         state
             .adapter_registry
@@ -995,7 +1046,11 @@ async fn play_ref_spotify(
     };
     match result {
         Ok(message) => Ok(play_success(state, env, message).await),
-        Err(e) => env.failed(format!("Play error for {title}: {}", e)),
+        Err(error) if plan.is_some() => Ok(env.json_result(&json!({
+            "plan": plan,
+            "provider": {"outcome": "refused", "detail": error.to_string()}
+        }))),
+        Err(error) => env.failed(format!("Play error for {title}: {}", error)),
     }
 }
 
