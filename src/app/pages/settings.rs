@@ -1099,6 +1099,18 @@ pub fn Settings() -> Element {
                                 p { class: "mt-1 text-sm text-secondary", "Save your Spotify client settings, then connect your account to discover Connect devices." }
                         }
                         div {
+                            class: "flex justify-end",
+                            hidden: !spotify_configured,
+                            aria_hidden: !spotify_configured,
+                            button {
+                                r#type: "button",
+                                class: "btn btn-outline btn-sm min-h-11",
+                                onclick: refresh_providers,
+                                aria_label: "Refresh Spotify devices",
+                                "Refresh devices"
+                            }
+                        }
+                        div {
                             hidden: !(spotify_configured && spotify_devices.is_some()),
                             aria_hidden: !(spotify_configured && spotify_devices.is_some()),
                             div { class: "flex items-center justify-between gap-3",
@@ -1108,13 +1120,6 @@ pub fn Settings() -> Element {
                                     } else {
                                         "Available devices"
                                     }
-                                }
-                                button {
-                                    r#type: "button",
-                                    class: "btn btn-outline btn-sm min-h-11",
-                                    onclick: refresh_providers,
-                                    aria_label: "Refresh Spotify devices",
-                                    "Refresh"
                                 }
                             }
                             div {
