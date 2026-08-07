@@ -108,7 +108,7 @@ public struct MacMusicKitContentCommand: Codable, Sendable {
 }
 
 @available(macOS 14.0, *)
-public struct MacMusicKitContentError: Codable, Sendable {
+public struct MacMusicKitContentError: Codable, Sendable, Equatable {
     public let code: String
     public let message: String
     public let retryable: Bool
@@ -118,7 +118,7 @@ public struct MacMusicKitContentError: Codable, Sendable {
 }
 
 @available(macOS 14.0, *)
-public struct MacMusicKitContentResult: Codable, Sendable {
+public struct MacMusicKitContentResult: Codable, Sendable, Equatable {
     /// The bridge vocabulary is intentionally closed. Provider-specific
     /// errors must be translated before they are persisted or acknowledged.
     public static let allowedOutcomes: Set<String> = [
@@ -214,7 +214,7 @@ public actor MacAppleMusicBridgeClient {
     }
 
     public func revoke() async throws {
-        try await requestEmpty(path: "api/bridges/applemusic/revoke", method: "POST")
+        try await requestEmpty(path: "api/bridges/applemusic/revoke", method: "POST", body: Optional<String>.none)
         accessToken = nil
     }
 

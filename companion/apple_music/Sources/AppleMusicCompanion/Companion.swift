@@ -141,23 +141,18 @@ public actor ApplicationMusicPlayerCompanion {
                 )
             }
             return MacMusicKitContentResult(outcome: "success", data: try jsonValue(entries))
-        case "playlist_create":
-            guard let name = stringParam(request.params, "name"), !name.isEmpty else { return invalidContentResult("name is required") }
-            let playlist = try await MusicLibrary.shared.createPlaylist(name: String(name.prefix(200)), description: stringParam(request.params, "description"), authorDisplayName: nil)
-            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(MacAppleMusicBridgePlaylistSummary(ref: mintPlaylistHandle(for: playlist), title: playlist.name)))
-        case "playlist_update":
-            guard let reference = stringParam(request.params, "id") ?? stringParam(request.params, "uri"), let playlist = playlistHandles[reference] else {
-                return MacMusicKitContentResult(outcome: "not_found", error: MacMusicKitContentError(code: "unknown_ref", message: "Playlist handle is unknown or expired.", retryable: false))
-            }
-            let updated = try await MusicLibrary.shared.edit(playlist, name: stringParam(request.params, "name"), description: stringParam(request.params, "description"), authorDisplayName: nil)
-            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(MacAppleMusicBridgePlaylistSummary(ref: mintPlaylistHandle(for: updated), title: updated.name)))
-        case "playlist_add":
-            guard let playlistReference = stringParam(request.params, "id") ?? stringParam(request.params, "playlist_ref"), let playlist = playlistHandles[playlistReference],
-                  let songReference = stringParam(request.params, "uri") ?? stringParam(request.params, "item_ref"), let song = handles[songReference] else {
-                return MacMusicKitContentResult(outcome: "not_found", error: MacMusicKitContentError(code: "unknown_ref", message: "Playlist or song handle is unknown or expired.", retryable: false))
-            }
-            let updated = try await MusicLibrary.shared.add(song, to: playlist)
-            return MacMusicKitContentResult(outcome: "success", data: try jsonValue(MacAppleMusicBridgePlaylistSummary(ref: mintPlaylistHandle(for: updated), title: updated.name)))
+        case "playlist_create", "playlist_update", "playlist_add":
+            // MusicLibrary playlist mutations are unavailable in the macOS
+            // MusicKit SDK. Keep the operation explicit rather than falling
+            // back to Music.app automation or claiming it succeeded.
+            return MacMusicKitContentResult(
+                outcome: "unsupported",
+                error: MacMusicKitContentError(
+                    code: "macos_music_library_mutation_unavailable",
+                    message: "Apple Music playlist mutations require the iPhone companion.",
+                    retryable: false
+                )
+            )
         case "play_uri", "queue_uri":
             guard let uri = stringParam(request.params, "uri"), let song = handles[uri] else {
                 return MacMusicKitContentResult(outcome: "not_found", error: MacMusicKitContentError(code: "unknown_ref", message: "Apple Music handle is unknown or expired.", retryable: false))
@@ -224,13 +219,13 @@ public actor ApplicationMusicPlayerCompanion {
     }
 
     public func play(song: Song) async throws {
-        player.queue = MusicPlayer.Queue(for: [song], startingAt: song)
+        player.queue = ApplicationMusicPlayer.Queue(for: [song], startingAt: song)
         try await player.play()
     }
 
     public func replaceQueue(with songs: [Song]) async throws {
         guard let first = songs.first else { return }
-        player.queue = MusicPlayer.Queue(for: songs, startingAt: first)
+        player.queue = ApplicationMusicPlayer.Queue(for: songs, startingAt: first)
         try await player.play()
     }
 
