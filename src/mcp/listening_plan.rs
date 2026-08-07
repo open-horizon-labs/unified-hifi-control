@@ -36,7 +36,14 @@ pub struct ListeningPlan {
 pub struct ListeningPlanRevision {
     pub generation: u64,
     pub operation: String,
-    pub items: Vec<ListeningPlanItem>,
+    /// Opaque refs only; titles stay on the current plan so context history
+    /// remains a small, provider-neutral summary.
+    pub references: Vec<String>,
+    /// Compatibility shim for plans written by 43e4d0a, which retained full
+    /// item objects in history. It is migrated to `references` on load and is
+    /// never emitted in the current format.
+    #[serde(default, skip_serializing)]
+    legacy_items: Vec<ListeningPlanItem>,
     pub source: String,
     pub confidence: String,
     pub recorded_at: u64,
@@ -220,7 +227,12 @@ fn record_revision(plan: &mut ListeningPlan, operation: &str) {
     plan.history.push(ListeningPlanRevision {
         generation: plan.generation,
         operation: operation.to_string(),
-        items: plan.items.clone(),
+        references: plan
+            .items
+            .iter()
+            .map(|item| item.reference.clone())
+            .collect(),
+        legacy_items: Vec::new(),
         source: "uhc_mcp".to_string(),
         confidence: "planned".to_string(),
         recorded_at: plan.updated_at,
@@ -229,13 +241,22 @@ fn record_revision(plan: &mut ListeningPlan, operation: &str) {
 }
 
 fn trim_history(plan: &mut ListeningPlan) {
+    for revision in &mut plan.history {
+        if revision.references.is_empty() && !revision.legacy_items.is_empty() {
+            revision.references = revision
+                .legacy_items
+                .iter()
+                .map(|item| item.reference.clone())
+                .collect();
+        }
+        revision.legacy_items.clear();
+    }
     plan.history.retain(|revision| {
-        revision.items.len() <= MAX_ITEMS
-            && revision.items.iter().all(|item| {
-                !item.reference.is_empty()
-                    && item.reference.len() <= MAX_REFERENCE_LENGTH
-                    && item.title.len() <= MAX_TITLE_LENGTH
-            })
+        revision.references.len() <= MAX_ITEMS
+            && revision
+                .references
+                .iter()
+                .all(|reference| !reference.is_empty() && reference.len() <= MAX_REFERENCE_LENGTH)
             && revision.operation.len() <= 64
             && revision.source.len() <= 64
             && revision.confidence.len() <= 64
