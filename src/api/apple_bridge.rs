@@ -558,8 +558,11 @@ impl MusicKitCompanion for PairedMusicKitCompanion {
 pub async fn pair(
     State(state): State<AppState>,
     Json(request): Json<PairRequest>,
-) -> Json<PairingResponse> {
-    Json(state.apple_bridges.create_pairing(request.bridge_id).await)
+) -> Result<Json<PairingResponse>, (StatusCode, Json<ErrorBody>)> {
+    validate_bridge_id(&request.bridge_id).map_err(|message| {
+        error(StatusCode::BAD_REQUEST, &message, "pairing_failed")
+    })?;
+    Ok(Json(state.apple_bridges.create_pairing(request.bridge_id).await))
 }
 
 pub async fn claim(
@@ -694,6 +697,24 @@ fn random_token(length: usize) -> String {
         .collect()
 }
 
+fn validate_bridge_id(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("bridge_id must not be empty".to_string());
+    }
+    if value.chars().count() > MAX_BRIDGE_ID_LENGTH {
+        return Err(format!(
+            "bridge_id must be at most {MAX_BRIDGE_ID_LENGTH} characters"
+        ));
+    }
+    if value.contains(':') {
+        return Err("bridge_id must not contain ':'".to_string());
+    }
+    if value.chars().any(|character| character.is_whitespace() || character.is_control()) {
+        return Err("bridge_id must not contain whitespace or control characters".to_string());
+    }
+    Ok(())
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -728,6 +749,15 @@ mod tests {
             volume: Some(0.5),
             is_muted: false,
         }
+    }
+
+    #[test]
+    fn pairing_bridge_ids_are_owner_safe() {
+        assert!(validate_bridge_id("iphone-01").is_ok());
+        for invalid in ["", "applemusic:iphone", "iphone 01", "iphone\n01"] {
+            assert!(validate_bridge_id(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert!(validate_bridge_id(&"x".repeat(MAX_BRIDGE_ID_LENGTH + 1)).is_err());
     }
 
     #[tokio::test]
