@@ -1,6 +1,6 @@
 use tempfile::tempdir;
 use unified_hifi_control::adapters::spotify::SpotifyToken;
-use unified_hifi_control::api::credentials::EncryptedCredentialStore;
+use unified_hifi_control::api::credentials::{EncryptedCredentialStore, SpotifyCredentialRecord};
 
 #[test]
 fn encrypted_credentials_survive_restart_without_plaintext_leakage() {
@@ -42,6 +42,36 @@ fn revoke_clears_durable_credentials() {
     store.clear().expect("clear credentials");
     assert_eq!(store.load().expect("load after revoke"), None);
     assert!(!credential_path.exists());
+}
+
+#[test]
+fn clearing_token_preserves_spotify_client_configuration() {
+    let directory = tempdir().expect("temporary credential directory");
+    let credential_path = directory.path().join("spotify.enc");
+    let store = EncryptedCredentialStore::new(credential_path.clone(), [8_u8; 32]);
+    store
+        .save_record(&SpotifyCredentialRecord {
+            token: Some(SpotifyToken {
+                access_token: "access".to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: Some(1234),
+            }),
+            client_id: "client-id".to_string(),
+            client_secret: Some("client-secret".to_string()),
+            redirect_uri: "https://uhc.example/callback".to_string(),
+        })
+        .expect("save credentials");
+
+    store.clear_token().expect("clear token");
+    let record = store
+        .load_record()
+        .expect("load credentials")
+        .expect("credential record remains");
+    assert_eq!(record.token, None);
+    assert_eq!(record.client_id, "client-id");
+    assert_eq!(record.client_secret.as_deref(), Some("client-secret"));
+    assert_eq!(record.redirect_uri, "https://uhc.example/callback");
+    assert!(credential_path.exists());
 }
 
 #[test]

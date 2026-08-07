@@ -161,6 +161,21 @@ impl EncryptedCredentialStore {
         Ok(())
     }
 
+    /// Clear only the persisted Spotify token while retaining the provider
+    /// configuration needed to authorize again.
+    ///
+    /// A rejected refresh token means the user must complete OAuth again, but
+    /// it does not invalidate the client id, client secret, or redirect URI
+    /// configured for that OAuth client.  Keep the encrypted record in place
+    /// so the next authorization attempt can reuse that configuration.
+    pub fn clear_token(&self) -> Result<()> {
+        let Some(mut record) = self.load_record()? else {
+            return Ok(());
+        };
+        record.token = None;
+        self.save_record(&record)
+    }
+
     /// Delete durable credentials. Missing files are already revoked.
     pub fn clear(&self) -> Result<()> {
         match std::fs::remove_file(&self.credential_path) {

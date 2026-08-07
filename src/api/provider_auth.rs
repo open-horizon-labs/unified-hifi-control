@@ -206,9 +206,6 @@ pub async fn configure_spotify(
             "invalid_redirect_uri",
         ));
     }
-    let client_secret = request
-        .client_secret
-        .filter(|value| !value.trim().is_empty());
     let store = state.provider_auth.credentials.clone().ok_or_else(|| {
         error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -223,6 +220,17 @@ pub async fn configure_spotify(
             "credential_storage_failed",
         )
     })?;
+    // The browser deliberately never receives the existing secret.  Treat an
+    // omitted/blank secret as "keep the current one" so editing the client ID
+    // or redirect URI cannot silently downgrade a configured confidential
+    // client to PKCE.  Replacing the secret still works by submitting a new
+    // non-empty value.
+    let client_secret = select_client_secret(
+        request.client_secret,
+        existing
+            .as_ref()
+            .and_then(|record| record.client_secret.clone()),
+    );
     store
         .save_record(&SpotifyCredentialRecord {
             token: existing.as_ref().and_then(|record| record.token.clone()),
@@ -611,6 +619,12 @@ fn valid_spotify_client_id(value: &str) -> bool {
         && !normalized.contains("example.test")
 }
 
+fn select_client_secret(requested: Option<String>, existing: Option<String>) -> Option<String> {
+    requested
+        .filter(|value| !value.trim().is_empty())
+        .or(existing)
+}
+
 struct SpotifyOAuthRefresher {
     config: Arc<SpotifyOAuthConfig>,
     credentials: Option<Arc<EncryptedCredentialStore>>,
@@ -644,7 +658,7 @@ impl SpotifyTokenRefresher for SpotifyOAuthRefresher {
                 if let Ok(body) = response.json::<serde_json::Value>().await {
                     if body["error"].as_str() == Some("invalid_grant") {
                         if let Some(store) = &self.credentials {
-                            store.clear()?;
+                            store.clear_token()?;
                         }
                         return Err(anyhow::anyhow!(
                             "Spotify refresh token was rejected; authorize Spotify again"
@@ -833,17 +847,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_grant_clears_credentials_without_echoing_token() {
+    async fn invalid_grant_clears_token_preserving_configuration_without_echoing_token() {
         let directory = tempdir().unwrap();
         let store = Arc::new(EncryptedCredentialStore::new(
             directory.path().join("spotify.enc"),
             [4_u8; 32],
         ));
         store
-            .save(&SpotifyToken {
-                access_token: "private-access".to_string(),
-                refresh_token: Some("private-refresh".to_string()),
-                expires_at: Some(1),
+            .save_record(&SpotifyCredentialRecord {
+                token: Some(SpotifyToken {
+                    access_token: "private-access".to_string(),
+                    refresh_token: Some("private-refresh".to_string()),
+                    expires_at: Some(1),
+                }),
+                client_id: "client-id-to-preserve".to_string(),
+                client_secret: Some("client-secret-to-preserve".to_string()),
+                redirect_uri: "https://uhc.example/callback-to-preserve".to_string(),
             })
             .unwrap();
         let mock = RefreshMock {
@@ -870,7 +889,17 @@ mod tests {
             .unwrap_err();
         assert!(!error.to_string().contains("private-access"));
         assert!(!error.to_string().contains("private-refresh"));
-        assert_eq!(store.load().unwrap(), None);
+        let record = store.load_record().unwrap().unwrap();
+        assert_eq!(record.token, None);
+        assert_eq!(record.client_id, "client-id-to-preserve");
+        assert_eq!(
+            record.client_secret.as_deref(),
+            Some("client-secret-to-preserve")
+        );
+        assert_eq!(
+            record.redirect_uri,
+            "https://uhc.example/callback-to-preserve"
+        );
         server.abort();
     }
 
@@ -890,5 +919,24 @@ mod tests {
         assert!(!valid_spotify_client_id(""));
         assert!(!valid_spotify_client_id("local-test"));
         assert!(!valid_spotify_client_id("your-client-id"));
+    }
+
+    #[test]
+    fn blank_client_secret_preserves_existing_secret() {
+        assert_eq!(
+            select_client_secret(Some("   ".to_string()), Some("stored-secret".to_string())),
+            Some("stored-secret".to_string())
+        );
+        assert_eq!(
+            select_client_secret(None, Some("stored-secret".to_string())),
+            Some("stored-secret".to_string())
+        );
+        assert_eq!(
+            select_client_secret(
+                Some("replacement".to_string()),
+                Some("stored-secret".to_string())
+            ),
+            Some("replacement".to_string())
+        );
     }
 }
