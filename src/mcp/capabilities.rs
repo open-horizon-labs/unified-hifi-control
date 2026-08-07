@@ -638,6 +638,20 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
 ///
 /// Routing answers first; anything it does not decide comes from [`GAPS`].
 pub fn support(target: ZoneTarget, capability: Capability) -> Support {
+    // A route to the bridge is not evidence that Apple's SystemMusicPlayer
+    // exposes the operation on a real iPhone. Keep the public matrix truthful
+    // until #465's signed-device validation proves each transport/volume cell.
+    if target == ZoneTarget::AppleMusic
+        && matches!(
+            capability,
+            Capability::Transport | Capability::TransportSkip | Capability::Volume
+        )
+    {
+        return Support::NotImplemented {
+            tracked_by: "#465",
+            evidence: "the native iPhone companion path is implemented, but this capability remains pending signed physical-device validation of SystemMusicPlayer behavior.",
+        };
+    }
     if let Some(supported) = routed(target, capability) {
         return supported;
     }
@@ -1058,5 +1072,15 @@ mod tests {
             support(ZoneTarget::Spotify, Capability::Browse),
             Support::Supported
         ));
+    }
+
+    #[test]
+    fn apple_transport_capabilities_wait_for_physical_validation() {
+        for capability in [Capability::Transport, Capability::TransportSkip, Capability::Volume] {
+            assert!(matches!(
+                support(ZoneTarget::AppleMusic, capability),
+                Support::NotImplemented { tracked_by: "#465", .. }
+            ));
+        }
     }
 }
