@@ -169,6 +169,26 @@ fn default_spotify_redirect_uri() -> String {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn initial_spotify_enabled() -> bool {
+    crate::api::load_app_settings().adapters.spotify
+}
+
+#[cfg(target_arch = "wasm32")]
+fn initial_spotify_enabled() -> bool {
+    false
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn initial_applemusic_enabled() -> bool {
+    crate::api::load_app_settings().adapters.applemusic
+}
+
+#[cfg(target_arch = "wasm32")]
+fn initial_applemusic_enabled() -> bool {
+    false
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn callback_feedback() -> Option<&'static str> {
     None
 }
@@ -258,8 +278,8 @@ pub fn Settings() -> Element {
     let mut openhome_enabled = use_signal(|| false);
     let mut upnp_enabled = use_signal(|| false);
     let mut hqplayer_enabled = use_signal(|| false);
-    let mut spotify_enabled = use_signal(|| false);
-    let mut applemusic_enabled = use_signal(|| false);
+    let mut spotify_enabled = use_signal(initial_spotify_enabled);
+    let mut applemusic_enabled = use_signal(initial_applemusic_enabled);
     let mut musicassistant_enabled = use_signal(|| false);
 
     // Streaming-provider onboarding state. Provider credentials are never
@@ -823,8 +843,10 @@ pub fn Settings() -> Element {
                 }
             }
 
-            // Direct streaming-provider onboarding
-            if spotify_enabled() || applemusic_enabled() {
+            // Keep a stable SSR anchor so hydration cannot insert the provider
+            // section into a later sibling when no provider is enabled yet.
+            div { id: "streaming-providers-anchor",
+                if spotify_enabled() || applemusic_enabled() {
                 section { class: "mb-8", aria_labelledby: "streaming-heading",
                 div { class: "mb-4",
                     h2 { id: "streaming-heading", class: "text-xl font-semibold", "Streaming providers" }
@@ -1111,10 +1133,11 @@ pub fn Settings() -> Element {
                                 apple_action.set(ProviderActionState::Success);
                             },
                             "Refresh companion status"
-                        }
-                    }
-                    }
                 }
+                }
+                }
+                }
+            }
                 }
             }
 
