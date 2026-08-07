@@ -114,9 +114,11 @@ through the same bridge contract:
 - The companion publishes `POST /api/bridges/applemusic/state`, polls
   `GET /api/bridges/applemusic/commands`, and acknowledges commands with
   `POST /api/bridges/applemusic/commands/{command_id}`.
-- `GET /api/bridges/applemusic/status` reports pairing, snapshot, and
-  thirty-second liveness; `POST /api/bridges/applemusic/revoke` invalidates a
-  companion token.
+- `GET /api/bridges/applemusic/status` reports the legacy freshest-companion
+  fields plus a `companions` collection containing every live companion's id,
+  snapshot state, and last-seen time. Multiple distinct companion ids may be
+  paired concurrently; re-pairing the same id replaces that installation.
+  `POST /api/bridges/applemusic/revoke` invalidates one companion token.
 
 Internally, the bridge registry keeps owner-scoped liveness distinct: an owner
 can be `unpaired`, `awaiting_snapshot`, `reachable`, or `stale`. The existing
