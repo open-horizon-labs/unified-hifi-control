@@ -10,9 +10,6 @@ mod server {
         mdns,
     };
 
-    // Import Startable trait for adapter lifecycle methods
-    use adapters::Startable;
-
     // Import load_app_settings for checking adapter enabled state
     use api::load_app_settings;
 
@@ -414,23 +411,28 @@ mod server {
         // Start enabled adapters (single codepath using coordinator)
         // =========================================================================
 
-        // Build list of startable adapters
+        // Build the complete lifecycle list. Provider adapters are registered
+        // with the API registry below, but the coordinator owns their start
+        // and stop decisions just like local adapters.
         // Note: lms_cli shares config with lms - both start when LMS is configured
-        let mut startable_adapters: Vec<Arc<dyn adapters::Startable>> = vec![
+        let legacy_startables: Vec<Arc<dyn adapters::Startable>> = vec![
             roon.clone(),
             lms.clone(),
             lms_cli.clone(),
             openhome.clone(),
             upnp.clone(),
-            spotify.clone(),
         ];
 
+        let mut provider_startables: Vec<Arc<dyn adapters::Startable>> = vec![spotify.clone()];
         if let Some(adapter) = music_assistant.clone() {
-            startable_adapters.push(adapter);
+            provider_startables.push(adapter);
         }
+        let mut startable_adapters = legacy_startables.clone();
+        startable_adapters.extend(provider_startables.iter().cloned());
 
-        // Single loop to start all enabled adapters
-        coord.start_all_enabled(&startable_adapters).await;
+        // Start local adapters first. Provider adapters start after the
+        // aggregator and registry are ready, through the same path below.
+        coord.start_all_enabled(&legacy_startables).await;
 
         // Initialize ZoneAggregator for unified zone state
         let zone_aggregator = Arc::new(aggregator::ZoneAggregator::new(bus.clone()));
@@ -439,9 +441,6 @@ mod server {
             aggregator_for_spawn.run().await;
         });
         tracing::info!("ZoneAggregator started");
-
-        // Clone Roon adapter for shutdown access (cheap - just Arc clones)
-        let roon_for_shutdown = roon.clone();
 
         // Create shutdown token for graceful SSE termination (fixes #73)
         let shutdown_token = CancellationToken::new();
@@ -503,11 +502,10 @@ mod server {
         // local adapters. Their zones still arrive through the bus and the
         // aggregator; the registry only dispatches commands and controls their
         // lifecycle after the coordinator has approved them.
+        provider_startables.push(apple_music.clone());
         let mut startable_adapters = (*state.startable_adapters).clone();
         startable_adapters.push(apple_music.clone());
         state.startable_adapters = Arc::new(startable_adapters);
-        let provider_startables: Vec<Arc<dyn adapters::Startable>> =
-            vec![spotify.clone(), apple_music.clone()];
         coord.start_all_enabled(&provider_startables).await;
 
         // Clone state for shutdown diagnostics
@@ -829,20 +827,13 @@ mod server {
         // Give listeners a moment to react to ShuttingDown
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Stop adapters
-        roon_for_shutdown.stop().await;
+        // Stop every adapter through the coordinator-owned lifecycle list.
+        coord
+            .stop_all(&state_for_shutdown.startable_adapters)
+            .await;
         if let Some(ref fw) = firmware_service {
             fw.stop();
         }
-        lms.stop().await;
-        openhome.stop().await;
-        upnp.stop().await;
-        state_for_shutdown.adapter_registry.stop("spotify").await;
-        state_for_shutdown
-            .adapter_registry
-            .stop("musicassistant")
-            .await;
-        state_for_shutdown.adapter_registry.stop("applemusic").await;
         tracing::info!("Shutdown complete");
 
         Ok(())
