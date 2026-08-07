@@ -120,6 +120,14 @@ impl AdapterCoordinator {
             if companion_names.iter().any(|companion| companion == name) {
                 continue;
             }
+            if !self.is_enabled(name).await {
+                debug!("Adapter {} is disabled, skipping", name);
+                continue;
+            }
+            if !adapter.can_start().await {
+                debug!("Adapter {} cannot start (not configured?), skipping", name);
+                continue;
+            }
             match self.start_adapter_and_companions(adapter.as_ref()).await {
                 Ok(()) => info!("Started adapter: {}", name),
                 Err(error) => warn!("Failed to start adapter {}: {}", name, error),
