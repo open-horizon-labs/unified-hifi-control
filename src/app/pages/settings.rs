@@ -964,8 +964,8 @@ pub fn Settings() -> Element {
                         div { class: "mt-5 grid gap-5 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]",
                             div {
                                 class: "status-panel rounded-lg p-4 sm:p-5",
-                                hidden: !(spotify_configured && !spotify_editing()),
-                                aria_hidden: !(spotify_configured && !spotify_editing()),
+                                hidden: !spotify_configured || spotify_editing(),
+                                aria_hidden: !spotify_configured || spotify_editing(),
                                 role: "status",
                                 aria_live: "polite",
                                 p { class: "font-medium",
@@ -1132,8 +1132,8 @@ pub fn Settings() -> Element {
                                 p { class: "mt-1 text-sm text-secondary", "Start Spotify on a Connect-capable player; UHC will detect it automatically." }
                             }
                             div {
-                                hidden: !spotify_devices.as_ref().is_some_and(|devices| !devices.is_empty()),
-                                aria_hidden: !spotify_devices.as_ref().is_some_and(|devices| !devices.is_empty()),
+                                hidden: spotify_devices.as_ref().is_none_or(Vec::is_empty),
+                                aria_hidden: spotify_devices.as_ref().is_none_or(Vec::is_empty),
                                 ul { class: "mt-3 grid gap-2 sm:grid-cols-2", aria_label: "Spotify devices",
                                     if let Some(ref devices) = spotify_devices {
                                         for device in devices {
@@ -1145,7 +1145,7 @@ pub fn Settings() -> Element {
                                                         code { class: "mt-1 block break-all", "{device.zone_id}" }
                                                     }
                                                 }
-                                                span { class: if zone_state_label(&device) == "unknown" { "text-muted text-sm" } else { "status-ok text-sm" }, "{spotify_device_state_label(&device)}" }
+                                                span { class: if zone_state_label(device) == "unknown" { "text-muted text-sm" } else { "status-ok text-sm" }, "{spotify_device_state_label(device)}" }
                                             }
                                         }
                                     }

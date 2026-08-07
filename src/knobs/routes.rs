@@ -25,8 +25,7 @@ use sha2::{Digest, Sha256};
 use crate::adapters::AdapterCommand;
 use crate::api::AppState;
 use crate::bus::runtime::{
-    CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
-    HqpRuntimeCommand, RuntimeCommand,
+    CommandDeadlines, CommandLane, CommandRequest, CommandStatus, HqpRuntimeCommand, RuntimeCommand,
 };
 use crate::bus::VolumeControl;
 use crate::bus::{Command, PrefixedZoneId};

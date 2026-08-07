@@ -11,12 +11,9 @@ use crate::adapters::{
     AdapterCommand, AdapterCommandResponse, AdapterLogic, LibraryAdapter, LibrarySearchResult,
     Startable,
 };
-use crate::aggregator::{HqpSnapshotPresence, ZoneAggregator};
-use crate::bus::runtime::{
-    CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
-    HqpRuntimeCommand, RuntimeCommand,
-};
-use crate::bus::{Command, PrefixedZoneId, ProviderAccount, SharedBus};
+use crate::aggregator::ZoneAggregator;
+use crate::bus::runtime::{CommandGateway, HqpRuntimeCommand};
+use crate::bus::{ProviderAccount, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -1004,17 +1001,6 @@ pub async fn roon_browse_status_handler(State(state): State<AppState>) -> impl I
 // =============================================================================
 // HQPlayer handlers
 // =============================================================================
-
-async fn hqp_default_pipeline_from_aggregator(
-    state: &AppState,
-) -> Option<crate::adapters::hqplayer::PipelineStatus> {
-    state
-        .aggregator
-        .get_hqplayer_snapshot("default")
-        .await
-        .filter(|snapshot| snapshot.presence == HqpSnapshotPresence::Live)
-        .map(|snapshot| snapshot.observation.pipeline)
-}
 
 pub(crate) async fn refresh_hqp_advanced_aggregate(
     state: &AppState,

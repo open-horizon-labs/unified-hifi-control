@@ -450,10 +450,11 @@ impl AdapterLogic for AppleMusicAdapter {
                                 }
                             }
                             for zone_id in discovered.keys().filter(|zone_id| !seen.contains_key(*zone_id)) {
-                                ctx.bus.publish(BusEvent::ZoneRemoved {
-                                    zone_id: PrefixedZoneId::parse(zone_id)
-                                        .expect("discovered Apple Music zone is prefixed"),
-                                });
+                                if let Some(zone_id) = PrefixedZoneId::parse(zone_id) {
+                                    ctx.bus.publish(BusEvent::ZoneRemoved { zone_id });
+                                } else {
+                                    tracing::warn!(zone_id, "ignoring malformed Apple Music zone id");
+                                }
                             }
                             discovered = seen;
                         }
@@ -464,12 +465,15 @@ impl AdapterLogic for AppleMusicAdapter {
                             // private history until a later successful poll
                             // confirms removal or the adapter is stopped.
                             for (zone_id, display_name) in &discovered {
-                                ctx.bus.publish(BusEvent::ZoneUpdated {
-                                    zone_id: PrefixedZoneId::parse(zone_id)
-                                        .expect("discovered Apple Music zone is prefixed"),
-                                    display_name: display_name.clone(),
-                                    state: "unknown".to_string(),
-                                });
+                                if let Some(zone_id) = PrefixedZoneId::parse(zone_id) {
+                                    ctx.bus.publish(BusEvent::ZoneUpdated {
+                                        zone_id,
+                                        display_name: display_name.clone(),
+                                        state: "unknown".to_string(),
+                                    });
+                                } else {
+                                    tracing::warn!(zone_id, "ignoring malformed Apple Music zone id");
+                                }
                             }
                             let detail = error.to_string().chars().take(256).collect::<String>();
                             ctx.bus.publish(BusEvent::AdapterError {
@@ -681,13 +685,13 @@ mod tests {
             command: MusicKitCommand::SetVolume { value: 0.5 },
         };
         assert_eq!(
-            serde_json::to_string(&request).expect("request serializes"),
+            serde_json::to_string(&request).unwrap_or_default(),
             r#"{"type":"command","command":{"command":"set_volume","value":0.5}}"#
         );
 
         let response = MusicKitResponse::Ack;
         assert_eq!(
-            serde_json::to_string(&response).expect("response serializes"),
+            serde_json::to_string(&response).unwrap_or_default(),
             r#"{"type":"ack"}"#
         );
     }

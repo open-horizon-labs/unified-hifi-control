@@ -167,6 +167,12 @@ impl ControllerAuthState {
     }
 }
 
+impl Default for ControllerAuthState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub async fn bootstrap(
     State(state): State<AppState>,
     Json(request): Json<BootstrapRequest>,
@@ -228,17 +234,18 @@ pub async fn middleware(
     let Some(session) = auth.session(headers).await else {
         return unauthorized();
     };
-    if request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD {
-        if !same_origin(headers) || !csrf_matches(headers, &session.csrf) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(AuthError {
-                    error: "Controller request is not authorized",
-                    code: "csrf_failed",
-                }),
-            )
-                .into_response();
-        }
+    if request.method() != axum::http::Method::GET
+        && request.method() != axum::http::Method::HEAD
+        && (!same_origin(headers) || !csrf_matches(headers, &session.csrf))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(AuthError {
+                error: "Controller request is not authorized",
+                code: "csrf_failed",
+            }),
+        )
+            .into_response();
     }
     next.run(request).await
 }

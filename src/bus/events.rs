@@ -475,7 +475,7 @@ pub struct CommandResponse {
 /// - Adapter lifecycle: Adapter start/stop, cleanup
 /// - System: Shutdown, health checks
 /// - Legacy: Backward-compatible events for existing integrations
-/// Non-secret account identity returned by a provider adapter.
+///   Non-secret account identity returned by a provider adapter.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderAccount {
     pub id: String,
