@@ -319,18 +319,20 @@ impl ZoneAggregator {
                     let prefix = format!("{}:", adapter);
 
                     // Remove all zones with this prefix
-                    let mut aggregate = self.state.write().await;
+                    let zone_ids = {
+                        let mut aggregate = self.state.write().await;
+                        let zone_ids: Vec<String> = aggregate
+                            .zones
+                            .keys()
+                            .filter(|k| k.starts_with(&prefix))
+                            .cloned()
+                            .collect();
 
-                    let zone_ids: Vec<String> = aggregate
-                        .zones
-                        .keys()
-                        .filter(|k| k.starts_with(&prefix))
-                        .cloned()
-                        .collect();
-
-                    for zone_id in &zone_ids {
-                        aggregate.zones.remove(zone_id);
-                    }
+                        for zone_id in &zone_ids {
+                            aggregate.zones.remove(zone_id);
+                        }
+                        zone_ids
+                    };
 
                     if adapter == "applemusic" {
                         for zone_id in &zone_ids {
