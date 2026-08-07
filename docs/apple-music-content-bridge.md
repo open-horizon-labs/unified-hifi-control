@@ -6,6 +6,32 @@ approved and the repository's `api-change-approved` gate is applied. Until
 then, the iPhone package's catalog, library, recommendation, and playlist
 methods remain companion-local.
 
+## Companion readiness state
+
+The existing boolean HTTP status and internal liveness classification are not
+enough to explain why a paired owner cannot play. The approved bridge extension
+should carry a bounded, non-secret readiness value alongside each published
+snapshot (and in the status projection):
+
+```text
+unpaired | awaiting_snapshot | authorization_needed | subscription_required |
+restricted | reachable | inactive | stale | offline
+```
+
+`reachable` means the companion has published a valid snapshot and is able to
+accept commands; `inactive` means the player is reachable but has no current
+item or is stopped. `authorization_needed`, `subscription_required`, and
+`restricted` are provider/account outcomes, not transport failures. `stale`
+means the paired lease expired, while `offline` means the companion could not
+publish or report its current state. The companion maps native MusicKit
+authorization and playback errors to these values; UHC never infers them from
+an absent track, a timeout, or a generic HTTP error.
+
+The value is deliberately separate from `playback_state`, `route`, and
+`liveness` so a reachable but paused player cannot be mistaken for an
+unauthorized account. No Apple account email, token, raw provider error, or
+subscription metadata crosses the bridge.
+
 ## Request envelope
 
 Every content request uses the existing bridge command delivery path and adds:
