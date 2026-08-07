@@ -147,11 +147,20 @@ pub async fn handle_apple_music(
         let limit = args.limit.unwrap_or(10) as usize;
         let feedback = state.apple_feedback.recent(zone_id, limit).await;
         let plan = state.listening_plans.get(zone_id).await;
+        let observed_playback = state
+            .aggregator
+            .observed_playback_history(zone_id, limit)
+            .await;
         return Ok(Envelope::read("hifi_apple_music", "context")
             .param("action", "context")
             .param("zone_id", zone_id)
             .json_result(
-                &json!({"zone_id": zone_id, "feedback": feedback, "listening_plan": plan}),
+                &json!({
+                    "zone_id": zone_id,
+                    "feedback": feedback,
+                    "listening_plan": plan,
+                    "observed_playback": observed_playback,
+                }),
             ));
     }
 

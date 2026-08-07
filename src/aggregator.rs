@@ -2,10 +2,19 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use crate::bus::{BusEvent, NowPlaying, ProviderAccount, SharedBus, Zone};
+use crate::mcp::observation_history::PlaybackObservationHistory;
+
+fn observation_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 /// ZoneAggregator maintains unified zone state from all adapters.
 /// - Subscribes to bus events
@@ -16,6 +25,7 @@ pub struct ZoneAggregator {
     zones: Arc<RwLock<HashMap<String, Zone>>>,
     provider_accounts: Arc<RwLock<HashMap<String, ProviderAccount>>>,
     adapter_errors: Arc<RwLock<HashMap<String, String>>>,
+    observed_playback: PlaybackObservationHistory,
     bus: SharedBus,
 }
 
@@ -25,8 +35,30 @@ impl ZoneAggregator {
             zones: Arc::new(RwLock::new(HashMap::new())),
             provider_accounts: Arc::new(RwLock::new(HashMap::new())),
             adapter_errors: Arc::new(RwLock::new(HashMap::new())),
+            observed_playback: PlaybackObservationHistory::from_config(),
             bus,
         }
+    }
+
+    pub fn new_with_observation_history(
+        bus: SharedBus,
+        observed_playback: PlaybackObservationHistory,
+    ) -> Self {
+        Self {
+            zones: Arc::new(RwLock::new(HashMap::new())),
+            provider_accounts: Arc::new(RwLock::new(HashMap::new())),
+            adapter_errors: Arc::new(RwLock::new(HashMap::new())),
+            observed_playback,
+            bus,
+        }
+    }
+
+    pub async fn observed_playback_history(
+        &self,
+        zone_id: &str,
+        limit: usize,
+    ) -> Vec<crate::mcp::observation_history::PlaybackObservation> {
+        self.observed_playback.recent(zone_id, limit).await
     }
 
     /// Start the aggregator's event processing loop
@@ -40,6 +72,9 @@ impl ZoneAggregator {
             match event {
                 BusEvent::ZoneDiscovered { zone } => {
                     debug!("Zone discovered: {}", zone.zone_id);
+                    self.observed_playback
+                        .record_zone(&zone, observation_now())
+                        .await;
                     self.zones.write().await.insert(zone.zone_id.clone(), zone);
                 }
 
@@ -49,6 +84,9 @@ impl ZoneAggregator {
                     state,
                 } => {
                     debug!("Zone updated: {}", zone_id);
+                    self.observed_playback
+                        .record_state(zone_id.as_str(), state.as_str().into(), observation_now())
+                        .await;
                     if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
                         zone.zone_name = display_name;
                         zone.state = state.as_str().into();
@@ -87,31 +125,45 @@ impl ZoneAggregator {
                     image_key,
                 } => {
                     debug!("Now playing changed: {}", zone_id);
-                    if let Some(zone) = self.zones.write().await.get_mut(zone_id.as_str()) {
-                        // Preserve seek_position and duration from existing now_playing
-                        let (seek_position, duration) = zone
-                            .now_playing
-                            .as_ref()
-                            .map(|np| (np.seek_position, np.duration))
-                            .unwrap_or((None, None));
+                    let state = {
+                        let mut zones = self.zones.write().await;
+                        if let Some(zone) = zones.get_mut(zone_id.as_str()) {
+                            // Preserve seek_position and duration from existing now_playing
+                            let (seek_position, duration) = zone
+                                .now_playing
+                                .as_ref()
+                                .map(|np| (np.seek_position, np.duration))
+                                .unwrap_or((None, None));
 
-                        let (repeat_mode, shuffle) = zone
-                            .now_playing
-                            .as_ref()
-                            .map(|np| (np.repeat_mode, np.shuffle))
-                            .unwrap_or((None, None));
-                        zone.now_playing = Some(NowPlaying {
-                            title: title.unwrap_or_default(),
-                            artist: artist.unwrap_or_default(),
-                            album: album.unwrap_or_default(),
-                            image_key,
-                            seek_position,
-                            duration,
-                            metadata: None,
-                            repeat_mode,
-                            shuffle,
-                        });
-                    }
+                            let (repeat_mode, shuffle) = zone
+                                .now_playing
+                                .as_ref()
+                                .map(|np| (np.repeat_mode, np.shuffle))
+                                .unwrap_or((None, None));
+                            zone.now_playing = Some(NowPlaying {
+                                title: title.unwrap_or_default(),
+                                artist: artist.unwrap_or_default(),
+                                album: album.unwrap_or_default(),
+                                image_key,
+                                seek_position,
+                                duration,
+                                metadata: None,
+                                repeat_mode,
+                                shuffle,
+                            });
+                            (zone.state, zone.now_playing.clone())
+                        } else {
+                            (crate::bus::PlaybackState::Unknown, None)
+                        }
+                    };
+                    self.observed_playback
+                        .record_now_playing(
+                            zone_id.as_str(),
+                            state.0,
+                            state.1.as_ref(),
+                            observation_now(),
+                        )
+                        .await;
                 }
 
                 BusEvent::PlaybackModesChanged {

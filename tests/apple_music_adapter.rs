@@ -19,6 +19,7 @@ use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api::apple_bridge::{AppleBridgeRegistry, PairedMusicKitCompanion};
 use unified_hifi_control::bus::SharedBus;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState};
+use unified_hifi_control::mcp::observation_history::PlaybackObservationHistory;
 
 #[derive(Clone)]
 struct FakeCompanion {
@@ -115,7 +116,10 @@ async fn companion_snapshot_maps_to_an_applemusic_zone() {
 #[tokio::test]
 async fn companion_snapshot_flows_through_aggregator_and_flushes_on_stop() {
     let bus = create_bus();
-    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let observations = PlaybackObservationHistory::new_for_test();
+    let aggregator = Arc::new(ZoneAggregator::new_with_observation_history(
+        bus.clone(), observations,
+    ));
     let aggregator_task = {
         let aggregator = aggregator.clone();
         tokio::spawn(async move { aggregator.run().await })
@@ -156,6 +160,13 @@ async fn companion_snapshot_flows_through_aggregator_and_flushes_on_stop() {
         zone.now_playing.as_ref().map(|track| track.title.as_str()),
         Some("Song")
     );
+    let observed = aggregator
+        .observed_playback_history("applemusic:application", 10)
+        .await;
+    assert!(!observed.is_empty());
+    assert_eq!(observed[0].title.as_deref(), Some("Song"));
+    assert_eq!(observed[0].reference, None);
+    assert_eq!(observed[0].confidence, "observed_unresolved");
 
     shutdown.cancel();
     adapter_task
