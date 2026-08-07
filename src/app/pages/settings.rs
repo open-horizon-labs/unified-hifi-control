@@ -407,9 +407,13 @@ pub fn Settings() -> Element {
         if !applemusic_enabled() {
             return;
         }
+        let enabled = applemusic_enabled;
         spawn(async move {
             loop {
                 dioxus_sdk_time::sleep(std::time::Duration::from_secs(2)).await;
+                if !enabled() {
+                    break;
+                }
                 apple_bridge_status.restart();
             }
         });
