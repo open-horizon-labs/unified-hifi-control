@@ -175,7 +175,7 @@ fn initial_spotify_enabled() -> bool {
 
 #[cfg(target_arch = "wasm32")]
 fn initial_spotify_enabled() -> bool {
-    false
+    initial_adapter_enabled_from_ssr("spotify")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -185,7 +185,20 @@ fn initial_applemusic_enabled() -> bool {
 
 #[cfg(target_arch = "wasm32")]
 fn initial_applemusic_enabled() -> bool {
-    false
+    initial_adapter_enabled_from_ssr("applemusic")
+}
+
+#[cfg(target_arch = "wasm32")]
+fn initial_adapter_enabled_from_ssr(adapter: &str) -> bool {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return false;
+    };
+    let Some(marker) = document.get_element_by_id("settings-adapter-hydration") else {
+        return false;
+    };
+    marker
+        .get_attribute(&format!("data-{adapter}-enabled"))
+        .is_some_and(|value| value == "true")
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -554,6 +567,33 @@ pub fn Settings() -> Element {
         .unwrap_or("unknown")
         .to_string();
     let callback_message = callback_feedback();
+    let spotify_status_is_error = spotify_error().is_some();
+    let spotify_status_message =
+        spotify_error().or_else(|| spotify_action().message().map(str::to_string));
+    let spotify_account = spotify_account_result
+        .as_ref()
+        .and_then(|response| response.account.as_ref());
+    let spotify_account_display = spotify_account
+        .and_then(|account| {
+            account
+                .display_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+        })
+        .or_else(|| spotify_account.map(|account| account.id.as_str()))
+        .unwrap_or("Not connected");
+    let spotify_account_id = spotify_account
+        .map(|account| account.id.as_str())
+        .unwrap_or("");
+    let spotify_account_email = spotify_account
+        .and_then(|account| account.email.as_deref().filter(|email| !email.is_empty()))
+        .unwrap_or("Email unavailable; reconnect Spotify to grant profile access.");
+    let spotify_account_error = spotify_account_result
+        .as_ref()
+        .and_then(|response| response.error.as_deref());
+    let spotify_account_error_hint = spotify_account_error
+        .map(|error| error.contains("not registered for this application"))
+        .unwrap_or(false);
 
     rsx! {
         Layout {
@@ -839,55 +879,62 @@ pub fn Settings() -> Element {
                                 td { class: "py-2 px-3 text-muted", "-" }
                             }
                         }
-                    }
                 }
             }
 
-            // Keep a stable SSR anchor so hydration cannot insert the provider
+            // Keep a stable SSR marker and anchor so hydration cannot insert the provider
             // section into a later sibling when no provider is enabled yet.
+            div {
+                id: "settings-adapter-hydration",
+                hidden: true,
+                "data-spotify-enabled": if initial_spotify_enabled() { "true" } else { "false" },
+                "data-applemusic-enabled": if initial_applemusic_enabled() { "true" } else { "false" },
+            }
             div { id: "streaming-providers-anchor",
-                if spotify_enabled() || applemusic_enabled() {
-                section { class: "mb-8", aria_labelledby: "streaming-heading",
+                section {
+                    class: "mb-8",
+                    hidden: !(spotify_enabled() || applemusic_enabled()),
+                    aria_labelledby: "streaming-heading",
                 div { class: "mb-4",
                     h2 { id: "streaming-heading", class: "text-xl font-semibold", "Streaming providers" }
                     p { class: "text-muted text-sm", "Connect providers without sharing credentials with the browser." }
                 }
 
-                div { class: if spotify_enabled() && applemusic_enabled() { "grid gap-4 md:grid-cols-2" } else { "grid gap-4 md:grid-cols-1" },
+                div { class: "grid gap-4 md:grid-cols-2",
                     // Keep authorization and client settings as separate
                     // actions so the credential boundary stays explicit.
-                    if spotify_enabled() {
-                    div { class: "card p-5 sm:p-6", aria_labelledby: "spotify-heading",
+                    div {
+                        class: "card p-5 sm:p-6",
+                        hidden: !spotify_enabled(),
+                        aria_labelledby: "spotify-heading",
                         div { class: "flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between",
                             div {
                                 h3 { id: "spotify-heading", class: "text-lg font-semibold", "Spotify Connect" }
                                 p { class: "mt-1 text-sm text-secondary", "Control existing Spotify Connect devices. UHC does not act as a receiver." }
-                                if let Some(account) = spotify_account_result
-                                    .as_ref()
-                                    .and_then(|response| response.account.as_ref())
-                                {
-                                    p { class: "mt-2 text-sm text-secondary", "Signed in as "
-                                        strong { class: "text-primary", "{account.display_name.as_deref().filter(|name| !name.is_empty()).unwrap_or(&account.id)}" }
+                                div {
+                                    class: "mt-2",
+                                    hidden: spotify_account.is_none(),
+                                    aria_hidden: spotify_account.is_none(),
+                                    p { class: "text-sm text-secondary", "Signed in as "
+                                        strong { class: "text-primary", "{spotify_account_display}" }
                                     }
                                     details { class: "mt-1 text-xs text-muted",
                                         summary { class: "cursor-pointer", "Show account details" }
                                         div { class: "mt-1 space-y-0.5",
-                                            p { "Spotify ID: {account.id}" }
-                                            if let Some(email) = account.email.as_deref().filter(|email| !email.is_empty()) {
-                                                p { "Email: {email}" }
-                                            } else {
-                                                p { "Email unavailable; reconnect Spotify to grant profile access." }
-                                            }
+                                            p { "Spotify ID: {spotify_account_id}" }
+                                            p { "Email: {spotify_account_email}" }
                                         }
                                     }
                                 }
-                                if let Some(error) = spotify_account_result
-                                    .as_ref()
-                                    .and_then(|response| response.error.as_deref())
-                                {
-                                    p { class: "mt-3 status-err", role: "alert", "Spotify could not refresh this connection: {error}" }
-                                    if error.contains("not registered for this application") {
-                                        p { class: "mt-2 text-sm text-secondary", "Add the Spotify account email to this app's Development-mode Users list, then reconnect." }
+                                div {
+                                    class: "mt-3",
+                                    hidden: spotify_account_error.is_none(),
+                                    aria_hidden: spotify_account_error.is_none(),
+                                    p { class: "status-err", role: "alert", "Spotify could not refresh this connection: {spotify_account_error.unwrap_or_default()}" }
+                                    p {
+                                        class: "mt-2 text-sm text-secondary",
+                                        hidden: !spotify_account_error_hint,
+                                        "Add the Spotify account email to this app's Development-mode Users list, then reconnect."
                                     }
                                 }
                             }
@@ -902,13 +949,25 @@ pub fn Settings() -> Element {
                             }
                         }
 
-                        if let Some(message) = callback_message {
-                            p { class: "mt-4 status-ok", role: "status", aria_live: "polite", "{message}" }
+                        p {
+                            class: "mt-4 status-ok",
+                            hidden: callback_message.is_none(),
+                            aria_hidden: callback_message.is_none(),
+                            role: "status",
+                            aria_live: "polite",
+                            "{callback_message.unwrap_or_default()}"
                         }
 
+                        // Keep both panes in the hydrated tree. The server can know that
+                        // credentials are configured before the browser's resources resolve;
+                        // conditionally omitting either pane shifts every later event handler.
                         div { class: "mt-5 grid gap-5 lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]",
-                        if spotify_configured && !spotify_editing() {
-                            div { class: "status-panel rounded-lg p-4 sm:p-5", role: "status", aria_live: "polite",
+                            div {
+                                class: "status-panel rounded-lg p-4 sm:p-5",
+                                hidden: !(spotify_configured && !spotify_editing()),
+                                aria_hidden: !(spotify_configured && !spotify_editing()),
+                                role: "status",
+                                aria_live: "polite",
                                 p { class: "font-medium",
                                     if spotify_connected {
                                         "Connected · credentials stored on this UHC server"
@@ -940,8 +999,10 @@ pub fn Settings() -> Element {
                                     }
                                 }
                             }
-                        } else {
-                        div { class: "lg:col-span-2 grid gap-4 sm:grid-cols-2",
+                            div {
+                                class: "lg:col-span-2 grid gap-4 sm:grid-cols-2",
+                                hidden: spotify_configured && !spotify_editing(),
+                                aria_hidden: spotify_configured && !spotify_editing(),
                             div { class: "rounded-md border border-default p-4",
                                 h4 { class: "font-medium", "Connect Spotify" }
                                 p { class: "mt-2 text-sm text-secondary", "After saving the client settings below, open Spotify’s consent page, approve playback access, and return here. Your token stays on this UHC server." }
@@ -1012,42 +1073,64 @@ pub fn Settings() -> Element {
                                 }
                                 p { class: "mt-2 text-xs text-muted", "Spotify requires HTTPS when UHC is accessed remotely. Plain HTTP is accepted only on 127.0.0.1 or [::1]." }
                                 button {
+                                    id: "spotify-save-client-settings",
                                     r#type: "button",
                                     class: "btn btn-outline mt-4 min-h-11 w-full sm:w-auto",
                                     disabled: spotify_action() == ProviderActionState::Loading,
                                     aria_busy: spotify_action() == ProviderActionState::Loading,
+                                    aria_describedby: "spotify-client-settings-status",
                                     onclick: save_spotify_local,
                                     if spotify_action() == ProviderActionState::Loading { "Saving…" } else { "Save client settings" }
                                 }
                                 p { class: "mt-2 text-xs text-muted", "Secrets are never returned to this page. Use Connect after saving to authorize the account." }
                             }
-                        }
+                            }
                         }
 
-                        if !spotify_configured {
-                            div { class: "rounded-md border border-default bg-elevated p-4", role: "status", aria_live: "polite",
+                        // Status panes stay mounted while their state changes so the
+                        // Refresh handler cannot move during hydration or polling.
+                        div {
+                            class: "rounded-md border border-default bg-elevated p-4",
+                            hidden: spotify_configured,
+                            aria_hidden: spotify_configured,
+                            role: "status",
+                            aria_live: "polite",
                                 p { class: "font-medium", "Spotify setup required" }
                                 p { class: "mt-1 text-sm text-secondary", "Save your Spotify client settings, then connect your account to discover Connect devices." }
-                            }
-                        } else if let Some(devices) = spotify_devices {
-                            if devices.is_empty() {
-                                div { class: "rounded-md border border-default bg-elevated p-4", role: "status", aria_live: "polite",
-                                    p { class: "font-medium", "No Spotify devices found" }
-                                    p { class: "mt-1 text-sm text-secondary", "Start Spotify on a Connect-capable player; UHC will detect it automatically." }
-                                }
-                            } else {
-                                div {
-                                    div { class: "flex items-center justify-between gap-3",
-                                        h4 { class: "font-medium", "Available devices ({devices.len()})" }
-                                        button {
-                                            r#type: "button",
-                                            class: "btn btn-outline btn-sm min-h-11",
-                                            onclick: refresh_providers,
-                                            aria_label: "Refresh Spotify devices",
-                                            "Refresh"
-                                        }
+                        }
+                        div {
+                            hidden: !(spotify_configured && spotify_devices.is_some()),
+                            aria_hidden: !(spotify_configured && spotify_devices.is_some()),
+                            div { class: "flex items-center justify-between gap-3",
+                                h4 { class: "font-medium",
+                                    if let Some(ref devices) = spotify_devices {
+                                        "Available devices ({devices.len()})"
+                                    } else {
+                                        "Available devices"
                                     }
-                                    ul { class: "mt-3 grid gap-2 sm:grid-cols-2", aria_label: "Spotify devices",
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "btn btn-outline btn-sm min-h-11",
+                                    onclick: refresh_providers,
+                                    aria_label: "Refresh Spotify devices",
+                                    "Refresh"
+                                }
+                            }
+                            div {
+                                class: "rounded-md border border-default bg-elevated p-4",
+                                hidden: !spotify_devices.as_ref().is_some_and(Vec::is_empty),
+                                aria_hidden: !spotify_devices.as_ref().is_some_and(Vec::is_empty),
+                                role: "status",
+                                aria_live: "polite",
+                                p { class: "font-medium", "No Spotify devices found" }
+                                p { class: "mt-1 text-sm text-secondary", "Start Spotify on a Connect-capable player; UHC will detect it automatically." }
+                            }
+                            div {
+                                hidden: !spotify_devices.as_ref().is_some_and(|devices| !devices.is_empty()),
+                                aria_hidden: !spotify_devices.as_ref().is_some_and(|devices| !devices.is_empty()),
+                                ul { class: "mt-3 grid gap-2 sm:grid-cols-2", aria_label: "Spotify devices",
+                                    if let Some(ref devices) = spotify_devices {
                                         for device in devices {
                                             li { class: "flex min-h-14 items-center justify-between gap-3 rounded-md border border-default bg-elevated px-3 py-2",
                                                 div { class: "min-w-0",
@@ -1063,21 +1146,36 @@ pub fn Settings() -> Element {
                                     }
                                 }
                             }
-                        } else if provider_zones_result.is_none() {
-                            div { class: "rounded-md border border-default bg-elevated p-4", role: "status", aria_live: "polite", "Loading Spotify devices…" }
-                        } else {
-                            div { class: "rounded-md border border-default bg-elevated p-4 status-err", role: "alert", "Unable to load Spotify devices. Refresh and try again." }
                         }
+                        div {
+                            class: "rounded-md border border-default bg-elevated p-4",
+                            hidden: !(spotify_configured && provider_zones_result.is_none()),
+                            aria_hidden: !(spotify_configured && provider_zones_result.is_none()),
+                            role: "status",
+                            aria_live: "polite",
+                            "Loading Spotify devices…"
+                        }
+                        div {
+                            class: "rounded-md border border-default bg-elevated p-4 status-err",
+                            hidden: !(spotify_configured && provider_zones_result.as_ref().is_some_and(|result| result.is_err())),
+                            aria_hidden: !(spotify_configured && provider_zones_result.as_ref().is_some_and(|result| result.is_err())),
+                            role: "alert",
+                            "Unable to load Spotify devices. Refresh and try again."
                         }
 
-                        if let Some(error) = spotify_error() {
-                            p { class: "mt-4 status-err", role: "alert", "{error}" }
-                        } else if let Some(message) = spotify_action().message() {
-                            p { class: "mt-4 text-sm text-secondary", role: "status", aria_live: "polite", "{message}" }
+                        p {
+                            id: "spotify-client-settings-status",
+                            class: if spotify_status_is_error { "mt-4 status-err" } else { "mt-4 text-sm text-secondary" },
+                            hidden: spotify_status_message.is_none(),
+                            role: if spotify_status_is_error { "alert" } else { "status" },
+                            aria_live: "polite",
+                            "{spotify_status_message.as_deref().unwrap_or_default()}"
                         }
 
-                        if spotify_configured || spotify_connected {
-                            div { class: "mt-5 flex flex-wrap gap-3 border-t border-default pt-4",
+                        div {
+                            class: "mt-5 flex flex-wrap gap-3 border-t border-default pt-4",
+                            hidden: !(spotify_configured || spotify_connected),
+                            aria_hidden: !(spotify_configured || spotify_connected),
                                 button {
                                     r#type: "button",
                                     class: "btn btn-outline min-h-11",
@@ -1088,12 +1186,13 @@ pub fn Settings() -> Element {
                             }
                         }
                     }
-                    }
 
                     // Apple Music is paired through the native MusicKit app;
                     // keep this card focused on status and the next action.
-                    if applemusic_enabled() {
-                    div { class: "card p-5 sm:p-6", aria_labelledby: "apple-music-heading",
+                    div {
+                        class: "card p-5 sm:p-6",
+                        hidden: !applemusic_enabled(),
+                        aria_labelledby: "apple-music-heading",
                         div { class: "flex items-start justify-between gap-3",
                             div {
                                 h3 { id: "apple-music-heading", class: "text-lg font-semibold", "Apple Music" }
@@ -1143,8 +1242,6 @@ pub fn Settings() -> Element {
                 }
                 }
                 }
-                }
-            }
                 }
             }
 
