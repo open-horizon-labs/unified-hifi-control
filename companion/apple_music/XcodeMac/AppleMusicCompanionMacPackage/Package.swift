@@ -14,7 +14,10 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(path: "../../")
+        .package(path: "../../"),
+        // Keep the package explicit for Command Line Tools and XcodeBuildMCP,
+        // which may not expose the toolchain's built-in Testing module.
+        .package(url: "https://github.com/swiftlang/swift-testing.git", from: "0.1.0")
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
@@ -28,7 +31,8 @@ let package = Package(
         .testTarget(
             name: "AppleMusicCompanionMacFeatureTests",
             dependencies: [
-                "AppleMusicCompanionMacFeature"
+                "AppleMusicCompanionMacFeature",
+                .product(name: "Testing", package: "swift-testing")
             ]
         ),
     ]
