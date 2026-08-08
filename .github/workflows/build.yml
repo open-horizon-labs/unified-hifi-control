@@ -1804,7 +1804,7 @@ jobs:
   publish-aur:
     name: Publish to AUR
     needs: [plan, upload-release]
-    if: needs.plan.outputs.is_release == 'true'
+    if: needs.plan.outputs.is_release == 'true' && needs.plan.outputs.is_beta != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
