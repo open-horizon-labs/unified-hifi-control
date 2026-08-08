@@ -12,6 +12,13 @@ normalize_version() {
 
     if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
         printf '%s-10000\n' "${BASH_REMATCH[1]}"
+    elif [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-beta(\.([0-9]+))?$ ]]; then
+        local beta_number=${BASH_REMATCH[3]:-0}
+        if ((beta_number > 999)); then
+            echo "Beta number is too large for Synology version encoding: $version" >&2
+            return 1
+        fi
+        printf '%s-%04d\n' "${BASH_REMATCH[1]}" "$((8000 + beta_number))"
     elif [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$ ]]; then
         local rc_number=${BASH_REMATCH[2]}
         if ((rc_number > 999)); then
