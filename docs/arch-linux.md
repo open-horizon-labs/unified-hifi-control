@@ -143,6 +143,12 @@ git checkout v3
 UHC_PORT=8088 make web-run
 ```
 
+`make web-run` invokes the Dioxus fullstack build and runs
+`target/dx/unified-hifi-control/release/web/server`; use that generated server
+for source development rather than `cargo run`, which does not produce the
+hydration bundle. Packaged releases embed those web assets in the installed
+binary.
+
 ## RoPieee / AudioLinux Integration
 
 For RoPieee and AudioLinux developers: this package follows standard Arch packaging conventions. The PKGBUILD can be adapted for inclusion in your distribution's package repository.
