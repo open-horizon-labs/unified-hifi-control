@@ -15,8 +15,10 @@ fn provider_area_is_hidden_until_a_streaming_adapter_is_enabled() {
         .expect("Settings needs a stable streaming-provider hydration anchor")..];
 
     assert!(
-        provider_area.contains("hidden: !(spotify_enabled() || applemusic_enabled())"),
-        "hide Streaming providers when neither Spotify nor Apple Music is enabled"
+        provider_area.contains(
+            "hidden: !(spotify_enabled() || applemusic_enabled() || musicassistant_enabled())",
+        ),
+        "hide Streaming providers when no streaming provider is enabled"
     );
 }
 
@@ -38,5 +40,29 @@ fn each_provider_card_is_gated_by_its_own_feature_state() {
     assert!(
         SETTINGS[apple_card_start..apple_heading].contains("hidden: !applemusic_enabled()"),
         "Apple Music pairing must disappear when Apple Music is disabled"
+    );
+}
+
+#[test]
+fn musicassistant_setup_explains_the_first_success_and_keeps_advanced_http_secondary() {
+    let card = &SETTINGS[SETTINGS
+        .find("aria_labelledby: \"musicassistant-heading\"")
+        .expect("Settings must contain the Music Assistant provider card")..];
+
+    assert!(
+        card.contains("Create a long-lived access token in Music Assistant, then paste it here."),
+        "first-run setup must tell listeners where the required token comes from"
+    );
+    assert!(
+        card.contains("Advanced connection options"),
+        "the exceptional plaintext HTTP option must not compete with the default setup path"
+    );
+    assert!(
+        card.contains("View discovered zones"),
+        "a successful connection must lead to UHC's first-value destination"
+    );
+    assert!(
+        card.contains("sm:col-span-2"),
+        "the token field must span the complete desktop form instead of occupying a stray grid cell"
     );
 }

@@ -13,7 +13,7 @@ use crate::app::components::Layout;
 use crate::app::settings_context::{initial_app_settings, use_settings};
 use crate::app::sse::use_sse;
 use crate::app::theme::{use_theme, Theme};
-use crate::app::McpEndpoint;
+use crate::app::{McpEndpoint, Route};
 
 /// OpenHome status response
 #[derive(Clone, Debug, Default, serde::Deserialize, PartialEq)]
@@ -1417,7 +1417,11 @@ pub fn Settings() -> Element {
                         p { class: "mt-1 text-sm text-secondary", "Connect UHC directly to a Music Assistant server. Its access token is encrypted and never returned to this page." }
                         if let Some(status) = musicassistant_status.read().clone().flatten() {
                             div { class: "mt-3 text-sm",
-                                if status.running { p { class: "status-ok", "Connected" } }
+                                if status.running {
+                                    p { class: "status-ok", "Connected" }
+                                    p { class: "mt-1 text-secondary", "Your Music Assistant zones are ready to use in UHC." }
+                                    Link { class: "link mt-2 inline-flex min-h-11 items-center", to: Route::Zones {}, "View discovered zones" }
+                                }
                                 else if status.configured { p { class: "text-yellow-500", "Configured, not currently connected" } }
                                 else { p { class: "text-muted", "Setup required" } }
                                 if let Some(endpoint) = status.endpoint {
@@ -1432,21 +1436,43 @@ pub fn Settings() -> Element {
                                 }
                             }
                         }
+                        if musicassistant_status
+                            .read()
+                            .clone()
+                            .flatten()
+                            .is_none_or(|status| !status.configured)
+                        {
+                            div { class: "mt-4 border-y border-default py-4",
+                                h4 { class: "font-medium", "Before you connect" }
+                                p { class: "mt-1 text-sm text-secondary", "Create a long-lived access token in Music Assistant, then paste it here." }
+                                p { class: "mt-1 text-sm text-muted", "You need the server address and token; the default port is 8095." }
+                            }
+                        }
                         div { class: "mt-4 grid gap-4 sm:grid-cols-2",
-                            label { class: "block text-sm font-medium", r#for: "musicassistant-host", "Server host" }
-                            input { id: "musicassistant-host", class: "input mt-1 min-h-11 w-full", value: musicassistant_host(), autocomplete: "url", placeholder: "music-assistant.local", oninput: move |event| musicassistant_host.set(event.value()) }
-                            label { class: "block text-sm font-medium", r#for: "musicassistant-port", "Port" }
-                            input { id: "musicassistant-port", class: "input mt-1 min-h-11 w-full", r#type: "number", value: musicassistant_port(), oninput: move |event| musicassistant_port.set(event.value()) }
-                            label { class: "block text-sm font-medium sm:col-span-2", r#for: "musicassistant-token", "Long-lived access token" }
-                            input { id: "musicassistant-token", class: "input mt-1 min-h-11 w-full", r#type: "password", value: musicassistant_token(), autocomplete: "new-password", placeholder: "Leave blank to keep the saved token", oninput: move |event| musicassistant_token.set(event.value()) }
+                            div {
+                                label { class: "block text-sm font-medium", r#for: "musicassistant-host", "Server host" }
+                                input { id: "musicassistant-host", class: "input mt-1 min-h-11 w-full", value: musicassistant_host(), autocomplete: "url", placeholder: "music-assistant.local", oninput: move |event| musicassistant_host.set(event.value()) }
+                            }
+                            div {
+                                label { class: "block text-sm font-medium", r#for: "musicassistant-port", "Port" }
+                                input { id: "musicassistant-port", class: "input mt-1 min-h-11 w-full", r#type: "number", value: musicassistant_port(), oninput: move |event| musicassistant_port.set(event.value()) }
+                            }
+                            div { class: "sm:col-span-2",
+                                label { class: "block text-sm font-medium", r#for: "musicassistant-token", "Long-lived access token" }
+                                input { id: "musicassistant-token", class: "input mt-1 min-h-11 w-full", r#type: "password", value: musicassistant_token(), autocomplete: "new-password", placeholder: "Leave blank to keep the saved token", oninput: move |event| musicassistant_token.set(event.value()) }
+                            }
                         }
                         label { class: "mt-4 flex items-center gap-2 text-sm",
                             input { r#type: "checkbox", checked: musicassistant_tls(), onchange: move |event| musicassistant_tls.set(event.checked()) }
                             "Use HTTPS (recommended)"
                         }
-                        label { class: "mt-3 flex items-center gap-2 text-sm",
-                            input { r#type: "checkbox", checked: musicassistant_insecure_http(), onchange: move |event| musicassistant_insecure_http.set(event.checked()) }
-                            "Allow plaintext HTTP only for a trusted local/private peer"
+                        details { class: "mt-4 border-t border-default pt-4", open: musicassistant_insecure_http(),
+                            summary { class: "cursor-pointer text-sm font-medium text-secondary", "Advanced connection options" }
+                            p { class: "mt-2 text-sm text-muted", "Only use plaintext HTTP when UHC and Music Assistant communicate over a trusted local or private network." }
+                            label { class: "mt-3 flex items-center gap-2 text-sm",
+                                input { r#type: "checkbox", checked: musicassistant_insecure_http(), onchange: move |event| musicassistant_insecure_http.set(event.checked()) }
+                                "Allow plaintext HTTP for this trusted local/private peer"
+                            }
                         }
                         button { id: "musicassistant-save-settings", r#type: "button", class: "btn btn-primary mt-5 min-h-11", disabled: musicassistant_action() == ProviderActionState::Loading, aria_busy: musicassistant_action() == ProviderActionState::Loading, onclick: save_musicassistant,
                             if musicassistant_action() == ProviderActionState::Loading { "Checking connection…" } else { "Save and connect" }

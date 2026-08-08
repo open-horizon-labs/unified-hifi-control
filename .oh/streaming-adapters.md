@@ -105,3 +105,31 @@ tests cover the approved route and MA secret redaction/rollback.
 separate because it needs an approved user-facing grouping contract. The new
 collection vocabulary is MA-first: other adapters remain truthfully unavailable
 until each maps its native library semantics into the shared opaque-ref shape.
+
+## Execute: Music Assistant Settings onboarding refinement
+
+**Aim:** get a listener from an enabled Music Assistant adapter to its first
+working UHC zones without making the normal secure path feel like a network
+administration form.
+
+**Scope:** the existing Music Assistant Settings card only. **Non-goals:** API,
+credential-storage, connection-lifecycle, or provider-capability changes.
+**Success:** the first-run card states where the token comes from, desktop
+fields retain their label/input relationship, plaintext HTTP is secondary, and
+a live connection leads to the discovered Zones page.
+
+**Risk retirement:** a focused Settings source contract fails the tempting
+flat-grid patch (where the token becomes an orphaned desktop cell), omission of
+token provenance, omission of the first-value link, and promoting HTTP beside
+the default path. `musicassistant_provider_auth` confirms the UI refinement did
+not weaken failed-replacement rollback or secret redaction. The Impeccable
+detector reported no mechanical design issue. Manual desktop/mobile rendering
+remains a human verification item because this environment has no browser
+runtime.
+
+## Review: Music Assistant Settings onboarding refinement
+
+**Status:** continue to commit. The card teaches only the minimum action to
+connect, preserves the existing server-owned credential boundary, and sends a
+successful listener to Zones rather than attempting a tutorial. No frame or
+scope drift found.
