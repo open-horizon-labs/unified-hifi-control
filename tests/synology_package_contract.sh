@@ -59,7 +59,7 @@ else
     printf '#!/bin/sh\nexit 0\n' > "$test_binary"
     chmod +x "$test_binary"
 
-    for version_case in '3.4.1:3.4.1-10000' '3.5.0-rc.2:3.5.0-9002' '0.0.0-pr171:0.0.0-0171' '0.0.0-dev:0.0.0-0001'; do
+    for version_case in '3.4.1:3.4.1-10000' '3.5.1-beta:3.5.1-8000' '3.5.0-rc.2:3.5.0-9002' '0.0.0-pr171:0.0.0-0171' '0.0.0-dev:0.0.0-0001'; do
         input_version=${version_case%%:*}
         expected_version=${version_case#*:}
         output_spk="${test_tmp}/${input_version}.spk"
@@ -94,7 +94,7 @@ else
     arm_arch=$(tar -xOf "$arm_spk" INFO | sed -n 's/^arch="\([^"]*\)"$/\1/p')
     [[ "$arm_arch" == 'armv8' ]] || fail "ARM SPK arch is ${arm_arch}, expected armv8"
 
-    if "${SYNOLOGY_DIR}/build-spk.sh" 3.5.0-beta.1 x86_64 "$test_binary" "${test_tmp}/invalid.spk" 2>/dev/null; then
+    if "${SYNOLOGY_DIR}/build-spk.sh" 3.5.0-alpha.1 x86_64 "$test_binary" "${test_tmp}/invalid.spk" 2>/dev/null; then
         fail "build-spk.sh must reject prerelease formats without an explicit DSM ordering rule"
     fi
 fi
