@@ -66,6 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       is_release: ${{ steps.decide.outputs.is_release }}
+      is_beta: ${{ steps.decide.outputs.is_beta }}
       build_linux_arm: ${{ steps.decide.outputs.build_linux_arm }}
       build_macos: ${{ steps.decide.outputs.build_macos }}
       build_windows: ${{ steps.decide.outputs.build_windows }}
@@ -171,6 +172,12 @@ jobs:
             IS_RELEASE="true"
           fi
           echo "is_release=$IS_RELEASE" >> $GITHUB_OUTPUT
+
+          IS_BETA="false"
+          if [[ "$IS_RELEASE" == "true" && "$GITHUB_REF_NAME" == *-* ]]; then
+            IS_BETA="true"
+          fi
+          echo "is_beta=$IS_BETA" >> $GITHUB_OUTPUT
 
           # Linux ARM: needed for ARM binaries, Synology ARM, QNAP ARM, linux packages
           BUILD_LINUX_ARM="false"
@@ -1670,17 +1677,48 @@ jobs:
           - `lms-unified-hifi-control-*.zip` - Install via LMS Settings > Plugins
           EOF
 
+      - name: Generate beta LMS repository feed
+        if: needs.plan.outputs.is_beta == 'true'
+        run: |
+          VERSION="${{ needs.plan.outputs.version }}"
+          ZIP="release/lms-unified-hifi-control-${VERSION}.zip"
+          SHA=$(sha1sum "$ZIP" | cut -d' ' -f1)
+          REPO_URL="https://github.com/${{ github.repository }}"
+
+          cat > release/lms-beta.xml << REPOXML
+          <?xml version="1.0" encoding="UTF-8"?>
+          <extensions>
+            <plugins>
+              <plugin name="UnifiedHiFi"
+                      version="${VERSION}"
+                      minTarget="8.0"
+                      maxTarget="*">
+                <title lang="EN">Unified Hi-Fi Control (Beta)</title>
+                <desc lang="EN">Beta builds of Unified Hi-Fi Control for testing.</desc>
+                <url>${REPO_URL}/releases/download/v${VERSION}/lms-unified-hifi-control-${VERSION}.zip</url>
+                <sha>${SHA}</sha>
+                <creator>Muness Castle</creator>
+                <link>https://github.com/${{ github.repository }}/releases/tag/v${VERSION}</link>
+              </plugin>
+            </plugins>
+          </extensions>
+          REPOXML
+
+          echo "Generated beta feed:"
+          cat release/lms-beta.xml
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
           append_body: true
           body_path: release-assets.md
+          prerelease: ${{ needs.plan.outputs.is_beta == 'true' }}
 
   update-repo-xml:
     name: Update LMS repo.xml
     needs: [plan, upload-release]
-    if: needs.plan.outputs.is_release == 'true'
+    if: needs.plan.outputs.is_release == 'true' && needs.plan.outputs.is_beta != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
