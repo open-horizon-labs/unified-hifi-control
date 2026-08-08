@@ -775,8 +775,12 @@ mod server {
             .route("/control", get(control_redirect))
             .route("/admin", get(settings_redirect))
             // Embedded WASM/JS assets (ADR 002: serve from memory, no disk extraction)
-            .route("/assets/{*path}", get(embedded::serve_embedded_asset))
-            // Embedded static files (favicon, CSS, images)
+            .route("/assets/{*path}", get(embedded::serve_embedded_asset));
+
+        // Static file routes: only needed for non-web builds (cargo run).
+        // In web/fullstack mode, Dioxus automatically serves public/ directory.
+        #[cfg(not(feature = "web"))]
+        let router = router
             .route(
                 "/favicon.ico",
                 get(|| embedded::serve_static_file(axum::extract::Path("favicon.ico".to_string()))),
@@ -802,7 +806,13 @@ mod server {
                         "dx-components-theme.css".to_string(),
                     ))
                 }),
-            )
+            );
+
+        // Keep router in scope for web builds (static files served by Dioxus)
+        #[cfg(feature = "web")]
+        let router = router;
+
+        let router = router
             // MCP routes (same port as main app)
             .route("/mcp", get(mcp::handle_mcp_get))
             .route("/mcp", post(mcp::handle_mcp_post))

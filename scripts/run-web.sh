@@ -8,7 +8,9 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-if ! command -v dx >/dev/null 2>&1; then
+# Prefer cargo-installed dioxus-cli over any system dx (e.g., Deno's dx alias)
+DX="${HOME}/.cargo/bin/dx"
+if [[ ! -x "$DX" ]]; then
   echo "UHC web runner requires Dioxus CLI: cargo install dioxus-cli@0.7.10 --locked" >&2
   exit 1
 fi
@@ -18,7 +20,7 @@ make css
 # Some development machines configure Cargo to use sccache, which can prevent
 # Dioxus from probing the wasm target. Override it only for this deterministic
 # fullstack build.
-CARGO_BUILD_RUSTC_WRAPPER='' dx build --release --platform web --features web
+CARGO_BUILD_RUSTC_WRAPPER='' "$DX" build --release --platform web --features web --bin unified-hifi-control
 
 server="$repo_root/target/dx/unified-hifi-control/release/web/server"
 if [[ ! -x "$server" ]]; then
