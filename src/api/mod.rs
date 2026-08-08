@@ -4,6 +4,7 @@ use crate::adapters::hqplayer::{
     HqpAdapter, HqpAdvancedOptionsSnapshot, HqpInstanceManager, HqpProfile, HqpZoneLinkService,
 };
 use crate::adapters::lms::LmsAdapter;
+use crate::adapters::musicassistant::ReconfigurableMusicAssistant;
 use crate::adapters::openhome::OpenHomeAdapter;
 use crate::adapters::roon::RoonAdapter;
 use crate::adapters::upnp::UPnPAdapter;
@@ -77,6 +78,23 @@ impl AdapterRegistry {
             .write()
             .await
             .insert(startable.name().to_string(), startable);
+    }
+
+    /// Start a registered lifecycle owner through the coordinator without
+    /// exposing its concrete adapter type to an API handler.
+    pub async fn start_registered_if_enabled(
+        &self,
+        coordinator: &AdapterCoordinator,
+        name: &str,
+    ) -> anyhow::Result<bool> {
+        let startable = self
+            .startables
+            .read()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("adapter `{name}` is not registered"))?;
+        coordinator.start_enabled(&startable).await
     }
 
     /// Register the optional content-library surface for a provider. Keeping
@@ -195,6 +213,22 @@ impl AdapterRegistry {
         adapter.queue_uri(zone_id, uri).await
     }
 
+    pub async fn play_next_library_uri(
+        &self,
+        prefix: &str,
+        zone_id: &str,
+        uri: &str,
+    ) -> anyhow::Result<()> {
+        let adapter = self
+            .libraries
+            .read()
+            .await
+            .get(prefix)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("adapter `{prefix}` is not configured"))?;
+        adapter.play_next_uri(zone_id, uri).await
+    }
+
     pub async fn read_library_queue(
         &self,
         prefix: &str,
@@ -237,6 +271,8 @@ pub struct AppState {
     pub lms: Arc<LmsAdapter>,
     pub openhome: Arc<OpenHomeAdapter>,
     pub upnp: Arc<UPnPAdapter>,
+    /// Stable owner for the reconfigurable outbound Music Assistant client.
+    pub musicassistant: Arc<ReconfigurableMusicAssistant>,
     pub adapter_registry: Arc<AdapterRegistry>,
     pub provider_auth: Arc<provider_auth::ProviderAuthState>,
     pub controller_auth: controller_auth::ControllerAuthState,
@@ -291,6 +327,7 @@ impl AppState {
             lms,
             openhome,
             upnp,
+            musicassistant: Arc::new(ReconfigurableMusicAssistant::new(bus.clone())),
             adapter_registry: Arc::new(AdapterRegistry::default()),
             provider_auth: Arc::new(provider_auth::ProviderAuthState::default()),
             controller_auth: controller_auth::ControllerAuthState::new(),
@@ -2661,13 +2698,13 @@ pub async fn api_settings_post_handler(
                     // Do not persist a feature as enabled when its runtime
                     // could not be started. The Settings client will restore
                     // its last confirmed switch position from this response.
-                    rollback_adapter_transitions(
-                        &coord,
-                        adapters_list.as_ref(),
-                        old_adapters,
-                        &applied_transitions,
-                    )
-                    .await;
+                    coord
+                        .rollback_adapter_transitions(
+                            adapters_list.as_ref(),
+                            old_adapters,
+                            &applied_transitions,
+                        )
+                        .await;
                     return Json(serde_json::json!({
                         "ok": false,
                         "error": format!("Could not enable {name}: {error}"),
@@ -2688,19 +2725,20 @@ pub async fn api_settings_post_handler(
 
     // Persist only after every requested runtime transition succeeded.
     if !save_app_settings(&new_settings) {
-        rollback_adapter_transitions(
-            &coord,
-            adapters_list.as_ref(),
-            old_adapters,
-            &applied_transitions,
-        )
-        .await;
+        coord
+            .rollback_adapter_transitions(
+                adapters_list.as_ref(),
+                old_adapters,
+                &applied_transitions,
+            )
+            .await;
         return Json(serde_json::json!({"ok": false, "error": "Failed to save settings"}));
     }
 
     Json(serde_json::json!({"ok": true}))
 }
 
+#[cfg(test)]
 fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
     match name {
         "roon" => Some(settings.roon),
@@ -2712,43 +2750,6 @@ fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
         "applemusic" => Some(settings.applemusic),
         "musicassistant" => Some(settings.musicassistant),
         _ => None,
-    }
-}
-
-/// Reconcile the runtime with the last persisted settings after a failed
-/// settings transaction. This is deliberately best-effort: the original
-/// adapter start error is the actionable result, while rollback errors are
-/// recorded for diagnostics rather than obscuring it.
-async fn rollback_adapter_transitions(
-    coordinator: &AdapterCoordinator,
-    adapters: &[Arc<dyn Startable>],
-    previous: &AdapterSettings,
-    transitions: &[&str],
-) {
-    for name in transitions.iter().rev().copied() {
-        let Some(was_enabled) = adapter_enabled(previous, name) else {
-            continue;
-        };
-        coordinator.set_enabled(name, was_enabled).await;
-        let Some(adapter) = adapters.iter().find(|adapter| adapter.name() == name) else {
-            continue;
-        };
-        if was_enabled {
-            if let Err(error) = coordinator
-                .start_adapter_and_companions(adapter.as_ref())
-                .await
-            {
-                tracing::error!("Failed to roll back adapter {}: {}", name, error);
-            }
-        } else {
-            coordinator
-                .stop_adapter_and_companions_then_flush(
-                    adapter.as_ref(),
-                    name,
-                    "settings transaction rollback",
-                )
-                .await;
-        }
     }
 }
 

@@ -799,7 +799,7 @@ const ROON_REF_ACTIONS: &[&str] = &["play", "queue", "radio"];
 /// Every action `hifi_play_ref` accepts for an LMS-minted ref.
 const LMS_REF_ACTIONS: &[&str] = &["play", "queue", "next"];
 const SPOTIFY_REF_ACTIONS: &[&str] = &["play", "queue"];
-const MUSIC_ASSISTANT_REF_ACTIONS: &[&str] = &["play", "queue"];
+const MUSIC_ASSISTANT_REF_ACTIONS: &[&str] = &["play", "queue", "next"];
 
 /// Validate `action` against a provider's closed action set, defaulting to
 /// the first (always `"play"`) when absent. Never falls through to a default
@@ -953,6 +953,14 @@ pub async fn handle_play_ref(
         (LibraryRoute::MusicAssistant, RefTarget::MusicAssistant { uri, title }) => {
             play_ref_music_assistant(state, env, &args, uri, title).await
         }
+        (LibraryRoute::MusicAssistant, RefTarget::MusicAssistantBrowse { .. }) => env.refused(
+            "this ref names a browsable collection, not playable media.",
+            Refusal::InvalidParameter {
+                parameter: "ref",
+                accepted: vec!["a playable ref returned by hifi_search or hifi_collections".to_string()],
+                detail: "Pass collection paths back as hifi_collections.path; use hifi_play_ref only with a playable result's ref.".to_string(),
+            },
+        ),
         (LibraryRoute::AppleMusic, RefTarget::AppleMusic { handle, title, .. }) => {
             play_ref_apple_music(state, env, &args, handle, title).await
         }
@@ -976,6 +984,10 @@ pub async fn handle_play_ref(
         | (LibraryRoute::Roon, RefTarget::MusicAssistant { .. })
         | (LibraryRoute::Lms, RefTarget::MusicAssistant { .. })
         | (LibraryRoute::Spotify, RefTarget::MusicAssistant { .. })
+        | (LibraryRoute::Roon, RefTarget::MusicAssistantBrowse { .. })
+        | (LibraryRoute::Lms, RefTarget::MusicAssistantBrowse { .. })
+        | (LibraryRoute::Spotify, RefTarget::MusicAssistantBrowse { .. })
+        | (LibraryRoute::AppleMusic, RefTarget::MusicAssistantBrowse { .. })
         | (LibraryRoute::MusicAssistant, RefTarget::Roon { .. })
         | (LibraryRoute::MusicAssistant, RefTarget::Lms { .. })
         | (LibraryRoute::MusicAssistant, RefTarget::Spotify { .. })
@@ -1152,6 +1164,12 @@ async fn play_ref_music_assistant(
             .queue_library_uri("musicassistant", &args.zone_id, &uri)
             .await
             .map(|_| format!("Queued {title} on Music Assistant"))
+    } else if action_name == "next" {
+        state
+            .adapter_registry
+            .play_next_library_uri("musicassistant", &args.zone_id, &uri)
+            .await
+            .map(|_| format!("Queued {title} next on Music Assistant"))
     } else {
         state
             .adapter_registry

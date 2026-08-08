@@ -30,6 +30,7 @@ const CREDENTIAL_FILE_ENV: &str = "UHC_SPOTIFY_CREDENTIAL_FILE";
 const KEY_FILE_ENV: &str = "UHC_CREDENTIAL_KEY_FILE";
 const KEY_ENV: &str = "UHC_CREDENTIAL_KEY";
 const APPLE_BRIDGE_FILE_ENV: &str = "UHC_APPLE_BRIDGE_CREDENTIAL_FILE";
+const MUSIC_ASSISTANT_CREDENTIAL_FILE_ENV: &str = "UHC_MUSIC_ASSISTANT_CREDENTIAL_FILE";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EncryptedEnvelope {
@@ -189,6 +190,133 @@ impl EncryptedCredentialStore {
     /// Path used for diagnostics; never includes credential contents.
     pub fn path(&self) -> &Path {
         &self.credential_path
+    }
+}
+
+/// Connection identity and bearer token for one Music Assistant server.
+///
+/// The token is intentionally only available to server-side callers.  The
+/// Settings/UI contract reports configuration presence, never this record.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MusicAssistantCredentialRecord {
+    pub host: String,
+    pub port: u16,
+    pub token: String,
+    pub tls: bool,
+    pub allow_insecure_http: bool,
+}
+
+impl std::fmt::Debug for MusicAssistantCredentialRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MusicAssistantCredentialRecord")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("token", &"[REDACTED]")
+            .field("tls", &self.tls)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .finish()
+    }
+}
+
+/// Encrypted credential storage for Music Assistant's outbound bearer token.
+#[derive(Clone)]
+pub struct MusicAssistantCredentialStore {
+    credential_path: PathBuf,
+    key: [u8; KEY_BYTES],
+}
+
+impl MusicAssistantCredentialStore {
+    pub fn new(credential_path: PathBuf, key: [u8; KEY_BYTES]) -> Self {
+        Self {
+            credential_path,
+            key,
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let credential_path = std::env::var_os(MUSIC_ASSISTANT_CREDENTIAL_FILE_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| get_config_file_path("musicassistant-credentials.enc"));
+        let key = if let Ok(value) = std::env::var(KEY_ENV) {
+            parse_key(&value).context("UHC_CREDENTIAL_KEY must be 32-byte hex or base64url")?
+        } else {
+            let key_path = std::env::var_os(KEY_FILE_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| get_config_file_path("credential.key"));
+            load_or_create_key(&key_path)?
+        };
+        Ok(Self::new(credential_path, key))
+    }
+
+    pub fn load(&self) -> Result<Option<MusicAssistantCredentialRecord>> {
+        let bytes = match std::fs::read(&self.credential_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let envelope: EncryptedEnvelope = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow!("Music Assistant credential envelope is invalid: {error}"))?;
+        if envelope.version != 1 || envelope.cipher != "chacha20poly1305" {
+            return Err(anyhow!("unsupported Music Assistant credential envelope"));
+        }
+        let nonce = URL_SAFE_NO_PAD
+            .decode(envelope.nonce)
+            .context("Music Assistant credential nonce is invalid")?;
+        if nonce.len() != NONCE_BYTES {
+            return Err(anyhow!(
+                "Music Assistant credential nonce has an invalid length"
+            ));
+        }
+        let ciphertext = URL_SAFE_NO_PAD
+            .decode(envelope.ciphertext)
+            .context("Music Assistant credential ciphertext is invalid")?;
+        let plaintext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
+            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .map_err(|_| anyhow!("Music Assistant credential decryption failed"))?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|error| anyhow!("Music Assistant credential payload is invalid: {error}"))
+    }
+
+    pub fn save(&self, record: &MusicAssistantCredentialRecord) -> Result<()> {
+        let parent = self
+            .credential_path
+            .parent()
+            .ok_or_else(|| anyhow!("Music Assistant credential path has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let plaintext =
+            serde_json::to_vec(record).context("serialize Music Assistant credentials")?;
+        let mut nonce = [0_u8; NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .map_err(|_| anyhow!("encrypt Music Assistant credentials"))?;
+        let encoded = serde_json::to_vec(&EncryptedEnvelope {
+            version: 1,
+            cipher: "chacha20poly1305".to_string(),
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+        })
+        .context("serialize Music Assistant credential envelope")?;
+        let temporary = self.credential_path.with_extension("enc.tmp");
+        write_private_file(&temporary, &encoded)?;
+        std::fs::rename(&temporary, &self.credential_path)
+            .context("replace Music Assistant credential file")?;
+        Ok(())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.credential_path
+    }
+
+    /// Remove the encrypted record when rolling a failed first-time setup
+    /// back to its prior absent state.
+    pub fn clear(&self) -> Result<()> {
+        match std::fs::remove_file(&self.credential_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 

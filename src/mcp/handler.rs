@@ -122,6 +122,9 @@ impl ServerHandler for HifiMcpHandler {
             HifiTools::HifiAppleMusicTool(args) => {
                 tools::apple_music::handle_apple_music(state, args).await
             }
+            HifiTools::HifiCollectionsTool(args) => {
+                tools::collections::handle_collections(state, args).await
+            }
         }
     }
 

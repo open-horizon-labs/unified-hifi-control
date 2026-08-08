@@ -56,3 +56,52 @@ Apple Music is device-native; Spotify is account- and Connect-device-scoped; Ama
 - Spotify controller adapter: #466
 - Music Assistant peer adapter: #467
 - Amazon access discovery: #464
+
+## Dissent: Approved MA parity contract expansion
+
+**Decision:** add a provider-neutral MCP browse/collection surface and MA
+outbound setup/status path.
+
+- **Steel-man:** one zone-scoped browse contract gives MA, Roon, LMS, Spotify,
+  and Apple a common discovery shape while leaving item identity and mutation
+  semantics provider-owned. MA configuration belongs beside provider setup but
+  is an outbound bearer-authenticated peer connection, not an Apple-style
+  pairing bridge.
+- **Contrary evidence:** a generic browse model can erase provider-specific
+  paging/item semantics; reusing the Apple bridge would invert connection
+  ownership; a settings save can leave a stopped or half-replaced adapter.
+- **Decision:** proceed with owner-scoped opaque refs, explicit capability
+  refusals, provider-native payload fields behind a common envelope, encrypted
+  MA credentials, transactional replacement, and aggregator-only client state.
+- **Invalidation / stop:** stop if the model requires cross-provider refs,
+  exposes a secret, bypasses the registry/aggregator, or cannot roll back a
+  failed MA replacement.
+
+## Execute: Approved MA parity expansion
+
+**Aim:** complete advertised MA library, queue, and setup capabilities without
+turning UHC into an MA host, proxy, or source of fabricated state.
+
+**Scope:** provider-neutral MCP browse/collections; MA browse/playlists/
+favorites; MA queue actions; secure outbound configuration/status and Settings
+workflow. **Non-goals:** audio relay, MA OAuth, Apple pairing reuse, playlist
+mutation. **Success:** deterministic wire/MCP/API/UI tests cover provider scope,
+pagination, refs, failures, secret redaction, and lifecycle rollback.
+
+## Review: Approved MA parity expansion
+
+**Status:** continue. The implementation keeps UHC an outbound MA client and
+uses the existing adapter registry and aggregator rather than a direct UI
+connection. MA collection paths and playable references are opaque,
+provider-scoped, and cannot cross into Spotify; MA configuration preserves the
+old encrypted endpoint and runtime on a failed replacement.
+
+**Evidence:** focused adapter wire tests cover authenticated commands, grouped
+queue resolution and mode changes; MCP tests cover catalog refs, collections,
+queue mutation/play-next, pagination and cross-provider ref rejection; API
+tests cover the approved route and MA secret redaction/rollback.
+
+**Remaining initiative work:** MA multiroom membership is deliberately still
+separate because it needs an approved user-facing grouping contract. The new
+collection vocabulary is MA-first: other adapters remain truthfully unavailable
+until each maps its native library semantics into the shared opaque-ref shape.

@@ -110,6 +110,35 @@ pub struct SpotifyConfigureResponse {
     pub has_client_secret: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct MusicAssistantConfigureRequest {
+    pub host: String,
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub tls: bool,
+    pub allow_insecure_http: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MusicAssistantEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    pub allow_insecure_http: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct MusicAssistantStatusResponse {
+    pub provider: String,
+    pub configured: bool,
+    pub enabled: bool,
+    pub running: bool,
+    pub endpoint: Option<MusicAssistantEndpoint>,
+    pub has_token: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpotifyAccount {
     pub id: String,

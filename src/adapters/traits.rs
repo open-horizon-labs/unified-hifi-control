@@ -157,6 +157,13 @@ pub trait LibraryAdapter: Send + Sync + 'static {
         ))
     }
 
+    /// Insert one URI immediately after the current item when supported.
+    async fn play_next_uri(&self, _zone_id: &str, _uri: &str) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "play next is not implemented for this provider"
+        ))
+    }
+
     /// Read a provider queue as JSON for provider-neutral MCP projection.
     async fn read_queue(&self, _zone_id: &str) -> Result<serde_json::Value> {
         Err(anyhow::anyhow!(

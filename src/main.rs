@@ -381,7 +381,7 @@ mod server {
             }
         }
 
-        let music_assistant = match (
+        let music_assistant_config = match (
             std::env::var("MUSIC_ASSISTANT_HOST"),
             std::env::var("MUSIC_ASSISTANT_TOKEN"),
         ) {
@@ -396,22 +396,13 @@ mod server {
                 let allow_insecure_http = std::env::var("MUSIC_ASSISTANT_INSECURE_HTTP")
                     .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
                     .unwrap_or(false);
-                match adapters::musicassistant::MusicAssistantAdapter::new(
-                    bus.clone(),
-                    adapters::musicassistant::MusicAssistantConfig {
-                        host,
-                        port,
-                        token,
-                        tls,
-                        allow_insecure_http,
-                    },
-                ) {
-                    Ok(adapter) => Some(Arc::new(adapter)),
-                    Err(error) => {
-                        tracing::warn!("Music Assistant adapter disabled: {error}");
-                        None
-                    }
-                }
+                Some(adapters::musicassistant::MusicAssistantConfig {
+                    host,
+                    port,
+                    token,
+                    tls,
+                    allow_insecure_http,
+                })
             }
             _ => None,
         };
@@ -433,9 +424,6 @@ mod server {
         ];
 
         let mut provider_startables: Vec<Arc<dyn adapters::Startable>> = vec![spotify.clone()];
-        if let Some(adapter) = music_assistant.clone() {
-            provider_startables.push(adapter);
-        }
         let mut startable_adapters = legacy_startables.clone();
         startable_adapters.extend(provider_startables.iter().cloned());
 
@@ -466,10 +454,7 @@ mod server {
                 app_settings.adapters.spotify || spotify.is_configured().await,
             )
             .await;
-        let music_assistant_configured = match music_assistant.as_ref() {
-            Some(adapter) => adapter.is_configured().await,
-            None => false,
-        };
+        let music_assistant_configured = music_assistant_config.is_some();
         coord
             .set_enabled(
                 "musicassistant",
@@ -518,16 +503,55 @@ mod server {
             .register_library("spotify", spotify.clone())
             .await;
         state.provider_auth.attach_spotify(spotify.clone()).await;
-        if let Some(adapter) = music_assistant.clone() {
-            state
-                .adapter_registry
-                .register_with_lifecycle(adapter.clone(), adapter.clone())
-                .await;
-            state
-                .adapter_registry
-                .register_library("musicassistant", adapter)
-                .await;
+        state
+            .provider_auth
+            .attach_musicassistant(state.musicassistant.clone())
+            .await;
+        let persisted_music_assistant_config = state
+            .provider_auth
+            .musicassistant_bootstrap_config()
+            .unwrap_or_else(|error| {
+                tracing::warn!("Music Assistant encrypted configuration unavailable: {error}");
+                None
+            });
+        if let Some(config) = music_assistant_config.or(persisted_music_assistant_config) {
+            match adapters::musicassistant::MusicAssistantAdapter::new(bus.clone(), config.clone())
+            {
+                Ok(adapter) => {
+                    if let Err(error) = state
+                        .musicassistant
+                        .install(Arc::new(adapter), config)
+                        .await
+                    {
+                        tracing::warn!("Music Assistant adapter disabled: {error}");
+                    }
+                }
+                Err(error) => tracing::warn!("Music Assistant adapter disabled: {error}"),
+            }
         }
+        // An encrypted credential-only restart discovers its usable client
+        // here, after the initial settings registry was constructed. Preserve
+        // the established credential-backed provider behavior: a configured
+        // MA peer starts even when its optional feature switch was previously
+        // false, while later settings writes remain authoritative.
+        coord
+            .set_enabled(
+                "musicassistant",
+                app_settings.adapters.musicassistant || state.musicassistant.is_configured().await,
+            )
+            .await;
+        state
+            .adapter_registry
+            .register_with_lifecycle(state.musicassistant.clone(), state.musicassistant.clone())
+            .await;
+        state
+            .adapter_registry
+            .register_library("musicassistant", state.musicassistant.clone())
+            .await;
+        provider_startables.push(state.musicassistant.clone());
+        let mut startable_adapters = (*state.startable_adapters).clone();
+        startable_adapters.push(state.musicassistant.clone());
+        state.startable_adapters = Arc::new(startable_adapters);
 
         // Apple Music playback is owned by a native MusicKit companion. The
         // paired bridge implementation shares the registry with the HTTP
@@ -568,8 +592,9 @@ mod server {
         let api_oauth_start = api::provider_auth::oauth_start;
         let api_oauth_callback = api::provider_auth::oauth_callback;
         let api_oauth_revoke = api::provider_auth::oauth_revoke;
-        let api_spotify_configure = api::provider_auth::configure_spotify;
+        let api_provider_configure = api::provider_auth::configure_provider;
         let api_spotify_account = api::spotify_account_handler;
+        let api_musicassistant_status = api::provider_auth::musicassistant_status;
         let api_bridge_pair = api::apple_bridge::pair;
         let api_bridge_discover_pairing = api::apple_bridge::discover_pairing;
         let api_bridge_claim = api::apple_bridge::claim;
@@ -595,8 +620,9 @@ mod server {
             .route("/api/providers/{provider}/oauth/start", get(api_oauth_start))
             .route("/api/providers/{provider}/oauth/callback", get(api_oauth_callback))
             .route("/api/providers/{provider}/oauth/revoke", post(api_oauth_revoke))
-            .route("/api/providers/{provider}/configure", post(api_spotify_configure))
+            .route("/api/providers/{provider}/configure", post(api_provider_configure))
             .route("/api/providers/spotify/account", get(api_spotify_account))
+            .route("/api/providers/musicassistant/status", get(api_musicassistant_status))
             .route("/api/bridges/applemusic/pair", post(api_bridge_pair))
             .route("/api/bridges/applemusic/discover", post(api_bridge_discover_pairing))
             .route("/api/bridges/applemusic/claim", post(api_bridge_claim))

@@ -6,8 +6,14 @@
 //! require another login.  Deployments should protect that directory as a
 //! secret-backed volume; Unix installs additionally enforce mode 0600.
 
+use crate::adapters::musicassistant::{
+    MusicAssistantAdapter, MusicAssistantConfig, ReconfigurableMusicAssistant,
+};
 use crate::adapters::spotify::{SpotifyAdapter, SpotifyToken, SpotifyTokenRefresher};
-use crate::api::credentials::{EncryptedCredentialStore, SpotifyCredentialRecord};
+use crate::api::credentials::{
+    EncryptedCredentialStore, MusicAssistantCredentialRecord, MusicAssistantCredentialStore,
+    SpotifyCredentialRecord,
+};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -17,6 +23,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::{distributions::Alphanumeric, Rng, RngCore};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -39,6 +46,8 @@ pub struct ProviderAuthState {
     pending: Arc<RwLock<HashMap<String, PendingOAuth>>>,
     credentials: Option<Arc<EncryptedCredentialStore>>,
     oauth: Arc<RwLock<Option<Arc<SpotifyOAuthConfig>>>>,
+    musicassistant: Arc<RwLock<Option<Arc<ReconfigurableMusicAssistant>>>>,
+    musicassistant_credentials: Option<Arc<MusicAssistantCredentialStore>>,
 }
 
 #[derive(Clone)]
@@ -62,11 +71,15 @@ impl Default for ProviderAuthState {
         let oauth = spotify_oauth_config(credentials.as_ref())
             .ok()
             .map(Arc::new);
+        let musicassistant_credentials =
+            MusicAssistantCredentialStore::from_env().ok().map(Arc::new);
         Self {
             spotify: Arc::new(RwLock::new(None)),
             pending: Arc::new(RwLock::new(HashMap::new())),
             credentials,
             oauth: Arc::new(RwLock::new(oauth)),
+            musicassistant: Arc::new(RwLock::new(None)),
+            musicassistant_credentials,
         }
     }
 }
@@ -84,7 +97,20 @@ impl ProviderAuthState {
             pending: Arc::new(RwLock::new(HashMap::new())),
             credentials,
             oauth: Arc::new(RwLock::new(oauth)),
+            musicassistant: Arc::new(RwLock::new(None)),
+            musicassistant_credentials: MusicAssistantCredentialStore::from_env()
+                .ok()
+                .map(Arc::new),
         }
+    }
+
+    /// Construct provider auth with an explicit Music Assistant credential
+    /// store. This keeps outbound-provider integration tests isolated from an
+    /// operator's real encrypted configuration.
+    pub fn with_musicassistant_credential_store(store: MusicAssistantCredentialStore) -> Self {
+        let mut state = Self::default();
+        state.musicassistant_credentials = Some(Arc::new(store));
+        state
     }
 
     pub async fn attach_spotify(&self, adapter: Arc<SpotifyAdapter>) {
@@ -109,6 +135,10 @@ impl ProviderAuthState {
         *self.spotify.write().await = Some(adapter);
     }
 
+    pub async fn attach_musicassistant(&self, adapter: Arc<ReconfigurableMusicAssistant>) {
+        *self.musicassistant.write().await = Some(adapter);
+    }
+
     async fn spotify(&self) -> Option<Arc<SpotifyAdapter>> {
         self.spotify.read().await.clone()
     }
@@ -117,6 +147,27 @@ impl ProviderAuthState {
     /// reports configuration presence; it never exposes client credentials.
     pub async fn spotify_configured(&self) -> bool {
         self.oauth.read().await.is_some()
+    }
+
+    async fn musicassistant(&self) -> Option<Arc<ReconfigurableMusicAssistant>> {
+        self.musicassistant.read().await.clone()
+    }
+
+    /// Load the encrypted boot configuration without exposing its bearer token
+    /// to a caller outside the server process.
+    pub fn musicassistant_bootstrap_config(&self) -> anyhow::Result<Option<MusicAssistantConfig>> {
+        match self.musicassistant_credentials.as_ref() {
+            Some(store) => store.load().map(|record| {
+                record.map(|record| MusicAssistantConfig {
+                    host: record.host,
+                    port: record.port,
+                    token: record.token,
+                    tls: record.tls,
+                    allow_insecure_http: record.allow_insecure_http,
+                })
+            }),
+            None => Ok(None),
+        }
     }
 }
 
@@ -167,25 +218,106 @@ pub struct SpotifyConfigureResponse {
     pub has_client_secret: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MusicAssistantConfigureRequest {
+    pub host: String,
+    #[serde(default = "default_musicassistant_port")]
+    pub port: u16,
+    /// Omit or submit blank to retain the stored bearer token.
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default = "default_musicassistant_tls")]
+    pub tls: bool,
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+}
+
+fn default_musicassistant_port() -> u16 {
+    8095
+}
+fn default_musicassistant_tls() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+pub struct MusicAssistantEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    pub allow_insecure_http: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MusicAssistantConfigureResponse {
+    pub provider: String,
+    pub configured: bool,
+    pub endpoint: MusicAssistantEndpoint,
+    pub has_token: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MusicAssistantStatusResponse {
+    pub provider: String,
+    pub configured: bool,
+    pub enabled: bool,
+    pub running: bool,
+    pub endpoint: Option<MusicAssistantEndpoint>,
+    pub has_token: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
     error: String,
     code: &'static str,
 }
 
-/// Persist Spotify client configuration without returning secrets or tokens.
-pub async fn configure_spotify(
+/// Persist provider configuration without returning secrets or tokens. The
+/// route is shared for compatibility; each provider retains its own request
+/// contract after path dispatch.
+pub async fn configure_provider(
     State(state): State<AppState>,
     Path(provider): Path<String>,
-    Json(request): Json<SpotifyConfigureRequest>,
-) -> Result<Json<SpotifyConfigureResponse>, (StatusCode, Json<ErrorBody>)> {
-    if provider != "spotify" {
-        return Err(error(
+    Json(request): Json<Value>,
+) -> Result<Response, (StatusCode, Json<ErrorBody>)> {
+    match provider.as_str() {
+        "spotify" => {
+            let request = serde_json::from_value(request).map_err(|_| {
+                error(
+                    StatusCode::BAD_REQUEST,
+                    "Spotify client configuration is invalid",
+                    "invalid_client_configuration",
+                )
+            })?;
+            configure_spotify_request(state, provider, request)
+                .await
+                .map(|value| value.into_response())
+        }
+        "musicassistant" => {
+            let request = serde_json::from_value(request).map_err(|_| {
+                error(
+                    StatusCode::BAD_REQUEST,
+                    "Music Assistant connection configuration is invalid",
+                    "invalid_connection_configuration",
+                )
+            })?;
+            configure_musicassistant_request(state, request)
+                .await
+                .map(|value| value.into_response())
+        }
+        _ => Err(error(
             StatusCode::NOT_IMPLEMENTED,
-            "only Spotify client configuration is supported here",
+            "this provider does not support browser configuration",
             "provider_not_supported",
-        ));
+        )),
     }
+}
+
+async fn configure_spotify_request(
+    state: AppState,
+    provider: String,
+    request: SpotifyConfigureRequest,
+) -> Result<Json<SpotifyConfigureResponse>, (StatusCode, Json<ErrorBody>)> {
     let client_id = request.client_id.trim().to_string();
     if !valid_spotify_client_id(&client_id) {
         return Err(error(
@@ -269,6 +401,194 @@ pub async fn configure_spotify(
         redirect_uri: Some(redirect_uri),
         has_client_secret: client_secret.is_some(),
     }))
+}
+
+async fn configure_musicassistant_request(
+    state: AppState,
+    request: MusicAssistantConfigureRequest,
+) -> Result<Json<MusicAssistantConfigureResponse>, (StatusCode, Json<ErrorBody>)> {
+    let store = state.provider_auth.musicassistant_credentials.clone().ok_or_else(|| error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Music Assistant credential storage is unavailable; configure UHC_CREDENTIAL_KEY or a writable key file",
+        "credential_storage_unavailable",
+    ))?;
+    let existing = store.load().map_err(|_| {
+        error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Music Assistant credentials could not be loaded",
+            "credential_storage_failed",
+        )
+    })?;
+    let token = request
+        .token
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| existing.as_ref().map(|record| record.token.clone()))
+        .ok_or_else(|| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "Enter a Music Assistant access token before saving setup",
+                "missing_access_token",
+            )
+        })?;
+    let record = MusicAssistantCredentialRecord {
+        host: request.host.trim().to_string(),
+        port: request.port,
+        token,
+        tls: request.tls,
+        allow_insecure_http: request.allow_insecure_http,
+    };
+    let config = MusicAssistantConfig {
+        host: record.host.clone(),
+        port: record.port,
+        token: record.token.clone(),
+        tls: record.tls,
+        allow_insecure_http: record.allow_insecure_http,
+    };
+    let candidate = Arc::new(
+        MusicAssistantAdapter::new(state.bus.clone(), config.clone()).map_err(|_| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "Music Assistant connection settings are not safe or complete",
+                "invalid_connection_configuration",
+            )
+        })?,
+    );
+    candidate.probe().await.map_err(|_| {
+        error(
+            StatusCode::BAD_GATEWAY,
+            "Music Assistant could not be reached with those settings",
+            "connection_probe_failed",
+        )
+    })?;
+    let runtime = state.provider_auth.musicassistant().await.ok_or_else(|| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Music Assistant runtime is unavailable",
+            "adapter_unavailable",
+        )
+    })?;
+    let previous_runtime_config = runtime.configuration().await;
+    // Probe before either durable or runtime mutation. Once that boundary has
+    // passed, installing this already validated in-memory adapter cannot make
+    // an outbound request, so a failed peer leaves the current setup intact.
+    if store.save(&record).is_err() {
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Music Assistant credentials could not be saved",
+            "credential_storage_failed",
+        ));
+    }
+    if runtime.install(candidate, config).await.is_err() {
+        restore_musicassistant_record(&store, existing.as_ref());
+        return Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Music Assistant runtime could not be updated",
+            "adapter_start_failed",
+        ));
+    }
+    let runtime_for_rollback = runtime.clone();
+    if state
+        .adapter_registry
+        .start_registered_if_enabled(&state.coordinator, "musicassistant")
+        .await
+        .is_err()
+    {
+        restore_musicassistant_record(&store, existing.as_ref());
+        restore_musicassistant_runtime(&state.bus, &runtime_for_rollback, previous_runtime_config)
+            .await;
+        return Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Music Assistant could not be started",
+            "adapter_start_failed",
+        ));
+    }
+    Ok(Json(MusicAssistantConfigureResponse {
+        provider: "musicassistant".to_string(),
+        configured: true,
+        endpoint: endpoint_from_record(&record),
+        has_token: true,
+    }))
+}
+
+fn restore_musicassistant_record(
+    store: &MusicAssistantCredentialStore,
+    previous: Option<&MusicAssistantCredentialRecord>,
+) {
+    let result = match previous {
+        Some(record) => store.save(record),
+        None => store.clear(),
+    };
+    if let Err(error) = result {
+        tracing::error!("Music Assistant credential rollback failed: {error}");
+    }
+}
+
+async fn restore_musicassistant_runtime(
+    bus: &crate::bus::SharedBus,
+    runtime: &ReconfigurableMusicAssistant,
+    previous: Option<MusicAssistantConfig>,
+) {
+    match previous {
+        Some(config) => match MusicAssistantAdapter::new(bus.clone(), config.clone()) {
+            Ok(adapter) => {
+                if let Err(error) = runtime.install(Arc::new(adapter), config).await {
+                    tracing::error!("Music Assistant runtime rollback failed: {error}");
+                }
+            }
+            Err(error) => tracing::error!("Music Assistant rollback config was invalid: {error}"),
+        },
+        None => runtime.clear().await,
+    }
+}
+
+pub async fn musicassistant_status(
+    State(state): State<AppState>,
+) -> Json<MusicAssistantStatusResponse> {
+    let record = state
+        .provider_auth
+        .musicassistant_credentials
+        .as_ref()
+        .and_then(|store| store.load().ok().flatten());
+    let runtime = state.provider_auth.musicassistant().await;
+    let runtime_config = match runtime.as_ref() {
+        Some(runtime) => runtime.configuration().await,
+        None => None,
+    };
+    let running = match runtime.as_ref() {
+        Some(runtime) => runtime.is_running().await,
+        None => false,
+    };
+    Json(MusicAssistantStatusResponse {
+        provider: "musicassistant".to_string(),
+        configured: record.is_some() || runtime_config.is_some(),
+        enabled: state.coordinator.is_enabled("musicassistant").await,
+        running,
+        endpoint: record
+            .as_ref()
+            .map(endpoint_from_record)
+            .or_else(|| runtime_config.as_ref().map(endpoint_from_config)),
+        has_token: record.is_some_and(|record| !record.token.trim().is_empty())
+            || runtime_config.is_some_and(|config| !config.token.trim().is_empty()),
+        error: state.aggregator.get_adapter_error("musicassistant").await,
+    })
+}
+
+fn endpoint_from_record(record: &MusicAssistantCredentialRecord) -> MusicAssistantEndpoint {
+    MusicAssistantEndpoint {
+        host: record.host.clone(),
+        port: record.port,
+        tls: record.tls,
+        allow_insecure_http: record.allow_insecure_http,
+    }
+}
+
+fn endpoint_from_config(config: &MusicAssistantConfig) -> MusicAssistantEndpoint {
+    MusicAssistantEndpoint {
+        host: config.host.clone(),
+        port: config.port,
+        tls: config.tls,
+        allow_insecure_http: config.allow_insecure_http,
+    }
 }
 
 pub async fn oauth_start(

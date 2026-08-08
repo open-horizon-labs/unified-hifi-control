@@ -29,7 +29,7 @@ use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, LibraryAdapter,
     LibrarySearchResult,
 };
-use crate::adapters::{AdapterHandle, RetryConfig};
+use crate::adapters::{AdapterHandle, RetryConfig, Startable};
 use crate::bus::{
     BusEvent, NowPlaying, PlaybackState, PrefixedZoneId, SharedBus, VolumeControl, VolumeScale,
     Zone,
@@ -168,6 +168,79 @@ pub struct MusicAssistantAdapter {
     running: Arc<RwLock<bool>>,
 }
 
+/// Stable registry/lifecycle owner for a Music Assistant connection.
+///
+/// The configured peer can change after UHC has started, while the adapter
+/// registry and coordinator must retain one stable `musicassistant` identity.
+/// This façade keeps that ownership boundary intact and forwards only to the
+/// currently installed outbound client.
+#[derive(Clone)]
+pub struct ReconfigurableMusicAssistant {
+    bus: SharedBus,
+    current: Arc<RwLock<Option<Arc<MusicAssistantAdapter>>>>,
+    config: Arc<RwLock<Option<MusicAssistantConfig>>>,
+    running: Arc<RwLock<bool>>,
+}
+
+impl ReconfigurableMusicAssistant {
+    pub fn new(bus: SharedBus) -> Self {
+        Self {
+            bus,
+            current: Arc::new(RwLock::new(None)),
+            config: Arc::new(RwLock::new(None)),
+            running: Arc::new(RwLock::new(false)),
+        }
+    }
+
+    /// Install a validated client. Start the candidate before disturbing the
+    /// current client so a lifecycle failure leaves the live configuration
+    /// intact; only then replace the projection owner.
+    pub async fn install(
+        &self,
+        adapter: Arc<MusicAssistantAdapter>,
+        config: MusicAssistantConfig,
+    ) -> Result<()> {
+        if *self.running.read().await {
+            adapter.start().await?;
+        }
+        let old = self.current.write().await.replace(adapter);
+        *self.config.write().await = Some(config);
+        if let Some(old) = old {
+            old.stop().await;
+        }
+        Ok(())
+    }
+
+    pub async fn clear(&self) {
+        if let Some(old) = self.current.write().await.take() {
+            old.stop().await;
+        }
+        *self.config.write().await = None;
+    }
+
+    pub async fn is_configured(&self) -> bool {
+        self.current.read().await.is_some()
+    }
+
+    pub async fn is_running(&self) -> bool {
+        *self.running.read().await
+    }
+
+    /// Server-side bootstrap/status use only. Callers must never serialize
+    /// the bearer token held in this configuration.
+    pub async fn configuration(&self) -> Option<MusicAssistantConfig> {
+        self.config.read().await.clone()
+    }
+
+    async fn adapter(&self) -> Result<Arc<MusicAssistantAdapter>> {
+        self.current
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("Music Assistant is not configured"))
+    }
+}
+
 impl MusicAssistantAdapter {
     pub fn new(bus: SharedBus, config: MusicAssistantConfig) -> Result<Self> {
         if config.host.trim().is_empty() {
@@ -216,6 +289,13 @@ impl MusicAssistantAdapter {
 
     pub async fn is_configured(&self) -> bool {
         !self.base_url.is_empty() && !self.token.trim().is_empty()
+    }
+
+    /// Verify the endpoint and bearer token without publishing a partial
+    /// zone snapshot. The peer response body is intentionally not surfaced.
+    pub async fn probe(&self) -> Result<()> {
+        let _: Vec<Value> = self.command("players/all", None).await?;
+        Ok(())
     }
 
     async fn start_internal(&self) -> Result<()> {
@@ -853,8 +933,263 @@ impl LibraryAdapter for MusicAssistantAdapter {
         self.queue_media_uri(zone_id, uri).await
     }
 
+    async fn play_next_uri(&self, zone_id: &str, uri: &str) -> Result<()> {
+        self.play_media_uri_with_option(zone_id, uri, Some("next"))
+            .await
+            .map(|_| ())
+    }
+
     async fn read_queue(&self, zone_id: &str) -> Result<Value> {
         self.read_active_queue(zone_id).await
+    }
+
+    async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
+        if operation.starts_with("collections_") {
+            return self.collections_content(operation, params).await;
+        }
+        let zone_id = params
+            .get("zone_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("Music Assistant queue operation requires zone_id"))?;
+        let before = self.read_active_queue(zone_id).await?;
+        let queue_id = before["queue"]["queue_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Music Assistant active queue had no queue_id"))?
+            .to_string();
+        let mut args = serde_json::Map::new();
+        args.insert("queue_id".to_string(), Value::String(queue_id));
+        let command = match operation {
+            "queue_jump" => {
+                args.insert("index".to_string(), required_param(params, "item_id")?);
+                "player_queues/play_index"
+            }
+            "queue_reorder" => {
+                args.insert(
+                    "queue_item_id".to_string(),
+                    required_param(params, "item_id")?,
+                );
+                let target = required_param(params, "position")?
+                    .as_i64()
+                    .ok_or_else(|| {
+                        anyhow!("Music Assistant reorder position must be an integer")
+                    })?;
+                let item_id = args["queue_item_id"].as_str().unwrap_or_default();
+                let current = before["items"]
+                    .as_array()
+                    .and_then(|items| items.iter().position(|item| item["queue_item_id"].as_str() == Some(item_id)))
+                    .ok_or_else(|| anyhow!("Music Assistant queue item {item_id} was not found in fresh queue state"))? as i64;
+                args.insert("pos_shift".to_string(), json!(target - current));
+                "player_queues/move_item"
+            }
+            "queue_remove" => {
+                args.insert(
+                    "item_id_or_index".to_string(),
+                    required_param(params, "item_id")?,
+                );
+                "player_queues/delete_item"
+            }
+            "queue_clear" => "player_queues/clear",
+            _ => {
+                return Err(anyhow!(
+                    "unsupported Music Assistant queue operation {operation}"
+                ))
+            }
+        };
+        let _: Value = self.command(command, Some(Value::Object(args))).await?;
+        self.read_active_queue(zone_id).await
+    }
+}
+
+impl MusicAssistantAdapter {
+    async fn collections_content(&self, operation: &str, params: &Value) -> Result<Value> {
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 50);
+        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let (command, args) = match operation {
+            "collections_browse" => (
+                "music/browse",
+                json!({"path": params.get("path").and_then(Value::as_str).unwrap_or("root")}),
+            ),
+            "collections_playlists" => (
+                "music/playlists/library_items",
+                json!({"limit": limit, "offset": offset}),
+            ),
+            "collections_favorites" => {
+                let media_type = params
+                    .get("media_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tracks");
+                if !matches!(
+                    media_type,
+                    "tracks"
+                        | "albums"
+                        | "artists"
+                        | "playlists"
+                        | "radio"
+                        | "podcasts"
+                        | "audiobooks"
+                ) {
+                    return Err(anyhow!(
+                        "unsupported Music Assistant favorites media_type {media_type}"
+                    ));
+                }
+                let command = match media_type {
+                    "tracks" => "music/tracks/library_items",
+                    "albums" => "music/albums/library_items",
+                    "artists" => "music/artists/library_items",
+                    "playlists" => "music/playlists/library_items",
+                    "radio" => "music/radio/library_items",
+                    "podcasts" => "music/podcasts/library_items",
+                    _ => "music/audiobooks/library_items",
+                };
+                (
+                    command,
+                    json!({"favorite": true, "limit": limit, "offset": offset}),
+                )
+            }
+            _ => {
+                return Err(anyhow!(
+                    "unsupported Music Assistant collection operation {operation}"
+                ))
+            }
+        };
+        let raw: Value = self.command(command, Some(args)).await?;
+        let raw_items = raw
+            .as_array()
+            .ok_or_else(|| anyhow!("Music Assistant collection response was not a list"))?;
+        // `library_items` applies offset/limit server-side. `music/browse`
+        // does not expose paging, so page that one locally without leaking MA's
+        // provider path format through the MCP response.
+        let page: Box<dyn Iterator<Item = &Value>> = if operation == "collections_browse" {
+            Box::new(raw_items.iter().skip(offset as usize).take(limit as usize))
+        } else {
+            Box::new(raw_items.iter())
+        };
+        let mut items = Vec::new();
+        for item in page {
+            let title =
+                value_string(item, &["name", "title"]).unwrap_or_else(|| "Untitled".to_string());
+            let subtitle = search_subtitle(item);
+            let mut mapped = serde_json::Map::new();
+            mapped.insert("title".to_string(), Value::String(title));
+            if let Some(subtitle) = subtitle {
+                mapped.insert("subtitle".to_string(), Value::String(subtitle));
+            }
+            if let Some(uri) = item.get("uri").and_then(Value::as_str) {
+                mapped.insert("uri".to_string(), Value::String(uri.to_string()));
+            }
+            if let Some(path) = item.get("path").and_then(Value::as_str) {
+                mapped.insert("path".to_string(), Value::String(path.to_string()));
+            }
+            items.push(Value::Object(mapped));
+        }
+        let next_offset = if operation == "collections_browse" {
+            (raw_items.len() > (offset + limit) as usize).then_some(offset + limit)
+        } else {
+            (raw_items.len() == limit as usize).then_some(offset + limit)
+        };
+        Ok(json!({"items": items, "next_offset": next_offset}))
+    }
+}
+
+fn required_param(params: &Value, name: &str) -> Result<Value> {
+    params
+        .get(name)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .ok_or_else(|| anyhow!("Music Assistant queue operation requires {name}"))
+}
+
+#[async_trait]
+impl AdapterLogic for ReconfigurableMusicAssistant {
+    fn prefix(&self) -> &'static str {
+        "musicassistant"
+    }
+
+    async fn run(&self, ctx: AdapterContext) -> Result<()> {
+        ctx.shutdown.cancelled().await;
+        Ok(())
+    }
+
+    async fn handle_command(
+        &self,
+        zone_id: &str,
+        command: AdapterCommand,
+    ) -> Result<AdapterCommandResponse> {
+        self.adapter().await?.handle_command(zone_id, command).await
+    }
+}
+
+#[async_trait]
+impl LibraryAdapter for ReconfigurableMusicAssistant {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<LibrarySearchResult>> {
+        self.adapter().await?.search(query, limit).await
+    }
+
+    async fn search_for_zone(
+        &self,
+        zone_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<LibrarySearchResult>> {
+        self.adapter()
+            .await?
+            .search_for_zone(zone_id, query, limit)
+            .await
+    }
+
+    async fn play_uri(&self, zone_id: &str, uri: &str) -> Result<String> {
+        self.adapter().await?.play_uri(zone_id, uri).await
+    }
+
+    async fn queue_uri(&self, zone_id: &str, uri: &str) -> Result<()> {
+        self.adapter().await?.queue_uri(zone_id, uri).await
+    }
+
+    async fn play_next_uri(&self, zone_id: &str, uri: &str) -> Result<()> {
+        self.adapter().await?.play_next_uri(zone_id, uri).await
+    }
+
+    async fn read_queue(&self, zone_id: &str) -> Result<Value> {
+        self.adapter().await?.read_queue(zone_id).await
+    }
+
+    async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
+        self.adapter().await?.content(operation, params).await
+    }
+}
+
+#[async_trait]
+impl crate::adapters::Startable for ReconfigurableMusicAssistant {
+    fn name(&self) -> &'static str {
+        "musicassistant"
+    }
+
+    async fn start(&self) -> Result<()> {
+        let adapter = self.adapter().await?;
+        adapter.start().await?;
+        *self.running.write().await = true;
+        Ok(())
+    }
+
+    async fn stop(&self) {
+        *self.running.write().await = false;
+        if let Some(adapter) = self.current.read().await.clone() {
+            adapter.stop().await;
+        } else {
+            self.bus.publish(BusEvent::AdapterStopping {
+                adapter: self.prefix().to_string(),
+                reason: Some("requested".to_string()),
+            });
+        }
+    }
+
+    async fn can_start(&self) -> bool {
+        self.is_configured().await
     }
 }
 
@@ -1357,6 +1692,66 @@ mod tests {
             .as_ref()
             .is_some_and(|track| track.repeat_mode.is_none() && track.shuffle.is_none())));
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn queue_mutations_use_active_queue_and_return_fresh_readback() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        let adapter =
+            MusicAssistantAdapter::new(crate::bus::create_bus(), config).expect("adapter");
+        for (operation, params, command, args) in [
+            (
+                "queue_jump",
+                json!({"item_id": "item-5"}),
+                "player_queues/play_index",
+                json!({"index": "item-5"}),
+            ),
+            (
+                "queue_reorder",
+                json!({"item_id": "item-5", "position": 1}),
+                "player_queues/move_item",
+                json!({"queue_item_id": "item-5", "pos_shift": 0}),
+            ),
+            (
+                "queue_remove",
+                json!({"item_id": "item-5"}),
+                "player_queues/delete_item",
+                json!({"item_id_or_index": "item-5"}),
+            ),
+            ("queue_clear", json!({}), "player_queues/clear", json!({})),
+        ] {
+            let mut params = params;
+            params["zone_id"] = json!("musicassistant:sonos-kitchen");
+            adapter.content(operation, &params).await.expect("mutation");
+            let requests = state.requests.lock().expect("requests").clone();
+            let mutation = requests
+                .iter()
+                .find(|request| request.body["command"] == command)
+                .expect("mutation command");
+            let mut expected = args;
+            expected["queue_id"] = json!("group-living-room");
+            assert_eq!(mutation.body["args"], expected);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn queue_reorder_refuses_a_stale_item_before_writing() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        let adapter =
+            MusicAssistantAdapter::new(crate::bus::create_bus(), config).expect("adapter");
+        let error = adapter
+            .content("queue_reorder", &json!({"zone_id": "musicassistant:sonos-kitchen", "item_id": "gone", "position": 0}))
+            .await
+            .expect_err("stale id");
+        assert!(error.to_string().contains("not found"));
+        assert!(!state
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .any(|request| request.body["command"] == "player_queues/move_item"));
         server.abort();
     }
 

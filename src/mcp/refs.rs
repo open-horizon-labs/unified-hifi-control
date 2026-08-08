@@ -132,6 +132,13 @@ pub enum RefTarget {
         uri: String,
         title: String,
     },
+    /// A Music Assistant browse continuation. This is deliberately a separate
+    /// target from playable media: the MA path remains server-side and this
+    /// token is only accepted by `hifi_collections`, never `hifi_play_ref`.
+    MusicAssistantBrowse {
+        path: String,
+        title: String,
+    },
     /// An Apple Music catalog/library identifier resolved by the paired native
     /// companion. Clients only receive the opaque token.
     AppleMusic {
@@ -153,6 +160,7 @@ impl RefTarget {
             Self::Lms { .. } => Provider::Lms,
             Self::Spotify { .. } => Provider::Spotify,
             Self::MusicAssistant { .. } => Provider::MusicAssistant,
+            Self::MusicAssistantBrowse { .. } => Provider::MusicAssistant,
             Self::AppleMusic { .. } => Provider::AppleMusic,
         }
     }
@@ -165,6 +173,7 @@ impl RefTarget {
             | Self::Lms { title, .. }
             | Self::Spotify { title, .. }
             | Self::MusicAssistant { title, .. }
+            | Self::MusicAssistantBrowse { title, .. }
             | Self::AppleMusic { title, .. } => title,
         }
     }

@@ -355,8 +355,13 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                     && matches!(target.for_transport(), TransportRoute::MusicAssistant))
         }
         Capability::QueueRead => matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant),
+        Capability::QueueJump
+        | Capability::QueueReorder
+        | Capability::QueueRemove
+        | Capability::QueueClear => target == ZoneTarget::MusicAssistant,
+        Capability::PlayNext => target == ZoneTarget::MusicAssistant,
         Capability::Browse | Capability::SavedPlaylists | Capability::Favorites => {
-            target == ZoneTarget::Spotify
+            matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant)
         }
         // Nothing else has an MCP call path at all yet.
         _ => false,

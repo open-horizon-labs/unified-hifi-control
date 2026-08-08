@@ -503,8 +503,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        15,
-        "expected 15 tools with HQPlayer enabled, got {}: {:?}",
+        16,
+        "expected 16 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -570,6 +570,7 @@ async fn tools_list_order_is_pinned() {
             "hifi_queue",
             "hifi_spotify",
             "hifi_apple_music",
+            "hifi_collections",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -615,6 +616,7 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
             "hifi_queue",
             "hifi_spotify",
             "hifi_apple_music",
+            "hifi_collections",
         ],
         "HQPlayer disabled must yield exactly the non-HQPlayer tools, in order"
     );
@@ -788,7 +790,15 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
         "hifi_play_ref",
         &[("ref", true), ("zone_id", true), ("action", false)],
     ),
-    ("hifi_queue", &[("zone_id", true)]),
+    (
+        "hifi_queue",
+        &[
+            ("zone_id", true),
+            ("action", true),
+            ("item_id", false),
+            ("position", false),
+        ],
+    ),
     (
         "hifi_spotify",
         &[
@@ -823,6 +833,17 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("rating", false),
             ("reason", false),
             ("source", false),
+        ],
+    ),
+    (
+        "hifi_collections",
+        &[
+            ("zone_id", true),
+            ("action", true),
+            ("path", false),
+            ("media_type", false),
+            ("limit", false),
+            ("offset", false),
         ],
     ),
 ];
@@ -987,7 +1008,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        15,
+        16,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }
@@ -1731,6 +1752,19 @@ async fn musicassistant_mcp_handler(
                 "artists": [{"name": "Miles Davis"}]
             }]
         }),
+        Some("music/browse") => json!([
+            {"name": "Jazz", "path": "library://jazz"},
+            {"name": "So What", "uri": "library://track/42", "artists": [{"name": "Miles Davis"}]}
+        ]),
+        Some("music/playlists/library_items") => json!([
+            {"name": "Sunday Morning", "uri": "library://playlist/7"}
+        ]),
+        Some("music/tracks/library_items") => json!([
+            {"name": "My Favorite Track", "uri": "library://track/99", "artists": [{"name": "Nina Simone"}]}
+        ]),
+        Some("music/radio/library_items") => json!([
+            {"name": "My Favorite Station", "uri": "library://radio/13"}
+        ]),
         Some("player_queues/get_active_queue") => json!({
             // This deliberately differs from the child player id: MCP must
             // retain MA's active-queue resolution across every operation.
@@ -1750,7 +1784,11 @@ async fn musicassistant_mcp_handler(
         ]),
         Some("player_queues/play_media")
         | Some("player_queues/repeat")
-        | Some("player_queues/shuffle") => json!({"ok": true}),
+        | Some("player_queues/shuffle")
+        | Some("player_queues/play_index")
+        | Some("player_queues/move_item")
+        | Some("player_queues/delete_item")
+        | Some("player_queues/clear") => json!({"ok": true}),
         command => panic!("unexpected Music Assistant command: {command:?}"),
     };
     Json(response)
@@ -1952,6 +1990,181 @@ async fn configured_musicassistant_mcp_catalog_refs_and_queue_use_documented_com
         json!({"queue_id": "living-room-group", "limit": 100, "offset": 0})
     );
 
+    server.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn musicassistant_queue_mutations_use_documented_wire_commands() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    let zone_id = "musicassistant:group-child";
+    for args in [
+        json!({"zone_id": zone_id, "action": "jump", "item_id": "q2"}),
+        json!({"zone_id": zone_id, "action": "reorder", "item_id": "q2", "position": 0}),
+        json!({"zone_id": zone_id, "action": "remove", "item_id": "q2"}),
+        json!({"zone_id": zone_id, "action": "clear"}),
+    ] {
+        assert_eq!(
+            app.call_tool("hifi_queue", args).await["structuredContent"]["outcome"],
+            "accepted"
+        );
+    }
+    let requests = mock.requests.lock().expect("requests").clone();
+    let mutation_args: Vec<_> = requests
+        .iter()
+        .filter_map(|request| match request["command"].as_str()? {
+            "player_queues/play_index"
+            | "player_queues/move_item"
+            | "player_queues/delete_item"
+            | "player_queues/clear" => Some((
+                request["command"].as_str().unwrap(),
+                request["args"].clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        mutation_args,
+        vec![
+            (
+                "player_queues/play_index",
+                json!({"queue_id":"living-room-group", "index":"q2"})
+            ),
+            (
+                "player_queues/move_item",
+                json!({"queue_id":"living-room-group", "queue_item_id":"q2", "pos_shift":-1})
+            ),
+            (
+                "player_queues/delete_item",
+                json!({"queue_id":"living-room-group", "item_id_or_index":"q2"})
+            ),
+            (
+                "player_queues/clear",
+                json!({"queue_id":"living-room-group"})
+            ),
+        ]
+    );
+    server.abort();
+}
+
+/// Collections must have one provider-neutral wire shape: no MA URI escapes,
+/// pages are explicit, paths continue browse, and playable rows use the same
+/// opaque refs as search.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn musicassistant_collections_are_paged_and_mint_opaque_playable_refs() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    let zone_id = "musicassistant:group-child";
+    let root = app
+        .call_tool(
+            "hifi_collections",
+            json!({
+                "zone_id": zone_id, "action": "browse", "limit": 1
+            }),
+        )
+        .await;
+    assert_eq!(root["structuredContent"]["outcome"], "ok");
+    let root_page: Value =
+        serde_json::from_str(&result_text(&root)).expect("root browse page JSON");
+    assert_eq!(root_page["items"][0]["title"], "Jazz");
+    let path = root_page["items"][0]["path"]
+        .as_str()
+        .expect("browse folder must return an opaque continuation path");
+    assert!(path.starts_with("ref_"));
+    assert_ne!(path, "library://jazz", "MA path must stay server-side");
+
+    let cross_provider = app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": "spotify:not-ma", "action": "browse", "path": path}),
+        )
+        .await;
+    assert_eq!(
+        cross_provider["structuredContent"]["outcome"], "invalid",
+        "{cross_provider}"
+    );
+    assert_eq!(
+        cross_provider["structuredContent"]["refusal"]["parameter"], "path",
+        "an MA collection continuation must not cross provider boundaries"
+    );
+
+    let browse = app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse", "path": path, "limit": 1, "offset": 1}),
+        )
+        .await;
+    assert_eq!(browse["structuredContent"]["outcome"], "ok");
+    let browse_page: Value = serde_json::from_str(&result_text(&browse)).expect("browse page JSON");
+    assert_eq!(browse_page["items"][0]["title"], "So What");
+    assert!(browse_page["items"][0]["ref"].as_str().is_some());
+    assert!(
+        browse_page["items"][0].get("uri").is_none(),
+        "provider URI must stay server-side"
+    );
+    let next = app
+        .call_tool(
+            "hifi_play_ref",
+            json!({
+                "zone_id": zone_id,
+                "ref": browse_page["items"][0]["ref"],
+                "action": "next"
+            }),
+        )
+        .await;
+    assert_eq!(next["structuredContent"]["outcome"], "accepted");
+
+    for (action, extra, expected_title) in [
+        ("playlists", json!({}), "Sunday Morning"),
+        (
+            "favorites",
+            json!({"media_type": "tracks"}),
+            "My Favorite Track",
+        ),
+        (
+            "favorites",
+            json!({"media_type": "radio"}),
+            "My Favorite Station",
+        ),
+    ] {
+        let mut args = json!({"zone_id": zone_id, "action": action, "limit": 20, "offset": 0});
+        args.as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        let result = app.call_tool("hifi_collections", args).await;
+        assert_eq!(result["structuredContent"]["outcome"], "ok");
+        let page: Value =
+            serde_json::from_str(&result_text(&result)).expect("collection page JSON");
+        assert_eq!(page["items"][0]["title"], expected_title);
+        assert!(page["items"][0]["ref"].as_str().is_some());
+    }
+
+    let requests = mock.requests.lock().expect("requests").clone();
+    assert!(requests
+        .iter()
+        .any(|request| request["command"] == "music/browse"
+            && request["args"] == json!({"path": "root"})));
+    assert!(requests
+        .iter()
+        .any(|request| request["command"] == "music/browse"
+            && request["args"] == json!({"path": "library://jazz"})));
+    assert!(requests.iter().any(
+        |request| request["command"] == "music/playlists/library_items"
+            && request["args"] == json!({"limit": 20, "offset": 0})
+    ));
+    assert!(requests
+        .iter()
+        .any(|request| request["command"] == "music/tracks/library_items"
+            && request["args"] == json!({"favorite": true, "limit": 20, "offset": 0})));
+    assert!(requests
+        .iter()
+        .any(|request| request["command"] == "music/radio/library_items"
+            && request["args"] == json!({"favorite": true, "limit": 20, "offset": 0})));
+    assert!(requests.iter().any(
+        |request| request["command"] == "player_queues/play_media"
+            && request["args"]
+                == json!({"queue_id": "living-room-group", "media": "library://track/42", "option": "next"})
+    ));
     server.abort();
 }
 
@@ -4822,14 +5035,45 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             )),
             "search" => Some(("hifi_search", json!({ "query": "q", "zone_id": zone_id }))),
             "play_by_query" => Some(("hifi_play", json!({ "query": "q", "zone_id": zone_id }))),
+            "play_next" => Some((
+                "hifi_play",
+                json!({ "query": "q", "zone_id": zone_id, "action": "next" }),
+            )),
             "play_by_ref" => Some((
                 "hifi_play_ref",
                 json!({ "ref": "bad-ref", "zone_id": zone_id }),
+            )),
+            "browse" | "saved_playlists" | "favorites" if provider == "musicassistant" => Some((
+                "hifi_collections",
+                json!({
+                    "zone_id": zone_id,
+                    "action": match capability {
+                        "browse" => "browse",
+                        "saved_playlists" => "playlists",
+                        _ => "favorites",
+                    }
+                }),
             )),
             "browse" | "saved_playlists" | "favorites" => {
                 Some(("hifi_spotify", json!({ "action": "playlists" })))
             }
             "queue_read" => Some(("hifi_queue", json!({ "zone_id": zone_id }))),
+            "queue_jump" => Some((
+                "hifi_queue",
+                json!({ "zone_id": zone_id, "action": "jump", "item_id": "item" }),
+            )),
+            "queue_reorder" => Some((
+                "hifi_queue",
+                json!({ "zone_id": zone_id, "action": "reorder", "item_id": "item", "position": 0 }),
+            )),
+            "queue_remove" => Some((
+                "hifi_queue",
+                json!({ "zone_id": zone_id, "action": "remove", "item_id": "item" }),
+            )),
+            "queue_clear" => Some((
+                "hifi_queue",
+                json!({ "zone_id": zone_id, "action": "clear" }),
+            )),
             "repeat_mode" => Some((
                 "hifi_control",
                 json!({ "zone_id": zone_id, "action": "repeat_off" }),
@@ -4861,7 +5105,9 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                 )
             });
             let text = result_text(&app.call_tool(tool, args).await);
-            let expected = if matches!(*provider, "spotify" | "musicassistant")
+            let expected = if *provider == "musicassistant" && capability == "play_next" {
+                "supports action='play' or action='queue'"
+            } else if matches!(*provider, "spotify" | "musicassistant")
                 && capability == "play_by_ref"
             {
                 "unknown or expired"
@@ -4878,15 +5124,16 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
         }
     }
     // The routed Spotify content and mode cells plus Music Assistant's queue
-    // mode cells add fourteen probes to the original provider transport set.
+    // mutations, mode, and collections cells add twenty-two probes to the
+    // original provider transport set.
     // Apple Music's transport/skip/volume
     // cells remain gated until signed physical companion validation (#465).
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 36,
-        "{proved} supported cells were proved end to end, expected 36. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 44,
+        "{proved} supported cells were proved end to end, expected 44. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 

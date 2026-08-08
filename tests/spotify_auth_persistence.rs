@@ -1,6 +1,38 @@
 use tempfile::tempdir;
 use unified_hifi_control::adapters::spotify::SpotifyToken;
-use unified_hifi_control::api::credentials::{EncryptedCredentialStore, SpotifyCredentialRecord};
+use unified_hifi_control::api::credentials::{
+    EncryptedCredentialStore, MusicAssistantCredentialRecord, MusicAssistantCredentialStore,
+    SpotifyCredentialRecord,
+};
+
+#[test]
+fn music_assistant_credentials_survive_restart_without_leaking_the_token() {
+    let directory = tempdir().expect("temporary credential directory");
+    let credential_path = directory.path().join("musicassistant.enc");
+    let token = "music-assistant-secret-token";
+    let store = MusicAssistantCredentialStore::new(credential_path.clone(), [6_u8; 32]);
+    store
+        .save(&MusicAssistantCredentialRecord {
+            host: "music.local".to_string(),
+            port: 8095,
+            token: token.to_string(),
+            tls: false,
+            allow_insecure_http: true,
+        })
+        .expect("save Music Assistant credentials");
+
+    let ciphertext = std::fs::read_to_string(&credential_path).expect("read ciphertext");
+    assert!(!ciphertext.contains(token));
+    assert!(!format!("{:?}", store.load().expect("load")).contains(token));
+
+    let restarted = MusicAssistantCredentialStore::new(credential_path, [6_u8; 32]);
+    let record = restarted
+        .load()
+        .expect("load after restart")
+        .expect("record");
+    assert_eq!(record.host, "music.local");
+    assert_eq!(record.token, token);
+}
 
 #[test]
 fn encrypted_credentials_survive_restart_without_plaintext_leakage() {

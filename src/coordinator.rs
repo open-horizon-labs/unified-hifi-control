@@ -155,6 +155,38 @@ impl AdapterCoordinator {
         Ok(true)
     }
 
+    /// Reconcile lifecycle state with the last persisted settings after a
+    /// failed settings transaction. Rollback is best-effort: the initiating
+    /// error remains the useful response while any rollback failure is logged.
+    pub async fn rollback_adapter_transitions(
+        &self,
+        adapters: &[Arc<dyn Startable>],
+        previous: &AdapterSettings,
+        transitions: &[&str],
+    ) {
+        for name in transitions.iter().rev().copied() {
+            let Some(was_enabled) = adapter_enabled(previous, name) else {
+                continue;
+            };
+            self.set_enabled(name, was_enabled).await;
+            let Some(adapter) = adapters.iter().find(|adapter| adapter.name() == name) else {
+                continue;
+            };
+            if was_enabled {
+                if let Err(error) = self.start_adapter_and_companions(adapter.as_ref()).await {
+                    tracing::error!("Failed to roll back adapter {}: {}", name, error);
+                }
+            } else {
+                self.stop_adapter_and_companions_then_flush(
+                    adapter.as_ref(),
+                    name,
+                    "settings transaction rollback",
+                )
+                .await;
+            }
+        }
+    }
+
     /// Stop one adapter through the coordinator-owned lifecycle path.
     pub async fn stop_one(&self, adapter: &Arc<dyn Startable>) {
         self.stop_adapter_and_companions_then_flush(
@@ -537,6 +569,20 @@ impl AdapterCoordinator {
                 )
             })
             .collect()
+    }
+}
+
+fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
+    match name {
+        "roon" => Some(settings.roon),
+        "lms" => Some(settings.lms),
+        "openhome" => Some(settings.openhome),
+        "upnp" => Some(settings.upnp),
+        "hqplayer" => Some(settings.hqplayer),
+        "spotify" => Some(settings.spotify),
+        "applemusic" => Some(settings.applemusic),
+        "musicassistant" => Some(settings.musicassistant),
+        _ => None,
     }
 }
 

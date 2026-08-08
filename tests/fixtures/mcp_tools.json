@@ -113,6 +113,46 @@
       "type": "object"
     }
   },
+  "hifi_collections": {
+    "description": "Browse a provider library or list saved playlists and favorites. Results are paged with limit/offset and playable entries include a short-lived opaque ref for hifi_play_ref. Use path from a browse entry to continue into that collection.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "browse, playlists, or favorites.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum entries to return (1-50; default 20).",
+          "nullable": true,
+          "type": "integer"
+        },
+        "media_type": {
+          "description": "Media type when listing favorites (tracks by default).",
+          "nullable": true,
+          "type": "string"
+        },
+        "offset": {
+          "description": "Zero-based page offset (default 0).",
+          "nullable": true,
+          "type": "integer"
+        },
+        "path": {
+          "description": "Opaque collection path returned by a preceding browse call.",
+          "nullable": true,
+          "type": "string"
+        },
+        "zone_id": {
+          "description": "Zone ID whose provider library is queried.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "zone_id",
+        "action"
+      ],
+      "type": "object"
+    }
+  },
   "hifi_control": {
     "description": "Control playback: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, or adjust volume. HQPlayer zones use the managed instance runtime.",
     "inputSchema": {
@@ -295,16 +335,31 @@
     }
   },
   "hifi_queue": {
-    "description": "Read the current playback queue for a zone. Spotify returns its account playback queue. Music Assistant returns the active player queue and its first 100 items. Queue add is hifi_play action='queue'. Queue edit, remove, reorder, and clear are not claimed unless a provider exposes them.",
+    "description": "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, and clear against its active queue; each mutation returns a fresh queue readback. Queue add is hifi_play action='queue'.",
     "inputSchema": {
       "properties": {
+        "action": {
+          "description": "read (default), jump, reorder, remove, or clear.",
+          "type": "string"
+        },
+        "item_id": {
+          "description": "Queue item id for jump, reorder, or remove.",
+          "nullable": true,
+          "type": "string"
+        },
+        "position": {
+          "description": "Target zero-based position for reorder.",
+          "nullable": true,
+          "type": "integer"
+        },
         "zone_id": {
           "description": "Zone ID from hifi_zones.",
           "type": "string"
         }
       },
       "required": [
-        "zone_id"
+        "zone_id",
+        "action"
       ],
       "type": "object"
     }

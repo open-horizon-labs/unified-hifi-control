@@ -5,9 +5,9 @@
 use dioxus::prelude::*;
 
 use crate::app::api::{
-    AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, ProviderAuthResponse, ProviderOAuthStart,
-    RoonStatus, SpotifyAccountResponse, SpotifyConfigureRequest, SpotifyConfigureResponse,
-    ZonesResponse,
+    AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, MusicAssistantConfigureRequest,
+    MusicAssistantStatusResponse, ProviderAuthResponse, ProviderOAuthStart, RoonStatus,
+    SpotifyAccountResponse, SpotifyConfigureRequest, SpotifyConfigureResponse, ZonesResponse,
 };
 use crate::app::components::Layout;
 use crate::app::settings_context::{initial_app_settings, use_settings};
@@ -129,6 +129,7 @@ enum AdapterToggle {
     HqPlayer,
     Spotify,
     AppleMusic,
+    MusicAssistant,
 }
 
 fn settings_with_toggle(mut settings: AppSettings, toggle: SettingsToggle) -> AppSettings {
@@ -148,6 +149,9 @@ fn settings_with_toggle(mut settings: AppSettings, toggle: SettingsToggle) -> Ap
         }
         SettingsToggle::Adapter(AdapterToggle::AppleMusic, enabled) => {
             settings.adapters.applemusic = enabled
+        }
+        SettingsToggle::Adapter(AdapterToggle::MusicAssistant, enabled) => {
+            settings.adapters.musicassistant = enabled
         }
         SettingsToggle::HideKnobs(enabled) => settings.hide_knobs_page = !enabled,
     }
@@ -451,6 +455,13 @@ pub fn Settings() -> Element {
     let mut spotify_client_id = use_signal(String::new);
     let mut spotify_client_secret = use_signal(String::new);
     let mut spotify_redirect_uri = use_signal(default_spotify_redirect_uri);
+    let mut musicassistant_action = use_signal(ProviderActionState::default);
+    let mut musicassistant_error = use_signal(|| None::<String>);
+    let mut musicassistant_host = use_signal(String::new);
+    let mut musicassistant_port = use_signal(|| "8095".to_string());
+    let mut musicassistant_token = use_signal(String::new);
+    let mut musicassistant_tls = use_signal(|| true);
+    let mut musicassistant_insecure_http = use_signal(|| false);
     let mut confirmed_settings = use_signal(|| None::<AppSettings>);
 
     // Hide knobs signal (LMS/HQPlayer visibility follows adapter enabled state)
@@ -523,8 +534,26 @@ pub fn Settings() -> Element {
             .await
             .ok()
     });
+    let mut musicassistant_status = use_resource(|| async {
+        crate::app::api::fetch_json::<MusicAssistantStatusResponse>(
+            "/api/providers/musicassistant/status",
+        )
+        .await
+        .ok()
+    });
     let mut apple_bridge_status = use_resource(|| async {
         crate::app::api::fetch_json::<AppleBridgeStatus>("/api/bridges/applemusic/status").await
+    });
+
+    use_effect(move || {
+        if let Some(Some(status)) = musicassistant_status.read().as_ref() {
+            if let Some(endpoint) = status.endpoint.as_ref() {
+                musicassistant_host.set(endpoint.host.clone());
+                musicassistant_port.set(endpoint.port.to_string());
+                musicassistant_tls.set(endpoint.tls);
+                musicassistant_insecure_http.set(endpoint.allow_insecure_http);
+            }
+        }
     });
 
     // Refresh discovery on SSE events
@@ -539,6 +568,7 @@ pub fn Settings() -> Element {
             hqp_status.restart();
             provider_zones.restart();
             spotify_account.restart();
+            musicassistant_status.restart();
             apple_bridge_status.restart();
         }
     });
@@ -659,6 +689,50 @@ pub fn Settings() -> Element {
         provider_zones.restart();
         spotify_account.restart();
         apple_bridge_status.restart();
+        musicassistant_status.restart();
+    };
+
+    let save_musicassistant = move |_| {
+        let host = musicassistant_host().trim().to_string();
+        let port = musicassistant_port().trim().parse::<u16>().unwrap_or(0);
+        let token = musicassistant_token().trim().to_string();
+        if host.is_empty() || port == 0 {
+            musicassistant_action.set(ProviderActionState::Failed);
+            musicassistant_error.set(Some(
+                "Enter a Music Assistant host and valid port.".to_string(),
+            ));
+            return;
+        }
+        musicassistant_action.set(ProviderActionState::Loading);
+        musicassistant_error.set(None);
+        let tls = musicassistant_tls();
+        let allow_insecure_http = musicassistant_insecure_http();
+        spawn(async move {
+            let request = MusicAssistantConfigureRequest {
+                host,
+                port,
+                token: (!token.is_empty()).then_some(token),
+                tls,
+                allow_insecure_http,
+            };
+            match crate::app::api::post_json::<MusicAssistantConfigureRequest, serde_json::Value>(
+                "/api/providers/musicassistant/configure",
+                &request,
+            )
+            .await
+            {
+                Ok(_) => {
+                    musicassistant_action.set(ProviderActionState::Success);
+                    musicassistant_token.set(String::new());
+                    musicassistant_status.restart();
+                    provider_zones.restart();
+                }
+                Err(error) => {
+                    musicassistant_action.set(ProviderActionState::Failed);
+                    musicassistant_error.set(Some(error));
+                }
+            }
+        });
     };
 
     let toggle_setting = move |toggle: SettingsToggle| {
@@ -905,6 +979,37 @@ pub fn Settings() -> Element {
                                     }
                                 }
                             }
+                            // Music Assistant is an optional outbound peer adapter.
+                            tr { class: "border-b border-default",
+                                td { class: "py-2 px-3",
+                                    FeatureToggle {
+                                        label: "Enable Music Assistant",
+                                        enabled: musicassistant_enabled(),
+                                        onclick: move |_| {
+                                            toggle_setting(SettingsToggle::Adapter(AdapterToggle::MusicAssistant, !musicassistant_enabled()));
+                                        }
+                                    }
+                                }
+                                td { class: "py-2 px-3",
+                                    div { class: "flex items-center gap-2",
+                                        "Music Assistant"
+                                        span { class: "badge badge-secondary", "Alpha" }
+                                    }
+                                }
+                                td { class: "py-2 px-3",
+                                    if musicassistant_enabled() {
+                                        if let Some(status) = musicassistant_status.read().clone().flatten() {
+                                            if status.running {
+                                                span { class: "status-ok", "✓ Connected" }
+                                            } else if status.configured {
+                                                span { class: "text-yellow-500", "Configured · waiting" }
+                                            } else {
+                                                span { class: "text-muted", "Setup required" }
+                                            }
+                                        } else { "..." }
+                                    } else { span { class: "text-muted", "-" } }
+                                }
+                            }
                             // Knobs (page only, no adapter)
                             // Spotify (controller adapter; zones arrive through the bus)
                             tr { class: "border-b border-default",
@@ -995,7 +1100,7 @@ pub fn Settings() -> Element {
             div { id: "streaming-providers-anchor",
                 section {
                     class: "mb-8",
-                    hidden: !(spotify_enabled() || applemusic_enabled()),
+                    hidden: !(spotify_enabled() || applemusic_enabled() || musicassistant_enabled()),
                     aria_labelledby: "streaming-heading",
                 div { class: "mb-4",
                     h2 { id: "streaming-heading", class: "text-xl font-semibold", "Streaming providers" }
@@ -1299,6 +1404,54 @@ pub fn Settings() -> Element {
                                 }
                             }
                         }
+                    }
+
+                    div {
+                        class: "card p-5 sm:p-6",
+                        hidden: !musicassistant_enabled(),
+                        aria_labelledby: "musicassistant-heading",
+                        h3 { id: "musicassistant-heading", class: "text-lg font-semibold flex items-center gap-2",
+                            "Music Assistant"
+                            span { class: "badge badge-secondary", "Alpha" }
+                        }
+                        p { class: "mt-1 text-sm text-secondary", "Connect UHC directly to a Music Assistant server. Its access token is encrypted and never returned to this page." }
+                        if let Some(status) = musicassistant_status.read().clone().flatten() {
+                            div { class: "mt-3 text-sm",
+                                if status.running { p { class: "status-ok", "Connected" } }
+                                else if status.configured { p { class: "text-yellow-500", "Configured, not currently connected" } }
+                                else { p { class: "text-muted", "Setup required" } }
+                                if let Some(endpoint) = status.endpoint {
+                                    p { class: "mt-1 text-secondary",
+                                        "Current endpoint: "
+                                        if endpoint.tls { "HTTPS" } else { "HTTP" }
+                                        "://{endpoint.host}:{endpoint.port}"
+                                    }
+                                }
+                                if let Some(message) = status.error {
+                                    p { class: "mt-2 status-err", role: "alert", "{message}" }
+                                }
+                            }
+                        }
+                        div { class: "mt-4 grid gap-4 sm:grid-cols-2",
+                            label { class: "block text-sm font-medium", r#for: "musicassistant-host", "Server host" }
+                            input { id: "musicassistant-host", class: "input mt-1 min-h-11 w-full", value: musicassistant_host(), autocomplete: "url", placeholder: "music-assistant.local", oninput: move |event| musicassistant_host.set(event.value()) }
+                            label { class: "block text-sm font-medium", r#for: "musicassistant-port", "Port" }
+                            input { id: "musicassistant-port", class: "input mt-1 min-h-11 w-full", r#type: "number", value: musicassistant_port(), oninput: move |event| musicassistant_port.set(event.value()) }
+                            label { class: "block text-sm font-medium sm:col-span-2", r#for: "musicassistant-token", "Long-lived access token" }
+                            input { id: "musicassistant-token", class: "input mt-1 min-h-11 w-full", r#type: "password", value: musicassistant_token(), autocomplete: "new-password", placeholder: "Leave blank to keep the saved token", oninput: move |event| musicassistant_token.set(event.value()) }
+                        }
+                        label { class: "mt-4 flex items-center gap-2 text-sm",
+                            input { r#type: "checkbox", checked: musicassistant_tls(), onchange: move |event| musicassistant_tls.set(event.checked()) }
+                            "Use HTTPS (recommended)"
+                        }
+                        label { class: "mt-3 flex items-center gap-2 text-sm",
+                            input { r#type: "checkbox", checked: musicassistant_insecure_http(), onchange: move |event| musicassistant_insecure_http.set(event.checked()) }
+                            "Allow plaintext HTTP only for a trusted local/private peer"
+                        }
+                        button { id: "musicassistant-save-settings", r#type: "button", class: "btn btn-primary mt-5 min-h-11", disabled: musicassistant_action() == ProviderActionState::Loading, aria_busy: musicassistant_action() == ProviderActionState::Loading, onclick: save_musicassistant,
+                            if musicassistant_action() == ProviderActionState::Loading { "Checking connection…" } else { "Save and connect" }
+                        }
+                        p { class: "mt-2 text-sm status-err", hidden: musicassistant_error().is_none(), role: "alert", "{musicassistant_error().unwrap_or_default()}" }
                     }
 
                     // Apple Music pairing is initiated by the companion after
