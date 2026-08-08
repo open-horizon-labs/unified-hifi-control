@@ -40,6 +40,8 @@ pub mod controller_auth;
 pub mod credentials;
 pub mod provider_auth;
 
+const MAX_REMOTE_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
+
 /// Preserve the legacy flash-page bookmark while sending users to the secure
 /// Web Serial flasher origin.
 pub async fn knob_flasher_redirect_handler() -> Redirect {
@@ -363,6 +365,8 @@ impl AppState {
                 .to_string();
             let data = response.bytes().await?.to_vec();
             ImageData { content_type, data }
+        } else if zone_id.starts_with("applemusic:") {
+            fetch_apple_music_artwork(image_key).await?
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
             let img = self.roon.get_image(image_key, width, height).await?;
             ImageData {
@@ -397,6 +401,58 @@ impl AppState {
             Ok(raw_image)
         }
     }
+}
+
+async fn fetch_apple_music_artwork(image_key: &str) -> anyhow::Result<crate::bus::ImageData> {
+    let url = validate_apple_music_artwork_url(image_key)?;
+    fetch_remote_artwork_url(url).await
+}
+
+fn validate_apple_music_artwork_url(image_key: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(image_key)
+        .map_err(|_| anyhow::anyhow!("Apple Music artwork URL is invalid"))?;
+    let url = if url.scheme().eq_ignore_ascii_case("musickit") {
+        let fat = url
+            .query_pairs()
+            .find(|(key, _)| key == "fat")
+            .map(|(_, value)| value.into_owned())
+            .ok_or_else(|| anyhow::anyhow!("MusicKit artwork URL has no CDN URL"))?;
+        reqwest::Url::parse(&fat)
+            .map_err(|_| anyhow::anyhow!("MusicKit artwork CDN URL is invalid"))?
+    } else {
+        url
+    };
+    let host = url.host_str().unwrap_or_default();
+    if url.scheme() != "https" || !(host == "mzstatic.com" || host.ends_with(".mzstatic.com")) {
+        anyhow::bail!("Apple Music artwork URL is not an allowed Apple CDN URL");
+    }
+
+    Ok(url)
+}
+
+async fn fetch_remote_artwork_url(url: reqwest::Url) -> anyhow::Result<crate::bus::ImageData> {
+    let response = reqwest::get(url).await?.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_REMOTE_ARTWORK_BYTES as u64)
+    {
+        anyhow::bail!("remote artwork is too large");
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.starts_with("image/"))
+        .ok_or_else(|| anyhow::anyhow!("remote artwork is not an image"))?
+        .to_string();
+    let data = response.bytes().await?;
+    if data.len() > MAX_REMOTE_ARTWORK_BYTES {
+        anyhow::bail!("remote artwork is too large");
+    }
+    Ok(crate::bus::ImageData {
+        content_type,
+        data: data.to_vec(),
+    })
 }
 
 /// Error response
@@ -2701,6 +2757,29 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::env;
+
+    #[test]
+    fn apple_music_artwork_accepts_only_https_apple_cdn_urls() {
+        assert!(validate_apple_music_artwork_url(
+            "https://is1-ssl.mzstatic.com/image/thumb/example.jpg"
+        )
+        .is_ok());
+        assert!(validate_apple_music_artwork_url(
+            "musicKit://artwork/library/item/512x512?fat=https%3A%2F%2Fis1-ssl.mzstatic.com%2Fimage%2Fthumb%2Fexample.jpg"
+        )
+        .is_ok());
+        for url in [
+            "http://is1-ssl.mzstatic.com/image.jpg",
+            "https://example.com/image.jpg",
+            "file:///etc/passwd",
+            "https://127.0.0.1/image.jpg",
+        ] {
+            assert!(
+                validate_apple_music_artwork_url(url).is_err(),
+                "accepted unsafe artwork URL: {url}"
+            );
+        }
+    }
 
     #[test]
     #[serial]
