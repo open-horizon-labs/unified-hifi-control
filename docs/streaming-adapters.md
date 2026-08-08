@@ -41,12 +41,17 @@ Music support.  MA-backed zones retain the `musicassistant:` adapter scope and
 MA remains the authority for those players and queues.
 
 The adapter uses MA's documented authenticated JSON API (`POST /api`) with a
-long-lived access token supplied by the user.  Player discovery and transport
-control are the initial capabilities; search, queue, and playlist operations
-remain separate follow-on capabilities so that MA's own library and queue
-semantics are not silently projected onto native provider adapters.  See the
-[MA API documentation](https://www.music-assistant.io/api/) for the token and
-command contract. HTTPS is required by default. For a deliberately trusted
+long-lived access token supplied by the user. It currently supports player
+discovery; transport, skip, volume, mute, repeat, and shuffle; catalog search;
+exact play and queue-add from MA-owned references; and a bounded active-queue
+read. All queue-scoped operations resolve MA's active queue for the selected
+player rather than assuming that a grouped player's queue ID equals its player
+ID. Browse, saved playlists, favorites, queue mutation, and MA grouping remain
+separate follow-on capabilities so MA-specific semantics are not silently
+projected onto native provider adapters. The local MA wire fixture covers the
+authenticated request envelope and ensures peer error bodies are never exposed
+through UHC errors. See the [MA API documentation](https://www.music-assistant.io/api/)
+for the token and command contract. HTTPS is required by default. For a deliberately trusted
 local-development-only MA instance, set `MUSIC_ASSISTANT_INSECURE_HTTP=1`
 alongside `MUSIC_ASSISTANT_TLS=false`; never use that override across an
 untrusted LAN or tunnel because the bearer token is sent on the wire.
