@@ -275,7 +275,10 @@ impl MusicAssistantAdapter {
             .await
             .context("read Music Assistant response")?;
         if !status.is_success() {
-            return Err(anyhow!("Music Assistant returned HTTP {status}: {body}"));
+            // MA's error body is peer-controlled and may reflect credentials
+            // or other sensitive request details. The status remains an
+            // actionable boundary without exporting that body into UHC errors.
+            return Err(anyhow!("Music Assistant returned HTTP {status}"));
         }
         serde_json::from_str(&body)
             .with_context(|| format!("decode Music Assistant response for {command}"))
@@ -861,8 +864,12 @@ crate::impl_startable!(MusicAssistantAdapter, "musicassistant", is_configured);
 mod tests {
     use super::*;
     use axum::{
-        body::Bytes, extract::State, http::HeaderMap, response::IntoResponse, routing::post, Json,
-        Router,
+        body::Bytes,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::post,
+        Json, Router,
     };
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::net::TcpListener;
@@ -877,6 +884,7 @@ mod tests {
     struct MockMusicAssistantState {
         requests: Arc<StdMutex<Vec<RecordedRequest>>>,
         players: Arc<StdMutex<Option<Value>>>,
+        failure_response: Arc<StdMutex<Option<(StatusCode, String)>>>,
         slow_active_queue_prefix: Arc<StdMutex<Option<String>>>,
         slow_active_queue_delay: Arc<StdMutex<Option<Duration>>>,
         active_queue_in_flight: Arc<AtomicUsize>,
@@ -900,6 +908,15 @@ mod tests {
                     .map(ToOwned::to_owned),
                 body: request.clone(),
             });
+
+        if let Some((status, response)) = state
+            .failure_response
+            .lock()
+            .expect("failure response lock")
+            .clone()
+        {
+            return (status, response).into_response();
+        }
 
         if request["command"] == "players/all" {
             let players = state.players.lock().expect("players lock").clone().unwrap_or_else(|| json!([{
@@ -1387,6 +1404,33 @@ mod tests {
         };
 
         assert!(!format!("{config:?}").contains("ma-test-token"));
+    }
+
+    #[tokio::test]
+    async fn upstream_error_is_actionable_without_leaking_a_reflected_token() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        *state
+            .failure_response
+            .lock()
+            .expect("failure response lock") = Some((
+            StatusCode::UNAUTHORIZED,
+            "invalid bearer ma-test-token; retry after authentication".to_string(),
+        ));
+        let adapter =
+            MusicAssistantAdapter::new(crate::bus::create_bus(), config).expect("valid MA adapter");
+
+        let response = adapter
+            .handle_command("musicassistant:sonos-kitchen", AdapterCommand::Play)
+            .await
+            .expect("adapter returns provider refusal");
+
+        assert!(!response.success);
+        let error = response.error.expect("actionable failure");
+        assert!(error.contains("Music Assistant returned HTTP 401"));
+        assert!(!error.contains("ma-test-token"));
+        assert!(!error.contains("invalid bearer"));
+
+        server.abort();
     }
 
     #[tokio::test]
