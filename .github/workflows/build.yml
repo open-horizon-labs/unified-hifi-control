@@ -1679,8 +1679,9 @@ jobs:
 
       - name: Generate beta LMS repository feed
         if: needs.plan.outputs.is_beta == 'true'
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
-          VERSION="${{ needs.plan.outputs.version }}"
           ZIP="release/lms-unified-hifi-control-${VERSION}.zip"
           SHA=$(sha1sum "$ZIP" | cut -d' ' -f1)
           REPO_URL="https://github.com/${{ github.repository }}"

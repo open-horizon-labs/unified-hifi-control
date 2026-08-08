@@ -59,7 +59,7 @@ else
     printf '#!/bin/sh\nexit 0\n' > "$test_binary"
     chmod +x "$test_binary"
 
-    for version_case in '3.4.1:3.4.1-10000' '3.5.1-beta:3.5.1-8000' '3.5.0-rc.2:3.5.0-9002' '0.0.0-pr171:0.0.0-0171' '0.0.0-dev:0.0.0-0001'; do
+    for version_case in '3.4.1:3.4.1-10000' '3.5.1-beta:3.5.1-8000' '3.5.1-beta.08:3.5.1-8008' '3.5.0-rc.2:3.5.0-9002' '0.0.0-pr171:0.0.0-0171' '0.0.0-dev:0.0.0-0001'; do
         input_version=${version_case%%:*}
         expected_version=${version_case#*:}
         output_spk="${test_tmp}/${input_version}.spk"
