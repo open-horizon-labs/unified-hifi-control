@@ -430,7 +430,7 @@ impl AppleBridgeRegistry {
         let session = state
             .sessions
             .get_mut(token)
-            .expect("session was inserted or present");
+            .ok_or_else(|| anyhow!("bridge session could not be restored"))?;
         session.last_seen = now_secs();
         Ok(f(session))
     }
@@ -887,11 +887,11 @@ impl AppleBridgeRegistry {
             .find(|record| record.bridge_id == bridge_id)
             .map(|record| record.access_token.clone())
             .ok_or_else(|| anyhow!("Apple Music companion is not paired"))?;
-        state
+        let credential = state
             .credentials
             .get_mut(&token)
-            .expect("credential was found by token")
-            .display_name = Some(display_name.clone());
+            .ok_or_else(|| anyhow!("Apple Music companion is not paired"))?;
+        credential.display_name = Some(display_name.clone());
         if let Some(session) = state.sessions.get_mut(&token) {
             if let Some(snapshot) = session.snapshot.as_mut() {
                 snapshot.display_name = display_name;

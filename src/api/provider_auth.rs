@@ -108,9 +108,10 @@ impl ProviderAuthState {
     /// store. This keeps outbound-provider integration tests isolated from an
     /// operator's real encrypted configuration.
     pub fn with_musicassistant_credential_store(store: MusicAssistantCredentialStore) -> Self {
-        let mut state = Self::default();
-        state.musicassistant_credentials = Some(Arc::new(store));
-        state
+        Self {
+            musicassistant_credentials: Some(Arc::new(store)),
+            ..Self::default()
+        }
     }
 
     pub async fn attach_spotify(&self, adapter: Arc<SpotifyAdapter>) {
