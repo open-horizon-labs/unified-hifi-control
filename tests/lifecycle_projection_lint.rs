@@ -278,6 +278,27 @@ fn lms_reconnect_can_republish_unchanged_players_as_snapshots() {
     );
 }
 
+/// LMS has two observer paths.  A CLI `client disconnect` is authoritative
+/// membership evidence in its own right: waiting for the slowed-down poller
+/// leaves a dead zone controllable for up to one poll interval.
+#[test]
+fn lms_cli_disconnect_retires_its_projection_immediately() {
+    let cli = facts(named_body(
+        &parse(include_str!("../src/adapters/lms.rs")),
+        "handle_cli_event",
+    ));
+    assert!(
+        cli.method_calls
+            .iter()
+            .any(|call| call == "publish_removed"),
+        "the LMS CLI disconnect path must publish a reliable removal"
+    );
+    assert!(
+        cli.paths.iter().any(|path| path == "ZoneRemoved"),
+        "the LMS CLI disconnect path must preserve the legacy bus fallback"
+    );
+}
+
 #[test]
 fn roon_core_loss_retires_every_projected_zone() {
     let file = parse(include_str!("../src/adapters/roon.rs"));

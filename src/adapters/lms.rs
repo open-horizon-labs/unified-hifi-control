@@ -2170,8 +2170,14 @@ async fn update_players_internal(
     runtime_bridge: Option<&LmsRuntimeBridge>,
 ) -> Result<()> {
     let players = rpc.get_players().await?;
+    // LMS keeps disconnected Squeezelite clients in its `players` inventory.
+    // That inventory is useful for server diagnostics, but only a connected
+    // client is a controllable UHC zone. Treat the connected subset as this
+    // poll's authoritative projection membership so a disconnect retires the
+    // old `lms:` zone through the reliable removal path below.
     let observed_ids: std::collections::HashSet<String> = players
         .iter()
+        .filter(|player| player.connected)
         .map(|player| player.playerid.clone())
         .collect();
 
@@ -2276,10 +2282,11 @@ async fn update_players_internal(
         s.players.insert(player.playerid.clone(), player);
     }
 
-    // `players` is LMS's authoritative server inventory. Keep the last observation for a player
-    // whose follow-up status call failed, but retire ids the inventory itself no longer reports.
-    // Without this retain, `current_ids` was always a superset of `previous_ids`, making the
-    // ZoneRemoved path below unreachable and leaving disconnected players in the aggregator.
+    // LMS's connected subset is the authoritative controllable-zone membership. Keep the last
+    // observation when a connected player's follow-up status call fails, but retire both missing
+    // and disconnected ids. Without this retain, `current_ids` was always a superset of
+    // `previous_ids`, making the ZoneRemoved path below unreachable and leaving disconnected
+    // players in the aggregator.
     state
         .write()
         .await
@@ -2831,17 +2838,17 @@ async fn handle_cli_event(
                     }
                 }
                 "disconnect" => {
-                    // Client disconnected
-                    let mut s = state.write().await;
-                    if let Some(player) = s.players.get_mut(&player_id) {
-                        player.connected = false;
-                    }
-                    drop(s);
+                    // A CLI disconnect is authoritative membership evidence, not merely a state
+                    // delta. Retire immediately rather than republishing a cached stopped zone
+                    // and waiting for the deliberately slowed-down poller to catch up.
+                    state.write().await.players.remove(&player_id);
+                    let zone_id = PrefixedZoneId::lms(&player_id);
                     if let Some(bridge) = runtime_bridge {
-                        if let Err(error) = publish_cached_lms_zone(state, bridge, &player_id).await
-                        {
-                            warn!(%error, player = %player_id, "could not project LMS CLI disconnect readback");
+                        if let Err(error) = bridge.publish_removed(zone_id).await {
+                            warn!(%error, player = %player_id, "could not retire LMS CLI disconnect projection");
                         }
+                    } else {
+                        bus.publish(BusEvent::ZoneRemoved { zone_id });
                     }
                 }
                 _ => {}
