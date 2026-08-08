@@ -220,8 +220,8 @@ Two things this table does **not** claim:
 | `queue_remove` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | 🚧 #462 |
 | `queue_clear` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | 🚧 #462 |
 | `play_next` | 🚧 #399 | 🚧 #403 | 🚧 #392 | 🚧 #396 | 🚧 #209 | 🚧 #483 | 🚧 #462 | 🚧 #462 |
-| `repeat_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ | 🚧 #462 | ✅ | 🚧 #462 |
-| `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ | 🚧 #462 | ✅ | 🚧 #462 |
+| `repeat_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ | 🚧 #462 | ✅ | ✅ |
+| `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ | 🚧 #462 | ✅ | ✅ |
 | `saved_playlists` | 🚧 #399 | 🚧 #403 | ⛔ | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | 🚧 #462 |
 | `favorites` | 🚧 #399 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | 🚧 #462 |
 | `multiroom_sync` | 🚧 #360 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
@@ -306,13 +306,11 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - 🚧 **openhome / `repeat_mode`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
 - 🚧 **upnp / `repeat_mode`** (#392) — AVTransport:1's SetPlayMode takes REPEAT_ONE and REPEAT_ALL, so repeat is a protocol feature UHC does not use. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **applemusic / `repeat_mode`** (#462) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **musicassistant / `repeat_mode`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `shuffle_mode`** (#360) — the Roon API's transport service takes a shuffle setting; UHC drives it from no surface.
 - 🚧 **lms / `shuffle_mode`** (#403) — playlist shuffle <0|1|2> and playlist shuffle ? read and write it; verified live. Setting it reshuffles the queue, so it is also a queue mutation.
 - 🚧 **openhome / `shuffle_mode`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.
 - 🚧 **upnp / `shuffle_mode`** (#392) — AVTransport:1's SetPlayMode takes SHUFFLE and RANDOM, so shuffle is a protocol feature UHC does not use. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **applemusic / `shuffle_mode`** (#462) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **musicassistant / `shuffle_mode`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `saved_playlists`** (#399) — Roon exposes Playlists as a browse hierarchy, so this arrives with browse rather than as its own protocol feature.
 - 🚧 **lms / `saved_playlists`** (#403) — playlists / playlists tracks / playlistcontrol cmd:load playlist_id / playlists new / rename / delete all exist and were verified live. playlist save additionally needs a configured playlistdir, which is unset on a stock install -- so its own answer is three-state at the server level, which is why #403 probes pref playlistdir ?.
 - ⛔ **openhome / `saved_playlists`** — the av-openhome-org service set has no playlist storage: Playlist:1 is the live queue (Read/Insert/DeleteId/DeleteAll) with no save or recall action, and stored playlists live on whatever media server the control point uses. Verified from the OpenHome service definitions, not from a device.

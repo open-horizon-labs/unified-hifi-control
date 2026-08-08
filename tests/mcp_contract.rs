@@ -1734,7 +1734,9 @@ async fn musicassistant_mcp_handler(
         Some("player_queues/get_active_queue") => json!({
             // This deliberately differs from the child player id: MCP must
             // retain MA's active-queue resolution across every operation.
-            "queue_id": "living-room-group"
+            "queue_id": "living-room-group",
+            "repeat_mode": "one",
+            "shuffle_enabled": true
         }),
         Some("player_queues/get") => json!({
             "queue_id": "living-room-group",
@@ -1746,7 +1748,9 @@ async fn musicassistant_mcp_handler(
             {"queue_item_id": "q1", "name": "So What", "uri": "library://track/42"},
             {"queue_item_id": "q2", "name": "Freddie Freeloader", "uri": "library://track/43"}
         ]),
-        Some("player_queues/play_media") => json!({"ok": true}),
+        Some("player_queues/play_media")
+        | Some("player_queues/repeat")
+        | Some("player_queues/shuffle") => json!({"ok": true}),
         command => panic!("unexpected Music Assistant command: {command:?}"),
     };
     Json(response)
@@ -1790,6 +1794,7 @@ async fn musicassistant_mcp_app() -> (TestApp, MusicAssistantMcpMock, tokio::tas
         )
         .expect("configured MA adapter"),
     );
+    state.adapter_registry.register(adapter.clone()).await;
     state
         .adapter_registry
         .register_library("musicassistant", adapter)
@@ -1842,6 +1847,25 @@ async fn configured_musicassistant_mcp_catalog_refs_and_queue_use_documented_com
     assert_eq!(ref_queue["structuredContent"]["outcome"], "accepted");
     assert_eq!(result_text(&ref_queue), "Queued So What on Music Assistant");
 
+    for action in [
+        "repeat_off",
+        "repeat_track",
+        "repeat_context",
+        "shuffle_on",
+        "shuffle_off",
+    ] {
+        let control = app
+            .call_tool(
+                "hifi_control",
+                json!({"zone_id": zone_id, "action": action}),
+            )
+            .await;
+        assert_eq!(
+            control["structuredContent"]["outcome"], "accepted",
+            "Music Assistant action {action} must route through the existing control schema"
+        );
+    }
+
     let queue = app
         .call_tool("hifi_queue", json!({"zone_id": zone_id}))
         .await;
@@ -1866,6 +1890,16 @@ async fn configured_musicassistant_mcp_catalog_refs_and_queue_use_documented_com
             "player_queues/get_active_queue",
             "player_queues/play_media",
             "player_queues/get_active_queue",
+            "player_queues/repeat",
+            "player_queues/get_active_queue",
+            "player_queues/repeat",
+            "player_queues/get_active_queue",
+            "player_queues/repeat",
+            "player_queues/get_active_queue",
+            "player_queues/shuffle",
+            "player_queues/get_active_queue",
+            "player_queues/shuffle",
+            "player_queues/get_active_queue",
             "player_queues/get",
             "player_queues/items",
         ]
@@ -1874,7 +1908,7 @@ async fn configured_musicassistant_mcp_catalog_refs_and_queue_use_documented_com
         requests[0]["args"],
         json!({"search_query": "so what", "limit": 10})
     );
-    for index in [2, 4, 6, 8] {
+    for index in [2, 4, 6, 8, 10, 12, 14, 16, 18] {
         assert_eq!(requests[index]["args"], json!({"player_id": "group-child"}));
     }
     assert_eq!(
@@ -1891,10 +1925,30 @@ async fn configured_musicassistant_mcp_catalog_refs_and_queue_use_documented_com
     );
     assert_eq!(
         requests[9]["args"],
+        json!({"queue_id": "living-room-group", "repeat_mode": "off"})
+    );
+    assert_eq!(
+        requests[11]["args"],
+        json!({"queue_id": "living-room-group", "repeat_mode": "one"})
+    );
+    assert_eq!(
+        requests[13]["args"],
+        json!({"queue_id": "living-room-group", "repeat_mode": "all"})
+    );
+    assert_eq!(
+        requests[15]["args"],
+        json!({"queue_id": "living-room-group", "shuffle_enabled": true})
+    );
+    assert_eq!(
+        requests[17]["args"],
+        json!({"queue_id": "living-room-group", "shuffle_enabled": false})
+    );
+    assert_eq!(
+        requests[19]["args"],
         json!({"queue_id": "living-room-group"})
     );
     assert_eq!(
-        requests[10]["args"],
+        requests[20]["args"],
         json!({"queue_id": "living-room-group", "limit": 100, "offset": 0})
     );
 
@@ -4823,15 +4877,16 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
             proved += 1;
         }
     }
-    // The routed Spotify content and mode cells add twelve probes to the
-    // original provider transport set. Apple Music's transport/skip/volume
+    // The routed Spotify content and mode cells plus Music Assistant's queue
+    // mode cells add fourteen probes to the original provider transport set.
+    // Apple Music's transport/skip/volume
     // cells remain gated until signed physical companion validation (#465).
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 34,
-        "{proved} supported cells were proved end to end, expected 34. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 36,
+        "{proved} supported cells were proved end to end, expected 36. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 

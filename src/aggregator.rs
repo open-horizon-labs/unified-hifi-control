@@ -1276,4 +1276,60 @@ mod tests {
             .expect("aggregator exits when the bus is explicitly shut down")
             .expect("aggregator task did not panic");
     }
+
+    #[tokio::test]
+    async fn playback_mode_event_updates_the_aggregated_now_playing_state() {
+        let bus = crate::bus::create_bus();
+        let aggregator = std::sync::Arc::new(ZoneAggregator::new(bus.clone()));
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let running = {
+            let aggregator = aggregator.clone();
+            tokio::spawn(async move { aggregator.run_with_ready(ready_tx).await })
+        };
+        ready_rx.await.expect("aggregator ready");
+
+        let mut zone = projected_zone("musicassistant:kitchen");
+        zone.now_playing = Some(NowPlaying {
+            title: "Kind of Blue".to_string(),
+            artist: "Miles Davis".to_string(),
+            album: "Kind of Blue".to_string(),
+            image_key: None,
+            seek_position: None,
+            duration: None,
+            metadata: None,
+            repeat_mode: Some(crate::bus::RepeatMode::Off),
+            shuffle: Some(false),
+        });
+        bus.publish(BusEvent::ZoneDiscovered { zone });
+        bus.publish(BusEvent::PlaybackModesChanged {
+            zone_id: PrefixedZoneId::musicassistant("kitchen"),
+            repeat_mode: Some(crate::bus::RepeatMode::All),
+            shuffle: Some(true),
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let matches = aggregator
+                    .get_zone("musicassistant:kitchen")
+                    .await
+                    .and_then(|zone| zone.now_playing)
+                    .is_some_and(|track| {
+                        track.repeat_mode == Some(crate::bus::RepeatMode::All)
+                            && track.shuffle == Some(true)
+                    });
+                if matches {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mode event reaches aggregated state");
+
+        bus.publish(BusEvent::ShuttingDown { reason: None });
+        tokio::time::timeout(Duration::from_secs(1), running)
+            .await
+            .expect("aggregator shutdown")
+            .expect("aggregator task");
+    }
 }

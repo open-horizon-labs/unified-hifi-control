@@ -8,6 +8,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -18,7 +19,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, LibraryAdapter,
@@ -32,6 +37,13 @@ use crate::bus::{
 
 const DEFAULT_PORT: u16 = 8095;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// A queue-mode read is supplementary state. Never let a slow MA queue delay
+/// player discovery or prevent other zones from being published.
+const QUEUE_MODE_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// Avoid stampeding an MA instance with one queue request per active player on
+/// every poll. Queue modes are supplemental; a small bounded batch keeps zone
+/// discovery responsive while allowing independent queues to hydrate together.
+const MAX_CONCURRENT_QUEUE_MODE_READS: usize = 4;
 /// `hifi_queue` has no pagination parameters, so keep the adapter response
 /// bounded while still returning a useful window of the active MA queue.
 const QUEUE_READ_ITEM_LIMIT: usize = 100;
@@ -139,9 +151,10 @@ struct ApiRequest<'a> {
 /// Direct adapter for an already-running Music Assistant server.
 ///
 /// MA player discovery, control, catalog search, exact playback, queue-add,
-/// and active-queue reads are available through its authenticated JSON API.
-/// Browse, playlist management, queue mutation, playback modes, and grouping
-/// remain separate capabilities until their MA contracts are wired end to end.
+/// active-queue reads, and playback modes are available through its
+/// authenticated JSON API. Browse, playlist management, queue mutation, and
+/// grouping remain separate capabilities until their MA contracts are wired
+/// end to end.
 #[derive(Clone)]
 pub struct MusicAssistantAdapter {
     bus: SharedBus,
@@ -270,10 +283,46 @@ impl MusicAssistantAdapter {
 
     async fn discover_players(&self) -> Result<Vec<PlayerSnapshot>> {
         let players: Vec<Value> = self.command("players/all", None).await?;
-        players
+        let mut snapshots = players
             .into_iter()
             .map(parse_player)
-            .collect::<Result<Vec<_>>>()
+            .collect::<Result<Vec<_>>>()?;
+        // Playback modes belong to MA's active queue rather than the player.
+        // In particular, a grouped child uses its group's queue, so never infer
+        // that identity from player_id.
+        let playing_player_ids = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.now_playing.is_some())
+            .map(|snapshot| snapshot.id.clone())
+            .collect::<Vec<_>>();
+        let queue_modes =
+            stream::iter(playing_player_ids.into_iter().map(|player_id| async move {
+                let result = timeout(
+                    QUEUE_MODE_READ_TIMEOUT,
+                    self.active_queue_for_zone(&zone_id_string(&player_id)),
+                )
+                .await;
+                (player_id, result)
+            }))
+            .buffer_unordered(MAX_CONCURRENT_QUEUE_MODE_READS)
+            .collect::<Vec<_>>()
+            .await;
+        for (player_id, result) in queue_modes {
+            let Some(snapshot) = snapshots
+                .iter_mut()
+                .find(|snapshot| snapshot.id == player_id)
+            else {
+                continue;
+            };
+            match result {
+                Ok(Ok(queue)) => apply_queue_playback_modes(snapshot, &queue),
+                Ok(Err(error)) => {
+                    tracing::debug!(%player_id, "Music Assistant queue mode read failed: {error}")
+                }
+                Err(_) => tracing::debug!(%player_id, "Music Assistant queue mode read timed out"),
+            }
+        }
+        Ok(snapshots)
     }
 
     async fn publish_snapshot(&self, snapshots: Vec<PlayerSnapshot>) {
@@ -309,6 +358,21 @@ impl MusicAssistantAdapter {
                             .now_playing
                             .as_ref()
                             .and_then(|track| track.image_key.clone()),
+                    });
+                }
+                let previous_modes = previous
+                    .now_playing
+                    .as_ref()
+                    .map(|track| (track.repeat_mode, track.shuffle));
+                let current_modes = snapshot
+                    .now_playing
+                    .as_ref()
+                    .map(|track| (track.repeat_mode, track.shuffle));
+                if previous_modes != current_modes {
+                    self.bus.publish(BusEvent::PlaybackModesChanged {
+                        zone_id: zone_id(&id),
+                        repeat_mode: current_modes.and_then(|modes| modes.0),
+                        shuffle: current_modes.and_then(|modes| modes.1),
                     });
                 }
                 let previous_position = previous
@@ -363,7 +427,7 @@ impl MusicAssistantAdapter {
         Ok(())
     }
 
-    async fn queue_id_for_zone(&self, zone_id: &str) -> Result<String> {
+    async fn active_queue_for_zone(&self, zone_id: &str) -> Result<Value> {
         let player_id = zone_id.strip_prefix("musicassistant:").unwrap_or(zone_id);
         if player_id.trim().is_empty() {
             return Err(anyhow!("Music Assistant zone_id must name a player"));
@@ -377,14 +441,26 @@ impl MusicAssistantAdapter {
                 Some(json!({ "player_id": player_id })),
             )
             .await?;
-        queue
+        if queue
             .get("queue_id")
             .and_then(Value::as_str)
             .filter(|queue_id| !queue_id.trim().is_empty())
+            .is_none()
+        {
+            return Err(anyhow!(
+                "Music Assistant returned no active queue for player {player_id}"
+            ));
+        }
+        Ok(queue)
+    }
+
+    async fn queue_id_for_zone(&self, zone_id: &str) -> Result<String> {
+        let queue = self.active_queue_for_zone(zone_id).await?;
+        queue
+            .get("queue_id")
+            .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                anyhow!("Music Assistant returned no active queue for player {player_id}")
-            })
+            .ok_or_else(|| anyhow!("Music Assistant active queue had no queue_id"))
     }
 
     async fn search_catalog(&self, query: &str, limit: usize) -> Result<Vec<LibrarySearchResult>> {
@@ -600,6 +676,22 @@ fn parse_now_playing(value: &Value) -> Option<NowPlaying> {
     })
 }
 
+/// Project queue-owned playback modes onto UHC's currently-playing state.
+/// MA has one queue per active player/group, whereas UHC displays these modes
+/// alongside a zone's now-playing metadata.
+fn apply_queue_playback_modes(snapshot: &mut PlayerSnapshot, queue: &Value) {
+    let Some(now_playing) = snapshot.now_playing.as_mut() else {
+        return;
+    };
+    now_playing.repeat_mode = match queue.get("repeat_mode").and_then(Value::as_str) {
+        Some("off") => Some(crate::bus::RepeatMode::Off),
+        Some("one") => Some(crate::bus::RepeatMode::One),
+        Some("all") => Some(crate::bus::RepeatMode::All),
+        _ => None,
+    };
+    now_playing.shuffle = queue.get("shuffle_enabled").and_then(Value::as_bool);
+}
+
 fn now_playing_changed(previous: Option<&NowPlaying>, current: Option<&NowPlaying>) -> bool {
     match (previous, current) {
         (None, None) => false,
@@ -609,6 +701,8 @@ fn now_playing_changed(previous: Option<&NowPlaying>, current: Option<&NowPlayin
                 || previous.album != current.album
                 || previous.image_key != current.image_key
                 || previous.duration != current.duration
+                || previous.repeat_mode != current.repeat_mode
+                || previous.shuffle != current.shuffle
         }
         _ => true,
     }
@@ -671,34 +765,65 @@ impl AdapterLogic for MusicAssistantAdapter {
         command: AdapterCommand,
     ) -> Result<AdapterCommandResponse> {
         let player_id = zone_id.strip_prefix("musicassistant:").unwrap_or(zone_id);
-        let request = match command {
-            AdapterCommand::Play => ("players/cmd/play", None),
-            AdapterCommand::Pause => ("players/cmd/pause", None),
-            AdapterCommand::PlayPause => ("players/cmd/play_pause", None),
-            AdapterCommand::Stop => ("players/cmd/stop", None),
-            AdapterCommand::Next => ("players/cmd/next", None),
-            AdapterCommand::Previous => ("players/cmd/previous", None),
-            AdapterCommand::VolumeAbsolute(value) => (
-                "players/cmd/volume_set",
-                Some(json!({ "volume_level": value.clamp(0, 100) })),
-            ),
-            AdapterCommand::VolumeRelative(delta) if delta >= 0 => ("players/cmd/volume_up", None),
-            AdapterCommand::VolumeRelative(_) => ("players/cmd/volume_down", None),
-            AdapterCommand::Mute(muted) => {
-                ("players/cmd/volume_mute", Some(json!({ "muted": muted })))
+        let result = match command {
+            AdapterCommand::Play => self.control(player_id, "players/cmd/play", None).await,
+            AdapterCommand::Pause => self.control(player_id, "players/cmd/pause", None).await,
+            AdapterCommand::PlayPause => {
+                self.control(player_id, "players/cmd/play_pause", None)
+                    .await
             }
-            AdapterCommand::SetRepeat(_) | AdapterCommand::SetShuffle(_) => {
-                return Ok(AdapterCommandResponse {
-                    success: false,
-                    error: Some(
-                        "Repeat and shuffle are not implemented by the Music Assistant adapter"
-                            .to_string(),
-                    ),
-                });
+            AdapterCommand::Stop => self.control(player_id, "players/cmd/stop", None).await,
+            AdapterCommand::Next => self.control(player_id, "players/cmd/next", None).await,
+            AdapterCommand::Previous => self.control(player_id, "players/cmd/previous", None).await,
+            AdapterCommand::VolumeAbsolute(value) => {
+                self.control(
+                    player_id,
+                    "players/cmd/volume_set",
+                    Some(json!({ "volume_level": value.clamp(0, 100) })),
+                )
+                .await
+            }
+            AdapterCommand::VolumeRelative(delta) if delta >= 0 => {
+                self.control(player_id, "players/cmd/volume_up", None).await
+            }
+            AdapterCommand::VolumeRelative(_) => {
+                self.control(player_id, "players/cmd/volume_down", None)
+                    .await
+            }
+            AdapterCommand::Mute(muted) => {
+                self.control(
+                    player_id,
+                    "players/cmd/volume_mute",
+                    Some(json!({ "muted": muted })),
+                )
+                .await
+            }
+            AdapterCommand::SetRepeat(mode) => {
+                let queue_id = self.queue_id_for_zone(zone_id).await?;
+                let repeat_mode = match mode {
+                    crate::bus::RepeatMode::Off => "off",
+                    crate::bus::RepeatMode::One => "one",
+                    crate::bus::RepeatMode::All => "all",
+                };
+                self.command::<Value>(
+                    "player_queues/repeat",
+                    Some(json!({ "queue_id": queue_id, "repeat_mode": repeat_mode })),
+                )
+                .await
+                .map(|_| ())
+            }
+            AdapterCommand::SetShuffle(enabled) => {
+                let queue_id = self.queue_id_for_zone(zone_id).await?;
+                self.command::<Value>(
+                    "player_queues/shuffle",
+                    Some(json!({ "queue_id": queue_id, "shuffle_enabled": enabled })),
+                )
+                .await
+                .map(|_| ())
             }
         };
 
-        match self.control(player_id, request.0, request.1).await {
+        match result {
             Ok(()) => Ok(AdapterCommandResponse {
                 success: true,
                 error: None,
@@ -751,6 +876,11 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockMusicAssistantState {
         requests: Arc<StdMutex<Vec<RecordedRequest>>>,
+        players: Arc<StdMutex<Option<Value>>>,
+        slow_active_queue_prefix: Arc<StdMutex<Option<String>>>,
+        slow_active_queue_delay: Arc<StdMutex<Option<Duration>>>,
+        active_queue_in_flight: Arc<AtomicUsize>,
+        max_active_queue_in_flight: Arc<AtomicUsize>,
     }
 
     async fn musicassistant_mock(
@@ -772,7 +902,7 @@ mod tests {
             });
 
         if request["command"] == "players/all" {
-            Json(json!([{
+            let players = state.players.lock().expect("players lock").clone().unwrap_or_else(|| json!([{
                 "player_id": "sonos-kitchen",
                 "name": "Kitchen",
                 "playback_state": "playing",
@@ -786,11 +916,36 @@ mod tests {
                     "elapsed_time": 12.5,
                     "duration": 300
                 }
-            }]))
+            }]));
+            Json(players)
         } else if request["command"] == "player_queues/get_active_queue" {
+            let delayed = state
+                .slow_active_queue_prefix
+                .lock()
+                .expect("slow player lock")
+                .as_ref()
+                .is_some_and(|prefix| request["args"]["player_id"].as_str().is_some_and(|id| id.starts_with(prefix)));
+            if delayed {
+                let in_flight = state.active_queue_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                state
+                    .max_active_queue_in_flight
+                    .fetch_max(in_flight, Ordering::SeqCst);
+                let delay = state
+                    .slow_active_queue_delay
+                    .lock()
+                    .expect("slow queue delay lock")
+                    .unwrap_or(QUEUE_MODE_READ_TIMEOUT + Duration::from_millis(50));
+                sleep(delay).await;
+                state.active_queue_in_flight.fetch_sub(1, Ordering::SeqCst);
+            }
             // Deliberately differs from player_id: MA grouped children must
             // resolve their active queue rather than infer it from membership.
-            Json(json!({"queue_id": "group-living-room", "items": 234}))
+            Json(json!({
+                "queue_id": "group-living-room",
+                "items": 234,
+                "repeat_mode": "all",
+                "shuffle_enabled": true
+            }))
         } else if request["command"] == "player_queues/get" {
             Json(json!({
                 "queue_id": "group-living-room",
@@ -1061,6 +1216,168 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn repeat_and_shuffle_resolve_the_active_group_queue_and_use_ma_wire_names() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        let adapter =
+            MusicAssistantAdapter::new(crate::bus::create_bus(), config).expect("valid MA adapter");
+
+        for command in [
+            AdapterCommand::SetRepeat(crate::bus::RepeatMode::Off),
+            AdapterCommand::SetRepeat(crate::bus::RepeatMode::One),
+            AdapterCommand::SetRepeat(crate::bus::RepeatMode::All),
+            AdapterCommand::SetShuffle(true),
+            AdapterCommand::SetShuffle(false),
+        ] {
+            assert!(
+                adapter
+                    .handle_command("musicassistant:sonos-kitchen", command)
+                    .await
+                    .expect("MA request")
+                    .success
+            );
+        }
+
+        let requests = state.requests.lock().expect("mock request lock").clone();
+        let commands: Vec<_> = requests
+            .iter()
+            .map(|request| request.body["command"].as_str().expect("command"))
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                "player_queues/get_active_queue",
+                "player_queues/repeat",
+                "player_queues/get_active_queue",
+                "player_queues/repeat",
+                "player_queues/get_active_queue",
+                "player_queues/repeat",
+                "player_queues/get_active_queue",
+                "player_queues/shuffle",
+                "player_queues/get_active_queue",
+                "player_queues/shuffle",
+            ]
+        );
+        assert_eq!(
+            requests[1].body["args"],
+            json!({"queue_id": "group-living-room", "repeat_mode": "off"})
+        );
+        assert_eq!(
+            requests[3].body["args"],
+            json!({"queue_id": "group-living-room", "repeat_mode": "one"})
+        );
+        assert_eq!(
+            requests[5].body["args"],
+            json!({"queue_id": "group-living-room", "repeat_mode": "all"})
+        );
+        assert_eq!(
+            requests[7].body["args"],
+            json!({"queue_id": "group-living-room", "shuffle_enabled": true})
+        );
+        assert_eq!(
+            requests[9].body["args"],
+            json!({"queue_id": "group-living-room", "shuffle_enabled": false})
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn active_queue_repeat_and_shuffle_are_projected_into_now_playing() {
+        let mut player = parse_player(json!({
+            "player_id": "sonos-kitchen",
+            "current_media": {"title": "Kind of Blue"}
+        }))
+        .expect("player");
+
+        apply_queue_playback_modes(
+            &mut player,
+            &json!({"repeat_mode": "one", "shuffle_enabled": true}),
+        );
+
+        let now_playing = player.now_playing.expect("now playing");
+        assert_eq!(now_playing.repeat_mode, Some(crate::bus::RepeatMode::One));
+        assert_eq!(now_playing.shuffle, Some(true));
+    }
+
+    #[test]
+    fn queue_mode_changes_count_as_now_playing_changes() {
+        let mut previous = parse_now_playing(&json!({"title": "Kind of Blue"})).expect("track");
+        let mut current = previous.clone();
+        previous.repeat_mode = Some(crate::bus::RepeatMode::Off);
+        current.repeat_mode = Some(crate::bus::RepeatMode::All);
+        current.shuffle = Some(true);
+
+        assert!(now_playing_changed(Some(&previous), Some(&current)));
+    }
+
+    #[tokio::test]
+    async fn slow_queue_mode_reads_are_bounded_and_concurrent() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        *state.players.lock().expect("players lock") = Some(json!([
+            {"player_id": "slow-one", "current_media": {"title": "One"}},
+            {"player_id": "slow-two", "current_media": {"title": "Two"}}
+        ]));
+        *state
+            .slow_active_queue_prefix
+            .lock()
+            .expect("slow player lock") = Some("slow-".to_string());
+        let adapter =
+            MusicAssistantAdapter::new(crate::bus::create_bus(), config).expect("adapter");
+
+        let started = std::time::Instant::now();
+        let players = adapter
+            .discover_players()
+            .await
+            .expect("discovery survives queue timeouts");
+        assert_eq!(players.len(), 2);
+        assert!(
+            started.elapsed() < QUEUE_MODE_READ_TIMEOUT + Duration::from_millis(500),
+            "two slow queue reads must share one timeout window"
+        );
+        assert!(players.iter().all(|player| player
+            .now_playing
+            .as_ref()
+            .is_some_and(|track| track.repeat_mode.is_none() && track.shuffle.is_none())));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn queue_mode_hydration_caps_in_flight_requests() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        *state.players.lock().expect("players lock") = Some(json!([
+            {"player_id": "slow-one", "current_media": {"title": "One"}},
+            {"player_id": "slow-two", "current_media": {"title": "Two"}},
+            {"player_id": "slow-three", "current_media": {"title": "Three"}},
+            {"player_id": "slow-four", "current_media": {"title": "Four"}},
+            {"player_id": "slow-five", "current_media": {"title": "Five"}}
+        ]));
+        *state
+            .slow_active_queue_prefix
+            .lock()
+            .expect("slow player lock") = Some("slow-".to_string());
+        *state
+            .slow_active_queue_delay
+            .lock()
+            .expect("slow queue delay lock") = Some(Duration::from_millis(100));
+        let adapter =
+            MusicAssistantAdapter::new(crate::bus::create_bus(), config).expect("adapter");
+
+        adapter
+            .discover_players()
+            .await
+            .expect("discovery survives queue timeouts");
+
+        assert!(
+            state.max_active_queue_in_flight.load(Ordering::SeqCst)
+                <= MAX_CONCURRENT_QUEUE_MODE_READS,
+            "queue-mode hydration must cap concurrent MA requests"
+        );
+
+        server.abort();
+    }
+
     #[test]
     fn config_debug_redacts_the_access_token() {
         let config = MusicAssistantConfig {
@@ -1095,6 +1412,16 @@ mod tests {
             zone.now_playing.as_ref().map(|track| track.title.as_str()),
             Some("Kind of Blue")
         );
+        assert_eq!(
+            zone.now_playing
+                .as_ref()
+                .and_then(|track| track.repeat_mode),
+            Some(crate::bus::RepeatMode::All)
+        );
+        assert_eq!(
+            zone.now_playing.as_ref().and_then(|track| track.shuffle),
+            Some(true)
+        );
 
         for command in [
             AdapterCommand::Play,
@@ -1118,7 +1445,7 @@ mod tests {
         }
 
         let requests = state.requests.lock().expect("mock request lock").clone();
-        assert_eq!(requests.len(), 11);
+        assert_eq!(requests.len(), 12);
         for request in &requests {
             assert_eq!(
                 request.authorization.as_deref(),
@@ -1141,6 +1468,7 @@ mod tests {
         assert_eq!(
             commands,
             [
+                "player_queues/get_active_queue",
                 "players/cmd/play",
                 "players/cmd/pause",
                 "players/cmd/play_pause",
@@ -1152,6 +1480,10 @@ mod tests {
                 "players/cmd/volume_down",
                 "players/cmd/volume_mute",
             ]
+        );
+        assert_eq!(
+            requests[1].body["args"],
+            json!({"player_id": "sonos-kitchen"})
         );
         let request_for = |command: &str| {
             requests

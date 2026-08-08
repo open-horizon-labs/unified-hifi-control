@@ -351,6 +351,8 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
             (target == ZoneTarget::Spotify
                 && matches!(target.for_transport(), TransportRoute::Spotify))
                 || target == ZoneTarget::HqPlayer
+                || (target == ZoneTarget::MusicAssistant
+                    && matches!(target.for_transport(), TransportRoute::MusicAssistant))
         }
         Capability::QueueRead => matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant),
         Capability::Browse | Capability::SavedPlaylists | Capability::Favorites => {
