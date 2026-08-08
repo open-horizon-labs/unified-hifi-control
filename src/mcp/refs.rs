@@ -126,6 +126,12 @@ pub enum RefTarget {
         uri: String,
         title: String,
     },
+    /// A durable Music Assistant media URI. The token keeps that URI out of
+    /// client-side control flow and binds it to the provider that searched it.
+    MusicAssistant {
+        uri: String,
+        title: String,
+    },
     /// An Apple Music catalog/library identifier resolved by the paired native
     /// companion. Clients only receive the opaque token.
     AppleMusic {
@@ -146,6 +152,7 @@ impl RefTarget {
             Self::Roon { .. } => Provider::Roon,
             Self::Lms { .. } => Provider::Lms,
             Self::Spotify { .. } => Provider::Spotify,
+            Self::MusicAssistant { .. } => Provider::MusicAssistant,
             Self::AppleMusic { .. } => Provider::AppleMusic,
         }
     }
@@ -157,6 +164,7 @@ impl RefTarget {
             Self::Roon { title, .. }
             | Self::Lms { title, .. }
             | Self::Spotify { title, .. }
+            | Self::MusicAssistant { title, .. }
             | Self::AppleMusic { title, .. } => title,
         }
     }

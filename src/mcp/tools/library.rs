@@ -1,6 +1,7 @@
 //! Library search and playback.
 //!
-//! The tools route on `roon:`, `lms:`, `spotify:`, and paired `applemusic:` zones.
+//! The tools route on `roon:`, `lms:`, `spotify:`, paired `applemusic:`, and
+//! `musicassistant:` zones.
 //! Everything else is refused since #398,
 //! where it used to reach Roon (see [`crate::mcp::routing`]).
 //!
@@ -74,7 +75,7 @@ const SPOTIFY_SEARCH_LIMIT: usize = 10;
 /// Search for music
 #[mcp_tool(
     name = "hifi_search",
-    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins. Spotify: searches the Spotify catalog for a Spotify Connect zone. Apple Music: searches through a paired iPhone companion and returns owner-scoped opaque refs; physical companion validation remains tracked in #465. Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play or queue that exact result.",
+    description = "Search for tracks, albums, or artists. Roon: searches Library, TIDAL, or Qobuz (use source param). LMS: searches all installed providers including streaming plugins. Spotify: searches the Spotify catalog for a Spotify Connect zone. Apple Music: searches through a paired iPhone companion and returns owner-scoped opaque refs; physical companion validation remains tracked in #465. Music Assistant searches its configured catalog for a Music Assistant zone. Each result may carry a short-lived `ref` token; hold it and pass it to hifi_play_ref to play or queue that exact result.",
     read_only_hint = true
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -92,7 +93,7 @@ pub struct HifiSearchTool {
 /// Search and play music in one command
 #[mcp_tool(
     name = "hifi_play",
-    description = "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. Apple Music play/queue uses a paired iPhone companion and owner-scoped opaque refs; physical validation remains tracked in #465. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead."
+    description = "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. Apple Music play/queue uses a paired iPhone companion and owner-scoped opaque refs; physical validation remains tracked in #465. Music Assistant supports play and queue against its active player queue. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiPlayTool {
@@ -111,7 +112,7 @@ pub struct HifiPlayTool {
 /// Play, queue, or start radio from a specific `hifi_search` result (#396)
 #[mcp_tool(
     name = "hifi_play_ref",
-    description = "Play or queue a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Refs are short-lived; call hifi_search again if one expires. zone_id must belong to the same provider (Roon, LMS, Spotify, or a paired Apple Music companion) the ref was minted for. Apple Music refs and play/queue use the paired iPhone companion; physical validation remains tracked in #465.",
+    description = "Play or queue a specific hifi_search result using its `ref` — the opaque token returned alongside a result, not a title. Refs are short-lived; call hifi_search again if one expires. zone_id must belong to the same provider (Roon, LMS, Spotify, Music Assistant, or a paired Apple Music companion) the ref was minted for. Music Assistant refs support play and queue against its active player queue. Apple Music refs and play/queue use the paired iPhone companion; physical validation remains tracked in #465.",
     read_only_hint = false
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -159,6 +160,7 @@ pub async fn handle_search(
         LibraryRoute::Lms
         | LibraryRoute::Spotify
         | LibraryRoute::AppleMusic
+        | LibraryRoute::MusicAssistant
         | LibraryRoute::Refused(_) => env,
         LibraryRoute::Roon => env.param(
             "source",
@@ -230,6 +232,33 @@ pub async fn handle_search(
                         let ref_token = state
                             .mcp_refs
                             .mint(RefTarget::Spotify {
+                                uri: item.uri,
+                                title: item.title.clone(),
+                            })
+                            .await;
+                        mcp_results.push(McpSearchResult {
+                            title: item.title,
+                            subtitle: item.subtitle,
+                            r#ref: Some(ref_token),
+                        });
+                    }
+                    Ok(env.json_result(&mcp_results))
+                }
+                Err(e) => env.failed(format!("Search error: {}", e)),
+            }
+        }
+        LibraryRoute::MusicAssistant => {
+            match state
+                .adapter_registry
+                .search_library("musicassistant", &args.query, SPOTIFY_SEARCH_LIMIT)
+                .await
+            {
+                Ok(results) => {
+                    let mut mcp_results = Vec::with_capacity(results.len());
+                    for item in results {
+                        let ref_token = state
+                            .mcp_refs
+                            .mint(RefTarget::MusicAssistant {
                                 uri: item.uri,
                                 title: item.title.clone(),
                             })
@@ -544,6 +573,57 @@ pub async fn handle_play(
                 Err(e) => env.failed(format!("Search error: {}", e)),
             }
         }
+        LibraryRoute::MusicAssistant => {
+            let action = args.action.as_deref().unwrap_or("play");
+            if !matches!(action, "play" | "queue") {
+                let env = Envelope::write("hifi_play", action)
+                    .param("query", &*args.query)
+                    .param("zone_id", &*args.zone_id)
+                    .param("action", action)
+                    .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
+                return env.refused(
+                    "Music Assistant query playback supports action='play' or action='queue'.",
+                    Refusal::InvalidParameter {
+                        parameter: "action",
+                        accepted: vec!["play".to_string(), "queue".to_string()],
+                        detail: "Music Assistant can start a catalog result or append it to its active queue.".to_string(),
+                    },
+                );
+            }
+            let env = Envelope::write("hifi_play", action)
+                .param("query", &*args.query)
+                .param("zone_id", &*args.zone_id)
+                .param("action", action)
+                .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
+            match state
+                .adapter_registry
+                .search_library("musicassistant", &args.query, SPOTIFY_SEARCH_LIMIT)
+                .await
+            {
+                Ok(mut results) => match results.drain(..).next() {
+                    Some(item) => {
+                        let result = if action == "queue" {
+                            state
+                                .adapter_registry
+                                .queue_library_uri("musicassistant", &args.zone_id, &item.uri)
+                                .await
+                                .map(|_| format!("Queued {} on Music Assistant", item.title))
+                        } else {
+                            state
+                                .adapter_registry
+                                .play_library_uri("musicassistant", &args.zone_id, &item.uri)
+                                .await
+                        };
+                        match result {
+                            Ok(message) => Ok(play_success(state, env, message).await),
+                            Err(e) => env.failed(format!("Play error: {}", e)),
+                        }
+                    }
+                    None => env.failed("Play error: Music Assistant search returned no results"),
+                },
+                Err(e) => env.failed(format!("Search error: {}", e)),
+            }
+        }
         LibraryRoute::AppleMusic => {
             let action = args.action.as_deref().unwrap_or("play");
             if !matches!(action, "play" | "queue") {
@@ -719,6 +799,7 @@ const ROON_REF_ACTIONS: &[&str] = &["play", "queue", "radio"];
 /// Every action `hifi_play_ref` accepts for an LMS-minted ref.
 const LMS_REF_ACTIONS: &[&str] = &["play", "queue", "next"];
 const SPOTIFY_REF_ACTIONS: &[&str] = &["play", "queue"];
+const MUSIC_ASSISTANT_REF_ACTIONS: &[&str] = &["play", "queue"];
 
 /// Validate `action` against a provider's closed action set, defaulting to
 /// the first (always `"play"`) when absent. Never falls through to a default
@@ -869,6 +950,9 @@ pub async fn handle_play_ref(
         (LibraryRoute::Spotify, RefTarget::Spotify { uri, title }) => {
             play_ref_spotify(state, env, &args, uri, title).await
         }
+        (LibraryRoute::MusicAssistant, RefTarget::MusicAssistant { uri, title }) => {
+            play_ref_music_assistant(state, env, &args, uri, title).await
+        }
         (LibraryRoute::AppleMusic, RefTarget::AppleMusic { handle, title, .. }) => {
             play_ref_apple_music(state, env, &args, handle, title).await
         }
@@ -885,9 +969,17 @@ pub async fn handle_play_ref(
         | (LibraryRoute::AppleMusic, RefTarget::Roon { .. })
         | (LibraryRoute::AppleMusic, RefTarget::Lms { .. })
         | (LibraryRoute::AppleMusic, RefTarget::Spotify { .. })
+        | (LibraryRoute::AppleMusic, RefTarget::MusicAssistant { .. })
         | (LibraryRoute::Roon, RefTarget::AppleMusic { .. })
         | (LibraryRoute::Lms, RefTarget::AppleMusic { .. })
-        | (LibraryRoute::Spotify, RefTarget::AppleMusic { .. }) => env.failed(
+        | (LibraryRoute::Spotify, RefTarget::AppleMusic { .. })
+        | (LibraryRoute::Roon, RefTarget::MusicAssistant { .. })
+        | (LibraryRoute::Lms, RefTarget::MusicAssistant { .. })
+        | (LibraryRoute::Spotify, RefTarget::MusicAssistant { .. })
+        | (LibraryRoute::MusicAssistant, RefTarget::Roon { .. })
+        | (LibraryRoute::MusicAssistant, RefTarget::Lms { .. })
+        | (LibraryRoute::MusicAssistant, RefTarget::Spotify { .. })
+        | (LibraryRoute::MusicAssistant, RefTarget::AppleMusic { .. }) => env.failed(
             "internal routing error: ref/zone provider mismatch reached dispatch after the \
                  capability check. This is a UHC bug.",
         ),
@@ -1025,6 +1117,45 @@ async fn play_ref_spotify(
         state
             .adapter_registry
             .play_library_uri("spotify", &args.zone_id, &uri)
+            .await
+    };
+    match result {
+        Ok(message) => Ok(play_success(state, env, message).await),
+        Err(error) => env.failed(format!("Play error for {title}: {}", error)),
+    }
+}
+
+async fn play_ref_music_assistant(
+    state: &AppState,
+    mut env: Envelope,
+    args: &HifiPlayRefTool,
+    uri: String,
+    title: String,
+) -> Result<CallToolResult, CallToolError> {
+    let action_name = match validate_ref_action(args.action.as_deref(), MUSIC_ASSISTANT_REF_ACTIONS)
+    {
+        Ok(name) => name,
+        Err(refusal) => {
+            env.operation = "invalid_action".to_string();
+            let detail = match &refusal {
+                Refusal::InvalidParameter { detail, .. } => detail.clone(),
+                _ => String::new(),
+            };
+            return env.refused(detail, refusal);
+        }
+    };
+    let mut env = env.param("action", action_name);
+    env.operation = action_name.to_string();
+    let result = if action_name == "queue" {
+        state
+            .adapter_registry
+            .queue_library_uri("musicassistant", &args.zone_id, &uri)
+            .await
+            .map(|_| format!("Queued {title} on Music Assistant"))
+    } else {
+        state
+            .adapter_registry
+            .play_library_uri("musicassistant", &args.zone_id, &uri)
             .await
     };
     match result {

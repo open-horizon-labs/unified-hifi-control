@@ -227,14 +227,15 @@ pub enum VolumeRoute {
 
 /// Where a library operation (`hifi_search` / `hifi_play`) is sent.
 ///
-/// Roon, LMS, and Spotify expose library/content surfaces; OpenHome and UPnP zones are
-/// renderers.
+/// Roon, LMS, Spotify, Apple Music, and Music Assistant expose library/content
+/// surfaces; OpenHome and UPnP zones are renderers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LibraryRoute {
     Roon,
     Lms,
     Spotify,
     AppleMusic,
+    MusicAssistant,
     /// No library path for this zone id.
     Refused(ZoneTarget),
 }
@@ -348,9 +349,8 @@ impl ZoneTarget {
             // OpenHome and UPnP zones are renderers with no library; before #398
             // both were sent to Roon, which searched a library the zone could not
             // play from.
-            Self::OpenHome | Self::Upnp | Self::HqPlayer | Self::MusicAssistant => {
-                LibraryRoute::Refused(self)
-            }
+            Self::MusicAssistant => LibraryRoute::MusicAssistant,
+            Self::OpenHome | Self::Upnp | Self::HqPlayer => LibraryRoute::Refused(self),
             Self::Unprefixed | Self::Unknown => LibraryRoute::Refused(self),
         }
     }
@@ -556,7 +556,7 @@ mod tests {
     /// Volume and transport still differ, and the difference has moved: it used
     /// to be OpenHome/UPnP, and now it is only the library rule that narrows.
     #[test]
-    fn library_routes_roon_lms_and_spotify() {
+    fn library_routes_each_provider_with_a_catalog_to_its_own_adapter() {
         assert_eq!(
             ZoneTarget::classify("roon:x").for_library(),
             LibraryRoute::Roon
@@ -568,6 +568,10 @@ mod tests {
         assert_eq!(
             ZoneTarget::classify("spotify:x").for_library(),
             LibraryRoute::Spotify
+        );
+        assert_eq!(
+            ZoneTarget::classify("musicassistant:x").for_library(),
+            LibraryRoute::MusicAssistant
         );
         for zone_id in ["openhome:x", "upnp:x", "hqplayer:x"] {
             assert!(

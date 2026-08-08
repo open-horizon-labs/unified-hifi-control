@@ -521,7 +521,11 @@ mod server {
         if let Some(adapter) = music_assistant.clone() {
             state
                 .adapter_registry
-                .register_with_lifecycle(adapter.clone(), adapter)
+                .register_with_lifecycle(adapter.clone(), adapter.clone())
+                .await;
+            state
+                .adapter_registry
+                .register_library("musicassistant", adapter)
                 .await;
         }
 

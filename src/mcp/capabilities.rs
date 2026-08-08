@@ -338,11 +338,13 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
             (ZoneTarget::Roon, LibraryRoute::Roon)
                 | (ZoneTarget::Lms, LibraryRoute::Lms)
                 | (ZoneTarget::Spotify, LibraryRoute::Spotify)
+                | (ZoneTarget::MusicAssistant, LibraryRoute::MusicAssistant)
         ),
         Capability::PlayByRef => {
             matches!(
                 (target, target.for_library()),
                 (ZoneTarget::Spotify, LibraryRoute::Spotify)
+                    | (ZoneTarget::MusicAssistant, LibraryRoute::MusicAssistant)
             )
         }
         Capability::RepeatMode | Capability::ShuffleMode => {
@@ -350,10 +352,10 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
                 && matches!(target.for_transport(), TransportRoute::Spotify))
                 || target == ZoneTarget::HqPlayer
         }
-        Capability::QueueRead
-        | Capability::Browse
-        | Capability::SavedPlaylists
-        | Capability::Favorites => target == ZoneTarget::Spotify,
+        Capability::QueueRead => matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant),
+        Capability::Browse | Capability::SavedPlaylists | Capability::Favorites => {
+            target == ZoneTarget::Spotify
+        }
         // Nothing else has an MCP call path at all yet.
         _ => false,
     };
@@ -810,7 +812,6 @@ mod tests {
                         ) && matches!(
                             capability,
                             Capability::Browse
-                                | Capability::QueueRead
                                 | Capability::QueueJump
                                 | Capability::QueueReorder
                                 | Capability::QueueRemove
@@ -819,17 +820,16 @@ mod tests {
                                 | Capability::SavedPlaylists
                                 | Capability::Favorites
                                 | Capability::MultiroomSync
-                        ) || (matches!(
-                            target,
-                            &ZoneTarget::AppleMusic | &ZoneTarget::MusicAssistant
-                        ) && matches!(
-                            capability,
-                            Capability::Search
-                                | Capability::PlayByQuery
-                                | Capability::PlayByRef
-                                | Capability::RepeatMode
-                                | Capability::ShuffleMode
-                        ))));
+                        ) || (matches!(target, &ZoneTarget::AppleMusic)
+                            && matches!(
+                                capability,
+                                Capability::Search
+                                    | Capability::PlayByQuery
+                                    | Capability::PlayByRef
+                                    | Capability::QueueRead
+                                    | Capability::RepeatMode
+                                    | Capability::ShuffleMode
+                            ))));
                 if !routed && !listed {
                     missing.push((target.label(), capability.name()));
                 }

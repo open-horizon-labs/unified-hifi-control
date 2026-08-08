@@ -210,11 +210,11 @@ Two things this table does **not** claim:
 | `transport` | ✅ | ✅ | ✅ | ✅ | ✅ | 🚧 #465 | ✅ | ✅ |
 | `transport_skip` | ✅ | ✅ | ✅ | 🚧 #392 | ✅ | 🚧 #465 | ✅ | ✅ |
 | `volume` | ✅ | ✅ | ✅ | ✅ | ✅ | 🚧 #465 | ✅ | ✅ |
-| `search` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #481 | ✅ | 🚧 #462 |
-| `play_by_query` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #481 | ✅ | 🚧 #462 |
-| `play_by_ref` | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #209 | 🚧 #481 | ✅ | 🚧 #462 |
+| `search` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #481 | ✅ | ✅ |
+| `play_by_query` | ✅ | ✅ | ⛔ | ⛔ | 🚧 #209 | 🚧 #481 | ✅ | ✅ |
+| `play_by_ref` | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #396 | 🚧 #209 | 🚧 #481 | ✅ | ✅ |
 | `browse` | 🚧 #399 | 🚧 #402 | ⛔ | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | 🚧 #462 |
-| `queue_read` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ✅ | 🚧 #462 |
+| `queue_read` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | ✅ | ✅ |
 | `queue_jump` | 🚧 #400 | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | 🚧 #462 |
 | `queue_reorder` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | 🚧 #462 |
 | `queue_remove` | ⛔ | 🚧 #400 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #483 | 🚧 #462 | 🚧 #462 |
@@ -238,19 +238,16 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `search`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `search`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `search`** (#481) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **musicassistant / `search`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - ⛔ **openhome / `play_by_query`** — UHC discovers OpenHome zones by their av-openhome-org Product, Transport and Volume services (src/adapters/openhome.rs) and the OpenHome service set has no library: content is resolved by a control point against a separate media server. Verified from the OpenHome service definitions, not from a device.
 - ⛔ **upnp / `play_by_query`** — UHC discovers UPnP zones as urn:schemas-upnp-org:device:MediaRenderer:1 and speaks only AVTransport:1 and RenderingControl:1. Searching or browsing content is a ContentDirectory:1 (MediaServer) capability, which a renderer does not have and UHC does not discover. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `play_by_query`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `play_by_query`** (#481) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **musicassistant / `play_by_query`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `play_by_ref`** (#396) — RoonAdapter::browse/load/play_item exist and are exposed over HTTP; MCP mints no reference for a search hit to act on.
 - 🚧 **lms / `play_by_ref`** (#396) — the native taggedlist queries return durable entity ids (track_id/album_id/artist_id) that playlistcontrol accepts, verified live; MCP discards them and hands back a title. Note the XMLBrowser paths (globalsearch, favorites) return positional breadcrumbs instead, which is #396's safety problem, not a capability gap.
 - 🚧 **openhome / `play_by_ref`** (#396) — the protocol can play a specific item -- UPnP AVTransport:1 takes SetAVTransportURI and SetNextAVTransportURI, OpenHome Playlist:1 takes Insert(AfterId, Uri, Metadata) -- so what is missing is UHC's ability to name one, not the device's ability to play it. Reported as a UHC gap rather than a provider limit, because a reference minted against a media server would work. Verified from the UPnP AV and OpenHome service definitions, not from a device.
 - 🚧 **upnp / `play_by_ref`** (#396) — the protocol can play a specific item -- UPnP AVTransport:1 takes SetAVTransportURI and SetNextAVTransportURI, OpenHome Playlist:1 takes Insert(AfterId, Uri, Metadata) -- so what is missing is UHC's ability to name one, not the device's ability to play it. Reported as a UHC gap rather than a provider limit, because a reference minted against a media server would work. Verified from the UPnP AV and OpenHome service definitions, not from a device.
 - 🚧 **hqplayer / `play_by_ref`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `play_by_ref`** (#481) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **musicassistant / `play_by_ref`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `browse`** (#399) — RoonAdapter::browse() and load() exist and POST /roon/browse exposes them; only the MCP projection is missing.
 - 🚧 **lms / `browse`** (#402) — browselibrary items and the native albums/artists/genres/years/playlists/mediafolder queries walk the whole hierarchy with native <start> <n> paging -- all verified live on Lyrion 9.1.2. The adapter never calls any of them.
 - ⛔ **openhome / `browse`** — UHC discovers OpenHome zones by their av-openhome-org Product, Transport and Volume services (src/adapters/openhome.rs) and the OpenHome service set has no library: content is resolved by a control point against a separate media server. Verified from the OpenHome service definitions, not from a device.
@@ -264,7 +261,6 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - ⛔ **upnp / `queue_read`** — AVTransport:1 holds a single current transport URI plus one SetNextAVTransportURI; it has no playlist to enumerate or mutate. Verified from the UPnP AV service definitions, not from a device.
 - 🚧 **hqplayer / `queue_read`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `queue_read`** (#483) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
-- 🚧 **musicassistant / `queue_read`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 - 🚧 **roon / `queue_jump`** (#400) — the pinned roon-api fork exposes play_from_here(zone, queue_item_id), which nothing in UHC calls.
 - 🚧 **lms / `queue_jump`** (#400) — playlist index <n> jumps to a queue position; verified live.
 - 🚧 **openhome / `queue_jump`** (#392) — OpenHome's Playlist:1 service provides Read/ReadList/IdArray, Insert, DeleteId, DeleteAll, SeekId/SeekIndex and SetRepeat/SetShuffle. UHC discovers only Product/Transport/Volume and drives none of it, so this is a UHC gap. Verified from the OpenHome service definitions, not from a device.

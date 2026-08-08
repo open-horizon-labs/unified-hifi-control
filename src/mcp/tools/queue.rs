@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 #[mcp_tool(
     name = "hifi_queue",
-    description = "Read the current playback queue for a zone. Spotify returns its account playback queue; queue add is hifi_play action='queue'. Queue edit, remove, reorder, and clear are not claimed unless a provider exposes them."
+    description = "Read the current playback queue for a zone. Spotify returns its account playback queue. Music Assistant returns the active player queue and its first 100 items. Queue add is hifi_play action='queue'. Queue edit, remove, reorder, and clear are not claimed unless a provider exposes them."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiQueueTool {
@@ -47,6 +47,14 @@ pub async fn handle_queue(
         LibraryRoute::AppleMusic => match state
             .adapter_registry
             .read_library_queue("applemusic", &args.zone_id)
+            .await
+        {
+            Ok(value) => Ok(env.json_result(&value)),
+            Err(e) => env.failed(format!("Queue error: {e}")),
+        },
+        LibraryRoute::MusicAssistant => match state
+            .adapter_registry
+            .read_library_queue("musicassistant", &args.zone_id)
             .await
         {
             Ok(value) => Ok(env.json_result(&value)),

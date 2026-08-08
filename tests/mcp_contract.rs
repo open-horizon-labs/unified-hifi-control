@@ -33,17 +33,24 @@ mod mock_servers;
 
 use axum::{
     body::Body,
-    http::{header, Method, Request},
+    extract::State,
+    http::{header, HeaderMap, Method, Request},
+    response::IntoResponse,
     routing::{delete, get, post},
-    Router,
+    Json, Router,
 };
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use unified_hifi_control::adapters::hqplayer::{HqpInstanceManager, HqpZoneLinkService};
 use unified_hifi_control::adapters::lms::LmsAdapter;
+use unified_hifi_control::adapters::musicassistant::{MusicAssistantAdapter, MusicAssistantConfig};
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
 use unified_hifi_control::adapters::roon::RoonAdapter;
 use unified_hifi_control::adapters::upnp::UPnPAdapter;
@@ -1694,6 +1701,205 @@ async fn library_routing_reaches_roon_and_lms_only() {
 // =============================================================================
 // 7. Round-trips against tests/mock_servers/
 // =============================================================================
+
+#[derive(Clone, Default)]
+struct MusicAssistantMcpMock {
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn musicassistant_mcp_handler(
+    State(mock): State<MusicAssistantMcpMock>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> impl IntoResponse {
+    assert_eq!(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer integration-test-token"),
+        "all MA library calls must use the configured bearer token"
+    );
+    mock.requests
+        .lock()
+        .expect("mock request lock")
+        .push(request.clone());
+    let response = match request["command"].as_str() {
+        Some("music/search") => json!({
+            "tracks": [{
+                "name": "So What",
+                "uri": "library://track/42",
+                "artists": [{"name": "Miles Davis"}]
+            }]
+        }),
+        Some("player_queues/get_active_queue") => json!({
+            // This deliberately differs from the child player id: MCP must
+            // retain MA's active-queue resolution across every operation.
+            "queue_id": "living-room-group"
+        }),
+        Some("player_queues/get") => json!({
+            "queue_id": "living-room-group",
+            "display_name": "Living Room",
+            "items": 2,
+            "current_index": 0
+        }),
+        Some("player_queues/items") => json!([
+            {"queue_item_id": "q1", "name": "So What", "uri": "library://track/42"},
+            {"queue_item_id": "q2", "name": "Freddie Freeloader", "uri": "library://track/43"}
+        ]),
+        Some("player_queues/play_media") => json!({"ok": true}),
+        command => panic!("unexpected Music Assistant command: {command:?}"),
+    };
+    Json(response)
+}
+
+/// Configured Music Assistant adapter + real MCP transport + deterministic MA
+/// command mock. It intentionally does not start the poller: the assertions
+/// exercise catalog and queue calls through the existing MCP tools only.
+async fn musicassistant_mcp_app() -> (TestApp, MusicAssistantMcpMock, tokio::task::JoinHandle<()>) {
+    let mock = MusicAssistantMcpMock::default();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("MA mock bind");
+    let port = listener.local_addr().expect("MA mock addr").port();
+    let server = tokio::spawn({
+        let mock = mock.clone();
+        async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/api", post(musicassistant_mcp_handler))
+                    .with_state(mock),
+            )
+            .await
+            .expect("MA mock serve");
+        }
+    });
+
+    let bus = create_bus();
+    let state = build_state_with_bus(bus.clone(), None).await;
+    let adapter = Arc::new(
+        MusicAssistantAdapter::new(
+            bus,
+            MusicAssistantConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                token: "integration-test-token".to_string(),
+                tls: false,
+                allow_insecure_http: true,
+            },
+        )
+        .expect("configured MA adapter"),
+    );
+    state
+        .adapter_registry
+        .register_library("musicassistant", adapter)
+        .await;
+    (TestApp::with_state(state), mock, server)
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn configured_musicassistant_mcp_catalog_refs_and_queue_use_documented_commands() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    let zone_id = "musicassistant:group-child";
+
+    let search = app
+        .call_tool(
+            "hifi_search",
+            json!({"query": "so what", "zone_id": zone_id}),
+        )
+        .await;
+    assert_eq!(search["structuredContent"]["outcome"], "ok");
+    let search_results: Vec<Value> =
+        serde_json::from_str(&result_text(&search)).expect("hifi_search result JSON");
+    assert_eq!(search_results[0]["title"], "So What");
+    let reference = search_results[0]["ref"]
+        .as_str()
+        .expect("MA result must mint an opaque ref")
+        .to_string();
+
+    let play = app
+        .call_tool("hifi_play", json!({"query": "so what", "zone_id": zone_id}))
+        .await;
+    assert_eq!(play["structuredContent"]["outcome"], "accepted");
+    assert_eq!(result_text(&play), "Music Assistant item started");
+
+    let ref_play = app
+        .call_tool(
+            "hifi_play_ref",
+            json!({"ref": reference, "zone_id": zone_id}),
+        )
+        .await;
+    assert_eq!(ref_play["structuredContent"]["outcome"], "accepted");
+    assert_eq!(result_text(&ref_play), "Music Assistant item started");
+
+    let ref_queue = app
+        .call_tool(
+            "hifi_play_ref",
+            json!({"ref": search_results[0]["ref"], "zone_id": zone_id, "action": "queue"}),
+        )
+        .await;
+    assert_eq!(ref_queue["structuredContent"]["outcome"], "accepted");
+    assert_eq!(result_text(&ref_queue), "Queued So What on Music Assistant");
+
+    let queue = app
+        .call_tool("hifi_queue", json!({"zone_id": zone_id}))
+        .await;
+    assert_eq!(queue["structuredContent"]["outcome"], "ok");
+    let queue_value: Value = serde_json::from_str(&result_text(&queue)).expect("queue result JSON");
+    assert_eq!(queue_value["queue"]["queue_id"], "living-room-group");
+    assert_eq!(queue_value["items"][1]["uri"], "library://track/43");
+
+    let requests = mock.requests.lock().expect("mock request lock").clone();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request["command"].as_str().expect("MA command"))
+            .collect::<Vec<_>>(),
+        [
+            "music/search",
+            "music/search",
+            "player_queues/get_active_queue",
+            "player_queues/play_media",
+            "player_queues/get_active_queue",
+            "player_queues/play_media",
+            "player_queues/get_active_queue",
+            "player_queues/play_media",
+            "player_queues/get_active_queue",
+            "player_queues/get",
+            "player_queues/items",
+        ]
+    );
+    assert_eq!(
+        requests[0]["args"],
+        json!({"search_query": "so what", "limit": 10})
+    );
+    for index in [2, 4, 6, 8] {
+        assert_eq!(requests[index]["args"], json!({"player_id": "group-child"}));
+    }
+    assert_eq!(
+        requests[3]["args"],
+        json!({"queue_id": "living-room-group", "media": "library://track/42", "option": "play"})
+    );
+    assert_eq!(
+        requests[5]["args"],
+        json!({"queue_id": "living-room-group", "media": "library://track/42", "option": "play"})
+    );
+    assert_eq!(
+        requests[7]["args"],
+        json!({"queue_id": "living-room-group", "media": "library://track/42", "option": "add"})
+    );
+    assert_eq!(
+        requests[9]["args"],
+        json!({"queue_id": "living-room-group"})
+    );
+    assert_eq!(
+        requests[10]["args"],
+        json!({"queue_id": "living-room-group", "limit": 100, "offset": 0})
+    );
+
+    server.abort();
+}
 
 /// A `TestApp` wired to a live mock LMS server, with the aggregator running so
 /// discovered players actually reach `hifi_zones`.
@@ -4601,7 +4807,9 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                 )
             });
             let text = result_text(&app.call_tool(tool, args).await);
-            let expected = if *provider == "spotify" && capability == "play_by_ref" {
+            let expected = if matches!(*provider, "spotify" | "musicassistant")
+                && capability == "play_by_ref"
+            {
                 "unknown or expired"
             } else {
                 fingerprint(provider)
@@ -4622,8 +4830,8 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 30,
-        "{proved} supported cells were proved end to end, expected 30. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 34,
+        "{proved} supported cells were proved end to end, expected 34. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 
