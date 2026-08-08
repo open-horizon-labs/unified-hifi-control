@@ -457,6 +457,39 @@
       "type": "object"
     }
   },
+  "hifi_zone_group": {
+    "description": "Inspect or change Music Assistant zone groups. action=status is read-only. join and leave require confirm=true because grouping changes playback topology.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "status, join, or leave.",
+          "type": "string"
+        },
+        "confirm": {
+          "description": "Required true for topology-changing join and leave actions.",
+          "nullable": true,
+          "type": "boolean"
+        },
+        "leader_zone_id": {
+          "description": "Music Assistant leader zone for join.",
+          "nullable": true,
+          "type": "string"
+        },
+        "member_zone_ids": {
+          "description": "Music Assistant member zones to add or leave.",
+          "items": {
+            "type": "string"
+          },
+          "nullable": true,
+          "type": "array"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  },
   "hifi_zones": {
     "annotations": {
       "readOnlyHint": true

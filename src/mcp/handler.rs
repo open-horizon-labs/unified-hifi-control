@@ -125,6 +125,9 @@ impl ServerHandler for HifiMcpHandler {
             HifiTools::HifiCollectionsTool(args) => {
                 tools::collections::handle_collections(state, args).await
             }
+            HifiTools::HifiZoneGroupTool(args) => {
+                tools::groups::handle_zone_group(state, args).await
+            }
         }
     }
 

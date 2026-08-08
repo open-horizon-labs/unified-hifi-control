@@ -138,6 +138,13 @@ struct PlayerSnapshot {
     muted: bool,
     now_playing: Option<NowPlaying>,
     seekable: bool,
+    /// MA's current group owner, if this player is a member of an active group.
+    active_group: Option<String>,
+    /// MA reports group members on the leader/group player. It may include the
+    /// leader itself; the normalized readback removes that duplicate.
+    group_members: Vec<String>,
+    /// `SET_MEMBERS` is per leader, not a global MA capability.
+    can_set_members: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -601,6 +608,91 @@ impl MusicAssistantAdapter {
         Ok(json!({ "queue": queue, "items": items }))
     }
 
+    async fn read_multiroom_players(&self) -> Result<Vec<PlayerSnapshot>> {
+        let players: Vec<Value> = self.command("players/all", None).await?;
+        players.into_iter().map(parse_player).collect()
+    }
+
+    async fn multiroom_status(&self) -> Result<Value> {
+        let players = self.read_multiroom_players().await?;
+        Ok(multiroom_status_from_players(&players))
+    }
+
+    async fn set_group_members(
+        &self,
+        leader_zone_id: &str,
+        add_zone_ids: &[String],
+        remove_zone_ids: &[String],
+    ) -> Result<Value> {
+        if add_zone_ids.is_empty() && remove_zone_ids.is_empty() {
+            return Err(anyhow!(
+                "Music Assistant group membership needs at least one member"
+            ));
+        }
+        let leader_id = musicassistant_player_id(leader_zone_id, "leader_zone_id")?;
+        let add_ids = musicassistant_player_ids(add_zone_ids, "member_zone_ids_to_add")?;
+        let remove_ids = musicassistant_player_ids(remove_zone_ids, "member_zone_ids_to_remove")?;
+        let players = self.read_multiroom_players().await?;
+        let leader = players
+            .iter()
+            .find(|player| player.id == leader_id)
+            .ok_or_else(|| anyhow!("Music Assistant group leader was not found"))?;
+        if !leader.available {
+            return Err(anyhow!("Music Assistant group leader is unavailable"));
+        }
+        if !leader.can_set_members {
+            return Err(anyhow!(
+                "Music Assistant group leader does not support membership changes"
+            ));
+        }
+        for player_id in add_ids.iter().chain(remove_ids.iter()) {
+            if player_id == &leader_id {
+                return Err(anyhow!(
+                    "Music Assistant group leader cannot be its own member input"
+                ));
+            }
+            let player = players
+                .iter()
+                .find(|player| player.id == *player_id)
+                .ok_or_else(|| anyhow!("Music Assistant group member was not found"))?;
+            if !player.available {
+                return Err(anyhow!("Music Assistant group member is unavailable"));
+            }
+        }
+        let mut args = serde_json::Map::new();
+        args.insert("target_player".to_string(), Value::String(leader_id));
+        if !add_ids.is_empty() {
+            args.insert("player_ids_to_add".to_string(), json!(add_ids));
+        }
+        if !remove_ids.is_empty() {
+            args.insert("player_ids_to_remove".to_string(), json!(remove_ids));
+        }
+        let _: Value = self
+            .command("players/cmd/set_members", Some(Value::Object(args)))
+            .await?;
+        self.multiroom_status().await
+    }
+
+    async fn ungroup_members(&self, member_zone_ids: &[String]) -> Result<Value> {
+        let player_ids = musicassistant_player_ids(member_zone_ids, "member_zone_ids")?;
+        if player_ids.is_empty() {
+            return Err(anyhow!("Music Assistant ungroup needs at least one member"));
+        }
+        let players = self.read_multiroom_players().await?;
+        for player_id in &player_ids {
+            if !players.iter().any(|player| player.id == *player_id) {
+                return Err(anyhow!("Music Assistant group member was not found"));
+            }
+        }
+        let _: Value = self
+            .command(
+                "players/cmd/ungroup_many",
+                Some(json!({"player_ids": player_ids})),
+            )
+            .await?;
+        self.multiroom_status().await
+    }
+
     async fn play_media_uri_with_option(
         &self,
         zone_id: &str,
@@ -668,6 +760,11 @@ fn parse_player(value: Value) -> Result<PlayerSnapshot> {
         .and_then(|media| media.get("duration"))
         .and_then(Value::as_f64)
         .is_some();
+    let group_members = player_string_list(&value, "group_members");
+    let active_group = player_string(&value, "active_group");
+    let can_set_members = player_string_list(&value, "supported_features")
+        .iter()
+        .any(|feature| feature.eq_ignore_ascii_case("set_members"));
 
     Ok(PlayerSnapshot {
         id,
@@ -678,7 +775,95 @@ fn parse_player(value: Value) -> Result<PlayerSnapshot> {
         muted,
         now_playing,
         seekable,
+        active_group,
+        group_members,
+        can_set_members,
     })
+}
+
+/// MA serializes player state at the top level today, but older/newer server
+/// shapes may nest it under `state`. Keep the adapter's read model tolerant at
+/// this protocol boundary rather than duplicating that tolerance at callers.
+fn player_string(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .or_else(|| value.get("state").and_then(|state| state.get(field)))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn player_string_list(value: &Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .or_else(|| value.get("state").and_then(|state| state.get(field)))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn musicassistant_player_id(zone_id: &str, parameter: &str) -> Result<String> {
+    zone_id
+        .strip_prefix("musicassistant:")
+        .filter(|value| !value.is_empty() && !value.contains(':'))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("{parameter} must be a Music Assistant zone id"))
+}
+
+fn musicassistant_player_ids(zone_ids: &[String], parameter: &str) -> Result<Vec<String>> {
+    let mut ids = Vec::with_capacity(zone_ids.len());
+    for zone_id in zone_ids {
+        let id = musicassistant_player_id(zone_id, parameter)?;
+        if ids.contains(&id) {
+            return Err(anyhow!("{parameter} must not contain duplicate zones"));
+        }
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+fn multiroom_status_from_players(players: &[PlayerSnapshot]) -> Value {
+    let mut groups = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for player in players {
+        if !player.group_members.is_empty() {
+            let members = groups.entry(player.id.clone()).or_default();
+            for member in &player.group_members {
+                if member != &player.id && !members.contains(member) {
+                    members.push(member.clone());
+                }
+            }
+        }
+        // Some MA providers only expose membership on children. Keep that
+        // relationship rather than pretending an empty leader list is truth.
+        if let Some(leader_id) = player.active_group.as_ref() {
+            if leader_id != &player.id {
+                let members = groups.entry(leader_id.clone()).or_default();
+                if !members.contains(&player.id) {
+                    members.push(player.id.clone());
+                }
+            }
+        }
+    }
+    let groups = groups
+        .into_iter()
+        .filter(|(_, members)| !members.is_empty())
+        .map(|(leader_id, members)| {
+            let can_set_members = players
+                .iter()
+                .find(|player| player.id == leader_id)
+                .is_some_and(|player| player.can_set_members);
+            json!({
+                "leader_zone_id": zone_id_string(&leader_id),
+                "member_zone_ids": members.iter().map(|member| zone_id_string(member)).collect::<Vec<_>>(),
+                "can_set_members": can_set_members,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"groups": groups})
 }
 
 /// Convert MA's grouped `SearchResults` payload to the provider-neutral
@@ -946,6 +1131,52 @@ impl LibraryAdapter for MusicAssistantAdapter {
     async fn content(&self, operation: &str, params: &Value) -> Result<Value> {
         if operation.starts_with("collections_") {
             return self.collections_content(operation, params).await;
+        }
+        match operation {
+            "multiroom_status" => return self.multiroom_status().await,
+            "multiroom_set_members" => {
+                let leader = params
+                    .get("leader_zone_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow!("Music Assistant group operation requires leader_zone_id")
+                    })?;
+                let add = params
+                    .get("member_zone_ids_to_add")
+                    .or_else(|| params.get("member_zone_ids"))
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        anyhow!("Music Assistant group operation requires member_zone_ids")
+                    })?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                let remove = params
+                    .get("member_zone_ids_to_remove")
+                    .and_then(Value::as_array)
+                    .map(|members| {
+                        members
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                return self.set_group_members(leader, &add, &remove).await;
+            }
+            "multiroom_ungroup" => {
+                let members = params
+                    .get("member_zone_ids")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow!("Music Assistant ungroup requires member_zone_ids"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                return self.ungroup_members(&members).await;
+            }
+            _ => {}
         }
         let zone_id = params
             .get("zone_id")
@@ -1426,6 +1657,126 @@ mod tests {
         let zone = snapshot_to_zone(&player);
         assert_eq!(zone.zone_id, "musicassistant:sonos-kitchen");
         assert_eq!(zone.source, "musicassistant");
+    }
+
+    #[tokio::test]
+    async fn multiroom_content_reads_membership_and_uses_guarded_ma_commands() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        *state.players.lock().expect("players lock") = Some(json!([
+            {
+                "player_id": "living-room",
+                "name": "Living Room",
+                "available": true,
+                "supported_features": ["set_members"],
+                "group_members": ["living-room", "kitchen"]
+            },
+            {
+                "player_id": "kitchen",
+                "name": "Kitchen",
+                "available": true,
+                "active_group": "living-room"
+            }
+        ]));
+        let adapter =
+            MusicAssistantAdapter::new(crate::bus::create_bus(), config).expect("valid MA adapter");
+
+        let status = adapter
+            .content("multiroom_status", &json!({}))
+            .await
+            .expect("group status");
+        assert_eq!(
+            status,
+            json!({"groups": [{
+                "leader_zone_id": "musicassistant:living-room",
+                "member_zone_ids": ["musicassistant:kitchen"],
+                "can_set_members": true
+            }]})
+        );
+
+        adapter
+            .content(
+                "multiroom_set_members",
+                &json!({
+                    "leader_zone_id": "musicassistant:living-room",
+                    "member_zone_ids": ["musicassistant:kitchen"]
+                }),
+            )
+            .await
+            .expect("set members");
+        adapter
+            .content(
+                "multiroom_ungroup",
+                &json!({"member_zone_ids": ["musicassistant:kitchen"]}),
+            )
+            .await
+            .expect("ungroup");
+
+        let requests = state.requests.lock().expect("requests").clone();
+        let set_members = requests
+            .iter()
+            .find(|request| request.body["command"] == "players/cmd/set_members")
+            .expect("set_members command");
+        assert_eq!(
+            set_members.body["args"],
+            json!({"target_player": "living-room", "player_ids_to_add": ["kitchen"]})
+        );
+        let ungroup = requests
+            .iter()
+            .find(|request| request.body["command"] == "players/cmd/ungroup_many")
+            .expect("ungroup command");
+        assert_eq!(ungroup.body["args"], json!({"player_ids": ["kitchen"]}));
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request.body["command"] == "players/all")
+                .count()
+                >= 3,
+            "status and both writes must take a fresh membership readback"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn multiroom_set_members_refuses_unmanageable_or_cross_provider_inputs_before_write() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        *state.players.lock().expect("players lock") = Some(json!([
+            {"player_id": "living-room", "available": true},
+            {"player_id": "kitchen", "available": true}
+        ]));
+        let adapter =
+            MusicAssistantAdapter::new(crate::bus::create_bus(), config).expect("valid MA adapter");
+
+        let unsupported = adapter
+            .content(
+                "multiroom_set_members",
+                &json!({
+                    "leader_zone_id": "musicassistant:living-room",
+                    "member_zone_ids": ["musicassistant:kitchen"]
+                }),
+            )
+            .await
+            .expect_err("leader without SET_MEMBERS must refuse");
+        assert!(unsupported.to_string().contains("does not support"));
+        let cross_provider = adapter
+            .content(
+                "multiroom_ungroup",
+                &json!({"member_zone_ids": ["spotify:kitchen"]}),
+            )
+            .await
+            .expect_err("cross-provider member must refuse");
+        assert!(cross_provider
+            .to_string()
+            .contains("Music Assistant zone id"));
+        assert!(!state
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .any(
+                |request| request.body["command"] == "players/cmd/set_members"
+                    || request.body["command"] == "players/cmd/ungroup_many"
+            ));
+        server.abort();
     }
 
     #[test]

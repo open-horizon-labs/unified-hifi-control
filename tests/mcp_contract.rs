@@ -503,8 +503,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        16,
-        "expected 16 tools with HQPlayer enabled, got {}: {:?}",
+        17,
+        "expected 17 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -571,6 +571,7 @@ async fn tools_list_order_is_pinned() {
             "hifi_spotify",
             "hifi_apple_music",
             "hifi_collections",
+            "hifi_zone_group",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -617,6 +618,7 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
             "hifi_spotify",
             "hifi_apple_music",
             "hifi_collections",
+            "hifi_zone_group",
         ],
         "HQPlayer disabled must yield exactly the non-HQPlayer tools, in order"
     );
@@ -846,6 +848,15 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("offset", false),
         ],
     ),
+    (
+        "hifi_zone_group",
+        &[
+            ("action", true),
+            ("leader_zone_id", false),
+            ("member_zone_ids", false),
+            ("confirm", false),
+        ],
+    ),
 ];
 
 #[tokio::test]
@@ -1008,7 +1019,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        16,
+        17,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }
@@ -1745,6 +1756,10 @@ async fn musicassistant_mcp_handler(
         .expect("mock request lock")
         .push(request.clone());
     let response = match request["command"].as_str() {
+        Some("players/all") => json!([
+            {"player_id":"living-room", "name":"Living Room", "available":true, "supported_features":["set_members"], "group_members":["living-room", "kitchen"]},
+            {"player_id":"kitchen", "name":"Kitchen", "available":true, "active_group":"living-room"}
+        ]),
         Some("music/search") => json!({
             "tracks": [{
                 "name": "So What",
@@ -1789,6 +1804,7 @@ async fn musicassistant_mcp_handler(
         | Some("player_queues/move_item")
         | Some("player_queues/delete_item")
         | Some("player_queues/clear") => json!({"ok": true}),
+        Some("players/cmd/set_members") | Some("players/cmd/ungroup_many") => json!({"ok": true}),
         command => panic!("unexpected Music Assistant command: {command:?}"),
     };
     Json(response)
@@ -2044,6 +2060,62 @@ async fn musicassistant_queue_mutations_use_documented_wire_commands() {
             ),
         ]
     );
+    server.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn musicassistant_zone_group_requires_confirmation_and_uses_fresh_ma_status() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    let status = app
+        .call_tool("hifi_zone_group", json!({"action":"status"}))
+        .await;
+    assert_eq!(status["structuredContent"]["outcome"], "ok");
+    assert_eq!(
+        status["structuredContent"]["scope"],
+        serde_json::Value::Null
+    );
+    let denied = app.call_tool("hifi_zone_group", json!({"action":"join", "leader_zone_id":"musicassistant:living-room", "member_zone_ids":["musicassistant:kitchen"]})).await;
+    assert_eq!(denied["structuredContent"]["outcome"], "invalid");
+    let joined = app.call_tool("hifi_zone_group", json!({"action":"join", "leader_zone_id":"musicassistant:living-room", "member_zone_ids":["musicassistant:kitchen"], "confirm":true})).await;
+    assert_eq!(joined["structuredContent"]["outcome"], "accepted");
+    let left = app
+        .call_tool(
+            "hifi_zone_group",
+            json!({"action":"leave", "member_zone_ids":["musicassistant:kitchen"], "confirm":true}),
+        )
+        .await;
+    assert_eq!(left["structuredContent"]["outcome"], "accepted");
+    let requests = mock.requests.lock().expect("requests").clone();
+    assert!(requests
+        .iter()
+        .any(|r| r["command"] == "players/cmd/set_members"
+            && r["args"]
+                == json!({"target_player":"living-room","player_ids_to_add":["kitchen"]})));
+    assert!(requests
+        .iter()
+        .any(|r| r["command"] == "players/cmd/ungroup_many"
+            && r["args"] == json!({"player_ids":["kitchen"]})));
+    server.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn musicassistant_zone_group_refuses_invalid_inputs_before_ma_calls() {
+    let (app, mock, server) = musicassistant_mcp_app().await;
+    for args in [
+        json!({"action":"join", "leader_zone_id":"musicassistant:living-room", "member_zone_ids":[], "confirm":true}),
+        json!({"action":"leave", "member_zone_ids":[], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"roon:living-room", "member_zone_ids":["musicassistant:kitchen"], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"musicassistant:living-room", "member_zone_ids":["roon:kitchen"], "confirm":true}),
+        json!({"action":"join", "leader_zone_id":"musicassistant:living-room", "member_zone_ids":["musicassistant:kitchen"]}),
+    ] {
+        assert_eq!(
+            app.call_tool("hifi_zone_group", args).await["structuredContent"]["outcome"],
+            "invalid"
+        );
+    }
+    assert!(mock.requests.lock().expect("requests").is_empty());
     server.abort();
 }
 
@@ -5082,6 +5154,7 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                 "hifi_control",
                 json!({ "zone_id": zone_id, "action": "shuffle_off" }),
             )),
+            "multiroom_sync" => Some(("hifi_zone_group", json!({ "action": "status" }))),
             _ => None,
         }
     }
@@ -5124,7 +5197,7 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
         }
     }
     // The routed Spotify content and mode cells plus Music Assistant's queue
-    // mutations, mode, and collections cells add twenty-two probes to the
+    // mutations, mode, collections, and zone-group cells add twenty-three probes to the
     // original provider transport set.
     // Apple Music's transport/skip/volume
     // cells remain gated until signed physical companion validation (#465).
@@ -5132,8 +5205,8 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 44,
-        "{proved} supported cells were proved end to end, expected 44. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 45,
+        "{proved} supported cells were proved end to end, expected 45. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 

@@ -224,7 +224,7 @@ Two things this table does **not** claim:
 | `shuffle_mode` | 🚧 #360 | 🚧 #403 | 🚧 #392 | 🚧 #392 | ✅ | 🚧 #462 | ✅ | ✅ |
 | `saved_playlists` | 🚧 #399 | 🚧 #403 | ⛔ | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | ✅ |
 | `favorites` | 🚧 #399 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #482 | ✅ | ✅ |
-| `multiroom_sync` | 🚧 #360 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | 🚧 #462 |
+| `multiroom_sync` | 🚧 #360 | 🚧 #403 | 🚧 #392 | ⛔ | 🚧 #209 | 🚧 #462 | 🚧 #462 | ✅ |
 
 ✅ supported · ⛔ the provider's protocol cannot do it · 🚧 the provider can, UHC has not wired it (issue that will)
 
@@ -324,7 +324,6 @@ Every non-supported cell states the fact it rests on, so the claim can be checke
 - 🚧 **hqplayer / `multiroom_sync`** (#209) — UHC's HQPlayer adapter speaks transport, volume, seek and pipeline settings; whether HQPlayer's control protocol reaches content operations has not been verified here. Reported as not-yet-implemented rather than as a provider limit, because an unverified 'never' is the more expensive error.
 - 🚧 **applemusic / `multiroom_sync`** (#462) — the native companion content bridge is specified but not enabled; this capability remains pending its approved owner-scoped transport and companion validation.
 - 🚧 **spotify / `multiroom_sync`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
-- 🚧 **musicassistant / `multiroom_sync`** (#462) — the adapter's initial contract covers transport, skip and volume; library, browse, queue and playlist operations are separate follow-on capability steps and are not wired yet.
 <!-- END GENERATED CAPABILITY MATRIX (#398) -->
 
 `hqplayer:` is a fifth zone prefix: `PrefixedZoneId` lists it and `HqpAdapter`

@@ -360,11 +360,10 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
         | Capability::QueueRemove
         | Capability::QueueClear => target == ZoneTarget::MusicAssistant,
         Capability::PlayNext => target == ZoneTarget::MusicAssistant,
+        Capability::MultiroomSync => target == ZoneTarget::MusicAssistant,
         Capability::Browse | Capability::SavedPlaylists | Capability::Favorites => {
             matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant)
         }
-        // Nothing else has an MCP call path at all yet.
-        _ => false,
     };
     supported.then_some(Support::Supported)
 }
