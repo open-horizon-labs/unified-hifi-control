@@ -203,6 +203,8 @@ pub struct AppleBridgeCredentialRecord {
     pub access_token: String,
     #[serde(default)]
     pub bound_player_id: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Clone)]

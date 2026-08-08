@@ -570,6 +570,8 @@ mod server {
         let api_bridge_discover_pairing = api::apple_bridge::discover_pairing;
         let api_bridge_claim = api::apple_bridge::claim;
         let api_bridge_revoke = api::apple_bridge::revoke;
+        let api_bridge_rename = api::apple_bridge::rename;
+        let api_bridge_revoke_by_bridge_id = api::apple_bridge::revoke_by_bridge_id;
         let api_bridge_status = api::apple_bridge::status;
         let api_bridge_state = api::apple_bridge::state;
         let api_bridge_commands = api::apple_bridge::commands;
@@ -595,6 +597,8 @@ mod server {
             .route("/api/bridges/applemusic/discover", post(api_bridge_discover_pairing))
             .route("/api/bridges/applemusic/claim", post(api_bridge_claim))
             .route("/api/bridges/applemusic/revoke", post(api_bridge_revoke))
+            .route("/api/bridges/applemusic/rename", post(api_bridge_rename))
+            .route("/api/bridges/applemusic/remove", post(api_bridge_revoke_by_bridge_id))
             .route("/api/bridges/applemusic/status", get(api_bridge_status))
             .route("/api/bridges/applemusic/state", post(api_bridge_state))
             .route("/api/bridges/applemusic/commands", get(api_bridge_commands))

@@ -134,6 +134,20 @@ pub struct MusicKitTrack {
     pub duration_seconds: Option<f64>,
 }
 
+/// An output discovered by the native companion. Output zones share the
+/// companion's playback owner and are projections of its current output set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MusicKitOutput {
+    pub output_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub is_active: bool,
+    #[serde(default)]
+    pub volume: Option<f32>,
+    #[serde(default)]
+    pub is_muted: Option<bool>,
+}
+
 /// Snapshot of the ApplicationMusicPlayer session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MusicKitSnapshot {
@@ -155,6 +169,8 @@ pub struct MusicKitSnapshot {
     /// Current shuffle state when the native player exposes it.
     #[serde(default)]
     pub shuffle: Option<bool>,
+    #[serde(default)]
+    pub outputs: Vec<MusicKitOutput>,
 }
 
 /// Commands understood by the native companion.
@@ -252,6 +268,31 @@ pub struct AppleMusicAdapter {
 }
 
 impl AppleMusicAdapter {
+    fn owner_display_name(snapshot: &MusicKitSnapshot) -> String {
+        let active_outputs = snapshot
+            .outputs
+            .iter()
+            .filter(|output| output.is_active)
+            .map(|output| output.display_name.as_str())
+            .collect::<Vec<_>>();
+        if active_outputs.is_empty() {
+            snapshot.display_name.clone()
+        } else {
+            format!(
+                "{} — Output: {}",
+                snapshot.display_name,
+                active_outputs.join(" + ")
+            )
+        }
+    }
+
+    fn owner_id_for_zone(zone_id: &str) -> Result<&str> {
+        let player_id = zone_id
+            .strip_prefix("applemusic:")
+            .ok_or_else(|| anyhow::anyhow!("not an Apple Music zone"))?;
+        Ok(player_id.split("~output~").next().unwrap_or(player_id))
+    }
+
     /// Build an adapter with a companion implementation.
     pub fn with_companion(
         bus: crate::bus::SharedBus,
@@ -307,7 +348,7 @@ impl AppleMusicAdapter {
 
         Ok(Zone {
             zone_id,
-            zone_name: snapshot.display_name.clone(),
+            zone_name: Self::owner_display_name(snapshot),
             state,
             volume_control,
             now_playing,
@@ -331,25 +372,26 @@ impl AppleMusicAdapter {
         bus: &crate::bus::SharedBus,
         snapshot: MusicKitSnapshot,
         discovered: &mut std::collections::HashSet<String>,
-    ) -> Result<PrefixedZoneId> {
+    ) -> Result<Vec<PrefixedZoneId>> {
         let zone = Self::zone_from_snapshot(&snapshot)?;
         let zone_id = PrefixedZoneId::applemusic(&snapshot.player_id);
+        let zone_ids = vec![zone_id.clone()];
 
         if discovered.insert(zone_id.to_string()) {
             bus.publish(BusEvent::ZoneDiscovered { zone });
         } else {
             bus.publish(BusEvent::ZoneUpdated {
                 zone_id: zone_id.clone(),
-                display_name: snapshot.display_name.clone(),
+                display_name: Self::owner_display_name(&snapshot),
                 state: zone.state.to_string(),
             });
-            if let Some(track) = snapshot.track {
+            if let Some(track) = snapshot.track.as_ref() {
                 bus.publish(BusEvent::NowPlayingChanged {
                     zone_id: zone_id.clone(),
-                    title: Some(track.title),
-                    artist: Some(track.artist),
-                    album: Some(track.album),
-                    image_key: track.artwork_url,
+                    title: Some(track.title.clone()),
+                    artist: Some(track.artist.clone()),
+                    album: Some(track.album.clone()),
+                    image_key: track.artwork_url.clone(),
                 });
                 if let Some(position) = track.position_seconds {
                     bus.publish(BusEvent::SeekPositionChanged {
@@ -378,7 +420,7 @@ impl AppleMusicAdapter {
                 });
             }
         }
-        Ok(zone_id)
+        Ok(zone_ids)
     }
 
     fn command_for(command: AdapterCommand) -> Result<MusicKitCommand> {
@@ -463,8 +505,10 @@ impl AdapterLogic for AppleMusicAdapter {
                             for snapshot in snapshots {
                                 let display_name = snapshot.display_name.clone();
                                 match self.publish_snapshot(&ctx.bus, snapshot, &mut published).await {
-                                    Ok(zone_id) => {
-                                        seen.insert(zone_id.to_string(), display_name);
+                                    Ok(zone_ids) => {
+                                        for zone_id in zone_ids {
+                                            seen.insert(zone_id.to_string(), display_name.clone());
+                                        }
                                     }
                                     Err(error) => tracing::debug!("invalid Apple Music companion snapshot: {error}"),
                                 }
@@ -522,9 +566,7 @@ impl AdapterLogic for AppleMusicAdapter {
             });
         }
 
-        let player_id = zone_id
-            .strip_prefix("applemusic:")
-            .ok_or_else(|| anyhow::anyhow!("invalid Apple Music zone id `{zone_id}`"))?;
+        let player_id = Self::owner_id_for_zone(zone_id)?;
         if matches!(
             &command,
             AdapterCommand::VolumeAbsolute(_)
@@ -584,7 +626,7 @@ impl LibraryAdapter for AppleMusicAdapter {
         let value = self
             .companion
             .content_for_player(
-                zone_id.strip_prefix("applemusic:").unwrap_or_default(),
+                Self::owner_id_for_zone(zone_id)?,
                 "catalog_search",
                 &serde_json::json!({"query": query, "limit": limit.clamp(1, 50), "zone_id": zone_id}),
             )
@@ -597,7 +639,7 @@ impl LibraryAdapter for AppleMusicAdapter {
         let value = self
             .companion
             .content_for_player(
-                zone_id.strip_prefix("applemusic:").unwrap_or_default(),
+                Self::owner_id_for_zone(zone_id)?,
                 "play_uri",
                 &serde_json::json!({"uri": uri, "zone_id": zone_id}),
             )
@@ -609,7 +651,7 @@ impl LibraryAdapter for AppleMusicAdapter {
         self.validate_content_zone(zone_id)?;
         self.companion
             .content_for_player(
-                zone_id.strip_prefix("applemusic:").unwrap_or_default(),
+                Self::owner_id_for_zone(zone_id)?,
                 "queue_uri",
                 &serde_json::json!({"uri": uri, "zone_id": zone_id}),
             )
@@ -621,7 +663,7 @@ impl LibraryAdapter for AppleMusicAdapter {
         self.validate_content_zone(zone_id)?;
         self.companion
             .content_for_player(
-                zone_id.strip_prefix("applemusic:").unwrap_or_default(),
+                Self::owner_id_for_zone(zone_id)?,
                 "queue_read",
                 &serde_json::json!({"zone_id": zone_id}),
             )
@@ -636,11 +678,7 @@ impl LibraryAdapter for AppleMusicAdapter {
         validate_content_request(operation, params)?;
         if let Some(zone_id) = params.get("zone_id").and_then(serde_json::Value::as_str) {
             self.companion
-                .content_for_player(
-                    zone_id.strip_prefix("applemusic:").unwrap_or_default(),
-                    operation,
-                    params,
-                )
+                .content_for_player(Self::owner_id_for_zone(zone_id)?, operation, params)
                 .await
         } else {
             self.companion.content(operation, params).await
@@ -727,6 +765,7 @@ mod tests {
             is_muted: false,
             repeat_mode: None,
             shuffle: None,
+            outputs: vec![],
         };
         assert!(AppleMusicAdapter::zone_from_snapshot(&snapshot).is_err());
         snapshot.volume = Some(0.5);
@@ -744,6 +783,7 @@ mod tests {
             is_muted: false,
             repeat_mode: None,
             shuffle: None,
+            outputs: vec![],
         };
         assert!(AppleMusicAdapter::zone_from_snapshot(&snapshot).is_err());
     }
@@ -808,6 +848,7 @@ mod tests {
             is_muted: false,
             repeat_mode: Some(RepeatMode::One),
             shuffle: Some(true),
+            outputs: vec![],
         };
         let zone = AppleMusicAdapter::zone_from_snapshot(&snapshot).unwrap();
         let now_playing = zone.now_playing.unwrap();

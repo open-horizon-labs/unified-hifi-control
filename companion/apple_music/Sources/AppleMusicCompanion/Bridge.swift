@@ -343,8 +343,23 @@ public actor MacAppleMusicCompanionHost {
         try installationStore.save(saved)
     }
 
-    public func publishCurrentSnapshot(from player: ApplicationMusicPlayerCompanion) async throws {
-        try await bridge.publish(snapshot: player.snapshot())
+    public func publishCurrentSnapshot(
+        from player: ApplicationMusicPlayerCompanion,
+        outputs: [MacMusicKitOutput] = []
+    ) async throws {
+        let base = await player.snapshot()
+        let snapshot = MacMusicKitSnapshot(
+            playerID: base.playerID,
+            displayName: base.displayName,
+            state: base.state,
+            track: base.track,
+            volume: base.volume,
+            isMuted: base.isMuted,
+            repeatMode: base.repeatMode,
+            shuffle: base.shuffle,
+            outputs: outputs
+        )
+        try await bridge.publish(snapshot: snapshot)
     }
 
     /// Commands are at-least-once. Bounded outcomes persist in the installation

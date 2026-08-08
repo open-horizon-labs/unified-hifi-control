@@ -1,4 +1,5 @@
 import AppleMusicCompanion
+import AVKit
 import MusicKit
 import SwiftUI
 
@@ -20,6 +21,7 @@ private final class CompanionModel: ObservableObject {
     @Published private(set) var message: String?
     @Published private(set) var pairingCode = ""
     @Published private(set) var isPaired = false
+    @Published private(set) var outputs: [MacMusicKitOutput] = []
     private let store: KeychainAppleMusicCompanionInstallationStore
     private let companionID: String
     private var host: MacAppleMusicCompanionHost
@@ -27,6 +29,7 @@ private final class CompanionModel: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var recoveryTask: Task<Void, Never>?
     private var discovery: UHCBonjourDiscovery?
+    private let airplayDiscovery = AirPlayOutputDiscovery()
 
     init() {
         store = KeychainAppleMusicCompanionInstallationStore()
@@ -40,6 +43,10 @@ private final class CompanionModel: ObservableObject {
         isPaired = installation.accessToken != nil
         stage = installation.accessToken != nil ? .reconnecting : .authorize
         message = installation.accessToken != nil ? "Paired; reconnecting to UHC…" : nil
+        airplayDiscovery.onOutputs = { [weak self] outputs in
+            self?.outputs = outputs
+        }
+        airplayDiscovery.start()
         if installation.accessToken != nil { reconnect() }
     }
 
@@ -162,10 +169,10 @@ private final class CompanionModel: ObservableObject {
         guard isPaired else { return }
         recoveryTask?.cancel(); recoveryTask = nil
         pollTask?.cancel()
-        pollTask = Task { [host, player] in
+        pollTask = Task { @MainActor [host, player] in
             while !Task.isCancelled {
                 do {
-                    try await host.publishCurrentSnapshot(from: player)
+                    try await host.publishCurrentSnapshot(from: player, outputs: self.outputs)
                     try await host.pollAndHandle { command in try await player.execute(command) }
                     try await host.pollAndHandleContent { request in try await player.executeContent(request) }
                     await MainActor.run {
@@ -245,6 +252,17 @@ public struct ContentView: View {
                 }
             case .connected:
                 Section("Apple Music") { Text("Apple Music is ready on this Mac. UHC controls this companion’s playback session.").foregroundStyle(.secondary) }
+                Section("AirPlay output") {
+                    Text("Choose one or more outputs for this companion’s session. UHC reports all discovered outputs below.")
+                        .foregroundStyle(.secondary)
+                    MacAirPlayRoutePicker()
+                        .frame(minHeight: 44)
+                    Text("\(model.outputs.count) outputs discovered")
+                        .foregroundStyle(.secondary)
+                    ForEach(model.outputs, id: \.outputID) { output in
+                        Label(output.displayName, systemImage: "hifispeaker")
+                    }
+                }
                 Section { Button("Disconnect from UHC", role: .destructive, action: model.revoke) }
             }
         }
@@ -254,4 +272,16 @@ public struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in if phase == .active { model.startPolling() } else { model.stopPolling() } }
         .task { model.startPolling() }
     }
+}
+
+private struct MacAirPlayRoutePicker: NSViewRepresentable {
+    func makeNSView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.isRoutePickerButtonBordered = true
+        picker.player = AVPlayer()
+        picker.setAccessibilityLabel("Choose AirPlay output")
+        return picker
+    }
+
+    func updateNSView(_ picker: AVRoutePickerView, context: Context) {}
 }

@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import MusicKit
 
 /// Return the bounded slice requested by a playlist-tracks bridge operation.
@@ -31,6 +32,11 @@ public enum BridgeClientError: Error, LocalizedError, Sendable {
     case invalidResponse
     case httpStatus(Int, String)
     case notConfigured
+
+    public var isAuthorizationFailure: Bool {
+        if case let .httpStatus(status, _) = self { return status == 401 || status == 403 }
+        return false
+    }
 
     public var errorDescription: String? {
         switch self {
@@ -190,7 +196,7 @@ public enum MusicKitWireCommand: Codable, Sendable, Equatable {
     case setVolume(value: Float)
     case adjustVolume(delta: Float)
     case setMute(muted: Bool)
-    case setRepeat(mode: MusicPlayer.RepeatMode)
+    case setRepeat(mode: MusicKit.MusicPlayer.RepeatMode)
     case setShuffle(enabled: Bool)
 
     private enum CodingKeys: String, CodingKey {
@@ -253,7 +259,7 @@ public enum MusicKitWireCommand: Codable, Sendable, Equatable {
         }
     }
 
-    private static func repeatWireValue(_ mode: MusicPlayer.RepeatMode) -> String {
+    private static func repeatWireValue(_ mode: MusicKit.MusicPlayer.RepeatMode) -> String {
         switch mode {
         case .none: "off"
         case .one: "one"
@@ -374,6 +380,7 @@ public actor AppleMusicBridgeClient {
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
+        request.timeoutInterval = 10
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if let accessToken { request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         if let body {
@@ -596,10 +603,12 @@ public struct MusicKitSnapshotPayload: Codable, Sendable {
     public let isMuted: Bool
     public let repeatMode: String?
     public let shuffle: Bool?
+    public let outputs: [MusicKitOutputPayload]
 
     public init(playerID: String, displayName: String, state: String,
                 track: MusicKitTrackPayload? = nil, volume: Float? = nil,
-                isMuted: Bool = false, repeatMode: String? = nil, shuffle: Bool? = nil) {
+                isMuted: Bool = false, repeatMode: String? = nil, shuffle: Bool? = nil,
+                outputs: [MusicKitOutputPayload] = []) {
         self.playerID = playerID
         self.displayName = displayName
         self.state = state
@@ -608,6 +617,7 @@ public struct MusicKitSnapshotPayload: Codable, Sendable {
         self.isMuted = isMuted
         self.repeatMode = repeatMode
         self.shuffle = shuffle
+        self.outputs = outputs
     }
 
     enum CodingKeys: String, CodingKey {
@@ -619,6 +629,34 @@ public struct MusicKitSnapshotPayload: Codable, Sendable {
         case isMuted = "is_muted"
         case repeatMode = "repeat_mode"
         case shuffle
+        case outputs
+    }
+}
+
+/// A bounded projection of the audio session's current output route. Apple
+/// owns route selection; this reports only the names and stable local IDs the
+/// companion can currently observe.
+public struct MusicKitOutputPayload: Codable, Sendable, Equatable {
+    public let outputID: String
+    public let displayName: String
+    public let isActive: Bool
+    public let volume: Float?
+    public let isMuted: Bool?
+
+    public init(outputID: String, displayName: String, isActive: Bool = true, volume: Float? = nil, isMuted: Bool? = nil) {
+        self.outputID = outputID
+        self.displayName = displayName
+        self.isActive = isActive
+        self.volume = volume
+        self.isMuted = isMuted
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case outputID = "output_id"
+        case displayName = "display_name"
+        case isActive = "is_active"
+        case volume
+        case isMuted = "is_muted"
     }
 }
 
@@ -730,6 +768,13 @@ public actor SystemMusicPlayerCompanion {
         } else {
             track = nil
         }
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs.map { output in
+            MusicKitOutputPayload(
+                outputID: Self.safeOutputID(output.uid),
+                displayName: output.portName,
+                isActive: true
+            )
+        }
         return MusicKitSnapshotPayload(
             playerID: companionID,
             displayName: "iPhone Apple Music",
@@ -738,15 +783,30 @@ public actor SystemMusicPlayerCompanion {
             volume: nil,
             isMuted: false,
             repeatMode: repeatWireValue(player.state.repeatMode),
-            shuffle: shuffleWireValue(player.state.shuffleMode)
+            shuffle: shuffleWireValue(player.state.shuffleMode),
+            outputs: outputs
         )
+    }
+
+    public func currentOutputLabel() -> String? {
+        let names = AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portName)
+        return names.isEmpty ? nil : names.joined(separator: " + ")
+    }
+
+    private static func safeOutputID(_ value: String) -> String {
+        let id = value.map { character in
+            character.isASCII && (character.isLetter || character.isNumber || character == "-" || character == "_")
+                ? String(character)
+                : "_"
+        }.joined()
+        return id.isEmpty ? "audio-output" : id
     }
 
     private func finite(_ value: TimeInterval) -> Double? {
         value.isFinite && value >= 0 ? value : nil
     }
 
-    private func playbackState(_ status: MusicPlayer.PlaybackStatus) -> String {
+    private func playbackState(_ status: MusicKit.MusicPlayer.PlaybackStatus) -> String {
         switch status {
         case .playing: "playing"
         case .paused: "paused"
@@ -760,7 +820,7 @@ public actor SystemMusicPlayerCompanion {
         }
     }
 
-    private func repeatWireValue(_ mode: MusicPlayer.RepeatMode?) -> String? {
+    private func repeatWireValue(_ mode: MusicKit.MusicPlayer.RepeatMode?) -> String? {
         guard let mode else { return nil }
         switch mode {
         case .none: return "off"
@@ -770,7 +830,7 @@ public actor SystemMusicPlayerCompanion {
         }
     }
 
-    private func shuffleWireValue(_ mode: MusicPlayer.ShuffleMode?) -> Bool? {
+    private func shuffleWireValue(_ mode: MusicKit.MusicPlayer.ShuffleMode?) -> Bool? {
         guard let mode else { return nil }
         switch mode {
         case .off: return false
@@ -871,7 +931,7 @@ public actor SystemMusicPlayerCompanion {
 
     /// Start an exact catalog/library result on the iPhone's system player.
     public func play(song: Song) async throws {
-        player.queue = MusicPlayer.Queue(for: [song], startingAt: song)
+        player.queue = MusicKit.MusicPlayer.Queue(for: [song], startingAt: song)
         try await player.play()
     }
 
@@ -1161,7 +1221,7 @@ public actor SystemMusicPlayerCompanion {
     /// visibility and persistence must still be proven on physical hardware.
     public func replaceQueue(with songs: [Song]) async throws {
         guard let first = songs.first else { return }
-        player.queue = MusicPlayer.Queue(for: songs, startingAt: first)
+        player.queue = MusicKit.MusicPlayer.Queue(for: songs, startingAt: first)
         try await player.play()
     }
 

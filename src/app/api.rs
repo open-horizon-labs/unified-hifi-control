@@ -151,6 +151,8 @@ pub struct AppleBridgePendingPairing {
 pub struct AppleBridgeCompanionStatus {
     pub bridge_id: String,
     #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
     pub paired: bool,
     #[serde(default)]
     pub live: bool,

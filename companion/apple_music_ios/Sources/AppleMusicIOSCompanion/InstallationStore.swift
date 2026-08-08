@@ -9,7 +9,7 @@ import Security
 /// kept in the platform secure store by a real host app.
 @available(iOS 17.0, *)
 public struct AppleMusicCompanionInstallation: Codable, Sendable, Equatable {
-    public let baseURL: URL
+    public var baseURL: URL
     public let companionID: String
     public var bridgeID: String?
     public var accessToken: String?

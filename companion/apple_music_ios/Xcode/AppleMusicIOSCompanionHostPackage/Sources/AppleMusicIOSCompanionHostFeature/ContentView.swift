@@ -45,11 +45,14 @@ private final class CompanionModel: ObservableObject {
     private let bridgeID: String
     @Published private(set) var pairingCode = ""
     @Published private(set) var isPaired = false
+    @Published private(set) var isLive = false
+    @Published private(set) var outputLabel: String?
     private let installationStore: KeychainAppleMusicCompanionInstallationStore
     private let companionID: String
     private var host: AppleMusicCompanionHost
     private let player = SystemMusicPlayerCompanion()
-    private var pollTask: Task<Void, Never>?
+    private var heartbeatTask: Task<Void, Never>?
+    private var commandTask: Task<Void, Never>?
     private var discovery: UHCBonjourDiscovery?
 
     init() {
@@ -72,7 +75,7 @@ private final class CompanionModel: ObservableObject {
         let alreadyPaired = installation.accessToken != nil
         isPaired = alreadyPaired
         stage = alreadyPaired ? .connected : .authorize
-        message = alreadyPaired ? "This companion is connected to UHC." : nil
+        message = alreadyPaired ? "Paired. Open this companion to connect to UHC." : nil
         if alreadyPaired { reconnect() }
     }
 
@@ -122,7 +125,10 @@ private final class CompanionModel: ObservableObject {
         let browser = UHCBonjourDiscovery()
         discovery = browser
         browser.onFailure = { [weak self] _ in
-            Task { @MainActor in self?.message = "UHC was not found on this local network. It will reconnect when available." }
+            Task { @MainActor in
+                self?.isLive = false
+                self?.message = "Paired, but UHC was not found on this local network. It will reconnect when available."
+            }
         }
         browser.onBaseURL = { [weak self] baseURL in
             Task { @MainActor in self?.useReconnectedUHC(at: baseURL) }
@@ -168,9 +174,10 @@ private final class CompanionModel: ObservableObject {
             do {
                 _ = try await claimHost.claim(bridgeID: bridgeID, pairingCode: pairingCode)
                 isPaired = true
+                isLive = false
                 pairingCode = ""
                 stage = .connected
-                message = "This companion is connected to UHC."
+                message = "Paired. Connecting to UHC…"
                 startPolling()
             } catch {
                 pairingCode = ""
@@ -181,24 +188,59 @@ private final class CompanionModel: ObservableObject {
     }
     func startPolling() {
         guard isPaired else { return }
-        pollTask?.cancel()
-        pollTask = Task { [host, player] in
+        stopPolling()
+        let host = host
+        let player = player
+        heartbeatTask = Task { [weak self, host, player] in
             while !Task.isCancelled {
                 do {
                     try await host.publishCurrentSnapshot(from: player)
-                    try await host.pollAndHandle { command in try await player.execute(command) }
-                    try await host.pollAndHandleContent { request in try await player.executeContent(request) }
-                    await MainActor.run { self.message = "This companion is connected to UHC." }
-                } catch {
+                    let outputLabel = await player.currentOutputLabel()
                     await MainActor.run {
-                        self.message = "UHC is temporarily unavailable. It will keep trying while this app is open."
+                        self?.isLive = true
+                        self?.outputLabel = outputLabel
+                        self?.message = "UHC is connected and controlling this companion."
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        await MainActor.run {
+                            if let bridgeError = error as? BridgeClientError, bridgeError.isAuthorizationFailure {
+                                self?.isPaired = false
+                                self?.stopPolling()
+                                self?.isLive = false
+                                self?.outputLabel = nil
+                                self?.message = "UHC removed this pairing. Find UHC to pair again."
+                                Task { try? await host.forgetAuthorization() }
+                            } else {
+                                self?.isLive = false
+                                self?.outputLabel = nil
+                                self?.message = "Paired, but UHC is temporarily unavailable. It will keep trying while this app is open."
+                            }
+                        }
                     }
                 }
                 try? await Task.sleep(for: .seconds(5))
             }
         }
+        commandTask = Task { [host, player] in
+            while !Task.isCancelled {
+                do {
+                    try await host.pollAndHandle { command in try await player.execute(command) }
+                    try await host.pollAndHandleContent { request in try await player.executeContent(request) }
+                } catch {
+                    try? await Task.sleep(for: .seconds(5))
+                }
+            }
+        }
     }
-    func stopPolling() { pollTask?.cancel(); pollTask = nil }
+    func stopPolling() {
+        heartbeatTask?.cancel()
+        heartbeatTask = nil
+        commandTask?.cancel()
+        commandTask = nil
+        isLive = false
+        outputLabel = nil
+    }
     func revoke() {
         Task { @MainActor in
             do {
@@ -231,8 +273,8 @@ public struct ContentView: View {
 
                 if let message = model.message {
                     Section {
-                        Label(message, systemImage: model.stage == .connected ? "checkmark.circle.fill" : "info.circle")
-                            .foregroundStyle(model.stage == .connected ? .green : .secondary)
+                        Label(message, systemImage: model.isLive ? "checkmark.circle.fill" : "info.circle")
+                            .foregroundStyle(model.isLive ? .green : .secondary)
                     }
                 }
 
@@ -276,6 +318,17 @@ public struct ContentView: View {
                     Section("Apple Music") {
                         Text("Apple Music is ready on this device. UHC controls this companion’s playback session.")
                             .foregroundStyle(.secondary)
+                        Label(
+                            model.isLive ? "UHC live" : "Paired · waiting for UHC",
+                            systemImage: model.isLive ? "dot.radiowaves.left.and.right" : "clock"
+                        )
+                        .foregroundStyle(model.isLive ? .green : .secondary)
+                        if let outputLabel = model.outputLabel {
+                            Label("Output: \(outputLabel)", systemImage: "hifispeaker.fill")
+                        } else {
+                            Label("Output: unavailable", systemImage: "hifispeaker.slash")
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     Section("AirPlay output") {
                         Text("Choose an AirPlay speaker or HomePod in Apple’s route picker.")
@@ -290,7 +343,13 @@ public struct ContentView: View {
             }
             .navigationTitle("Apple Music")
         }
-        .onChange(of: scenePhase) { _, phase in if phase == .active { model.startPolling() } else { model.stopPolling() } }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                model.startPolling()
+            } else if phase == .background {
+                model.stopPolling()
+            }
+        }
         .task { model.startPolling() }
     }
 }

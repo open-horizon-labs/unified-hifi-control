@@ -307,7 +307,11 @@ fn is_protected(path: &str, method: &axum::http::Method) -> bool {
     if path == "/api/settings" {
         return method != axum::http::Method::GET;
     }
-    if path == "/api/bridges/applemusic/pair" || path == "/api/bridges/applemusic/revoke" {
+    if path == "/api/bridges/applemusic/pair"
+        || path == "/api/bridges/applemusic/revoke"
+        || path == "/api/bridges/applemusic/rename"
+        || path == "/api/bridges/applemusic/remove"
+    {
         return true;
     }
     if *method == axum::http::Method::GET || *method == axum::http::Method::HEAD {

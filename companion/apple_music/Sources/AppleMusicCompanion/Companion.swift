@@ -263,7 +263,8 @@ public actor ApplicationMusicPlayerCompanion {
             volume: nil,
             isMuted: false,
             repeatMode: repeatWireValue(player.state.repeatMode),
-            shuffle: shuffleWireValue(player.state.shuffleMode)
+            shuffle: shuffleWireValue(player.state.shuffleMode),
+            outputs: []
         )
     }
 
@@ -312,12 +313,13 @@ public struct MacMusicKitSnapshot: Codable, Sendable, Equatable {
     public let isMuted: Bool
     public let repeatMode: String?
     public let shuffle: Bool?
+    public let outputs: [MacMusicKitOutput]
 
     enum CodingKeys: String, CodingKey {
-        case playerID = "player_id", displayName = "display_name", state, track, volume, isMuted = "is_muted", repeatMode = "repeat_mode", shuffle
+        case playerID = "player_id", displayName = "display_name", state, track, volume, isMuted = "is_muted", repeatMode = "repeat_mode", shuffle, outputs
     }
 
-    public init(playerID: String, displayName: String, state: String, track: MacMusicKitTrack? = nil, volume: Float? = nil, isMuted: Bool = false, repeatMode: String? = nil, shuffle: Bool? = nil) {
+    public init(playerID: String, displayName: String, state: String, track: MacMusicKitTrack? = nil, volume: Float? = nil, isMuted: Bool = false, repeatMode: String? = nil, shuffle: Bool? = nil, outputs: [MacMusicKitOutput] = []) {
         self.playerID = playerID
         self.displayName = displayName
         self.state = state
@@ -326,6 +328,28 @@ public struct MacMusicKitSnapshot: Codable, Sendable, Equatable {
         self.isMuted = isMuted
         self.repeatMode = repeatMode
         self.shuffle = shuffle
+        self.outputs = outputs
+    }
+}
+
+@available(macOS 14.0, *)
+public struct MacMusicKitOutput: Codable, Sendable, Equatable {
+    public let outputID: String
+    public let displayName: String
+    public let isActive: Bool
+    public let volume: Float?
+    public let isMuted: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case outputID = "output_id", displayName = "display_name", isActive = "is_active", volume, isMuted = "is_muted"
+    }
+
+    public init(outputID: String, displayName: String, isActive: Bool = true, volume: Float? = nil, isMuted: Bool? = nil) {
+        self.outputID = outputID
+        self.displayName = displayName
+        self.isActive = isActive
+        self.volume = volume
+        self.isMuted = isMuted
     }
 }
 

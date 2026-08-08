@@ -94,6 +94,17 @@ pub struct ClaimResponse {
     pub access_token: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RenameRequest {
+    pub bridge_id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BridgeIdRequest {
+    pub bridge_id: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct BridgeStatus {
     /// A durable companion credential is present. This remains true while
@@ -122,6 +133,7 @@ pub struct PendingPairing {
 #[derive(Debug, Serialize, Clone)]
 pub struct BridgeCompanionStatus {
     pub bridge_id: String,
+    pub display_name: String,
     pub paired: bool,
     pub live: bool,
     pub last_seen: u64,
@@ -344,6 +356,7 @@ impl AppleBridgeRegistry {
             bridge_id: request.bridge_id.clone(),
             access_token: access_token.clone(),
             bound_player_id: None,
+            display_name: None,
         };
         persist_credentials(&state, record.clone())?;
         state.credentials.insert(access_token.clone(), record);
@@ -423,6 +436,13 @@ impl AppleBridgeRegistry {
     }
 
     pub async fn update_snapshot(&self, token: &str, snapshot: MusicKitSnapshot) -> Result<()> {
+        let display_name = self
+            .inner
+            .read()
+            .await
+            .credentials
+            .get(token)
+            .and_then(|record| record.display_name.clone());
         let newly_bound = self
             .with_session(token, |session| {
                 let was_unbound = session.bound_player_id.is_none();
@@ -435,6 +455,10 @@ impl AppleBridgeRegistry {
                     }
                 } else {
                     session.bound_player_id = Some(snapshot.player_id.clone());
+                }
+                let mut snapshot = snapshot;
+                if let Some(display_name) = display_name {
+                    snapshot.display_name = display_name;
                 }
                 session.snapshot = Some(snapshot);
                 Ok(was_unbound)
@@ -844,6 +868,38 @@ impl AppleBridgeRegistry {
             .ok_or_else(|| anyhow!("bridge token is invalid"))
     }
 
+    pub async fn token_for_bridge_id(&self, bridge_id: &str) -> Result<String> {
+        let state = self.inner.read().await;
+        state
+            .credentials
+            .values()
+            .find(|record| record.bridge_id == bridge_id)
+            .map(|record| record.access_token.clone())
+            .ok_or_else(|| anyhow!("Apple Music companion is not paired"))
+    }
+
+    pub async fn rename(&self, bridge_id: &str, display_name: String) -> Result<()> {
+        let display_name = normalize_display_name(&display_name)?;
+        let mut state = self.inner.write().await;
+        let token = state
+            .credentials
+            .values()
+            .find(|record| record.bridge_id == bridge_id)
+            .map(|record| record.access_token.clone())
+            .ok_or_else(|| anyhow!("Apple Music companion is not paired"))?;
+        state
+            .credentials
+            .get_mut(&token)
+            .expect("credential was found by token")
+            .display_name = Some(display_name.clone());
+        if let Some(session) = state.sessions.get_mut(&token) {
+            if let Some(snapshot) = session.snapshot.as_mut() {
+                snapshot.display_name = display_name;
+            }
+        }
+        persist_all_credentials(&state)
+    }
+
     pub async fn status(&self) -> BridgeStatus {
         let state = self.inner.read().await;
         let now = now_secs();
@@ -857,6 +913,15 @@ impl AppleBridgeRegistry {
                     .filter(|session| session.last_seen + BRIDGE_LIVENESS_TTL.as_secs() > now);
                 BridgeCompanionStatus {
                     bridge_id: record.bridge_id.clone(),
+                    display_name: record
+                        .display_name
+                        .clone()
+                        .or_else(|| {
+                            session
+                                .and_then(|session| session.snapshot.as_ref())
+                                .map(|snapshot| snapshot.display_name.clone())
+                        })
+                        .unwrap_or_else(|| default_display_name(&record.bridge_id)),
                     paired: true,
                     live: session.is_some(),
                     last_seen: session.map(|session| session.last_seen).unwrap_or(0),
@@ -901,6 +966,22 @@ impl AppleBridgeRegistry {
                 .collect(),
         }
     }
+}
+
+fn default_display_name(bridge_id: &str) -> String {
+    match bridge_id.split('-').next().unwrap_or_default() {
+        "ios" => "iOS Apple Music companion".to_string(),
+        "macos" => "Mac Apple Music companion".to_string(),
+        _ => "Apple Music companion".to_string(),
+    }
+}
+
+fn normalize_display_name(value: &str) -> Result<String> {
+    let name = value.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        bail!("Apple Music companion name must be 1–80 characters");
+    }
+    Ok(name.to_string())
 }
 
 fn persist_credentials(state: &BridgeState, record: AppleBridgeCredentialRecord) -> Result<()> {
@@ -1026,6 +1107,39 @@ pub async fn claim(
 
 pub async fn status(State(state): State<AppState>) -> Json<BridgeStatus> {
     Json(state.apple_bridges.status().await)
+}
+
+pub async fn rename(
+    State(state): State<AppState>,
+    Json(request): Json<RenameRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    validate_bridge_id(&request.bridge_id)
+        .map_err(|message| error(StatusCode::BAD_REQUEST, &message, "rename_failed"))?;
+    state
+        .apple_bridges
+        .rename(&request.bridge_id, request.display_name)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| error(StatusCode::BAD_REQUEST, &e.to_string(), "rename_failed"))
+}
+
+pub async fn revoke_by_bridge_id(
+    State(state): State<AppState>,
+    Json(request): Json<BridgeIdRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorBody>)> {
+    validate_bridge_id(&request.bridge_id)
+        .map_err(|message| error(StatusCode::BAD_REQUEST, &message, "revoke_failed"))?;
+    let token = state
+        .apple_bridges
+        .token_for_bridge_id(&request.bridge_id)
+        .await
+        .map_err(|e| error(StatusCode::NOT_FOUND, &e.to_string(), "revoke_failed"))?;
+    state
+        .apple_bridges
+        .revoke(&token)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
+        .map_err(|e| error(StatusCode::BAD_REQUEST, &e.to_string(), "revoke_failed"))
 }
 
 pub async fn revoke(
@@ -1316,6 +1430,7 @@ mod tests {
             is_muted: false,
             repeat_mode: None,
             shuffle: None,
+            outputs: vec![],
         }
     }
 
@@ -1809,6 +1924,59 @@ mod tests {
             .companions
             .iter()
             .any(|companion| companion.bridge_id == "ipad"));
+    }
+
+    #[tokio::test]
+    async fn companion_names_are_human_readable_and_renameable() {
+        let registry = AppleBridgeRegistry::default();
+        let pairing = registry.create_pairing("ios-device".to_string()).await;
+        registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+
+        assert_eq!(
+            registry.status().await.companions[0].display_name,
+            "iOS Apple Music companion"
+        );
+        registry
+            .rename("ios-device", "Kitchen iPad".to_string())
+            .await
+            .expect("rename succeeds");
+        assert_eq!(
+            registry.status().await.companions[0].display_name,
+            "Kitchen iPad"
+        );
+        assert!(registry
+            .rename("ios-device", "   ".to_string())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn companion_can_be_removed_by_bridge_identity() {
+        let registry = AppleBridgeRegistry::default();
+        let pairing = registry.create_pairing("macos-device".to_string()).await;
+        let claim = registry
+            .claim(ClaimRequest {
+                bridge_id: pairing.bridge_id,
+                pairing_code: pairing.pairing_code,
+            })
+            .await
+            .expect("claim succeeds");
+        let token = registry
+            .token_for_bridge_id("macos-device")
+            .await
+            .expect("token is available");
+        registry.revoke(&token).await.expect("revoke succeeds");
+        assert!(registry.token_for_bridge_id("macos-device").await.is_err());
+        assert!(registry
+            .update_snapshot(&claim.access_token, snapshot())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

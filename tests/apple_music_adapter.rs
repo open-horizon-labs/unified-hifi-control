@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use unified_hifi_control::adapters::apple_music::{
     AppleMusicAdapter, CompanionPlatform, ExecutionOwner, MusicKitCommand, MusicKitCompanion,
-    MusicKitPlaybackState, MusicKitSnapshot, MusicKitTrack, PlaybackRoute,
+    MusicKitOutput, MusicKitPlaybackState, MusicKitSnapshot, MusicKitTrack, PlaybackRoute,
 };
 use unified_hifi_control::adapters::{
     AdapterCommand, AdapterContext, AdapterLogic, LibraryAdapter, Startable,
@@ -85,6 +85,7 @@ fn snapshot() -> MusicKitSnapshot {
         is_muted: false,
         repeat_mode: None,
         shuffle: None,
+        outputs: vec![],
     }
 }
 
@@ -97,6 +98,51 @@ fn adapter(bus: SharedBus, commands: Arc<Mutex<Vec<MusicKitCommand>>>) -> AppleM
         }),
         Duration::from_millis(5),
     )
+}
+
+#[tokio::test]
+async fn observed_airplay_outputs_are_attached_to_the_owner_zone() {
+    let bus = create_bus();
+    let mut events = bus.subscribe();
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let mut snapshot = snapshot();
+    snapshot.outputs.push(MusicKitOutput {
+        output_id: "kitchen".to_string(),
+        display_name: "Kitchen".to_string(),
+        is_active: true,
+        volume: None,
+        is_muted: None,
+    });
+    let adapter = AppleMusicAdapter::with_companion(
+        bus.clone(),
+        Arc::new(FakeCompanion { snapshot, commands }),
+        Duration::from_millis(5),
+    );
+    let shutdown = CancellationToken::new();
+    let run = tokio::spawn({
+        let adapter = adapter.clone();
+        let shutdown = shutdown.clone();
+        async move { adapter.run(AdapterContext { bus, shutdown }).await }
+    });
+
+    let owner = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Ok(BusEvent::ZoneDiscovered { zone }) = events.recv().await {
+                break zone;
+            }
+        }
+    })
+    .await
+    .expect("owner zone must be published");
+
+    assert_eq!(owner.zone_id, "applemusic:application");
+    assert_eq!(owner.zone_name, "Apple Music — Output: Kitchen");
+    assert_eq!(owner.state, PlaybackState::Playing);
+
+    shutdown.cancel();
+    run.await
+        .expect("adapter task must join")
+        .expect("adapter must stop cleanly");
 }
 
 #[tokio::test]

@@ -71,6 +71,8 @@ POST /api/bridges/applemusic/commands/{command_id}
 POST /api/bridges/applemusic/content/{request_id}
 POST /api/bridges/applemusic/discover
 POST /api/bridges/applemusic/pair
+POST /api/bridges/applemusic/remove
+POST /api/bridges/applemusic/rename
 POST /api/bridges/applemusic/revoke
 POST /api/bridges/applemusic/state
 POST /api/controller/bootstrap

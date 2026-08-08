@@ -337,6 +337,34 @@ fn apple_music_live_companion_count(status: Option<&AppleBridgeStatus>) -> usize
 }
 
 #[cfg(target_arch = "wasm32")]
+fn browser_confirm(message: &str) -> bool {
+    web_sys::window()
+        .and_then(|window| window.confirm_with_message(message).ok())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn browser_confirm(_message: &str) -> bool {
+    false
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browser_prompt(message: &str, default: &str) -> Option<String> {
+    web_sys::window()
+        .and_then(|window| {
+            window
+                .prompt_with_message_and_default(message, default)
+                .ok()
+        })
+        .flatten()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn browser_prompt(_message: &str, _default: &str) -> Option<String> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
 fn show_copy_result(mut state: Signal<CopyState>, result: CopyState) {
     state.set(result);
     spawn(async move {
@@ -1291,7 +1319,7 @@ pub fn Settings() -> Element {
                             if !applemusic_enabled() {
                                 span { class: "badge badge-secondary shrink-0", "Disabled" }
                             } else if matches!(apple_music_state, AppleMusicStatusState::Live) {
-                                span { class: "badge badge-success shrink-0", "{apple_music_live_count} companions live" }
+                                span { class: "badge badge-success shrink-0", "{apple_music_live_count} ", if apple_music_live_count == 1 { "companion live" } else { "companions live" } }
                             } else if matches!(apple_music_state, AppleMusicStatusState::PairedWaiting) {
                                 span { class: "badge badge-secondary shrink-0", "Paired · waiting" }
                             } else {
@@ -1323,10 +1351,55 @@ pub fn Settings() -> Element {
                                     for companion in status.companions.iter() {
                                         div { class: "rounded-lg bg-surface-muted p-4",
                                             div { class: "flex items-center justify-between gap-3",
-                                                p { class: "font-medium truncate", "{companion.bridge_id}" }
+                                                p { class: "font-medium truncate", "{companion.display_name}" }
                                                 span { class: if companion.paired && companion.live { "badge badge-success" } else { "badge badge-secondary" }, if companion.paired && companion.live { "Live" } else { "Offline · paired" } }
                                             }
                                             p { class: "mt-2 text-xs text-secondary", if companion.paired && companion.live { "Ready for playback through UHC." } else if companion.paired { "Pairing is saved. Open the companion app to reconnect it to UHC." } else { "Waiting for this companion to finish pairing." } }
+                                            div { class: "mt-3 flex flex-wrap items-center gap-3",
+                                                button {
+                                                    r#type: "button",
+                                                    class: "btn btn-outline min-h-9 px-3 text-sm",
+                                                    onclick: {
+                                                        let bridge_id = companion.bridge_id.clone();
+                                                        let current_name = companion.display_name.clone();
+                                                        move |_| {
+                                                            let Some(display_name) = browser_prompt("Name this Apple Music companion", &current_name) else { return; };
+                                                            let mut apple_bridge_status = apple_bridge_status;
+                                                            let bridge_id = bridge_id.clone();
+                                                            spawn(async move {
+                                                                let _ = crate::app::api::post_json_no_response(
+                                                                    "/api/bridges/applemusic/rename",
+                                                                    &serde_json::json!({ "bridge_id": bridge_id, "display_name": display_name }),
+                                                                ).await;
+                                                                apple_bridge_status.restart();
+                                                            });
+                                                        }
+                                                    },
+                                                    "Rename"
+                                                }
+                                                button {
+                                                    r#type: "button",
+                                                    class: "btn btn-ghost min-h-9 px-3 text-sm text-danger",
+                                                    onclick: {
+                                                        let bridge_id = companion.bridge_id.clone();
+                                                        let display_name = companion.display_name.clone();
+                                                        move |_| {
+                                                            if !browser_confirm(&format!("Remove {display_name} from UHC? This revokes its saved pairing.")) { return; }
+                                                            let mut apple_bridge_status = apple_bridge_status;
+                                                            let bridge_id = bridge_id.clone();
+                                                            spawn(async move {
+                                                                let _ = crate::app::api::post_json_no_response(
+                                                                    "/api/bridges/applemusic/remove",
+                                                                    &serde_json::json!({ "bridge_id": bridge_id }),
+                                                                ).await;
+                                                                apple_bridge_status.restart();
+                                                            });
+                                                        }
+                                                    },
+                                                    "Remove companion"
+                                                }
+                                            }
+                                            p { class: "mt-3 text-[11px] text-muted", "Device ID: {companion.bridge_id}" }
                                         }
                                     }
                                 }
