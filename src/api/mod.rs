@@ -1203,6 +1203,8 @@ async fn hqp_apply_named_setting(
         "mode" | "filter1x" | "filterNx" | "filternx" | "shaper" | "dither" | "junk_filter" => {
             value.to_string()
         }
+        "matrix_profile" if value.eq_ignore_ascii_case("[default]") => String::new(),
+        "matrix_profile" => value.to_string(),
         "convolution" | "adaptive_volume" | "random" => parse_hqp_bool(value)?.to_string(),
         "repeat" => parse_hqp_repeat(value)?.to_string(),
         "samplerate" | "rate" => {
@@ -1318,6 +1320,7 @@ pub async fn hqp_pipeline_update_handler(
         "adaptive_volume",
         "repeat",
         "random",
+        "matrix_profile",
     ];
     if !valid_settings.contains(&req.setting.as_str()) {
         return (
@@ -1358,19 +1361,16 @@ pub async fn hqp_pipeline_update_handler(
     };
 
     match result {
-        Ok(()) => {
-            // Publish verified readback first, then answer from the one shared state owner.
-            if refresh_hqp_advanced_aggregate(&state, "default")
-                .await
-                .is_ok()
-            {
-                if let Some(pipeline) = hqp_default_pipeline_from_aggregator(&state).await {
-                    return (StatusCode::OK, Json(pipeline)).into_response();
-                }
-            }
-            // Preserve the legacy success fallback when the post-write refresh cannot complete.
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-        }
+        Ok(()) => match hqp_default_pipeline_from_aggregator(&state).await {
+            Some(pipeline) => (StatusCode::OK, Json(pipeline)).into_response(),
+            None => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "HQPlayer accepted and verified the native setting, but its canonical pipeline readback is unavailable".to_string(),
+                }),
+            )
+                .into_response(),
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

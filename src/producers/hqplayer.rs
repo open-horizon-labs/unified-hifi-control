@@ -3053,6 +3053,7 @@ mod tests {
                 info: None,
             },
             pipeline: crate::adapters::hqplayer::PipelineStatus::default(),
+            active_profile: Some("Zen".to_string()),
             transport: HqpNativeTransportState::Playing,
             metadata: HqpNativeMetadata {
                 track_id: Some("track-42".to_string()),

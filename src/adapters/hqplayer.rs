@@ -1497,6 +1497,9 @@ pub struct FilterItem {
     pub name: String,
     pub value: i32, // Filter values can be negative
     pub arg: u32,
+    /// Compact, daemon-authored selector metadata (quality/focus/rate suitability).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Pipeline settings for a single setting type
@@ -1548,6 +1551,7 @@ pub struct HqpAdvancedOptionsSnapshot {
 #[derive(Debug, Clone)]
 struct CoherentPipelineSnapshot {
     legacy: PipelineStatus,
+    active_profile: Option<String>,
     state: HqpState,
     playback_status: HqpStatus,
     chain: ChainSnapshot,
@@ -1596,6 +1600,8 @@ pub struct HqpNativeObservation {
     /// consumers can project their unchanged contract from the aggregator without re-querying the
     /// adapter and accidentally joining two daemon moments.
     pub pipeline: PipelineStatus,
+    /// Active named persistent configuration. `None` is HQPlayer's unnamed base configuration.
+    pub active_profile: Option<String>,
     pub transport: HqpNativeTransportState,
     pub metadata: HqpNativeMetadata,
     pub volume: HqpNativeVolume,
@@ -2070,6 +2076,10 @@ impl Drop for InFlightConnection {
 pub struct HqpProfile {
     pub value: String,
     pub title: String,
+    /// Whether the native daemon currently reports this named configuration as active.
+    /// HQPlayer's unnamed base configuration is intentionally represented by no active item.
+    #[serde(default)]
+    pub active: bool,
 }
 
 /// Matrix profile info
@@ -3313,7 +3323,8 @@ impl HqpAdapter {
                 .then_some(snapshot.playback_status.active_filter.clone()),
             shaper: (!snapshot.playback_status.active_shaper.is_empty())
                 .then_some(snapshot.playback_status.active_shaper.clone()),
-            rate: (snapshot.playback_status.active_rate != 0)
+            rate: (snapshot.playback_status.state != 0
+                && snapshot.playback_status.active_rate != 0)
                 .then_some(snapshot.playback_status.active_rate.to_string()),
         });
 
@@ -3376,7 +3387,8 @@ impl HqpAdapter {
             host,
             filter: (!status.active_filter.is_empty()).then_some(status.active_filter),
             shaper: (!status.active_shaper.is_empty()).then_some(status.active_shaper),
-            rate: (status.active_rate != 0).then_some(status.active_rate.to_string()),
+            rate: (status.state != 0 && status.active_rate != 0)
+                .then_some(status.active_rate.to_string()),
         });
         Ok(())
     }
@@ -3453,6 +3465,7 @@ impl HqpAdapter {
                 info: Some(snapshot.info.clone()),
             },
             pipeline: snapshot.legacy.clone(),
+            active_profile: snapshot.active_profile.clone(),
             transport: match snapshot.playback_status.state {
                 0 => HqpNativeTransportState::Stopped,
                 1 => HqpNativeTransportState::Paused,
@@ -3805,6 +3818,7 @@ impl HqpAdapter {
             name: Self::parse_attr(item, "name").unwrap_or_default(),
             value: Self::parse_attr_i32(item, "value"),
             arg: Self::parse_attr_u32(item, "arg"),
+            description: Self::parse_attr(item, "description"),
         });
         self.publish_fresh_family(FreshFamily::Filters(filters.clone()), since)
             .await?;
@@ -5323,6 +5337,7 @@ impl HqpAdapter {
             name: Self::parse_attr(item, "name").unwrap_or_default(),
             value: Self::parse_attr_i32(item, "value"),
             arg: Self::parse_attr_u32(item, "arg"),
+            description: Self::parse_attr(item, "description"),
         });
 
         // Log first 10 filters to help debug index vs value issues
@@ -5351,6 +5366,7 @@ impl HqpAdapter {
                 name: Self::parse_attr(item, "name").unwrap_or_default(),
                 value: Self::parse_attr_i32(item, "value"),
                 arg: Self::parse_attr_u32(item, "arg"),
+                description: Self::parse_attr(item, "description"),
             }),
             generation,
         ))
@@ -6157,6 +6173,113 @@ impl HqpAdapter {
             return Some(ModeFamily::Sdm);
         }
         None
+    }
+
+    /// Resolve the mode currently reported by the running engine.
+    ///
+    /// `State.active_mode` is not the live output mode on the HQPlayer 6.0.4 daemon we support:
+    /// while an explicitly configured SDM chain is loaded, `State` can still report the PCM index.
+    /// `Status.active_mode` is authoritative for an explicit PCM/SDM mode. Under `[source]` it can
+    /// echo `[source]` rather than name the loaded chain, so the unambiguous output-rate family is
+    /// the authority there. Keep the state-index fallback only for older/partial replies.
+    fn active_mode_name(
+        modes: &[ListItem],
+        state: &HqpState,
+        playback_status: &HqpStatus,
+    ) -> String {
+        const SDM_RATE_FLOOR_HZ: u32 = 2_822_400;
+
+        let configured_is_source = modes
+            .iter()
+            .find(|mode| mode.index == u32::from(state.mode))
+            .is_some_and(|mode| Self::mode_family(&mode.name) == Some(ModeFamily::Source));
+        let reported_family = Self::mode_family(&playback_status.active_mode);
+        if (reported_family == Some(ModeFamily::Source)
+            || (playback_status.active_mode.trim().is_empty() && configured_is_source))
+            && playback_status.active_rate > 0
+        {
+            let active_family = if playback_status.active_rate >= SDM_RATE_FLOOR_HZ {
+                ModeFamily::Sdm
+            } else {
+                ModeFamily::Pcm
+            };
+            return modes
+                .iter()
+                .find(|mode| Self::mode_family(&mode.name) == Some(active_family))
+                .map(|mode| mode.name.clone())
+                .unwrap_or_else(|| match active_family {
+                    ModeFamily::Pcm => "PCM".to_string(),
+                    ModeFamily::Sdm => "SDM (DSD)".to_string(),
+                    ModeFamily::Source => unreachable!("the output-rate family is never source"),
+                });
+        }
+        if !playback_status.active_mode.trim().is_empty() {
+            return playback_status.active_mode.clone();
+        }
+        modes
+            .iter()
+            .find(|mode| mode.index == u32::from(state.active_mode))
+            .map(|mode| mode.name.clone())
+            .unwrap_or_else(|| format!("Unknown({})", state.active_mode))
+    }
+
+    fn rate_label(rate: u32) -> String {
+        if rate == 0 {
+            return "Auto".to_string();
+        }
+
+        let frequency = Self::format_rate_frequency(rate);
+        const SDM_RATE_FLOOR_HZ: u32 = 2_822_400;
+        let tier = if rate >= SDM_RATE_FLOOR_HZ {
+            [44_100, 48_000].into_iter().find_map(|base| {
+                rate.is_multiple_of(base)
+                    .then_some(rate / base)
+                    .filter(|multiple| multiple.is_power_of_two() && *multiple >= 64)
+                    .map(|multiple| format!("DSD{multiple}"))
+            })
+        } else {
+            [44_100, 48_000].into_iter().find_map(|base| {
+                rate.is_multiple_of(base)
+                    .then_some(rate / base)
+                    .filter(|multiple| multiple.is_power_of_two())
+                    .map(|multiple| format!("{multiple}×"))
+            })
+        };
+
+        tier.map_or(frequency.clone(), |tier| format!("{tier} · {frequency}"))
+    }
+
+    fn mode_label(name: &str) -> String {
+        if Self::mode_family(name) == Some(ModeFamily::Source) {
+            "Auto (follow source)".to_string()
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn filter_label(filter: &FilterItem) -> String {
+        filter.description.as_deref().map_or_else(
+            || filter.name.clone(),
+            |description| format!("{} · {description}", filter.name),
+        )
+    }
+
+    fn format_rate_frequency(rate: u32) -> String {
+        let (scaled, unit, precision) = if rate >= 1_000_000 {
+            (f64::from(rate) / 1_000_000.0, "MHz", 4)
+        } else if rate >= 1_000 {
+            (f64::from(rate) / 1_000.0, "kHz", 3)
+        } else {
+            return format!("{rate} Hz");
+        };
+        let mut number = format!("{scaled:.precision$}");
+        while number.contains('.') && number.ends_with('0') {
+            number.pop();
+        }
+        if number.ends_with('.') {
+            number.pop();
+        }
+        format!("{number} {unit}")
     }
 
     /// Resolve a mode name against the list the daemon is serving **now**.
@@ -7283,7 +7406,7 @@ impl HqpAdapter {
         // *now* as when the lists were published; a move out and back inside that window leaves it
         // agreeing. Only a daemon-side atomic snapshot could do better, and the protocol has none.
         let mut retried = false;
-        let (state, playback_status, snapshot, vol_range, session) = loop {
+        let (state, playback_status, active_profile, snapshot, vol_range, session) = loop {
             // Query recovery may replace only the TCP transport and deliberately leave managed
             // reachability false. Any first-attempt disturbance can discover that replacement —
             // an unsettled list fill, failed probe, replaced snapshot, or the closing fence — so
@@ -7298,7 +7421,7 @@ impl HqpAdapter {
 
             // (1) Reconnect-capable, so it goes ahead of everything the proof will cover. On the
             // first read of a connection this is always a real request.
-            let (vol_range, mut attempt_generation) = match self.ensure_volume_range().await? {
+            let (mut vol_range, volume_generation) = match self.ensure_volume_range().await? {
                 PipelineVolumeRange::Observed { range, generation } => (range, generation),
                 PipelineVolumeRange::FixedFallback(range) => {
                     // A timeout/lost reply discarded the old socket. Establish the replacement
@@ -7309,6 +7432,46 @@ impl HqpAdapter {
                     (range, self.transport_generation().await)
                 }
             };
+
+            // ConfigurationGet is also reconnect-capable. Read it before capturing any
+            // chain-scoped identity, and date the attempt from the session that answered it. A
+            // reconnect here invalidates the list cache; the fill below will then rebuild the
+            // complete set on the replacement session instead of joining an old set to a new
+            // profile identity.
+            let (active_configuration, mut attempt_generation) =
+                self.active_configuration_with_generation().await?;
+            let active_profile = Self::named_configuration(active_configuration);
+
+            // ConfigurationGet may have reconciled a cancelled or failed transport. In that case
+            // the range above belongs to the discarded session and must be read again. A second
+            // session change means the reconnect-capable preflight itself did not settle; restart
+            // the one bounded whole-read attempt instead of joining the two sessions.
+            if volume_generation != attempt_generation {
+                let (refreshed_range, refreshed_generation) =
+                    match self.ensure_volume_range().await? {
+                        PipelineVolumeRange::Observed { range, generation } => (range, generation),
+                        PipelineVolumeRange::FixedFallback(range) => {
+                            self.ensure_connected().await?;
+                            (range, self.transport_generation().await)
+                        }
+                    };
+                if refreshed_generation != attempt_generation {
+                    if !retried {
+                        tracing::info!(
+                            "HQPlayer's native session changed twice during the reconnect-capable \
+                             pipeline preflight; restarting the complete read"
+                        );
+                        retried = true;
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "HQPlayer's native session would not settle while its profile identity and \
+                         volume capability were being read; refusing to join preflight state from \
+                         different sessions"
+                    ));
+                }
+                vol_range = refreshed_range;
+            }
 
             // A query may establish a usable native transport without declaring the managed
             // session reachable. Complete that handshake on the same socket and carry the range
@@ -7372,7 +7535,6 @@ impl HqpAdapter {
             // `HqpStatus::default()`. A failed Status reply therefore invalidates this complete
             // coherent reading just as an unsettled chain does.
             let observed_status = self.get_playback_status().await?;
-
             // (4) A probe that could not run is not a probe that passed. "The cache was not
             // invalidated, so the lists are still the ones the state was read against" is true about
             // the *cache* and answers nothing about the *daemon*: whether it still has that chain
@@ -7432,7 +7594,14 @@ impl HqpAdapter {
                             ));
                         }
                     };
-                    break (observed, observed_status, snapshot, vol_range, session);
+                    break (
+                        observed,
+                        observed_status,
+                        active_profile,
+                        snapshot,
+                        vol_range,
+                        session,
+                    );
                 }
                 Err(reason) if !retried => {
                     tracing::info!(
@@ -7499,23 +7668,25 @@ impl HqpAdapter {
         let legacy = PipelineStatus {
             status: PipelineState {
                 state: state_str.to_string(),
-                // State.mode and State.active_mode are INDEX (0,1,2) - look up by ModesItem.index
+                // State.mode returns an INDEX (0,1,2) - look it up by ModesItem.index.
                 mode: get_mode_by_index(state.mode),
-                // `State.active_mode`, resolved through the modes list. This is a **reporting choice
-                // between two fields whose semantics are not both measured**, not a statement that one
-                // is right: `Status.active_mode` is measured to echo the configured mode under
-                // `[source]` (HQP-C-023), and what `State.active_mode` reports there has never been
-                // measured by anyone (HQP-C-024). An earlier comment here called the `Status` field
-                // "unreliable" and instructed always using this one, which asserted the unmeasured half
-                // as fact; #332 owns settling it.
-                //
-                // Nothing that has to be *correct* depends on this field. The loaded chain — which
-                // decides every enumeration below — is resolved from the enumerations the daemon
-                // serves, never from either `active_mode`.
-                active_mode: get_mode_by_index(state.active_mode),
+                // `Status.active_mode` is the live engine's semantic readout. The supported 6.0.4
+                // daemon can leave State.active_mode at the PCM index while an explicit SDM chain is
+                // loaded, so State is only a compatibility fallback when Status omits the field.
+                // Source-following mode derives the loaded PCM/SDM chain from Status.active_rate
+                // when Status echoes `[source]`; enumerations never depend on this display field.
+                active_mode: if state.state == 0 {
+                    String::new()
+                } else {
+                    Self::active_mode_name(&modes, &state, &playback_status)
+                },
                 active_filter: playback_status.active_filter.clone(),
                 active_shaper: playback_status.active_shaper.clone(),
-                active_rate: state.active_rate,
+                active_rate: if state.state == 0 {
+                    0
+                } else {
+                    playback_status.active_rate
+                },
                 convolution: state.convolution,
                 invert: state.invert,
             },
@@ -7530,13 +7701,13 @@ impl HqpAdapter {
                     selected: SelectedOption {
                         // Use name for the value - adapter handles name→value conversion
                         value: get_mode_by_index(state.mode),
-                        label: get_mode_by_index(state.mode),
+                        label: Self::mode_label(&get_mode_by_index(state.mode)),
                     },
                     options: modes
                         .iter()
                         .map(|m| SelectOption {
                             value: m.name.clone(), // Send NAME, not value
-                            label: m.name.clone(),
+                            label: Self::mode_label(&m.name),
                         })
                         .collect(),
                 },
@@ -7544,13 +7715,13 @@ impl HqpAdapter {
                     selected: SelectedOption {
                         // Use name - adapter handles name→index conversion
                         value: filter1x_obj.map(|f| f.name.clone()).unwrap_or_default(),
-                        label: filter1x_obj.map(|f| f.name.clone()).unwrap_or_default(),
+                        label: filter1x_obj.map(Self::filter_label).unwrap_or_default(),
                     },
                     options: filters
                         .iter()
                         .map(|f| SelectOption {
                             value: f.name.clone(), // Send NAME, not index
-                            label: f.name.clone(),
+                            label: Self::filter_label(f),
                         })
                         .collect(),
                 },
@@ -7558,13 +7729,13 @@ impl HqpAdapter {
                     selected: SelectedOption {
                         // Use name - adapter handles name→index conversion
                         value: filter_nx_obj.map(|f| f.name.clone()).unwrap_or_default(),
-                        label: filter_nx_obj.map(|f| f.name.clone()).unwrap_or_default(),
+                        label: filter_nx_obj.map(Self::filter_label).unwrap_or_default(),
                     },
                     options: filters
                         .iter()
                         .map(|f| SelectOption {
                             value: f.name.clone(), // Send NAME, not index
-                            label: f.name.clone(),
+                            label: Self::filter_label(f),
                         })
                         .collect(),
                 },
@@ -7582,17 +7753,16 @@ impl HqpAdapter {
                         })
                         .collect(),
                 },
-                // In PCM mode, it's called "Shaper"; in DSD/SDM mode, it's "Modulator"
+                // HQPTuner and HQPlayer's own terminology call the PCM family "Dither" and the
+                // SDM family "Modulator". The wire still calls both families shapers.
                 shaper_label: {
                     let mode_name = get_mode_by_index(state.mode);
-                    // PCM mode → "Shaper", DSD/SDM mode → "Modulator"
-                    // "[source]" mode depends on source material - default to "Shaper"
-                    if mode_name.to_uppercase().contains("SDM")
-                        || mode_name.to_uppercase().contains("DSD")
-                    {
+                    if Self::mode_family(&mode_name) == Some(ModeFamily::Sdm) {
                         "Modulator".to_string()
+                    } else if Self::mode_family(&mode_name) == Some(ModeFamily::Source) {
+                        "Dither / modulator".to_string()
                     } else {
-                        "Shaper".to_string()
+                        "Dither".to_string()
                     }
                 },
                 samplerate: PipelineSetting {
@@ -7607,25 +7777,15 @@ impl HqpAdapter {
                         label: rates
                             .iter()
                             .find(|r| r.index == state.rate)
-                            .map(|r| {
-                                if r.rate == 0 {
-                                    "Auto".to_string()
-                                } else {
-                                    r.rate.to_string()
-                                }
-                            })
-                            .unwrap_or_else(|| state.active_rate.to_string()),
+                            .map(|r| Self::rate_label(r.rate))
+                            .unwrap_or_else(|| Self::rate_label(state.active_rate)),
                     },
                     options: rates
                         .iter()
                         .map(|r| SelectOption {
                             // Use rate as value (what HQPlayer expects)
                             value: r.rate.to_string(),
-                            label: if r.rate == 0 {
-                                "Auto".to_string()
-                            } else {
-                                r.rate.to_string()
-                            },
+                            label: Self::rate_label(r.rate),
                         })
                         .collect(),
                 },
@@ -7634,6 +7794,7 @@ impl HqpAdapter {
 
         Ok(CoherentPipelineSnapshot {
             legacy,
+            active_profile,
             state,
             playback_status,
             chain: ChainSnapshot {
@@ -7998,10 +8159,34 @@ impl HqpAdapter {
     /// Ask the native protocol which named configuration is active.
     /// Empty means the base configuration; a named value is returned exactly.
     async fn active_configuration_under_operation(&self) -> Result<String> {
+        self.active_configuration_with_generation()
+            .await
+            .map(|(active, _)| active)
+    }
+
+    async fn active_configuration_with_generation(&self) -> Result<(String, u64)> {
         let xml = Self::build_request("ConfigurationGet", &[]);
-        let response = self.send_command(&xml).await?;
-        Self::parse_attr(&response, "value")
-            .ok_or_else(|| anyhow!("ConfigurationGet response omitted its active value"))
+        let (response, generation) = self.send_command_with_generation(&xml).await?;
+        let active = Self::parse_attr(&response, "value")
+            .ok_or_else(|| anyhow!("ConfigurationGet response omitted its active value"))?;
+        Ok((active, generation))
+    }
+
+    fn named_configuration(active: String) -> Option<String> {
+        let active = active.trim();
+        (!active.is_empty()).then(|| active.to_string())
+    }
+
+    /// Return the active named profile, hiding HQPlayer's unnamed base configuration.
+    ///
+    /// HQPlayer reports the base configuration as an empty `ConfigurationGet.value`. That value is
+    /// not a user-facing profile in UHC; callers receive `None`, while named profiles retain their
+    /// semantic identity.
+    pub async fn get_active_profile(&self) -> Result<Option<String>> {
+        let _operation_guard = self.operation_lock.lock().await;
+        Ok(Self::named_configuration(
+            self.active_configuration_under_operation().await?,
+        ))
     }
 
     /// Parse hidden form inputs from HTML
@@ -8057,20 +8242,21 @@ impl HqpAdapter {
                     .map(|c| c[1].to_string())
                     .unwrap_or_else(|| text.to_string());
 
-                // Skip default/empty profiles
-                let slug: String = value
-                    .to_lowercase()
-                    .chars()
-                    .filter(|c| c.is_alphanumeric())
-                    .collect();
-                if !value.is_empty() && !slug.is_empty() && slug != "default" {
+                // HQPlayer exposes its unnamed base configuration as `[default]`.
+                // That is not a user profile, but a saved profile literally named
+                // `Default` is valid and must remain selectable.
+                let trimmed_value = value.trim();
+                let is_unnamed_base =
+                    trimmed_value.is_empty() || trimmed_value.eq_ignore_ascii_case("[default]");
+                if !is_unnamed_base {
                     profiles.push(HqpProfile {
-                        value: value.trim().to_string(),
+                        value: trimmed_value.to_string(),
                         title: if text.is_empty() {
                             value.clone()
                         } else {
                             text.to_string()
                         },
+                        active: false,
                     });
                 }
             }
@@ -8126,7 +8312,14 @@ impl HqpAdapter {
         }
 
         let hidden_fields = Self::parse_hidden_inputs(html);
-        let profiles = Self::parse_profiles_from_html(html);
+        let mut profiles = Self::parse_profiles_from_html(html);
+        let active = self.active_configuration_under_operation().await?;
+        let active = active.trim();
+        if !active.is_empty() {
+            for profile in &mut profiles {
+                profile.active = profile.value == active;
+            }
+        }
 
         // Cache for later use
         {
@@ -8351,6 +8544,7 @@ impl HqpAdapter {
     /// of application (HQP-C-028) — so the write is confirmed by reading `State.matrix_profile` back.
     pub async fn set_matrix_profile_named(&self, name: &str) -> Result<SettingOutcome> {
         let _operation_guard = self.operation_lock.lock().await;
+        let name = Self::native_matrix_profile_name(name);
         let (state, generation) = self.get_state_with_generation().await?;
         if state.matrix_profile == name {
             return Ok(SettingOutcome::AlreadySet);
@@ -8364,6 +8558,7 @@ impl HqpAdapter {
         name: &str,
         generation: u64,
     ) -> Result<SettingOutcome> {
+        let name = Self::native_matrix_profile_name(name);
         if self
             .get_state_on_transport(generation)
             .await?
@@ -8374,6 +8569,14 @@ impl HqpAdapter {
         }
         self.write_matrix_profile_on_transport(name, generation)
             .await
+    }
+
+    fn native_matrix_profile_name(name: &str) -> &str {
+        if name.eq_ignore_ascii_case("[default]") {
+            ""
+        } else {
+            name
+        }
     }
 
     async fn write_matrix_profile_on_transport(
@@ -10145,6 +10348,97 @@ mod parse_attr_scope_tests {
 mod chain_identity_tests {
     use super::*;
 
+    #[test]
+    fn live_mode_uses_status_active_mode_when_state_reports_a_stale_index() {
+        let modes = vec![mode(1, "PCM"), mode(2, "SDM (DSD)")];
+        let state = HqpState {
+            mode: 2,
+            active_mode: 1,
+            ..HqpState::default()
+        };
+        let status = HqpStatus {
+            active_mode: "SDM (DSD)".to_string(),
+            ..HqpStatus::default()
+        };
+
+        assert_eq!(
+            HqpAdapter::active_mode_name(&modes, &state, &status),
+            "SDM (DSD)"
+        );
+    }
+
+    #[test]
+    fn live_mode_falls_back_to_state_only_when_status_omits_it() {
+        let modes = vec![mode(1, "PCM"), mode(2, "SDM (DSD)")];
+        let state = HqpState {
+            active_mode: 1,
+            ..HqpState::default()
+        };
+
+        assert_eq!(
+            HqpAdapter::active_mode_name(&modes, &state, &HqpStatus::default()),
+            "PCM"
+        );
+    }
+
+    #[test]
+    fn source_mode_uses_the_active_output_rate_to_name_the_loaded_chain() {
+        let modes = vec![mode(0, "[source]"), mode(1, "PCM"), mode(2, "SDM (DSD)")];
+        let state = HqpState {
+            mode: 0,
+            active_mode: 1,
+            ..HqpState::default()
+        };
+
+        let pcm = HqpStatus {
+            active_mode: "[source]".to_string(),
+            active_rate: 192_000,
+            ..HqpStatus::default()
+        };
+        assert_eq!(HqpAdapter::active_mode_name(&modes, &state, &pcm), "PCM");
+
+        let sdm = HqpStatus {
+            active_mode: "[source]".to_string(),
+            active_rate: 5_644_800,
+            ..HqpStatus::default()
+        };
+        assert_eq!(
+            HqpAdapter::active_mode_name(&modes, &state, &sdm),
+            "SDM (DSD)"
+        );
+    }
+
+    #[test]
+    fn rate_labels_match_hqptuners_user_facing_tiers_without_losing_frequency() {
+        assert_eq!(HqpAdapter::rate_label(0), "Auto");
+        assert_eq!(HqpAdapter::rate_label(352_800), "8× · 352.8 kHz");
+        assert_eq!(HqpAdapter::rate_label(384_000), "8× · 384 kHz");
+        assert_eq!(HqpAdapter::rate_label(5_644_800), "DSD128 · 5.6448 MHz");
+        assert_eq!(HqpAdapter::rate_label(6_144_000), "DSD128 · 6.144 MHz");
+        assert_eq!(HqpAdapter::rate_label(12_345), "12.345 kHz");
+    }
+
+    #[test]
+    fn source_following_mode_gets_a_human_label_without_changing_its_wire_value() {
+        assert_eq!(HqpAdapter::mode_label("[source]"), "Auto (follow source)");
+        assert_eq!(HqpAdapter::mode_label("PCM"), "PCM");
+        assert_eq!(HqpAdapter::mode_label("SDM (DSD)"), "SDM (DSD)");
+    }
+
+    #[test]
+    fn filter_labels_keep_the_native_name_and_its_daemon_authored_guidance() {
+        let mut described = filter(0, "poly-sinc-gauss-long");
+        described.description = Some("5/5 timbre, transients ⤣ Any".to_string());
+        assert_eq!(
+            HqpAdapter::filter_label(&described),
+            "poly-sinc-gauss-long · 5/5 timbre, transients ⤣ Any"
+        );
+        assert_eq!(
+            HqpAdapter::filter_label(&filter(1, "future-filter")),
+            "future-filter"
+        );
+    }
+
     fn mode(index: u32, name: &str) -> ListItem {
         ListItem {
             index,
@@ -10159,6 +10453,7 @@ mod chain_identity_tests {
             name: name.to_string(),
             value: 0,
             arg: 0,
+            description: None,
         }
     }
 

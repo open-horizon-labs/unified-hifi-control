@@ -1237,6 +1237,7 @@ async fn hifi_hqplayer_status_shape_is_pinned() {
         json!({
             "connected": false,
             "host": null,
+            "active_profile": null,
             "pipeline": null,
             "options": null,
             "options_unavailable_reason": null
@@ -2192,6 +2193,10 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
         DisplayOnly("hifi_status grouping key, not a value a client passes anywhere"),
     ),
     (
+        "active_profile",
+        DisplayOnly("active named HQPlayer configuration; None is the unnamed base configuration"),
+    ),
+    (
         "pipeline",
         DisplayOnly("hifi_hqplayer_status grouping key wrapping the pipeline readout"),
     ),
@@ -2589,6 +2594,7 @@ async fn no_tool_returns_an_unclassified_field() {
     collect_keys(
         &serde_json::to_value(McpPipelineStatus {
             state: String::new(),
+            mode: String::new(),
             filter: String::new(),
             shaper: String::new(),
             rate: 0,
@@ -2946,7 +2952,7 @@ const TEXT_CORRECTIONS: &[(&str, &str, &str)] = &[
     (
         "hifi_hqplayer_status/disconnected",
         "{\n  \"connected\": false,\n  \"host\": null,\n  \"pipeline\": null\n}",
-        "{\n  \"connected\": false,\n  \"host\": null,\n  \"pipeline\": null,\n  \"options\": null,\n  \"options_unavailable_reason\": null\n}",
+        "{\n  \"connected\": false,\n  \"host\": null,\n  \"active_profile\": null,\n  \"pipeline\": null,\n  \"options\": null,\n  \"options_unavailable_reason\": null\n}",
     ),
 ];
 

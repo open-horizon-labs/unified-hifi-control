@@ -195,25 +195,35 @@ pub fn Zones() -> Element {
                 profile: String,
             }
             let req = ProfileRequest { profile };
-            if let Err(e) = crate::app::api::post_json_no_response("/hqplayer/profile", &req).await
-            {
-                hqp_error.set(Some(format!("Profile load failed: {e}")));
+            match crate::app::api::post_json_no_response("/hqplayer/profile", &req).await {
+                Ok(()) => {
+                    if let Ok(profiles) =
+                        crate::app::api::fetch_json::<Vec<HqpProfile>>("/hqplayer/profiles").await
+                    {
+                        hqp_profiles.set(profiles);
+                    }
+                }
+                Err(e) => {
+                    hqp_error.set(Some(format!("Profile load failed: {e}")));
+                }
             }
         });
     };
 
     // Set matrix profile handler
-    let set_matrix = move |profile_idx: u32| {
+    let set_matrix = move |profile_name: String| {
         hqp_error.set(None);
         spawn(async move {
             #[derive(serde::Serialize)]
             struct MatrixRequest {
-                profile: u32,
+                setting: &'static str,
+                value: String,
             }
             let req = MatrixRequest {
-                profile: profile_idx,
+                setting: "matrix_profile",
+                value: profile_name,
             };
-            match crate::app::api::post_json_no_response("/hqplayer/matrix/profile", &req).await {
+            match crate::app::api::post_json_no_response("/hqp/pipeline", &req).await {
                 Ok(_) => {
                     // Refresh matrix after change
                     if let Ok(matrix) = crate::app::api::fetch_json::<HqpMatrixProfilesResponse>(
@@ -333,7 +343,7 @@ fn ZoneCard(
     hqp_matrix: Option<HqpMatrixProfilesResponse>,
     on_control: EventHandler<(String, String)>,
     on_load_profile: EventHandler<String>,
-    on_set_matrix: EventHandler<u32>,
+    on_set_matrix: EventHandler<String>,
 ) -> Element {
     let zone_id = zone.zone_id.clone();
     let zone_id_prev = zone_id.clone();
@@ -386,17 +396,14 @@ fn ZoneCard(
         .unwrap_or_default();
 
     // HQP matrix info
-    let has_matrix = hqp_matrix
-        .as_ref()
-        .map(|m| !m.profiles.is_empty())
-        .unwrap_or(false);
+    let has_matrix = hqp_matrix.is_some();
     let matrix_profiles = hqp_matrix
         .as_ref()
         .map(|m| m.profiles.clone())
         .unwrap_or_default();
     let matrix_current = hqp_matrix
         .as_ref()
-        .and_then(|m| m.current.as_ref().map(|profile| profile.index));
+        .and_then(|m| m.current.as_ref().map(|profile| profile.name.clone()));
 
     rsx! {
         article { class: "zone-card",
@@ -440,6 +447,7 @@ fn ZoneCard(
                 HqpControlsCompact {
                     profiles: hqp_profiles,
                     matrix_profiles: matrix_profiles,
+                    matrix_available: has_matrix,
                     active_matrix: matrix_current,
                     on_profile_select: on_load_profile,
                     on_matrix_select: on_set_matrix,

@@ -946,6 +946,11 @@ async fn filters_list_is_parsed_in_full_from_a_multiline_container() {
         expected,
         "every FiltersItem in the container must be parsed, not just the first"
     );
+    assert_eq!(
+        filters.first().and_then(|filter| filter.description.as_deref()),
+        Some("(text not reproduced)"),
+        "the daemon's compact filter description is authoritative selector metadata and must not be discarded"
+    );
     h.stop();
 }
 
@@ -1636,6 +1641,53 @@ fn the_persistent_config_form_separates_the_unnamed_base_from_named_profiles() {
          ones, and the distinction matters: loading a NAMED profile restarts the daemon and empties \
          /backup/settings.zip, while `[default]` does not. Found {offered:?}"
     );
+}
+
+/// The native public getter exposes only a named active profile. HQPlayer's empty base
+/// configuration is an implementation detail and must remain a neutral `None`, not a selectable
+/// `[default]` profile.
+#[tokio::test]
+async fn the_active_profile_getter_hides_the_unnamed_base_and_reports_a_named_profile() {
+    let h = Harness::verified().await;
+
+    assert_eq!(
+        h.adapter
+            .get_active_profile()
+            .await
+            .expect("read unnamed active configuration"),
+        None
+    );
+
+    h.model
+        .external_change(|state| state.active_configuration = "Zen".to_string());
+    assert_eq!(
+        h.adapter
+            .get_active_profile()
+            .await
+            .expect("read named active configuration")
+            .as_deref(),
+        Some("Zen")
+    );
+    h.stop();
+}
+
+/// HQPTuner treats Status mode/rate as playback evidence: once the engine is stopped, their last
+/// values no longer describe an active output. Filter/shaper remain useful configured context.
+#[tokio::test]
+async fn a_stopped_engine_suppresses_stale_active_mode_and_rate() {
+    let h = Harness::verified().await;
+    h.model.external_change(|state| {
+        state.playback = 0;
+        state.active_rate_hz = 5_644_800;
+    });
+
+    let pipeline = h.adapter.get_pipeline_status().await.expect("pipeline");
+    assert_eq!(pipeline.status.state, "Stopped");
+    assert_eq!(pipeline.status.active_mode, "");
+    assert_eq!(pipeline.status.active_rate, 0);
+    assert!(!pipeline.status.active_filter.is_empty());
+    assert!(!pipeline.status.active_shaper.is_empty());
+    h.stop();
 }
 
 /// Verified rule for the persistent WRITE lane: "the 200 response body is the HTML restore page —
@@ -3806,9 +3858,59 @@ const CONFIG_PAGE_RAW_LANE: &str = r#"<html><body><form>
 
 const PROFILE_PAGE_SEMANTIC_LANE: &str = r#"<html><body><form>
     <select name="profile">
+      <option value="[default]">[default]</option>
+      <option value="Default">Default</option>
       <option value="semantic-z">Semantic Lane Z</option>
     </select>
 </form></body></html>"#;
+
+/// The browser inventory and native active getter are one user-facing fact. The unnamed HQPlayer
+/// base remains absent, while a named native configuration marks exactly its matching selector.
+#[tokio::test]
+async fn profile_inventory_marks_the_active_named_profile_without_exposing_the_base() {
+    let web = FakeConfigWeb::start(CONFIG_PAGE_RAW_LANE, PROFILE_PAGE_SEMANTIC_LANE).await;
+    let h = Harness::start(VERIFIED_PROFILE, WirePolicy::default(), fast_timeouts()).await;
+    h.adapter.connect().await.expect("connect to fake daemon");
+    configure_without_persisting(
+        &h.adapter,
+        "127.0.0.1",
+        h.server.port(),
+        web.port,
+        "conformance",
+        "conformance",
+    )
+    .await;
+
+    let unnamed = h.adapter.fetch_profiles().await.expect("unnamed inventory");
+    assert_eq!(unnamed.len(), 2);
+    assert!(
+        unnamed.iter().any(|profile| profile.value == "Default"),
+        "a saved profile literally named Default is not HQPlayer's bracketed unnamed [default] base"
+    );
+    assert!(
+        unnamed.iter().all(|profile| profile.value != "[default]"),
+        "the bracketed unnamed base must not become a user-facing profile"
+    );
+    assert!(
+        unnamed.iter().all(|profile| !profile.active),
+        "the unnamed base is not a named profile"
+    );
+
+    h.model
+        .external_change(|state| state.active_configuration = "semantic-z".to_string());
+    let named = h.adapter.fetch_profiles().await.expect("named inventory");
+    assert_eq!(named.len(), 2);
+    assert!(
+        named
+            .iter()
+            .find(|profile| profile.value == "semantic-z")
+            .is_some_and(|profile| profile.active),
+        "the matching named profile must be selected"
+    );
+
+    h.stop();
+    web.stop();
+}
 
 #[tokio::test]
 async fn an_about_redirect_is_not_reported_as_an_empty_profile_or_config_page() {
@@ -7541,6 +7643,31 @@ async fn an_external_matrix_switch_is_visible_and_an_empty_profile_is_no_selecti
             .is_none(),
         "an empty profile field is the default/no-selection identity, not index 0"
     );
+    h.stop();
+}
+
+/// `[Default]` is the user-facing name for the unnamed matrix, while `Default` can be a distinct
+/// saved profile. The Rust client accepts the friendly sentinel and sends the daemon's empty value.
+#[tokio::test]
+async fn the_friendly_matrix_default_sends_an_empty_native_name() {
+    let h = Harness::verified().await;
+    h.adapter
+        .set_matrix_profile_named("[Default]")
+        .await
+        .applied()
+        .expect("select unnamed matrix default");
+
+    assert_eq!(
+        request_attr(
+            &h.model
+                .last_request("MatrixSetProfile")
+                .expect("MatrixSetProfile sent"),
+            "value"
+        )
+        .as_deref(),
+        Some(""),
+    );
+    assert_eq!(h.model.state().matrix_profile, "");
     h.stop();
 }
 

@@ -386,6 +386,7 @@ pub fn HqPlayer() -> Element {
                 hqp_error.set(Some(format!("Profile load failed: {e}")));
             } else {
                 pipeline.restart();
+                profiles.restart();
                 refresh_advanced_projection(matrix, matrix_refresh, false);
             }
             hqp_loading.set(false);
@@ -393,18 +394,20 @@ pub fn HqPlayer() -> Element {
     };
 
     // Set matrix profile handler
-    let set_matrix = move |profile_idx: u32| {
+    let set_matrix = move |profile_name: String| {
         hqp_error.set(None);
         hqp_loading.set(true);
         spawn(async move {
             #[derive(serde::Serialize)]
             struct MatrixRequest {
-                profile: u32,
+                setting: &'static str,
+                value: String,
             }
             let req = MatrixRequest {
-                profile: profile_idx,
+                setting: "matrix_profile",
+                value: profile_name,
             };
-            if let Err(e) = api::post_json_no_response("/hqplayer/matrix/profile", &req).await {
+            if let Err(e) = api::post_json_no_response("/hqp/pipeline", &req).await {
                 hqp_error.set(Some(format!("Matrix profile failed: {e}")));
             } else {
                 refresh_advanced_projection(matrix, matrix_refresh, false);
@@ -568,7 +571,11 @@ pub fn HqPlayer() -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::{hqplayer_mute_control, CoalescingRefresh};
+    use super::{
+        filter_hqp_options, format_hqp_rate, hqp_live_mode_readout, hqp_live_output_readout,
+        hqp_shaper_minimum_rate_hz, hqplayer_mute_control, CoalescingRefresh,
+    };
+    use crate::app::api::{HqpOption, HqpPipelineStatus, HqpSettingOptions};
 
     #[test]
     fn advanced_refreshes_never_overlap_and_coalesce_bursts() {
@@ -608,6 +615,120 @@ mod tests {
         let floored = hqplayer_mute_control(Some(-60.0), Some(-60.0));
         assert_eq!(floored.label, "At minimum volume");
         assert!(floored.disabled);
+    }
+
+    #[test]
+    fn active_rates_are_presented_as_human_frequencies() {
+        assert_eq!(format_hqp_rate(44_100), "44.1 kHz");
+        assert_eq!(format_hqp_rate(384_000), "384 kHz");
+        assert_eq!(format_hqp_rate(5_644_800), "5.6448 MHz");
+    }
+
+    #[test]
+    fn stopped_and_paused_engines_do_not_advertise_stale_mode_or_output() {
+        for state in ["Stopped", "Paused"] {
+            let status = HqpPipelineStatus {
+                state: Some(state.to_string()),
+                mode: Some("SDM (DSD)".to_string()),
+                active_mode: Some("PCM".to_string()),
+                active_rate: Some(5_644_800),
+                ..HqpPipelineStatus::default()
+            };
+
+            assert_eq!(hqp_live_mode_readout(&status), "—");
+            assert_eq!(hqp_live_output_readout(&status), "—");
+        }
+    }
+
+    #[test]
+    fn playing_engine_readouts_use_only_active_mode_and_rate() {
+        let status = HqpPipelineStatus {
+            state: Some("Playing".to_string()),
+            mode: Some("PCM".to_string()),
+            active_mode: Some("SDM (DSD)".to_string()),
+            active_rate: Some(5_644_800),
+            ..HqpPipelineStatus::default()
+        };
+
+        assert_eq!(hqp_live_mode_readout(&status), "SDM (DSD)");
+        assert_eq!(hqp_live_output_readout(&status), "5.6448 MHz");
+    }
+
+    #[test]
+    fn filter_search_keeps_the_current_choice_visible_without_lying_about_matches() {
+        let options = vec![
+            HqpOption {
+                value: "poly-sinc-gauss-long".to_string(),
+                label: None,
+                disabled: false,
+                reason: None,
+            },
+            HqpOption {
+                value: "poly-sinc-ext2-hires-lp".to_string(),
+                label: None,
+                disabled: false,
+                reason: None,
+            },
+            HqpOption {
+                value: "IIR".to_string(),
+                label: None,
+                disabled: false,
+                reason: None,
+            },
+        ];
+
+        let filtered = filter_hqp_options(&options, "hires", "poly-sinc-gauss-long");
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["poly-sinc-gauss-long", "poly-sinc-ext2-hires-lp"]
+        );
+    }
+
+    #[test]
+    fn hqptuner_rate_gates_are_applied_to_rate_specific_modulators() {
+        assert_eq!(hqp_shaper_minimum_rate_hz("DSD7 256+fs"), Some(10_240_000));
+        assert_eq!(
+            hqp_shaper_minimum_rate_hz("ASDM7EC-fast 512+fs"),
+            Some(22_579_200)
+        );
+        assert_eq!(
+            hqp_shaper_minimum_rate_hz("AMSDM7EC 512+fs"),
+            Some(20_480_000)
+        );
+        assert_eq!(hqp_shaper_minimum_rate_hz("AHM7EC8B"), Some(40_960_000));
+        assert_eq!(hqp_shaper_minimum_rate_hz("ASDM7EC-fast"), None);
+    }
+
+    #[test]
+    fn rate_specific_modulators_stay_visible_but_explain_why_they_are_unavailable() {
+        let options = HqpSettingOptions {
+            options: vec![
+                HqpOption {
+                    value: "ASDM7EC-fast".to_string(),
+                    label: Some("ASDM7EC-fast".to_string()),
+                    disabled: false,
+                    reason: None,
+                },
+                HqpOption {
+                    value: "ASDM7EC-fast 512+fs".to_string(),
+                    label: Some("ASDM7EC-fast 512+fs".to_string()),
+                    disabled: false,
+                    reason: None,
+                },
+            ],
+            selected: None,
+        };
+
+        let guided = super::apply_hqp_shaper_rate_guidance(options, 11_289_600);
+        assert!(!guided.options[0].disabled);
+        assert!(guided.options[1].disabled);
+        assert_eq!(
+            guided.options[1].reason.as_deref(),
+            Some("needs at least 22.5792 MHz")
+        );
     }
 }
 
@@ -919,7 +1040,7 @@ fn DspSettings(
     loading: bool,
     on_set_pipeline: EventHandler<(String, String)>,
     on_load_profile: EventHandler<String>,
-    on_set_matrix: EventHandler<u32>,
+    on_set_matrix: EventHandler<String>,
 ) -> Element {
     let Some(ref pipe) = pipeline else {
         return rsx! {
@@ -937,19 +1058,23 @@ fn DspSettings(
     let samplerate_opts = settings.and_then(|s| s.samplerate.clone());
     let filter1x_opts = settings.and_then(|s| s.filter1x.clone());
     let filter_nx_opts = settings.and_then(|s| s.filter_nx.clone());
-    let shaper_opts = settings.and_then(|s| s.shaper.clone());
+    let shaper_opts = settings.and_then(|s| s.shaper.clone()).map(|options| {
+        let selected_rate = samplerate_opts
+            .as_ref()
+            .and_then(|rates| rates.selected.as_ref())
+            .and_then(|rate| rate.value.parse::<u32>().ok())
+            .unwrap_or_default();
+        apply_hqp_shaper_rate_guidance(options, selected_rate)
+    });
 
-    let has_matrix = matrix
-        .as_ref()
-        .map(|m| !m.profiles.is_empty())
-        .unwrap_or(false);
+    let has_matrix = matrix.is_some();
     let matrix_profiles = matrix
         .as_ref()
         .map(|m| m.profiles.clone())
         .unwrap_or_default();
     let matrix_current = matrix
         .as_ref()
-        .and_then(|m| m.current.as_ref().map(|profile| profile.index));
+        .and_then(|m| m.current.as_ref().map(|profile| profile.name.clone()));
     let junk_filter_opts = matrix.as_ref().and_then(|advanced| {
         if advanced.junk_filters.is_empty() {
             return None;
@@ -962,6 +1087,8 @@ fn DspSettings(
                 .map(|choice| crate::app::api::HqpOption {
                     value: choice.name.clone(),
                     label: Some(choice.name.clone()),
+                    disabled: false,
+                    reason: None,
                 })
         });
         Some(crate::app::api::HqpSettingOptions {
@@ -971,6 +1098,8 @@ fn DspSettings(
                 .map(|choice| crate::app::api::HqpOption {
                     value: choice.name.clone(),
                     label: Some(choice.name.clone()),
+                    disabled: false,
+                    reason: None,
                 })
                 .collect(),
             selected,
@@ -985,12 +1114,16 @@ fn DspSettings(
                     .map(|(value, label)| crate::app::api::HqpOption {
                         value: (*value).to_string(),
                         label: Some((*label).to_string()),
+                        disabled: false,
+                        reason: None,
                     })
                     .collect(),
                 selected: choices.get(usize::from(selected)).map(|(value, label)| {
                     crate::app::api::HqpOption {
                         value: (*value).to_string(),
                         label: Some((*label).to_string()),
+                        disabled: false,
+                        reason: None,
                     }
                 }),
             }
@@ -1002,21 +1135,9 @@ fn DspSettings(
         .and_then(|advanced| advanced.adaptive_volume);
     let random = matrix.as_ref().and_then(|advanced| advanced.random);
 
-    // Dynamic shaper label based on mode
-    // SDM/DSD mode = "Modulator", PCM mode = "Shaper" (not "Dither")
-    let shaper_label = mode_opts
-        .as_ref()
-        .and_then(|m| m.selected.as_ref())
-        .and_then(|s| s.label.as_ref())
-        .map(|label| {
-            let lower = label.to_lowercase();
-            if lower.contains("sdm") || lower.contains("dsd") {
-                "Modulator"
-            } else {
-                "Shaper" // PCM mode uses noise shaping, not dithering
-            }
-        })
-        .unwrap_or("Shaper");
+    let shaper_label = settings
+        .and_then(|settings| settings.shaper_label.clone())
+        .unwrap_or_else(|| "Dither / modulator".to_string());
 
     rsx! {
         div { class: "card p-6",
@@ -1032,10 +1153,10 @@ fn DspSettings(
                     h3 { class: "text-sm font-semibold mb-3", "Live engine state" }
                     dl { class: "grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3 lg:grid-cols-5",
                         HqpReadout { label: "Engine", value: status.state.clone().unwrap_or_else(|| "Unknown".to_string()) }
-                        HqpReadout { label: "Mode", value: status.active_mode.clone().or_else(|| status.mode.clone()).unwrap_or_else(|| "—".to_string()) }
+                        HqpReadout { label: "Mode", value: hqp_live_mode_readout(status) }
                         HqpReadout { label: "Filter", value: status.active_filter.clone().unwrap_or_else(|| "—".to_string()) }
-                        HqpReadout { label: "Modulator / shaper", value: status.active_shaper.clone().unwrap_or_else(|| "—".to_string()) }
-                        HqpReadout { label: "Output", value: status.active_rate.map(format_hqp_rate).unwrap_or_else(|| "—".to_string()) }
+                        HqpReadout { label: "Dither / modulator", value: status.active_shaper.clone().unwrap_or_else(|| "—".to_string()) }
+                        HqpReadout { label: "Output", value: hqp_live_output_readout(status) }
                     }
                 }
             }
@@ -1090,6 +1211,8 @@ fn DspSettings(
                     label: "Filter (1x)",
                     setting: "filter1x",
                     options: filter1x_opts,
+                    searchable: true,
+                    hint: "Base-rate sources below 50 kHz. Search by family or suffix, such as gauss, hires, -lp, -mp, or -ip.",
                     disabled: loading,
                     on_change: on_set_pipeline,
                 }
@@ -1098,6 +1221,8 @@ fn DspSettings(
                     label: "Filter (Nx)",
                     setting: "filterNx",
                     options: filter_nx_opts,
+                    searchable: true,
+                    hint: "Sources at 2× and above. Search by family or suffix, such as gauss, hires, -lp, -mp, or -ip.",
                     disabled: loading,
                     on_change: on_set_pipeline,
                 }
@@ -1106,6 +1231,8 @@ fn DspSettings(
                     label: shaper_label,
                     setting: "shaper",
                     options: shaper_opts,
+                    searchable: true,
+                    hint: "PCM uses dither/noise shaping; SDM uses a sigma-delta modulator. Names ending 256+fs or 512+fs require those output-rate tiers.",
                     disabled: loading,
                     on_change: on_set_pipeline,
                 }
@@ -1184,13 +1311,48 @@ fn HqpReadout(label: &'static str, value: String) -> Element {
 }
 
 fn format_hqp_rate(rate: u64) -> String {
-    if rate >= 1_000_000 && rate.is_multiple_of(1_000_000) {
-        format!("{} MHz", rate / 1_000_000)
-    } else if rate >= 1_000 && rate.is_multiple_of(1_000) {
-        format!("{} kHz", rate / 1_000)
+    let (scaled, unit, precision) = if rate >= 1_000_000 {
+        (rate as f64 / 1_000_000.0, "MHz", 4)
+    } else if rate >= 1_000 {
+        (rate as f64 / 1_000.0, "kHz", 3)
     } else {
-        format!("{rate} Hz")
+        return format!("{rate} Hz");
+    };
+    let mut number = format!("{scaled:.precision$}");
+    while number.contains('.') && number.ends_with('0') {
+        number.pop();
     }
+    if number.ends_with('.') {
+        number.pop();
+    }
+    format!("{number} {unit}")
+}
+
+fn hqp_engine_is_playing(status: &crate::app::api::HqpPipelineStatus) -> bool {
+    status.state.as_deref() == Some("Playing")
+}
+
+fn hqp_live_mode_readout(status: &crate::app::api::HqpPipelineStatus) -> String {
+    if !hqp_engine_is_playing(status) {
+        return "—".to_string();
+    }
+    status
+        .active_mode
+        .as_deref()
+        .filter(|mode| !mode.trim().is_empty())
+        .unwrap_or("—")
+        .to_string()
+}
+
+fn hqp_live_output_readout(status: &crate::app::api::HqpPipelineStatus) -> String {
+    if !hqp_engine_is_playing(status) {
+        return "—".to_string();
+    }
+    status
+        .active_rate
+        .filter(|rate| *rate > 0)
+        .map(format_hqp_rate)
+        .unwrap_or_else(|| "—".to_string())
 }
 
 #[component]
@@ -1225,9 +1387,11 @@ fn HqpToggle(
 #[component]
 fn HqpSelect(
     id: &'static str,
-    label: &'static str,
+    label: String,
     setting: &'static str,
     options: Option<crate::app::api::HqpSettingOptions>,
+    #[props(default = false)] searchable: bool,
+    #[props(default)] hint: Option<&'static str>,
     #[props(default = false)] disabled: bool,
     on_change: EventHandler<(String, String)>,
 ) -> Element {
@@ -1240,11 +1404,29 @@ fn HqpSelect(
         .and_then(|o| o.selected.as_ref())
         .map(|s| s.value.clone())
         .unwrap_or_default();
+    let mut query = use_signal(String::new);
+    let visible_options = if searchable {
+        filter_hqp_options(&opts_list, &query(), &selected)
+    } else {
+        opts_list.clone()
+    };
+    let total_options = opts_list.len();
     let setting_name = setting.to_string();
 
     rsx! {
         label {
             span { class: "block text-sm font-medium mb-1", "{label}" }
+            if searchable {
+                input {
+                    r#type: "search",
+                    class: "input mb-2",
+                    value: "{query}",
+                    placeholder: "Search {total_options} choices…",
+                    disabled: disabled,
+                    aria_label: "Search {label}",
+                    oninput: move |evt| query.set(evt.value()),
+                }
+            }
             select {
                 id: "{id}",
                 class: "input",
@@ -1253,16 +1435,85 @@ fn HqpSelect(
                     let value = evt.value();
                     on_change.call((setting_name.clone(), value));
                 },
-                for opt in opts_list {
+                for opt in visible_options {
                     option {
                         value: "{opt.value}",
                         selected: opt.value == selected,
-                        "{opt.label.as_deref().unwrap_or(&opt.value)}"
+                        disabled: opt.disabled,
+                        if let Some(reason) = opt.reason.as_deref() {
+                            "{opt.label.as_deref().unwrap_or(&opt.value)} — {reason}"
+                        } else {
+                            "{opt.label.as_deref().unwrap_or(&opt.value)}"
+                        }
                     }
                 }
             }
+            if let Some(hint) = hint {
+                span { class: "block text-xs text-muted mt-1", "{hint}" }
+            }
         }
     }
+}
+
+fn filter_hqp_options(
+    options: &[crate::app::api::HqpOption],
+    query: &str,
+    selected: &str,
+) -> Vec<crate::app::api::HqpOption> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return options.to_vec();
+    }
+    options
+        .iter()
+        .filter(|option| {
+            option.value == selected
+                || option.value.to_lowercase().contains(&needle)
+                || option
+                    .label
+                    .as_deref()
+                    .is_some_and(|label| label.to_lowercase().contains(&needle))
+        })
+        .cloned()
+        .collect()
+}
+
+fn hqp_shaper_minimum_rate_hz(name: &str) -> Option<u32> {
+    // HQPTuner's 1.7.0 metadata keeps these choices visible and applies the documented family
+    // floors. The native shaper enumeration has names but no constraint attributes, so match only
+    // the explicit rate-bearing families and leave every unknown future choice available.
+    if name.starts_with("AHM") {
+        Some(40_960_000)
+    } else if name.starts_with("AMSDM") && name.contains("512+fs") {
+        Some(20_480_000)
+    } else if name.contains("512+fs") {
+        Some(22_579_200)
+    } else if name.contains("256+fs") {
+        Some(10_240_000)
+    } else {
+        None
+    }
+}
+
+fn apply_hqp_shaper_rate_guidance(
+    mut options: crate::app::api::HqpSettingOptions,
+    selected_rate: u32,
+) -> crate::app::api::HqpSettingOptions {
+    if selected_rate == 0 {
+        return options;
+    }
+    for option in &mut options.options {
+        if let Some(minimum) = hqp_shaper_minimum_rate_hz(&option.value) {
+            if selected_rate < minimum {
+                option.disabled = true;
+                option.reason = Some(format!(
+                    "needs at least {}",
+                    format_hqp_rate(u64::from(minimum))
+                ));
+            }
+        }
+    }
+    options
 }
 
 /// Zone link selector component - simplified single dropdown
