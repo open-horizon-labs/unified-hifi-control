@@ -1275,9 +1275,8 @@ async fn hqp_apply_named_setting(
     value: &str,
 ) -> anyhow::Result<()> {
     let normalized = match setting {
-        "mode" | "filter" | "filter1x" | "filterNx" | "filternx" | "shaper" | "dither" | "junk_filter" => {
-            value.to_string()
-        }
+        "mode" | "filter" | "filter1x" | "filterNx" | "filternx" | "shaper" | "dither"
+        | "junk_filter" => value.to_string(),
         "matrix_profile" if value.eq_ignore_ascii_case("[default]") => String::new(),
         "matrix_profile" => value.to_string(),
         "convolution" | "adaptive_volume" | "random" => parse_hqp_bool(value)?.to_string(),
