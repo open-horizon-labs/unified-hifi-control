@@ -9054,14 +9054,13 @@ impl HqpAdapter {
             // a legitimate action rather than avoid an impossible one.
             is_play_allowed: state != PlaybackState::Playing,
             is_pause_allowed: state == PlaybackState::Playing,
-            // HQPlayer is the DSP endpoint, not UHC's playback-queue owner. A loaded track and
-            // metadata therefore do not make HQPlayer's native Next/Previous commands a valid
-            // capability: Roon/JPLAY (or another source) owns the queue and must receive skips.
-            // Keeping these false prevents a direct HQPlayer zone from drawing buttons that the
-            // daemon will reject with `result="Error"`. Linked source zones retain their own
+            // `track` is HQPlayer's native playlist cursor. A source-fed stream can have metadata,
+            // a duration, and even a track ID while still having no HQPlayer queue; that is the
+            // state in which native Next/Previous returns `result="Error"`. Only advertise queue
+            // skips when HQPlayer reports a native cursor. Linked source zones retain their own
             // transport flags and remain controllable from the HQPlayer page.
-            is_next_allowed: false,
-            is_previous_allowed: false,
+            is_next_allowed: status.track > 0,
+            is_previous_allowed: status.track > 0,
         }
     }
 }

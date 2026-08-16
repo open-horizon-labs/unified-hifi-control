@@ -488,8 +488,8 @@ async fn mcp_hqplayer_refusals_set_the_call_tool_error_flag() {
 }
 
 /// **Client expectation.** Every transport verb the direct zone advertises routes through MCP, not
-/// just play/pause. HQPlayer is not the queue owner, so Next/Previous are refused before native
-/// I/O; linked source zones own those operations.
+/// just play/pause. A native HQPlayer queue owns Next/Previous when its cursor is present; linked
+/// source zones continue to use their source transport.
 ///
 /// **RED:** `stop`, `seek` are not recognized `hifi_control` action values at all (they fall into
 /// the generic pass-through and are sent as an unknown action to Roon); `next`/`previous` fall
@@ -502,7 +502,12 @@ async fn mcp_stop_next_previous_and_seek_all_route_to_the_hqplayer_daemon() {
     rig.attach(&server).await;
     rig.zone_when(|z| z.state == PlaybackState::Playing).await;
 
-    for (action, element, value) in [("seek", "Seek", Some(90.0)), ("stop", "Stop", None)] {
+    for (action, element, value) in [
+        ("next", "Next", None),
+        ("previous", "Previous", None),
+        ("seek", "Seek", Some(90.0)),
+        ("stop", "Stop", None),
+    ] {
         let before = model.request_count(element);
         let mut args = json!({"zone_id": "hqplayer:rig", "action": action});
         if let Some(v) = value {
@@ -518,30 +523,6 @@ async fn mcp_stop_next_previous_and_seek_all_route_to_the_hqplayer_daemon() {
             model.request_count(element),
             before + 1,
             "action `{action}` must send exactly one `{element}`"
-        );
-    }
-
-    for (action, element) in [("next", "Next"), ("previous", "Previous")] {
-        let before = model.request_count(element);
-        let result = rig
-            .call_tool(
-                "hifi_control",
-                json!({"zone_id": "hqplayer:rig", "action": action}),
-            )
-            .await;
-        let text = text_of(&result);
-        assert!(
-            result.is_error == Some(true),
-            "{action} must be refused: {text}"
-        );
-        assert!(
-            text.contains("not available"),
-            "{action} refusal must be actionable: {text}"
-        );
-        assert_eq!(
-            model.request_count(element),
-            before,
-            "{action} must not reach HQPlayer"
         );
     }
 

@@ -308,7 +308,8 @@ impl Rig {
     }
 }
 
-/// A daemon mid-playback with a loaded, seekable track and a working decimal-dB control.
+/// A daemon mid-playback with a native playlist cursor, a loaded seekable track, and a working
+/// decimal-dB control.
 fn playing_daemon() -> DaemonModel {
     let model = DaemonModel::with_profile(VERIFIED_PROFILE);
     model.external_change(|s| {
@@ -371,14 +372,19 @@ async fn transport_reaches_the_selected_hqplayer_instance_and_not_roon() {
 /// **RED before #328:** all of them reached Roon. `stop` and `seek` additionally had no route at
 /// all — `control_roon` maps `stop`, but `seek` is not in any adapter's action vocabulary.
 #[tokio::test]
-async fn stop_and_seek_route_while_queue_skips_are_refused() {
+async fn transport_actions_route_to_the_daemon_when_its_native_queue_is_loaded() {
     let model = playing_daemon();
     let server = start_daemon(&model).await;
     let rig = Rig::new().await;
     rig.attach(&server).await;
     rig.zone_when(|z| z.state == PlaybackState::Playing).await;
 
-    for (action, element, value) in [("seek", "Seek", Some(json!(90))), ("stop", "Stop", None)] {
+    for (action, element, value) in [
+        ("next", "Next", None),
+        ("previous", "Previous", None),
+        ("seek", "Seek", Some(json!(90))),
+        ("stop", "Stop", None),
+    ] {
         let before = model.request_count(element);
         let mut body = json!({"zone_id":"hqplayer:rig","action":action});
         if let Some(v) = value {
@@ -394,23 +400,6 @@ async fn stop_and_seek_route_while_queue_skips_are_refused() {
             model.request_count(element),
             before + 1,
             "action `{action}` must send exactly one `{element}`"
-        );
-    }
-
-    for (action, element) in [("next", "Next"), ("previous", "Previous")] {
-        let before = model.request_count(element);
-        let (status, response) = rig
-            .post_control(json!({"zone_id":"hqplayer:rig","action":action}))
-            .await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "{action} must be refused: {response}"
-        );
-        assert_eq!(
-            model.request_count(element),
-            before,
-            "{action} must not reach HQPlayer"
         );
     }
 
@@ -590,11 +579,14 @@ async fn a_loaded_playing_zone_advertises_the_transport_it_really_has() {
     let zone = rig.zone_when(|z| z.state == PlaybackState::Playing).await;
 
     assert!(zone.is_seekable, "a 215 s track is seekable");
-    // HQPlayer is the DSP endpoint here, not the playback queue owner. Its native
-    // Next/Previous commands are not a reliable transport capability for tracks
-    // supplied by Roon/JPLAY, even while metadata is present.
-    assert!(!zone.is_next_allowed);
-    assert!(!zone.is_previous_allowed);
+    assert!(
+        zone.is_next_allowed,
+        "a native HQPlayer track cursor enables Next"
+    );
+    assert!(
+        zone.is_previous_allowed,
+        "a native HQPlayer track cursor enables Previous"
+    );
     assert!(zone.is_pause_allowed);
     assert!(!zone.is_play_allowed, "already playing");
     assert!(zone.is_controllable);
@@ -944,7 +936,7 @@ async fn stopping_clears_the_track_and_the_capabilities_that_depended_on_it() {
     rig.attach(&server).await;
     let playing = rig.zone_when(|z| z.state == PlaybackState::Playing).await;
     assert!(playing.is_seekable);
-    assert!(!playing.is_next_allowed);
+    assert!(playing.is_next_allowed);
 
     model.external_change(|s| {
         s.playback = 0;
@@ -966,6 +958,33 @@ async fn stopping_clears_the_track_and_the_capabilities_that_depended_on_it() {
 
     rig.shutdown().await;
     server.stop();
+}
+
+#[tokio::test]
+async fn a_loaded_source_track_without_a_native_queue_refuses_queue_skips() {
+    let model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    model.external_change(|s| {
+        s.playback = 2;
+        s.track = 0;
+        s.track_id = "source-track".to_string();
+        s.position = 42;
+        s.length = 215;
+        s.metadata = Some(Metadata::sample());
+    });
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    let zone = rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+
+    assert!(!zone.is_next_allowed);
+    assert!(!zone.is_previous_allowed);
+
+    for action in ["next", "previous"] {
+        let (status, response) = rig
+            .post_control(json!({"zone_id":"hqplayer:rig","action":action}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{action}: {response}");
+    }
 }
 
 /// **Client expectation.** A transient failure to read the volume capability must not tell the

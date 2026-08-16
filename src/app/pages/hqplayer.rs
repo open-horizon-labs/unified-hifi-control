@@ -381,7 +381,7 @@ pub fn HqPlayer() -> Element {
                 value,
             };
             if let Err(error) = api::post_json_no_response("/control", &req).await {
-                hqp_error.set(Some(format!("Playback control failed: {error}")));
+                hqp_error.set(Some(playback_control_error(&error.to_string())));
             }
         });
     };
@@ -731,8 +731,8 @@ mod tests {
     use super::{
         filter_hqp_options, format_hqp_rate, hqp_live_mode_readout, hqp_live_output_readout,
         hqp_shaper_minimum_rate_hz, hqplayer_mute_control, is_zone_match_candidate,
-        normalized_match_selection, playback_path_label, zone_match_availability,
-        CoalescingRefresh, ZoneMatchAvailability,
+        normalized_match_selection, playback_control_error, playback_path_label,
+        zone_match_availability, CoalescingRefresh, ZoneMatchAvailability,
     };
     use crate::app::api::{HqpOption, HqpPipelineStatus, HqpSettingOptions};
 
@@ -774,6 +774,18 @@ mod tests {
         let floored = hqplayer_mute_control(Some(-60.0), Some(-60.0));
         assert_eq!(floored.label, "At minimum volume");
         assert!(floored.disabled);
+    }
+
+    #[test]
+    fn rejected_queue_skip_explains_the_linked_transport_fallback() {
+        assert_eq!(
+            playback_control_error("HTTP 500: HQPlayer rejected Next (no reason given)"),
+            "HQPlayer has no usable native queue for next track. Use the linked playback zone's transport controls."
+        );
+        assert_eq!(
+            playback_control_error("HTTP 500: HQPlayer rejected Previous: empty playlist"),
+            "HQPlayer has no usable native queue for previous track. Use the linked playback zone's transport controls."
+        );
     }
 
     #[test]
@@ -1795,6 +1807,17 @@ fn playback_source_label(source: Option<&str>) -> String {
         Some(other) => other.to_string(),
         None => "Playback zone".to_string(),
     }
+}
+
+fn playback_control_error(error: &str) -> String {
+    for (element, action) in [("Next", "next track"), ("Previous", "previous track")] {
+        if error.contains(&format!("HQPlayer rejected {element}")) {
+            return format!(
+                "HQPlayer has no usable native queue for {action}. Use the linked playback zone's transport controls."
+            );
+        }
+    }
+    format!("Playback control failed: {error}")
 }
 
 fn playback_path_label(source: Option<&str>) -> String {
