@@ -14,7 +14,7 @@ use crate::adapters::{
 };
 use crate::aggregator::{HqpSnapshotPresence, ZoneAggregator};
 use crate::bus::runtime::{CommandGateway, HqpRuntimeCommand};
-use crate::bus::{Command, HqpImageSource, PrefixedZoneId, ProviderAccount, SharedBus};
+use crate::bus::{HqpImageSource, ProviderAccount, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -1149,6 +1149,17 @@ pub(crate) async fn refresh_hqp_profiles_aggregate(
         .await
         .and_then(|snapshot| snapshot.profiles)
         .ok_or_else(|| anyhow::anyhow!("HQPlayer profiles were not retained by the aggregator"))
+}
+
+async fn hqp_default_pipeline_from_aggregator(
+    state: &AppState,
+) -> Option<crate::adapters::hqplayer::PipelineStatus> {
+    state
+        .aggregator
+        .get_hqplayer_snapshot("default")
+        .await
+        .filter(|snapshot| snapshot.presence == HqpSnapshotPresence::Live)
+        .map(|snapshot| snapshot.observation.pipeline)
 }
 
 /// GET /hqplayer/status - HQPlayer connection status

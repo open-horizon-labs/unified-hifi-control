@@ -88,7 +88,6 @@ src/api/mod.rs|hqp_instance_set_matrix_profile_handler|direct-field-access|hqp_i
 src/api/mod.rs|hqp_load_profile_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_matrix_profiles_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_pipeline_handler|direct-field-access|hqplayer
-src/api/mod.rs|hqp_pipeline_update_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_profiles_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_set_matrix_profile_handler|direct-field-access|hqplayer
 src/api/mod.rs|hqp_volume_handler|direct-field-access|hqplayer
