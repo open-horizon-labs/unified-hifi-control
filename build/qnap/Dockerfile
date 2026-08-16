@@ -7,7 +7,7 @@ ARG QDK_DEB_SHA256=17b3841b7d4590a4ee025844ba583304b5e3c497d9fa8934d5175131d3908
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --yes \
-        bsdextrautils ca-certificates curl fakeroot gnupg2 pv rsync xz-utils \
+        ca-certificates curl fakeroot gnupg2 pv rsync xz-utils \
     && curl --fail --silent --show-error --location \
         "https://github.com/qnap-dev/QDK/releases/download/v${QDK_VERSION}/qdk_${QDK_VERSION}_amd64.deb" \
         --output /tmp/qdk.deb \
