@@ -1282,7 +1282,7 @@ jobs:
             -v "$(pwd)/qnap-build:/src" \
             -w /src \
             owncloudci/qnap-qpkg-builder@sha256:e342184e415b1df87ef00b8c1df47988ffd6a9d232a21331556067d400f06189 \
-            sh -c '/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
+            sh -c '/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build --build-arch x86_64 && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
 
       - name: Move QPKG to dist
         run: |
@@ -1334,7 +1334,7 @@ jobs:
             -v "$(pwd)/qnap-build:/src" \
             -w /src \
             owncloudci/qnap-qpkg-builder@sha256:e342184e415b1df87ef00b8c1df47988ffd6a9d232a21331556067d400f06189 \
-            sh -c '/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
+            sh -c '/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build --build-arch arm_64 && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
 
       - name: Move QPKG to dist
         run: |

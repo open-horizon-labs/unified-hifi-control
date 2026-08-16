@@ -1,14 +1,38 @@
-//! Safety contract for the privileged QNAP service wrapper.
+//! Safety and packaging contract for the privileged QNAP service wrapper.
 
 const SERVICE: &str = include_str!("../build/qnap/shared/unified-hifi-control.sh");
 const UNINSTALL: &str = include_str!("../build/qnap/shared/uninstall.sh");
 const QPKG_CONFIG: &str = include_str!("../build/qnap/qpkg.cfg");
+const BUILD_WORKFLOW: &str = include_str!("../.github/workflows/build.yml");
 
 #[test]
 fn qpkg_allows_install_volume_selection_and_migration() {
     assert!(
         QPKG_CONFIG.contains("QPKG_VOLUME_SELECT=3"),
         "QNAP must allow selecting and migrating the package volume instead of forcing the system volume"
+    );
+}
+
+#[test]
+fn qnap_jobs_pin_qdk_architecture_to_the_binary_they_package() {
+    let x64_job = BUILD_WORKFLOW
+        .split("build-qnap-x64:")
+        .nth(1)
+        .and_then(|tail| tail.split("build-qnap-arm:").next())
+        .expect("x64 QNAP job exists");
+    let arm_job = BUILD_WORKFLOW
+        .split("build-qnap-arm:")
+        .nth(1)
+        .and_then(|tail| tail.split("build-docker-x64:").next())
+        .expect("ARM QNAP job exists");
+
+    assert!(
+        x64_job.contains("qbuild --build-dir /src/build --build-arch x86_64"),
+        "the x64 package must be built for x86_64 explicitly"
+    );
+    assert!(
+        arm_job.contains("qbuild --build-dir /src/build --build-arch arm_64"),
+        "the ARM package must be built for arm_64 explicitly"
     );
 }
 
