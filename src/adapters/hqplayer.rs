@@ -7459,7 +7459,34 @@ impl HqpAdapter {
     /// daemon moments even if the legacy response still looked plausible.
     async fn read_coherent_pipeline(&self) -> Result<CoherentPipelineSnapshot> {
         let _operation_guard = self.operation_lock.lock().await;
-        self.read_coherent_pipeline_under_operation().await
+        let snapshot = self.read_coherent_pipeline_under_operation().await?;
+        self.remember_rate_from_snapshot(&snapshot).await;
+        Ok(snapshot)
+    }
+
+    async fn remember_rate_from_snapshot(&self, snapshot: &CoherentPipelineSnapshot) {
+        let Some(rate) = snapshot
+            .chain
+            .rates
+            .iter()
+            .find(|rate| rate.index == snapshot.state.rate)
+            .map(|rate| rate.rate)
+            .filter(|rate| *rate != 0)
+        else {
+            return;
+        };
+        let family = snapshot
+            .chain
+            .modes
+            .iter()
+            .find(|mode| mode.index == u32::from(snapshot.state.mode))
+            .and_then(|mode| Self::mode_family(&mode.name));
+        let mut state = self.state.write().await;
+        match family {
+            Some(ModeFamily::Pcm) => state.remembered_pcm_rate = Some(rate),
+            Some(ModeFamily::Sdm) => state.remembered_sdm_rate = Some(rate),
+            _ => {}
+        }
     }
 
     async fn read_coherent_pipeline_under_operation(&self) -> Result<CoherentPipelineSnapshot> {
@@ -7888,24 +7915,6 @@ impl HqpAdapter {
                 },
             },
         };
-
-        // Seed the same per-family memory used by explicit SetRate calls from authoritative State.
-        // This lets an adapter that attached after another controller configured the engine preserve
-        // that family on later switches instead of learning only from its own writes.
-        if let Some(rate) = rates
-            .iter()
-            .find(|rate| rate.index == state.rate)
-            .map(|rate| rate.rate)
-            .filter(|rate| *rate != 0)
-        {
-            let family = Self::mode_family(&get_mode_by_index(state.mode));
-            let mut adapter_state = self.state.write().await;
-            match family {
-                Some(ModeFamily::Pcm) => adapter_state.remembered_pcm_rate = Some(rate),
-                Some(ModeFamily::Sdm) => adapter_state.remembered_sdm_rate = Some(rate),
-                _ => {}
-            }
-        }
 
         Ok(CoherentPipelineSnapshot {
             legacy,
