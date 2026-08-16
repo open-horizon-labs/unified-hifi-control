@@ -13,7 +13,7 @@ use crate::bus::runtime::{
     CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
     HqpRuntimeCommand, RuntimeCommand,
 };
-use crate::bus::{Command, PrefixedZoneId, SharedBus};
+use crate::bus::{Command, HqpImageSource, PrefixedZoneId, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -41,6 +41,7 @@ pub struct AppState {
     pub roon: Arc<RoonAdapter>,
     pub hqplayer: Arc<HqpAdapter>,
     pub hqp_instances: Arc<HqpInstanceManager>,
+    hqp_images: Arc<dyn HqpImageSource>,
     pub hqp_zone_links: Arc<HqpZoneLinkService>,
     pub lms: Arc<LmsAdapter>,
     pub openhome: Arc<OpenHomeAdapter>,
@@ -83,10 +84,12 @@ impl AppState {
         start_time: Instant,
         shutdown: CancellationToken,
     ) -> Self {
+        let hqp_images: Arc<dyn HqpImageSource> = hqp_instances.clone();
         Self {
             roon,
             hqplayer,
             hqp_instances,
+            hqp_images,
             hqp_zone_links,
             lms,
             openhome,
@@ -149,12 +152,7 @@ impl AppState {
                 "UPnP zones don't support image retrieval - the protocol doesn't expose album art URLs"
             )
         } else if let Some(instance) = zone_id.strip_prefix("hqplayer:") {
-            let adapter = self
-                .hqp_instances
-                .get(instance)
-                .await
-                .ok_or_else(|| anyhow::anyhow!("Unknown HQPlayer instance: {instance}"))?;
-            adapter.get_current_cover().await?
+            self.hqp_images.get_current_cover(instance).await?
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
             let img = self.roon.get_image(image_key, width, height).await?;
             ImageData {

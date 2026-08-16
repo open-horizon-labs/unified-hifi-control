@@ -292,6 +292,14 @@ pub struct ImageData {
     pub data: Vec<u8>,
 }
 
+/// Narrow provider boundary for HQPlayer's current-cover resource.
+///
+/// HTTP surfaces depend on this capability rather than reaching into the concrete instance manager.
+#[async_trait::async_trait]
+pub trait HqpImageSource: Send + Sync {
+    async fn get_current_cover(&self, instance: &str) -> anyhow::Result<ImageData>;
+}
+
 /// Zone update payload for partial updates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ZoneUpdate {

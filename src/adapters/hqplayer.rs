@@ -9671,6 +9671,17 @@ impl HqpInstanceManager {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::bus::HqpImageSource for HqpInstanceManager {
+    async fn get_current_cover(&self, instance: &str) -> Result<crate::bus::ImageData> {
+        let adapter = self
+            .get(instance)
+            .await
+            .ok_or_else(|| anyhow!("Unknown HQPlayer instance: {instance}"))?;
+        adapter.get_current_cover().await
+    }
+}
+
 /// Consume one exact-instance reliable endpoint.  The native write is not a success response:
 /// only the coherent readback's correlated projection commit resolves the caller's ticket.
 async fn run_hqplayer_command_endpoint(
