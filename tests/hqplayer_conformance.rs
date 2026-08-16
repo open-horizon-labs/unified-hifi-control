@@ -7153,6 +7153,91 @@ async fn switching_modes_restores_each_familys_last_verified_rate_pin() {
     h.stop();
 }
 
+/// `Auto` is not a usable return target on every NAA path. When HQPlayer has resolved Auto to an
+/// exact live output rate, that verified output is the only safe family-specific value available
+/// to retain before `SetMode` clears the pin.
+#[tokio::test]
+async fn an_auto_pin_learns_the_live_pcm_rate_before_a_round_trip_through_sdm() {
+    let h = Harness::verified().await;
+    h.model.external_change(|state| {
+        state.playback = 2;
+        state.mode_index = 1;
+        state.loaded_chain = LoadedChain::Pcm;
+        state.rate_index = 0;
+        state.active_rate_hz = 352_800;
+    });
+
+    let observed = h
+        .adapter
+        .get_pipeline_status()
+        .await
+        .expect("live PCM state");
+    assert_eq!(observed.settings.samplerate.selected.value, "0");
+    assert_eq!(observed.status.active_rate, 352_800);
+
+    h.adapter
+        .set_mode("SDM (DSD)")
+        .await
+        .applied()
+        .expect("enter SDM");
+    h.adapter
+        .set_rate(5_644_800)
+        .await
+        .applied()
+        .expect("pin SDM");
+    h.adapter
+        .set_mode("PCM")
+        .await
+        .applied()
+        .expect("return to PCM");
+
+    assert_eq!(
+        h.model.state().rate_index,
+        7,
+        "the exact 352.8 kHz output observed under Auto must become PCM's safe return rate"
+    );
+    h.stop();
+}
+
+#[tokio::test]
+async fn an_auto_output_absent_from_the_fresh_rate_list_is_never_invented_as_a_pin() {
+    let h = Harness::verified().await;
+    h.model.external_change(|state| {
+        state.playback = 2;
+        state.mode_index = 1;
+        state.loaded_chain = LoadedChain::Pcm;
+        state.rate_index = 0;
+        state.active_rate_hz = 123_456;
+    });
+
+    h.adapter
+        .get_pipeline_status()
+        .await
+        .expect("observe an unpinnable live rate");
+    h.adapter
+        .set_mode("SDM (DSD)")
+        .await
+        .applied()
+        .expect("enter SDM");
+    h.adapter
+        .set_rate(5_644_800)
+        .await
+        .applied()
+        .expect("pin SDM");
+    h.adapter
+        .set_mode("PCM")
+        .await
+        .applied()
+        .expect("return to PCM");
+
+    assert_eq!(
+        h.model.state().rate_index,
+        0,
+        "a live number the PCM enumeration cannot pin must leave Auto truthful"
+    );
+    h.stop();
+}
+
 /// The daemon names the DSD mode `"SDM (DSD)"`, so a caller asking for `"DSD"` or `"SDM"` must reach
 /// it by **semantic alias**, never by assuming a list position (HQP-C-013's device fixture is why
 /// position is unsafe).

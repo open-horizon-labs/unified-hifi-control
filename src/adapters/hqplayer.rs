@@ -7465,14 +7465,31 @@ impl HqpAdapter {
     }
 
     async fn remember_rate_from_snapshot(&self, snapshot: &CoherentPipelineSnapshot) {
-        let Some(rate) = snapshot
+        let configured_rate = snapshot
             .chain
             .rates
             .iter()
             .find(|rate| rate.index == snapshot.state.rate)
             .map(|rate| rate.rate)
-            .filter(|rate| *rate != 0)
-        else {
+            .filter(|rate| *rate != 0);
+        // Auto is a real daemon selection, but not a safe return target for every NAA. Once the
+        // running engine has resolved it to an exact output rate, retain that observable value as
+        // the family's safe return pin. This extends HQPTuner's explicit per-family memory to the
+        // one trustworthy value Auto reveals. Require it to belong to the current chain's fresh
+        // enumeration: Status can otherwise carry stale or source-relative numbers that the entered
+        // family cannot pin.
+        let live_auto_rate = (snapshot.state.rate == 0
+            && snapshot.playback_status.state != 0
+            && snapshot.playback_status.active_rate != 0)
+            .then_some(snapshot.playback_status.active_rate)
+            .filter(|active| {
+                snapshot
+                    .chain
+                    .rates
+                    .iter()
+                    .any(|candidate| candidate.rate == *active)
+            });
+        let Some(rate) = configured_rate.or(live_auto_rate) else {
             return;
         };
         let family = snapshot
