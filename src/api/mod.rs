@@ -13,7 +13,7 @@ use crate::bus::runtime::{
     CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
     HqpRuntimeCommand, RuntimeCommand,
 };
-use crate::bus::{Command, PrefixedZoneId, SharedBus};
+use crate::bus::{Command, HqpImageSource, PrefixedZoneId, SharedBus};
 use crate::coordinator::AdapterCoordinator;
 use crate::knobs::KnobStore;
 use axum::{
@@ -41,6 +41,7 @@ pub struct AppState {
     pub roon: Arc<RoonAdapter>,
     pub hqplayer: Arc<HqpAdapter>,
     pub hqp_instances: Arc<HqpInstanceManager>,
+    hqp_images: Arc<dyn HqpImageSource>,
     pub hqp_zone_links: Arc<HqpZoneLinkService>,
     pub lms: Arc<LmsAdapter>,
     pub openhome: Arc<OpenHomeAdapter>,
@@ -83,10 +84,12 @@ impl AppState {
         start_time: Instant,
         shutdown: CancellationToken,
     ) -> Self {
+        let hqp_images: Arc<dyn HqpImageSource> = hqp_instances.clone();
         Self {
             roon,
             hqplayer,
             hqp_instances,
+            hqp_images,
             hqp_zone_links,
             lms,
             openhome,
@@ -116,7 +119,7 @@ impl AppState {
 
     /// Fetch image from the appropriate adapter based on zone_id prefix
     ///
-    /// Routes to the correct backend (Roon, LMS, OpenHome) based on the zone_id
+    /// Routes to the correct backend (Roon, LMS, OpenHome, HQPlayer) based on the zone_id
     /// prefix and fetches the image using that adapter's API.
     ///
     /// Note: UPnP zones don't support image retrieval as the protocol doesn't
@@ -148,6 +151,8 @@ impl AppState {
             anyhow::bail!(
                 "UPnP zones don't support image retrieval - the protocol doesn't expose album art URLs"
             )
+        } else if let Some(instance) = zone_id.strip_prefix("hqplayer:") {
+            self.hqp_images.get_current_cover(instance).await?
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
             let img = self.roon.get_image(image_key, width, height).await?;
             ImageData {
@@ -1203,6 +1208,8 @@ async fn hqp_apply_named_setting(
         "mode" | "filter1x" | "filterNx" | "filternx" | "shaper" | "dither" | "junk_filter" => {
             value.to_string()
         }
+        "matrix_profile" if value.eq_ignore_ascii_case("[default]") => String::new(),
+        "matrix_profile" => value.to_string(),
         "convolution" | "adaptive_volume" | "random" => parse_hqp_bool(value)?.to_string(),
         "repeat" => parse_hqp_repeat(value)?.to_string(),
         "samplerate" | "rate" => {
@@ -1318,6 +1325,7 @@ pub async fn hqp_pipeline_update_handler(
         "adaptive_volume",
         "repeat",
         "random",
+        "matrix_profile",
     ];
     if !valid_settings.contains(&req.setting.as_str()) {
         return (
@@ -1358,19 +1366,16 @@ pub async fn hqp_pipeline_update_handler(
     };
 
     match result {
-        Ok(()) => {
-            // Publish verified readback first, then answer from the one shared state owner.
-            if refresh_hqp_advanced_aggregate(&state, "default")
-                .await
-                .is_ok()
-            {
-                if let Some(pipeline) = hqp_default_pipeline_from_aggregator(&state).await {
-                    return (StatusCode::OK, Json(pipeline)).into_response();
-                }
-            }
-            // Preserve the legacy success fallback when the post-write refresh cannot complete.
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-        }
+        Ok(()) => match hqp_default_pipeline_from_aggregator(&state).await {
+            Some(pipeline) => (StatusCode::OK, Json(pipeline)).into_response(),
+            None => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "HQPlayer accepted and verified the native setting, but its canonical pipeline readback is unavailable".to_string(),
+                }),
+            )
+                .into_response(),
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1921,12 +1926,6 @@ pub async fn hqp_configure_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpConfigRequest>,
 ) -> impl IntoResponse {
-    // Clear zone links for "default" instance - prevents stale data after host change
-    state
-        .hqp_zone_links
-        .remove_links_for_instance("default")
-        .await;
-
     // Configure the adapter
     state
         .hqplayer

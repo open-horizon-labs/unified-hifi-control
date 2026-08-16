@@ -384,26 +384,31 @@ pub(super) fn project_native(
             CONTROL_TRANSPORT_PLAY,
             "control.transport.play",
             CONTROL_TRANSPORT_STATE,
+            true,
         ),
         transport_action_control(
             CONTROL_TRANSPORT_PAUSE,
             "control.transport.pause",
             CONTROL_TRANSPORT_STATE,
+            true,
         ),
         transport_action_control(
             CONTROL_TRANSPORT_STOP,
             "control.transport.stop",
             CONTROL_TRANSPORT_STATE,
+            true,
         ),
         transport_action_control(
             CONTROL_TRANSPORT_PREVIOUS,
             "control.transport.previous",
             CONTROL_METADATA_TRACK_ID,
+            observation.zone.is_previous_allowed,
         ),
         transport_action_control(
             CONTROL_TRANSPORT_NEXT,
             "control.transport.next",
             CONTROL_METADATA_TRACK_ID,
+            observation.zone.is_next_allowed,
         ),
         transport_state_control(observation),
         metadata_control(
@@ -696,7 +701,12 @@ fn transport_state_control(observation: &HqpNativeObservation) -> Control {
     )
 }
 
-fn transport_action_control(id: &str, label_key: &str, verify_via: &str) -> Control {
+fn transport_action_control(
+    id: &str,
+    label_key: &str,
+    verify_via: &str,
+    available: bool,
+) -> Control {
     control(
         id,
         ControlKind::Action,
@@ -705,7 +715,15 @@ fn transport_action_control(id: &str, label_key: &str, verify_via: &str) -> Cont
         Vec::new(),
         None,
         None,
-        Availability::available(),
+        if available {
+            Availability::available()
+        } else {
+            unavailable(
+                ReasonCode::NotSupported,
+                ReasonScope::Observed,
+                "reason.transport.queue_owned_by_source",
+            )
+        },
         Some(ApplySemantics {
             lane: ApplyLane::Immediate,
             effect: ApplyEffect::VerifiedPending,
@@ -3053,6 +3071,7 @@ mod tests {
                 info: None,
             },
             pipeline: crate::adapters::hqplayer::PipelineStatus::default(),
+            active_profile: Some("Zen".to_string()),
             transport: HqpNativeTransportState::Playing,
             metadata: HqpNativeMetadata {
                 track_id: Some("track-42".to_string()),

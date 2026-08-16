@@ -93,6 +93,8 @@ pub struct McpPlayResult {
 pub struct McpHqpStatus {
     pub connected: bool,
     pub host: Option<String>,
+    /// Active named HQPlayer configuration; `None` means the unnamed base configuration.
+    pub active_profile: Option<String>,
     pub pipeline: Option<McpPipelineStatus>,
     pub options: Option<McpHqpOptions>,
     pub options_unavailable_reason: Option<String>,
@@ -101,6 +103,8 @@ pub struct McpHqpStatus {
 #[derive(Debug, Serialize)]
 pub struct McpPipelineStatus {
     pub state: String,
+    /// The mode the running HQPlayer engine reports, distinct from `options.mode.current`.
+    pub mode: String,
     pub filter: String,
     pub shaper: String,
     pub rate: u32,

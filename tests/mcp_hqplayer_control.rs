@@ -488,7 +488,8 @@ async fn mcp_hqplayer_refusals_set_the_call_tool_error_flag() {
 }
 
 /// **Client expectation.** Every transport verb the direct zone advertises routes through MCP, not
-/// just play/pause.
+/// just play/pause. A native HQPlayer queue owns Next/Previous when its cursor is present; linked
+/// source zones continue to use their source transport.
 ///
 /// **RED:** `stop`, `seek` are not recognized `hifi_control` action values at all (they fall into
 /// the generic pass-through and are sent as an unknown action to Roon); `next`/`previous` fall
@@ -793,6 +794,7 @@ async fn mcp_status_does_not_publish_adapter_private_connection_state() {
 #[tokio::test]
 async fn mcp_hqplayer_status_profiles_and_pipeline_tools_reach_the_default_instance() {
     let model = playing_daemon();
+    model.external_change(|state| state.active_configuration = "Zen".to_string());
     let server = start_daemon(&model).await;
     let rig = Rig::new().await;
     rig.attach_default(&server).await;
@@ -808,6 +810,14 @@ async fn mcp_hqplayer_status_profiles_and_pipeline_tools_reach_the_default_insta
     let status = rig.call_tool("hifi_hqplayer_status", json!({})).await;
     let status_json: Value = serde_json::from_str(&text_of(&status)).expect("status JSON");
     assert_eq!(status_json["connected"], true, "status={status_json}");
+    assert_eq!(
+        status_json["active_profile"], "Zen",
+        "ConfigurationGet must reach MCP as the optional active named profile: {status_json}"
+    );
+    assert!(
+        status_json["pipeline"]["mode"].is_string(),
+        "MCP must expose the live engine mode separately from options.mode.current: {status_json}"
+    );
 
     let profiles = rig.call_tool("hifi_hqplayer_profiles", json!({})).await;
     let profiles_text = text_of(&profiles);
@@ -848,7 +858,10 @@ async fn mcp_advanced_hqplayer_tools_target_the_named_instance_not_default() {
     let default_model = playing_daemon();
     default_model.external_change(|s| s.filter_nx_index = 0);
     let rig_model = playing_daemon();
-    rig_model.external_change(|s| s.filter_nx_index = 1);
+    rig_model.external_change(|s| {
+        s.filter_nx_index = 1;
+        s.matrix_profile.clear();
+    });
     let default_server = start_daemon(&default_model).await;
     let rig_server = start_daemon(&rig_model).await;
     let rig = Rig::new().await;
@@ -898,6 +911,18 @@ async fn mcp_advanced_hqplayer_tools_target_the_named_instance_not_default() {
     assert!(
         options["repeat"].is_string(),
         "status must expose repeat as off/one/all: {options}"
+    );
+    assert_eq!(
+        options["matrix_profile"]["current"], "[Default]",
+        "the unnamed matrix must use HQPTuner's friendly identity: {options}"
+    );
+    assert!(
+        options["matrix_profile"]["choices"]
+            .as_array()
+            .is_some_and(|choices| {
+                choices.contains(&json!("[Default]")) && choices.contains(&json!("Default"))
+            }),
+        "the unnamed [Default] matrix and a saved profile literally named Default are distinct choices: {options}"
     );
 
     let default_before = default_model.request_count("SetFilter");

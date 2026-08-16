@@ -1,7 +1,79 @@
-//! Safety contract for the privileged QNAP service wrapper.
+//! Safety and packaging contract for the privileged QNAP service wrapper.
 
 const SERVICE: &str = include_str!("../build/qnap/shared/unified-hifi-control.sh");
 const UNINSTALL: &str = include_str!("../build/qnap/shared/uninstall.sh");
+const QPKG_CONFIG: &str = include_str!("../build/qnap/qpkg.cfg");
+const BUILD_WORKFLOW: &str = include_str!("../.github/workflows/build.yml");
+const QNAP_DOCKERFILE: &str = include_str!("../build/qnap/Dockerfile");
+
+#[test]
+fn qpkg_allows_install_volume_selection_and_migration() {
+    assert!(
+        QPKG_CONFIG.contains("QPKG_VOLUME_SELECT=3"),
+        "QNAP must allow selecting and migrating the package volume instead of forcing the system volume"
+    );
+}
+
+#[test]
+fn qnap_jobs_pin_qdk_architecture_to_the_binary_they_package() {
+    let x64_job = BUILD_WORKFLOW
+        .split("build-qnap-x64:")
+        .nth(1)
+        .and_then(|tail| tail.split("build-qnap-arm:").next())
+        .expect("x64 QNAP job exists");
+    let arm_job = BUILD_WORKFLOW
+        .split("build-qnap-arm:")
+        .nth(1)
+        .and_then(|tail| tail.split("build-docker-x64:").next())
+        .expect("ARM QNAP job exists");
+
+    assert!(
+        x64_job.contains("qbuild --build-dir /src/build --build-arch x86_64"),
+        "the x64 package must be built for x86_64 explicitly"
+    );
+    assert!(
+        arm_job.contains("qbuild --build-dir /src/build --build-arch arm_64"),
+        "the ARM package must be built for arm_64 explicitly"
+    );
+}
+
+#[test]
+fn qnap_jobs_use_the_pinned_first_party_qdk_builder() {
+    assert!(
+        !BUILD_WORKFLOW.contains("owncloudci/qnap-qpkg-builder"),
+        "QNAP builds must not depend on the unowned third-party builder image"
+    );
+    assert!(
+        BUILD_WORKFLOW
+            .matches("--file build/qnap/Dockerfile")
+            .count()
+            >= 2,
+        "each QNAP architecture job must build the repository-owned QDK image"
+    );
+    assert!(
+        BUILD_WORKFLOW.matches("qnap-qdk:2.5.3").count() >= 4,
+        "both QNAP jobs must use the pinned QDK image tag for build and run"
+    );
+    assert!(
+        QNAP_DOCKERFILE.contains("FROM ubuntu:20.04@sha256:"),
+        "the QDK builder base image must be digest-pinned"
+    );
+    assert!(
+        QNAP_DOCKERFILE.contains(
+            "qnap-dev/QDK/releases/download/v${QDK_VERSION}/qdk_${QDK_VERSION}_amd64.deb"
+        ),
+        "the builder must download QDK from the official qnap-dev release"
+    );
+    assert!(
+        QNAP_DOCKERFILE
+            .contains("17b3841b7d4590a4ee025844ba583304b5e3c497d9fa8934d5175131d3908022"),
+        "the official QDK 2.5.3 artifact must be checksum-pinned"
+    );
+    assert!(
+        BUILD_WORKFLOW.contains("/usr/share/QDK/bin/qbuild"),
+        "the workflow must invoke the path shipped by official QDK 2.5.3"
+    );
+}
 
 #[test]
 fn qnap_service_keeps_credentials_private_and_stops_only_its_recorded_process() {
