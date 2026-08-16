@@ -277,4 +277,143 @@
   .hqp-seek:disabled {
     @apply cursor-not-allowed opacity-45;
   }
+
+  .hqp-page-heading {
+    @apply mb-7;
+  }
+
+  .hqp-connection-bar {
+    @apply flex flex-col gap-3 rounded-xl px-4 py-3 sm:flex-row sm:items-center sm:justify-between;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-default);
+  }
+
+  .hqp-signal {
+    @apply relative block size-2.5 shrink-0 rounded-full;
+    background: var(--secondary-success-color);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--secondary-success-color) 35%, transparent);
+    animation: hqp-signal 2.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+  }
+
+  .hqp-onboarding-path {
+    @apply grid grid-cols-1 gap-0 border-y sm:grid-cols-3;
+    border-color: var(--border-subtle);
+  }
+
+  .hqp-onboarding-path li {
+    @apply flex items-center gap-3 py-3 sm:px-4;
+  }
+
+  .hqp-onboarding-path li:first-child {
+    @apply sm:pl-0;
+  }
+
+  .hqp-onboarding-path li + li {
+    @apply border-t sm:border-l sm:border-t-0;
+    border-color: var(--border-subtle);
+  }
+
+  .hqp-onboarding-path li > span {
+    @apply flex size-7 shrink-0 items-center justify-center rounded-full text-xs font-semibold;
+    background: var(--surface-hover);
+    color: var(--text-primary);
+  }
+
+  .hqp-onboarding-path strong,
+  .hqp-onboarding-path small {
+    @apply block;
+  }
+
+  .hqp-onboarding-path strong {
+    @apply text-sm;
+  }
+
+  .hqp-onboarding-path small {
+    @apply mt-0.5 text-xs;
+    color: var(--text-muted);
+  }
+
+  .hqp-empty-path {
+    @apply flex flex-col gap-4 rounded-xl p-5 sm:flex-row sm:items-center;
+    background: var(--surface-elevated);
+    border: 1px dashed var(--border-default);
+  }
+
+  .hqp-empty-path > span {
+    @apply h-10 w-20 shrink-0;
+  }
+
+  .hqp-empty-path > span > svg {
+    @apply size-full;
+    fill: none;
+    stroke: var(--accent-color);
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 2;
+  }
+
+  .hqp-album-art {
+    box-shadow: 0 8px 20px color-mix(in srgb, black 22%, transparent);
+  }
+
+  .hqp-pairing-explainer {
+    @apply grid grid-cols-[minmax(0,1fr)_2.5rem_minmax(0,1fr)] items-center gap-2 rounded-xl px-3 py-4 sm:px-5;
+    background: var(--surface-base);
+  }
+
+  .hqp-pairing-explainer > span,
+  .hqp-saved-path > span {
+    @apply h-4 w-10;
+  }
+
+  .hqp-pairing-explainer > span > svg,
+  .hqp-saved-path > span > svg {
+    @apply size-full;
+    fill: none;
+    stroke: var(--accent-color);
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 2;
+  }
+
+  .hqp-path-node {
+    @apply min-w-0;
+  }
+
+  .hqp-path-node:last-child {
+    @apply text-right;
+  }
+
+  .hqp-path-node span,
+  .hqp-path-node small {
+    @apply block;
+  }
+
+  .hqp-path-node span {
+    @apply text-sm font-semibold;
+  }
+
+  .hqp-path-node small {
+    @apply mt-0.5 truncate text-xs;
+    color: var(--text-muted);
+  }
+
+  .hqp-saved-path {
+    @apply grid grid-cols-[minmax(0,1fr)_2.5rem_minmax(0,1fr)] items-center gap-3;
+  }
+}
+
+@keyframes hqp-signal {
+  0%, 55% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--secondary-success-color) 35%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hqp-signal {
+    animation: none;
+  }
 }

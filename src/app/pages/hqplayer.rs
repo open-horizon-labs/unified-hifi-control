@@ -332,7 +332,7 @@ pub fn HqPlayer() -> Element {
         let u = username();
         let pw = password();
 
-        config_status.set(Some("Saving...".to_string()));
+        config_status.set(Some("Testing connection…".to_string()));
 
         spawn(async move {
             let req = HqpConfigureRequest {
@@ -350,9 +350,12 @@ pub fn HqPlayer() -> Element {
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     if connected {
-                        config_status.set(Some("Connected!".to_string()));
+                        config_status.set(Some("Connected and verified.".to_string()));
                     } else {
-                        config_status.set(Some("Saved but not connected".to_string()));
+                        config_status.set(Some(
+                            "Saved, but HQPlayer did not answer. Check the host and control port."
+                                .to_string(),
+                        ));
                     }
                     status.restart();
                     pipeline.restart();
@@ -360,7 +363,9 @@ pub fn HqPlayer() -> Element {
                     refresh_advanced_projection(matrix, matrix_refresh, false);
                 }
                 Err(e) => {
-                    config_status.set(Some(format!("Error: {}", e)));
+                    config_status.set(Some(format!(
+                        "Connection failed: {e}. Check the address, ports, and web credentials."
+                    )));
                 }
             }
         });
@@ -462,7 +467,7 @@ pub fn HqPlayer() -> Element {
                 }
                 Err(error) => {
                     zone_match_feedback.set(Some(ZoneMatchFeedback::Error(format!(
-                        "Could not save the zone match: {error}"
+                        "Could not pair this playback path: {error}"
                     ))));
                 }
             }
@@ -484,7 +489,7 @@ pub fn HqPlayer() -> Element {
                 }
                 Err(error) => {
                     zone_match_feedback.set(Some(ZoneMatchFeedback::Error(format!(
-                        "Could not remove the zone match: {error}"
+                        "Could not remove this pairing: {error}"
                     ))));
                 }
             }
@@ -513,6 +518,7 @@ pub fn HqPlayer() -> Element {
         .unwrap_or_default();
     let zone_match_resources_loaded =
         zones_loaded_once() && zone_links_loaded_once() && instances_loaded_once();
+    let controlled_zones_loaded = zones_loaded_once() && zone_links_loaded_once();
     let np_map = now_playing_map();
 
     let controlled_zones = controlled_zones_signal();
@@ -527,7 +533,12 @@ pub fn HqPlayer() -> Element {
             title: "HQPlayer".to_string(),
             nav_active: "hqplayer".to_string(),
 
-            h1 { class: "text-2xl font-bold mb-6", "HQPlayer" }
+            div { class: "hqp-page-heading",
+                h1 { class: "text-2xl font-bold", "HQPlayer" }
+                p { class: "mt-2 max-w-2xl text-sm text-muted sm:text-base",
+                    "Start playback in the app you already use, then see and shape HQPlayer's live output here."
+                }
+            }
 
             // Error display
             if let Some(ref error) = hqp_error() {
@@ -540,7 +551,35 @@ pub fn HqPlayer() -> Element {
             if !is_connected {
                 section { id: "hqp-config", class: "mb-8",
                     div { class: "card p-6",
-                        h2 { class: "text-lg font-semibold mb-4", "Connection" }
+                        div { class: "mb-5 max-w-2xl",
+                            h2 { class: "text-lg font-semibold", "Connect HQPlayer" }
+                            p { class: "mt-1 text-sm text-muted",
+                                "Add HQPlayer Embedded once. Unified Hi-Fi Control will verify the native engine and its web artwork endpoint."
+                            }
+                        }
+                        ol { class: "hqp-onboarding-path mb-6",
+                            li {
+                                span { "1" }
+                                div {
+                                    strong { "Connect" }
+                                    small { "Verify the engine" }
+                                }
+                            }
+                            li {
+                                span { "2" }
+                                div {
+                                    strong { "Pair" }
+                                    small { "Name the playback path" }
+                                }
+                            }
+                            li {
+                                span { "3" }
+                                div {
+                                    strong { "Listen & tune" }
+                                    small { "Control live DSP" }
+                                }
+                            }
+                        }
                         ConfigForm {
                             host: host,
                             port: port,
@@ -557,12 +596,22 @@ pub fn HqPlayer() -> Element {
 
             // Connected: show status bar with collapsible settings
             if is_connected {
-                div { class: "flex items-center justify-between mb-6",
-                    span { class: "status-ok", "✓ Connected to {current_status.as_ref().and_then(|s| s.host.as_deref()).unwrap_or(\"HQPlayer\")}" }
+                div { class: "hqp-connection-bar mb-8",
+                    div { class: "flex min-w-0 items-center gap-3",
+                        span { class: "hqp-signal", aria_hidden: "true" }
+                        div { class: "min-w-0",
+                            p { class: "font-semibold truncate",
+                                "Connected to {current_status.as_ref().and_then(|s| s.host.as_deref()).unwrap_or(\"HQPlayer\")}"
+                            }
+                            p { class: "mt-0.5 text-xs text-muted sm:text-sm",
+                                "Live engine reads and DSP changes are verified with HQPlayer."
+                            }
+                        }
+                    }
                     button {
                         class: "btn btn-ghost btn-sm",
                         onclick: move |_| show_config.toggle(),
-                        if show_config() { "Hide Settings" } else { "Settings" }
+                        if show_config() { "Close connection settings" } else { "Connection settings" }
                     }
                 }
 
@@ -588,7 +637,12 @@ pub fn HqPlayer() -> Element {
             // Every direct or linked HQPlayer zone uses the same aggregator-backed control path.
             if is_connected && !controlled_zones.is_empty() {
                 section { id: "hqp-zones", class: "mb-8",
-                    h2 { class: "text-lg font-semibold mb-4", "HQPlayer Zones" }
+                    div { class: "mb-4 max-w-3xl",
+                        h2 { class: "text-lg font-semibold", "Now playing through HQPlayer" }
+                        p { class: "mt-1 text-sm text-muted",
+                            "Transport comes from the playback zone; sound shaping comes from HQPlayer. Paired zones keep both together."
+                        }
+                    }
                     div { class: "grid gap-4 grid-cols-1",
                         for zone in controlled_zones.iter() {
                             LinkedZoneCard {
@@ -602,10 +656,35 @@ pub fn HqPlayer() -> Element {
                 }
             }
 
+            if is_connected && controlled_zones_loaded && controlled_zones.is_empty() {
+                section { id: "hqp-zones-empty", class: "hqp-empty-path mb-8",
+                    span { aria_hidden: "true",
+                        svg { view_box: "0 0 48 24",
+                            circle { cx: "8", cy: "12", r: "5" }
+                            path { d: "M14 12h18" }
+                            path { d: "m27 7 5 5-5 5" }
+                            circle { cx: "40", cy: "12", r: "5" }
+                        }
+                    }
+                    div { class: "min-w-0 flex-1",
+                        h2 { class: "font-semibold", "Bring your playback zone into view" }
+                        p { class: "mt-1 max-w-2xl text-sm text-muted",
+                            "If Roon, JPLAY, or another controller already sends this zone through HQPlayer, pair their names below. Audio routing stays exactly as configured."
+                        }
+                    }
+                    a { class: "btn btn-primary shrink-0", href: "#hqp-zone-links", "Pair a playback zone" }
+                }
+            }
+
             // DSP Settings (only if connected)
             if is_connected {
                 section { id: "hqp-dsp", class: "mb-8",
-                    h2 { class: "text-lg font-semibold mb-4", "DSP Settings" }
+                    div { class: "mb-4 max-w-3xl",
+                        h2 { class: "text-lg font-semibold", "Shape the sound" }
+                        p { class: "mt-1 text-sm text-muted",
+                            "Playing now is measured from HQPlayer's engine. The controls below set the pipeline and confirm what HQPlayer accepted."
+                        }
+                    }
                     DspSettings {
                         pipeline: current_pipeline,
                         profiles: profiles_list,
@@ -618,25 +697,28 @@ pub fn HqPlayer() -> Element {
                 }
             }
 
-            // Zone matching section
-            section { id: "hqp-zone-links", class: "mb-8",
-                div { class: "mb-4 max-w-3xl",
-                    h2 { class: "text-lg font-semibold", "Zone matching" }
-                    p { class: "mt-1 text-sm text-muted",
-                        "Match a playback zone that already sends audio through HQPlayer. This combines playback and DSP controls; it does not change audio routing."
+            // Pairing is useful only after HQPlayer itself is connected. Keeping it hidden during
+            // first-run setup preserves the connect → pair → listen progression above.
+            if is_connected {
+                section { id: "hqp-zone-links", class: "mb-8",
+                    div { class: "mb-4 max-w-3xl",
+                        h2 { class: "text-lg font-semibold", "Pair a playback zone" }
+                        p { class: "mt-1 text-sm text-muted",
+                            "Tell Unified Hi-Fi Control which playback-zone name and HQPlayer instance describe the same existing signal path."
+                        }
                     }
-                }
-                div { class: "card overflow-hidden",
-                    ZoneLinkTable {
-                        key: "{zone_match_key}",
-                        zones: zones_list,
-                        links: links_list,
-                        instances: instances_list,
-                        resources_loaded: zone_match_resources_loaded,
-                        busy: zone_match_busy(),
-                        feedback: zone_match_feedback(),
-                        on_link: link_zone,
-                        on_unlink: unlink_zone,
+                    div { class: "card overflow-hidden",
+                        ZoneLinkTable {
+                            key: "{zone_match_key}",
+                            zones: zones_list,
+                            links: links_list,
+                            instances: instances_list,
+                            resources_loaded: zone_match_resources_loaded,
+                            busy: zone_match_busy(),
+                            feedback: zone_match_feedback(),
+                            on_link: link_zone,
+                            on_unlink: unlink_zone,
+                        }
                     }
                 }
             }
@@ -649,8 +731,8 @@ mod tests {
     use super::{
         filter_hqp_options, format_hqp_rate, hqp_live_mode_readout, hqp_live_output_readout,
         hqp_shaper_minimum_rate_hz, hqplayer_mute_control, is_zone_match_candidate,
-        normalized_match_selection, zone_match_availability, CoalescingRefresh,
-        ZoneMatchAvailability,
+        normalized_match_selection, playback_path_label, zone_match_availability,
+        CoalescingRefresh, ZoneMatchAvailability,
     };
     use crate::app::api::{HqpOption, HqpPipelineStatus, HqpSettingOptions};
 
@@ -845,6 +927,13 @@ mod tests {
             "a saved zone disappears from the candidate list, so the form must select a valid next choice"
         );
     }
+
+    #[test]
+    fn playback_paths_name_direct_and_paired_control_without_implying_routing() {
+        assert_eq!(playback_path_label(Some("hqplayer")), "Direct HQPlayer");
+        assert_eq!(playback_path_label(Some("roon")), "Roon + HQPlayer DSP");
+        assert_eq!(playback_path_label(None), "Playback + HQPlayer DSP");
+    }
 }
 
 /// Linked zone card with playback controls
@@ -933,6 +1022,7 @@ fn LinkedZoneCard(
             }
         })
         .unwrap_or_default();
+    let path_label = playback_path_label(zone.source.as_deref());
 
     rsx! {
         article { class: "card p-4 sm:p-5",
@@ -942,7 +1032,7 @@ fn LinkedZoneCard(
                     img {
                         src: "{image_url}",
                         alt: "Album art",
-                        class: "w-20 h-20 sm:w-24 sm:h-24 object-cover rounded-lg bg-elevated flex-shrink-0"
+                        class: "hqp-album-art w-20 h-20 sm:w-24 sm:h-24 object-cover rounded-lg bg-elevated flex-shrink-0"
                     }
                 } else {
                     div { class: "w-20 h-20 sm:w-24 sm:h-24 rounded-lg bg-elevated flex items-center justify-center text-muted text-2xl flex-shrink-0",
@@ -952,7 +1042,10 @@ fn LinkedZoneCard(
 
                 // Info + controls
                 div { class: "flex-1 min-w-0",
-                    h3 { class: "text-base font-semibold truncate mb-1", "{zone.zone_name}" }
+                    div { class: "mb-2 flex flex-wrap items-center gap-2",
+                        h3 { class: "text-base font-semibold truncate", "{zone.zone_name}" }
+                        span { class: "badge badge-secondary", "{path_label}" }
+                    }
 
                     if !track.is_empty() {
                         p { class: "text-sm truncate mb-0.5", "{track}" }
@@ -1075,19 +1168,22 @@ fn ConfigForm(
     rsx! {
         div { class: "space-y-4",
             div {
-                label { class: "block text-sm font-medium mb-1", "Host" }
+                label { class: "block text-sm font-medium mb-1", r#for: "hqp-host", "HQPlayer host" }
                 input {
+                    id: "hqp-host",
                     class: "input",
                     r#type: "text",
                     placeholder: "192.168.1.100",
                     value: "{host}",
                     oninput: move |evt| host.set(evt.value())
                 }
+                p { class: "mt-1 text-xs text-muted", "The hostname or LAN address running HQPlayer Embedded." }
             }
             div { class: "grid grid-cols-1 sm:grid-cols-2 gap-4",
                 div {
-                    label { class: "block text-sm font-medium mb-1", "Native Port" }
+                    label { class: "block text-sm font-medium mb-1", r#for: "hqp-native-port", "Engine control port" }
                     input {
+                        id: "hqp-native-port",
                         class: "input",
                         r#type: "number",
                         value: "{port}",
@@ -1097,10 +1193,12 @@ fn ConfigForm(
                             }
                         }
                     }
+                    p { class: "mt-1 text-xs text-muted", "Usually 4321. Used for playback and DSP control." }
                 }
                 div {
-                    label { class: "block text-sm font-medium mb-1", "Web Port" }
+                    label { class: "block text-sm font-medium mb-1", r#for: "hqp-web-port", "Web and artwork port" }
                     input {
+                        id: "hqp-web-port",
                         class: "input",
                         r#type: "number",
                         value: "{web_port}",
@@ -1110,12 +1208,18 @@ fn ConfigForm(
                             }
                         }
                     }
+                    p { class: "mt-1 text-xs text-muted", "Usually 8088. Used for profiles and current cover art." }
                 }
+            }
+            div { class: "pt-1",
+                p { class: "text-sm font-medium", "Web sign-in" }
+                p { class: "mt-1 text-xs text-muted", "Optional. Leave blank unless HQPlayer's web interface requires credentials." }
             }
             div { class: "grid grid-cols-1 sm:grid-cols-2 gap-4",
                 div {
-                    label { class: "block text-sm font-medium mb-1", "Username" }
+                    label { class: "block text-sm font-medium mb-1", r#for: "hqp-username", "Username" }
                     input {
+                        id: "hqp-username",
                         class: "input",
                         r#type: "text",
                         placeholder: if has_credentials { "(saved)" } else { "admin" },
@@ -1124,8 +1228,9 @@ fn ConfigForm(
                     }
                 }
                 div {
-                    label { class: "block text-sm font-medium mb-1", "Password" }
+                    label { class: "block text-sm font-medium mb-1", r#for: "hqp-password", "Password" }
                     input {
+                        id: "hqp-password",
                         class: "input",
                         r#type: "password",
                         placeholder: if has_credentials { "(saved)" } else { "password" },
@@ -1134,10 +1239,10 @@ fn ConfigForm(
                     }
                 }
             }
-            div { class: "flex items-center gap-4",
-                button { class: "btn btn-primary", onclick: move |_| on_save.call(()), "Save" }
+            div { class: "flex flex-wrap items-center gap-4 pt-1",
+                button { class: "btn btn-primary", onclick: move |_| on_save.call(()), "Save and test connection" }
                 if let Some(ref msg) = config_status {
-                    span { class: if msg.contains("Connected") { "status-ok" } else if msg.starts_with("Error") { "status-err" } else { "text-muted" },
+                    span { class: if msg.contains("Connected") { "status-ok" } else if msg.contains("failed") || msg.starts_with("Saved, but") { "status-err" } else { "text-muted" },
                         "{msg}"
                     }
                 }
@@ -1265,7 +1370,10 @@ fn DspSettings(
 
             if let Some(status) = pipe.status.as_ref() {
                 div { class: "mb-6 pb-6 border-b border-subtle",
-                    h3 { class: "text-sm font-semibold mb-3", "Live engine state" }
+                    div { class: "mb-3 flex flex-wrap items-baseline justify-between gap-2",
+                        h3 { class: "text-sm font-semibold", "Playing now" }
+                        p { class: "text-xs text-muted", "Live engine readback" }
+                    }
                     dl { class: "grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-3 lg:grid-cols-5",
                         HqpReadout { label: "Engine", value: status.state.clone().unwrap_or_else(|| "Unknown".to_string()) }
                         HqpReadout { label: "Mode", value: hqp_live_mode_readout(status) }
@@ -1278,7 +1386,12 @@ fn DspSettings(
 
             // Profile selectors
             if !profiles.is_empty() || has_matrix {
-                div { class: "grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6",
+                div { class: "mb-6",
+                    div { class: "mb-3",
+                        h3 { class: "text-sm font-semibold", "Recall a saved setup" }
+                        p { class: "mt-1 text-xs text-muted", "Loading a profile can change several pipeline controls at once." }
+                    }
+                    div { class: "grid grid-cols-1 sm:grid-cols-2 gap-4",
                     if !profiles.is_empty() {
                         label { class: "block",
                             span { class: "block text-sm font-medium mb-1", "Profile" }
@@ -1300,10 +1413,16 @@ fn DspSettings(
                             }
                         }
                     }
+                    }
                 }
             }
 
-            h3 { class: "text-sm font-semibold mb-3", "Core pipeline" }
+            div { class: "mb-3",
+                h3 { class: "text-sm font-semibold", "Output pipeline" }
+                p { class: "mt-1 text-xs text-muted",
+                    "Mode and rate work as a pair. When you return to PCM or SDM, your last verified rate for that mode is restored."
+                }
+            }
             div { class: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4",
                 HqpSelect {
                     id: "hqp-mode",
@@ -1678,6 +1797,14 @@ fn playback_source_label(source: Option<&str>) -> String {
     }
 }
 
+fn playback_path_label(source: Option<&str>) -> String {
+    match source {
+        Some("hqplayer") => "Direct HQPlayer".to_string(),
+        None => "Playback + HQPlayer DSP".to_string(),
+        _ => format!("{} + HQPlayer DSP", playback_source_label(source)),
+    }
+}
+
 /// Shows every persisted source-zone match and lets the user add another one.
 #[component]
 fn ZoneLinkTable(
@@ -1723,14 +1850,38 @@ fn ZoneLinkTable(
     let feedback_copy = feedback.as_ref().map(|state| match state {
         ZoneMatchFeedback::Saved => (
             false,
-            "Zone match saved. It will remain after restarts.".to_string(),
+            "Paired. Playback and DSP now share one control card.".to_string(),
         ),
-        ZoneMatchFeedback::Removed => (false, "Zone match removed.".to_string()),
+        ZoneMatchFeedback::Removed => (
+            false,
+            "Pairing removed. Audio routing was not changed.".to_string(),
+        ),
         ZoneMatchFeedback::Error(message) => (true, message.clone()),
     });
 
     rsx! {
         div { class: "px-5 py-5 sm:px-6",
+            div { class: "hqp-pairing-explainer mb-6",
+                div { class: "hqp-path-node",
+                    span { "Playback zone" }
+                    small { "Roon, JPLAY, LMS…" }
+                }
+                span { aria_hidden: "true",
+                    svg { view_box: "0 0 40 16",
+                        path { d: "M2 8h32" }
+                        path { d: "m29 3 5 5-5 5" }
+                    }
+                }
+                div { class: "hqp-path-node",
+                    span { "HQPlayer" }
+                    small { "DSP and output" }
+                }
+            }
+            p { class: "mb-6 max-w-3xl text-sm text-muted",
+                strong { class: "text-primary", "Pairing only changes this screen. " }
+                "It does not route audio, group rooms, or change either app's configuration."
+            }
+
             if current_links.is_empty()
                 && matches!(
                     availability,
@@ -1738,18 +1889,18 @@ fn ZoneLinkTable(
                 )
             {
                 div { class: "mb-5",
-                    h3 { class: "font-semibold", "No saved matches" }
+                    h3 { class: "font-semibold", "Nothing paired yet" }
                     p { class: "mt-1 text-sm text-muted",
-                        "Choose the playback zone that already uses this HQPlayer."
+                        "Choose the zone where you start playback and the HQPlayer instance it already feeds."
                     }
                 }
             }
 
             if !current_links.is_empty() {
                 div { class: "mb-6",
-                    h3 { class: "font-semibold", "Saved matches" }
+                    h3 { class: "font-semibold", "Paired playback paths" }
                     p { class: "mt-1 text-sm text-muted",
-                        "These matches are stored by Unified Hi-Fi Control and remain after restarts."
+                        "These pairings are stored by Unified Hi-Fi Control and remain after restarts."
                     }
                     div { class: "mt-4 divide-y divide-[var(--border-default)]",
                         for link in current_links.iter() {
@@ -1772,23 +1923,30 @@ fn ZoneLinkTable(
                                     .unwrap_or_else(|| link.instance.clone());
                 let zone_id = link.zone_id.clone();
                 rsx! {
-                                    div { class: "flex flex-col gap-3 py-4 first:pt-0 last:pb-0 sm:flex-row sm:items-center sm:justify-between",
-                                        div { class: "min-w-0",
-                                            div { class: "flex flex-wrap items-center gap-2",
-                                                span { class: "font-semibold", "{zone_name}" }
-                                                span { class: "badge badge-secondary", "{source_label}" }
+                                    div { class: "flex flex-col gap-3 py-4 first:pt-0 last:pb-0 lg:flex-row lg:items-center lg:justify-between",
+                                        div { class: "hqp-saved-path min-w-0 flex-1",
+                                            div { class: "min-w-0",
+                                                span { class: "badge badge-secondary mb-1", "{source_label}" }
+                                                p { class: "font-semibold truncate", title: "{zone_name}", "{zone_name}" }
                                             }
-                                            p { class: "mt-1 text-sm text-muted",
-                                                "Uses HQPlayer {instance_detail}"
+                                            span { aria_hidden: "true",
+                                                svg { view_box: "0 0 40 16",
+                                                    path { d: "M2 8h32" }
+                                                    path { d: "m29 3 5 5-5 5" }
+                                                }
+                                            }
+                                            div { class: "min-w-0",
+                                                span { class: "badge badge-secondary mb-1", "HQPlayer" }
+                                                p { class: "font-semibold truncate", title: "{instance_detail}", "{instance_detail}" }
                                             }
                                         }
                                         button {
                                             r#type: "button",
                                             class: "btn btn-outline btn-sm shrink-0",
                                             disabled: busy,
-                                            aria_label: "Remove match for {zone_name}",
+                                            aria_label: "Remove pairing for {zone_name}",
                                             onclick: move |_| on_unlink.call(zone_id.clone()),
-                                            if busy { "Updating…" } else { "Remove match" }
+                                            if busy { "Updating…" } else { "Remove pairing" }
                                         }
                                     }
                                 }
@@ -1802,7 +1960,7 @@ fn ZoneLinkTable(
                 match availability {
                     ZoneMatchAvailability::Loading => rsx! {
                         p { class: "text-sm text-muted", aria_live: "polite",
-                            "Loading playback zones and saved matches…"
+                            "Finding playback zones and saved pairings…"
                         }
                     },
                     ZoneMatchAvailability::NoInstances => rsx! {
@@ -1812,18 +1970,18 @@ fn ZoneLinkTable(
                         }
                     },
                     ZoneMatchAvailability::NoPlaybackZones => rsx! {
-                        h3 { class: "font-semibold", "No unmatched playback zones" }
+                        h3 { class: "font-semibold", "No playback zones available to pair" }
                         p { class: "mt-1 text-sm text-muted",
-                            "Every available playback zone is already matched, or no playback provider is connected."
+                            "Every available zone is already paired, or no playback provider is connected yet."
                         }
                     },
                     ZoneMatchAvailability::Ready => rsx! {
                         h3 { class: "font-semibold",
-                            if current_links.is_empty() { "Match a playback zone" } else { "Match another zone" }
+                            if current_links.is_empty() { "Pair this signal path" } else { "Pair another signal path" }
                         }
                         div { class: "mt-4 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] lg:items-end",
                             div {
-                                label { class: "mb-2 block text-sm font-medium", r#for: "zone-match-playback", "Playback zone" }
+                                label { class: "mb-2 block text-sm font-medium", r#for: "zone-match-playback", "Zone where playback starts" }
                                 select {
                                     id: "zone-match-playback",
                                     class: "input",
@@ -1840,7 +1998,7 @@ fn ZoneLinkTable(
                                 }
                             }
                             div {
-                                label { class: "mb-2 block text-sm font-medium", r#for: "zone-match-instance", "HQPlayer" }
+                                label { class: "mb-2 block text-sm font-medium", r#for: "zone-match-instance", "HQPlayer it already feeds" }
                                 select {
                                     id: "zone-match-instance",
                                     class: "input",
@@ -1881,11 +2039,11 @@ fn ZoneLinkTable(
                                         on_link.call((zone_id, instance));
                                     }
                                 },
-                                if busy { "Saving match…" } else { "Save match" }
+                                if busy { "Pairing…" } else { "Pair zone" }
                             }
                         }
                         p { class: "mt-3 max-w-3xl text-xs text-muted",
-                            "Only match zones that are already configured to play through this HQPlayer. Saving a match does not reroute audio."
+                            "Not sure? Start a track in your playback app and confirm that this HQPlayer begins playing before you pair them."
                         }
                     },
                 }
