@@ -2,6 +2,15 @@
 
 const SERVICE: &str = include_str!("../build/qnap/shared/unified-hifi-control.sh");
 const UNINSTALL: &str = include_str!("../build/qnap/shared/uninstall.sh");
+const QPKG_CONFIG: &str = include_str!("../build/qnap/qpkg.cfg");
+
+#[test]
+fn qpkg_allows_install_volume_selection_and_migration() {
+    assert!(
+        QPKG_CONFIG.contains("QPKG_VOLUME_SELECT=3"),
+        "QNAP must allow selecting and migrating the package volume instead of forcing the system volume"
+    );
+}
 
 #[test]
 fn qnap_service_keeps_credentials_private_and_stops_only_its_recorded_process() {
