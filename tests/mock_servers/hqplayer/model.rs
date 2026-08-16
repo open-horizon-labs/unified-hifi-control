@@ -1001,10 +1001,15 @@ impl Responder for DaemonModel {
 
             "MatrixSetProfile" => {
                 let name = request_attr(request, "value").unwrap_or_default();
-                let known =
-                    corpus::enum_entries(&inner.enumeration("MatrixListProfiles"), "MatrixProfile")
-                        .into_iter()
-                        .any(|e| e.name == name);
+                // HQPlayer's unnamed matrix is selected with an empty value. It is deliberately
+                // absent from MatrixListProfiles and is rendered as `[Default]` by friendly UIs.
+                let known = name.is_empty()
+                    || corpus::enum_entries(
+                        &inner.enumeration("MatrixListProfiles"),
+                        "MatrixProfile",
+                    )
+                    .into_iter()
+                    .any(|e| e.name == name);
                 if known {
                     inner.apply(
                         "MatrixSetProfile",

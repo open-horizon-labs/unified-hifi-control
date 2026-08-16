@@ -889,6 +889,7 @@ mod tests {
                 info: None,
             },
             pipeline: crate::adapters::hqplayer::PipelineStatus::default(),
+            active_profile: None,
             transport: HqpNativeTransportState::Stopped,
             metadata: HqpNativeMetadata {
                 track_id: None,

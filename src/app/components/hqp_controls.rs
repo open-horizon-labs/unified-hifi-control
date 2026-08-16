@@ -28,7 +28,11 @@ pub fn HqpProfileSelect(
                     on_select.call(value);
                 }
             },
-            option { value: "", "Profile..." }
+            option {
+                value: "",
+                selected: !profiles.iter().any(|profile| profile.active),
+                "(no preset)"
+            }
             for profile in profiles.iter() {
                 {
                     let value = profile
@@ -41,6 +45,7 @@ pub fn HqpProfileSelect(
                         option {
                             key: "{value}",
                             value: "{value}",
+                            selected: profile.active,
                             "{title}"
                         }
                     }
@@ -55,10 +60,10 @@ pub fn HqpProfileSelect(
 pub fn HqpMatrixSelect(
     /// Available matrix profiles to choose from
     profiles: Vec<HqpMatrixProfile>,
-    /// Currently active profile index (if any)
-    active: Option<u32>,
-    /// Called when a matrix profile is selected (passes the profile index)
-    on_select: EventHandler<u32>,
+    /// Currently active profile name. `None` is the unnamed `[Default]` matrix.
+    active: Option<String>,
+    /// Called with the native profile name; empty selects `[Default]`.
+    on_select: EventHandler<String>,
     /// Optional CSS class for the select element
     #[props(default = "input".to_string())]
     class: String,
@@ -71,16 +76,14 @@ pub fn HqpMatrixSelect(
             class: "{class}",
             disabled: disabled,
             onchange: move |evt| {
-                if let Ok(idx) = evt.value().parse::<u32>() {
-                    on_select.call(idx);
-                }
+                on_select.call(evt.value());
             },
-            option { value: "", "Matrix..." }
+            option { value: "", selected: active.is_none(), "[Default]" }
             for profile in profiles.iter() {
                 option {
                     key: "{profile.index}",
-                    value: "{profile.index}",
-                    selected: active == Some(profile.index),
+                    value: "{profile.name}",
+                    selected: active.as_deref() == Some(profile.name.as_str()),
                     "{profile.name}"
                 }
             }
@@ -95,12 +98,15 @@ pub fn HqpControlsCompact(
     profiles: Vec<HqpProfile>,
     /// Available matrix profiles
     matrix_profiles: Vec<HqpMatrixProfile>,
-    /// Currently active matrix profile index
-    active_matrix: Option<u32>,
+    /// Whether the matrix inventory was read successfully. The unnamed `[Default]` exists even
+    /// when there are no saved named profiles.
+    matrix_available: bool,
+    /// Currently active matrix profile name; `None` is the unnamed `[Default]` matrix.
+    active_matrix: Option<String>,
     /// Called when a profile is selected
     on_profile_select: EventHandler<String>,
     /// Called when a matrix profile is selected
-    on_matrix_select: EventHandler<u32>,
+    on_matrix_select: EventHandler<String>,
 ) -> Element {
     rsx! {
         div { class: "flex flex-wrap gap-2 mt-4",
@@ -111,7 +117,7 @@ pub fn HqpControlsCompact(
                     class: "input flex-1 min-w-0".to_string(),
                 }
             }
-            if !matrix_profiles.is_empty() {
+            if matrix_available {
                 HqpMatrixSelect {
                     profiles: matrix_profiles,
                     active: active_matrix,

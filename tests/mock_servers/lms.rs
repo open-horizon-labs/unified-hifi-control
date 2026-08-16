@@ -153,6 +153,15 @@ impl MockLmsServer {
         self.state.write().await.players.remove(playerid);
     }
 
+    /// Keep a player in LMS's inventory while changing whether its client is
+    /// actually connected. Real LMS retains disconnected players this way.
+    pub async fn set_connected(&self, playerid: &str, connected: bool) {
+        let mut state = self.state.write().await;
+        if let Some(player) = state.players.get_mut(playerid) {
+            player.connected = connected;
+        }
+    }
+
     /// Set player state (play/pause/stop)
     pub async fn set_mode(&self, playerid: &str, mode: &str) {
         let mut state = self.state.write().await;

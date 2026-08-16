@@ -335,6 +335,8 @@ pub struct HqpSettings {
     #[serde(rename = "filterNx")]
     pub filter_nx: Option<HqpSettingOptions>,
     pub shaper: Option<HqpSettingOptions>,
+    #[serde(rename = "shaperLabel")]
+    pub shaper_label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -347,6 +349,10 @@ pub struct HqpSettingOptions {
 pub struct HqpOption {
     pub value: String,
     pub label: Option<String>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -354,6 +360,8 @@ pub struct HqpProfile {
     pub name: Option<String>,
     pub title: Option<String>,
     pub value: Option<String>,
+    #[serde(default)]
+    pub active: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

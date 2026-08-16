@@ -1580,7 +1580,7 @@ mod hqplayer_setting_route_contract {
     #[tokio::test]
     async fn advanced_state_and_choices_round_trip_through_the_web_routes() {
         let model = Arc::new(DaemonModel::with_profile(VERIFIED_PROFILE));
-        let server = WireServer::start(model, WirePolicy::default()).await;
+        let server = WireServer::start(model.clone(), WirePolicy::default()).await;
         let (app, state) = create_test_app_with_state().await;
         state
             .hqplayer
@@ -1642,6 +1642,7 @@ mod hqplayer_setting_route_contract {
             ("repeat", "all"),
             ("random", "true"),
         ] {
+            let choices_before = model.request_count("GetJunkFilters");
             let (status, body) = post_json(
                 &app,
                 "/hqp/pipeline",
@@ -1649,6 +1650,15 @@ mod hqplayer_setting_route_contract {
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{setting}: {body}");
+            let returned = assert_json("canonical pipeline write response", &body);
+            assert!(
+                returned["settings"].is_object(),
+                "a successful pipeline write returns canonical pipeline state, never an unqualified {{\"ok\":true}} fallback: {body}"
+            );
+            assert!(
+                model.request_count("GetJunkFilters") - choices_before <= 3,
+                "the reliable command path's verified publication owns the post-write reads; a fourth GetJunkFilters means the HTTP route issued the redundant refresh that caused live writes to fall back to unqualified success"
+            );
         }
 
         let (status, body) = get_request(&app, "/hqplayer/matrix/profiles").await;

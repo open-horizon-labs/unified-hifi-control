@@ -249,16 +249,26 @@ fn hqp_status_payload_from_snapshot(
                         .map(|item| item.name)
                         .collect(),
                 },
-                matrix_profile: McpHqpSelection {
-                    current: snapshot
+                matrix_profile: {
+                    let current = snapshot
                         .current_matrix_profile
                         .map(|profile| profile.name)
-                        .unwrap_or_default(),
-                    choices: snapshot
-                        .matrix_profiles
-                        .into_iter()
-                        .map(|profile| profile.name)
-                        .collect(),
+                        .or_else(|| {
+                            (!state.matrix_profile.is_empty()).then(|| state.matrix_profile.clone())
+                        })
+                        .unwrap_or_else(|| "[Default]".to_string());
+                    let mut choices = std::iter::once("[Default]".to_string())
+                        .chain(
+                            snapshot
+                                .matrix_profiles
+                                .into_iter()
+                                .map(|profile| profile.name),
+                        )
+                        .collect::<Vec<_>>();
+                    if !choices.contains(&current) {
+                        choices.push(current.clone());
+                    }
+                    McpHqpSelection { current, choices }
                 },
                 convolution: state.convolution,
                 adaptive_volume: state.adaptive,
@@ -279,8 +289,10 @@ fn hqp_status_payload_from_snapshot(
     McpHqpStatus {
         connected: status.connected,
         host: status.host,
+        active_profile: snapshot.observation.active_profile.clone(),
         pipeline: pipeline.map(|p| McpPipelineStatus {
             state: p.status.state,
+            mode: p.status.active_mode,
             filter: p.status.active_filter,
             shaper: p.status.active_shaper,
             rate: p.status.active_rate,
@@ -300,6 +312,7 @@ async fn hqp_status_payload_for_adapter(state: &AppState, instance: &str) -> Mcp
         return McpHqpStatus {
             connected: false,
             host: None,
+            active_profile: None,
             pipeline: None,
             options: None,
             options_unavailable_reason: None,
@@ -406,13 +419,14 @@ pub async fn handle_load_profile(
     )
     .await
     {
-        Ok(()) => {
-            let env = match hqp_mutation_payload(state, &instance).await {
-                Some(payload) => env.data(&payload),
-                None => env,
-            };
-            Ok(env.text_result(format!("Loaded profile: {}", args.profile)))
-        }
+        Ok(()) => match hqp_mutation_payload(state, &instance).await {
+            Some(payload) => Ok(env
+                .data(&payload)
+                .text_result(format!("Loaded profile: {}", args.profile))),
+            None => env.failed(
+                "HQPlayer verified the profile load, but its canonical readback is unavailable",
+            ),
+        },
         Err(e) => env.failed(format!("Failed to load profile: {}", e.message())),
     }
 }
@@ -441,7 +455,14 @@ pub async fn handle_set_pipeline(
     let normalized = match args.setting.as_str() {
         // Accepts a name like "PCM", "DSD", "[source]".
         "mode" | "filter1x" | "filter_1x" | "filterNx" | "filter_nx" | "filternx" | "shaper"
-        | "dither" | "junk" | "junk_filter" | "matrix" | "matrix_profile" => args.value.clone(),
+        | "dither" | "junk" | "junk_filter" => args.value.clone(),
+        "matrix" | "matrix_profile" => {
+            if args.value.eq_ignore_ascii_case("[default]") {
+                String::new()
+            } else {
+                args.value.clone()
+            }
+        }
         "convolution" => match parse_bool(&args.value) {
             Some(value) => value.to_string(),
             None => {
@@ -553,13 +574,15 @@ pub async fn handle_set_pipeline(
     )
     .await
     {
-        Ok(()) => {
-            let env = match hqp_mutation_payload(state, &instance).await {
-                Some(payload) => env.data(&payload),
-                None => env,
-            };
-            Ok(env.text_result(format!("Set {} to {}", args.setting, args.value)))
-        }
+        Ok(()) => match hqp_mutation_payload(state, &instance).await {
+            Some(payload) => Ok(env
+                .data(&payload)
+                .text_result(format!("Set {} to {}", args.setting, args.value))),
+            None => env.failed(format!(
+                "HQPlayer verified {}, but its canonical readback is unavailable",
+                args.setting
+            )),
+        },
         Err(e) => env.failed(format!("Failed to set {}: {}", args.setting, e.message())),
     }
 }

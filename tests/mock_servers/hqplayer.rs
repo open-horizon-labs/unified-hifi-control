@@ -181,6 +181,11 @@ async fn process_command(command: &str, state: &Arc<RwLock<MockHqpState>>) -> St
         "VolumeRange" => {
             "<?xml version=\"1.0\"?>\n<VolumeRange min=\"-60\" max=\"0\" step=\"1\" enabled=\"1\" adaptive=\"0\"/>\n".to_string()
         }
+        "ConfigurationGet" => {
+            // Empty is HQPlayer's unnamed base configuration. It must reach the
+            // public model as no active named profile, not as a profile called Default.
+            "<?xml version=\"1.0\"?>\n<ConfigurationGet value=\"\"/>\n".to_string()
+        }
         "GetModes" => {
             "<?xml version=\"1.0\"?>\n<GetModes><ModesItem index=\"0\" name=\"PCM\" value=\"0\"/><ModesItem index=\"1\" name=\"SDM\" value=\"1\"/></GetModes>\n".to_string()
         }

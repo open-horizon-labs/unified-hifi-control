@@ -1289,11 +1289,15 @@ jobs:
 
       - name: Build QPKG with Docker
         run: |
+          docker build \
+            --file build/qnap/Dockerfile \
+            --tag qnap-qdk:2.5.3 \
+            build/qnap
           docker run --rm --platform linux/amd64 \
             -v "$(pwd)/qnap-build:/src" \
             -w /src \
-            owncloudci/qnap-qpkg-builder@sha256:e342184e415b1df87ef00b8c1df47988ffd6a9d232a21331556067d400f06189 \
-            sh -c '/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
+            qnap-qdk:2.5.3 \
+            sh -c '/usr/share/QDK/bin/qbuild --build-dir /src/build --build-arch x86_64 && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
 
       - name: Move QPKG to dist
         run: |
@@ -1341,11 +1345,15 @@ jobs:
 
       - name: Build QPKG with Docker
         run: |
+          docker build \
+            --file build/qnap/Dockerfile \
+            --tag qnap-qdk:2.5.3 \
+            build/qnap
           docker run --rm --platform linux/amd64 \
             -v "$(pwd)/qnap-build:/src" \
             -w /src \
-            owncloudci/qnap-qpkg-builder@sha256:e342184e415b1df87ef00b8c1df47988ffd6a9d232a21331556067d400f06189 \
-            sh -c '/usr/share/qdk2/QDK/bin/qbuild --build-dir /src/build && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
+            qnap-qdk:2.5.3 \
+            sh -c '/usr/share/QDK/bin/qbuild --build-dir /src/build --build-arch arm_64 && cp /src/build/*.qpkg /src/ && chmod 666 /src/*.qpkg'
 
       - name: Move QPKG to dist
         run: |
@@ -1690,8 +1698,9 @@ jobs:
 
       - name: Generate beta LMS repository feed
         if: needs.plan.outputs.is_beta == 'true'
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
-          VERSION="${{ needs.plan.outputs.version }}"
           ZIP="release/lms-unified-hifi-control-${VERSION}.zip"
           SHA=$(sha1sum "$ZIP" | cut -d' ' -f1)
           REPO_URL="https://github.com/${{ github.repository }}"
@@ -1815,7 +1824,7 @@ jobs:
   publish-aur:
     name: Publish to AUR
     needs: [plan, upload-release]
-    if: needs.plan.outputs.is_release == 'true'
+    if: needs.plan.outputs.is_release == 'true' && needs.plan.outputs.is_beta != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

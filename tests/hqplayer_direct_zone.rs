@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::response::Redirect;
 use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{json, Value};
@@ -37,8 +38,8 @@ use mock_servers::hqplayer::model::{DaemonModel, Metadata};
 use mock_servers::hqplayer::wire::{WirePolicy, WireServer};
 
 use unified_hifi_control::adapters::hqplayer::{
-    HqpAdapter, HqpInstanceManager, HqpRecoveryConfig, HqpStatus, HqpTimeouts, HqpZoneLinkService,
-    VolumeRange,
+    HqpAdapter, HqpInfo, HqpInstanceManager, HqpRecoveryConfig, HqpStatus, HqpTimeouts,
+    HqpZoneLinkService, VolumeRange,
 };
 use unified_hifi_control::adapters::lms::LmsAdapter;
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
@@ -46,7 +47,7 @@ use unified_hifi_control::adapters::roon::RoonAdapter;
 use unified_hifi_control::adapters::upnp::UPnPAdapter;
 use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
-use unified_hifi_control::api::AppState;
+use unified_hifi_control::api::{self, AppState};
 use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState, SharedBus, Zone};
 use unified_hifi_control::coordinator::AdapterCoordinator;
@@ -107,6 +108,7 @@ fn fast_recovery() -> HqpRecoveryConfig {
 /// route the client does not use.
 fn client_router(state: AppState) -> Router {
     Router::new()
+        .route("/hqplayer/configure", post(api::hqp_configure_handler))
         .route("/control", post(knobs::knob_control_handler))
         .route("/knob/control", post(knobs::knob_control_handler))
         .route("/knob/now_playing", get(knobs::knob_now_playing_handler))
@@ -272,6 +274,32 @@ impl Rig {
         (status, value)
     }
 
+    async fn post_json(&self, uri: &str, body: Value) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build post request");
+        let response = self
+            .app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("post response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .expect("read body");
+        let value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "{uri} response was not JSON ({e}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, value)
+    }
+
     async fn shutdown(self) {
         self.manager.stop().await;
         self.bus.publish(BusEvent::ShuttingDown { reason: None });
@@ -280,7 +308,8 @@ impl Rig {
     }
 }
 
-/// A daemon mid-playback with a loaded, seekable track and a working decimal-dB control.
+/// A daemon mid-playback with a native playlist cursor, a loaded seekable track, and a working
+/// decimal-dB control.
 fn playing_daemon() -> DaemonModel {
     let model = DaemonModel::with_profile(VERIFIED_PROFILE);
     model.external_change(|s| {
@@ -343,7 +372,7 @@ async fn transport_reaches_the_selected_hqplayer_instance_and_not_roon() {
 /// **RED before #328:** all of them reached Roon. `stop` and `seek` additionally had no route at
 /// all — `control_roon` maps `stop`, but `seek` is not in any adapter's action vocabulary.
 #[tokio::test]
-async fn stop_next_previous_and_seek_all_route_to_the_daemon() {
+async fn transport_actions_route_to_the_daemon_when_its_native_queue_is_loaded() {
     let model = playing_daemon();
     let server = start_daemon(&model).await;
     let rig = Rig::new().await;
@@ -550,8 +579,14 @@ async fn a_loaded_playing_zone_advertises_the_transport_it_really_has() {
     let zone = rig.zone_when(|z| z.state == PlaybackState::Playing).await;
 
     assert!(zone.is_seekable, "a 215 s track is seekable");
-    assert!(zone.is_next_allowed);
-    assert!(zone.is_previous_allowed);
+    assert!(
+        zone.is_next_allowed,
+        "a native HQPlayer track cursor enables Next"
+    );
+    assert!(
+        zone.is_previous_allowed,
+        "a native HQPlayer track cursor enables Previous"
+    );
     assert!(zone.is_pause_allowed);
     assert!(!zone.is_play_allowed, "already playing");
     assert!(zone.is_controllable);
@@ -561,9 +596,63 @@ async fn a_loaded_playing_zone_advertises_the_transport_it_really_has() {
         .expect("a loaded track publishes now_playing");
     assert_eq!(np.duration, Some(215.0));
     assert_eq!(np.seek_position, Some(42.0));
+    assert!(
+        np.image_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("hqplayer:")),
+        "a loaded HQPlayer track must carry a stable artwork identity"
+    );
 
     rig.shutdown().await;
     server.stop();
+}
+
+/// **Client expectation.** HQPlayer Embedded's own page displays `/cover/current`, which may
+/// redirect to a streaming service CDN. UHC's existing artwork proxy must return those bytes for a
+/// direct HQPlayer zone instead of its generic "No Image" placeholder.
+#[tokio::test]
+async fn hqplayer_current_cover_reaches_the_unified_image_interface() {
+    const JPEG: &[u8] = b"\xff\xd8\xff\xe0hqplayer-cover\xff\xd9";
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind cover server");
+    let web_port = listener.local_addr().expect("cover address").port();
+    let cover_server = tokio::spawn(async move {
+        let app = Router::new()
+            .route(
+                "/cover/current",
+                get(|| async { Redirect::temporary("/art.jpg") }),
+            )
+            .route(
+                "/art.jpg",
+                get(|| async { ([("content-type", "image/jpeg")], JPEG) }),
+            );
+        axum::serve(listener, app).await.expect("serve cover");
+    });
+
+    let rig = Rig::new().await;
+    rig.manager
+        .add_instance(
+            "cover".to_string(),
+            "127.0.0.1".to_string(),
+            Some(9),
+            Some(web_port),
+            None,
+            None,
+        )
+        .await;
+
+    let image = rig
+        .state
+        .get_image("hqplayer:cover", "hqplayer:test-track", None, None, None)
+        .await
+        .expect("fetch the current HQPlayer cover through the unified image interface");
+    assert_eq!(image.content_type, "image/jpeg");
+    assert_eq!(image.data, JPEG);
+
+    rig.shutdown().await;
+    cover_server.abort();
 }
 
 /// **Client expectation.** A seek on a zone the server told the client was not seekable is refused
@@ -846,7 +935,8 @@ async fn stopping_clears_the_track_and_the_capabilities_that_depended_on_it() {
     let rig = Rig::new().await;
     rig.attach(&server).await;
     let playing = rig.zone_when(|z| z.state == PlaybackState::Playing).await;
-    assert!(playing.is_seekable && playing.is_next_allowed);
+    assert!(playing.is_seekable);
+    assert!(playing.is_next_allowed);
 
     model.external_change(|s| {
         s.playback = 0;
@@ -868,6 +958,52 @@ async fn stopping_clears_the_track_and_the_capabilities_that_depended_on_it() {
 
     rig.shutdown().await;
     server.stop();
+}
+
+#[tokio::test]
+async fn a_loaded_source_track_without_a_native_queue_refuses_queue_skips() {
+    let model = DaemonModel::with_profile(VERIFIED_PROFILE);
+    model.external_change(|s| {
+        s.playback = 2;
+        s.track = 0;
+        s.track_id = "source-track".to_string();
+        s.position = 42;
+        s.length = 215;
+        s.metadata = Some(Metadata::sample());
+    });
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+    rig.attach(&server).await;
+    let zone = rig.zone_when(|z| z.state == PlaybackState::Playing).await;
+
+    assert!(!zone.is_next_allowed);
+    assert!(!zone.is_previous_allowed);
+
+    for action in ["next", "previous"] {
+        let (status, response) = rig
+            .post_control(json!({"zone_id":"hqplayer:rig","action":action}))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{action}: {response}");
+    }
+}
+
+#[test]
+fn a_single_item_native_queue_does_not_advertise_skip_controls() {
+    let status = HqpAdapter::parse_status_for_test(
+        r#"<Status state="2" track="1" tracks_total="1" track_id="queued-track" position="4" length="215" volume="-18" samplerate="44100"/>"#,
+    );
+    let zone = HqpAdapter::project_direct_zone(
+        "hqplayer.test",
+        Some("rig"),
+        &HqpInfo::default(),
+        &status,
+        &VolumeRange::default(),
+    );
+
+    assert!(
+        !zone.is_next_allowed && !zone.is_previous_allowed,
+        "a one-item native queue must not advertise skips that HQPlayer will reject"
+    );
 }
 
 /// **Client expectation.** A transient failure to read the volume capability must not tell the
@@ -1474,6 +1610,55 @@ async fn a_linked_roon_zone_keeps_its_dsp_enrichment() {
     assert_eq!(linked["dsp"]["instance"], "rig");
 
     rig.state.hqp_zone_links.unlink_zone("roon:living").await;
+    rig.shutdown().await;
+    server.stop();
+}
+
+/// **Client expectation.** Reconnecting or re-saving an HQPlayer endpoint must not forget which
+/// source zone the user linked to that instance. The link is user configuration keyed by the
+/// stable instance name; connection settings are implementation details of that same instance.
+///
+/// **RED before #498 follow-up:** `POST /hqplayer/configure` unconditionally removed every link to
+/// `default`, including when saving the same endpoint after a daemon or host reboot.
+#[tokio::test]
+async fn configuring_the_default_instance_preserves_its_zone_link() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+
+    rig.state
+        .hqp_zone_links
+        .link_zone("roon:hqplayer-dsp".to_string(), "default".to_string())
+        .await
+        .expect("link source zone to the default HQPlayer instance");
+
+    let (status, body) = rig
+        .post_json(
+            "/hqplayer/configure",
+            json!({
+                "host": "127.0.0.1",
+                "port": server.port(),
+                "web_port": 1,
+                "username": null,
+                "password": null
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "configure failed: {body}");
+    assert_eq!(
+        rig.state
+            .hqp_zone_links
+            .get_instance_for_zone("roon:hqplayer-dsp")
+            .await
+            .as_deref(),
+        Some("default"),
+        "reconfiguring an existing instance must preserve its user-owned zone link"
+    );
+
+    rig.state
+        .hqp_zone_links
+        .unlink_zone("roon:hqplayer-dsp")
+        .await;
     rig.shutdown().await;
     server.stop();
 }

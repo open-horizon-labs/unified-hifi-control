@@ -236,7 +236,23 @@ and an unprivileged start/status/stop lifecycle. See the
 [Synology Developer Guide](https://help.synology.com/developer-guide/synology_package/introduction.html)
 for SPK structure.
 
-**QNAP QPKG:** Uses `qbuild` via Docker.
+**QNAP QPKG:** Uses a repository-owned Docker image containing QNAP's official
+QDK 2.5.3 release. The image is based on digest-pinned Ubuntu 20.04 and
+checksum-pins the official `qdk_2.5.3_amd64.deb` artifact. Both jobs run the
+AMD64 builder on the AMD64 GitHub runner; QDK's `qbuild --build-arch` selects
+the normal `.qpkg` output architecture (`x86_64` or `arm_64`), so this is not a
+package-format migration. The official release also ships an ARM64 QDK
+package, but it is not needed for the cross-target build and is not used
+speculatively.
+
+To upgrade the builder, choose a published release from
+[qnap-dev/QDK](https://github.com/qnap-dev/QDK/releases), verify the release
+asset SHA-256 in the Dockerfile, update `QDK_VERSION`, the checksum, and the
+base-image digest together, then run the QNAP contract tests and both CI jobs.
+The QDK 2.5.3 release assets used here are:
+
+- `qdk_2.5.3_amd64.deb`: `17b3841b7d4590a4ee025844ba583304b5e3c497d9fa8934d5175131d3908022`
+- `qdk_2.5.3_arm64.deb`: `4b00c009cb48c0ffa7e4b7b00c5a6a1982a0955d663c0c6ec57020353e68eeb9` (available from the release, not used by CI)
 
 ## Build Matrix
 
