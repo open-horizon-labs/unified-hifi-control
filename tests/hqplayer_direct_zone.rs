@@ -46,7 +46,7 @@ use unified_hifi_control::adapters::roon::RoonAdapter;
 use unified_hifi_control::adapters::upnp::UPnPAdapter;
 use unified_hifi_control::adapters::Startable;
 use unified_hifi_control::aggregator::ZoneAggregator;
-use unified_hifi_control::api::AppState;
+use unified_hifi_control::api::{self, AppState};
 use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::bus::{create_bus, BusEvent, PlaybackState, SharedBus, Zone};
 use unified_hifi_control::coordinator::AdapterCoordinator;
@@ -107,6 +107,7 @@ fn fast_recovery() -> HqpRecoveryConfig {
 /// route the client does not use.
 fn client_router(state: AppState) -> Router {
     Router::new()
+        .route("/hqplayer/configure", post(api::hqp_configure_handler))
         .route("/control", post(knobs::knob_control_handler))
         .route("/knob/control", post(knobs::knob_control_handler))
         .route("/knob/now_playing", get(knobs::knob_now_playing_handler))
@@ -259,6 +260,32 @@ impl Rig {
             .oneshot(request)
             .await
             .expect("get response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .expect("read body");
+        let value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "{uri} response was not JSON ({e}): {}",
+                String::from_utf8_lossy(&bytes)
+            )
+        });
+        (status, value)
+    }
+
+    async fn post_json(&self, uri: &str, body: Value) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build post request");
+        let response = self
+            .app
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("post response");
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
             .await
@@ -1474,6 +1501,55 @@ async fn a_linked_roon_zone_keeps_its_dsp_enrichment() {
     assert_eq!(linked["dsp"]["instance"], "rig");
 
     rig.state.hqp_zone_links.unlink_zone("roon:living").await;
+    rig.shutdown().await;
+    server.stop();
+}
+
+/// **Client expectation.** Reconnecting or re-saving an HQPlayer endpoint must not forget which
+/// source zone the user linked to that instance. The link is user configuration keyed by the
+/// stable instance name; connection settings are implementation details of that same instance.
+///
+/// **RED before #498 follow-up:** `POST /hqplayer/configure` unconditionally removed every link to
+/// `default`, including when saving the same endpoint after a daemon or host reboot.
+#[tokio::test]
+async fn configuring_the_default_instance_preserves_its_zone_link() {
+    let model = playing_daemon();
+    let server = start_daemon(&model).await;
+    let rig = Rig::new().await;
+
+    rig.state
+        .hqp_zone_links
+        .link_zone("roon:hqplayer-dsp".to_string(), "default".to_string())
+        .await
+        .expect("link source zone to the default HQPlayer instance");
+
+    let (status, body) = rig
+        .post_json(
+            "/hqplayer/configure",
+            json!({
+                "host": "127.0.0.1",
+                "port": server.port(),
+                "web_port": 1,
+                "username": null,
+                "password": null
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "configure failed: {body}");
+    assert_eq!(
+        rig.state
+            .hqp_zone_links
+            .get_instance_for_zone("roon:hqplayer-dsp")
+            .await
+            .as_deref(),
+        Some("default"),
+        "reconfiguring an existing instance must preserve its user-owned zone link"
+    );
+
+    rig.state
+        .hqp_zone_links
+        .unlink_zone("roon:hqplayer-dsp")
+        .await;
     rig.shutdown().await;
     server.stop();
 }

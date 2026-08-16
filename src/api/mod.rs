@@ -1921,12 +1921,6 @@ pub async fn hqp_configure_handler(
     State(state): State<AppState>,
     Json(req): Json<HqpConfigRequest>,
 ) -> impl IntoResponse {
-    // Clear zone links for "default" instance - prevents stale data after host change
-    state
-        .hqp_zone_links
-        .remove_links_for_instance("default")
-        .await;
-
     // Configure the adapter
     state
         .hqplayer

@@ -60,6 +60,13 @@ struct ZoneUnlinkRequest {
     zone_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum ZoneMatchFeedback {
+    Saved,
+    Removed,
+    Error(String),
+}
+
 /// Control request body
 #[derive(Clone, serde::Serialize)]
 struct ControlRequest {
@@ -157,6 +164,8 @@ pub fn HqPlayer() -> Element {
     // HQP state
     let mut hqp_loading = use_signal(|| false);
     let mut hqp_error = use_signal(|| None::<String>);
+    let mut zone_match_busy = use_signal(|| false);
+    let mut zone_match_feedback = use_signal(|| None::<ZoneMatchFeedback>);
 
     // Now playing for linked zones
     let mut now_playing_map = use_signal(std::collections::HashMap::<String, NowPlaying>::new);
@@ -202,6 +211,29 @@ pub fn HqPlayer() -> Element {
         api::fetch_json::<InstancesResponse>("/hqp/instances")
             .await
             .ok()
+    });
+    let mut zones_loaded_once = use_signal(|| false);
+    let mut zone_links_loaded_once = use_signal(|| false);
+    let mut instances_loaded_once = use_signal(|| false);
+
+    let zones_state = zones.state();
+    use_effect(move || {
+        if !zones_loaded_once() && matches!(*zones_state.read(), UseResourceState::Ready) {
+            zones_loaded_once.set(true);
+        }
+    });
+    let zone_links_state = zone_links.state();
+    use_effect(move || {
+        if !zone_links_loaded_once() && matches!(*zone_links_state.read(), UseResourceState::Ready)
+        {
+            zone_links_loaded_once.set(true);
+        }
+    });
+    let instances_state = instances.state();
+    use_effect(move || {
+        if !instances_loaded_once() && matches!(*instances_state.read(), UseResourceState::Ready) {
+            instances_loaded_once.set(true);
+        }
     });
 
     // Sync config to form when loaded
@@ -418,19 +450,45 @@ pub fn HqPlayer() -> Element {
 
     // Zone link handler
     let link_zone = move |(zone_id, instance): (String, String)| {
+        zone_match_busy.set(true);
+        zone_match_feedback.set(None);
         spawn(async move {
             let req = ZoneLinkRequest { zone_id, instance };
-            let _ = api::post_json_no_response("/hqp/zones/link", &req).await;
-            zone_links.restart();
+            match api::post_json_no_response("/hqp/zones/link", &req).await {
+                Ok(()) => {
+                    zone_match_feedback.set(Some(ZoneMatchFeedback::Saved));
+                    zone_links.restart();
+                    zones.restart();
+                }
+                Err(error) => {
+                    zone_match_feedback.set(Some(ZoneMatchFeedback::Error(format!(
+                        "Could not save the zone match: {error}"
+                    ))));
+                }
+            }
+            zone_match_busy.set(false);
         });
     };
 
     // Zone unlink handler
     let unlink_zone = move |zone_id: String| {
+        zone_match_busy.set(true);
+        zone_match_feedback.set(None);
         spawn(async move {
             let req = ZoneUnlinkRequest { zone_id };
-            let _ = api::post_json_no_response("/hqp/zones/unlink", &req).await;
-            zone_links.restart();
+            match api::post_json_no_response("/hqp/zones/unlink", &req).await {
+                Ok(()) => {
+                    zone_match_feedback.set(Some(ZoneMatchFeedback::Removed));
+                    zone_links.restart();
+                    zones.restart();
+                }
+                Err(error) => {
+                    zone_match_feedback.set(Some(ZoneMatchFeedback::Error(format!(
+                        "Could not remove the zone match: {error}"
+                    ))));
+                }
+            }
+            zone_match_busy.set(false);
         });
     };
 
@@ -441,12 +499,20 @@ pub fn HqPlayer() -> Element {
     let matrix_data = matrix.read().clone();
     let zones_list = zones_list_signal();
     let links_list = links_signal();
+    let mut zone_match_key_parts = links_list
+        .iter()
+        .map(|link| format!("{}={}", link.zone_id, link.instance))
+        .collect::<Vec<_>>();
+    zone_match_key_parts.sort();
+    let zone_match_key = zone_match_key_parts.join("|");
     let instances_list = instances
         .read()
         .clone()
         .flatten()
         .map(|r| r.instances)
         .unwrap_or_default();
+    let zone_match_resources_loaded =
+        zones_loaded_once() && zone_links_loaded_once() && instances_loaded_once();
     let np_map = now_playing_map();
 
     let controlled_zones = controlled_zones_signal();
@@ -552,14 +618,23 @@ pub fn HqPlayer() -> Element {
                 }
             }
 
-            // Zone Linking section
+            // Zone matching section
             section { id: "hqp-zone-links", class: "mb-8",
-                h2 { class: "text-lg font-semibold mb-4", "Zone Linking" }
-                div { class: "card p-6",
+                div { class: "mb-4 max-w-3xl",
+                    h2 { class: "text-lg font-semibold", "Zone matching" }
+                    p { class: "mt-1 text-sm text-muted",
+                        "Match a playback zone that already sends audio through HQPlayer. This combines playback and DSP controls; it does not change audio routing."
+                    }
+                }
+                div { class: "card overflow-hidden",
                     ZoneLinkTable {
+                        key: "{zone_match_key}",
                         zones: zones_list,
                         links: links_list,
                         instances: instances_list,
+                        resources_loaded: zone_match_resources_loaded,
+                        busy: zone_match_busy(),
+                        feedback: zone_match_feedback(),
                         on_link: link_zone,
                         on_unlink: unlink_zone,
                     }
@@ -573,7 +648,9 @@ pub fn HqPlayer() -> Element {
 mod tests {
     use super::{
         filter_hqp_options, format_hqp_rate, hqp_live_mode_readout, hqp_live_output_readout,
-        hqp_shaper_minimum_rate_hz, hqplayer_mute_control, CoalescingRefresh,
+        hqp_shaper_minimum_rate_hz, hqplayer_mute_control, is_zone_match_candidate,
+        normalized_match_selection, zone_match_availability, CoalescingRefresh,
+        ZoneMatchAvailability,
     };
     use crate::app::api::{HqpOption, HqpPipelineStatus, HqpSettingOptions};
 
@@ -728,6 +805,44 @@ mod tests {
         assert_eq!(
             guided.options[1].reason.as_deref(),
             Some("needs at least 22.5792 MHz")
+        );
+    }
+
+    #[test]
+    fn zone_matching_distinguishes_loading_from_an_empty_system() {
+        assert_eq!(
+            zone_match_availability(false, 0, 0),
+            ZoneMatchAvailability::Loading,
+            "pending zone, link, and instance reads are not an empty system"
+        );
+    }
+
+    #[test]
+    fn zone_matching_only_offers_unmatched_playback_zones() {
+        assert!(is_zone_match_candidate(
+            "roon:hqplayer-dsp",
+            Some("roon"),
+            false
+        ));
+        assert!(!is_zone_match_candidate(
+            "hqplayer:default",
+            Some("hqplayer"),
+            false
+        ));
+        assert!(!is_zone_match_candidate(
+            "roon:already-matched",
+            Some("roon"),
+            true
+        ));
+    }
+
+    #[test]
+    fn zone_matching_moves_selection_after_the_selected_zone_is_saved() {
+        let choices = vec!["roon:bedroom".to_string(), "roon:patio".to_string()];
+        assert_eq!(
+            normalized_match_selection("roon:just-saved", &choices),
+            "roon:bedroom",
+            "a saved zone disappears from the candidate list, so the form must select a valid next choice"
         );
     }
 }
@@ -1516,131 +1631,272 @@ fn apply_hqp_shaper_rate_guidance(
     options
 }
 
-/// Zone link selector component - simplified single dropdown
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZoneMatchAvailability {
+    Loading,
+    Ready,
+    NoPlaybackZones,
+    NoInstances,
+}
+
+fn zone_match_availability(
+    resources_loaded: bool,
+    candidate_count: usize,
+    instance_count: usize,
+) -> ZoneMatchAvailability {
+    if !resources_loaded {
+        ZoneMatchAvailability::Loading
+    } else if instance_count == 0 {
+        ZoneMatchAvailability::NoInstances
+    } else if candidate_count == 0 {
+        ZoneMatchAvailability::NoPlaybackZones
+    } else {
+        ZoneMatchAvailability::Ready
+    }
+}
+
+fn is_zone_match_candidate(zone_id: &str, source: Option<&str>, already_linked: bool) -> bool {
+    !already_linked && source != Some("hqplayer") && !zone_id.starts_with("hqplayer:")
+}
+
+fn normalized_match_selection(current: &str, choices: &[String]) -> String {
+    if choices.iter().any(|choice| choice == current) {
+        current.to_string()
+    } else {
+        choices.first().cloned().unwrap_or_default()
+    }
+}
+
+fn playback_source_label(source: Option<&str>) -> String {
+    match source {
+        Some("roon") => "Roon".to_string(),
+        Some("lms") => "LMS".to_string(),
+        Some("openhome") => "OpenHome".to_string(),
+        Some("upnp") => "UPnP".to_string(),
+        Some(other) => other.to_string(),
+        None => "Playback zone".to_string(),
+    }
+}
+
+/// Shows every persisted source-zone match and lets the user add another one.
 #[component]
 fn ZoneLinkTable(
     zones: Vec<Zone>,
     links: Vec<ZoneLink>,
     instances: Vec<HqpInstance>,
+    resources_loaded: bool,
+    busy: bool,
+    feedback: Option<ZoneMatchFeedback>,
     on_link: EventHandler<(String, String)>,
     on_unlink: EventHandler<String>,
 ) -> Element {
-    if zones.is_empty() {
-        return rsx! {
-            p { class: "text-muted", "No audio zones available." }
-        };
-    }
+    let mut current_links = links.clone();
+    current_links.sort_by(|left, right| left.zone_id.cmp(&right.zone_id));
 
-    // Find currently linked zone (if any)
-    let linked_zone = links.first().cloned();
-    let _linked_zone_id = linked_zone.as_ref().map(|l| l.zone_id.clone());
-    let linked_instance = linked_zone.as_ref().map(|l| l.instance.clone());
+    let mut candidates = zones
+        .iter()
+        .filter(|zone| {
+            let already_linked = links.iter().any(|link| link.zone_id == zone.zone_id);
+            is_zone_match_candidate(&zone.zone_id, zone.source.as_deref(), already_linked)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.zone_name.cmp(&right.zone_name));
+    let candidate_ids = candidates
+        .iter()
+        .map(|zone| zone.zone_id.clone())
+        .collect::<Vec<_>>();
 
-    // Default instance for new links (empty string if none configured)
     let default_instance = instances
         .first()
         .map(|i| i.name.clone())
         .unwrap_or_default();
-
-    // First zone ID (computed each render from props)
-    let first_zone_id = zones.first().map(|z| z.zone_id.clone()).unwrap_or_default();
-
-    // Selected zone - initialize to first zone if available
+    let first_zone_id = candidates
+        .first()
+        .map(|zone| zone.zone_id.clone())
+        .unwrap_or_default();
     let mut selected_zone = use_signal(|| first_zone_id.clone());
-    let mut selected_instance =
-        use_signal(|| linked_instance.clone().unwrap_or(default_instance.clone()));
-
-    // Clone for onclick closure
-    let first_zone_for_click = first_zone_id.clone();
+    let mut selected_instance = use_signal(|| default_instance.clone());
+    let candidate_ids_for_click = candidate_ids.clone();
     let default_instance_for_click = default_instance.clone();
-
-    let has_multiple_instances = instances.len() > 1;
+    let availability = zone_match_availability(resources_loaded, candidates.len(), instances.len());
+    let feedback_copy = feedback.as_ref().map(|state| match state {
+        ZoneMatchFeedback::Saved => (
+            false,
+            "Zone match saved. It will remain after restarts.".to_string(),
+        ),
+        ZoneMatchFeedback::Removed => (false, "Zone match removed.".to_string()),
+        ZoneMatchFeedback::Error(message) => (true, message.clone()),
+    });
 
     rsx! {
-        if let Some(ref link) = linked_zone {
-            // Currently linked - show linked zone with unlink option
+        div { class: "px-5 py-5 sm:px-6",
+            if current_links.is_empty()
+                && matches!(
+                    availability,
+                    ZoneMatchAvailability::Ready | ZoneMatchAvailability::NoPlaybackZones
+                )
             {
+                div { class: "mb-5",
+                    h3 { class: "font-semibold", "No saved matches" }
+                    p { class: "mt-1 text-sm text-muted",
+                        "Choose the playback zone that already uses this HQPlayer."
+                    }
+                }
+            }
+
+            if !current_links.is_empty() {
+                div { class: "mb-6",
+                    h3 { class: "font-semibold", "Saved matches" }
+                    p { class: "mt-1 text-sm text-muted",
+                        "These matches are stored by Unified Hi-Fi Control and remain after restarts."
+                    }
+                    div { class: "mt-4 divide-y divide-[var(--border-default)]",
+                        for link in current_links.iter() {
+                            {
                 let zone_name = zones
                     .iter()
                     .find(|z| z.zone_id == link.zone_id)
                     .map(|z| z.zone_name.clone())
                     .unwrap_or_else(|| link.zone_id.clone());
+                                let source = zones
+                                    .iter()
+                                    .find(|z| z.zone_id == link.zone_id)
+                                    .and_then(|z| z.source.as_deref());
+                                let source_label = playback_source_label(source);
+                                let instance_detail = instances
+                                    .iter()
+                                    .find(|instance| instance.name == link.instance)
+                                    .and_then(|instance| instance.host.as_deref())
+                                    .map(|host| format!("{} at {}", link.instance, host))
+                                    .unwrap_or_else(|| link.instance.clone());
                 let zone_id = link.zone_id.clone();
                 rsx! {
-                    div { class: "flex items-center gap-4 flex-wrap",
-                        div { class: "flex items-center gap-2",
-                            span { class: "text-muted", "Linked to" }
-                            span { class: "font-semibold", "{zone_name}" }
-                            if has_multiple_instances {
-                                span { class: "text-muted", "on" }
-                                span { class: "font-semibold", "{link.instance}" }
+                                    div { class: "flex flex-col gap-3 py-4 first:pt-0 last:pb-0 sm:flex-row sm:items-center sm:justify-between",
+                                        div { class: "min-w-0",
+                                            div { class: "flex flex-wrap items-center gap-2",
+                                                span { class: "font-semibold", "{zone_name}" }
+                                                span { class: "badge badge-secondary", "{source_label}" }
+                                            }
+                                            p { class: "mt-1 text-sm text-muted",
+                                                "Uses HQPlayer {instance_detail}"
+                                            }
+                                        }
+                                        button {
+                                            r#type: "button",
+                                            class: "btn btn-outline btn-sm shrink-0",
+                                            disabled: busy,
+                                            aria_label: "Remove match for {zone_name}",
+                                            onclick: move |_| on_unlink.call(zone_id.clone()),
+                                            if busy { "Updating…" } else { "Remove match" }
+                                        }
+                                    }
+                                }
                             }
-                        }
-                        button {
-                            class: "btn btn-outline btn-sm",
-                            onclick: move |_| on_unlink.call(zone_id.clone()),
-                            "Unlink"
                         }
                     }
                 }
             }
-        } else {
-            // Not linked - show zone dropdown and link button
-            div { class: "flex items-center gap-3 flex-wrap",
-                select {
-                    class: "input",
-                    "aria-label": "Select zone to link",
-                    value: "{selected_zone}",
-                    onchange: move |evt| selected_zone.set(evt.value()),
-                    for zone in zones.iter() {
-                        option {
-                            value: "{zone.zone_id}",
-                            selected: zone.zone_id == selected_zone(),
-                            "{zone.zone_name}"
-                        }
-                    }
-                }
-                if has_multiple_instances {
-                    select {
-                        class: "input",
-                        "aria-label": "Select HQPlayer instance",
-                        value: "{selected_instance}",
-                        onchange: move |evt| selected_instance.set(evt.value()),
-                        for inst in instances.iter() {
-                            option {
-                                value: "{inst.name}",
-                                selected: inst.name == selected_instance(),
-                                "{inst.name}"
-                            }
-                        }
-                    }
-                }
-                button {
-                    class: "btn btn-primary",
-                    onclick: move |_| {
-                        // Use selected zone, or fall back to first zone if signal wasn't synced
-                        let zone_id = {
-                            let sel = selected_zone();
-                            if sel.is_empty() {
-                                first_zone_for_click.clone()
-                            } else {
-                                sel
-                            }
-                        };
-                        // Use selected instance, or fall back to default if signal wasn't synced
-                        let instance = {
-                            let sel = selected_instance();
-                            if sel.is_empty() {
-                                default_instance_for_click.clone()
-                            } else {
-                                sel
-                            }
-                        };
-                        if !zone_id.is_empty() {
-                            on_link.call((zone_id, instance));
+
+            div { class: if current_links.is_empty() { "" } else { "border-t border-default pt-5" },
+                match availability {
+                    ZoneMatchAvailability::Loading => rsx! {
+                        p { class: "text-sm text-muted", aria_live: "polite",
+                            "Loading playback zones and saved matches…"
                         }
                     },
-                    "Link Zone"
+                    ZoneMatchAvailability::NoInstances => rsx! {
+                        h3 { class: "font-semibold", "Connect HQPlayer first" }
+                        p { class: "mt-1 text-sm text-muted",
+                            "Save an HQPlayer connection before matching it to a playback zone."
+                        }
+                    },
+                    ZoneMatchAvailability::NoPlaybackZones => rsx! {
+                        h3 { class: "font-semibold", "No unmatched playback zones" }
+                        p { class: "mt-1 text-sm text-muted",
+                            "Every available playback zone is already matched, or no playback provider is connected."
+                        }
+                    },
+                    ZoneMatchAvailability::Ready => rsx! {
+                        h3 { class: "font-semibold",
+                            if current_links.is_empty() { "Match a playback zone" } else { "Match another zone" }
+                        }
+                        div { class: "mt-4 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] lg:items-end",
+                            div {
+                                label { class: "mb-2 block text-sm font-medium", r#for: "zone-match-playback", "Playback zone" }
+                                select {
+                                    id: "zone-match-playback",
+                                    class: "input",
+                                    value: "{selected_zone}",
+                                    disabled: busy,
+                                    onchange: move |evt| selected_zone.set(evt.value()),
+                                    for zone in candidates.iter() {
+                                        option {
+                                            value: "{zone.zone_id}",
+                                            selected: zone.zone_id == selected_zone(),
+                                            "{zone.zone_name} ({playback_source_label(zone.source.as_deref())})"
+                                        }
+                                    }
+                                }
+                            }
+                            div {
+                                label { class: "mb-2 block text-sm font-medium", r#for: "zone-match-instance", "HQPlayer" }
+                                select {
+                                    id: "zone-match-instance",
+                                    class: "input",
+                                    value: "{selected_instance}",
+                                    disabled: busy,
+                                    onchange: move |evt| selected_instance.set(evt.value()),
+                                    for instance in instances.iter() {
+                                        option {
+                                            value: "{instance.name}",
+                                            selected: instance.name == selected_instance(),
+                                            if let Some(ref host) = instance.host {
+                                                "{instance.name} ({host})"
+                                            } else {
+                                                "{instance.name}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            button {
+                                r#type: "button",
+                                class: "btn btn-primary w-full lg:w-auto",
+                                disabled: busy,
+                                onclick: move |_| {
+                                    let zone_id = {
+                                        let selected = selected_zone();
+                                        normalized_match_selection(&selected, &candidate_ids_for_click)
+                                    };
+                                    let instance = {
+                                        let selected = selected_instance();
+                                        if selected.is_empty() {
+                                            default_instance_for_click.clone()
+                                        } else {
+                                            selected
+                                        }
+                                    };
+                                    if !zone_id.is_empty() && !instance.is_empty() {
+                                        on_link.call((zone_id, instance));
+                                    }
+                                },
+                                if busy { "Saving match…" } else { "Save match" }
+                            }
+                        }
+                        p { class: "mt-3 max-w-3xl text-xs text-muted",
+                            "Only match zones that are already configured to play through this HQPlayer. Saving a match does not reroute audio."
+                        }
+                    },
+                }
+            }
+
+            if let Some((is_error, message)) = feedback_copy {
+                p {
+                    class: if is_error { "mt-4 text-sm text-red-400" } else { "mt-4 text-sm status-ok" },
+                    role: if is_error { "alert" } else { "status" },
+                    aria_live: "polite",
+                    "{message}"
                 }
             }
         }
