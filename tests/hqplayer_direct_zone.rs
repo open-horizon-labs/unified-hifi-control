@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::response::Redirect;
 use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{json, Value};
@@ -588,9 +589,63 @@ async fn a_loaded_playing_zone_advertises_the_transport_it_really_has() {
         .expect("a loaded track publishes now_playing");
     assert_eq!(np.duration, Some(215.0));
     assert_eq!(np.seek_position, Some(42.0));
+    assert!(
+        np.image_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("hqplayer:")),
+        "a loaded HQPlayer track must carry a stable artwork identity"
+    );
 
     rig.shutdown().await;
     server.stop();
+}
+
+/// **Client expectation.** HQPlayer Embedded's own page displays `/cover/current`, which may
+/// redirect to a streaming service CDN. UHC's existing artwork proxy must return those bytes for a
+/// direct HQPlayer zone instead of its generic "No Image" placeholder.
+#[tokio::test]
+async fn hqplayer_current_cover_reaches_the_unified_image_interface() {
+    const JPEG: &[u8] = b"\xff\xd8\xff\xe0hqplayer-cover\xff\xd9";
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind cover server");
+    let web_port = listener.local_addr().expect("cover address").port();
+    let cover_server = tokio::spawn(async move {
+        let app = Router::new()
+            .route(
+                "/cover/current",
+                get(|| async { Redirect::temporary("/art.jpg") }),
+            )
+            .route(
+                "/art.jpg",
+                get(|| async { ([("content-type", "image/jpeg")], JPEG) }),
+            );
+        axum::serve(listener, app).await.expect("serve cover");
+    });
+
+    let rig = Rig::new().await;
+    rig.manager
+        .add_instance(
+            "cover".to_string(),
+            "127.0.0.1".to_string(),
+            Some(9),
+            Some(web_port),
+            None,
+            None,
+        )
+        .await;
+
+    let image = rig
+        .state
+        .get_image("hqplayer:cover", "hqplayer:test-track", None, None, None)
+        .await
+        .expect("fetch the current HQPlayer cover through the unified image interface");
+    assert_eq!(image.content_type, "image/jpeg");
+    assert_eq!(image.data, JPEG);
+
+    rig.shutdown().await;
+    cover_server.abort();
 }
 
 /// **Client expectation.** A seek on a zone the server told the client was not seekable is refused

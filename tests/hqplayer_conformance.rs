@@ -7107,6 +7107,52 @@ async fn a_performed_mode_write_reports_the_cleared_rate_pin_honestly() {
     h.stop();
 }
 
+/// HQPlayer keeps one rate pin and clears it on every real mode change. Like HQPTuner, the client
+/// must remember a verified pin per output family and restore the entered family's pin after the
+/// mode-dependent rate list has been re-enumerated.
+#[tokio::test]
+async fn switching_modes_restores_each_familys_last_verified_rate_pin() {
+    let h = Harness::verified().await;
+    h.adapter
+        .set_rate(352_800)
+        .await
+        .applied()
+        .expect("remember a PCM pin");
+    h.adapter
+        .set_mode("SDM (DSD)")
+        .await
+        .applied()
+        .expect("enter SDM");
+    h.adapter
+        .set_rate(5_644_800)
+        .await
+        .applied()
+        .expect("remember an SDM pin");
+
+    h.adapter
+        .set_mode("PCM")
+        .await
+        .applied()
+        .expect("return to PCM");
+    assert_eq!(
+        h.model.state().rate_index,
+        7,
+        "PCM 352.8 kHz must be restored"
+    );
+
+    h.adapter
+        .set_mode("SDM (DSD)")
+        .await
+        .applied()
+        .expect("return to SDM");
+    assert_eq!(
+        h.model.state().rate_index,
+        3,
+        "SDM 5.6448 MHz must be restored"
+    );
+    h.stop();
+}
+
 /// The daemon names the DSD mode `"SDM (DSD)"`, so a caller asking for `"DSD"` or `"SDM"` must reach
 /// it by **semantic alias**, never by assuming a list position (HQP-C-013's device fixture is why
 /// position is unsafe).

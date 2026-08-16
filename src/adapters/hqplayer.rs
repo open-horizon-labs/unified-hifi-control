@@ -2399,6 +2399,10 @@ struct HqpAdapterState {
     /// session or poll, and nothing in the contents distinguishes that from the cache never having
     /// been touched. Monotonic, bumped on every clear and every publication, and never reset.
     chain_generation: u64,
+    /// Last verified exact-rate pin for each forced output family. HQPlayer has only one live pin
+    /// and clears it on `SetMode`, so these restore the family being entered.
+    remembered_pcm_rate: Option<u32>,
+    remembered_sdm_rate: Option<u32>,
     volume_range: Option<VolumeRange>,
     /// The last volume capability this endpoint was ever *observed* to have (#328).
     ///
@@ -2463,6 +2467,8 @@ impl Default for HqpAdapterState {
             shapers_fingerprint: None,
             rates_fingerprint: None,
             chain_generation: 0,
+            remembered_pcm_rate: None,
+            remembered_sdm_rate: None,
             volume_range: None,
             last_observed_volume_range: None,
             profiles: Vec::new(),
@@ -2519,6 +2525,9 @@ pub struct HqpAdapter {
 }
 
 impl HqpAdapter {
+    const MAX_COVER_BYTES: usize = 16 * 1024 * 1024;
+    const MAX_COVER_REDIRECTS: usize = 4;
+
     fn store_captured_receipt(
         captured: &std::sync::Mutex<Option<NativeSettingReceipt>>,
         receipt: NativeSettingReceipt,
@@ -2754,6 +2763,8 @@ impl HqpAdapter {
                 // Clear every native-session cache when switching native endpoints.
                 state.info = None;
                 state.last_state = None;
+                state.remembered_pcm_rate = None;
+                state.remembered_sdm_rate = None;
                 // Through the common helper rather than by hand. The lists, the fingerprints that
                 // anchor them and the generation that dates them are one fact in three parts — a
                 // second spelling of the clearing is how one of the three gets left behind, and a
@@ -6175,6 +6186,43 @@ impl HqpAdapter {
         None
     }
 
+    fn receipt_verified(receipt: &NativeSettingReceipt) -> bool {
+        matches!(
+            receipt,
+            NativeSettingReceipt::DaemonAcknowledged {
+                readback: NativeSettingReadback::Verified
+            } | NativeSettingReceipt::NotAttempted {
+                readback: NativeSettingReadback::Noop,
+                ..
+            }
+        )
+    }
+
+    async fn remembered_rate(&self, family: ModeFamily) -> Option<u32> {
+        let state = self.state.read().await;
+        match family {
+            ModeFamily::Pcm => state.remembered_pcm_rate,
+            ModeFamily::Sdm => state.remembered_sdm_rate,
+            ModeFamily::Source => None,
+        }
+    }
+
+    async fn remember_rate_for_current_mode(&self, rate: u32, fence: Option<u64>) -> Result<()> {
+        let (modes, generation) = self.command_modes(fence).await?;
+        let current = self.get_state_on_transport(generation).await?;
+        let family = modes
+            .iter()
+            .find(|mode| mode.index == u32::from(current.mode))
+            .and_then(|mode| Self::mode_family(&mode.name));
+        let mut state = self.state.write().await;
+        match family {
+            Some(ModeFamily::Pcm) => state.remembered_pcm_rate = (rate != 0).then_some(rate),
+            Some(ModeFamily::Sdm) => state.remembered_sdm_rate = (rate != 0).then_some(rate),
+            _ => {}
+        }
+        Ok(())
+    }
+
     /// Resolve the mode currently reported by the running engine.
     ///
     /// `State.active_mode` is not the live output mode on the HQPlayer 6.0.4 daemon we support:
@@ -6334,7 +6382,7 @@ impl HqpAdapter {
     /// A mode the daemon is already in is **not written**. `SetMode` clears the exact-rate pin even
     /// when the mode does not change (HQP-C-017), so an unconditional write destroys a user's pinned
     /// rate for nothing. When a write is performed the chain reloads, so every chain-scoped list is
-    /// dropped and the pin the daemon just cleared is re-read rather than remembered.
+    /// dropped and re-read before a verified rate previously seen for the entered family is restored.
     /// The chain-transition hazard [`SemanticFamily`] describes cannot reach *this* family: `GetModes`
     /// is device-scoped, so the loaded chain moving does not renumber it. What can reshape it is a
     /// device or profile change — a PCM-only DAC's list has **no** SDM entry and the survivors keep
@@ -6348,7 +6396,7 @@ impl HqpAdapter {
     }
 
     async fn set_mode_under_operation(&self, mode_name: &str) -> Result<SettingOutcome> {
-        self.execute_mode_receipt_under_operation(mode_name, None)
+        self.execute_mode_with_rate_restore_under_operation(mode_name, None)
             .await?
             .into_setting_outcome("mode")
     }
@@ -6686,9 +6734,15 @@ impl HqpAdapter {
         // write; checking only once outside the bracket would let a transition to `[source]` during
         // the first attempt send a pin on the retry.
         let _operation_guard = self.operation_lock.lock().await;
-        self.execute_rate_receipt_under_operation(rate_value, None)
-            .await?
-            .into_setting_outcome("rate")
+        let receipt = self
+            .execute_rate_receipt_under_operation(rate_value, None)
+            .await?;
+        if Self::receipt_verified(&receipt) {
+            if let Err(error) = self.remember_rate_for_current_mode(rate_value, None).await {
+                tracing::warn!(%error, rate = rate_value, "could not retain verified HQPlayer rate pin");
+            }
+        }
+        receipt.into_setting_outcome("rate")
     }
 
     /// Execute one semantic pipeline command and retain typed native evidence for its caller.
@@ -6716,7 +6770,7 @@ impl HqpAdapter {
         let fence = Some(target.transport_generation);
         match setting {
             HqpNativeSetting::Mode(value) => {
-                self.execute_mode_receipt_under_operation(&value, fence)
+                self.execute_mode_with_rate_restore_under_operation(&value, fence)
                     .await
             }
             HqpNativeSetting::Filter1x(value) => {
@@ -6732,10 +6786,53 @@ impl HqpAdapter {
                     .await
             }
             HqpNativeSetting::Rate(value) => {
-                self.execute_rate_receipt_under_operation(value, fence)
-                    .await
+                let receipt = self
+                    .execute_rate_receipt_under_operation(value, fence)
+                    .await?;
+                if Self::receipt_verified(&receipt) {
+                    if let Err(error) = self.remember_rate_for_current_mode(value, fence).await {
+                        tracing::warn!(%error, rate = value, "could not retain verified HQPlayer rate pin");
+                    }
+                }
+                Ok(receipt)
             }
         }
+    }
+
+    async fn execute_mode_with_rate_restore_under_operation(
+        &self,
+        mode_name: &str,
+        fence: Option<u64>,
+    ) -> Result<NativeSettingReceipt> {
+        let receipt = self
+            .execute_mode_receipt_under_operation(mode_name, fence)
+            .await?;
+        let changed = matches!(
+            receipt,
+            NativeSettingReceipt::DaemonAcknowledged {
+                readback: NativeSettingReadback::Verified
+            }
+        );
+        if changed {
+            let remembered = match Self::mode_family(mode_name) {
+                Some(family) => self.remembered_rate(family).await,
+                None => None,
+            };
+            if let Some(rate) = remembered {
+                let rate_receipt = self
+                    .execute_rate_receipt_under_operation(rate, fence)
+                    .await?;
+                rate_receipt
+                    .into_setting_outcome("rate")?
+                    .into_applied_result()
+                    .with_context(|| {
+                        format!(
+                            "HQPlayer changed mode to {mode_name}, but could not restore its remembered {rate} Hz rate"
+                        )
+                    })?;
+            }
+        }
+        Ok(receipt)
     }
 
     async fn execute_mode_receipt_under_operation(
@@ -7792,6 +7889,24 @@ impl HqpAdapter {
             },
         };
 
+        // Seed the same per-family memory used by explicit SetRate calls from authoritative State.
+        // This lets an adapter that attached after another controller configured the engine preserve
+        // that family on later switches instead of learning only from its own writes.
+        if let Some(rate) = rates
+            .iter()
+            .find(|rate| rate.index == state.rate)
+            .map(|rate| rate.rate)
+            .filter(|rate| *rate != 0)
+        {
+            let family = Self::mode_family(&get_mode_by_index(state.mode));
+            let mut adapter_state = self.state.write().await;
+            match family {
+                Some(ModeFamily::Pcm) => adapter_state.remembered_pcm_rate = Some(rate),
+                Some(ModeFamily::Sdm) => adapter_state.remembered_sdm_rate = Some(rate),
+                _ => {}
+            }
+        }
+
         Ok(CoherentPipelineSnapshot {
             legacy,
             active_profile,
@@ -7833,6 +7948,18 @@ impl HqpAdapter {
     /// MD5 hash helper
     fn md5_hash(input: &str) -> String {
         format!("{:x}", md5::compute(input.as_bytes()))
+    }
+
+    fn cover_cache_key(status: &HqpStatus) -> String {
+        let identity = format!(
+            "{}\0{}\0{}\0{}\0{}",
+            status.track_id,
+            status.title.as_deref().unwrap_or_default(),
+            status.artist.as_deref().unwrap_or_default(),
+            status.album.as_deref().unwrap_or_default(),
+            status.length
+        );
+        format!("hqplayer:{}", Self::md5_hash(&identity))
     }
 
     /// Build digest auth header
@@ -8031,6 +8158,101 @@ impl HqpAdapter {
         }
 
         Ok(response.text().await?)
+    }
+
+    /// Fetch the artwork HQPlayer Embedded displays for its current track.
+    ///
+    /// The daemon serves bytes directly for local/library artwork and redirects streaming-service
+    /// artwork to a CDN. Redirects are followed explicitly because ordinary configuration reads
+    /// deliberately disable them to detect HQPlayer's operational-page redirects to `/about`.
+    pub async fn get_current_cover(&self) -> Result<crate::bus::ImageData> {
+        let path = "/cover/current";
+        let base_url = self.web_base_url().await?;
+        let url = format!("{base_url}{path}");
+
+        let send_origin = |authorization: Option<String>| {
+            let mut request = self.http_client.get(&url);
+            if let Some(value) = authorization {
+                request = request.header("Authorization", value);
+            }
+            request
+        };
+
+        let mut response = send_origin(self.build_digest_header("GET", path).await)
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let challenge = response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| value.to_ascii_lowercase().starts_with("digest"))
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("HQPlayer cover authentication failed"))?;
+            self.parse_digest_challenge(&challenge).await;
+            response = send_origin(self.build_digest_header("GET", path).await)
+                .send()
+                .await?;
+        }
+
+        for redirect_count in 0..=Self::MAX_COVER_REDIRECTS {
+            if response.status().is_redirection() {
+                if redirect_count == Self::MAX_COVER_REDIRECTS {
+                    return Err(anyhow!("HQPlayer cover exceeded the redirect limit"));
+                }
+                let location = response
+                    .headers()
+                    .get("location")
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| anyhow!("HQPlayer cover redirect omitted Location"))?;
+                let next = response
+                    .url()
+                    .join(location)
+                    .context("HQPlayer cover redirect was not a valid URL")?;
+                if !matches!(next.scheme(), "http" | "https") {
+                    return Err(anyhow!(
+                        "HQPlayer cover redirect used unsupported scheme {}",
+                        next.scheme()
+                    ));
+                }
+                response = self.http_client.get(next).send().await?;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                return Err(anyhow!(
+                    "HQPlayer cover request failed: {}",
+                    response.status()
+                ));
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > Self::MAX_COVER_BYTES as u64)
+            {
+                return Err(anyhow!("HQPlayer cover exceeded the size limit"));
+            }
+
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
+                .filter(|value| value.starts_with("image/"))
+                .ok_or_else(|| anyhow!("HQPlayer cover response was not an image"))?;
+            let mut data = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if data.len().saturating_add(chunk.len()) > Self::MAX_COVER_BYTES {
+                    return Err(anyhow!("HQPlayer cover exceeded the size limit"));
+                }
+                data.extend_from_slice(&chunk);
+            }
+            if data.is_empty() {
+                return Err(anyhow!("HQPlayer cover response was empty"));
+            }
+            return Ok(crate::bus::ImageData { content_type, data });
+        }
+
+        Err(anyhow!("HQPlayer cover redirect handling exhausted"))
     }
 
     /// Send one profile form request inside its dedicated whole-request budget.
@@ -8720,10 +8942,10 @@ impl HqpAdapter {
                 title: status.title.clone().unwrap_or_default(),
                 artist: status.artist.clone().unwrap_or_default(),
                 album: status.album.clone().unwrap_or_default(),
-                // Album art is explicitly unavailable rather than promised. Native `LibraryPicture`
-                // needs binary framing on a connection this client treats as XML-only, plus caps,
-                // authentication and cache policy — none of which #328 establishes.
-                image_key: None,
+                // HQPlayer Embedded exposes the current cover through its authenticated web lane.
+                // The key identifies the track rather than the URL: `/cover/current` is stable, so
+                // clients need this value to invalidate an earlier cover when playback advances.
+                image_key: Some(Self::cover_cache_key(status)),
                 seek_position: Some(status.position as f64),
                 duration: Some(status.length as f64),
                 metadata: Some(TrackMetadata {

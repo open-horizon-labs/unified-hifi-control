@@ -116,7 +116,7 @@ impl AppState {
 
     /// Fetch image from the appropriate adapter based on zone_id prefix
     ///
-    /// Routes to the correct backend (Roon, LMS, OpenHome) based on the zone_id
+    /// Routes to the correct backend (Roon, LMS, OpenHome, HQPlayer) based on the zone_id
     /// prefix and fetches the image using that adapter's API.
     ///
     /// Note: UPnP zones don't support image retrieval as the protocol doesn't
@@ -148,6 +148,13 @@ impl AppState {
             anyhow::bail!(
                 "UPnP zones don't support image retrieval - the protocol doesn't expose album art URLs"
             )
+        } else if let Some(instance) = zone_id.strip_prefix("hqplayer:") {
+            let adapter = self
+                .hqp_instances
+                .get(instance)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("Unknown HQPlayer instance: {instance}"))?;
+            adapter.get_current_cover().await?
         } else if zone_id.starts_with("roon:") || !zone_id.contains(':') {
             let img = self.roon.get_image(image_key, width, height).await?;
             ImageData {
