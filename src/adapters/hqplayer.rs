@@ -9054,10 +9054,14 @@ impl HqpAdapter {
             // a legitimate action rather than avoid an impossible one.
             is_play_allowed: state != PlaybackState::Playing,
             is_pause_allowed: state == PlaybackState::Playing,
-            // Skip needs something to skip from. With nothing loaded these are the flags that had a
-            // knob drawing enabled buttons for a daemon that would answer `result="Error"`.
-            is_next_allowed: track_loaded,
-            is_previous_allowed: track_loaded,
+            // HQPlayer is the DSP endpoint, not UHC's playback-queue owner. A loaded track and
+            // metadata therefore do not make HQPlayer's native Next/Previous commands a valid
+            // capability: Roon/JPLAY (or another source) owns the queue and must receive skips.
+            // Keeping these false prevents a direct HQPlayer zone from drawing buttons that the
+            // daemon will reject with `result="Error"`. Linked source zones retain their own
+            // transport flags and remain controllable from the HQPlayer page.
+            is_next_allowed: false,
+            is_previous_allowed: false,
         }
     }
 }
