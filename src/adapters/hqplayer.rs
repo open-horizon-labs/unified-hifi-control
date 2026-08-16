@@ -1376,6 +1376,9 @@ pub struct HqpInfo {
 pub struct HqpStatus {
     pub state: u8,
     pub track: u32,
+    /// Native HQPlayer playlist size. Zero means the daemon did not provide a total.
+    #[serde(skip)]
+    pub tracks_total: u32,
     pub track_id: String,
     pub position: u32,
     pub length: u32,
@@ -5067,6 +5070,7 @@ impl HqpAdapter {
         HqpStatus {
             state: Self::parse_attr_u32(response, "state") as u8,
             track: Self::parse_attr_u32(response, "track"),
+            tracks_total: Self::parse_attr_u32(response, "tracks_total"),
             track_id: Self::parse_attr(response, "track_id").unwrap_or_default(),
             position: Self::parse_attr_u32(response, "position"),
             length: Self::parse_attr_u32(response, "length"),
@@ -9057,10 +9061,13 @@ impl HqpAdapter {
             // `track` is HQPlayer's native playlist cursor. A source-fed stream can have metadata,
             // a duration, and even a track ID while still having no HQPlayer queue; that is the
             // state in which native Next/Previous returns `result="Error"`. Only advertise queue
-            // skips when HQPlayer reports a native cursor. Linked source zones retain their own
-            // transport flags and remain controllable from the HQPlayer page.
-            is_next_allowed: status.track > 0,
-            is_previous_allowed: status.track > 0,
+            // skips when HQPlayer reports a native cursor. When the daemon supplies the queue
+            // size, also enforce its bounds: a one-item source-backed playlist reports track=1,
+            // but Next still fails and may clear the track. Older daemon/status variants omit the
+            // total, so retain the cursor-only fallback for those observations.
+            is_next_allowed: status.track > 0
+                && (status.tracks_total == 0 || status.track < status.tracks_total),
+            is_previous_allowed: status.track > 1,
         }
     }
 }
@@ -9759,6 +9766,21 @@ async fn run_hqplayer_command_endpoint(
         let projection = match result {
             Ok(projection) => projection,
             Err(error) => {
+                // HQPlayer's negative transport response is not state-neutral: with a source-fed
+                // track, `<Next result="Error"/>` / `<Previous result="Error"/>` can still leave
+                // the daemon stopped with an empty Status document. Refresh before completing the
+                // ticket so the aggregator, MCP, and UI converge on that native outcome while the
+                // caller still receives the original backend error.
+                if let Err(refresh_error) = adapter
+                    .observe_and_publish_managed(native_worker.as_ref())
+                    .await
+                {
+                    tracing::warn!(
+                        %refresh_error,
+                        command_id = command_id.get(),
+                        "HQPlayer command failed and its state refresh also failed"
+                    );
+                }
                 permit.complete_native(NativeResult::Failed(error.to_string()));
                 continue;
             }

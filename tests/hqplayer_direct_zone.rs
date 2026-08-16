@@ -38,8 +38,8 @@ use mock_servers::hqplayer::model::{DaemonModel, Metadata};
 use mock_servers::hqplayer::wire::{WirePolicy, WireServer};
 
 use unified_hifi_control::adapters::hqplayer::{
-    HqpAdapter, HqpInstanceManager, HqpRecoveryConfig, HqpStatus, HqpTimeouts, HqpZoneLinkService,
-    VolumeRange,
+    HqpAdapter, HqpInfo, HqpInstanceManager, HqpRecoveryConfig, HqpStatus, HqpTimeouts,
+    HqpZoneLinkService, VolumeRange,
 };
 use unified_hifi_control::adapters::lms::LmsAdapter;
 use unified_hifi_control::adapters::openhome::OpenHomeAdapter;
@@ -985,6 +985,25 @@ async fn a_loaded_source_track_without_a_native_queue_refuses_queue_skips() {
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{action}: {response}");
     }
+}
+
+#[test]
+fn a_single_item_native_queue_does_not_advertise_skip_controls() {
+    let status = HqpAdapter::parse_status_for_test(
+        r#"<Status state="2" track="1" tracks_total="1" track_id="queued-track" position="4" length="215" volume="-18" samplerate="44100"/>"#,
+    );
+    let zone = HqpAdapter::project_direct_zone(
+        "hqplayer.test",
+        Some("rig"),
+        &HqpInfo::default(),
+        &status,
+        &VolumeRange::default(),
+    );
+
+    assert!(
+        !zone.is_next_allowed && !zone.is_previous_allowed,
+        "a one-item native queue must not advertise skips that HQPlayer will reject"
+    );
 }
 
 /// **Client expectation.** A transient failure to read the volume capability must not tell the
