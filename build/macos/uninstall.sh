@@ -11,7 +11,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-echo "Uninstalling Unified Hi-Fi Control..."
+echo "Uninstalling Unified Hi-Fi Control by Open Horizon Labs..."
 
 # Stop and unload the service
 launchctl stop com.cloudatlas.unified-hifi-control 2>/dev/null || true
@@ -42,4 +42,4 @@ fi
 # Remove package receipt
 pkgutil --forget com.cloudatlas.unified-hifi-control 2>/dev/null || true
 
-echo "Unified Hi-Fi Control has been uninstalled."
+echo "Unified Hi-Fi Control by Open Horizon Labs has been uninstalled."

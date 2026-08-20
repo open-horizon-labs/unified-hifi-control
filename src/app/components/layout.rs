@@ -7,6 +7,7 @@ use crate::app::api::AppStatus;
 use crate::app::embedded_assets::{
     APPLE_TOUCH_ICON_DATA_URL, DX_THEME_CSS, FAVICON_DATA_URL, TAILWIND_CSS,
 };
+use crate::brand::PRODUCT_BYLINE;
 
 #[derive(Props, Clone, PartialEq)]
 pub struct LayoutProps {
@@ -46,7 +47,7 @@ pub fn Layout(props: LayoutProps) -> Element {
             )
         }
     };
-    let full_title = format!("{} - Unified Hi-Fi Control", props.title);
+    let full_title = format!("{} — {}", props.title, PRODUCT_BYLINE);
 
     rsx! {
         // Head elements - Dioxus hoists these to the real <head>
@@ -82,7 +83,7 @@ pub fn Layout(props: LayoutProps) -> Element {
             {props.children}
         }
         footer { class: "max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center py-3",
-            small { class: "text-muted", "Unified Hi-Fi Control v{version} ({git_sha})" }
+            small { class: "text-muted", "{PRODUCT_BYLINE} · v{version} ({git_sha})" }
         }
     }
 }

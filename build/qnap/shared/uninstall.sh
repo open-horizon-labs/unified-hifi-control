@@ -16,5 +16,5 @@ if [ -f "$PID_FILE" ]; then
     rm -f "$PID_FILE"
 fi
 
-echo "Unified Hi-Fi Control uninstalled"
+echo "Unified Hi-Fi Control by Open Horizon Labs uninstalled"
 exit 0

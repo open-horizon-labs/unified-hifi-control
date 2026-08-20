@@ -9,6 +9,6 @@ TARGET_DIR="${SYNOPKG_PKGDEST:-${PACKAGE_DIR}/target}"
 # Make binary executable
 chmod +x "${TARGET_DIR}/unified-hifi-control"
 
-echo "Unified Hi-Fi Control upgraded successfully"
+echo "Unified Hi-Fi Control by Open Horizon Labs upgraded successfully"
 
 exit 0

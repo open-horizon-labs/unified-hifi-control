@@ -28,7 +28,7 @@ if [ "$WAS_RUNNING" = true ]; then
     "${QPKG_ROOT}/unified-hifi-control.sh" start
 fi
 
-echo "Unified Hi-Fi Control installed successfully"
+echo "Unified Hi-Fi Control by Open Horizon Labs installed successfully"
 echo "Access the web UI at http://$(hostname):8088"
 
 exit 0

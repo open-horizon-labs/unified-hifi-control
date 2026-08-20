@@ -1,12 +1,12 @@
 PLUGIN_UNIFIED_HIFI
-	DE	Unified Hi-Fi Steuerung
-	EN	Unified Hi-Fi Control
-	FR	Contrôle Hi-Fi Unifié
-	NL	Unified Hi-Fi Bediening
+	DE	Unified Hi-Fi Steuerung — Open Horizon Labs
+	EN	Unified Hi-Fi Control by Open Horizon Labs
+	FR	Contrôle Hi-Fi Unifié — Open Horizon Labs
+	NL	Unified Hi-Fi Bediening — Open Horizon Labs
 
 PLUGIN_UNIFIED_HIFI_DESC
 	DE	Quellenunabhängige Hi-Fi-Steuerungsbrücke für Roon, LMS, HQPlayer und Hardware-Drehregler. Bietet HTTP-APIs, MQTT-Integration und Web-Oberfläche.
-	EN	Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer, and hardware knobs. Provides HTTP APIs, MQTT integration, and web UI.
+	EN	Unified music control for Roon, LMS, HQPlayer, HiPhi controllers, automation, and AI agents by Open Horizon Labs.
 	FR	Passerelle de contrôle hi-fi indépendante de la source pour Roon, LMS, HQPlayer et boutons matériels. Fournit des API HTTP, une intégration MQTT et une interface web.
 	NL	Brononafhankelijke hi-fi-bedieningsbrug voor Roon, LMS, HQPlayer en hardwareknoppen. Biedt HTTP-API's, MQTT-integratie en webinterface.
 
@@ -18,7 +18,7 @@ PLUGIN_UNIFIED_HIFI_AUTORUN
 
 PLUGIN_UNIFIED_HIFI_AUTORUN_DESC
 	DE	Startet die Unified Hi-Fi Control Bridge automatisch mit LMS.
-	EN	Automatically start the Unified Hi-Fi Control bridge when LMS starts.
+	EN	Automatically start Unified Hi-Fi Control by Open Horizon Labs when LMS starts.
 	FR	Démarre automatiquement la passerelle Unified Hi-Fi Control au démarrage de LMS.
 	NL	Start de Unified Hi-Fi Control bridge automatisch bij het starten van LMS.
 
@@ -82,13 +82,13 @@ PLUGIN_UNIFIED_HIFI_STATUS
 
 PLUGIN_UNIFIED_HIFI_KNOB
 	DE	Drehregler-Konfiguration
-	EN	Knob Configuration
+	EN	Controller Configuration
 	FR	Configuration du bouton
 	NL	Knopconfiguratie
 
 PLUGIN_UNIFIED_HIFI_KNOB_NAME
 	DE	Name des Drehreglers
-	EN	Knob name
+	EN	Controller name
 	FR	Nom du bouton
 	NL	Knopnaam
 

@@ -90,7 +90,7 @@ sub start {
 
     my $lmsPort = $serverPrefs->get('httpport');
 
-    $log->info("Starting Unified Hi-Fi Control: $binary on port $port");
+    $log->info("Starting Unified Hi-Fi Control by Open Horizon Labs: $binary on port $port");
 
     # Set environment variables for the subprocess
     # Using local ensures they're restored after Proc::Background->new() returns

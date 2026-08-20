@@ -501,7 +501,7 @@ pub fn Settings() -> Element {
                                 "You have an MCP server"
                             }
                             p { class: "mt-2 text-secondary max-w-2xl",
-                                "MCP (Model Context Protocol) is how compatible AI agents connect to your hi-fi tools. It is already running with Unified Hi-Fi Control—there is nothing else to install."
+                                "MCP (Model Context Protocol) is how compatible AI agents connect to your hi-fi tools. It is already running with Unified Hi-Fi Control by Open Horizon Labs—there is nothing else to install."
                             }
                         }
                         span { class: "badge badge-secondary gap-2 self-start shrink-0",
@@ -542,7 +542,7 @@ pub fn Settings() -> Element {
                                 }
                             }
                             p { class: "mt-4 text-xs text-muted max-w-prose",
-                                "Keep Unified Hi-Fi Control running, and only connect agents you trust. Connected agents can control playback on your system."
+                                "Keep Unified Hi-Fi Control by Open Horizon Labs running, and only connect agents you trust. Connected agents can control playback on your system."
                             }
                         }
 

@@ -800,8 +800,8 @@ pub fn create_mcp_extension(state: AppState) -> axum::Extension<McpExtState> {
         server_info: Implementation {
             name: "unified-hifi-control".into(),
             version: env!("CARGO_PKG_VERSION").into(),
-            title: Some("Unified Hi-Fi Control".into()),
-            description: Some("Control your music system via MCP".into()),
+            title: Some(crate::brand::PRODUCT_BYLINE.into()),
+            description: Some("Control music services and HiPhi controllers via MCP".into()),
             icons: vec![],
             website_url: Some("https://github.com/open-horizon-labs/unified-hifi-control".into()),
         },
@@ -811,7 +811,7 @@ pub fn create_mcp_extension(state: AppState) -> axum::Extension<McpExtState> {
         },
         meta: None,
         instructions: Some(
-            "Unified Hi-Fi Control MCP Server - Control Your Music System\n\n\
+            "Unified Hi-Fi Control by Open Horizon Labs — MCP Server\n\n\
             Use hifi_zones to list available zones, hifi_now_playing to see what's playing, \
             hifi_control for playback control, hifi_search to find music, and hifi_play to play it.\n\n\
             Note: hifi_search and hifi_play currently work with Roon and LMS zones only. \

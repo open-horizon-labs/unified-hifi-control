@@ -6,8 +6,8 @@
 #[cfg(feature = "server")]
 mod server {
     use unified_hifi_control::{
-        adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
-        mdns,
+        adapters, aggregator, api, app, brand, bus, config, coordinator, embedded, firmware, knobs,
+        mcp, mdns,
     };
 
     // Import Startable trait for adapter lifecycle methods
@@ -39,15 +39,15 @@ mod server {
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Flash Knob - Unified Hi-Fi Control</title>
+    <title>Flash a HiPhi Controller — Unified Hi-Fi Control by Open Horizon Labs</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
 </head>
 <body class="container">
-    <h1>Flash Knob Firmware</h1>
+    <h1>Flash HiPhi Controller Firmware</h1>
     <article>
         <p><strong>HTTPS Required</strong></p>
         <p>Browser-based flashing requires HTTPS. Use the official web flasher:</p>
-        <p><a href="https://roon-knob.muness.com/" target="_blank" rel="noopener" role="button">Open Web Flasher</a></p>
+        <p><a href="https://hiphi.audio/flash/" target="_blank" rel="noopener" role="button">Open the HiPhi Flash Center</a></p>
     </article>
 </body>
 </html>"#,
@@ -144,7 +144,8 @@ mod server {
             .init();
 
         tracing::info!(
-            "Starting Unified Hi-Fi Control (Rust) v{} ({})",
+            "Starting {} v{} ({})",
+            brand::PRODUCT_BYLINE,
             env!("UHC_VERSION"),
             env!("UHC_GIT_SHA")
         );
@@ -561,7 +562,7 @@ mod server {
         tracing::info!("Listening on http://{}", addr);
 
         // Advertise via mDNS for knob discovery
-        let _mdns = match mdns::advertise(config.port, "Unified Hi-Fi Control", &base_url) {
+        let _mdns = match mdns::advertise(config.port, brand::PRODUCT_BYLINE, &base_url) {
             Ok(daemon) => {
                 tracing::info!("mDNS advertising started");
                 Some(daemon)
@@ -696,7 +697,8 @@ async fn main() -> anyhow::Result<()> {
         );
         println!();
         println!(
-            "Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer, and hardware knobs."
+            "{} — source-agnostic control for music services and HiPhi controllers.",
+            unified_hifi_control::brand::PRODUCT_BYLINE
         );
         println!();
         println!("USAGE:");

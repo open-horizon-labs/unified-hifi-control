@@ -2,8 +2,8 @@
 name = "unified-hifi-control"
 version = "0.0.0"  # Injected from git tag at build time
 edition = "2021"
-authors = ["Muness Castle"]
-description = "Source-agnostic hi-fi control bridge for hardware surfaces and Home Assistant"
+authors = ["Open Horizon Labs"]
+description = "Source-agnostic music control platform for HiPhi hardware, web, automation, and AI agents"
 license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/open-horizon-labs/unified-hifi-control"
 

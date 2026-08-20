@@ -483,11 +483,11 @@ fn format_ago(timestamp: Option<&str>) -> String {
 /// Human-readable product name for current and already-released device slugs.
 fn device_type_label(device_type: Option<&str>) -> String {
     match device_type {
-        Some("hiphi-dial") => "Dial",
-        Some("frame") | Some("hiphi-frame") => "Frame",
-        Some("rlcd-42") | Some("hiphi-rlcd") => "RLCD",
-        Some("hiphi-joy") => "Joy",
-        Some("hiphi-tough") => "Tough",
+        Some("hiphi-dial") => "HiPhi Dial",
+        Some("frame") | Some("hiphi-frame") => "HiPhi Frame",
+        Some("rlcd-42") | Some("hiphi-rlcd") => "HiPhi RLCD",
+        Some("hiphi-joy") => "HiPhi Joy",
+        Some("hiphi-tough") => "HiPhi Tough",
         Some("hiphi-dial-beta") | Some("hiphi-m5-dial") => "M5 Dial Lab",
         Some("hiphi-sticks3-beta") | Some("hiphi-sticks3-twist") => "StickS3 Twist",
         Some("hiphi-stopwatch-beta") | Some("hiphi-stopwatch-remote") => "StopWatch Remote",
@@ -590,13 +590,13 @@ mod tests {
     #[test]
     fn labels_every_released_controller_identity() {
         let cases = [
-            ("hiphi-dial", "Dial"),
-            ("frame", "Frame"),
-            ("hiphi-frame", "Frame"),
-            ("rlcd-42", "RLCD"),
-            ("hiphi-rlcd", "RLCD"),
-            ("hiphi-joy", "Joy"),
-            ("hiphi-tough", "Tough"),
+            ("hiphi-dial", "HiPhi Dial"),
+            ("frame", "HiPhi Frame"),
+            ("hiphi-frame", "HiPhi Frame"),
+            ("rlcd-42", "HiPhi RLCD"),
+            ("hiphi-rlcd", "HiPhi RLCD"),
+            ("hiphi-joy", "HiPhi Joy"),
+            ("hiphi-tough", "HiPhi Tough"),
             ("hiphi-dial-beta", "M5 Dial Lab"),
             ("hiphi-sticks3-beta", "StickS3 Twist"),
             ("hiphi-stopwatch-beta", "StopWatch Remote"),

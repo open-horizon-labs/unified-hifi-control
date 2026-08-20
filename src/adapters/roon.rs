@@ -1489,9 +1489,9 @@ async fn run_roon_loop(
     // Use same extension ID as Node.js for seamless migration
     let info = Info::new(
         "com.muness.unified-hifi-control".to_string(),
-        "Unified Hi-Fi Control",
+        crate::brand::PRODUCT_BYLINE,
         env!("UHC_VERSION"),
-        Some("Muness Castle"),
+        Some(crate::brand::COMPANY_NAME),
         "",
         Some(env!("CARGO_PKG_REPOSITORY")),
     );

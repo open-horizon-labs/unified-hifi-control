@@ -10,7 +10,7 @@ chmod +x "${TARGET_DIR}/unified-hifi-control"
 # Create data directory if it doesn't exist
 mkdir -p "${PACKAGE_DIR}/var"
 
-echo "Unified Hi-Fi Control installed successfully"
+echo "Unified Hi-Fi Control by Open Horizon Labs installed successfully"
 echo "Access the web UI at http://$(hostname):8088"
 
 exit 0

@@ -3,7 +3,7 @@ name = "unified-hifi-control"
 asset_dir = "public"
 
 [web.app]
-title = "Unified Hi-Fi Control"
+title = "Unified Hi-Fi Control by Open Horizon Labs"
 
 [web.watcher]
 reload_html = true

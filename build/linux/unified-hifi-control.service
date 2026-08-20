@@ -1,5 +1,5 @@
 [Unit]
-Description=Unified Hi-Fi Control Bridge
+Description=Unified Hi-Fi Control by Open Horizon Labs
 Documentation=https://github.com/open-horizon-labs/unified-hifi-control
 After=network-online.target
 Wants=network-online.target

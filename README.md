@@ -1,10 +1,10 @@
-# Unified Hi-Fi Control
+# Unified Hi-Fi Control by Open Horizon Labs
 
 [![Build](https://github.com/open-horizon-labs/unified-hifi-control/actions/workflows/build.yml/badge.svg?branch=v3)](https://github.com/open-horizon-labs/unified-hifi-control/actions/workflows/build.yml)
 [![GitHub Release](https://img.shields.io/github/v/release/open-horizon-labs/unified-hifi-control)](https://github.com/open-horizon-labs/unified-hifi-control/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/open-horizon-labs/unified-hifi-control/total)](https://github.com/open-horizon-labs/unified-hifi-control/releases)
 
-Control your hi-fi system from anywhere — a hardware knob on your couch, your phone, or just ask Claude.
+Control your hi-fi system from anywhere — a HiPhi controller on your couch, your phone, or an AI agent.
 
 This bridge connects your music sources (Roon, LMS, UPnP) to any control surface you prefer. No vendor lock-in: mix and match sources, add HQPlayer DSP processing, and control it all from one place.
 
@@ -13,7 +13,7 @@ This bridge connects your music sources (Roon, LMS, UPnP) to any control surface
 Once the bridge is running, control your system from:
 
 - **Web UI** — Built-in at `http://your-bridge:8088`
-- **[roon-knob](https://github.com/muness/roon-knob)** — ESP32-S3 hardware knob with OLED display
+- **[HiPhi controllers](https://hiphi.audio/controllers.html)** — HiPhi Dial, HiPhi Frame, HiPhi RLCD, HiPhi Joy, HiPhi Tough, M5 Dial Lab, StickS3 Twist, StopWatch Remote, and Kizz
 - **iOS & Apple Watch** — In alpha testing. [Get in touch](https://github.com/open-horizon-labs/unified-hifi-control/issues) if you'd like to try it.
 - **Claude & AI agents** — Via the built-in MCP server (see [MCP Server](#mcp-server-claude-integration) below)
 
@@ -47,7 +47,7 @@ Add this repository URL in LMS Settings → Plugins → Additional Repositories:
 ```
 https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v3/lms-plugin/repo.xml
 ```
-Then install "Unified Hi-Fi Control" from the plugin list. The plugin automatically downloads and manages the bridge binary.
+Then install "Unified Hi-Fi Control by Open Horizon Labs" from the plugin list. The plugin automatically downloads and manages the bridge binary.
 
 ### Binary Downloads
 
@@ -106,7 +106,7 @@ If you route audio through HQPlayer for upsampling or filtering, this bridge let
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                   Unified Hi-Fi Control Bridge                       │
+│        Unified Hi-Fi Control by Open Horizon Labs                    │
 │  ┌────────┐  ┌────────┐  ┌──────────┐  ┌────────┐  ┌──────────┐    │
 │  │  Roon  │  │ Lyrion │  │ OpenHome │  │  UPnP  │  │ HQPlayer │    │
 │  │        │  │  /LMS  │  │          │  │  /DLNA │  │   DSP    │    │

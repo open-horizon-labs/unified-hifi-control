@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Server for Unified Hi-Fi Control
+ * MCP Server for Unified Hi-Fi Control by Open Horizon Labs
  *
  * Exposes hi-fi control capabilities to Claude and other MCP clients.
  * Connects to the running unified-hifi-control bridge via HTTP.
@@ -17,7 +17,7 @@ const { version: VERSION } = require('../package.json');
 const BRIDGE_URL = process.env.HIFI_BRIDGE_URL || 'http://localhost:3000';
 
 const SERVER_INSTRUCTIONS = `
-Unified Hi-Fi Control MCP Server - Control Your Music System
+Unified Hi-Fi Control by Open Horizon Labs — MCP Server
 
 This server connects you to a hi-fi control bridge that manages Roon music playback
 and HQPlayer Embedded audio processing. Use these tools when the user wants to:

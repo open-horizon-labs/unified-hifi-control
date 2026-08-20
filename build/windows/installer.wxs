@@ -2,9 +2,9 @@
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
      xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
 
-  <?define ProductName = "Unified Hi-Fi Control" ?>
+  <?define ProductName = "Unified Hi-Fi Control by Open Horizon Labs" ?>
   <?define ProductVersion = "$(var.Version)" ?>
-  <?define ProductManufacturer = "Cloud Atlas" ?>
+  <?define ProductManufacturer = "Open Horizon Labs" ?>
   <?define UpgradeCode = "F8E7D6C5-B4A3-4281-9060-504030201000" ?>
 
   <Product Id="*"
@@ -18,7 +18,7 @@
              Compressed="yes"
              InstallScope="perMachine"
              Description="$(var.ProductName) Installer"
-             Comments="Source-agnostic hi-fi control bridge" />
+             Comments="Unified music control for services, HiPhi controllers, automation, and AI agents" />
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of $(var.ProductName) is already installed."
                   AllowSameVersionUpgrades="yes" />
@@ -28,7 +28,7 @@
     <!-- Icon -->
     <Icon Id="AppIcon.ico" SourceFile="resources\app.ico" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
-    <Property Id="ARPHELPLINK" Value="https://github.com/cloud-atlas-ai/unified-hifi-control" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/open-horizon-labs/unified-hifi-control" />
 
     <!-- Install directory -->
     <Directory Id="TARGETDIR" Name="SourceDir">
@@ -54,8 +54,8 @@
         <ServiceInstall Id="ServiceInstaller"
                         Type="ownProcess"
                         Name="UnifiedHiFiControl"
-                        DisplayName="Unified Hi-Fi Control"
-                        Description="Source-agnostic hi-fi control bridge for Roon, LMS, HQPlayer"
+                        DisplayName="$(var.ProductName)"
+                        Description="Unified music control service"
                         Start="auto"
                         Account="NT AUTHORITY\NetworkService"
                         ErrorControl="normal"
@@ -93,13 +93,13 @@
     <ComponentGroup Id="ShortcutComponents" Directory="ApplicationProgramsFolder">
       <Component Id="ApplicationShortcuts" Guid="D4E5F6A7-B8C9-0123-DEF0-456789012345">
         <Shortcut Id="WebUIShortcut"
-                  Name="Unified Hi-Fi Control"
+                  Name="$(var.ProductName)"
                   Description="Open Web UI"
                   Target="http://localhost:8088"
                   Icon="AppIcon.ico" />
 
         <Shortcut Id="UninstallShortcut"
-                  Name="Uninstall Unified Hi-Fi Control"
+                  Name="Uninstall $(var.ProductName)"
                   Description="Uninstalls the application"
                   Target="[System64Folder]msiexec.exe"
                   Arguments="/x [ProductCode]" />
@@ -115,7 +115,7 @@
     </ComponentGroup>
 
     <!-- Features -->
-    <Feature Id="ProductFeature" Title="Unified Hi-Fi Control" Level="1">
+    <Feature Id="ProductFeature" Title="$(var.ProductName)" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
       <ComponentGroupRef Id="ShortcutComponents" />
     </Feature>

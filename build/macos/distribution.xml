@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <installer-gui-script minSpecVersion="2">
-    <title>Unified Hi-Fi Control</title>
+    <title>Unified Hi-Fi Control by Open Horizon Labs</title>
     <organization>com.cloudatlas</organization>
     <domains enable_localSystem="true" enable_currentUserHome="false"/>
 
@@ -20,8 +20,8 @@
 
     <choice id="com.cloudatlas.unified-hifi-control.pkg"
             visible="false"
-            title="Unified Hi-Fi Control"
-            description="Installs Unified Hi-Fi Control service">
+            title="Unified Hi-Fi Control by Open Horizon Labs"
+            description="Installs the Unified Hi-Fi Control service from Open Horizon Labs">
         <pkg-ref id="com.cloudatlas.unified-hifi-control.pkg"/>
     </choice>
 

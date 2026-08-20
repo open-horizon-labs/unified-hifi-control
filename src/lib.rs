@@ -29,6 +29,9 @@
 // Dioxus UI app (shared between server SSR and WASM client)
 pub mod app;
 
+/// Canonical product-facing identity shared by the UI and server surfaces.
+pub mod brand;
+
 // Dioxus components (official dx components)
 pub mod components;
 

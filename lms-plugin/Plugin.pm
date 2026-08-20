@@ -44,12 +44,12 @@ sub initPlugin {
 
     $prefs->setValidate({ 'validator' => 'intlimit', 'low' => 1024, 'high' => 65535 }, 'port');
 
-    $log->info("Unified Hi-Fi Control plugin initialized");
+    $log->info("Unified Hi-Fi Control by Open Horizon Labs plugin initialized");
 }
 
 sub shutdownPlugin {
     Plugins::UnifiedHiFi::Helper->stop;
-    $log->info("Unified Hi-Fi Control plugin shutdown");
+    $log->info("Unified Hi-Fi Control by Open Horizon Labs plugin shutdown");
 }
 
 sub getDisplayName {
@@ -74,6 +74,6 @@ control surfaces.
 
 =head1 SEE ALSO
 
-L<https://github.com/cloud-atlas-ai/unified-hifi-control>
+L<https://github.com/open-horizon-labs/unified-hifi-control>
 
 =cut

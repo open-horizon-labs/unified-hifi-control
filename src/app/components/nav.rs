@@ -3,6 +3,7 @@
 use crate::app::embedded_assets::LOGO_DATA_URL;
 use crate::app::settings_context::use_settings;
 use crate::app::Route;
+use crate::brand::{COMPANY_NAME, PRODUCT_NAME};
 use dioxus::prelude::*;
 
 #[derive(Props, Clone, PartialEq)]
@@ -61,8 +62,12 @@ pub fn Nav(props: NavProps) -> Element {
                     Link { class: "nav-brand flex items-center", to: Route::Zones {},
                         img {
                             src: "{*LOGO_DATA_URL}",
-                            alt: "Hi-Fi Control",
+                            alt: "{PRODUCT_NAME}",
                             class: "h-6 w-6 rounded"
+                        }
+                        span { class: "ml-2 leading-tight",
+                            strong { class: "block text-sm", "{PRODUCT_NAME}" }
+                            small { class: "block text-muted text-xs", "by {COMPANY_NAME}" }
                         }
                     }
                 }
