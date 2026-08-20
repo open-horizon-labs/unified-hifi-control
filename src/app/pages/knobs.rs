@@ -1,4 +1,4 @@
-//! Knobs page component.
+//! HiPhi controller management page.
 //!
 //! Knob device management using Dioxus resources for async data fetching.
 
@@ -11,7 +11,7 @@ use crate::app::api::{
 use crate::app::components::Layout;
 use crate::app::sse::use_sse;
 
-/// Knobs page component.
+/// HiPhi controller management page.
 #[component]
 pub fn Knobs() -> Element {
     let sse = use_sse();
@@ -307,10 +307,10 @@ pub fn Knobs() -> Element {
 
     rsx! {
         Layout {
-            title: "Knobs".to_string(),
+            title: "Controllers".to_string(),
             nav_active: "knobs".to_string(),
 
-            h1 { class: "text-2xl font-bold mb-6", "Knob Devices" }
+            h1 { class: "text-2xl font-bold mb-6", "HiPhi Controllers" }
 
             p { class: "mb-6 text-muted",
                 a {
@@ -318,23 +318,24 @@ pub fn Knobs() -> Element {
                     href: "https://community.roonlabs.com/t/50-esp32-s3-knob-roon-controller/311363",
                     target: "_blank",
                     rel: "noopener",
-                    "Knob Community Thread"
+                    "HiPhi Community Thread"
                 }
                 " - build info, firmware updates, discussion"
             }
 
-            // Knobs section
+            // Controllers section
             section { id: "knobs-section", class: "mb-8",
                 if is_loading {
-                    div { class: "card p-6", aria_busy: "true", "Loading knobs..." }
+                    div { class: "card p-6", aria_busy: "true", "Loading controllers..." }
                 } else if knobs_list.is_empty() {
-                    div { class: "card p-6 text-muted", "No knobs registered. Connect a knob to see it here." }
+                    div { class: "card p-6 text-muted", "No controllers registered. Connect a HiPhi controller to see it here." }
                 } else {
                     div { class: "card p-6 overflow-x-auto",
                         table { class: "w-full",
                             thead {
                                 tr { class: "border-b border-default",
                                     th { class: "text-left py-2 text-sm", "Name" }
+                                    th { class: "text-left py-2 text-sm", "Device" }
                                     th { class: "text-left py-2 text-sm", "Version" }
                                     th { class: "text-left py-2 text-sm", "IP" }
                                     th { class: "text-left py-2 text-sm", "Zone" }
@@ -361,7 +362,7 @@ pub fn Knobs() -> Element {
             section { id: "firmware-section", class: "mb-8",
                 div { class: "mb-4",
                     h2 { class: "text-xl font-semibold", "Firmware" }
-                    p { class: "text-muted text-sm", "Manage knob firmware updates" }
+                    p { class: "text-muted text-sm", "Manage HiPhi controller firmware" }
                 }
                 div { class: "card p-6",
                     p { class: "mb-4",
@@ -383,7 +384,7 @@ pub fn Knobs() -> Element {
                             onclick: fetch_firmware,
                             "Fetch Latest from GitHub"
                         }
-                        a { class: "link inline-flex min-h-11 items-center", href: "/knobs/flash", "Flash a new knob" }
+                        a { class: "link inline-flex min-h-11 items-center", href: "/knobs/flash", "Flash a controller" }
                         if let Some((is_err, ref msg)) = fw_message() {
                             if is_err {
                                 span { class: "status-err", "{msg}" }
@@ -479,7 +480,25 @@ fn format_ago(timestamp: Option<&str>) -> String {
     }
 }
 
-/// Format knob display name
+/// Human-readable product name for current and already-released device slugs.
+fn device_type_label(device_type: Option<&str>) -> String {
+    match device_type {
+        Some("hiphi-dial") => "Dial",
+        Some("frame") | Some("hiphi-frame") => "Frame",
+        Some("rlcd-42") | Some("hiphi-rlcd") => "RLCD",
+        Some("hiphi-joy") => "Joy",
+        Some("hiphi-tough") => "Tough",
+        Some("hiphi-dial-beta") | Some("hiphi-m5-dial") => "M5 Dial Lab",
+        Some("hiphi-sticks3-beta") | Some("hiphi-sticks3-twist") => "StickS3 Twist",
+        Some("hiphi-stopwatch-beta") | Some("hiphi-stopwatch-remote") => "StopWatch Remote",
+        Some("hiphi-kizz-beta") | Some("hiphi-kizz") => "Kizz",
+        Some(_) => "HiPhi Controller",
+        None => "Legacy controller",
+    }
+    .to_string()
+}
+
+/// Format controller display name.
 fn knob_display_name(knob: &KnobDevice) -> String {
     if let Some(ref name) = knob.name {
         if !name.is_empty() {
@@ -500,9 +519,13 @@ fn knob_display_name(knob: &KnobDevice) -> String {
         .to_lowercase();
 
     if suffix.is_empty() {
-        "unnamed".to_string()
+        device_type_label(knob.device_type.as_deref())
     } else {
-        format!("roon-knob-{}", suffix)
+        format!(
+            "{} {}",
+            device_type_label(knob.device_type.as_deref()),
+            suffix
+        )
     }
 }
 
@@ -536,12 +559,14 @@ fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) 
         .unwrap_or_else(|| "—".to_string());
 
     let version = knob.version.clone().unwrap_or_else(|| "—".to_string());
+    let device_type = device_type_label(knob.device_type.as_deref());
     let display_name = knob_display_name(&knob);
     let last_seen = format_ago(knob.last_seen.as_deref());
 
     rsx! {
         tr { class: "border-b border-default",
             td { class: "py-2", "{display_name}" }
+            td { class: "py-2", "{device_type}" }
             td { class: "py-2", "{version}" }
             td { class: "py-2", "{ip}" }
             td { class: "py-2", "{zone_name}" }
@@ -555,6 +580,41 @@ fn KnobRow(knob: KnobDevice, zones: Vec<Zone>, on_config: EventHandler<String>) 
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::device_type_label;
+
+    #[test]
+    fn labels_every_released_controller_identity() {
+        let cases = [
+            ("hiphi-dial", "Dial"),
+            ("frame", "Frame"),
+            ("hiphi-frame", "Frame"),
+            ("rlcd-42", "RLCD"),
+            ("hiphi-rlcd", "RLCD"),
+            ("hiphi-joy", "Joy"),
+            ("hiphi-tough", "Tough"),
+            ("hiphi-dial-beta", "M5 Dial Lab"),
+            ("hiphi-sticks3-beta", "StickS3 Twist"),
+            ("hiphi-stopwatch-beta", "StopWatch Remote"),
+            ("hiphi-kizz-beta", "Kizz"),
+        ];
+
+        for (slug, expected) in cases {
+            assert_eq!(device_type_label(Some(slug)), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_and_legacy_controllers_are_labeled_truthfully() {
+        assert_eq!(
+            device_type_label(Some("hiphi-future-controller")),
+            "HiPhi Controller"
+        );
+        assert_eq!(device_type_label(None), "Legacy controller");
     }
 }
 
@@ -742,7 +802,7 @@ fn ConfigModal(
 
                 // Header
                 div { class: "flex items-center justify-between mb-6",
-                    h2 { class: "text-xl font-semibold", "Knob Configuration" }
+                    h2 { class: "text-xl font-semibold", "Controller Configuration" }
                     button {
                         class: "text-muted hover:text-white text-xl",
                         aria_label: "Close",
@@ -765,7 +825,7 @@ fn ConfigModal(
                             input {
                                 class: "input",
                                 r#type: "text",
-                                placeholder: "Living Room Knob",
+                                placeholder: "Living Room Controller",
                                 value: "{name}",
                                 oninput: move |e| on_name_change.call(e.value())
                             }
@@ -942,7 +1002,7 @@ fn ConfigModal(
                                             }
                                         }
                                         p { class: "text-xs text-muted mt-2",
-                                            "The knob multiplies your base step by rotation speed. Faster turning = larger volume jumps."
+                                            "The controller multiplies your base step by input speed. Faster movement = larger volume jumps."
                                         }
                                     }
                                 } else {

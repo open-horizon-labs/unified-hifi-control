@@ -76,6 +76,22 @@ fn extract_knob_version(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Extract a bounded, forward-compatible controller type slug.
+fn extract_device_type(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-device-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+        .map(str::to_string)
+}
+
 /// DSP info for zones linked to HQPlayer (iOS compatible)
 #[derive(Serialize, Clone)]
 pub struct DspInfo {
@@ -268,12 +284,16 @@ pub async fn knob_now_playing_handler(
     // Update knob status if knob ID present
     let knob_id = extract_knob_id(&headers, params.knob_id.as_deref());
     let knob_version = extract_knob_version(&headers);
+    let device_type = extract_device_type(&headers);
     let client_ip = extract_client_ip(&headers, connect_info.ok().map(|c| c.0));
     let mut config_sha = None;
 
     let mut volume_step_override = None;
     if let Some(ref id) = knob_id {
-        let knob = state.knobs.get_or_create(id, knob_version.as_deref()).await;
+        let knob = state
+            .knobs
+            .get_or_create(id, knob_version.as_deref(), device_type.as_deref())
+            .await;
         volume_step_override = knob.config.volume_step_override;
         let battery_level = params.battery_level.filter(|&level| level <= 100);
         let battery_charging = params
@@ -872,11 +892,12 @@ pub async fn knob_config_by_path_handler(
     axum::extract::Path(knob_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let version = extract_knob_version(&headers);
+    let device_type = extract_device_type(&headers);
 
     // Get or create knob (ensures it exists for newly connected devices)
     let knob = state
         .knobs
-        .get_or_create(&knob_id, version.as_deref())
+        .get_or_create(&knob_id, version.as_deref(), device_type.as_deref())
         .await;
 
     // Build config response matching Node.js format

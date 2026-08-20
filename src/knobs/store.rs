@@ -118,6 +118,10 @@ pub struct Knob {
     pub name: String,
     pub last_seen: DateTime<Utc>,
     pub version: Option<String>,
+    /// Stable target slug reported by HiPhi firmware (for example
+    /// `hiphi-frame`). Missing for controllers running older firmware.
+    #[serde(default)]
+    pub device_type: Option<String>,
     pub config: KnobConfig,
     pub config_sha: String,
     pub status: KnobStatus,
@@ -192,14 +196,22 @@ impl KnobStore {
         knobs.get(knob_id).cloned()
     }
 
-    /// Get or create knob, updating last_seen and version
-    pub async fn get_or_create(&self, knob_id: &str, version: Option<&str>) -> Knob {
+    /// Get or create a controller, updating last_seen and reported identity.
+    pub async fn get_or_create(
+        &self,
+        knob_id: &str,
+        version: Option<&str>,
+        device_type: Option<&str>,
+    ) -> Knob {
         let mut knobs = self.knobs.write().await;
 
         if let Some(knob) = knobs.get_mut(knob_id) {
             knob.last_seen = Utc::now();
             if let Some(v) = version {
                 knob.version = Some(v.to_string());
+            }
+            if let Some(device_type) = device_type {
+                knob.device_type = Some(device_type.to_string());
             }
             let result = knob.clone();
             drop(knobs);
@@ -216,6 +228,7 @@ impl KnobStore {
             name,
             last_seen: Utc::now(),
             version: version.map(|s| s.to_string()),
+            device_type: device_type.map(|s| s.to_string()),
             config,
             config_sha,
             status: KnobStatus::default(),
@@ -332,6 +345,7 @@ impl KnobStore {
                 name: knob.name.clone(),
                 last_seen: knob.last_seen,
                 version: knob.version.clone(),
+                device_type: knob.device_type.clone(),
                 status: knob.status.clone(),
             })
             .collect()
@@ -381,5 +395,35 @@ pub struct KnobSummary {
     pub name: String,
     pub last_seen: DateTime<Utc>,
     pub version: Option<String>,
+    pub device_type: Option<String>,
     pub status: KnobStatus,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_knob() -> Knob {
+        let config = KnobConfig::default();
+        Knob {
+            name: String::new(),
+            last_seen: Utc::now(),
+            version: Some("2.6.0".to_string()),
+            device_type: Some("hiphi-frame".to_string()),
+            config_sha: compute_sha(&config, ""),
+            config,
+            status: KnobStatus::default(),
+        }
+    }
+
+    #[test]
+    fn legacy_persisted_knob_without_device_type_still_loads() {
+        let mut value = serde_json::to_value(sample_knob()).unwrap();
+        value.as_object_mut().unwrap().remove("device_type");
+
+        let restored: Knob = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.device_type, None);
+        assert_eq!(restored.version.as_deref(), Some("2.6.0"));
+    }
 }

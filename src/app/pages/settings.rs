@@ -473,7 +473,7 @@ pub fn Settings() -> Element {
                                         input {
                                             r#type: "checkbox",
                                             class: "checkbox",
-                                            aria_label: "Show Knobs page",
+                                            aria_label: "Show Controllers page",
                                             checked: !hide_knobs(),
                                             onchange: move |_| {
                                                 hide_knobs.toggle();
@@ -482,7 +482,7 @@ pub fn Settings() -> Element {
                                         }
                                     }
                                 }
-                                td { class: "py-2 px-3", "Knobs" }
+                                td { class: "py-2 px-3", "Controllers" }
                                 td { class: "py-2 px-3 text-muted", "-" }
                             }
                         }

@@ -77,7 +77,7 @@ pub fn Nav(props: NavProps) -> Element {
                         Link { class: nav_link_class("lms"), to: Route::Lms {}, "LMS" }
                     }
                     if !hide_knobs {
-                        Link { class: nav_link_class("knobs"), to: Route::Knobs {}, "Knobs" }
+                        Link { class: nav_link_class("knobs"), to: Route::Knobs {}, "Controllers" }
                     }
                     Link { class: nav_link_class("settings"), to: Route::Settings {}, "Settings" }
                 }
@@ -115,7 +115,7 @@ pub fn Nav(props: NavProps) -> Element {
                         Link { class: nav_link_class("lms"), to: Route::Lms {}, onclick: move |_| menu_open.set(false), "LMS" }
                     }
                     if !hide_knobs {
-                        Link { class: nav_link_class("knobs"), to: Route::Knobs {}, onclick: move |_| menu_open.set(false), "Knobs" }
+                        Link { class: nav_link_class("knobs"), to: Route::Knobs {}, onclick: move |_| menu_open.set(false), "Controllers" }
                     }
                     Link { class: nav_link_class("settings"), to: Route::Settings {}, onclick: move |_| menu_open.set(false), "Settings" }
                 }

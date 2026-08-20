@@ -238,6 +238,8 @@ pub struct KnobDevice {
     pub knob_id: String,
     pub name: Option<String>,
     pub version: Option<String>,
+    #[serde(default)]
+    pub device_type: Option<String>,
     pub last_seen: Option<String>,
     pub status: Option<KnobStatus>,
 }

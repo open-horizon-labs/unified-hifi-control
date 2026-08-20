@@ -368,6 +368,37 @@ async fn get_with_headers(
     (status, body_str)
 }
 
+/// Helper to make a GET request with the full HiPhi controller identity headers.
+async fn get_with_device_headers(
+    app: &Router,
+    path: &str,
+    knob_id: &str,
+    knob_version: &str,
+    device_type: &str,
+) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header("X-Knob-Id", knob_id)
+                .header("X-Knob-Version", knob_version)
+                .header("X-Device-Type", device_type)
+                .header("Accept", "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body).to_string();
+    (status, body_str)
+}
+
 /// Helper to make a POST request with JSON body
 async fn post_json(app: &Router, path: &str, body: &impl Serialize) -> (StatusCode, String) {
     let json_body = serde_json::to_string(body).unwrap();
@@ -1070,6 +1101,34 @@ mod shared_endpoints {
         assert_eq!(status, StatusCode::OK);
         let json = assert_json("GET /knob/devices", &body);
         assert!(json.is_object());
+    }
+
+    /// A controller's target identity must survive registration and appear in
+    /// the management response. The legacy `knobs` envelope remains stable.
+    #[tokio::test]
+    async fn controller_device_type_is_registered() {
+        let app = create_test_app().await;
+        let controller_id = "device-type-test-frame";
+        let path = format!(
+            "/now_playing?zone_id=test-zone&battery_level=80&battery_charging=false&knob_id={controller_id}"
+        );
+
+        let _ = get_with_device_headers(&app, &path, controller_id, "2.7.0-alpha.1", "hiphi-frame")
+            .await;
+
+        let (status, body) = get_request(&app, "/knob/devices").await;
+        assert_eq!(status, StatusCode::OK);
+        let json = assert_json("GET /knob/devices after controller registration", &body);
+        let controller = json["knobs"]
+            .as_array()
+            .and_then(|devices| {
+                devices
+                    .iter()
+                    .find(|device| device["knob_id"] == controller_id)
+            })
+            .expect("registered controller must be listed");
+
+        assert_eq!(controller["device_type"], "hiphi-frame");
     }
 
     /// Test: GET /hqp/instances - HQPlayer instances
