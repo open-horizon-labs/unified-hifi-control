@@ -63,3 +63,5 @@ pub mod mdns;
 // Server-only: it necessarily touches both `crate::bus` and `crate::adaptive`.
 #[cfg(feature = "server")]
 pub mod producers;
+#[cfg(feature = "server")]
+pub mod voice;

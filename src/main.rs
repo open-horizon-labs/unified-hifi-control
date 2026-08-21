@@ -7,7 +7,7 @@
 mod server {
     use unified_hifi_control::{
         adapters, aggregator, api, app, bus, config, coordinator, embedded, firmware, knobs, mcp,
-        mdns,
+        mdns, voice,
     };
 
     // Import load_app_settings for checking adapter enabled state
@@ -479,6 +479,10 @@ mod server {
             .route("/api/settings", post(api::api_settings_post_handler))
             // Event stream (SSE)
             .route("/events", get(api::events_handler))
+            // Kizz's LAN-only realtime voice transport.  This is deliberately
+            // separate from the controller API so an embedded listener cannot
+            // reach arbitrary App Server capabilities.
+            .route("/voice/v1", get(voice::voice_upgrade))
             // Knob hardware API routes
             .route("/knob/zones", get(knobs::knob_zones_handler))
             .route("/knob/now_playing", get(knobs::knob_now_playing_handler))
@@ -633,6 +637,11 @@ mod server {
                 }
             }
         };
+
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            voice::prewarm().await;
+        });
 
         let server_result = axum::serve(
             listener,

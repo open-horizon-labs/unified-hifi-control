@@ -58,6 +58,7 @@ GET /roon/zones
 GET /status
 GET /upnp/status
 GET /upnp/zones
+GET /voice/v1
 GET /zones
 POST /api/settings
 POST /control
