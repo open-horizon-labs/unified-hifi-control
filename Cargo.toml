@@ -25,6 +25,7 @@ server = [
     "dep:resvg",
     "dep:tokio-stream",
     "dep:tokio-util",
+    "dep:tokio-tungstenite",
     "dep:ssdp-client",
     "dep:mdns-sd",
     "dep:gethostname",
@@ -110,6 +111,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # Tokio stream utilities (server only)
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 tokio-util = { version = "0.7", optional = true }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"], optional = true }
 
 # SSDP/UPnP/mDNS discovery (server only)
 ssdp-client = { version = "2", optional = true }

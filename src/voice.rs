@@ -1,14 +1,14 @@
 //! LAN-only Kizz voice gateway.
 //!
 //! Kizz performs wake-word detection and VAD on-device, then streams one
-//! bounded 16 kHz mono utterance. UHC wraps the PCM as WAV and hands it to a
-//! persistent Codex App Server thread whose only music capability is UHC's
-//! MCP server. Kizz, not the model, owns the audible and visual response.
+//! bounded 16 kHz mono utterance. UHC streams it to speech recognition, then
+//! hands the transcript to a persistent Codex App Server thread whose only
+//! music capability is UHC's MCP server. Kizz owns the response character.
 
-use crate::config::get_data_dir;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
 use axum::response::Response;
+use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
@@ -16,8 +16,10 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as DgMessage};
 
 const SAMPLE_RATE: u32 = 16_000;
 const MAX_UTTERANCE_BYTES: usize = SAMPLE_RATE as usize * 2 * 14;
@@ -25,9 +27,43 @@ const MAX_WAKE_SAMPLE_BYTES: usize = SAMPLE_RATE as usize * 2 * 3;
 const MIN_UTTERANCE_BYTES: usize = SAMPLE_RATE as usize / 2;
 const CODEX_START_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEX_TURN_TIMEOUT: Duration = Duration::from_secs(30);
-const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(15);
+const DEEPGRAM_AUDIO_CHUNK_BYTES: usize = 16_000 * 2 * 80 / 1000;
 
 static CODEX_AGENT: OnceLock<Mutex<Option<CodexVoiceAgent>>> = OnceLock::new();
+
+#[derive(Debug)]
+enum DeepgramEvent {
+    EndOfTurn {
+        transcript: String,
+        confidence: Option<f64>,
+    },
+    Failed(String),
+}
+
+struct DeepgramTurn {
+    input: mpsc::Sender<DeepgramInput>,
+}
+
+enum DeepgramInput {
+    Audio(Vec<u8>),
+    Close,
+}
+
+impl DeepgramTurn {
+    async fn send_audio(&self, pcm: Vec<u8>) -> Result<(), String> {
+        self.input
+            .send(DeepgramInput::Audio(pcm))
+            .await
+            .map_err(|_| "Deepgram audio task stopped".to_string())
+    }
+
+    async fn close(&self) -> Result<(), String> {
+        self.input
+            .send(DeepgramInput::Close)
+            .await
+            .map_err(|_| "Deepgram audio task stopped before finalization".to_string())
+    }
+}
 
 pub async fn voice_upgrade(upgrade: WebSocketUpgrade) -> Response {
     upgrade.on_upgrade(run_session)
@@ -53,87 +89,142 @@ async fn run_session(mut socket: WebSocket) {
     let mut utterance = Vec::<u8>::new();
     let mut current_zone_id = None::<String>;
     let mut wake_sample = None::<WakeSample>;
-    while let Some(incoming) = socket.recv().await {
-        let message = match incoming {
-            Ok(message) => message,
-            Err(error) => {
-                tracing::warn!(%error, "Kizz voice session received a WebSocket error");
-                break;
-            }
-        };
-        match message {
-            Message::Binary(pcm) => {
-                if let Some(sample) = wake_sample.take() {
-                    if pcm.len() == sample.bytes {
-                        if let Err(error) = store_wake_sample(&sample.label, &pcm) {
-                            tracing::warn!(%error, "Kizz wake training sample was not stored");
-                        }
-                    } else {
-                        tracing::warn!(
-                            expected = sample.bytes,
-                            actual = pcm.len(),
-                            "Kizz wake training sample length mismatch"
-                        );
+    let (deepgram_events_tx, mut deepgram_events_rx) = mpsc::channel(8);
+    let mut deepgram = None::<DeepgramTurn>;
+    let mut pending_fallback = None::<(Vec<u8>, Option<String>)>;
+    let mut turn_completed = false;
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                let Some(incoming) = incoming else { break };
+                let message = match incoming {
+                    Ok(message) => message,
+                    Err(error) => {
+                        tracing::warn!(%error, "Kizz voice session received a WebSocket error");
+                        break;
                     }
-                    continue;
-                }
-                utterance.extend_from_slice(&pcm);
-                if utterance.len() > MAX_UTTERANCE_BYTES {
-                    let excess = utterance.len() - MAX_UTTERANCE_BYTES;
-                    utterance.drain(..excess);
-                }
-            }
-            Message::Text(message) => match parse_client_event(&message) {
-                Some(ClientEvent::Start { zone_id }) => {
-                    utterance.clear();
-                    current_zone_id = zone_id;
-                    tracing::info!(
-                        zone_id = current_zone_id.as_deref().unwrap_or("unknown"),
-                        "Kizz voice turn received device context"
-                    );
-                }
-                Some(ClientEvent::WakeSample(sample)) => {
-                    wake_sample = Some(sample);
-                }
-                Some(ClientEvent::Commit) => {
-                    let committed = std::mem::take(&mut utterance);
-                    let zone_id = current_zone_id.take();
-                    tracing::info!(bytes = committed.len(), "Kizz utterance committed");
-                    if committed.len() < MIN_UTTERANCE_BYTES {
-                        let _ = send_event(
-                        &mut socket,
-                        json!({"type":"state","state":"clarify","message":"I did not hear enough yet."}),
-                    )
-                    .await;
-                        continue;
-                    }
-
-                    // The sentence has ended, so Kizz may leave listening and show
-                    // thinking while the same bounded audio is reasoned over.
-                    let _ =
-                        send_event(&mut socket, json!({"type":"state","state":"thinking"})).await;
-
-                    let result = match codex_request(&committed, zone_id.as_deref()).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            tracing::warn!(%error, "Kizz Codex voice turn failed");
-                            json!({"type":"state","state":"clarify","message":"I lost that thought. Please try once more."})
+                };
+                match message {
+                    Message::Binary(pcm) => {
+                        if let Some(sample) = wake_sample.take() {
+                            if pcm.len() == sample.bytes {
+                                if let Err(error) = store_wake_sample(&sample.label, &pcm) {
+                                    tracing::warn!(%error, "Kizz wake training sample was not stored");
+                                }
+                            } else {
+                                tracing::warn!(expected = sample.bytes, actual = pcm.len(),
+                                    "Kizz wake training sample length mismatch");
+                            }
+                            continue;
                         }
-                    };
-                    let _ = send_event(&mut socket, result).await;
-                }
-                None => tracing::warn!(%message, "Ignored unknown Kizz voice event"),
-            },
-            Message::Ping(payload) => {
-                if socket.send(Message::Pong(payload)).await.is_err() {
-                    break;
+                        utterance.extend_from_slice(&pcm);
+                        if utterance.len() > MAX_UTTERANCE_BYTES {
+                            let excess = utterance.len() - MAX_UTTERANCE_BYTES;
+                            utterance.drain(..excess);
+                        }
+                        if let Some(turn) = deepgram.as_ref() {
+                            if turn.send_audio(pcm.to_vec()).await.is_err() {
+                                deepgram = None;
+                            }
+                        }
+                    }
+                    Message::Text(message) => match parse_client_event(&message) {
+                        Some(ClientEvent::Start { zone_id }) => {
+                            utterance.clear();
+                            current_zone_id = zone_id;
+                            turn_completed = false;
+                            pending_fallback = None;
+                            deepgram = match start_deepgram_turn(deepgram_events_tx.clone()).await {
+                                Ok(turn) => Some(turn),
+                                Err(error) => {
+                                    tracing::warn!(%error, "Deepgram Flux unavailable; local transcription remains armed");
+                                    None
+                                }
+                            };
+                            tracing::info!(zone_id = current_zone_id.as_deref().unwrap_or("unknown"),
+                                deepgram = deepgram.is_some(),
+                                "Kizz voice turn received device context");
+                        }
+                        Some(ClientEvent::WakeSample(sample)) => wake_sample = Some(sample),
+                        Some(ClientEvent::Commit) if turn_completed => {
+                            tracing::info!("Ignored device fallback commit after Flux completed the turn");
+                        }
+                        Some(ClientEvent::Commit) if pending_fallback.is_some() => {
+                            tracing::info!("Ignored duplicate device fallback commit while Flux finalizes");
+                        }
+                        Some(ClientEvent::Commit) => {
+                            let committed = std::mem::take(&mut utterance);
+                            let zone_id = current_zone_id.take();
+                            tracing::info!(bytes = committed.len(), "Kizz fallback utterance committed");
+                            if committed.len() < MIN_UTTERANCE_BYTES {
+                                let _ = send_event(&mut socket,
+                                    json!({"type":"state","state":"clarify","message":"I did not hear enough yet."})).await;
+                                continue;
+                            }
+                            let _ = send_event(&mut socket, json!({"type":"state","state":"thinking"})).await;
+                            if let Some(turn) = deepgram.as_ref() {
+                                pending_fallback = Some((committed, zone_id));
+                                if turn.close().await.is_ok() {
+                                    tracing::info!("Deepgram Flux finalization requested by device fallback");
+                                    continue;
+                                }
+                                deepgram = None;
+                                pending_fallback = None;
+                                turn_completed = true;
+                                tracing::warn!("Deepgram Flux could not be finalized; no local speech recognizer is enabled");
+                                let _ = send_event(&mut socket, json!({"type":"state","state":"clarify","message":"Speech recognition is unavailable. Please try once more."})).await;
+                                continue;
+                            }
+                            turn_completed = true;
+                            tracing::warn!("No streaming speech recognizer was available for the Kizz turn");
+                            let _ = send_event(&mut socket, json!({"type":"state","state":"clarify","message":"Speech recognition is unavailable. Please try once more."})).await;
+                        }
+                        None => tracing::warn!(%message, "Ignored unknown Kizz voice event"),
+                    },
+                    Message::Ping(payload) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() { break; }
+                    }
+                    Message::Close(_) => {
+                        tracing::info!("Kizz voice session closed by client");
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            Message::Close(_) => {
-                tracing::info!("Kizz voice session closed by client");
-                break;
+            event = deepgram_events_rx.recv() => {
+                let Some(event) = event else { continue };
+                match event {
+                    DeepgramEvent::EndOfTurn { transcript, confidence } if !turn_completed => {
+                        turn_completed = true;
+                        deepgram = None;
+                        let (committed, zone_id) = pending_fallback.take()
+                            .unwrap_or_else(|| (std::mem::take(&mut utterance), current_zone_id.take()));
+                        tracing::info!(%transcript, confidence, bytes = committed.len(),
+                            "Deepgram Flux ended Kizz voice turn");
+                        let _ = send_event(&mut socket, json!({"type":"endpoint","reason":"deepgram_flux","confidence":confidence})).await;
+                        let _ = send_event(&mut socket, json!({"type":"state","state":"thinking"})).await;
+                        let result = match codex_transcript_request(&transcript, zone_id.as_deref()).await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                tracing::warn!(%error, "Kizz Codex voice turn failed");
+                                json!({"type":"state","state":"clarify","message":"I lost that thought. Please try once more."})
+                            }
+                        };
+                        let _ = send_event(&mut socket, result).await;
+                    }
+                    DeepgramEvent::EndOfTurn { .. } => {}
+                    DeepgramEvent::Failed(error) => {
+                        deepgram = None;
+                        if pending_fallback.take().is_some() {
+                            tracing::warn!(%error, "Deepgram Flux finalization failed; no local speech recognizer is enabled");
+                            turn_completed = true;
+                            let _ = send_event(&mut socket, json!({"type":"state","state":"clarify","message":"Speech recognition is unavailable. Please try once more."})).await;
+                        } else {
+                            tracing::warn!(%error, "Deepgram Flux stream failed; awaiting device fallback endpoint");
+                        }
+                    }
+                }
             }
-            _ => {}
         }
     }
     tracing::info!("Kizz voice session ended");
@@ -199,22 +290,146 @@ fn store_wake_sample(label: &str, pcm: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-async fn codex_request(pcm: &[u8], current_zone_id: Option<&str>) -> Result<Value, String> {
-    let (conditioned, capture_peak, gain) = condition_voice_pcm(pcm);
-    tracing::info!(
-        capture_peak,
-        gain = format_args!("{gain:.1}"),
-        "Conditioned Kizz voice capture for the audio model"
+async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<DeepgramTurn, String> {
+    let key = std::env::var("DEEPGRAM_API_KEY")
+        .map_err(|_| "DEEPGRAM_API_KEY is not configured".to_string())?;
+    let eot_threshold =
+        std::env::var("DEEPGRAM_EOT_THRESHOLD").unwrap_or_else(|_| "0.70".to_string());
+    let eot_timeout_ms =
+        std::env::var("DEEPGRAM_EOT_TIMEOUT_MS").unwrap_or_else(|_| "1800".to_string());
+    let uri = format!(
+        "wss://api.deepgram.com/v2/listen?model=flux-general-en&encoding=linear16&sample_rate=16000&eot_threshold={eot_threshold}&eot_timeout_ms={eot_timeout_ms}"
     );
-    let mut wav = tempfile::Builder::new()
-        .prefix("kizz-utterance-")
-        .suffix(".wav")
-        .tempfile()
-        .map_err(|error| error.to_string())?;
-    write_wav(&mut wav, &conditioned).map_err(|error| error.to_string())?;
-    let transcript = transcribe_voice(wav.path()).await?;
-    tracing::info!(%transcript, "Kizz local speech recognition completed");
+    let mut request = uri
+        .into_client_request()
+        .map_err(|error| format!("invalid Deepgram URI: {error}"))?;
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Token {key}")
+            .parse()
+            .map_err(|error| format!("invalid Deepgram credential: {error}"))?,
+    );
+    let (socket, _) = timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| "Deepgram connection timed out".to_string())?
+    .map_err(|error| format!("Deepgram connection failed: {error}"))?;
+    let (mut output, mut input) = socket.split();
+    let keyterms = std::env::var("DEEPGRAM_KEYTERMS")
+        .unwrap_or_else(|_| "HiPhi,Kizz,Roon".to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if !keyterms.is_empty() {
+        output
+            .send(DgMessage::Text(
+                json!({"type":"Configure","keyterms":keyterms}).to_string(),
+            ))
+            .await
+            .map_err(|error| format!("Deepgram configuration failed: {error}"))?;
+    }
+    let (input_tx, mut input_rx) = mpsc::channel::<DeepgramInput>(64);
+    tokio::spawn(async move {
+        let mut pending = Vec::<u8>::with_capacity(DEEPGRAM_AUDIO_CHUNK_BYTES * 2);
+        let mut close_deadline = None::<tokio::time::Instant>;
+        let mut input_open = true;
+        loop {
+            tokio::select! {
+                command = input_rx.recv(), if input_open => {
+                    match command {
+                        Some(DeepgramInput::Audio(audio)) => {
+                            pending.extend_from_slice(&audio);
+                            while pending.len() >= DEEPGRAM_AUDIO_CHUNK_BYTES {
+                                let remainder = pending.split_off(DEEPGRAM_AUDIO_CHUNK_BYTES);
+                                let chunk = std::mem::replace(&mut pending, remainder);
+                                if let Err(error) = output.send(DgMessage::Binary(chunk)).await {
+                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    return;
+                                }
+                            }
+                        }
+                        Some(DeepgramInput::Close) | None => {
+                            input_open = false;
+                            if !pending.is_empty() {
+                                if let Err(error) = output.send(DgMessage::Binary(
+                                    std::mem::take(&mut pending))).await {
+                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    return;
+                                }
+                            }
+                            if let Err(error) = output.send(DgMessage::Text(
+                                json!({"type":"CloseStream"}).to_string())).await {
+                                let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                return;
+                            }
+                            close_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(3));
+                        }
+                    }
+                }
+                message = input.next() => {
+                    let Some(message) = message else {
+                        let _ = events.send(DeepgramEvent::Failed(
+                            "Deepgram closed the stream".to_string())).await;
+                        return;
+                    };
+                    match message {
+                        Ok(DgMessage::Text(text)) => {
+                            let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
+                            if event.get("type").and_then(Value::as_str) == Some("Error") {
+                                let _ = events.send(DeepgramEvent::Failed(event.to_string())).await;
+                                return;
+                            }
+                            if event.get("type").and_then(Value::as_str) == Some("TurnInfo") &&
+                                event.get("event").and_then(Value::as_str) == Some("EndOfTurn") {
+                                let transcript = event.get("transcript")
+                                    .and_then(Value::as_str).unwrap_or("").trim().to_string();
+                                let confidence = event.get("end_of_turn_confidence")
+                                    .and_then(Value::as_f64);
+                                if transcript.is_empty() {
+                                    let _ = events.send(DeepgramEvent::Failed(
+                                        "Deepgram ended an empty turn".to_string())).await;
+                                } else {
+                                    let _ = events.send(DeepgramEvent::EndOfTurn {
+                                        transcript,
+                                        confidence,
+                                    }).await;
+                                }
+                                return;
+                            }
+                        }
+                        Ok(DgMessage::Close(_)) => {
+                            let _ = events.send(DeepgramEvent::Failed(
+                                "Deepgram closed the stream".to_string())).await;
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(close_deadline.unwrap_or_else(||
+                    tokio::time::Instant::now() + Duration::from_secs(86_400))),
+                    if close_deadline.is_some() => {
+                    let _ = events.send(DeepgramEvent::Failed(
+                        "Deepgram finalization timed out".to_string())).await;
+                    return;
+                }
+            }
+        }
+    });
+    Ok(DeepgramTurn { input: input_tx })
+}
 
+async fn codex_transcript_request(
+    transcript: &str,
+    current_zone_id: Option<&str>,
+) -> Result<Value, String> {
     let agent = CODEX_AGENT.get_or_init(|| Mutex::new(None));
     let mut _conversation_guard = agent.lock().await;
     if _conversation_guard.is_none() {
@@ -228,7 +443,7 @@ async fn codex_request(pcm: &[u8], current_zone_id: Option<&str>) -> Result<Valu
     let first = _conversation_guard
         .as_mut()
         .ok_or("Codex voice agent was not initialized")?
-        .turn(&transcript, current_zone_id);
+        .turn(transcript, current_zone_id);
     let first = timeout(CODEX_TURN_TIMEOUT, first)
         .await
         .map_err(|_| "Codex voice turn timed out".to_string())?;
@@ -246,7 +461,7 @@ async fn codex_request(pcm: &[u8], current_zone_id: Option<&str>) -> Result<Valu
         .map_err(|_| "Codex App Server restart timed out".to_string())??;
     let result = timeout(
         CODEX_TURN_TIMEOUT,
-        restarted.turn(&transcript, current_zone_id),
+        restarted.turn(transcript, current_zone_id),
     )
     .await
     .map_err(|_| "Codex voice turn timed out after restart".to_string())?;
@@ -572,83 +787,6 @@ fn write_wav(file: &mut tempfile::NamedTempFile, pcm: &[u8]) -> std::io::Result<
     file.flush()
 }
 
-fn condition_voice_pcm(pcm: &[u8]) -> (Vec<u8>, i32, f32) {
-    let peak = pcm
-        .chunks_exact(2)
-        .map(|sample| i16::from_le_bytes([sample[0], sample[1]]) as i32)
-        .map(i32::abs)
-        .max()
-        .unwrap_or(0);
-    if peak == 0 {
-        return (pcm.to_vec(), 0, 1.0);
-    }
-
-    // CoreS3's official microphone path is intentionally conservative. Raise
-    // only the captured utterance to a healthy model input level; this never
-    // touches M5Unified speaker gain or Kizz's chirp loudness.
-    let gain = (18_000.0 / peak as f32).clamp(1.0, 16.0);
-    let mut output = Vec::with_capacity(pcm.len());
-    for sample in pcm.chunks_exact(2) {
-        let value = i16::from_le_bytes([sample[0], sample[1]]) as f32;
-        let conditioned = (value * gain).round().clamp(-32_768.0, 32_767.0) as i16;
-        output.extend_from_slice(&conditioned.to_le_bytes());
-    }
-    (output, peak, gain)
-}
-
-async fn transcribe_voice(wav_path: &Path) -> Result<String, String> {
-    let model = std::env::var_os("KIZZ_WHISPER_MODEL")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| get_data_dir().join("models/ggml-base.en.bin"));
-    if !model.is_file() {
-        return Err(format!(
-            "Kizz Whisper model is missing at {} (set KIZZ_WHISPER_MODEL to override)",
-            model.display()
-        ));
-    }
-    let output = timeout(
-        TRANSCRIBE_TIMEOUT,
-        Command::new("whisper-cli")
-            .args([
-                "-m",
-                model
-                    .to_str()
-                    .ok_or("Kizz Whisper model path is not valid UTF-8")?,
-                "-f",
-                wav_path
-                    .to_str()
-                    .ok_or("Kizz WAV path is not valid UTF-8")?,
-                "-l",
-                "en",
-                "-t",
-                "4",
-                "--no-timestamps",
-                "--no-prints",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output(),
-    )
-    .await
-    .map_err(|_| "Kizz local speech recognition timed out".to_string())?
-    .map_err(|error| format!("Kizz local speech recognition is unavailable: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Kizz local speech recognition exited as {}",
-            output.status
-        ));
-    }
-    let transcript = String::from_utf8(output.stdout)
-        .map_err(|error| format!("Kizz transcript was not UTF-8: {error}"))?
-        .trim()
-        .to_string();
-    if transcript.is_empty() {
-        return Err("Kizz local speech recognition heard no words".to_string());
-    }
-    Ok(transcript)
-}
-
 async fn send_event(socket: &mut WebSocket, event: Value) -> Result<(), axum::Error> {
     socket.send(Message::Text(event.to_string().into())).await
 }
@@ -717,20 +855,6 @@ mod tests {
         assert_eq!(
             parse_client_event(r#"{"type":"wake_sample","label":"hiphi_kizz","bytes":999999}"#),
             None
-        );
-    }
-
-    #[test]
-    fn quiet_voice_capture_is_raised_without_touching_duration() {
-        let pcm = [500i16.to_le_bytes(), (-750i16).to_le_bytes()].concat();
-        let (conditioned, peak, gain) = condition_voice_pcm(&pcm);
-        assert_eq!(peak, 750);
-        assert_eq!(gain, 16.0);
-        assert_eq!(conditioned.len(), pcm.len());
-        assert_eq!(i16::from_le_bytes([conditioned[0], conditioned[1]]), 8_000);
-        assert_eq!(
-            i16::from_le_bytes([conditioned[2], conditioned[3]]),
-            -12_000
         );
     }
 }
