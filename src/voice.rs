@@ -7,13 +7,17 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::WebSocketUpgrade;
+use axum::http::StatusCode;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
@@ -30,6 +34,134 @@ const CODEX_TURN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEEPGRAM_AUDIO_CHUNK_BYTES: usize = 16_000 * 2 * 80 / 1000;
 
 static CODEX_AGENT: OnceLock<Mutex<Option<CodexVoiceAgent>>> = OnceLock::new();
+static RUNTIME: OnceLock<VoiceRuntime> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SttProvider {
+    Deepgram,
+    Assemblyai,
+}
+
+impl SttProvider {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "deepgram" => Some(Self::Deepgram),
+            "assemblyai" | "assembly" => Some(Self::Assemblyai),
+            _ => None,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Deepgram => "deepgram",
+            Self::Assemblyai => "assemblyai",
+        }
+    }
+}
+
+struct VoiceRuntime {
+    provider: tokio::sync::RwLock<SttProvider>,
+    reliability: Mutex<VoiceReliability>,
+}
+
+#[derive(Default, Serialize)]
+struct VoiceReliability {
+    attempts: u64,
+    connected: u64,
+    failed: u64,
+    completed: u64,
+    recent: VecDeque<VoiceTurnRecord>,
+}
+
+#[derive(Serialize)]
+struct VoiceTurnRecord {
+    timestamp: u64,
+    provider: &'static str,
+    outcome: &'static str,
+    latency_ms: Option<u64>,
+    detail: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ProviderRequest {
+    provider: String,
+}
+
+fn runtime() -> &'static VoiceRuntime {
+    RUNTIME.get_or_init(|| VoiceRuntime {
+        provider: tokio::sync::RwLock::new(
+            std::env::var("KIZZ_STT_PROVIDER")
+                .ok()
+                .and_then(|v| SttProvider::parse(&v))
+                .unwrap_or(SttProvider::Deepgram),
+        ),
+        reliability: Mutex::new(VoiceReliability::default()),
+    })
+}
+
+async fn record_turn(
+    provider: SttProvider,
+    outcome: &'static str,
+    latency_ms: Option<u64>,
+    detail: Option<String>,
+) {
+    let state = runtime();
+    let mut reliability = state.reliability.lock().await;
+    match outcome {
+        "connected" => {
+            reliability.attempts += 1;
+            reliability.connected += 1;
+        }
+        "failed" => {
+            reliability.attempts += 1;
+            reliability.failed += 1;
+        }
+        "completed" => reliability.completed += 1,
+        _ => {}
+    }
+    reliability.recent.push_back(VoiceTurnRecord {
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        provider: provider.name(),
+        outcome,
+        latency_ms,
+        detail,
+    });
+    while reliability.recent.len() > 50 {
+        reliability.recent.pop_front();
+    }
+}
+
+pub async fn provider_get() -> axum::Json<Value> {
+    let provider = *runtime().provider.read().await;
+    axum::Json(json!({"provider": provider.name()}))
+}
+
+pub async fn provider_post(
+    axum::Json(request): axum::Json<ProviderRequest>,
+) -> Result<axum::Json<Value>, (StatusCode, axum::Json<Value>)> {
+    let Some(provider) = SttProvider::parse(&request.provider) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error":"provider must be deepgram or assemblyai"})),
+        ));
+    };
+    *runtime().provider.write().await = provider;
+    tracing::info!(
+        provider = provider.name(),
+        "Kizz STT provider changed at runtime"
+    );
+    Ok(axum::Json(json!({"provider": provider.name()})))
+}
+
+pub async fn reliability_get() -> axum::Json<Value> {
+    let reliability = runtime().reliability.lock().await;
+    axum::Json(
+        serde_json::to_value(&*reliability).unwrap_or_else(|_| json!({"error":"unavailable"})),
+    )
+}
 
 #[derive(Debug)]
 enum DeepgramEvent {
@@ -41,12 +173,18 @@ enum DeepgramEvent {
 }
 
 struct SttTurn {
+    provider: SttProvider,
     input: mpsc::Sender<SttInput>,
 }
 
 enum SttInput {
     Audio(Vec<u8>),
     Close,
+}
+
+struct ProviderEvent {
+    provider: SttProvider,
+    event: DeepgramEvent,
 }
 
 impl SttTurn {
@@ -89,10 +227,12 @@ async fn run_session(mut socket: WebSocket) {
     let mut utterance = Vec::<u8>::new();
     let mut current_zone_id = None::<String>;
     let mut wake_sample = None::<WakeSample>;
-    let (deepgram_events_tx, mut deepgram_events_rx) = mpsc::channel(8);
-    let mut deepgram = None::<SttTurn>;
+    let (provider_events_tx, mut provider_events_rx) = mpsc::channel(16);
+    let mut stt_turns = Vec::<SttTurn>::new();
     let mut pending_fallback = None::<(Vec<u8>, Option<String>)>;
     let mut turn_completed = false;
+    let mut turn_started = None::<Instant>;
+    let mut failed_stt = 0usize;
     loop {
         tokio::select! {
             incoming = socket.recv() => {
@@ -122,10 +262,8 @@ async fn run_session(mut socket: WebSocket) {
                             let excess = utterance.len() - MAX_UTTERANCE_BYTES;
                             utterance.drain(..excess);
                         }
-                        if let Some(turn) = deepgram.as_ref() {
-                            if turn.send_audio(pcm.to_vec()).await.is_err() {
-                                deepgram = None;
-                            }
+                        for turn in &stt_turns {
+                            let _ = turn.send_audio(pcm.to_vec()).await;
                         }
                     }
                     Message::Text(message) => match parse_client_event(&message) {
@@ -134,15 +272,29 @@ async fn run_session(mut socket: WebSocket) {
                             current_zone_id = zone_id;
                             turn_completed = false;
                             pending_fallback = None;
-                            deepgram = match start_stt_turn(deepgram_events_tx.clone()).await {
-                                Ok(turn) => Some(turn),
-                                Err(error) => {
-                                    tracing::warn!(%error, "streaming speech recognition unavailable");
-                                    None
+                            let selected_provider = *runtime().provider.read().await;
+                            turn_started = Some(Instant::now());
+                            stt_turns.clear();
+                            failed_stt = 0;
+                            let providers = if selected_provider == SttProvider::Deepgram { vec![SttProvider::Deepgram, SttProvider::Assemblyai] } else { vec![SttProvider::Assemblyai, SttProvider::Deepgram] };
+                            for provider in providers {
+                                let connect_started = Instant::now();
+                                match start_provider_turn(provider, provider_events_tx.clone()).await {
+                                    Ok(turn) => {
+                                        record_turn(provider, "connected", Some(connect_started.elapsed().as_millis() as u64), None).await;
+                                        stt_turns.push(turn);
+                                    }
+                                    Err(error) => {
+                                        record_turn(provider, "failed", Some(connect_started.elapsed().as_millis() as u64), Some(error.clone())).await;
+                                        tracing::warn!(provider = provider.name(), %error, "streaming speech recognition unavailable");
+                                    }
                                 }
-                            };
+                            }
+                            if stt_turns.is_empty() {
+                                let _ = send_event(&mut socket, json!({"type":"state","state":"clarify","message":"I could not connect to speech recognition. Please try again."})).await;
+                            }
                             tracing::info!(zone_id = current_zone_id.as_deref().unwrap_or("unknown"),
-                                deepgram = deepgram.is_some(),
+                                providers = stt_turns.len(),
                                 "Kizz voice turn received device context");
                         }
                         Some(ClientEvent::WakeSample(sample)) => wake_sample = Some(sample),
@@ -162,17 +314,10 @@ async fn run_session(mut socket: WebSocket) {
                                 continue;
                             }
                             let _ = send_event(&mut socket, json!({"type":"state","state":"thinking"})).await;
-                            if let Some(turn) = deepgram.as_ref() {
+                            if !stt_turns.is_empty() {
                                 pending_fallback = Some((committed, zone_id));
-                                if turn.close().await.is_ok() {
-                                    tracing::info!("Deepgram Flux finalization requested by device fallback");
-                                    continue;
-                                }
-                                deepgram = None;
-                                pending_fallback = None;
-                                turn_completed = true;
-                                tracing::warn!("Deepgram Flux could not be finalized; no local speech recognizer is enabled");
-                                let _ = send_event(&mut socket, json!({"type":"state","state":"clarify","message":"Speech recognition is unavailable. Please try once more."})).await;
+                                for turn in &stt_turns { let _ = turn.close().await; }
+                                tracing::info!("Streaming STT finalization requested by device fallback");
                                 continue;
                             }
                             turn_completed = true;
@@ -191,17 +336,23 @@ async fn run_session(mut socket: WebSocket) {
                     _ => {}
                 }
             }
-            event = deepgram_events_rx.recv() => {
-                let Some(event) = event else { continue };
+            event = provider_events_rx.recv() => {
+                let Some(ProviderEvent { provider, event }) = event else { continue };
                 match event {
                     DeepgramEvent::EndOfTurn { transcript, confidence } if !turn_completed => {
                         turn_completed = true;
-                        deepgram = None;
+                        for turn in &stt_turns { let _ = turn.close().await; }
                         let (committed, zone_id) = pending_fallback.take()
                             .unwrap_or_else(|| (std::mem::take(&mut utterance), current_zone_id.take()));
-                        tracing::info!(%transcript, confidence, bytes = committed.len(),
-                            "Deepgram Flux ended Kizz voice turn");
-                        let _ = send_event(&mut socket, json!({"type":"endpoint","reason":"deepgram_flux","confidence":confidence})).await;
+                        let latency_ms = turn_started.map(|started| started.elapsed().as_millis() as u64);
+                        record_turn(provider, "completed", latency_ms, Some(format!("transcript_chars={}", transcript.chars().count()))).await;
+                        tracing::info!(%transcript, confidence, provider = provider.name(), bytes = committed.len(), latency_ms = latency_ms.unwrap_or(0),
+                            "Streaming STT ended Kizz voice turn");
+                        let _ = send_event(&mut socket, json!({"type":"endpoint","reason":format!("{}_end_of_turn", provider.name()),"confidence":confidence})).await;
+                        // Surface the recognition result immediately. The device can
+                        // show what it heard while the Codex/MCP turn is running.
+                        let _ = send_event(&mut socket,
+                            json!({"type":"transcript","text":transcript})).await;
                         let _ = send_event(&mut socket, json!({"type":"state","state":"thinking"})).await;
                         let result = match codex_transcript_request(&transcript, zone_id.as_deref()).await {
                             Ok(result) => result,
@@ -212,15 +363,20 @@ async fn run_session(mut socket: WebSocket) {
                         };
                         let _ = send_event(&mut socket, result).await;
                     }
-                    DeepgramEvent::EndOfTurn { .. } => {}
+                    DeepgramEvent::EndOfTurn { transcript, confidence } => {
+                        let latency_ms = turn_started.map(|started| started.elapsed().as_millis() as u64);
+                        record_turn(provider, "completed", latency_ms, Some(format!("secondary_transcript_chars={};confidence={:?}", transcript.chars().count(), confidence))).await;
+                    }
                     DeepgramEvent::Failed(error) => {
-                        deepgram = None;
-                        if pending_fallback.take().is_some() {
-                            tracing::warn!(%error, "Deepgram Flux finalization failed; no local speech recognizer is enabled");
+                        failed_stt += 1;
+                        record_turn(provider, "failed", None, Some(error.clone())).await;
+                        if pending_fallback.is_some() && failed_stt >= stt_turns.len() {
+                            pending_fallback.take();
+                            tracing::warn!(provider = provider.name(), %error, "Streaming STT finalization failed");
                             turn_completed = true;
                             let _ = send_event(&mut socket, json!({"type":"state","state":"clarify","message":"Speech recognition is unavailable. Please try once more."})).await;
                         } else {
-                            tracing::warn!(%error, "Deepgram Flux stream failed; awaiting device fallback endpoint");
+                            tracing::warn!(provider = provider.name(), %error, "Streaming STT stream failed; awaiting another provider or device fallback endpoint");
                         }
                     }
                 }
@@ -290,13 +446,35 @@ fn store_wake_sample(label: &str, pcm: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-async fn start_stt_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttTurn, String> {
-    match std::env::var("KIZZ_STT_PROVIDER")
-        .unwrap_or_else(|_| "deepgram".to_string())
-        .as_str()
-    {
-        "assemblyai" | "assembly" => start_assemblyai_turn(events).await,
-        _ => start_deepgram_turn(events).await,
+async fn start_provider_turn(
+    provider: SttProvider,
+    events: mpsc::Sender<ProviderEvent>,
+) -> Result<SttTurn, String> {
+    let (inner_tx, mut inner_rx) = mpsc::channel(8);
+    let forward = events.clone();
+    tokio::spawn(async move {
+        while let Some(event) = inner_rx.recv().await {
+            if forward
+                .send(ProviderEvent { provider, event })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut turn = start_stt_turn(provider, inner_tx).await?;
+    turn.provider = provider;
+    Ok(turn)
+}
+
+async fn start_stt_turn(
+    provider: SttProvider,
+    events: mpsc::Sender<DeepgramEvent>,
+) -> Result<SttTurn, String> {
+    match provider {
+        SttProvider::Assemblyai => start_assemblyai_turn(events).await,
+        SttProvider::Deepgram => start_deepgram_turn(events).await,
     }
 }
 
@@ -433,7 +611,10 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttT
             }
         }
     });
-    Ok(SttTurn { input: input_tx })
+    Ok(SttTurn {
+        provider: SttProvider::Deepgram,
+        input: input_tx,
+    })
 }
 
 async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttTurn, String> {
@@ -464,21 +645,46 @@ async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
     let (mut output, mut input) = socket.split();
     let (input_tx, mut input_rx) = mpsc::channel::<SttInput>(64);
     tokio::spawn(async move {
+        // The device emits 32 ms (512-sample) frames. AssemblyAI requires
+        // audio messages to be at least 50 ms, so coalesce frames before
+        // forwarding them and pad only the final tail when necessary.
+        const MIN_AUDIO_BYTES: usize = 16_000 * 2 * 50 / 1000;
+        const AUDIO_CHUNK_BYTES: usize = 16_000 * 2 * 80 / 1000;
+        let mut pending_audio = Vec::<u8>::with_capacity(AUDIO_CHUNK_BYTES * 2);
         loop {
             tokio::select! {
                 command = input_rx.recv() => {
                     match command {
                         Some(SttInput::Audio(audio)) => {
-                            if let Err(error) = output.send(DgMessage::Binary(audio)).await {
-                                let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
-                                return;
+                            pending_audio.extend_from_slice(&audio);
+                            while pending_audio.len() >= AUDIO_CHUNK_BYTES {
+                                let remainder = pending_audio.split_off(AUDIO_CHUNK_BYTES);
+                                let chunk = std::mem::replace(&mut pending_audio, remainder);
+                                if let Err(error) = output.send(DgMessage::Binary(chunk)).await {
+                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    return;
+                                }
                             }
                         }
                         Some(SttInput::Close) | None => {
+                            // Kizz's device-side VAD has already decided that this
+                            // utterance is complete. AssemblyAI's ForceEndpoint
+                            // flushes the final Turn; Terminate only closes the
+                            // session and can discard an in-flight final turn.
                             if let Err(error) = output.send(DgMessage::Text(
-                                json!({"type":"Terminate"}).to_string())).await {
+                                json!({"type":"ForceEndpoint"}).to_string())).await {
                                 let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
                                 return;
+                            }
+                            if !pending_audio.is_empty() {
+                                if pending_audio.len() < MIN_AUDIO_BYTES {
+                                    pending_audio.resize(MIN_AUDIO_BYTES, 0);
+                                }
+                                if let Err(error) = output.send(DgMessage::Binary(
+                                    std::mem::take(&mut pending_audio))).await {
+                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    return;
+                                }
                             }
                             match tokio::time::timeout(Duration::from_secs(5), async {
                                 while let Some(message) = input.next().await {
@@ -553,7 +759,10 @@ async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
             }
         }
     });
-    Ok(SttTurn { input: input_tx })
+    Ok(SttTurn {
+        provider: SttProvider::Assemblyai,
+        input: input_tx,
+    })
 }
 
 async fn codex_transcript_request(
