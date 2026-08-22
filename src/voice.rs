@@ -277,9 +277,12 @@ async fn run_session(mut socket: WebSocket) {
                             stt_turns.clear();
                             failed_stt = 0;
                             let providers = if selected_provider == SttProvider::Deepgram { vec![SttProvider::Deepgram, SttProvider::Assemblyai] } else { vec![SttProvider::Assemblyai, SttProvider::Deepgram] };
-                            for provider in providers {
-                                let connect_started = Instant::now();
-                                match start_provider_turn(provider, provider_events_tx.clone()).await {
+                            let connect_started = Instant::now();
+                            let first = start_provider_turn(providers[0], provider_events_tx.clone());
+                            let second = start_provider_turn(providers[1], provider_events_tx.clone());
+                            let (first_result, second_result) = tokio::join!(first, second);
+                            for (provider, result) in [(providers[0], first_result), (providers[1], second_result)] {
+                                match result {
                                     Ok(turn) => {
                                         record_turn(provider, "connected", Some(connect_started.elapsed().as_millis() as u64), None).await;
                                         stt_turns.push(turn);
@@ -345,7 +348,7 @@ async fn run_session(mut socket: WebSocket) {
                         let (committed, zone_id) = pending_fallback.take()
                             .unwrap_or_else(|| (std::mem::take(&mut utterance), current_zone_id.take()));
                         let latency_ms = turn_started.map(|started| started.elapsed().as_millis() as u64);
-                        record_turn(provider, "completed", latency_ms, Some(format!("transcript_chars={}", transcript.chars().count()))).await;
+                        record_turn(provider, "completed", latency_ms, Some(transcript.clone())).await;
                         tracing::info!(%transcript, confidence, provider = provider.name(), bytes = committed.len(), latency_ms = latency_ms.unwrap_or(0),
                             "Streaming STT ended Kizz voice turn");
                         let _ = send_event(&mut socket, json!({"type":"endpoint","reason":format!("{}_end_of_turn", provider.name()),"confidence":confidence})).await;
@@ -365,7 +368,7 @@ async fn run_session(mut socket: WebSocket) {
                     }
                     DeepgramEvent::EndOfTurn { transcript, confidence } => {
                         let latency_ms = turn_started.map(|started| started.elapsed().as_millis() as u64);
-                        record_turn(provider, "completed", latency_ms, Some(format!("secondary_transcript_chars={};confidence={:?}", transcript.chars().count(), confidence))).await;
+                        record_turn(provider, "completed", latency_ms, Some(format!("{} (confidence={:?})", transcript, confidence))).await;
                     }
                     DeepgramEvent::Failed(error) => {
                         failed_stt += 1;
