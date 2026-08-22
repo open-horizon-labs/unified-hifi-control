@@ -40,28 +40,28 @@ enum DeepgramEvent {
     Failed(String),
 }
 
-struct DeepgramTurn {
-    input: mpsc::Sender<DeepgramInput>,
+struct SttTurn {
+    input: mpsc::Sender<SttInput>,
 }
 
-enum DeepgramInput {
+enum SttInput {
     Audio(Vec<u8>),
     Close,
 }
 
-impl DeepgramTurn {
+impl SttTurn {
     async fn send_audio(&self, pcm: Vec<u8>) -> Result<(), String> {
         self.input
-            .send(DeepgramInput::Audio(pcm))
+            .send(SttInput::Audio(pcm))
             .await
-            .map_err(|_| "Deepgram audio task stopped".to_string())
+            .map_err(|_| "speech recognition task stopped".to_string())
     }
 
     async fn close(&self) -> Result<(), String> {
         self.input
-            .send(DeepgramInput::Close)
+            .send(SttInput::Close)
             .await
-            .map_err(|_| "Deepgram audio task stopped before finalization".to_string())
+            .map_err(|_| "speech recognition task stopped before finalization".to_string())
     }
 }
 
@@ -90,7 +90,7 @@ async fn run_session(mut socket: WebSocket) {
     let mut current_zone_id = None::<String>;
     let mut wake_sample = None::<WakeSample>;
     let (deepgram_events_tx, mut deepgram_events_rx) = mpsc::channel(8);
-    let mut deepgram = None::<DeepgramTurn>;
+    let mut deepgram = None::<SttTurn>;
     let mut pending_fallback = None::<(Vec<u8>, Option<String>)>;
     let mut turn_completed = false;
     loop {
@@ -134,10 +134,10 @@ async fn run_session(mut socket: WebSocket) {
                             current_zone_id = zone_id;
                             turn_completed = false;
                             pending_fallback = None;
-                            deepgram = match start_deepgram_turn(deepgram_events_tx.clone()).await {
+                            deepgram = match start_stt_turn(deepgram_events_tx.clone()).await {
                                 Ok(turn) => Some(turn),
                                 Err(error) => {
-                                    tracing::warn!(%error, "Deepgram Flux unavailable; local transcription remains armed");
+                                    tracing::warn!(%error, "streaming speech recognition unavailable");
                                     None
                                 }
                             };
@@ -290,7 +290,17 @@ fn store_wake_sample(label: &str, pcm: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<DeepgramTurn, String> {
+async fn start_stt_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttTurn, String> {
+    match std::env::var("KIZZ_STT_PROVIDER")
+        .unwrap_or_else(|_| "deepgram".to_string())
+        .as_str()
+    {
+        "assemblyai" | "assembly" => start_assemblyai_turn(events).await,
+        _ => start_deepgram_turn(events).await,
+    }
+}
+
+async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttTurn, String> {
     let key = std::env::var("DEEPGRAM_API_KEY")
         .map_err(|_| "DEEPGRAM_API_KEY is not configured".to_string())?;
     let eot_threshold =
@@ -332,7 +342,7 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<Deep
             .await
             .map_err(|error| format!("Deepgram configuration failed: {error}"))?;
     }
-    let (input_tx, mut input_rx) = mpsc::channel::<DeepgramInput>(64);
+    let (input_tx, mut input_rx) = mpsc::channel::<SttInput>(64);
     tokio::spawn(async move {
         let mut pending = Vec::<u8>::with_capacity(DEEPGRAM_AUDIO_CHUNK_BYTES * 2);
         let mut close_deadline = None::<tokio::time::Instant>;
@@ -341,7 +351,7 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<Deep
             tokio::select! {
                 command = input_rx.recv(), if input_open => {
                     match command {
-                        Some(DeepgramInput::Audio(audio)) => {
+                        Some(SttInput::Audio(audio)) => {
                             pending.extend_from_slice(&audio);
                             while pending.len() >= DEEPGRAM_AUDIO_CHUNK_BYTES {
                                 let remainder = pending.split_off(DEEPGRAM_AUDIO_CHUNK_BYTES);
@@ -352,7 +362,7 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<Deep
                                 }
                             }
                         }
-                        Some(DeepgramInput::Close) | None => {
+                        Some(SttInput::Close) | None => {
                             input_open = false;
                             if !pending.is_empty() {
                                 if let Err(error) = output.send(DgMessage::Binary(
@@ -423,7 +433,127 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<Deep
             }
         }
     });
-    Ok(DeepgramTurn { input: input_tx })
+    Ok(SttTurn { input: input_tx })
+}
+
+async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttTurn, String> {
+    let key = std::env::var("ASSEMBLYAI_API_KEY")
+        .map_err(|_| "ASSEMBLYAI_API_KEY is not configured".to_string())?;
+    let min_silence =
+        std::env::var("ASSEMBLYAI_MIN_TURN_SILENCE_MS").unwrap_or_else(|_| "300".to_string());
+    let max_silence =
+        std::env::var("ASSEMBLYAI_MAX_TURN_SILENCE_MS").unwrap_or_else(|_| "1200".to_string());
+    let uri = format!(
+        "wss://streaming.assemblyai.com/v3/ws?sample_rate=16000&speech_model=u3-rt-pro&format_turns=false&min_turn_silence={min_silence}&max_turn_silence={max_silence}"
+    );
+    let mut request = uri
+        .into_client_request()
+        .map_err(|error| format!("invalid AssemblyAI URI: {error}"))?;
+    request.headers_mut().insert(
+        "Authorization",
+        key.parse()
+            .map_err(|error| format!("invalid AssemblyAI credential: {error}"))?,
+    );
+    let (socket, _) = timeout(
+        Duration::from_secs(5),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| "AssemblyAI connection timed out".to_string())?
+    .map_err(|error| format!("AssemblyAI connection failed: {error}"))?;
+    let (mut output, mut input) = socket.split();
+    let (input_tx, mut input_rx) = mpsc::channel::<SttInput>(64);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                command = input_rx.recv() => {
+                    match command {
+                        Some(SttInput::Audio(audio)) => {
+                            if let Err(error) = output.send(DgMessage::Binary(audio)).await {
+                                let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                return;
+                            }
+                        }
+                        Some(SttInput::Close) | None => {
+                            if let Err(error) = output.send(DgMessage::Text(
+                                json!({"type":"Terminate"}).to_string())).await {
+                                let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                return;
+                            }
+                            match tokio::time::timeout(Duration::from_secs(5), async {
+                                while let Some(message) = input.next().await {
+                                    match message {
+                                        Ok(DgMessage::Text(text)) => {
+                                            let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
+                                            if event.get("type").and_then(Value::as_str) == Some("Turn") &&
+                                                event.get("end_of_turn").and_then(Value::as_bool) == Some(true) {
+                                                let transcript = event.get("transcript")
+                                                    .and_then(Value::as_str).unwrap_or("").trim().to_string();
+                                                if transcript.is_empty() {
+                                                    return Err("AssemblyAI ended an empty turn".to_string());
+                                                }
+                                                let confidence = event.get("end_of_turn_confidence").and_then(Value::as_f64);
+                                                let _ = events.send(DeepgramEvent::EndOfTurn { transcript, confidence }).await;
+                                                return Ok(());
+                                            }
+                                            if event.get("type").and_then(Value::as_str) == Some("Error") {
+                                                return Err(event.to_string());
+                                            }
+                                        }
+                                        Ok(DgMessage::Close(_)) => return Err("AssemblyAI closed the stream".to_string()),
+                                        Err(error) => return Err(error.to_string()),
+                                        _ => {}
+                                    }
+                                }
+                                Err("AssemblyAI closed the stream".to_string())
+                            }).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => { let _ = events.send(DeepgramEvent::Failed(error)).await; }
+                                Err(_) => { let _ = events.send(DeepgramEvent::Failed("AssemblyAI finalization timed out".to_string())).await; }
+                            }
+                            return;
+                        }
+                    }
+                }
+                message = input.next() => {
+                    let Some(message) = message else {
+                        let _ = events.send(DeepgramEvent::Failed("AssemblyAI closed the stream".to_string())).await;
+                        return;
+                    };
+                    match message {
+                        Ok(DgMessage::Text(text)) => {
+                            let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
+                            if event.get("type").and_then(Value::as_str) == Some("Error") {
+                                let _ = events.send(DeepgramEvent::Failed(event.to_string())).await;
+                                return;
+                            }
+                            if event.get("type").and_then(Value::as_str) == Some("Turn") &&
+                                event.get("end_of_turn").and_then(Value::as_bool) == Some(true) {
+                                let transcript = event.get("transcript").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                                if transcript.is_empty() {
+                                    let _ = events.send(DeepgramEvent::Failed("AssemblyAI ended an empty turn".to_string())).await;
+                                } else {
+                                    let confidence = event.get("end_of_turn_confidence").and_then(Value::as_f64);
+                                    let _ = events.send(DeepgramEvent::EndOfTurn { transcript, confidence }).await;
+                                }
+                                return;
+                            }
+                        }
+                        Ok(DgMessage::Close(_)) => {
+                            let _ = events.send(DeepgramEvent::Failed("AssemblyAI closed the stream".to_string())).await;
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+    Ok(SttTurn { input: input_tx })
 }
 
 async fn codex_transcript_request(
