@@ -119,6 +119,10 @@ fn all_active_providers_finished(
     has_pending_device_commit && active > 0 && finished >= active
 }
 
+fn provider_event_is_current(active_turn_id: u64, event_turn_id: u64) -> bool {
+    active_turn_id == event_turn_id
+}
+
 struct VoiceRuntime {
     provider: tokio::sync::RwLock<SttProvider>,
     reliability: Mutex<VoiceReliability>,
@@ -433,7 +437,7 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
             }
             event = provider_events_rx.recv() => {
                 let Some(ProviderEvent { turn_id, provider, event, latency_ms }) = event else { continue };
-                if turn_id != active_turn_id {
+                if !provider_event_is_current(active_turn_id, turn_id) {
                     tracing::info!(turn_id, active_turn_id, provider = provider.name(),
                         "Ignored a late STT result from an earlier Kizz turn");
                     continue;
@@ -1685,6 +1689,13 @@ mod tests {
             deepgram_closed_event(false, Some("stale".to_string()), None),
             DeepgramEvent::Failed(_)
         ));
+    }
+
+    #[test]
+    fn late_provider_result_cannot_enter_the_active_turn() {
+        assert!(provider_event_is_current(42, 42));
+        assert!(!provider_event_is_current(42, 41));
+        assert!(!provider_event_is_current(42, 43));
     }
 
     #[test]
