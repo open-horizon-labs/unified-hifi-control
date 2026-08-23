@@ -15,8 +15,6 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
-use std::io::Write;
-use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -30,7 +28,6 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as DgMes
 
 const SAMPLE_RATE: u32 = 16_000;
 const MAX_UTTERANCE_BYTES: usize = SAMPLE_RATE as usize * 2 * 14;
-const MAX_WAKE_SAMPLE_BYTES: usize = SAMPLE_RATE as usize * 2 * 3;
 const MIN_UTTERANCE_BYTES: usize = SAMPLE_RATE as usize / 2;
 const CODEX_START_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEX_TURN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -311,7 +308,6 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
     tracing::info!("Kizz voice session opened");
     let mut utterance = Vec::<u8>::new();
     let mut current_zone_id = None::<String>;
-    let mut wake_sample = None::<WakeSample>;
     let (provider_events_tx, mut provider_events_rx) = mpsc::channel(16);
     let mut stt_turns = Vec::<SttTurn>::new();
     let mut pending_fallback = None::<(Vec<u8>, Option<String>)>;
@@ -331,17 +327,6 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
                 };
                 match message {
                     Message::Binary(pcm) => {
-                        if let Some(sample) = wake_sample.take() {
-                            if pcm.len() == sample.bytes {
-                                if let Err(error) = store_wake_sample(&sample.label, &pcm) {
-                                    tracing::warn!(%error, "Kizz wake training sample was not stored");
-                                }
-                            } else {
-                                tracing::warn!(expected = sample.bytes, actual = pcm.len(),
-                                    "Kizz wake training sample length mismatch");
-                            }
-                            continue;
-                        }
                         utterance.extend_from_slice(&pcm);
                         if utterance.len() > MAX_UTTERANCE_BYTES {
                             let excess = utterance.len() - MAX_UTTERANCE_BYTES;
@@ -396,7 +381,6 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
                                 providers = stt_turns.len(),
                                 "Kizz voice turn received device context");
                         }
-                        Some(ClientEvent::WakeSample(sample)) => wake_sample = Some(sample),
                         Some(ClientEvent::Commit) if turn_completed => {
                             tracing::info!("Ignored device fallback commit after Flux completed the turn");
                         }
@@ -521,14 +505,7 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
 #[derive(Debug, PartialEq)]
 enum ClientEvent {
     Start { zone_id: Option<String> },
-    WakeSample(WakeSample),
     Commit,
-}
-
-#[derive(Debug, PartialEq)]
-struct WakeSample {
-    label: String,
-    bytes: usize,
 }
 
 fn parse_client_event(message: &str) -> Option<ClientEvent> {
@@ -541,41 +518,9 @@ fn parse_client_event(message: &str) -> Option<ClientEvent> {
                 .filter(|zone_id| !zone_id.is_empty())
                 .map(str::to_owned),
         }),
-        "wake_sample" => {
-            let label = event.get("label")?.as_str()?;
-            let bytes = usize::try_from(event.get("bytes")?.as_u64()?).ok()?;
-            if label != "hiphi_kizz" || bytes == 0 || bytes > MAX_WAKE_SAMPLE_BYTES {
-                return None;
-            }
-            Some(ClientEvent::WakeSample(WakeSample {
-                label: label.to_owned(),
-                bytes,
-            }))
-        }
         "commit" => Some(ClientEvent::Commit),
         _ => None,
     }
-}
-
-fn store_wake_sample(label: &str, pcm: &[u8]) -> Result<(), String> {
-    let Some(root) = std::env::var_os("KIZZ_WAKE_TRAINING_DIR") else {
-        return Ok(());
-    };
-    let destination = Path::new(&root).join("positive").join(label);
-    std::fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
-    let mut sample = tempfile::Builder::new()
-        .prefix("device-")
-        .suffix(".wav")
-        .tempfile_in(&destination)
-        .map_err(|error| error.to_string())?;
-    write_wav(&mut sample, pcm).map_err(|error| error.to_string())?;
-    let path = sample
-        .into_temp_path()
-        .keep()
-        .map_err(|error| error.to_string())?;
-    tracing::info!(path = %path.display(), bytes = pcm.len(),
-        "Stored Kizz wake training sample");
-    Ok(())
 }
 
 async fn start_provider_turn(
@@ -1549,24 +1494,6 @@ fn normalize_codex_result(text: &str) -> Result<Value, String> {
     Ok(result)
 }
 
-fn write_wav(file: &mut tempfile::NamedTempFile, pcm: &[u8]) -> std::io::Result<()> {
-    let data_len = pcm.len() as u32;
-    file.write_all(b"RIFF")?;
-    file.write_all(&(36 + data_len).to_le_bytes())?;
-    file.write_all(b"WAVEfmt ")?;
-    file.write_all(&16u32.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&SAMPLE_RATE.to_le_bytes())?;
-    file.write_all(&(SAMPLE_RATE * 2).to_le_bytes())?;
-    file.write_all(&2u16.to_le_bytes())?;
-    file.write_all(&16u16.to_le_bytes())?;
-    file.write_all(b"data")?;
-    file.write_all(&data_len.to_le_bytes())?;
-    file.write_all(pcm)?;
-    file.flush()
-}
-
 async fn send_event(socket: &mut WebSocket, event: Value) -> Result<(), axum::Error> {
     socket.send(Message::Text(event.to_string().into())).await
 }
@@ -1781,13 +1708,10 @@ mod tests {
     }
 
     #[test]
-    fn wake_training_sample_is_bounded_and_exactly_labeled() {
+    fn production_voice_rejects_training_audio() {
         assert_eq!(
             parse_client_event(r#"{"type":"wake_sample","label":"hiphi_kizz","bytes":64000}"#),
-            Some(ClientEvent::WakeSample(WakeSample {
-                label: "hiphi_kizz".to_string(),
-                bytes: 64_000,
-            }))
+            None
         );
         assert_eq!(
             parse_client_event(r#"{"type":"wake_sample","label":"other","bytes":64000}"#),
