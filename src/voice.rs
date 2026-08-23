@@ -29,6 +29,7 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message as DgMes
 const SAMPLE_RATE: u32 = 16_000;
 const MAX_UTTERANCE_BYTES: usize = SAMPLE_RATE as usize * 2 * 14;
 const MIN_UTTERANCE_BYTES: usize = SAMPLE_RATE as usize / 2;
+const STT_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const CODEX_START_TIMEOUT: Duration = Duration::from_secs(20);
 const CODEX_TURN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEEPGRAM_AUDIO_CHUNK_BYTES: usize = 16_000 * 2 * 80 / 1000;
@@ -352,7 +353,19 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
                                 let events = provider_events_tx.clone();
                                 async move {
                                     let started = Instant::now();
-                                    let result = start_provider_turn(turn_id, provider, events).await;
+                                    let result = match timeout(
+                                        STT_CONNECT_TIMEOUT,
+                                        start_provider_turn(turn_id, provider, events),
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) => result,
+                                        Err(_) => Err(format!(
+                                            "{} connection timed out after {} ms",
+                                            provider.name(),
+                                            STT_CONNECT_TIMEOUT.as_millis()
+                                        )),
+                                    };
                                     (provider, result, started.elapsed().as_millis() as u64)
                                 }
                             });
