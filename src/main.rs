@@ -483,10 +483,8 @@ mod server {
             // separate from the controller API so an embedded listener cannot
             // reach arbitrary App Server capabilities.
             .route("/voice/v1", get(voice::voice_upgrade))
-            .route(
-                "/voice/provider",
-                get(voice::provider_get).post(voice::provider_post),
-            )
+            .route("/voice/provider", get(voice::provider_get))
+            .route("/voice/provider", post(voice::provider_post))
             .route("/voice/reliability", get(voice::reliability_get))
             // Knob hardware API routes
             .route("/knob/zones", get(knobs::knob_zones_handler))
