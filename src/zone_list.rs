@@ -235,6 +235,36 @@ pub enum MoveDirection {
     Down,
 }
 
+/// Move one zone to the slot another zone currently occupies, returning the full resulting order.
+///
+/// This is the drop half of drag-and-drop, where [`reorder`] is the step half. It takes a target
+/// *zone* rather than a target index because the client's row indices and the server's list can
+/// disagree — a zone can appear or vanish between render and drop — and a stale index would silently
+/// drop the zone in the wrong place, while a stale zone id resolves to `None` and does nothing.
+///
+/// Unlike [`reorder`], this does not step over hidden zones: a drop names an exact destination, and
+/// honouring it literally is what makes the result match where the user let go.
+///
+/// Returns `None` when either zone is unknown, or when they are the same zone.
+pub fn reorder_to(
+    effective_order: &[Zone],
+    zone_id: &str,
+    target_zone_id: &str,
+) -> Option<Vec<String>> {
+    if zone_id == target_zone_id {
+        return None;
+    }
+    let from = effective_order.iter().position(|z| z.zone_id == zone_id)?;
+    let to = effective_order
+        .iter()
+        .position(|z| z.zone_id == target_zone_id)?;
+
+    let mut ids: Vec<String> = effective_order.iter().map(|z| z.zone_id.clone()).collect();
+    let moved = ids.remove(from);
+    ids.insert(to, moved);
+    Some(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +621,40 @@ mod tests {
             reorder(&effective, "roon:visible", MoveDirection::Up, &hidden).is_none(),
             "already first among visible zones"
         );
+    }
+
+    /// A drop lands the zone exactly where the user let go, hidden rows included — unlike a button
+    /// step, which reasons about visible neighbours. Dropping onto row 0 must put it at row 0.
+    #[test]
+    fn a_drop_lands_on_the_targets_exact_slot() {
+        let effective = vec![
+            zone("roon:a", "Attic"),
+            zone("roon:b", "Basement"),
+            zone("roon:c", "Cellar"),
+        ];
+
+        assert_eq!(
+            reorder_to(&effective, "roon:c", "roon:a").expect("drop should apply"),
+            vec!["roon:c", "roon:a", "roon:b"],
+            "dropping Cellar onto Attic's row puts Cellar first"
+        );
+        assert_eq!(
+            reorder_to(&effective, "roon:a", "roon:c").expect("drop should apply"),
+            vec!["roon:b", "roon:c", "roon:a"],
+            "dropping Attic onto Cellar's row puts Attic last"
+        );
+    }
+
+    /// A drop that resolves to nothing must be a no-op, never a panic or a silent misplacement.
+    /// The dragged row can vanish between render and drop — a zone going offline mid-drag is
+    /// ordinary in this product.
+    #[test]
+    fn a_drop_on_an_unknown_or_identical_zone_does_nothing() {
+        let effective = vec![zone("roon:a", "Attic"), zone("roon:b", "Basement")];
+
+        assert!(reorder_to(&effective, "roon:a", "roon:a").is_none());
+        assert!(reorder_to(&effective, "roon:gone", "roon:a").is_none());
+        assert!(reorder_to(&effective, "roon:a", "roon:gone").is_none());
     }
 
     /// A hidden zone has no visible position, so it trades with whatever is adjacent.

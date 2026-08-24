@@ -222,14 +222,20 @@ async fn get_zone_infos(state: &AppState) -> Vec<ZoneInfo> {
 /// Changes when zones are added/removed, enabling clients to detect zone list updates
 fn compute_zones_sha(zones: &[ZoneInfo]) -> String {
     let mut hasher = Sha256::new();
-    // Hash zone IDs and names - sorted for deterministic output
-    // Use length-prefixing to avoid delimiter collision (e.g., if zone name contains special chars)
-    let mut zone_data: Vec<_> = zones
-        .iter()
-        .map(|z| format!("{}:{}", z.zone_id, z.zone_name))
-        .collect();
-    zone_data.sort();
-    for item in &zone_data {
+    // Hashed in list order, so a reorder changes the SHA and clients notice.
+    //
+    // This used to sort first, and that was correct at the time: the list came from
+    // `HashMap::values()`, so its order differed between two requests with an unchanged zone set. An
+    // order-sensitive hash would have changed on essentially every request and had knobs refetching
+    // their zone list constantly, so sorting the order away was the only way to get a stable value.
+    //
+    // `zone_list::visible_zones` now imposes a deterministic order, which removes the reason for the
+    // sort and turns it into a bug: user-visible reordering was invisible to every client that polls
+    // this SHA, because reordering is the one change sorting erases.
+    //
+    // Length-prefixed to avoid delimiter collisions, e.g. a zone named "a:b".
+    for zone in zones {
+        let item = format!("{}:{}", zone.zone_id, zone.zone_name);
         let len = item.len() as u32;
         hasher.update(len.to_be_bytes());
         hasher.update(item.as_bytes());
@@ -1555,9 +1561,16 @@ mod tests {
         assert_eq!(sha1.len(), 8, "SHA should be 8 hex chars");
     }
 
+    /// Reordering must change the SHA, or clients never learn about it.
+    ///
+    /// This test replaces `zones_sha_order_insensitive`, which asserted the opposite. That assertion
+    /// was right for its time: the zone list came from `HashMap::values()` and had no stable order,
+    /// so hashing order would have churned the SHA on every request. `zone_list::visible_zones` now
+    /// guarantees a deterministic order, so hashing it is safe — and necessary, because reordering
+    /// changes neither the set of zones nor their names, and is therefore the one user-visible
+    /// change a sorted hash cannot see.
     #[test]
-    fn zones_sha_order_insensitive() {
-        // Same zones in different order should produce same SHA
+    fn zones_sha_changes_on_reorder() {
         let zones_a = vec![
             make_zone("zone-1", "Living Room"),
             make_zone("zone-2", "Kitchen"),
@@ -1568,10 +1581,36 @@ mod tests {
             make_zone("zone-1", "Living Room"),
         ];
 
-        let sha_a = compute_zones_sha(&zones_a);
-        let sha_b = compute_zones_sha(&zones_b);
+        assert_ne!(
+            compute_zones_sha(&zones_a),
+            compute_zones_sha(&zones_b),
+            "a knob polling this SHA must be able to detect that the zone order changed"
+        );
+    }
 
-        assert_eq!(sha_a, sha_b, "Order should not affect SHA");
+    /// The same list still hashes the same. Determinism is what makes the SHA usable at all; the
+    /// change above is that it is now determined by the order too, not that it became unstable.
+    #[test]
+    fn zones_sha_is_stable_for_an_unchanged_list() {
+        let zones = vec![
+            make_zone("zone-1", "Living Room"),
+            make_zone("zone-2", "Kitchen"),
+        ];
+
+        assert_eq!(compute_zones_sha(&zones), compute_zones_sha(&zones));
+    }
+
+    /// Hiding a zone changes the SHA, because a hidden zone is absent from the list this hashes.
+    /// (Renaming is already covered by `zones_sha_changes_on_rename` below.)
+    #[test]
+    fn zones_sha_changes_when_a_zone_is_hidden() {
+        let shown = vec![
+            make_zone("zone-1", "Living Room"),
+            make_zone("zone-2", "Kitchen"),
+        ];
+        let hidden = vec![make_zone("zone-1", "Living Room")];
+
+        assert_ne!(compute_zones_sha(&shown), compute_zones_sha(&hidden));
     }
 
     #[test]

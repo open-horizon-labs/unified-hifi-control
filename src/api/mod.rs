@@ -2927,7 +2927,16 @@ const MAX_ZONE_NAME_CHARS: usize = 60;
 #[derive(Debug, Deserialize)]
 pub struct ZoneOrderRequest {
     pub zone_id: String,
-    pub direction: crate::zone_list::MoveDirection,
+    /// Step one place. Used by the up/down buttons.
+    #[serde(default)]
+    pub direction: Option<crate::zone_list::MoveDirection>,
+    /// Take the slot this zone currently occupies. Used by drag-and-drop.
+    ///
+    /// A target *zone* rather than an index: the client's row indices can go stale between render
+    /// and drop if a zone appears or disappears, and a stale index would land the zone somewhere
+    /// the user did not point at, silently. A stale zone id simply resolves to nothing.
+    #[serde(default)]
+    pub target_zone_id: Option<String>,
 }
 
 /// POST /api/zones/order - move one zone one place up or down.
@@ -2947,9 +2956,16 @@ pub async fn zone_order_post(
     let hidden_ids: Vec<String> = settings.hidden_zone_ids().to_vec();
     let hidden: std::collections::HashSet<&str> = hidden_ids.iter().map(String::as_str).collect();
 
-    let Some(new_order) =
-        crate::zone_list::reorder(&effective, &req.zone_id, req.direction, &hidden)
-    else {
+    // A drop names its destination exactly; a button step has to reason about hidden neighbours.
+    let moved = match (&req.target_zone_id, req.direction) {
+        (Some(target), _) => crate::zone_list::reorder_to(&effective, &req.zone_id, target),
+        (None, Some(direction)) => {
+            crate::zone_list::reorder(&effective, &req.zone_id, direction, &hidden)
+        }
+        (None, None) => None,
+    };
+
+    let Some(new_order) = moved else {
         // Already at the end it was moved toward, or no such zone. A no-op, not an error -- but say
         // so, since the UI announces "already first" rather than silently doing nothing.
         return (

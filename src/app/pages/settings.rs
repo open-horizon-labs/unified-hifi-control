@@ -268,10 +268,7 @@ pub fn Settings() -> Element {
             }
             let result = crate::app::api::post_json::<_, serde_json::Value>(
                 "/api/zones/order",
-                &ZoneOrderRequest {
-                    zone_id: zone.zone_id.clone(),
-                    direction,
-                },
+                &ZoneOrderRequest::step(zone.zone_id.clone(), direction),
             )
             .await;
             match result {
@@ -281,6 +278,32 @@ pub fn Settings() -> Element {
                         MoveDirection::Up => format!("{label} moved up."),
                         MoveDirection::Down => format!("{label} moved down."),
                     });
+                }
+                Err(err) => report_zone_failure(err),
+            }
+            managed_zones.restart();
+        });
+    };
+
+    // Drag-and-drop state. HTML5 drag events do not fire on touch devices, so this is an
+    // enhancement layered over the up/down buttons rather than a replacement for them -- the buttons
+    // remain the path for phones and for keyboard users.
+    let mut dragging = use_signal(|| Option::<String>::None);
+    let mut drop_target = use_signal(|| Option::<String>::None);
+
+    let drop_zone_onto = move |zone: ManagedZone, target: ManagedZone| {
+        let label = zone.qualified_label();
+        let target_label = target.qualified_label();
+        spawn(async move {
+            let result = crate::app::api::post_json::<_, serde_json::Value>(
+                "/api/zones/order",
+                &ZoneOrderRequest::drop_onto(zone.zone_id.clone(), target.zone_id.clone()),
+            )
+            .await;
+            match result {
+                Ok(_) => {
+                    zone_error.set(None);
+                    zone_status.set(format!("{label} moved to {target_label}'s position."));
                 }
                 Err(err) => report_zone_failure(err),
             }
@@ -626,7 +649,7 @@ pub fn Settings() -> Element {
                 div { class: "mb-4",
                     h2 { id: "zones-heading", class: "text-xl font-semibold", "Zone list" }
                     p { class: "text-muted text-sm",
-                        "Name your zones, choose which ones appear, and set their order. Applies everywhere — this app, knobs, and connected assistants."
+                        "Name your zones, choose which ones appear, and set their order. Drag a row to move it, or use the arrows. Applies everywhere — this app, knobs, and connected assistants."
                     }
                 }
 
@@ -696,6 +719,14 @@ pub fn Settings() -> Element {
                             }
                             let first_visible = rows.iter().position(|(z, _)| !z.hidden);
                             let last_visible = rows.iter().rposition(|(z, _)| !z.hidden);
+                            // A drop knows only the dragged zone's id, so the row it belongs to has
+                            // to be recoverable by id from inside the drop handler.
+                            let drop_lookup: std::rc::Rc<std::collections::HashMap<String, ManagedZone>> =
+                                std::rc::Rc::new(
+                                    rows.iter()
+                                        .map(|(z, _)| (z.zone_id.clone(), z.clone()))
+                                        .collect(),
+                                );
 
                             rsx! {
                                 table { class: "w-full", id: "zones-table",
@@ -711,7 +742,48 @@ pub fn Settings() -> Element {
                                         for (index, (zone, position)) in rows.into_iter().enumerate() {
                                             tr {
                                                 key: "{zone.zone_id}-{revision}",
-                                                class: "border-b border-default",
+                                                class: if drop_target() == Some(zone.zone_id.clone()) {
+                                                    "zone-row zone-row-drop-target border-b border-default"
+                                                } else if dragging() == Some(zone.zone_id.clone()) {
+                                                    "zone-row zone-row-dragging border-b border-default"
+                                                } else {
+                                                    "zone-row border-b border-default"
+                                                },
+                                                draggable: "true",
+                                                ondragstart: {
+                                                    let zone_id = zone.zone_id.clone();
+                                                    move |_| dragging.set(Some(zone_id.clone()))
+                                                },
+                                                ondragover: {
+                                                    let zone_id = zone.zone_id.clone();
+                                                    move |evt: DragEvent| {
+                                                        // Without preventDefault the browser treats
+                                                        // this as an invalid drop target and never
+                                                        // fires ondrop.
+                                                        evt.prevent_default();
+                                                        if dragging().is_some() {
+                                                            drop_target.set(Some(zone_id.clone()));
+                                                        }
+                                                    }
+                                                },
+                                                ondrop: {
+                                                    let target = zone.clone();
+                                                    let rows_for_drop = drop_lookup.clone();
+                                                    move |evt: DragEvent| {
+                                                        evt.prevent_default();
+                                                        if let Some(dragged_id) = dragging() {
+                                                            if let Some(dragged) = rows_for_drop.get(&dragged_id) {
+                                                                drop_zone_onto(dragged.clone(), target.clone());
+                                                            }
+                                                        }
+                                                        dragging.set(None);
+                                                        drop_target.set(None);
+                                                    }
+                                                },
+                                                ondragend: move |_| {
+                                                    dragging.set(None);
+                                                    drop_target.set(None);
+                                                },
                                                 td { class: "py-2 px-2 align-top",
                                                     label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-2",
                                                         input {
@@ -764,6 +836,23 @@ pub fn Settings() -> Element {
                                                 td { class: "py-2 px-2 align-top text-muted hidden sm:table-cell", "{source_label(&zone.source)}" }
                                                 td { class: "py-2 px-2 align-top",
                                                     div { class: "flex items-center justify-end gap-2",
+                                                        // Grip: the affordance that says "this row
+                                                        // drags". Decorative only -- dragging has
+                                                        // no keyboard or touch equivalent, so the
+                                                        // buttons beside it carry the accessible
+                                                        // path and this is aria-hidden.
+                                                        svg {
+                                                            class: "w-4 h-4 text-muted hidden sm:block",
+                                                            fill: "currentColor",
+                                                            view_box: "0 0 24 24",
+                                                            "aria-hidden": "true",
+                                                            circle { cx: "9", cy: "6", r: "1.5" }
+                                                            circle { cx: "15", cy: "6", r: "1.5" }
+                                                            circle { cx: "9", cy: "12", r: "1.5" }
+                                                            circle { cx: "15", cy: "12", r: "1.5" }
+                                                            circle { cx: "9", cy: "18", r: "1.5" }
+                                                            circle { cx: "15", cy: "18", r: "1.5" }
+                                                        }
                                                         span { class: "text-muted text-sm tabular-nums",
                                                             if let Some(position) = position {
                                                                 "{position} of {visible_total}"

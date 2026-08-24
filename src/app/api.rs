@@ -133,7 +133,30 @@ pub struct ZoneVisibilityRequest {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ZoneOrderRequest {
     pub zone_id: String,
-    pub direction: MoveDirection,
+    /// Step one place — the up/down buttons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<MoveDirection>,
+    /// Take this zone's slot — a drag-and-drop drop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_zone_id: Option<String>,
+}
+
+impl ZoneOrderRequest {
+    pub fn step(zone_id: String, direction: MoveDirection) -> Self {
+        Self {
+            zone_id,
+            direction: Some(direction),
+            target_zone_id: None,
+        }
+    }
+
+    pub fn drop_onto(zone_id: String, target_zone_id: String) -> Self {
+        Self {
+            zone_id,
+            direction: None,
+            target_zone_id: Some(target_zone_id),
+        }
+    }
 }
 
 /// Shared with the server's `zone_list::MoveDirection`, so a typo is a compile error rather than a
