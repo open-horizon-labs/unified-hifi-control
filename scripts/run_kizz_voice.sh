@@ -55,7 +55,7 @@ trap 'kill "$server_pid" 2>/dev/null || true' EXIT INT TERM
 
 for _ in {1..50}; do
   if curl -fsS --max-time 1 http://127.0.0.1:8088/voice/reliability >/dev/null; then
-    echo "UHC voice ready on :8088 (Deepgram + AssemblyAI + ElevenLabs $ELEVENLABS_STT_MODEL)"
+    echo "UHC voice ready on :8088 (single-prompt intent gate; Deepgram + AssemblyAI + ElevenLabs $ELEVENLABS_STT_MODEL)"
     wait "$server_pid"
     exit $?
   fi

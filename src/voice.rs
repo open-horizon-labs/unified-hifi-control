@@ -1394,6 +1394,7 @@ impl CodexVoiceAgent {
             let result = normalize_codex_result(text)?;
             tracing::info!(
                 state = %result["state"].as_str().unwrap_or("invalid"),
+                intent = %result["intent"].as_str().unwrap_or("invalid"),
                 message = %result["message"].as_str().unwrap_or(""),
                 zone = %result["zone"].as_str().unwrap_or(""),
                 heard = %result["heard"].as_str().unwrap_or(""),
@@ -1468,6 +1469,15 @@ spoken room always overrides device context. For a clear request, perform it and
 report success only when the MCP result confirms it. If the intended content or
 zone is genuinely ambiguous, do not guess or act; ask one short clarification.
 
+This is a hard execution boundary. Before considering any MCP call, classify the
+transcript in the `intent` field as exactly one of `command`, `non_command`, or
+`uncertain`. `command` means a clear request to control music, playback, volume,
+content, or zones. `non_command` means ordinary conversation or unrelated
+speech. `uncertain` means the transcript is too fragmentary or ambiguous to
+establish a music request. If the intent is `non_command` or `uncertain`, do not
+call any MCP tool. Return `state` as `clarify`, set `intent` accordingly, and set
+`message` exactly to `I can't let you do that Dave`.
+
 Kizz itself communicates with expressions, motion, and chirps. Do not create a
 spoken model response and do not emit commentary. Return only the structured
 JSON required by the supplied output schema. Keep message under 90 characters.
@@ -1477,12 +1487,13 @@ fn kizz_result_schema() -> Value {
     json!({
         "type":"object",
         "additionalProperties":false,
-        "required":["state","message","zone","heard"],
+        "required":["state","message","zone","heard","intent"],
         "properties":{
             "state":{"type":"string","enum":["success","clarify","error"]},
             "message":{"type":"string"},
             "zone":{"type":["string","null"]},
-            "heard":{"type":["string","null"]}
+            "heard":{"type":["string","null"]},
+            "intent":{"type":"string","enum":["command","non_command","uncertain"]}
         }
     })
 }
@@ -1496,6 +1507,16 @@ fn normalize_codex_result(text: &str) -> Result<Value, String> {
         .to_string();
     if !matches!(state.as_str(), "success" | "clarify" | "error") {
         return Err(format!("Codex returned unsupported Kizz state: {state}"));
+    }
+    if !matches!(
+        result["intent"].as_str(),
+        Some("command" | "non_command" | "uncertain")
+    ) {
+        return Err("Codex returned unsupported Kizz intent".to_string());
+    }
+    if result["intent"] != "command" {
+        result["state"] = json!("clarify");
+        result["message"] = json!("I can't let you do that Dave");
     }
     if !result["message"].is_string() {
         return Err("Codex returned no Kizz message".to_string());
@@ -1679,7 +1700,7 @@ mod tests {
     #[test]
     fn codex_success_becomes_a_kizz_state_event() {
         let result = normalize_codex_result(
-            r#"{"state":"success","message":"On it.","zone":"Kitchen","heard":null}"#,
+            r#"{"state":"success","message":"On it.","zone":"Kitchen","heard":null,"intent":"command"}"#,
         )
         .expect("valid agent result");
         assert_eq!(result["type"], "state");
@@ -1690,7 +1711,7 @@ mod tests {
     #[test]
     fn codex_error_never_claims_device_success() {
         let result = normalize_codex_result(
-            r#"{"state":"error","message":"Music service unavailable","zone":null,"heard":null}"#,
+            r#"{"state":"error","message":"Music service unavailable","zone":null,"heard":null,"intent":"command"}"#,
         )
         .expect("valid agent result");
         assert_eq!(result["state"], "clarify");
@@ -1699,6 +1720,32 @@ mod tests {
     #[test]
     fn malformed_agent_output_is_rejected() {
         assert!(normalize_codex_result("played it").is_err());
+    }
+
+    #[test]
+    fn codex_output_requires_a_valid_intent_classification() {
+        assert!(normalize_codex_result(
+            r#"{"state":"clarify","message":"Try again.","zone":null,"heard":null}"#
+        )
+        .is_err());
+        assert!(normalize_codex_result(
+            r#"{"state":"clarify","message":"Try again.","zone":null,"heard":null,"intent":"maybe"}"#
+        )
+        .is_err());
+        let result = normalize_codex_result(
+            r#"{"state":"clarify","message":"Try again.","zone":null,"heard":null,"intent":"uncertain"}"#
+        )
+        .expect("valid uncertain intent");
+        assert_eq!(result["intent"], "uncertain");
+        assert_eq!(result["state"], "clarify");
+        assert_eq!(result["message"], "I can't let you do that Dave");
+
+        let result = normalize_codex_result(
+            r#"{"state":"success","message":"I changed it.","zone":"Kitchen","heard":null,"intent":"non_command"}"#
+        )
+        .expect("valid non-command intent");
+        assert_eq!(result["state"], "clarify");
+        assert_eq!(result["message"], "I can't let you do that Dave");
     }
 
     #[test]
