@@ -335,11 +335,11 @@
     }
   },
   "hifi_queue": {
-    "description": "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, and clear against its active queue; each mutation returns a fresh queue readback. Queue add is hifi_play action='queue'.",
+    "description": "Read or edit a playback queue. action='read' is the default. Music Assistant supports jump, reorder, remove, clear, and transfer against its active queue; each mutation returns a fresh queue readback. transfer moves the active queue from zone_id to target_zone_id (both must be Music Assistant zones). Queue add is hifi_play action='queue'.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "read (default), jump, reorder, remove, or clear.",
+          "description": "read (default), jump, reorder, remove, clear, or transfer.",
           "type": "string"
         },
         "item_id": {
@@ -351,6 +351,11 @@
           "description": "Target zero-based position for reorder.",
           "nullable": true,
           "type": "integer"
+        },
+        "target_zone_id": {
+          "description": "Destination zone ID for transfer. Must belong to the same provider as zone_id.",
+          "nullable": true,
+          "type": "string"
         },
         "zone_id": {
           "description": "Zone ID from hifi_zones.",

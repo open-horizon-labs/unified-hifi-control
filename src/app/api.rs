@@ -250,6 +250,129 @@ pub struct NowPlaying {
 }
 
 // =============================================================================
+// Collections / queue types (#507)
+//
+// These mirror the `hifi_collections`/`hifi_queue`/`hifi_play_ref` MCP tool
+// wire shapes exactly, because `/api/collections`, `/api/queue` and
+// `/api/play_ref` (src/api/browse.rs) forward those tools' own envelope
+// verbatim -- see that module's doc comment for why. Only the fields this UI
+// renders are modelled; unknown fields are ignored by serde's default
+// behavior, so extra envelope fields (`scope`, `observed`, `params`, ...)
+// deserialize away harmlessly.
+// =============================================================================
+
+/// One item from a `hifi_collections` page: either a folder (`path` set,
+/// browse only) or a playable entry (`r#ref` set, usable with `/api/play_ref`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CollectionItem {
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(rename = "ref", default)]
+    pub item_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CollectionPage {
+    #[serde(default)]
+    pub items: Vec<CollectionItem>,
+    #[serde(default)]
+    pub next_offset: Option<u32>,
+}
+
+/// The `reason`-tagged refusal shape from `crate::mcp::envelope::Refusal`.
+/// Every variant carries `detail`, which is all this UI shows.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct EnvelopeRefusal {
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// The envelope every `hifi_*` tool result carries
+/// (`crate::mcp::envelope::Envelope`), as forwarded verbatim by
+/// `src/api/browse.rs`. Generic over `data`'s shape.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Envelope<T> {
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub data: Option<T>,
+    #[serde(default)]
+    pub refusal: Option<EnvelopeRefusal>,
+}
+
+impl<T> Envelope<T> {
+    pub fn is_ok(&self) -> bool {
+        matches!(self.outcome.as_str(), "ok" | "accepted")
+    }
+
+    /// A human-readable reason for a non-ok outcome, for display.
+    pub fn error_detail(&self) -> String {
+        self.refusal
+            .as_ref()
+            .map(|r| r.detail.clone())
+            .filter(|detail| !detail.is_empty())
+            .unwrap_or_else(|| format!("request did not succeed ({})", self.outcome))
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CollectionsRequest {
+    pub zone_id: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QueueRequest {
+    pub zone_id: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_zone_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PlayRefRequest {
+    #[serde(rename = "ref")]
+    pub item_ref: String,
+    pub zone_id: String,
+    pub action: String,
+}
+
+/// `POST /api/collections`.
+pub async fn fetch_collections(
+    req: &CollectionsRequest,
+) -> Result<Envelope<CollectionPage>, String> {
+    post_json("/api/collections", req).await
+}
+
+/// `POST /api/queue`, for actions this UI drives without reading the queue
+/// contents back (transfer). The response body is ignored beyond outcome.
+pub async fn post_queue_action(req: &QueueRequest) -> Result<Envelope<serde_json::Value>, String> {
+    post_json("/api/queue", req).await
+}
+
+/// `POST /api/play_ref`.
+pub async fn post_play_ref(req: &PlayRefRequest) -> Result<Envelope<serde_json::Value>, String> {
+    post_json("/api/play_ref", req).await
+}
+
+// =============================================================================
 // LMS Types
 // =============================================================================
 
