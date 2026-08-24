@@ -1,0 +1,74 @@
+name: Home Assistant integration
+
+# Tests for the HACS custom_components/unified_hifi_control Python
+# package. This job is intentionally independent of the Rust crate's
+# build/CI (build.yml) since it has its own toolchain and dependencies.
+#
+# Note: feature-branch PRs in this repo do not currently run CI checks
+# (see AGENTS.md / stacked-PR workflow notes); this workflow becomes
+# active once merged to v3.
+
+on:
+  push:
+    branches: [v3]
+    paths:
+      - "custom_components/unified_hifi_control/**"
+      - "hacs.json"
+      - "pyproject.toml"
+      - ".github/workflows/ha-integration.yml"
+  pull_request:
+    branches: [v3]
+    paths:
+      - "custom_components/unified_hifi_control/**"
+      - "hacs.json"
+      - "pyproject.toml"
+      - ".github/workflows/ha-integration.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: custom_components/unified_hifi_control/requirements_test.txt
+
+      - name: Install test dependencies
+        run: pip install -r custom_components/unified_hifi_control/requirements_test.txt
+
+      - name: Work around aiodns/pycares thread-leak false positive
+        # homeassistant depends on aiodns/pycares, whose AsyncResolver
+        # spins up a background c-ares thread the first time any test
+        # constructs a real aiohttp connector. pytest-homeassistant-
+        # custom-component's per-test thread-leak check then flags that
+        # thread against whichever test happened to run first, even
+        # though every HTTP call in this suite goes through
+        # aioclient_mock and never touches a real connector. Since our
+        # tests never need real DNS resolution, removing pycares avoids
+        # the false positive without weakening the check itself.
+        run: pip uninstall -y aiodns pycares
+
+      - name: Run pytest
+        run: pytest custom_components/unified_hifi_control/tests -v
+
+  hacs-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master

@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+testpaths = ["custom_components/unified_hifi_control/tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+include = ["custom_components/unified_hifi_control/**/*.py"]

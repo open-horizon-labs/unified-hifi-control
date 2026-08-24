@@ -1,0 +1,14 @@
+{
+  "domain": "unified_hifi_control",
+  "name": "Unified Hifi Control",
+  "codeowners": ["@muness"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/open-horizon-labs/unified-hifi-control/blob/v3/docs/home_assistant_integration.md",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/open-horizon-labs/unified-hifi-control/issues",
+  "requirements": [],
+  "version": "0.1.0",
+  "zeroconf": ["_uhc._tcp.local."]
+}

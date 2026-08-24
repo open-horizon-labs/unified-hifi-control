@@ -25,3 +25,10 @@ public/tailwind.css
 # Note: public/dx-components-theme.css is hand-authored, NOT generated
 .worktrees/
 .impeccable/critique/
+
+# Python (Home Assistant integration test env)
+__pycache__/
+*.pyc
+.venv*/
+.pytest_cache/
+.ruff_cache/

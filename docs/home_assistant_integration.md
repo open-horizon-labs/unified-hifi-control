@@ -1,0 +1,162 @@
+# Home Assistant integration (`custom_components/unified_hifi_control`)
+
+A HACS-installable custom integration that exposes every UHC zone as a
+`media_player` entity, giving Home Assistant native voice control
+("pause the kitchen"), media-player dashboard cards, and `media_player.*`
+service calls — beyond what the MQTT device-composition path (PR #518,
+issue #508) can offer, since HA's built-in MQTT integration has no
+`media_player` platform.
+
+## Repo location
+
+Lives at the repository root (`custom_components/unified_hifi_control/`
+plus a root-level `hacs.json`), not in a sibling repo or a nested
+subdirectory. Rationale:
+
+- HACS's "integration" category expects `custom_components/<domain>/`
+  and `hacs.json` at the **root** of the repository it's pointed at.
+  Nesting the integration under e.g. `ha_integration/` would require
+  either a second HACS-visible repo or an unsupported layout; keeping it
+  at repo root lets users add
+  `https://github.com/open-horizon-labs/unified-hifi-control` directly
+  as a HACS custom repository today, with zero extra hosting.
+- This mirrors how several other server+integration monorepos ship (the
+  Rust crate and the Python integration are independent build/test
+  units that happen to share a repo and an issue tracker).
+- A sibling repo was considered but rejected for this PR: it would
+  require creating and maintaining a second GitHub repository, which
+  isn't something this change can do unattended, and would separate the
+  integration's issue history from the UHC server changes it depends
+  on (capability matrix, zone id conventions, event bus shape).
+
+## Architecture
+
+- **Transport**: plain HTTP against UHC's unified `/knob/*` routes
+  (`src/knobs/routes.rs`) — `GET /knob/zones`, `GET /knob/now_playing`,
+  `POST /knob/control`, `GET /knob/now_playing/image`. These work across
+  every adapter (Roon, LMS, HQPlayer, OpenHome, UPnP, Music Assistant)
+  without per-provider client code.
+- **State updates**: push-based via Server-Sent Events. UHC's
+  `GET /events` (`src/api/mod.rs::events_handler`) streams every
+  `BusEvent` off a real `tokio::sync::broadcast` channel
+  (`src/bus/mod.rs`). The coordinator (`coordinator.py`) holds a
+  long-lived connection and applies `NowPlayingChanged`,
+  `VolumeChanged`, `SeekPositionChanged`, `ZoneUpdated`,
+  `ZoneDiscovered`, and `ZoneRemoved` events directly to in-memory zone
+  state, then pushes updates to entities via
+  `DataUpdateCoordinator.async_set_updated_data` — no polling delay for
+  ordinary playback changes.
+  - **Documented polling fallback**: a 60-second periodic poll
+    (`FALLBACK_POLL_INTERVAL`) runs alongside the SSE listener as a
+    safety net for connections that go idle-dead without erroring
+    (some NAT/proxy setups swallow resets on long-lived idle TCP
+    connections). Under normal operation this poll observes no changes
+    because SSE already applied them.
+  - The SSE listener reconnects with exponential backoff (2s-60s) on
+    any disconnect and resets to the minimum backoff once a connection
+    has stayed up for 5+ seconds.
+- **Unavailability**: entities report unavailable when the coordinator's
+  last poll failed (`UpdateFailed`) or when their zone_id has been
+  removed from the coordinator's zone map (e.g. after a `ZoneRemoved`
+  event, or the zone no longer appears in a poll).
+- **Capability mapping**: `media_player.py::_supported_features` derives
+  `MediaPlayerEntityFeature` flags from the zone's provider using the
+  same facts as `src/mcp/capabilities.rs` / AGENTS.md's capability
+  matrix on this branch:
+  - Transport (play/pause/stop) and volume: all providers except
+    AppleMusic, which is gated behind #465 pending physical-device
+    validation on the UHC side.
+  - Next/previous: all providers except UPnP, whose adapter explicitly
+    refuses skip actions (`src/adapters/upnp.rs::REFUSED_TRANSPORT_ACTIONS`).
+  - Grouping (`MediaPlayerEntityFeature.GROUPING`, wired to
+    `async_join_players`/`async_unjoin_player`): **Music Assistant
+    only** on this branch, matching `Capability::MultiroomSync` in
+    `src/mcp/capabilities.rs` (the only provider marked `Supported`
+    there). Roon/LMS grouping work exists on branch `issue/517`
+    (feeding PR #521) but had not merged into this integration's base
+    branch as of this PR — calling join/unjoin on any other provider
+    raises a `HomeAssistantError` naming the tracking issues instead of
+    silently failing.
+  - Grouping itself is implemented over the `/mcp` JSON-RPC endpoint
+    (`hifi_zone_group` tool) because grouping has no plain-REST route
+    yet; everything else in this integration is plain REST.
+- **Mute caveat**: UHC's `/knob/now_playing` response does not include
+  mute state, and not every provider has confirmed `mute`/`unmute`
+  wiring through `/knob/control` end-to-end (only HQPlayer's handler was
+  found to set `Command::Mute` explicitly during research for this
+  integration). `media_player.is_volume_muted` is therefore `None`
+  (unknown) until a `VolumeChanged` SSE event with `is_muted` has been
+  observed for that zone, and `async_mute_volume` is a best-effort call
+  that surfaces a `HomeAssistantError` if UHC rejects it rather than
+  failing silently.
+- **Zone id stability**: unique_id is UHC's provider-prefixed zone id
+  (`roon:<id>`, `lms:<mac>`, `hqplayer:<instance>`,
+  `musicassistant:<id>`, etc. — see `PrefixedZoneId` in
+  `src/bus/events.rs`). These are stable for the lifetime of a zone on
+  the UHC server, with one known exception: Roon's own zone_id can
+  change when a user regroups outputs inside Roon itself, since Roon's
+  zone model — not UHC — owns that identity. That churn is inherent to
+  Roon and out of this integration's control; it shows up in Home
+  Assistant as the old entity going unavailable and a new one appearing
+  after a Roon-side regroup.
+- **Auth**: this integration talks to UHC assuming the default,
+  unauthenticated-on-LAN posture. If a server is run with
+  `UHC_REQUIRE_CONTROLLER_AUTH=1` (see `docs/controller-auth.md`), most
+  `/knob/*` and provider routes become protected by a cookie+CSRF
+  session this integration does not implement; the config flow surfaces
+  a clear "auth_required" error in that case rather than silently
+  failing. Front such a server with a reverse proxy that supplies the
+  session, or leave the flag unset for the interface this integration
+  is pointed at.
+
+## Choosing MQTT vs. this integration
+
+- Use the MQTT path (PR #518 / issue #508) for lightweight dashboards
+  and automations without installing a custom component, or when HA and
+  UHC can't reach each other over plain HTTP but already share an MQTT
+  broker.
+- Use this integration for real `media_player` entities: Assist voice
+  control, media-player dashboard cards, and `media_player.*` service
+  calls (play/pause/volume/seek/grouping) — none of which HA's MQTT
+  integration can provide, since it has no `media_player` platform.
+  Both can be installed side by side; they don't conflict.
+
+## Testing
+
+`custom_components/unified_hifi_control/tests/` uses
+`pytest-homeassistant-custom-component`. Run locally with:
+
+```
+pip install -r custom_components/unified_hifi_control/requirements_test.txt
+pip uninstall -y aiodns pycares  # see note below
+pytest custom_components/unified_hifi_control/tests -v
+```
+
+The `aiodns`/`pycares` uninstall works around a false-positive thread-leak
+failure: `homeassistant` depends on `aiodns`, whose `AsyncResolver` spins
+up a background c-ares thread the first time any test constructs a real
+aiohttp connector, and pytest-homeassistant-custom-component's per-test
+thread-leak check then flags that thread against whichever test happens
+to run first — even though every HTTP call in this suite goes through
+`aioclient_mock` and never builds a real connector. Since the suite never
+needs real DNS resolution, removing `pycares` avoids the false positive
+without weakening the check for genuine leaks.
+
+CI: `.github/workflows/ha-integration.yml` runs the test suite plus
+`hacs/action` (HACS repository validation) and
+`home-assistant/actions/hassfest` (manifest/schema validation) on pushes
+and PRs to `v3` that touch the integration. Per this repo's stacked-PR
+convention, feature-branch-based PRs (including the one that introduced
+this integration) do not run CI — the workflow was verified locally and
+becomes active once this lands on `v3`.
+
+## Known follow-ups
+
+- No plain-REST route exists for zone grouping, collections, queue, or
+  play-by-ref — they're MCP-only today. This integration only uses MCP
+  for grouping; a UHC-side push endpoint or plain-REST equivalents for
+  the rest would let a future version add queue/collections support
+  without embedding an MCP client for everything.
+- Extending grouping support to Roon/LMS once `issue/517`'s work lands
+  on this integration's base branch is a follow-up, not blocking this
+  PR (the code already refuses cleanly for those providers today).
