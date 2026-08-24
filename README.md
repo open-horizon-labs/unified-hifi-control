@@ -49,6 +49,12 @@ https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v3/lms-
 ```
 Then install "Unified Hi-Fi Control" from the plugin list. The plugin automatically downloads and manages the bridge binary.
 
+**Beta channel.** To test pre-releases instead, use this URL — it always points at the newest beta, so LMS picks up each one without you re-pointing it:
+```
+https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v3/lms-plugin/repo-beta.xml
+```
+Betas are less soaked than releases. Use one channel or the other, not both at once — LMS would see two entries for the same plugin.
+
 ### Binary Downloads
 
 Pre-built binaries available for Linux (x64, arm64, armv7), macOS (x64, arm64), and Windows from [Releases](https://github.com/open-horizon-labs/unified-hifi-control/releases).
