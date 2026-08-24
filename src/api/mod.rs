@@ -2667,24 +2667,73 @@ pub fn load_app_settings() -> AppSettings {
     settings
 }
 
+/// Serialises every read-modify-write of `app-settings.json`.
+///
+/// The zone handlers each load the settings, change one field, and save the whole file. Without a
+/// lock, two requests that overlap both read the same starting state and the second save discards
+/// the first change — so hiding two zones in quick succession, or two browser tabs editing
+/// different zones, can silently keep only one. Splitting the API into one-zone-per-request (rather
+/// than whole-list writes) narrows that window but does not close it; this does.
+static SETTINGS_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load the settings, apply `mutate`, and save — atomically with respect to other callers.
+///
+/// Every zone-settings mutation goes through here. The load happens *inside* the lock, which is the
+/// point: a caller that loaded beforehand would be acting on state that another writer may already
+/// have replaced.
+fn mutate_app_settings(mutate: impl FnOnce(&mut AppSettings)) -> bool {
+    let _guard = SETTINGS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut settings = load_app_settings();
+    mutate(&mut settings);
+    save_app_settings_locked(&settings)
+}
+
+/// Overwrite the settings wholesale. Test-only on purpose.
+///
+/// Production writes go through [`mutate_app_settings`], which reads the current state inside the
+/// lock. A blind overwrite is safe only when the caller knows nothing else is writing — true for a
+/// test seeding a temp config directory, and not true anywhere else.
+#[cfg(test)]
 fn save_app_settings(settings: &AppSettings) -> bool {
+    let _guard = SETTINGS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    save_app_settings_locked(settings)
+}
+
+/// The actual write. Callers must already hold [`SETTINGS_WRITE_LOCK`].
+fn save_app_settings_locked(settings: &AppSettings) -> bool {
     let path = settings_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match serde_json::to_string_pretty(settings) {
-        Ok(json) => match std::fs::write(&path, json) {
-            Ok(()) => {
-                tracing::info!("Saved app settings");
-                true
-            }
-            Err(e) => {
-                tracing::error!("Failed to save app settings: {}", e);
-                false
-            }
-        },
+    let json = match serde_json::to_string_pretty(settings) {
+        Ok(json) => json,
         Err(e) => {
             tracing::error!("Failed to serialize app settings: {}", e);
+            return false;
+        }
+    };
+
+    // Write-then-rename, so a crash or a full disk mid-write cannot leave a truncated
+    // `app-settings.json` behind. `std::fs::write` truncates in place, which on the config file
+    // holding every adapter toggle and the zone hide list means a bad moment costs the user their
+    // whole configuration. The temp file is a sibling so the rename stays within one filesystem.
+    let temp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&temp, &json) {
+        tracing::error!("Failed to write app settings: {}", e);
+        return false;
+    }
+    match std::fs::rename(&temp, &path) {
+        Ok(()) => {
+            tracing::info!("Saved app settings");
+            true
+        }
+        Err(e) => {
+            tracing::error!("Failed to replace app settings: {}", e);
+            let _ = std::fs::remove_file(&temp);
             false
         }
     }
@@ -2700,29 +2749,35 @@ pub async fn api_settings_post_handler(
     State(state): State<AppState>,
     Json(new_settings): Json<AppSettings>,
 ) -> impl IntoResponse {
-    // Load current settings to compare
-    let old_settings = load_app_settings();
-
-    // Carry the hide list forward when the body did not mention it. This endpoint saves its request
-    // body wholesale, and its main caller -- the settings page -- builds an `AppSettings` from its
-    // own form fields, which do not include hidden zones. Without this, toggling any adapter would
-    // unhide every zone the user had hidden. An explicit `"hidden_zones": []` still clears.
+    // Carry the zone fields forward when the body did not mention them. This endpoint saves its
+    // request body wholesale, and its main caller -- the settings page -- builds an `AppSettings`
+    // from its own form fields, which do not include the zone preferences. Without this, toggling
+    // any adapter would unhide every zone the user had hidden. An explicit `"hidden_zones": []`
+    // still clears.
+    //
+    // The merge happens inside the write lock, and reads the settings from inside it too. Doing the
+    // load outside would reintroduce exactly the race the carry-forward exists to prevent: a zone
+    // hidden between the load and the save would be carried forward from stale state and lost.
     let mut new_settings = new_settings;
-    if new_settings.hidden_zones.is_none() {
-        new_settings.hidden_zones = old_settings.hidden_zones.clone();
-    }
-    if new_settings.zone_order.is_none() {
-        new_settings.zone_order = old_settings.zone_order.clone();
-    }
-    if new_settings.zone_names.is_none() {
-        new_settings.zone_names = old_settings.zone_names.clone();
-    }
-    let new_settings = new_settings;
+    let mut old_settings = AppSettings::default();
+    let saved = mutate_app_settings(|current| {
+        old_settings = current.clone();
+        if new_settings.hidden_zones.is_none() {
+            new_settings.hidden_zones = current.hidden_zones.clone();
+        }
+        if new_settings.zone_order.is_none() {
+            new_settings.zone_order = current.zone_order.clone();
+        }
+        if new_settings.zone_names.is_none() {
+            new_settings.zone_names = current.zone_names.clone();
+        }
+        *current = new_settings.clone();
+    });
 
-    // Save the new settings
-    if !save_app_settings(&new_settings) {
+    if !saved {
         return Json(serde_json::json!({"ok": false, "error": "Failed to save settings"}));
     }
+    let new_settings = new_settings;
 
     // Compare adapter enabled states and start/stop as needed
     let old_adapters = &old_settings.adapters;
@@ -2860,22 +2915,10 @@ pub async fn zone_visibility_get(State(state): State<AppState>) -> impl IntoResp
     Json(ManagedZonesResponse { zones })
 }
 
-/// `POST /api/zones/visibility` request body.
-#[derive(Debug, Deserialize)]
-pub struct ZoneVisibilityRequest {
-    pub zone_id: String,
-    pub hidden: bool,
-}
-
-/// `POST /api/zones/name` request body.
-#[derive(Debug, Deserialize)]
-pub struct ZoneNameRequest {
-    pub zone_id: String,
-    /// The new display name. Empty, whitespace-only, or absent clears the override and restores the
-    /// provider's own name — so there is always a way back without a separate "reset" control.
-    #[serde(default)]
-    pub name: Option<String>,
-}
+// The zone request bodies are defined once, in `crate::app::api`, and shared with the client that
+// sends them. `src/app` is not feature-gated, so the server compiles it too. Redefining them here
+// would let a field name drift into a 422 the UI could not explain.
+pub use crate::app::api::{ZoneNameRequest, ZoneOrderRequest, ZoneVisibilityRequest};
 
 /// POST /api/zones/name - rename a zone, or clear the rename.
 ///
@@ -2883,13 +2926,10 @@ pub struct ZoneNameRequest {
 /// applied before sorting, prefixing several zones with a common string ("Basement - ") groups them
 /// in every list, which is the main reason this exists.
 pub async fn zone_name_post(Json(req): Json<ZoneNameRequest>) -> impl IntoResponse {
-    let mut settings = load_app_settings();
-    let mut names = settings.zone_names.take().unwrap_or_default();
+    let trimmed = req.name.as_deref().map(str::trim).unwrap_or("").to_string();
 
-    let trimmed = req.name.as_deref().map(str::trim).unwrap_or("");
-    if trimmed.is_empty() {
-        names.remove(&req.zone_id);
-    } else if trimmed.chars().count() > MAX_ZONE_NAME_CHARS {
+    // Validate before taking the write lock: a rejected name must not hold up other writers.
+    if trimmed.chars().count() > MAX_ZONE_NAME_CHARS {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -2897,13 +2937,19 @@ pub async fn zone_name_post(Json(req): Json<ZoneNameRequest>) -> impl IntoRespon
                 "error": format!("Zone names are limited to {MAX_ZONE_NAME_CHARS} characters.")
             })),
         );
-    } else {
-        names.insert(req.zone_id.clone(), trimmed.to_string());
     }
 
-    settings.zone_names = Some(names);
+    let saved = mutate_app_settings(|settings| {
+        let mut names = settings.zone_names.take().unwrap_or_default();
+        if trimmed.is_empty() {
+            names.remove(&req.zone_id);
+        } else {
+            names.insert(req.zone_id.clone(), trimmed.clone());
+        }
+        settings.zone_names = Some(names);
+    });
 
-    if !save_app_settings(&settings) {
+    if !saved {
         // See `zone_order_post` for why this is a 500, not `200 {"ok": false}`.
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2923,22 +2969,6 @@ pub async fn zone_name_post(Json(req): Json<ZoneNameRequest>) -> impl IntoRespon
 /// layout of a zone list or a knob's small display.
 const MAX_ZONE_NAME_CHARS: usize = 60;
 
-/// `POST /api/zones/order` request body.
-#[derive(Debug, Deserialize)]
-pub struct ZoneOrderRequest {
-    pub zone_id: String,
-    /// Step one place. Used by the up/down buttons.
-    #[serde(default)]
-    pub direction: Option<crate::zone_list::MoveDirection>,
-    /// Take the slot this zone currently occupies. Used by drag-and-drop.
-    ///
-    /// A target *zone* rather than an index: the client's row indices can go stale between render
-    /// and drop if a zone appears or disappears, and a stale index would land the zone somewhere
-    /// the user did not point at, silently. A stale zone id simply resolves to nothing.
-    #[serde(default)]
-    pub target_zone_id: Option<String>,
-}
-
 /// POST /api/zones/order - move one zone one place up or down.
 ///
 /// Takes a zone and a direction rather than a whole ordered list. Two reasons: the client does not
@@ -2952,7 +2982,7 @@ pub async fn zone_order_post(
     // The order is computed over *manageable* zones, hidden ones included, so that hiding a zone
     // and later unhiding it puts it back where the user had placed it rather than at the end.
     let effective = crate::zone_list::manageable_zones(&state).await;
-    let mut settings = load_app_settings();
+    let settings = load_app_settings();
     let hidden_ids: Vec<String> = settings.hidden_zone_ids().to_vec();
     let hidden: std::collections::HashSet<&str> = hidden_ids.iter().map(String::as_str).collect();
 
@@ -2966,8 +2996,9 @@ pub async fn zone_order_post(
     };
 
     let Some(new_order) = moved else {
-        // Already at the end it was moved toward, or no such zone. A no-op, not an error -- but say
-        // so, since the UI announces "already first" rather than silently doing nothing.
+        // Already at the end it was moved toward, or no such zone. A no-op, not an error -- and the
+        // UI reads `moved` to announce "already first" instead of claiming a move that never
+        // happened.
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2978,9 +3009,8 @@ pub async fn zone_order_post(
         );
     };
 
-    settings.zone_order = Some(new_order.clone());
-
-    if !save_app_settings(&settings) {
+    let order_to_save = new_order.clone();
+    if !mutate_app_settings(move |settings| settings.zone_order = Some(order_to_save)) {
         // A real 500. Returning 200 with `{"ok": false}` would be indistinguishable from success to
         // any client that checks the HTTP status -- and a settings page that silently discards
         // writes is worse than one that refuses them. A read-only bind-mounted config directory is
@@ -3009,24 +3039,29 @@ fn hidden_ids_order(settings: &AppSettings) -> Vec<String> {
 /// Deliberately not folded into `POST /api/settings`. That endpoint takes a whole `AppSettings`, so
 /// a caller wanting only to hide a zone would have to send every other setting too — and
 /// `AdapterSettings::default()` is all-false, so a body that omitted `adapters` would silently
-/// disable Roon. A one-zone toggle also has no read-modify-write window: two browser tabs hiding
-/// different zones both land, where posting a whole list would have the second overwrite the first.
+/// disable Roon. A one-zone toggle also keeps the read-modify-write window as small as it can be:
+/// two browser tabs hiding different zones both land, because each request states only its own
+/// change and [`mutate_app_settings`] serialises the merge. Posting a whole list instead would have
+/// the second write overwrite the first no matter how the server locked.
 pub async fn zone_visibility_post(Json(req): Json<ZoneVisibilityRequest>) -> impl IntoResponse {
-    let mut settings = load_app_settings();
-    let mut hidden = settings.hidden_zones.take().unwrap_or_default();
-
-    if req.hidden {
-        if !hidden.contains(&req.zone_id) {
-            hidden.push(req.zone_id.clone());
+    let mut hidden = Vec::new();
+    let saved = mutate_app_settings(|settings| {
+        let mut list = settings.hidden_zones.take().unwrap_or_default();
+        if req.hidden {
+            if !list.contains(&req.zone_id) {
+                list.push(req.zone_id.clone());
+            }
+        } else {
+            list.retain(|id| *id != req.zone_id);
         }
-    } else {
-        hidden.retain(|id| *id != req.zone_id);
-    }
-    // Sorted so the persisted file has a stable shape regardless of the order zones were hidden in.
-    hidden.sort();
-    settings.hidden_zones = Some(hidden.clone());
+        // Sorted so the persisted file has a stable shape regardless of the order zones were hidden
+        // in.
+        list.sort();
+        hidden = list.clone();
+        settings.hidden_zones = Some(list);
+    });
 
-    if !save_app_settings(&settings) {
+    if !saved {
         // See `zone_order_post` for why this is a 500 rather than `200 {"ok": false}`.
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3477,6 +3512,53 @@ mod tests {
             after.custom_zone_name("roon:kitchen"),
             None,
             "a refused rename must not be persisted"
+        );
+    }
+
+    /// Concurrent hides must all survive.
+    ///
+    /// Each handler loads the settings, adds one zone, and saves the whole file. Without a lock
+    /// spanning that read-modify-write, two overlapping requests both read the same starting list
+    /// and the second save discards the first zone — so hiding several zones quickly, or from two
+    /// browser tabs, silently keeps only some of them. One-zone-per-request narrows the window; it
+    /// does not close it, and this test fails any implementation that relies on the narrowing.
+    ///
+    /// `multi_thread` is load-bearing. The handlers' read-modify-write contains no `.await`, so on
+    /// the default current-thread runtime the tasks would run to completion one at a time and this
+    /// would pass against the racy implementation it exists to catch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[serial]
+    async fn concurrent_hides_do_not_overwrite_each_other() {
+        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-zone-visibility-concurrent");
+        assert!(
+            save_app_settings(&AppSettings::default()),
+            "failed to seed settings"
+        );
+
+        let zone_ids: Vec<String> = (0..12).map(|i| format!("roon:zone-{i:02}")).collect();
+        let mut handles = Vec::new();
+        for zone_id in zone_ids.clone() {
+            handles.push(tokio::spawn(async move {
+                zone_visibility_post(Json(ZoneVisibilityRequest {
+                    zone_id,
+                    hidden: true,
+                }))
+                .await;
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("hide task panicked");
+        }
+
+        let after = load_app_settings();
+        env::remove_var("UHC_CONFIG_DIR");
+
+        let mut expected = zone_ids;
+        expected.sort();
+        assert_eq!(
+            after.hidden_zone_ids(),
+            expected.as_slice(),
+            "every concurrent hide must survive; lost entries mean the read-modify-write raced"
         );
     }
 

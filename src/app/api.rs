@@ -124,20 +124,31 @@ pub struct ManagedZonesResponse {
     pub zones: Vec<ManagedZone>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+/// `POST /api/zones/visibility`.
+///
+/// The zone request types are defined once and used by both sides: `src/app` serialises them and
+/// `src/api` deserialises them in its handlers. `src/app` is not feature-gated, so the server
+/// compiles this module too. Two parallel definitions would let a field name or an enum spelling
+/// drift into a 422 that the UI has no way to explain.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ZoneVisibilityRequest {
     pub zone_id: String,
     pub hidden: bool,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+/// `POST /api/zones/order`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ZoneOrderRequest {
     pub zone_id: String,
     /// Step one place — the up/down buttons.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<MoveDirection>,
-    /// Take this zone's slot — a drag-and-drop drop.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Take the slot this zone currently occupies — a drag-and-drop drop.
+    ///
+    /// A target *zone* rather than an index: the client's row indices can go stale between render
+    /// and drop if a zone appears or disappears, and a stale index would land the zone somewhere
+    /// the user did not point at, silently. A stale zone id simply resolves to nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_zone_id: Option<String>,
 }
 
@@ -159,19 +170,21 @@ impl ZoneOrderRequest {
     }
 }
 
-/// Shared with the server's `zone_list::MoveDirection`, so a typo is a compile error rather than a
-/// 422 the UI would discard.
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+/// Which way a step-reorder moves a zone. Re-exported by `crate::zone_list` for the server side.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum MoveDirection {
     Up,
     Down,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+/// `POST /api/zones/name`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ZoneNameRequest {
     pub zone_id: String,
-    /// `None` or empty clears the override and restores the provider's name.
+    /// `None`, empty, or whitespace-only clears the override and restores the provider's name — so
+    /// there is always a way back without a separate "reset" endpoint.
+    #[serde(default)]
     pub name: Option<String>,
 }
 

@@ -228,12 +228,10 @@ pub fn reorder(
 }
 
 /// Which way [`reorder`] moves a zone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MoveDirection {
-    Up,
-    Down,
-}
+///
+/// Re-exported rather than redefined: the client sends this value, so one definition means a
+/// mismatch is a compile error instead of a 422 at runtime.
+pub use crate::app::api::MoveDirection;
 
 /// Move one zone to the slot another zone currently occupies, returning the full resulting order.
 ///

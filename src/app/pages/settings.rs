@@ -283,11 +283,22 @@ pub fn Settings() -> Element {
             )
             .await;
             match result {
-                Ok(_) => {
+                Ok(body) => {
                     zone_error.set(None);
-                    zone_status.set(match direction {
-                        MoveDirection::Up => format!("{label} moved up."),
-                        MoveDirection::Down => format!("{label} moved down."),
+                    // The server reports whether a swap actually happened. `at_boundary` above is
+                    // computed from the first/last *visible* rows, so a hidden row never matches it
+                    // and always sends a request -- and a hidden row that is already first has
+                    // nothing to swap with. Announcing "moved up" there would tell a screen-reader
+                    // user, who has no other feedback for this action, something untrue.
+                    let moved = body
+                        .get("moved")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true);
+                    zone_status.set(match (moved, direction) {
+                        (true, MoveDirection::Up) => format!("{label} moved up."),
+                        (true, MoveDirection::Down) => format!("{label} moved down."),
+                        (false, MoveDirection::Up) => format!("{label} is already first."),
+                        (false, MoveDirection::Down) => format!("{label} is already last."),
                     });
                 }
                 Err(err) => report_zone_failure(err),
@@ -351,9 +362,17 @@ pub fn Settings() -> Element {
                 }
                 Err(err) => report_zone_failure(err),
             }
-            // Either way the server is now authoritative for this row: on success it holds the new
-            // name, on failure the old one, and in both cases that is what the field should show.
-            name_drafts.write().remove(&zone.zone_id);
+            // The server is now authoritative for this row -- but only for the text we submitted.
+            // The user can start typing again while the request is in flight, so drop the draft
+            // only if it still matches what was sent; otherwise the newer keystrokes would vanish
+            // and the field would snap back to the name they had just moved on from.
+            let stale = name_drafts
+                .read()
+                .get(&zone.zone_id)
+                .is_some_and(|draft| draft.trim() == trimmed);
+            if stale {
+                name_drafts.write().remove(&zone.zone_id);
+            }
             managed_zones.restart();
         });
     };
