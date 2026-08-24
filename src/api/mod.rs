@@ -2717,15 +2717,35 @@ fn save_app_settings_locked(settings: &AppSettings) -> bool {
         }
     };
 
-    // Write-then-rename, so a crash or a full disk mid-write cannot leave a truncated
-    // `app-settings.json` behind. `std::fs::write` truncates in place, which on the config file
-    // holding every adapter toggle and the zone hide list means a bad moment costs the user their
-    // whole configuration. The temp file is a sibling so the rename stays within one filesystem.
+    // Write to a sibling temp file, flush it to disk, then rename over the target. Writing in place
+    // with `std::fs::write` truncates first, so a crash or a full disk between the truncate and the
+    // last byte costs the user every adapter toggle, hide-list entry, and zone name at once.
+    //
+    // All three steps matter and none of them substitutes for another:
+    //
+    // - The temp file is a *sibling* so the rename stays within one filesystem. `rename(2)` across
+    //   devices fails outright.
+    // - `sync_all` before the rename is what makes the guarantee real. `rename` is atomic for the
+    //   name only; it says nothing about whether the temp file's bytes have reached the disk. Skip
+    //   the flush and a power loss can leave the renamed file empty or half-written on ext4,
+    //   XFS, and APFS alike — the exact corruption the temp file was supposed to prevent.
+    // - Cleaning up on rename failure keeps a stale `.json.tmp` from accumulating.
+    //
+    // Not covered: the directory entry created by the rename is itself unflushed, so a power loss
+    // right after can lose the *new* settings. That is acceptable — the user sees their previous
+    // configuration, not a damaged one, which is the property this is protecting.
     let temp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&temp, &json) {
+    let written = std::fs::File::create(&temp).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(e) = written {
         tracing::error!("Failed to write app settings: {}", e);
+        let _ = std::fs::remove_file(&temp);
         return false;
     }
+
     match std::fs::rename(&temp, &path) {
         Ok(()) => {
             tracing::info!("Saved app settings");
@@ -3560,6 +3580,57 @@ mod tests {
             expected.as_slice(),
             "every concurrent hide must survive; lost entries mean the read-modify-write raced"
         );
+    }
+
+    /// A successful save leaves no `.json.tmp` behind, and the file it wrote is complete.
+    ///
+    /// The durable-replace path writes a sibling temp file, flushes it, and renames over the
+    /// target. A rename that silently failed to move the temp file — or a code path that wrote the
+    /// temp and forgot the rename — would leave the config unchanged while reporting success, with
+    /// a stray temp file as the only evidence.
+    #[tokio::test]
+    #[serial]
+    async fn saving_settings_leaves_no_temp_file_behind() {
+        let dir = std::env::temp_dir().join("uhc-test-settings-durable-replace");
+        let _ = std::fs::remove_dir_all(&dir);
+        env::set_var("UHC_CONFIG_DIR", dir.to_string_lossy().as_ref());
+
+        let _ = zone_visibility_post(Json(ZoneVisibilityRequest {
+            zone_id: "roon:phone".to_string(),
+            hidden: true,
+        }))
+        .await;
+
+        let written = load_app_settings();
+        let strays: Vec<_> = walk_config_files(&dir)
+            .into_iter()
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        env::remove_var("UHC_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            written.hidden_zone_ids(),
+            ["roon:phone".to_string()],
+            "the rename must have published the new contents"
+        );
+        assert!(strays.is_empty(), "temp files left behind: {strays:?}");
+    }
+
+    fn walk_config_files(dir: &std::path::Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(walk_config_files(&path));
+            } else {
+                found.push(path.to_string_lossy().into_owned());
+            }
+        }
+        found
     }
 
     /// A failed save must be an HTTP error, not `200 {"ok": false}`.
