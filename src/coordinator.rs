@@ -395,7 +395,11 @@ impl AdapterCoordinator {
             .unwrap_or(false)
     }
 
-    async fn set_running(&self, prefix: &str, running: bool) {
+    /// Record direct-managed running state for an adapter whose lifecycle is not owned by
+    /// `start_adapter`/`stop_adapter` (for example HQPlayer/LMS instances started inline by an API
+    /// handler). Visible to the rest of the crate so those handlers can keep coordinator bookkeeping
+    /// in sync.
+    pub(crate) async fn set_running(&self, prefix: &str, running: bool) {
         if let Some(adapter) = self.adapters.write().await.get_mut(prefix) {
             adapter.direct_running = running;
         }

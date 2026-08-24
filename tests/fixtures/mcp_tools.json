@@ -154,15 +154,15 @@
     }
   },
   "hifi_control": {
-    "description": "Control playback: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, or adjust volume. HQPlayer zones use the managed instance runtime.",
+    "description": "Control playback and volume: play, pause, playpause (toggle), next, previous, repeat_off/repeat_context/repeat_track, shuffle_on/shuffle_off, volume_set, volume_up, volume_down. HQPlayer zones use the managed instance runtime and also support stop, seek, and mute.",
     "inputSchema": {
       "properties": {
         "action": {
-          "description": "Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, volume_down",
+          "description": "Action: play, pause, playpause, next, previous, repeat_off, repeat_context, repeat_track, shuffle_on, shuffle_off, volume_set, volume_up, or volume_down. HQPlayer also accepts stop, seek, and mute.",
           "type": "string"
         },
         "value": {
-          "description": "For volume actions: the level (0-100 for volume_set) or amount to change",
+          "description": "For seek, the position in seconds. For volume: 0-100 for normalized providers, or decimal dB for HQPlayer; relative amounts use the provider's scale.",
           "nullable": true,
           "type": "number"
         },
