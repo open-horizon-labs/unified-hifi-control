@@ -1,7 +1,12 @@
 services:
   unified-hifi-control:
     build: .
-    # Host network required for Roon mDNS discovery
+    # Host network required for Roon mDNS discovery.
+    #
+    # Note this publishes :8088 on every interface the host has, not just localhost.
+    # The web UI, REST API, and MCP endpoint are all unauthenticated, so anything on
+    # your network can control playback, volume, and DSP. Keep it on a trusted LAN and
+    # do not port-forward it. See "Security and Network Exposure" in the README.
     network_mode: host
     volumes:
       - ./data:/data

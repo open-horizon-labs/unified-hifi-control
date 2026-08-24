@@ -60,7 +60,9 @@ Pre-built binaries available for Linux (x64, arm64, armv7), macOS (x64, arm64), 
 services:
   unified-hifi-control:
     image: muness/unified-hifi-control:latest
-    network_mode: host  # Required for Roon/UPnP discovery
+    # Required for Roon/UPnP discovery. Also publishes :8088 on every interface
+    # the host has — see "Security and network exposure" below.
+    network_mode: host
     volumes:
       - ./data:/data
     environment:
@@ -88,6 +90,20 @@ docker compose up -d
 Legacy aliases: `PORT` (→ `UHC_PORT`), `LOG_LEVEL` (→ `RUST_LOG`)
 
 **Note:** Port 8088 is also HQPlayer's default. If running both on the same host, change one.
+
+## Security and Network Exposure
+
+**Unified Hi-Fi Control is unauthenticated by design. Treat it as a trusted-LAN service and do not port-forward it.**
+
+The bridge listens on `0.0.0.0:8088` — every interface the host has — and the web UI, the REST API, and the MCP endpoint all accept requests without credentials. That is deliberate: the ESP32 knobs, the iOS companion, browsers, and AI agents all need to reach it, and none of them have a way to hold a secret. It also matches the backends it sits in front of, which are themselves open on the LAN (Lyrion Music Server, for instance, requires no auth by default).
+
+What that means in practice:
+
+- **Anything on your network can control playback.** A guest's phone, an IoT gadget, or a compromised TV can change zones, volume, transport, and HQPlayer DSP settings. The blast radius is your music, not your data — there is no file access, no shell, and no credential store behind these endpoints.
+- **Do not expose port 8088 to the internet.** `network_mode: host` in the Docker example publishes it on every interface, so a router port-forward or a permissive cloud firewall is all it takes. If you need remote access, use a VPN or an authenticating reverse proxy rather than forwarding the port.
+- **Agents connected over MCP inherit that control.** If the agent you connect also reads untrusted text — web pages, track and playlist names, email — a prompt-injection attack could steer it into these tools. Connect agents you trust, and be aware that "control my stereo" is the ceiling of what they can be talked into here.
+
+If your network is flat and you would rather not have guest devices reach the bridge, put it on a VLAN or restrict port 8088 at the firewall to the devices that need it.
 
 ## HQPlayer DSP Integration
 
@@ -157,6 +173,8 @@ Control your hi-fi with natural language. The bridge includes an MCP server so C
 | `hifi_hqplayer_set_pipeline` | Change filter, shaper, dither settings |
 
 *Search and play work with Roon and LMS. Transport controls work with all adapters.*
+
+The MCP endpoint is unauthenticated like the rest of the bridge — see [Security and Network Exposure](#security-and-network-exposure).
 
 ### Example Usage
 
