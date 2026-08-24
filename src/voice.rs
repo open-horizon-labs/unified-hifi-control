@@ -253,6 +253,15 @@ fn deepgram_closed_event(
     }
 }
 
+async fn emit_provider_event(events: &mpsc::Sender<DeepgramEvent>, event: DeepgramEvent) -> bool {
+    if events.send(event).await.is_err() {
+        tracing::debug!("Kizz STT provider event receiver dropped");
+        false
+    } else {
+        true
+    }
+}
+
 struct SttTurn {
     provider: SttProvider,
     input: mpsc::Sender<SttInput>,
@@ -334,7 +343,13 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
                             utterance.drain(..excess);
                         }
                         for turn in &stt_turns {
-                            let _ = turn.send_audio(pcm.to_vec()).await;
+                            if let Err(error) = turn.send_audio(pcm.to_vec()).await {
+                                tracing::debug!(
+                                    provider = turn.provider.name(),
+                                    %error,
+                                    "Kizz STT provider stopped accepting audio"
+                                );
+                            }
                         }
                     }
                     Message::Text(message) => match parse_client_event(&message) {
@@ -387,8 +402,10 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
                                     }
                                 }
                             }
-                            if stt_turns.is_empty() {
-                                let _ = send_event(&mut socket, json!({"type":"state","state":"clarify","message":"I could not connect to speech recognition. Please try again."})).await;
+                            if stt_turns.is_empty()
+                                && send_event(&mut socket, json!({"type":"state","state":"clarify","message":"I could not connect to speech recognition. Please try again."})).await.is_err()
+                            {
+                                break;
                             }
                             tracing::info!(zone_id = current_zone_id.as_deref().unwrap_or("unknown"),
                                 providers = stt_turns.len(),
@@ -405,20 +422,34 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
                             let zone_id = current_zone_id.take();
                             tracing::info!(bytes = committed.len(), "Kizz fallback utterance committed");
                             if committed.len() < MIN_UTTERANCE_BYTES {
-                                let _ = send_event(&mut socket,
-                                    json!({"type":"state","state":"clarify","message":"I did not hear enough yet."})).await;
+                                if send_event(&mut socket,
+                                    json!({"type":"state","state":"clarify","message":"I did not hear enough yet."})).await.is_err() {
+                                    break;
+                                }
                                 continue;
                             }
-                            let _ = send_event(&mut socket, json!({"type":"state","state":"thinking"})).await;
+                            if send_event(&mut socket, json!({"type":"state","state":"thinking"})).await.is_err() {
+                                break;
+                            }
                             if !stt_turns.is_empty() {
                                 pending_fallback = Some((committed, zone_id));
-                                for turn in &stt_turns { let _ = turn.close().await; }
+                                for turn in &stt_turns {
+                                    if let Err(error) = turn.close().await {
+                                        tracing::debug!(
+                                            provider = turn.provider.name(),
+                                            %error,
+                                            "Kizz STT provider stopped before finalization"
+                                        );
+                                    }
+                                }
                                 tracing::info!("Streaming STT finalization requested by device fallback");
                                 continue;
                             }
                             turn_completed = true;
                             tracing::warn!("No streaming speech recognizer was available for the Kizz turn");
-                            let _ = send_event(&mut socket, json!({"type":"state","state":"clarify","message":"Speech recognition is unavailable. Please try once more."})).await;
+                            if send_event(&mut socket, json!({"type":"state","state":"clarify","message":"Speech recognition is unavailable. Please try once more."})).await.is_err() {
+                                break;
+                            }
                         }
                         None => tracing::warn!(%message, "Ignored unknown Kizz voice event"),
                     },
@@ -459,17 +490,31 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
                     DeepgramEvent::EndOfTurn { transcript, confidence } if !turn_completed => {
                         finished_stt += 1;
                         turn_completed = true;
-                        for turn in &stt_turns { let _ = turn.close().await; }
+                        for turn in &stt_turns {
+                            if let Err(error) = turn.close().await {
+                                tracing::debug!(
+                                    provider = turn.provider.name(),
+                                    %error,
+                                    "Kizz STT provider stopped before competitor finalization"
+                                );
+                            }
+                        }
                         let (committed, zone_id) = pending_fallback.take()
                             .unwrap_or_else(|| (std::mem::take(&mut utterance), current_zone_id.take()));
                         tracing::info!(%transcript, confidence, provider = provider.name(), bytes = committed.len(), latency_ms,
                             "Streaming STT ended Kizz voice turn");
-                        let _ = send_event(&mut socket, json!({"type":"endpoint","reason":format!("{}_end_of_turn", provider.name()),"confidence":confidence})).await;
+                        if send_event(&mut socket, json!({"type":"endpoint","reason":format!("{}_end_of_turn", provider.name()),"confidence":confidence})).await.is_err() {
+                            break;
+                        }
                         // Surface the recognition result immediately. The device can
                         // show what it heard while the Codex/MCP turn is running.
-                        let _ = send_event(&mut socket,
-                            json!({"type":"transcript","text":transcript})).await;
-                        let _ = send_event(&mut socket, json!({"type":"state","state":"thinking"})).await;
+                        if send_event(&mut socket,
+                            json!({"type":"transcript","text":transcript})).await.is_err() {
+                            break;
+                        }
+                        if send_event(&mut socket, json!({"type":"state","state":"thinking"})).await.is_err() {
+                            break;
+                        }
                         let context = current_voice_context(&state, zone_id.as_deref()).await;
                         tracing::info!(
                             zone_id = context.zone_id.as_deref().unwrap_or("unknown"),
@@ -486,7 +531,9 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
                                 json!({"type":"state","state":"clarify","message":"I lost that thought. Please try once more."})
                             }
                         };
-                        let _ = send_event(&mut socket, result).await;
+                        if send_event(&mut socket, result).await.is_err() {
+                            break;
+                        }
                     }
                     DeepgramEvent::EndOfTurn { transcript, confidence } => {
                         finished_stt += 1;
@@ -503,7 +550,9 @@ async fn run_session(mut socket: WebSocket, state: AppState) {
                             pending_fallback.take();
                             tracing::warn!(provider = provider.name(), %error, "Streaming STT finalization failed");
                             turn_completed = true;
-                            let _ = send_event(&mut socket, json!({"type":"state","state":"clarify","message":"Speech recognition is unavailable. Please try once more."})).await;
+                            if send_event(&mut socket, json!({"type":"state","state":"clarify","message":"Speech recognition is unavailable. Please try once more."})).await.is_err() {
+                                break;
+                            }
                         } else {
                             tracing::warn!(provider = provider.name(), %error, "Streaming STT stream failed; awaiting another provider or device fallback endpoint");
                         }
@@ -677,7 +726,14 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttT
                                 let remainder = pending.split_off(DEEPGRAM_AUDIO_CHUNK_BYTES);
                                 let chunk = std::mem::replace(&mut pending, remainder);
                                 if let Err(error) = output.send(DgMessage::Binary(chunk)).await {
-                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::Failed(error.to_string()),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     return;
                                 }
                             }
@@ -687,13 +743,27 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttT
                             if !pending.is_empty() {
                                 if let Err(error) = output.send(DgMessage::Binary(
                                     std::mem::take(&mut pending))).await {
-                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::Failed(error.to_string()),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     return;
                                 }
                             }
                             if let Err(error) = output.send(DgMessage::Text(
                                 json!({"type":"CloseStream"}).to_string())).await {
-                                let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                if !emit_provider_event(
+                                    &events,
+                                    DeepgramEvent::Failed(error.to_string()),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
                                 return;
                             }
                             close_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(3));
@@ -702,18 +772,32 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttT
                 }
                 message = input.next() => {
                     let Some(message) = message else {
-                        let _ = events.send(deepgram_closed_event(
-                            !input_open,
-                            latest_transcript.take(),
-                            latest_confidence,
-                        )).await;
+                        if !emit_provider_event(
+                            &events,
+                            deepgram_closed_event(
+                                !input_open,
+                                latest_transcript.take(),
+                                latest_confidence,
+                            ),
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         return;
                     };
                     match message {
                         Ok(DgMessage::Text(text)) => {
                             let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
                             if event.get("type").and_then(Value::as_str) == Some("Error") {
-                                let _ = events.send(DeepgramEvent::Failed(event.to_string())).await;
+                                if !emit_provider_event(
+                                    &events,
+                                    DeepgramEvent::Failed(event.to_string()),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
                                 return;
                             }
                             if event.get("type").and_then(Value::as_str) == Some("TurnInfo") {
@@ -732,13 +816,26 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttT
                                 let confidence = event.get("end_of_turn_confidence")
                                     .and_then(Value::as_f64);
                                 if transcript.is_empty() {
-                                    let _ = events.send(DeepgramEvent::Failed(
-                                        "Deepgram ended an empty turn".to_string())).await;
-                                } else {
-                                    let _ = events.send(DeepgramEvent::EndOfTurn {
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::Failed(
+                                            "Deepgram ended an empty turn".to_string(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                } else if !emit_provider_event(
+                                    &events,
+                                    DeepgramEvent::EndOfTurn {
                                         transcript,
                                         confidence,
-                                    }).await;
+                                    },
+                                )
+                                .await
+                                {
+                                    return;
                                 }
                                 return;
                             }
@@ -748,21 +845,41 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttT
                                     .and_then(Value::as_str).unwrap_or("").trim();
                                 if !transcript.is_empty() {
                                     first_partial_sent = true;
-                                    let _ = events.send(DeepgramEvent::PartialTranscript(
-                                        transcript.to_string())).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::PartialTranscript(transcript.to_string()),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                         }
                         Ok(DgMessage::Close(_)) => {
-                            let _ = events.send(deepgram_closed_event(
-                                !input_open,
-                                latest_transcript.take(),
-                                latest_confidence,
-                            )).await;
+                            if !emit_provider_event(
+                                &events,
+                                deepgram_closed_event(
+                                    !input_open,
+                                    latest_transcript.take(),
+                                    latest_confidence,
+                                ),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             return;
                         }
                         Err(error) => {
-                            let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                            if !emit_provider_event(
+                                &events,
+                                DeepgramEvent::Failed(error.to_string()),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             return;
                         }
                         _ => {}
@@ -771,8 +888,14 @@ async fn start_deepgram_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<SttT
                 _ = tokio::time::sleep_until(close_deadline.unwrap_or_else(||
                     tokio::time::Instant::now() + Duration::from_secs(86_400))),
                     if close_deadline.is_some() => {
-                    let _ = events.send(DeepgramEvent::Failed(
-                        "Deepgram finalization timed out".to_string())).await;
+                    if !emit_provider_event(
+                        &events,
+                        DeepgramEvent::Failed("Deepgram finalization timed out".to_string()),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     return;
                 }
             }
@@ -895,7 +1018,14 @@ async fn start_elevenlabs_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                                 audio_bytes_sent += chunk.len();
                                 if let Err(error) = output.send(DgMessage::Text(
                                     elevenlabs_audio_message(&chunk, false))).await {
-                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::Failed(error.to_string()),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     return;
                                 }
                             }
@@ -906,7 +1036,14 @@ async fn start_elevenlabs_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                                 audio_bytes_sent += pending_audio.len();
                                 if let Err(error) = output.send(DgMessage::Text(
                                     elevenlabs_audio_message(&std::mem::take(&mut pending_audio), false))).await {
-                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::Failed(error.to_string()),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     return;
                                 }
                             }
@@ -915,7 +1052,14 @@ async fn start_elevenlabs_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                                 let chunk_bytes = padding_bytes.min(ELEVENLABS_AUDIO_CHUNK_BYTES);
                                 if let Err(error) = output.send(DgMessage::Text(
                                     elevenlabs_audio_message(&vec![0; chunk_bytes], false))).await {
-                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::Failed(error.to_string()),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     return;
                                 }
                                 padding_bytes -= chunk_bytes;
@@ -923,7 +1067,14 @@ async fn start_elevenlabs_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                             // This matches the official SDK's manual commit wire message.
                             if let Err(error) = output.send(DgMessage::Text(
                                 elevenlabs_audio_message(&[], true))).await {
-                                let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                if !emit_provider_event(
+                                    &events,
+                                    DeepgramEvent::Failed(error.to_string()),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
                                 return;
                             }
                             close_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
@@ -932,8 +1083,14 @@ async fn start_elevenlabs_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                 }
                 message = input.next() => {
                     let Some(message) = message else {
-                        let _ = events.send(DeepgramEvent::Failed(
-                            "ElevenLabs closed the stream".to_string())).await;
+                        if !emit_provider_event(
+                            &events,
+                            DeepgramEvent::Failed("ElevenLabs closed the stream".to_string()),
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         return;
                     };
                     match message {
@@ -943,22 +1100,39 @@ async fn start_elevenlabs_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                                     DeepgramEvent::PartialTranscript(_) if first_partial_sent => {}
                                     DeepgramEvent::PartialTranscript(_) => {
                                         first_partial_sent = true;
-                                        let _ = events.send(event).await;
+                                        if !emit_provider_event(&events, event).await {
+                                            return;
+                                        }
                                     }
                                     _ => {
-                                        let _ = events.send(event).await;
+                                        if !emit_provider_event(&events, event).await {
+                                            return;
+                                        }
                                         return;
                                     }
                                 }
                             }
                         }
                         Ok(DgMessage::Close(_)) => {
-                            let _ = events.send(DeepgramEvent::Failed(
-                                "ElevenLabs closed the stream".to_string())).await;
+                            if !emit_provider_event(
+                                &events,
+                                DeepgramEvent::Failed("ElevenLabs closed the stream".to_string()),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             return;
                         }
                         Err(error) => {
-                            let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                            if !emit_provider_event(
+                                &events,
+                                DeepgramEvent::Failed(error.to_string()),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             return;
                         }
                         _ => {}
@@ -967,8 +1141,14 @@ async fn start_elevenlabs_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                 _ = tokio::time::sleep_until(close_deadline.unwrap_or_else(||
                     tokio::time::Instant::now() + Duration::from_secs(86_400))),
                     if close_deadline.is_some() => {
-                    let _ = events.send(DeepgramEvent::Failed(
-                        "ElevenLabs finalization timed out".to_string())).await;
+                    if !emit_provider_event(
+                        &events,
+                        DeepgramEvent::Failed("ElevenLabs finalization timed out".to_string()),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     return;
                 }
             }
@@ -1025,7 +1205,14 @@ async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                                 let remainder = pending_audio.split_off(AUDIO_CHUNK_BYTES);
                                 let chunk = std::mem::replace(&mut pending_audio, remainder);
                                 if let Err(error) = output.send(DgMessage::Binary(chunk)).await {
-                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::Failed(error.to_string()),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     return;
                                 }
                             }
@@ -1041,7 +1228,14 @@ async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                                 }
                                 if let Err(error) = output.send(DgMessage::Binary(
                                     std::mem::take(&mut pending_audio))).await {
-                                    let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::Failed(error.to_string()),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     return;
                                 }
                             }
@@ -1049,7 +1243,14 @@ async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                             // closes the session and can discard an in-flight turn.
                             if let Err(error) = output.send(DgMessage::Text(
                                 json!({"type":"ForceEndpoint"}).to_string())).await {
-                                let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                                if !emit_provider_event(
+                                    &events,
+                                    DeepgramEvent::Failed(error.to_string()),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
                                 return;
                             }
                             match tokio::time::timeout(Duration::from_secs(5), async {
@@ -1065,7 +1266,14 @@ async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                                                     return Err("AssemblyAI ended an empty turn".to_string());
                                                 }
                                                 let confidence = event.get("end_of_turn_confidence").and_then(Value::as_f64);
-                                                let _ = events.send(DeepgramEvent::EndOfTurn { transcript, confidence }).await;
+                                                if !emit_provider_event(
+                                                    &events,
+                                                    DeepgramEvent::EndOfTurn { transcript, confidence },
+                                                )
+                                                .await
+                                                {
+                                                    return Err("Kizz provider event receiver dropped".to_string());
+                                                }
                                                 return Ok(());
                                             }
                                             if event.get("type").and_then(Value::as_str) == Some("Error") {
@@ -1080,8 +1288,23 @@ async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                                 Err("AssemblyAI closed the stream".to_string())
                             }).await {
                                 Ok(Ok(())) => {}
-                                Ok(Err(error)) => { let _ = events.send(DeepgramEvent::Failed(error)).await; }
-                                Err(_) => { let _ = events.send(DeepgramEvent::Failed("AssemblyAI finalization timed out".to_string())).await; }
+                                Ok(Err(error)) => {
+                                    if !emit_provider_event(&events, DeepgramEvent::Failed(error)).await {
+                                        return;
+                                    }
+                                }
+                                Err(_) => {
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::Failed(
+                                            "AssemblyAI finalization timed out".to_string(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                }
                             }
                             return;
                         }
@@ -1089,24 +1312,54 @@ async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                 }
                 message = input.next() => {
                     let Some(message) = message else {
-                        let _ = events.send(DeepgramEvent::Failed("AssemblyAI closed the stream".to_string())).await;
+                        if !emit_provider_event(
+                            &events,
+                            DeepgramEvent::Failed("AssemblyAI closed the stream".to_string()),
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         return;
                     };
                     match message {
                         Ok(DgMessage::Text(text)) => {
                             let Ok(event) = serde_json::from_str::<Value>(&text) else { continue };
                             if event.get("type").and_then(Value::as_str) == Some("Error") {
-                                let _ = events.send(DeepgramEvent::Failed(event.to_string())).await;
+                                if !emit_provider_event(
+                                    &events,
+                                    DeepgramEvent::Failed(event.to_string()),
+                                )
+                                .await
+                                {
+                                    return;
+                                }
                                 return;
                             }
                             if event.get("type").and_then(Value::as_str) == Some("Turn") &&
                                 event.get("end_of_turn").and_then(Value::as_bool) == Some(true) {
                                 let transcript = event.get("transcript").and_then(Value::as_str).unwrap_or("").trim().to_string();
                                 if transcript.is_empty() {
-                                    let _ = events.send(DeepgramEvent::Failed("AssemblyAI ended an empty turn".to_string())).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::Failed(
+                                            "AssemblyAI ended an empty turn".to_string(),
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                 } else {
                                     let confidence = event.get("end_of_turn_confidence").and_then(Value::as_f64);
-                                    let _ = events.send(DeepgramEvent::EndOfTurn { transcript, confidence }).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::EndOfTurn { transcript, confidence },
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                 }
                                 return;
                             }
@@ -1116,17 +1369,37 @@ async fn start_assemblyai_turn(events: mpsc::Sender<DeepgramEvent>) -> Result<St
                                     .and_then(Value::as_str).unwrap_or("").trim();
                                 if !transcript.is_empty() {
                                     first_partial_sent = true;
-                                    let _ = events.send(DeepgramEvent::PartialTranscript(
-                                        transcript.to_string())).await;
+                                    if !emit_provider_event(
+                                        &events,
+                                        DeepgramEvent::PartialTranscript(transcript.to_string()),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                         }
                         Ok(DgMessage::Close(_)) => {
-                            let _ = events.send(DeepgramEvent::Failed("AssemblyAI closed the stream".to_string())).await;
+                            if !emit_provider_event(
+                                &events,
+                                DeepgramEvent::Failed("AssemblyAI closed the stream".to_string()),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             return;
                         }
                         Err(error) => {
-                            let _ = events.send(DeepgramEvent::Failed(error.to_string())).await;
+                            if !emit_provider_event(
+                                &events,
+                                DeepgramEvent::Failed(error.to_string()),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             return;
                         }
                         _ => {}
