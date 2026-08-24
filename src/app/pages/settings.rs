@@ -4,7 +4,12 @@
 
 use dioxus::prelude::*;
 
-use crate::app::api::{AdapterSettings, AppSettings, HqpStatus, LmsConfig, RoonStatus};
+use crate::app::api::{
+    source_label, AdapterSettings, AppSettings, HqpStatus, LmsConfig, ManagedZone,
+    ManagedZonesResponse, MoveDirection, RoonStatus, ZoneNameRequest, ZoneOrderRequest,
+    ZoneVisibilityRequest,
+};
+use crate::app::components::ErrorAlert;
 use crate::app::components::Layout;
 use crate::app::settings_context::use_settings;
 use crate::app::sse::use_sse;
@@ -196,6 +201,182 @@ pub fn Settings() -> Element {
         }
     });
 
+    // Zone management: every zone the user can manage, hidden ones included. Deliberately not
+    // `/zones`, which excludes hidden zones -- this is the one view that has to show them, or
+    // hiding would be a one-way door.
+    let mut managed_zones = use_resource(|| async {
+        crate::app::api::fetch_json::<ManagedZonesResponse>("/api/zones/visibility")
+            .await
+            .ok()
+    });
+
+    // Announced to assistive tech after every zone change. Without it a screen-reader user presses
+    // "move up" and hears nothing at all -- the row moves silently.
+    let mut zone_status = use_signal(String::new);
+    let mut zone_error = use_signal(|| Option::<String>::None);
+    // Bumped on a failed write. It is part of each row's key, so a failure forces Dioxus to recreate
+    // the row's DOM nodes. Without that, a rejected checkbox click leaves the browser's natively
+    // toggled checkbox showing the opposite of the truth: the refetched data is unchanged, so the
+    // VDOM `checked` value is unchanged, so the diff emits no correcting mutation.
+    let mut zone_revision = use_signal(|| 0u32);
+    // In-progress name edits, by zone id.
+    //
+    // `value:` on a Dioxus input makes it *controlled*: after every input event the DOM value is
+    // reset to whatever the VDOM says. With only an `onchange` handler -- which fires on blur, not
+    // per keystroke -- nothing held the typed text, so each character was immediately overwritten by
+    // the server's name and the field appeared to reject typing. Every other text input in this app
+    // pairs `value:` with an `oninput` that writes to a signal; this is that signal, per row.
+    //
+    // A draft is cleared once the rename commits, so the field falls back to the server's answer --
+    // which is what makes the "reset" button visibly restore the provider's name.
+    let mut name_drafts = use_signal(std::collections::HashMap::<String, String>::new);
+
+    let mut report_zone_failure = move |err: String| {
+        zone_error.set(Some(err));
+        zone_revision += 1;
+    };
+
+    let set_zone_hidden = move |zone: ManagedZone| {
+        let label = zone.qualified_label();
+        let now_hidden = !zone.hidden;
+        spawn(async move {
+            let result = crate::app::api::post_json::<_, serde_json::Value>(
+                "/api/zones/visibility",
+                &ZoneVisibilityRequest {
+                    zone_id: zone.zone_id.clone(),
+                    hidden: now_hidden,
+                },
+            )
+            .await;
+            match result {
+                Ok(_) => {
+                    zone_error.set(None);
+                    zone_status.set(if now_hidden {
+                        format!("{label} hidden.")
+                    } else {
+                        format!("{label} shown.")
+                    });
+                }
+                Err(err) => report_zone_failure(err),
+            }
+            managed_zones.restart();
+        });
+    };
+
+    let move_zone = move |zone: ManagedZone, direction: MoveDirection, at_boundary: bool| {
+        let label = zone.qualified_label();
+        spawn(async move {
+            if at_boundary {
+                // The control stays focusable at the boundary rather than becoming `disabled`,
+                // because a disabled element cannot hold focus -- pressing "up" on the second row
+                // would move the zone to first, disable the button under the user's finger, and drop
+                // focus to <body>. Saying so is better than silence.
+                zone_status.set(match direction {
+                    MoveDirection::Up => format!("{label} is already first."),
+                    MoveDirection::Down => format!("{label} is already last."),
+                });
+                return;
+            }
+            let result = crate::app::api::post_json::<_, serde_json::Value>(
+                "/api/zones/order",
+                &ZoneOrderRequest::step(zone.zone_id.clone(), direction),
+            )
+            .await;
+            match result {
+                Ok(body) => {
+                    zone_error.set(None);
+                    // The server reports whether a swap actually happened. `at_boundary` above is
+                    // computed from the first/last *visible* rows, so a hidden row never matches it
+                    // and always sends a request -- and a hidden row that is already first has
+                    // nothing to swap with. Announcing "moved up" there would tell a screen-reader
+                    // user, who has no other feedback for this action, something untrue.
+                    let moved = body
+                        .get("moved")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true);
+                    zone_status.set(match (moved, direction) {
+                        (true, MoveDirection::Up) => format!("{label} moved up."),
+                        (true, MoveDirection::Down) => format!("{label} moved down."),
+                        (false, MoveDirection::Up) => format!("{label} is already first."),
+                        (false, MoveDirection::Down) => format!("{label} is already last."),
+                    });
+                }
+                Err(err) => report_zone_failure(err),
+            }
+            managed_zones.restart();
+        });
+    };
+
+    // Drag-and-drop state. HTML5 drag events do not fire on touch devices, so this is an
+    // enhancement layered over the up/down buttons rather than a replacement for them -- the buttons
+    // remain the path for phones and for keyboard users.
+    let mut dragging = use_signal(|| Option::<String>::None);
+    let mut drop_target = use_signal(|| Option::<String>::None);
+
+    let drop_zone_onto = move |zone: ManagedZone, target: ManagedZone| {
+        let label = zone.qualified_label();
+        let target_label = target.qualified_label();
+        spawn(async move {
+            let result = crate::app::api::post_json::<_, serde_json::Value>(
+                "/api/zones/order",
+                &ZoneOrderRequest::drop_onto(zone.zone_id.clone(), target.zone_id.clone()),
+            )
+            .await;
+            match result {
+                Ok(_) => {
+                    zone_error.set(None);
+                    zone_status.set(format!("{label} moved to {target_label}'s position."));
+                }
+                Err(err) => report_zone_failure(err),
+            }
+            managed_zones.restart();
+        });
+    };
+
+    let mut rename_zone = move |zone: ManagedZone, name: String| {
+        let trimmed = name.trim().to_string();
+        if trimmed == zone.zone_name {
+            // Nothing to save, but drop the draft anyway so a field edited only by whitespace snaps
+            // back to the canonical name instead of keeping the user's spacing.
+            name_drafts.write().remove(&zone.zone_id);
+            return;
+        }
+        spawn(async move {
+            let cleared = trimmed.is_empty();
+            let result = crate::app::api::post_json::<_, serde_json::Value>(
+                "/api/zones/name",
+                &ZoneNameRequest {
+                    zone_id: zone.zone_id.clone(),
+                    name: if cleared { None } else { Some(trimmed.clone()) },
+                },
+            )
+            .await;
+            match result {
+                Ok(_) => {
+                    zone_error.set(None);
+                    zone_status.set(if cleared {
+                        format!("Name reset to {}.", zone.provider_name)
+                    } else {
+                        format!("Renamed to {trimmed}.")
+                    });
+                }
+                Err(err) => report_zone_failure(err),
+            }
+            // The server is now authoritative for this row -- but only for the text we submitted.
+            // The user can start typing again while the request is in flight, so drop the draft
+            // only if it still matches what was sent; otherwise the newer keystrokes would vanish
+            // and the field would snap back to the name they had just moved on from.
+            let stale = name_drafts
+                .read()
+                .get(&zone.zone_id)
+                .is_some_and(|draft| draft.trim() == trimmed);
+            if stale {
+                name_drafts.write().remove(&zone.zone_id);
+            }
+            managed_zones.restart();
+        });
+    };
+
     // Discovery status resources
     let mut roon_status = use_resource(|| async {
         crate::app::api::fetch_json::<RoonStatus>("/roon/status")
@@ -234,6 +415,11 @@ pub fn Settings() -> Element {
             lms_config.restart();
             hqp_status.restart();
         }
+        // The zone set changes while the user is on this page -- they power on a speaker precisely
+        // because they are configuring it. Without this the table only updates on a manual reload.
+        if sse.should_refresh_zones() {
+            managed_zones.restart();
+        }
     });
 
     // Save settings handler
@@ -260,6 +446,10 @@ pub fn Settings() -> Element {
         };
         spawn(async move {
             let _ = crate::app::api::post_json_no_response("/api/settings", &settings).await;
+            // Enabling or disabling an adapter changes which zones are manageable, and the zone
+            // table sits directly below these toggles. Without this it keeps listing zones from an
+            // adapter the user just turned off.
+            managed_zones.restart();
         });
     };
 
@@ -484,6 +674,303 @@ pub fn Settings() -> Element {
                                 }
                                 td { class: "py-2 px-3", "Knobs" }
                                 td { class: "py-2 px-3 text-muted", "-" }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Zone management: name, visibility, and order.
+            section { class: "mb-8", aria_labelledby: "zones-heading",
+                div { class: "mb-4",
+                    h2 { id: "zones-heading", class: "text-xl font-semibold", "Zone list" }
+                    p { class: "text-muted text-sm",
+                        "Name your zones, choose which ones appear, and set their order. Drag a row to move it, or use the arrows. Applies everywhere — this app, knobs, and connected assistants."
+                    }
+                }
+
+                // Placed above the table, not below it. This is the sentence that defuses the
+                // "am I deleting my speaker?" moment, so it has to arrive before the checkbox
+                // rather than several screens below it on a long list. It also sits outside the
+                // loaded-and-non-empty branch, so it is present in every state.
+                p { class: "text-muted text-sm mb-4",
+                    "Hiding only removes a zone from lists. Nothing is deleted, a knob already pointing at it keeps working, and an assistant asked for it by name still finds it. A hidden zone keeps its place in the order, so showing it again puts it back where you left it."
+                }
+
+                if let Some(message) = zone_error() {
+                    ErrorAlert {
+                        message,
+                        on_dismiss: move |_| zone_error.set(None),
+                    }
+                }
+
+                // Announcements for assistive tech. Visually hidden: sighted users see the row
+                // move, which this exists to substitute for.
+                div {
+                    class: "sr-only",
+                    role: "status",
+                    aria_live: "polite",
+                    aria_atomic: "true",
+                    "{zone_status}"
+                }
+
+                div { class: "card overflow-x-auto p-4 sm:p-6",
+                    match managed_zones.read().as_ref() {
+                        None => rsx! {
+                            p { class: "text-muted py-2", role: "status", aria_live: "polite", "Loading zones…" }
+                        },
+                        Some(None) => rsx! {
+                            div { role: "alert",
+                                p { class: "status-err py-2 mb-3", "Could not load the zone list." }
+                                button {
+                                    r#type: "button",
+                                    class: "btn btn-outline btn-sm",
+                                    onclick: move |_| managed_zones.restart(),
+                                    "Try again"
+                                }
+                            }
+                        },
+                        Some(Some(response)) if response.zones.is_empty() => rsx! {
+                            p { class: "text-muted py-2",
+                                "No zones discovered yet. Check that an adapter is enabled above and connected."
+                            }
+                        },
+                        Some(Some(response)) => {
+                            let zones = response.zones.clone();
+                            let revision = zone_revision();
+                            // Positions count visible zones only, because that is the order every
+                            // other surface shows. Numbering hidden zones would promise an order
+                            // that nothing displays.
+                            let visible_total = zones.iter().filter(|z| !z.hidden).count();
+                            let mut visible_position = 0usize;
+                            let mut rows = Vec::with_capacity(zones.len());
+                            for zone in zones {
+                                let position = if zone.hidden {
+                                    None
+                                } else {
+                                    visible_position += 1;
+                                    Some(visible_position)
+                                };
+                                rows.push((zone, position));
+                            }
+                            let first_visible = rows.iter().position(|(z, _)| !z.hidden);
+                            let last_visible = rows.iter().rposition(|(z, _)| !z.hidden);
+                            // A drop knows only the dragged zone's id, so the row it belongs to has
+                            // to be recoverable by id from inside the drop handler.
+                            let drop_lookup: std::rc::Rc<std::collections::HashMap<String, ManagedZone>> =
+                                std::rc::Rc::new(
+                                    rows.iter()
+                                        .map(|(z, _)| (z.zone_id.clone(), z.clone()))
+                                        .collect(),
+                                );
+
+                            rsx! {
+                                table { class: "w-full", id: "zones-table",
+                                    thead {
+                                        tr { class: "border-b border-default",
+                                            // Handle column. Hidden below `sm` because HTML5 drag
+                                            // events never fire on touch -- a grip a phone cannot
+                                            // use is a false affordance, and the arrows are the
+                                            // real control there.
+                                            th { class: "w-8 hidden sm:table-cell", span { class: "sr-only", "Drag to reorder" } }
+                                            th { class: "text-left py-2 px-2 font-semibold w-12", "Show" }
+                                            th { class: "text-left py-2 px-2 font-semibold", "Name" }
+                                            th { class: "text-left py-2 px-2 font-semibold hidden sm:table-cell w-28", "Source" }
+                                            th { class: "text-right py-2 px-2 font-semibold w-32", "Position" }
+                                        }
+                                    }
+                                    tbody {
+                                        for (index, (zone, position)) in rows.into_iter().enumerate() {
+                                            tr {
+                                                key: "{zone.zone_id}-{revision}",
+                                                class: if drop_target() == Some(zone.zone_id.clone()) {
+                                                    "zone-row zone-row-drop-target border-b border-default"
+                                                } else if dragging() == Some(zone.zone_id.clone()) {
+                                                    "zone-row zone-row-dragging border-b border-default"
+                                                } else {
+                                                    "zone-row border-b border-default"
+                                                },
+                                                ondragover: {
+                                                    let zone_id = zone.zone_id.clone();
+                                                    move |evt: DragEvent| {
+                                                        // Without preventDefault the browser treats
+                                                        // this as an invalid drop target and never
+                                                        // fires ondrop.
+                                                        evt.prevent_default();
+                                                        if dragging().is_some() {
+                                                            drop_target.set(Some(zone_id.clone()));
+                                                        }
+                                                    }
+                                                },
+                                                ondrop: {
+                                                    let target = zone.clone();
+                                                    let rows_for_drop = drop_lookup.clone();
+                                                    move |evt: DragEvent| {
+                                                        evt.prevent_default();
+                                                        if let Some(dragged_id) = dragging() {
+                                                            if let Some(dragged) = rows_for_drop.get(&dragged_id) {
+                                                                drop_zone_onto(dragged.clone(), target.clone());
+                                                            }
+                                                        }
+                                                        dragging.set(None);
+                                                        drop_target.set(None);
+                                                    }
+                                                },
+                                                ondragend: move |_| {
+                                                    dragging.set(None);
+                                                    drop_target.set(None);
+                                                },
+                                                // The drag handle. `draggable` lives here rather
+                                                // than on the row so that selecting text in the
+                                                // name field does not start a drag -- the row is
+                                                // still the drop target, just not the drag source.
+                                                td {
+                                                    class: "zone-handle-cell hidden sm:table-cell align-middle",
+                                                    draggable: "true",
+                                                    ondragstart: {
+                                                        let zone_id = zone.zone_id.clone();
+                                                        move |_| dragging.set(Some(zone_id.clone()))
+                                                    },
+                                                    // aria-hidden: dragging has no keyboard
+                                                    // equivalent, so the arrows carry the
+                                                    // accessible path and this must not add a
+                                                    // stop in the tab order that does nothing.
+                                                    svg {
+                                                        class: "w-4 h-4 text-muted mx-auto",
+                                                        fill: "currentColor",
+                                                        view_box: "0 0 24 24",
+                                                        "aria-hidden": "true",
+                                                        circle { cx: "9", cy: "6", r: "1.5" }
+                                                        circle { cx: "15", cy: "6", r: "1.5" }
+                                                        circle { cx: "9", cy: "12", r: "1.5" }
+                                                        circle { cx: "15", cy: "12", r: "1.5" }
+                                                        circle { cx: "9", cy: "18", r: "1.5" }
+                                                        circle { cx: "15", cy: "18", r: "1.5" }
+                                                    }
+                                                }
+                                                td { class: "py-2 px-2 align-top",
+                                                    label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-2",
+                                                        input {
+                                                            r#type: "checkbox",
+                                                            class: "checkbox",
+                                                            aria_label: "Show {zone.qualified_label()}",
+                                                            checked: !zone.hidden,
+                                                            onchange: {
+                                                                let zone = zone.clone();
+                                                                move |_| set_zone_hidden(zone.clone())
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                td { class: "py-2 px-2 align-top",
+                                                    input {
+                                                        r#type: "text",
+                                                        class: if zone.hidden { "input w-full text-muted" } else { "input w-full" },
+                                                        // The draft while the user is typing,
+                                                        // otherwise the server's name. A controlled
+                                                        // input needs somewhere to put keystrokes
+                                                        // or the next render throws them away.
+                                                        value: "{name_drafts().get(&zone.zone_id).cloned().unwrap_or_else(|| zone.zone_name.clone())}",
+                                                        maxlength: "60",
+                                                        aria_label: "Name for {zone.qualified_label()}",
+                                                        oninput: {
+                                                            let zone_id = zone.zone_id.clone();
+                                                            move |evt: FormEvent| {
+                                                                name_drafts.write().insert(zone_id.clone(), evt.value());
+                                                            }
+                                                        },
+                                                        // Commits on blur and on Enter rather than
+                                                        // per keystroke: each save is a disk write
+                                                        // plus a full list refetch, and refetching
+                                                        // mid-word would fight the cursor.
+                                                        onchange: {
+                                                            let zone = zone.clone();
+                                                            move |evt: FormEvent| rename_zone(zone.clone(), evt.value())
+                                                        }
+                                                    }
+                                                    // Source lives here below `sm`, where the
+                                                    // column is hidden to buy back width for the
+                                                    // name field on a phone.
+                                                    div { class: "text-muted text-xs mt-1 sm:hidden", "{source_label(&zone.source)}" }
+                                                    if zone.renamed {
+                                                        div { class: "text-muted text-xs mt-1",
+                                                            "{zone.provider_name} · "
+                                                            button {
+                                                                r#type: "button",
+                                                                class: "underline",
+                                                                onclick: {
+                                                                    let zone = zone.clone();
+                                                                    move |_| rename_zone(zone.clone(), String::new())
+                                                                },
+                                                                "reset"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                td { class: "py-2 px-2 align-top text-muted hidden sm:table-cell", "{source_label(&zone.source)}" }
+                                                td { class: "py-2 px-2 align-top",
+                                                    div { class: "flex items-center justify-end gap-2",
+                                                        span { class: "text-muted text-sm tabular-nums",
+                                                            if let Some(position) = position {
+                                                                "{position} of {visible_total}"
+                                                            } else {
+                                                                "Hidden"
+                                                            }
+                                                        }
+                                                        {
+                                                            let at_top = Some(index) == first_visible;
+                                                            let at_bottom = Some(index) == last_visible;
+                                                            let up_zone = zone.clone();
+                                                            let down_zone = zone.clone();
+                                                            rsx! {
+                                                                // `aria-disabled`, not `disabled`:
+                                                                // a disabled control cannot hold
+                                                                // focus, so moving a zone to first
+                                                                // would disable the very button
+                                                                // that was just pressed and drop
+                                                                // focus to <body>. These stay
+                                                                // focusable and announce "already
+                                                                // first" instead.
+                                                                button {
+                                                                    r#type: "button",
+                                                                    class: if at_top { "btn btn-outline btn-sm opacity-45" } else { "btn btn-outline btn-sm" },
+                                                                    aria_disabled: if at_top { "true" } else { "false" },
+                                                                    aria_label: "Move {zone.qualified_label()} up",
+                                                                    onclick: move |_| move_zone(up_zone.clone(), MoveDirection::Up, at_top),
+                                                                    svg {
+                                                                        class: "w-4 h-4",
+                                                                        fill: "none",
+                                                                        view_box: "0 0 24 24",
+                                                                        stroke: "currentColor",
+                                                                        "stroke-width": "2",
+                                                                        "aria-hidden": "true",
+                                                                        path { "stroke-linecap": "round", "stroke-linejoin": "round", d: "M5 15l7-7 7 7" }
+                                                                    }
+                                                                }
+                                                                button {
+                                                                    r#type: "button",
+                                                                    class: if at_bottom { "btn btn-outline btn-sm opacity-45" } else { "btn btn-outline btn-sm" },
+                                                                    aria_disabled: if at_bottom { "true" } else { "false" },
+                                                                    aria_label: "Move {zone.qualified_label()} down",
+                                                                    onclick: move |_| move_zone(down_zone.clone(), MoveDirection::Down, at_bottom),
+                                                                    svg {
+                                                                        class: "w-4 h-4",
+                                                                        fill: "none",
+                                                                        view_box: "0 0 24 24",
+                                                                        stroke: "currentColor",
+                                                                        "stroke-width": "2",
+                                                                        "aria-hidden": "true",
+                                                                        path { "stroke-linecap": "round", "stroke-linejoin": "round", d: "M19 9l-7 7-7-7" }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }

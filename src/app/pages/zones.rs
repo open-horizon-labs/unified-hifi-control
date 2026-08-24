@@ -253,31 +253,27 @@ pub fn Zones() -> Element {
     let profiles = hqp_profiles();
     let matrix = hqp_matrix();
 
-    // Group zones by source protocol
+    // Group *consecutive* same-source zones, preserving the order `/zones` delivered.
+    //
+    // `/zones` arrives ordered by `crate::zone_list` -- the user's explicit order, then
+    // alphabetical -- and that order is the whole point of the zone-list settings. This page used to
+    // bucket zones by source into a `HashMap` and sort the buckets by a fixed provider priority
+    // (Roon, LMS, OpenHome, UPnP, other), which rendered every Roon zone before every LMS zone no
+    // matter what the user arranged. A user who put an LMS zone at the top never saw it there.
+    //
+    // Runs of the same source still get one heading, so the grouping affordance survives; a source
+    // that appears in two places in the user's order simply gets two headings, which is a truthful
+    // rendering of what they asked for rather than a reshuffle behind their back.
     let grouped_zones: Vec<(String, Vec<Zone>)> = {
-        let mut groups: std::collections::HashMap<String, Vec<Zone>> =
-            std::collections::HashMap::new();
+        let mut runs: Vec<(String, Vec<Zone>)> = Vec::new();
         for zone in zones_list.iter() {
             let source = zone.source.clone().unwrap_or_else(|| "Other".to_string());
-            groups.entry(source).or_default().push(zone.clone());
-        }
-        // Sort zones within each group by name for stable ordering
-        for zones in groups.values_mut() {
-            zones.sort_by(|a, b| a.zone_name.cmp(&b.zone_name));
-        }
-        // Sort groups in a sensible order: Roon, LMS, OpenHome, UPnP, then others
-        let priority = |s: &str| -> i32 {
-            match s.to_lowercase().as_str() {
-                "roon" => 0,
-                "lms" => 1,
-                "openhome" => 2,
-                "upnp" => 3,
-                _ => 4,
+            match runs.last_mut() {
+                Some((current, zones)) if *current == source => zones.push(zone.clone()),
+                _ => runs.push((source, vec![zone.clone()])),
             }
-        };
-        let mut result: Vec<_> = groups.into_iter().collect();
-        result.sort_by_key(|a| priority(&a.0));
-        result
+        }
+        runs
     };
 
     let content = if is_loading {

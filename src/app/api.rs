@@ -76,6 +76,118 @@ pub struct Zone {
     pub dsp: Option<ZoneDsp>,
 }
 
+// =============================================================================
+// Zone management types (`/api/zones/visibility`, `/api/zones/order`)
+// =============================================================================
+
+/// One row of the zone management list. Unlike [`Zone`], this includes zones the user has hidden —
+/// the management view is the one place that must show them, or unhiding would be impossible.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ManagedZone {
+    pub zone_id: String,
+    /// The effective display name: the user's override when set, otherwise the provider's.
+    pub zone_name: String,
+    /// What Roon/LMS/etc. calls this zone, so a renamed zone can still be identified.
+    #[serde(default)]
+    pub provider_name: String,
+    #[serde(default)]
+    pub renamed: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+impl ManagedZone {
+    /// Name plus provider, for accessible labels. Zone names are not unique — the same room name on
+    /// two providers is common in this product — so a bare name would produce two controls with
+    /// identical accessible names and no way to tell them apart by ear.
+    pub fn qualified_label(&self) -> String {
+        format!("{} ({})", self.zone_name, source_label(&self.source))
+    }
+}
+
+/// Provider ids as people know them, matching the Features table's spelling.
+pub fn source_label(source: &str) -> &str {
+    match source {
+        "roon" => "Roon",
+        "lms" => "LMS",
+        "hqplayer" => "HQPlayer",
+        "openhome" => "OpenHome",
+        "upnp" => "UPnP",
+        other => other,
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ManagedZonesResponse {
+    pub zones: Vec<ManagedZone>,
+}
+
+/// `POST /api/zones/visibility`.
+///
+/// The zone request types are defined once and used by both sides: `src/app` serialises them and
+/// `src/api` deserialises them in its handlers. `src/app` is not feature-gated, so the server
+/// compiles this module too. Two parallel definitions would let a field name or an enum spelling
+/// drift into a 422 that the UI has no way to explain.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ZoneVisibilityRequest {
+    pub zone_id: String,
+    pub hidden: bool,
+}
+
+/// `POST /api/zones/order`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ZoneOrderRequest {
+    pub zone_id: String,
+    /// Step one place — the up/down buttons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<MoveDirection>,
+    /// Take the slot this zone currently occupies — a drag-and-drop drop.
+    ///
+    /// A target *zone* rather than an index: the client's row indices can go stale between render
+    /// and drop if a zone appears or disappears, and a stale index would land the zone somewhere
+    /// the user did not point at, silently. A stale zone id simply resolves to nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_zone_id: Option<String>,
+}
+
+impl ZoneOrderRequest {
+    pub fn step(zone_id: String, direction: MoveDirection) -> Self {
+        Self {
+            zone_id,
+            direction: Some(direction),
+            target_zone_id: None,
+        }
+    }
+
+    pub fn drop_onto(zone_id: String, target_zone_id: String) -> Self {
+        Self {
+            zone_id,
+            direction: None,
+            target_zone_id: Some(target_zone_id),
+        }
+    }
+}
+
+/// Which way a step-reorder moves a zone. Re-exported by `crate::zone_list` for the server side.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MoveDirection {
+    Up,
+    Down,
+}
+
+/// `POST /api/zones/name`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ZoneNameRequest {
+    pub zone_id: String,
+    /// `None`, empty, or whitespace-only clears the override and restores the provider's name — so
+    /// there is always a way back without a separate "reset" endpoint.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ZoneDsp {
     pub r#type: Option<String>,

@@ -16,6 +16,7 @@
 DELETE /mcp
 GET /admin
 GET /api/settings
+GET /api/zones/visibility
 GET /assets/{*path}
 GET /config/{knob_id}
 GET /control
@@ -60,6 +61,9 @@ GET /upnp/status
 GET /upnp/zones
 GET /zones
 POST /api/settings
+POST /api/zones/name
+POST /api/zones/order
+POST /api/zones/visibility
 POST /control
 POST /hqp/detect
 POST /hqp/instances

@@ -165,11 +165,21 @@ struct SettingsFixture {
 
 impl SettingsFixture {
     fn with_hqplayer(enabled: bool) -> Self {
+        Self::new(enabled, &[])
+    }
+
+    /// Settings with a populated per-zone hide list, for the MCP visibility contract.
+    fn with_hidden_zones(hidden: &[&str]) -> Self {
+        Self::new(true, hidden)
+    }
+
+    fn new(enabled: bool, hidden_zones: &[&str]) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = json!({
             "hide_knobs_page": false,
             "hide_hqp_page": false,
             "hide_lms_page": false,
+            "hidden_zones": hidden_zones,
             "adapters": {
                 "roon": true,
                 "upnp": true,
@@ -5505,4 +5515,204 @@ async fn status_resource_agrees_with_hifi_status_tool() {
         tool_value, resource_value,
         "hifi://status must carry exactly the hifi_status tool's payload"
     );
+}
+
+// =============================================================================
+// Zone visibility (per-zone hide list)
+// =============================================================================
+
+/// Publish a bare zone onto the bus and wait for the aggregator to hold it.
+///
+/// Republishes rather than sleeping-then-publishing-once. The bus is a broadcast channel, so an
+/// event published before `ZoneAggregator::run` has attached its subscription is dropped with no
+/// error — and a fixed sleep only makes that race less likely on an unloaded machine, which is the
+/// worst kind of test flake. `ZoneDiscovered` is idempotent in the aggregator (it upserts by
+/// `zone_id`), so repeating it until the zone is observably held is safe and removes the race
+/// outright.
+async fn seed_zone(
+    bus: &unified_hifi_control::bus::SharedBus,
+    state: &AppState,
+    zone_id: &str,
+    zone_name: &str,
+) {
+    let zone = unified_hifi_control::bus::Zone {
+        zone_id: zone_id.to_string(),
+        zone_name: zone_name.to_string(),
+        state: unified_hifi_control::bus::PlaybackState::Stopped,
+        volume_control: None,
+        now_playing: None,
+        source: zone_id.split(':').next().unwrap_or("roon").to_string(),
+        is_controllable: true,
+        is_seekable: false,
+        last_updated: 0,
+        is_play_allowed: true,
+        is_pause_allowed: true,
+        is_next_allowed: true,
+        is_previous_allowed: true,
+    };
+
+    for _ in 0..100 {
+        bus.publish(unified_hifi_control::bus::BusEvent::ZoneDiscovered { zone: zone.clone() });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if state.aggregator.get_zone(zone_id).await.is_some() {
+            return;
+        }
+    }
+    panic!("zone {zone_id} never reached the aggregator");
+}
+
+/// A zone the user hid must be withheld from **all three** MCP zone surfaces, not just the obvious
+/// one.
+///
+/// `hifi_zones`, the `hifi://zones/...` resource enumeration, and `hifi_capabilities` each read
+/// `aggregator.get_zones()` directly before this work. Filtering only `hifi_zones` — the tempting
+/// one-line fix, since it is the tool named "zones" — leaves the hidden zone advertised as a
+/// resource and described in the capability report, so an assistant still finds it and offers it.
+/// This test fails that fix.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn a_hidden_zone_is_withheld_from_every_mcp_zone_surface() {
+    let _settings = SettingsFixture::with_hidden_zones(&["roon:phone"]);
+    let bus = create_bus();
+    let state = build_state_with_bus(bus.clone(), None).await;
+    let aggregator = state.aggregator.clone();
+    let aggregator_task = tokio::spawn(async move { aggregator.run().await });
+    // Let the aggregator's bus subscription attach before the first publish, or the event races the
+    // subscribe and is dropped.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    seed_zone(&bus, &state, "roon:phone", "My Phone").await;
+    seed_zone(&bus, &state, "roon:kitchen", "Kitchen").await;
+
+    let app = TestApp::with_state(state.clone());
+
+    // 1. hifi_zones
+    let zones_text = result_text(&app.call_tool("hifi_zones", json!({})).await);
+    assert!(
+        !zones_text.contains("roon:phone"),
+        "hifi_zones must not list a hidden zone: {zones_text}"
+    );
+    assert!(
+        zones_text.contains("roon:kitchen"),
+        "hifi_zones must still list the zones that are not hidden: {zones_text}"
+    );
+
+    // 2. resource enumeration
+    let resources = app.list_resources().await;
+    let uris: Vec<String> = resources
+        .get("resources")
+        .and_then(Value::as_array)
+        .expect("resources array")
+        .iter()
+        .filter_map(|r| r.get("uri").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !uris.iter().any(|u| u == "hifi://zones/roon:phone"),
+        "a hidden zone must not be advertised as a resource: {uris:?}"
+    );
+    assert!(
+        uris.iter().any(|u| u == "hifi://zones/roon:kitchen"),
+        "visible zones must still be advertised as resources: {uris:?}"
+    );
+
+    // 3. hifi_capabilities
+    let caps_text = result_text(&app.call_tool("hifi_capabilities", json!({})).await);
+    assert!(
+        !caps_text.contains("roon:phone"),
+        "hifi_capabilities must not describe a hidden zone: {caps_text}"
+    );
+    assert!(
+        caps_text.contains("roon:kitchen"),
+        "hifi_capabilities must still describe visible zones: {caps_text}"
+    );
+
+    aggregator_task.abort();
+}
+
+/// Hiding declutters lists; it does not withdraw control.
+///
+/// This is the guardrail that stops "hidden" from quietly becoming "denied". Knob bindings, MCP
+/// `zone_id` arguments, and HQPlayer links all address zones by ID, so an implementation that
+/// filtered the *control* path too would silently break working setups on upgrade — and would still
+/// pass every list-filtering assertion above.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn a_hidden_zone_remains_controllable_by_id() {
+    let _settings = SettingsFixture::with_hidden_zones(&["roon:phone"]);
+    let bus = create_bus();
+    let state = build_state_with_bus(bus.clone(), None).await;
+    let aggregator = state.aggregator.clone();
+    let aggregator_task = tokio::spawn(async move { aggregator.run().await });
+    // Let the aggregator's bus subscription attach before the first publish, or the event races the
+    // subscribe and is dropped.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    seed_zone(&bus, &state, "roon:phone", "My Phone").await;
+
+    let app = TestApp::with_state(state.clone());
+
+    let now_playing = app
+        .call_tool("hifi_now_playing", json!({ "zone_id": "roon:phone" }))
+        .await;
+    let text = result_text(&now_playing);
+    assert!(
+        !text.to_lowercase().contains("not found"),
+        "a hidden zone must still resolve when addressed by ID: {text}"
+    );
+
+    let read = app.read_resource("hifi://zones/roon:phone").await;
+    assert!(
+        read.pointer("/result/contents/0/text").is_some(),
+        "a hidden zone's resource must still be readable when addressed directly: {read}"
+    );
+
+    aggregator_task.abort();
+}
+
+/// Ordering must reach MCP too, not just the web UI.
+///
+/// Before this work `hifi_zones` returned `HashMap::values()`, so two identical calls could return
+/// two different orders. An assistant told "play in the second zone" would act on different
+/// hardware each time.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn hifi_zones_is_ordered_and_stable_across_calls() {
+    let _settings = SettingsFixture::with_hqplayer(true);
+    let bus = create_bus();
+    let state = build_state_with_bus(bus.clone(), None).await;
+    let aggregator = state.aggregator.clone();
+    let aggregator_task = tokio::spawn(async move { aggregator.run().await });
+
+    // Seeded in an order that is neither alphabetical nor reverse-alphabetical, and with mixed case
+    // so a byte-order sort would put `attic` last rather than first.
+    seed_zone(&bus, &state, "roon:z", "Zed").await;
+    seed_zone(&bus, &state, "roon:a", "attic").await;
+    seed_zone(&bus, &state, "roon:m", "Middle").await;
+
+    let app = TestApp::with_state(state.clone());
+
+    let first: Value =
+        serde_json::from_str(&result_text(&app.call_tool("hifi_zones", json!({})).await))
+            .expect("hifi_zones must return JSON");
+    let names: Vec<&str> = first
+        .as_array()
+        .expect("hifi_zones returns an array")
+        .iter()
+        .filter_map(|z| z.get("zone_name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["attic", "Middle", "Zed"],
+        "hifi_zones must be sorted by name, case-insensitively"
+    );
+
+    for _ in 0..5 {
+        let again: Value =
+            serde_json::from_str(&result_text(&app.call_tool("hifi_zones", json!({})).await))
+                .expect("hifi_zones must return JSON");
+        assert_eq!(first, again, "hifi_zones order must not vary between calls");
+    }
+
+    aggregator_task.abort();
 }

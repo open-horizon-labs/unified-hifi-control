@@ -477,6 +477,12 @@ mod server {
             // App settings API
             .route("/api/settings", get(api::api_settings_get_handler))
             .route("/api/settings", post(api::api_settings_post_handler))
+            // Kept on one line each: the API-contract extractor (tests/api_contract.rs) only sees
+            // single-line `.route(...)` calls, so a multi-line form would slip past the guard.
+            .route("/api/zones/visibility", get(api::zone_visibility_get))
+            .route("/api/zones/visibility", post(api::zone_visibility_post))
+            .route("/api/zones/order", post(api::zone_order_post))
+            .route("/api/zones/name", post(api::zone_name_post))
             // Event stream (SSE)
             .route("/events", get(api::events_handler))
             // Knob hardware API routes
