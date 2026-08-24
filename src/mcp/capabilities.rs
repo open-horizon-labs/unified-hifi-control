@@ -360,7 +360,15 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
         | Capability::QueueRemove
         | Capability::QueueClear => target == ZoneTarget::MusicAssistant,
         Capability::PlayNext => target == ZoneTarget::MusicAssistant,
-        Capability::MultiroomSync => target == ZoneTarget::MusicAssistant,
+        // #517: LMS (#513) and Roon (#515) both implement the
+        // multiroom_status/multiroom_set_members/multiroom_ungroup contract at
+        // the adapter layer, exactly like Music Assistant. `hifi_zone_group`
+        // routes join/leave/status to whichever of the three owns the zone
+        // prefix (`src/mcp/tools/groups.rs`), so all three are routed here.
+        Capability::MultiroomSync => matches!(
+            target,
+            ZoneTarget::MusicAssistant | ZoneTarget::Roon | ZoneTarget::Lms
+        ),
         Capability::Browse | Capability::SavedPlaylists | Capability::Favorites => {
             matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant)
         }
@@ -455,7 +463,8 @@ const HQPLAYER_CONTENT_UNVERIFIED: &str = "UHC's HQPlayer adapter speaks transpo
 #[rustfmt::skip]
 const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     // -------------------------------------------------------------------------
-    // Roon. Transport, volume, search and play-by-query are routed.
+    // Roon. Transport, volume, search, play-by-query and (since #517)
+    // multiroom_sync are routed.
     // -------------------------------------------------------------------------
     (ZoneTarget::Roon, Capability::PlayByRef, Gap::NotWired("#396",
         "RoonAdapter::browse/load/play_item exist and are exposed over HTTP; MCP mints no \
@@ -488,9 +497,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
     (ZoneTarget::Roon, Capability::Favorites, Gap::NotWired("#399",
         "Roon exposes My Favorites and tags as browse hierarchies, so this arrives with \
          browse.")),
-    (ZoneTarget::Roon, Capability::MultiroomSync, Gap::NotWired("#360",
-        "the Roon API's transport service groups and ungroups outputs; UHC exposes no \
-         grouping on any surface.")),
 
     // -------------------------------------------------------------------------
     // LMS. **Not one ProviderCannot** -- every gap here is UHC's, verified live
@@ -537,10 +543,6 @@ const GAPS: &[(ZoneTarget, Capability, Gap)] = &[
         "favorites items / favorites playlist play / add / delete / exists all work; verified \
          live. Note LMS favorites have no durable id -- only a url -- so a ref must be minted \
          over the url.")),
-    (ZoneTarget::Lms, Capability::MultiroomSync, Gap::NotWired("#403",
-        "sync <playerid>, sync -, sync ? and the server-scoped syncgroups ? all work; verified \
-         live. Joining is destructive to the target zone's queue, which is why #403 gates it \
-         behind confirmation.")),
 
     // -------------------------------------------------------------------------
     // OpenHome. Transport, skip and (since #398) volume are routed.
