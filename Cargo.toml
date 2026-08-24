@@ -18,6 +18,7 @@ server = [
     "dep:tower-http",
     "dep:roon-api",
     "dep:reqwest",
+    "dep:tokio-tungstenite",
     "dep:tracing-subscriber",
     "dep:config",
     "dep:image",
@@ -99,6 +100,11 @@ roon-api = { git = "https://github.com/open-horizon-labs/rust-roon-api.git", bra
 # HTTP client (server only)
 reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"], optional = true }
 
+# WebSocket client (server only) - Music Assistant event subscription (#506).
+# rustls to match reqwest's TLS backend rather than pulling in a second (native-tls)
+# implementation.
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
+
 # Logging subscriber (server only - needs tokio)
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
@@ -162,10 +168,9 @@ syn = { version = "2", features = ["full", "parsing", "visit"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 walkdir = "2"
 tempfile = "3"
-# WebSocket *server* for tests/mock_servers/roon_core.rs (the Roon Core protocol fake).
-# Pinned to the same version roon-api uses as its client, so the fake and the real
-# client library share one framing implementation and no new crate is compiled.
-tokio-tungstenite = "0.21"
+# tokio-tungstenite moved to [dependencies] (#506): the Music Assistant adapter now
+# needs a WebSocket *client* in production, and tests/mock_servers/roon_core.rs's
+# WebSocket *server* fake shares that same declaration.
 
 [profile.release]
 lto = true

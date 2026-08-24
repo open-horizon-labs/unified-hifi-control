@@ -9,21 +9,24 @@
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
+use futures::SinkExt;
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::sleep;
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 use crate::adapters::traits::{
     AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, LibraryAdapter,
@@ -36,7 +39,20 @@ use crate::bus::{
 };
 
 const DEFAULT_PORT: u16 = 8095;
+/// Fallback cadence used only while the websocket event session is down
+/// (initial connect, or after a drop, gated by `AdapterHandle`'s own
+/// reconnect backoff). This is the pre-#506 poll interval, kept as a
+/// degraded path rather than the adapter's primary update mechanism.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Once the websocket session is subscribed and healthy, state changes
+/// publish on event receipt (see [`MusicAssistantAdapter::run_event_session`]),
+/// not on a timer. This slow safety-net poll only guards against a missed or
+/// malformed event leaving a zone stale forever; it is not the latency path.
+const DEFAULT_SAFETY_NET_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// Coalesce a burst of rapid successive MA events (e.g. volume drag, or a
+/// multi-player group update) into a single re-read + publish instead of one
+/// per event.
+const EVENT_COALESCE_WINDOW: Duration = Duration::from_millis(150);
 /// A queue-mode read is supplementary state. Never let a slow MA queue delay
 /// player discovery or prevent other zones from being published.
 const QUEUE_MODE_READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -104,6 +120,22 @@ impl MusicAssistantConfig {
         format!("{}://{}:{}/api", scheme, self.host, self.port)
     }
 
+    /// MA's websocket endpoint sits beside the HTTP command API on the same
+    /// host/port. The bearer token travels as a query parameter because the
+    /// websocket upgrade handshake happens before any application-level
+    /// message (including an `Authorization` header set on the initial
+    /// request) is guaranteed to be honored by every MA server version.
+    fn ws_url(&self) -> String {
+        let scheme = if self.tls { "wss" } else { "ws" };
+        format!(
+            "{}://{}:{}/ws?token={}",
+            scheme,
+            self.host,
+            self.port,
+            urlencoding::encode(&self.token)
+        )
+    }
+
     fn permits_insecure_local_http(&self) -> bool {
         if self.tls || !self.allow_insecure_http {
             return false;
@@ -167,8 +199,10 @@ pub struct MusicAssistantAdapter {
     bus: SharedBus,
     http: Client,
     base_url: String,
+    ws_url: String,
     token: String,
     poll_interval: Duration,
+    safety_net_poll_interval: Duration,
     sequence: Arc<Mutex<u64>>,
     players: Arc<RwLock<HashMap<String, PlayerSnapshot>>>,
     shutdown: Arc<RwLock<CancellationToken>>,
@@ -269,8 +303,10 @@ impl MusicAssistantAdapter {
                 .build()
                 .context("build Music Assistant HTTP client")?,
             base_url: config.base_url(),
+            ws_url: config.ws_url(),
             token: config.token,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            safety_net_poll_interval: DEFAULT_SAFETY_NET_POLL_INTERVAL,
             sequence: Arc::new(Mutex::new(0)),
             players: Arc::new(RwLock::new(HashMap::new())),
             shutdown: Arc::new(RwLock::new(CancellationToken::new())),
@@ -278,10 +314,19 @@ impl MusicAssistantAdapter {
         })
     }
 
-    /// Override the polling period for tests or installations with a large
-    /// player inventory.
+    /// Override the degraded-fallback polling period (used only while the
+    /// websocket event session is down) for tests or installations with a
+    /// large player inventory.
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval.max(Duration::from_millis(250));
+        self
+    }
+
+    /// Override the slow safety-net poll interval used while the websocket
+    /// session is healthy. Tests shrink this to observe the safety net
+    /// without waiting a full minute; production leaves it at the default.
+    pub fn with_safety_net_poll_interval(mut self, interval: Duration) -> Self {
+        self.safety_net_poll_interval = interval.max(Duration::from_millis(250));
         self
     }
 
@@ -714,6 +759,154 @@ impl MusicAssistantAdapter {
             .await?;
         Ok("Music Assistant item started".to_string())
     }
+
+    /// Background safety-net poll. Runs for the lifetime of one `run()`
+    /// attempt, alongside [`Self::run_event_session`], and refreshes state on
+    /// a timer regardless of the websocket session's health.
+    ///
+    /// The interval it uses depends on `ws_active`: fast
+    /// (`poll_interval`, default 5s) while the websocket session is down, so
+    /// zones stay reasonably fresh in that degraded mode; slow
+    /// (`safety_net_poll_interval`, default 60s) while the websocket session
+    /// is healthy, purely to correct for a missed or malformed event rather
+    /// than to carry the adapter's normal latency path. This mirrors the LMS
+    /// adapter's CLI-subscription/poll coordination pattern (`src/adapters/lms.rs`).
+    async fn run_safety_net_poll(&self, shutdown: CancellationToken, ws_active: Arc<AtomicBool>) {
+        loop {
+            let interval = if ws_active.load(Ordering::Acquire) {
+                self.safety_net_poll_interval
+            } else {
+                self.poll_interval
+            };
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = sleep(interval) => {}
+            }
+            match self.discover_players().await {
+                Ok(snapshots) => self.publish_snapshot(snapshots).await,
+                Err(error) => tracing::debug!("Music Assistant safety-net poll failed: {error}"),
+            }
+        }
+    }
+
+    /// Open a websocket session, subscribe to MA's player/queue events, and
+    /// keep publishing on event receipt until the connection drops or shuts
+    /// down. Returns `Err` on any disconnect so the caller's
+    /// [`crate::adapters::AdapterHandle`] retry/backoff reconnects — this
+    /// adapter deliberately does not implement its own reconnect loop (see
+    /// `src/adapters/handle.rs`'s module doc).
+    ///
+    /// A full snapshot readback (and publish) happens once immediately after
+    /// (re)connecting, so an MA restart mid-session — where the player list
+    /// may change wholesale — resyncs correctly rather than trusting stale
+    /// incremental state.
+    async fn run_event_session(
+        &self,
+        ctx: &AdapterContext,
+        ws_active: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        let (stream, _response) = tokio_tungstenite::connect_async(&self.ws_url)
+            .await
+            .context("connect Music Assistant websocket")?;
+        let (mut write, mut read) = stream.split();
+
+        let subscribe = ApiRequest {
+            message_id: self.next_message_id().await,
+            command: "subscribe",
+            args: None,
+        };
+        write
+            .send(WsMessage::Text(
+                serde_json::to_string(&subscribe).context("encode Music Assistant subscribe")?,
+            ))
+            .await
+            .context("send Music Assistant subscribe")?;
+
+        // Establish (or re-establish) ground truth now that the session is
+        // live, rather than waiting for the first event.
+        match self.discover_players().await {
+            Ok(snapshots) => self.publish_snapshot(snapshots).await,
+            Err(error) => {
+                tracing::warn!("Music Assistant post-connect snapshot failed: {error}")
+            }
+        }
+        ws_active.store(true, Ordering::Release);
+
+        let result = async {
+            let mut flush_at: Option<tokio::time::Instant> = None;
+            loop {
+                let flush = async {
+                    match flush_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    _ = ctx.shutdown.cancelled() => return Ok(()),
+                    message = read.next() => {
+                        match message {
+                            Some(Ok(WsMessage::Text(text))) => {
+                                if is_actionable_ma_event(&text) {
+                                    // Reset the window on every event so a burst
+                                    // (#506: "coalesce rapid successive events")
+                                    // collapses into one refresh after it quiets
+                                    // down, instead of one per event.
+                                    flush_at = Some(tokio::time::Instant::now() + EVENT_COALESCE_WINDOW);
+                                }
+                            }
+                            Some(Ok(WsMessage::Ping(payload))) => {
+                                if write.send(WsMessage::Pong(payload)).await.is_err() {
+                                    return Err(anyhow!(
+                                        "Music Assistant websocket pong failed"
+                                    ));
+                                }
+                            }
+                            Some(Ok(WsMessage::Close(_))) | None => {
+                                return Err(anyhow!("Music Assistant websocket closed by peer"));
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(error)) => {
+                                return Err(anyhow!("Music Assistant websocket error: {error}"));
+                            }
+                        }
+                    }
+                    _ = flush => {
+                        flush_at = None;
+                        match self.discover_players().await {
+                            Ok(snapshots) => self.publish_snapshot(snapshots).await,
+                            Err(error) => tracing::warn!(
+                                "Music Assistant event-triggered refresh failed: {error}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        .await;
+
+        ws_active.store(false, Ordering::Release);
+        result
+    }
+}
+
+/// MA pushes several message shapes over the same websocket: a server-info
+/// message on connect, command acknowledgements (`message_id` + `result`),
+/// and unsolicited events. Only the last kind should trigger a refresh; the
+/// others are otherwise-ignored protocol chatter on this adapter's read path.
+fn is_actionable_ma_event(text: &str) -> bool {
+    const RELEVANT_EVENTS: &[&str] = &[
+        "player_updated",
+        "player_added",
+        "player_removed",
+        "queue_updated",
+    ];
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    value
+        .get("event")
+        .and_then(Value::as_str)
+        .is_some_and(|event| RELEVANT_EVENTS.contains(&event))
 }
 
 fn zone_id_string(raw: &str) -> String {
@@ -1011,20 +1204,36 @@ impl AdapterLogic for MusicAssistantAdapter {
         "musicassistant"
     }
 
+    /// #506: MA's event stream, not a poll tick, drives normal updates.
+    ///
+    /// This spawns a safety-net poll (see [`Self::run_safety_net_poll`]) for
+    /// the duration of one websocket session attempt, then runs that session
+    /// (see [`Self::run_event_session`]) to completion. A dropped or
+    /// never-established session returns `Err`, and reconnect-with-backoff is
+    /// [`crate::adapters::AdapterHandle`]'s job, not this adapter's — retrying
+    /// `run()` opens a fresh websocket connection and, on reconnect, a full
+    /// snapshot resync (handling an MA restart mid-session, where the player
+    /// list may change wholesale).
     async fn run(&self, ctx: AdapterContext) -> Result<()> {
-        loop {
-            if ctx.shutdown.is_cancelled() {
-                return Ok(());
-            }
-            match self.discover_players().await {
-                Ok(snapshots) => self.publish_snapshot(snapshots).await,
-                Err(error) => tracing::warn!("Music Assistant poll failed: {error}"),
-            }
-            tokio::select! {
-                _ = ctx.shutdown.cancelled() => return Ok(()),
-                _ = sleep(self.poll_interval) => {}
-            }
+        if ctx.shutdown.is_cancelled() {
+            return Ok(());
         }
+
+        let ws_active = Arc::new(AtomicBool::new(false));
+        let safety_net = {
+            let adapter = self.clone();
+            let shutdown = ctx.shutdown.clone();
+            let ws_active = ws_active.clone();
+            tokio::spawn(async move { adapter.run_safety_net_poll(shutdown, ws_active).await })
+        };
+
+        let result = self.run_event_session(&ctx, &ws_active).await;
+        safety_net.abort();
+
+        if ctx.shutdown.is_cancelled() {
+            return Ok(());
+        }
+        result
     }
 
     async fn handle_command(
@@ -1431,14 +1640,16 @@ mod tests {
     use super::*;
     use axum::{
         body::Bytes,
+        extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
         extract::State,
         http::{HeaderMap, StatusCode},
         response::IntoResponse,
-        routing::post,
+        routing::{get, post},
         Json, Router,
     };
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::net::TcpListener;
+    use tokio::sync::broadcast;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedRequest {
@@ -1446,7 +1657,12 @@ mod tests {
         body: Value,
     }
 
-    #[derive(Clone, Default)]
+    /// Sent on `events` in place of a real event payload to make the mock's
+    /// one currently-connected websocket close, so tests can exercise
+    /// reconnect-with-backoff (#506) without a second listening port.
+    const MOCK_WS_FORCE_CLOSE: &str = "__uhc_mock_close__";
+
+    #[derive(Clone)]
     struct MockMusicAssistantState {
         requests: Arc<StdMutex<Vec<RecordedRequest>>>,
         players: Arc<StdMutex<Option<Value>>>,
@@ -1455,6 +1671,92 @@ mod tests {
         slow_active_queue_delay: Arc<StdMutex<Option<Duration>>>,
         active_queue_in_flight: Arc<AtomicUsize>,
         max_active_queue_in_flight: Arc<AtomicUsize>,
+        /// Text frames received from connected websocket clients (subscribe
+        /// requests), in arrival order.
+        ws_messages: Arc<StdMutex<Vec<String>>>,
+        /// Fan-out to every connected mock websocket client, so a test can
+        /// push an MA-shaped event (or [`MOCK_WS_FORCE_CLOSE`]) to whichever
+        /// client the adapter under test currently has open.
+        events: broadcast::Sender<String>,
+    }
+
+    impl Default for MockMusicAssistantState {
+        fn default() -> Self {
+            let (events, _receiver) = broadcast::channel(32);
+            Self {
+                requests: Arc::default(),
+                players: Arc::default(),
+                failure_response: Arc::default(),
+                slow_active_queue_prefix: Arc::default(),
+                slow_active_queue_delay: Arc::default(),
+                active_queue_in_flight: Arc::default(),
+                max_active_queue_in_flight: Arc::default(),
+                ws_messages: Arc::default(),
+                events,
+            }
+        }
+    }
+
+    impl MockMusicAssistantState {
+        fn push_event(&self, event: Value) {
+            // No receiver means no websocket client is connected yet; tests
+            // that use this always wait for a connection first, so a send
+            // failure here would itself indicate a test bug worth seeing.
+            if self.events.send(event.to_string()).is_err() {
+                panic!("mock push_event: no connected websocket client to receive it");
+            }
+        }
+
+        fn close_connected_websocket(&self) {
+            if self.events.send(MOCK_WS_FORCE_CLOSE.to_string()).is_err() {
+                panic!("mock close_connected_websocket: no connected websocket client to close");
+            }
+        }
+
+        fn players_all_request_count(&self) -> usize {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .iter()
+                .filter(|request| request.body["command"] == "players/all")
+                .count()
+        }
+    }
+
+    async fn musicassistant_ws(
+        State(state): State<MockMusicAssistantState>,
+        upgrade: WebSocketUpgrade,
+    ) -> impl IntoResponse {
+        upgrade.on_upgrade(move |socket| musicassistant_ws_session(socket, state))
+    }
+
+    async fn musicassistant_ws_session(mut socket: WebSocket, state: MockMusicAssistantState) {
+        let mut events = state.events.subscribe();
+        loop {
+            tokio::select! {
+                incoming = socket.recv() => {
+                    match incoming {
+                        Some(Ok(AxumWsMessage::Text(text))) => {
+                            state.ws_messages.lock().expect("ws messages lock").push(text.to_string());
+                        }
+                        Some(Ok(AxumWsMessage::Close(_))) | None => return,
+                        Some(Err(_)) => return,
+                        Some(Ok(_)) => {}
+                    }
+                }
+                event = events.recv() => {
+                    match event {
+                        Ok(payload) if payload == MOCK_WS_FORCE_CLOSE => return,
+                        Ok(payload) => {
+                            if socket.send(AxumWsMessage::Text(payload.into())).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+            }
+        }
     }
 
     async fn musicassistant_mock(
@@ -1557,6 +1859,7 @@ mod tests {
         let address = listener.local_addr().expect("mock address");
         let router = Router::new()
             .route("/api", post(musicassistant_mock))
+            .route("/ws", get(musicassistant_ws))
             .with_state(state.clone());
         let handle = tokio::spawn(async move {
             axum::serve(listener, router).await.expect("mock serve");
@@ -2298,6 +2601,167 @@ mod tests {
             json!({"player_id": "sonos-kitchen", "muted": true})
         );
 
+        server.abort();
+    }
+
+    /// #506: state changes publish on websocket event receipt, not on a poll
+    /// tick, and a burst of same-player events coalesces into one refresh.
+    #[tokio::test]
+    async fn websocket_event_triggers_publish_and_coalesces_bursts() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        let bus = crate::bus::create_bus();
+        let mut events = bus.subscribe();
+        // Long enough that only the event path (not either poll timer) could
+        // plausibly produce a publish inside this test's timeouts.
+        let adapter = MusicAssistantAdapter::new(bus.clone(), config)
+            .expect("valid MA adapter")
+            .with_poll_interval(Duration::from_secs(30))
+            .with_safety_net_poll_interval(Duration::from_secs(3600));
+
+        adapter.start().await.expect("adapter starts");
+
+        let discovered = timeout(Duration::from_secs(2), async {
+            loop {
+                if let BusEvent::ZoneDiscovered { zone } = events.recv().await.expect("bus event")
+                {
+                    return zone;
+                }
+            }
+        })
+        .await
+        .expect("connect performs an initial full-snapshot publish");
+        assert_eq!(discovered.zone_id, "musicassistant:sonos-kitchen");
+
+        // Wait for the adapter to actually subscribe over the websocket
+        // before pushing an event, so the push isn't lost to a client that
+        // hasn't connected yet.
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if !state
+                    .ws_messages
+                    .lock()
+                    .expect("ws messages lock")
+                    .is_empty()
+                {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("adapter subscribes over the websocket after connecting");
+
+        let baseline_players_all = state.players_all_request_count();
+
+        // Change upstream state to what a real `player_updated` event would
+        // reflect once the adapter re-reads it.
+        *state.players.lock().expect("players lock") = Some(json!([{
+            "player_id": "sonos-kitchen",
+            "name": "Kitchen",
+            "playback_state": "playing",
+            "available": true,
+            "volume_level": 77,
+            "volume_muted": false,
+            "current_media": {
+                "title": "Kind of Blue",
+                "artist": "Miles Davis",
+                "album": "Kind of Blue",
+                "elapsed_time": 12.5,
+                "duration": 300
+            }
+        }]));
+
+        // A burst of rapid successive events for the same player must
+        // coalesce into one re-read + publish rather than one per event
+        // (#506: "Guard against event storms").
+        for _ in 0..5 {
+            state.push_event(json!({"event": "player_updated", "object_id": "sonos-kitchen"}));
+        }
+
+        let volume_changed = timeout(Duration::from_millis(900), async {
+            loop {
+                match events.recv().await.expect("bus event") {
+                    BusEvent::VolumeChanged {
+                        output_id, value, ..
+                    } if output_id == "musicassistant:sonos-kitchen" => return value,
+                    _ => continue,
+                }
+            }
+        })
+        .await
+        .expect("event receipt publishes well under the old 5s poll tick");
+        assert_eq!(volume_changed, 77.0);
+
+        // Give an over-eager per-event refresh a chance to show up, then
+        // assert the whole burst only cost one extra `players/all` read.
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            state.players_all_request_count(),
+            baseline_players_all + 1,
+            "a burst of same-player events must coalesce into a single refresh"
+        );
+
+        adapter.stop().await;
+        server.abort();
+    }
+
+    /// #506: a websocket drop reconnects with backoff (via
+    /// `AdapterHandle::run_with_retry`) and resyncs via a full snapshot on
+    /// reconnect, so an MA restart mid-session — where the player list may
+    /// change wholesale — is reflected correctly rather than trusting stale
+    /// state.
+    #[tokio::test]
+    async fn websocket_drop_reconnects_and_fully_resyncs_state() {
+        let (config, state, server) = mock_musicassistant_server().await;
+        *state.players.lock().expect("players lock") = Some(json!([
+            {"player_id": "sonos-kitchen", "name": "Kitchen", "playback_state": "playing", "available": true},
+            {"player_id": "sonos-office", "name": "Office", "playback_state": "idle", "available": true}
+        ]));
+        let bus = crate::bus::create_bus();
+        let mut events = bus.subscribe();
+        let adapter = MusicAssistantAdapter::new(bus.clone(), config)
+            .expect("valid MA adapter")
+            .with_poll_interval(Duration::from_secs(30))
+            .with_safety_net_poll_interval(Duration::from_secs(3600));
+
+        adapter.start().await.expect("adapter starts");
+
+        let mut discovered = std::collections::HashSet::new();
+        timeout(Duration::from_secs(2), async {
+            while discovered.len() < 2 {
+                if let BusEvent::ZoneDiscovered { zone } = events.recv().await.expect("bus event")
+                {
+                    discovered.insert(zone.zone_id);
+                }
+            }
+        })
+        .await
+        .expect("initial snapshot for both players published");
+
+        // Simulate an MA restart: the websocket session drops and the office
+        // player is gone by the time the adapter reconnects and reads state
+        // afresh.
+        state.close_connected_websocket();
+        *state.players.lock().expect("players lock") = Some(json!([
+            {"player_id": "sonos-kitchen", "name": "Kitchen", "playback_state": "playing", "available": true}
+        ]));
+
+        // `AdapterHandle`'s default retry backoff (5s initial delay) owns the
+        // reconnect timing here deliberately (see `run_event_session`'s doc
+        // comment) rather than this adapter running its own reconnect loop.
+        let removed = timeout(Duration::from_secs(10), async {
+            loop {
+                if let BusEvent::ZoneRemoved { zone_id } = events.recv().await.expect("bus event")
+                {
+                    return zone_id;
+                }
+            }
+        })
+        .await
+        .expect("reconnect resyncs and removes the vanished player within the retry backoff window");
+        assert_eq!(removed.to_string(), "musicassistant:sonos-office");
+
+        adapter.stop().await;
         server.abort();
     }
 }
