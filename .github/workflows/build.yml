@@ -6,10 +6,25 @@ on:
     types: [opened, synchronize, reopened, labeled]
   push:
     branches: [v3, 'feature/**']
+    # Tag pushes are the single release trigger. `release: [published]` used to be
+    # listed here as well, which meant `gh release create` — the way releases are
+    # actually cut — fired both events for the same commit and built the entire
+    # matrix twice: two macOS builds, two Windows, two Docker, two of every NAS
+    # package, ~20 minutes of duplicated CI per release. It also made the release
+    # page link the slower duplicate, so a release looked mid-build long after its
+    # artifacts had been uploaded by the other run.
+    #
+    # Dropping the `release` trigger loses nothing. Both branches of the version
+    # logic below resolve `${GITHUB_REF#refs/tags/v}`, `is_beta` reads
+    # `GITHUB_REF_NAME`, and no job references the `github.event.release` payload —
+    # the two runs were byte-for-byte equivalent work.
+    #
+    # Kept this side rather than the other because it covers strictly more: a bare
+    # `git push --tags` still builds and publishes (softprops/action-gh-release
+    # creates the release if absent), whereas a release-only trigger would silently
+    # skip that path.
     tags:
       - 'v*'
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       build_lms:
@@ -1803,6 +1818,65 @@ jobs:
           add-paths: |
             lms-plugin/repo.xml
             lms-plugin/install.xml
+
+      - name: Enable auto-merge
+        if: steps.create-pr.outputs.pull-request-number
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr merge ${{ steps.create-pr.outputs.pull-request-number }} --squash --auto
+
+  # The beta counterpart of update-repo-xml.
+  #
+  # `upload-release` already generates `lms-beta.xml` and attaches it to the release, but a release
+  # asset URL contains the version, so it changes with every beta. An LMS user cannot subscribe to
+  # that: they would have to re-point their Additional Repositories entry at each new build, and
+  # nothing told them the channel existed. The feed was generated and then unreachable.
+  #
+  # This commits the same file to a fixed path on `v3`, so the beta channel gets a permanent URL the
+  # way the stable channel already has one via `lms-plugin/repo.xml`.
+  #
+  # It downloads the asset rather than regenerating the XML, so there is exactly one definition of
+  # the beta feed. Regenerating it here would put a second copy of the template in this file, free
+  # to drift from the one that actually ships.
+  update-beta-repo-xml:
+    name: Update LMS beta repo.xml
+    needs: [plan, upload-release]
+    if: needs.plan.outputs.is_release == 'true' && needs.plan.outputs.is_beta == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: v3
+
+      - name: Fetch the published beta feed
+        run: |
+          FEED_URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/lms-beta.xml"
+          echo "Downloading $FEED_URL"
+          curl -fSL --retry 3 --retry-delay 5 "$FEED_URL" -o lms-plugin/repo-beta.xml
+
+          # A GitHub error page is still a 200 from some proxies; refuse anything that is not the
+          # feed rather than committing a broken repository file that LMS would choke on.
+          if ! grep -q '<plugin name="UnifiedHiFi"' lms-plugin/repo-beta.xml; then
+            echo "Downloaded file is not an LMS plugin feed:"
+            head -20 lms-plugin/repo-beta.xml
+            exit 1
+          fi
+          cat lms-plugin/repo-beta.xml
+
+      - name: Create PR for LMS beta feed update
+        id: create-pr
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: Point LMS beta feed at v${{ needs.plan.outputs.version }}"
+          title: "chore: Point LMS beta feed at v${{ needs.plan.outputs.version }}"
+          body: "Auto-generated. Updates `lms-plugin/repo-beta.xml` so the beta repository URL serves v${{ needs.plan.outputs.version }}."
+          branch: chore/lms-beta-feed-${{ needs.plan.outputs.version }}
+          base: v3
+          add-paths: lms-plugin/repo-beta.xml
 
       - name: Enable auto-merge
         if: steps.create-pr.outputs.pull-request-number
