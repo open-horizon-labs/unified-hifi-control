@@ -76,6 +76,82 @@ pub struct Zone {
     pub dsp: Option<ZoneDsp>,
 }
 
+// =============================================================================
+// Zone management types (`/api/zones/visibility`, `/api/zones/order`)
+// =============================================================================
+
+/// One row of the zone management list. Unlike [`Zone`], this includes zones the user has hidden —
+/// the management view is the one place that must show them, or unhiding would be impossible.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ManagedZone {
+    pub zone_id: String,
+    /// The effective display name: the user's override when set, otherwise the provider's.
+    pub zone_name: String,
+    /// What Roon/LMS/etc. calls this zone, so a renamed zone can still be identified.
+    #[serde(default)]
+    pub provider_name: String,
+    #[serde(default)]
+    pub renamed: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+impl ManagedZone {
+    /// Name plus provider, for accessible labels. Zone names are not unique — the same room name on
+    /// two providers is common in this product — so a bare name would produce two controls with
+    /// identical accessible names and no way to tell them apart by ear.
+    pub fn qualified_label(&self) -> String {
+        format!("{} ({})", self.zone_name, source_label(&self.source))
+    }
+}
+
+/// Provider ids as people know them, matching the Features table's spelling.
+pub fn source_label(source: &str) -> &str {
+    match source {
+        "roon" => "Roon",
+        "lms" => "LMS",
+        "hqplayer" => "HQPlayer",
+        "openhome" => "OpenHome",
+        "upnp" => "UPnP",
+        other => other,
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ManagedZonesResponse {
+    pub zones: Vec<ManagedZone>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct ZoneVisibilityRequest {
+    pub zone_id: String,
+    pub hidden: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct ZoneOrderRequest {
+    pub zone_id: String,
+    pub direction: MoveDirection,
+}
+
+/// Shared with the server's `zone_list::MoveDirection`, so a typo is a compile error rather than a
+/// 422 the UI would discard.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MoveDirection {
+    Up,
+    Down,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct ZoneNameRequest {
+    pub zone_id: String,
+    /// `None` or empty clears the override and restores the provider's name.
+    pub name: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ZoneDsp {
     pub r#type: Option<String>,

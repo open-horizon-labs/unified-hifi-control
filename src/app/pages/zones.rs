@@ -261,10 +261,11 @@ pub fn Zones() -> Element {
             let source = zone.source.clone().unwrap_or_else(|| "Other".to_string());
             groups.entry(source).or_default().push(zone.clone());
         }
-        // Sort zones within each group by name for stable ordering
-        for zones in groups.values_mut() {
-            zones.sort_by(|a, b| a.zone_name.cmp(&b.zone_name));
-        }
+        // No sort here. `/zones` arrives already ordered by `crate::zone_list` -- the user's
+        // explicit order, then alphabetical -- and grouping preserves the relative order of what it
+        // is handed. Re-sorting locally would override the order the user set in Settings, and the
+        // byte-order `zone_name.cmp` this replaced also disagreed with the server's
+        // case-insensitive sort, putting `kitchen` after `Zone` on this page alone.
         // Sort groups in a sensible order: Roon, LMS, OpenHome, UPnP, then others
         let priority = |s: &str| -> i32 {
             match s.to_lowercase().as_str() {

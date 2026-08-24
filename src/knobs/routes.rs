@@ -123,13 +123,14 @@ pub async fn knob_zones_handler(
     Json(ZonesResponse { zones })
 }
 
-/// Helper to aggregate zones from aggregator (respects adapter settings, public for UI module)
+/// Helper to aggregate zones from aggregator (public for UI module).
+///
+/// Membership and order come from [`crate::zone_list::visible_zones`] — adapter settings, the
+/// user's per-zone hide list, and a deterministic sort. This function's remaining job is the
+/// `Zone` → [`ZoneInfo`] projection, which attaches HQPlayer DSP links and must preserve the order
+/// it is handed.
 pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
-    use crate::api::load_app_settings;
     use std::collections::HashMap;
-
-    let settings = load_app_settings();
-    let adapters = settings.adapters;
 
     // Get HQPlayer zone links for DSP field population
     let hqp_links: HashMap<String, String> = state
@@ -161,32 +162,10 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
         })
     };
 
-    // Get all zones from aggregator (already prefixed with source:)
-    let all_zones = state.aggregator.get_zones().await;
-
-    // Filter by enabled adapters and convert to ZoneInfo
-    all_zones
+    // Filtered (adapter settings + hide list) and sorted by the shared policy.
+    crate::zone_list::visible_zones(state)
+        .await
         .into_iter()
-        .filter(|z| {
-            // Filter based on adapter settings
-            if z.zone_id.starts_with("roon:") {
-                adapters.roon
-            } else if z.zone_id.starts_with("lms:") {
-                adapters.lms
-            } else if z.zone_id.starts_with("openhome:") {
-                adapters.openhome
-            } else if z.zone_id.starts_with("upnp:") {
-                adapters.upnp
-            } else if z.zone_id.starts_with("hqplayer:") {
-                // `hqplayer:` is the prefix `PrefixedZoneId::hqplayer` emits and the only one
-                // HQPlayer zones ever carry. This tested `hqp:` until #328, so it never matched, and
-                // HQPlayer zones fell into the include-by-default arm below — the adapter toggle in
-                // settings silently did nothing for them.
-                adapters.hqplayer
-            } else {
-                true // Unknown prefix, include by default
-            }
-        })
         .map(|z| ZoneInfo {
             dsp: get_dsp(&z.zone_id),
             zone_id: z.zone_id,

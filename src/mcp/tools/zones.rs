@@ -58,9 +58,11 @@ pub struct HifiNowPlayingTool {
 ///
 /// [`Zone`]: crate::bus::Zone
 pub async fn zones_payload(state: &AppState) -> Vec<McpZone> {
-    state
-        .aggregator
-        .get_zones()
+    // `visible_zones`, not `aggregator.get_zones()`: an assistant should be offered the same zones,
+    // in the same order, as the web UI and the knobs. A zone the user hid is not offered here --
+    // though `hifi_play` and friends still accept its ID, since hiding declutters lists rather than
+    // withdrawing control (see `crate::zone_list`).
+    crate::zone_list::visible_zones(state)
         .await
         .into_iter()
         .map(|z| McpZone {
