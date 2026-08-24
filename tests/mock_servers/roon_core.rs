@@ -562,6 +562,11 @@ struct CoreState {
     core_id: String,
     display_name: String,
     display_version: String,
+    /// The zone subscription's `(req_id, writer)`, captured when
+    /// `subscribe_zones` completes (#509). `group_outputs`/`ungroup_outputs`
+    /// push their effect on this same subscription, mirroring a real Core --
+    /// see the `SubscribeZones` handler for why it must be this req_id.
+    zone_push: Option<(usize, Writer)>,
 }
 
 // =============================================================================
@@ -611,6 +616,7 @@ impl FakeRoonCore {
             core_id: format!("fake-core-408-{}", addr.port()),
             display_name: "Fake Roon Core".to_string(),
             display_version: "2.0.408".to_string(),
+            zone_push: None,
         }));
         let root_title = library.root_title.clone();
 
@@ -951,6 +957,48 @@ pub fn default_zone(zone_id: &str, display_name: &str) -> Value {
     })
 }
 
+/// A single-output zone with an explicit output id and grouping
+/// compatibility list (issue #509), for tests that need several distinct
+/// zones whose outputs can (or deliberately cannot) be grouped together.
+/// `default_zone` above always derives `"{zone_id}_output"` and leaves
+/// `can_group_with_output_ids` empty, which cannot express either.
+pub fn zone_with_grouping(
+    zone_id: &str,
+    display_name: &str,
+    output_id: &str,
+    can_group_with_output_ids: &[&str],
+) -> Value {
+    json!({
+        "zone_id": zone_id,
+        "display_name": display_name,
+        "state": "stopped",
+        "is_next_allowed": true,
+        "is_previous_allowed": true,
+        "is_pause_allowed": false,
+        "is_play_allowed": true,
+        "is_seek_allowed": false,
+        "queue_items_remaining": 0,
+        "queue_time_remaining": 0,
+        "now_playing": null,
+        "settings": { "loop": "disabled", "shuffle": false, "auto_radio": false },
+        "outputs": [{
+            "output_id": output_id,
+            "zone_id": zone_id,
+            "can_group_with_output_ids": can_group_with_output_ids,
+            "display_name": display_name,
+            "source_controls": null,
+            "volume": {
+                "type": "number",
+                "min": 0.0,
+                "max": 100.0,
+                "value": 50.0,
+                "step": 1.0,
+                "is_muted": false
+            }
+        }]
+    })
+}
+
 // =============================================================================
 // MOO framing
 // =============================================================================
@@ -1186,6 +1234,14 @@ async fn handle_request(
         }
         RequestKind::SubscribeZones => {
             let body = json!({ "zones": core.read().await.zones.clone() });
+            // Remember this request id and connection so group_outputs /
+            // ungroup_outputs (#509) can push a later `CONTINUE Changed` on
+            // the same subscription -- exactly how a real Core reports the
+            // effect of grouping, per the fork's own `parse_msg`
+            // (`transport.rs:457-484`): it only recognises `zones_changed` /
+            // `zones_added` / `zones_removed` arriving on the *subscription's*
+            // `req_id`, not a fresh one.
+            core.write().await.zone_push = Some((req_id, writer.clone()));
             // FROM FORK: transport.rs:479 accepts name "Subscribed"; a
             // subscription stays open, hence CONTINUE.
             respond(
@@ -1203,6 +1259,8 @@ async fn handle_request(
         }
         RequestKind::Browse => handle_browse(req_id, &body, &core, &writer, &root_title).await,
         RequestKind::Load => handle_load(req_id, &body, &core, &writer).await,
+        RequestKind::GroupOutputs => handle_group_outputs(req_id, &body, &core, &writer).await,
+        RequestKind::UngroupOutputs => handle_ungroup_outputs(req_id, &body, &core, &writer).await,
         RequestKind::Unknown => {
             // Mirrors the fork's own reply to an unknown service (lib.rs:588-592).
             // FROM ROONLABS' PUBLISHED API: `InvalidRequest` with an `error` string
@@ -1232,6 +1290,8 @@ enum RequestKind {
     Browse,
     Load,
     Ping,
+    GroupOutputs,
+    UngroupOutputs,
     Unknown,
 }
 
@@ -1245,6 +1305,9 @@ impl RequestKind {
             "com.roonlabs.browse:1/browse" => Self::Browse,
             "com.roonlabs.browse:1/load" => Self::Load,
             "com.roonlabs.ping:1/ping" => Self::Ping,
+            // FROM FORK: transport.rs:334,343 -- both send only `output_ids`.
+            "com.roonlabs.transport:2/group_outputs" => Self::GroupOutputs,
+            "com.roonlabs.transport:2/ungroup_outputs" => Self::UngroupOutputs,
             _ => Self::Unknown,
         }
     }
@@ -1496,6 +1559,231 @@ async fn handle_load(req_id: usize, body: &Value, core: &Arc<RwLock<CoreState>>,
     // FROM FORK: browse.rs:93-98 LoadResult { items, offset, list } — all required.
     let body = json!({ "items": items, "offset": offset, "list": list });
     respond(core, writer, "COMPLETE", "Success", req_id, Some(&body)).await;
+}
+
+// =============================================================================
+// Grouping: group_outputs / ungroup_outputs (issue #509)
+// =============================================================================
+//
+// FROM FORK: `transport.rs:334-350` sends only `{"output_ids": [...]}` and
+// reads no reply body at all -- `Transport::group_outputs`/`ungroup_outputs`
+// return the raw `Option<usize>` request id, not a parsed result. So the
+// client observes the *effect* of grouping only through the zone
+// subscription's `Changed` push, exactly like every other Roon transport
+// write in this fake (`control`, `mute`, `change_volume` get the same
+// body-less `COMPLETE Success`). This fake's own zone-merge/split semantics
+// below are a simplified model, not a documented Core behavior: real Roon's
+// exact index/ordering rules for a merged zone's `outputs` list are
+// unpublished. What is load-bearing is that a merge (a) keeps the leader's
+// zone_id, (b) unions the outputs, and (c) retires any source zone left with
+// none -- which is exactly what issue #509's acceptance criteria describe.
+
+async fn handle_group_outputs(req_id: usize, body: &Value, core: &Arc<RwLock<CoreState>>, writer: &Writer) {
+    let output_ids = string_array(body, "output_ids");
+    respond(core, writer, "COMPLETE", "Success", req_id, None).await;
+
+    let (merge, push) = {
+        let mut state = core.write().await;
+        let merge = merge_zone_outputs(&mut state.zones, &output_ids);
+        (merge, state.zone_push.clone())
+    };
+    let Some((merged_zone, removed_zone_ids)) = merge else {
+        return;
+    };
+    if let Some((sub_req_id, sub_writer)) = push {
+        let mut change = json!({ "zones_changed": [merged_zone] });
+        if !removed_zone_ids.is_empty() {
+            change["zones_removed"] = json!(removed_zone_ids);
+        }
+        send(&sub_writer, "CONTINUE", "Changed", sub_req_id, Some(&change)).await;
+    }
+}
+
+async fn handle_ungroup_outputs(
+    req_id: usize,
+    body: &Value,
+    core: &Arc<RwLock<CoreState>>,
+    writer: &Writer,
+) {
+    let output_ids = string_array(body, "output_ids");
+    respond(core, writer, "COMPLETE", "Success", req_id, None).await;
+
+    let (changed, added, removed, push) = {
+        let mut state = core.write().await;
+        let (changed, added, removed) = split_zone_outputs(&mut state.zones, &output_ids);
+        (changed, added, removed, state.zone_push.clone())
+    };
+    if changed.is_empty() && added.is_empty() && removed.is_empty() {
+        return;
+    }
+    if let Some((sub_req_id, sub_writer)) = push {
+        let mut zones_changed = changed;
+        zones_changed.extend(added);
+        let mut change = json!({});
+        if !zones_changed.is_empty() {
+            change["zones_changed"] = json!(zones_changed);
+        }
+        if !removed.is_empty() {
+            change["zones_removed"] = json!(removed);
+        }
+        send(&sub_writer, "CONTINUE", "Changed", sub_req_id, Some(&change)).await;
+    }
+}
+
+fn string_array(body: &Value, field: &str) -> Vec<String> {
+    body.get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `(zone index, output index)` of the zone currently holding `output_id`.
+fn zone_output_index(zones: &[Value], output_id: &str) -> Option<(usize, usize)> {
+    zones.iter().enumerate().find_map(|(zi, zone)| {
+        let outs = zone.get("outputs")?.as_array()?;
+        let oi = outs
+            .iter()
+            .position(|o| o.get("output_id").and_then(Value::as_str) == Some(output_id))?;
+        Some((zi, oi))
+    })
+}
+
+/// Merge every output in `output_ids` into the zone holding the first id.
+/// Returns the merged zone's full JSON and the zone_ids of any source zones
+/// that lost their last output and were retired as a result. `None` when
+/// there was nothing to merge (the leader output was not found, or every
+/// other requested output already belongs to the leader's zone).
+fn merge_zone_outputs(zones: &mut Vec<Value>, output_ids: &[String]) -> Option<(Value, Vec<String>)> {
+    let leader_output_id = output_ids.first()?;
+    let (leader_zi, _) = zone_output_index(zones, leader_output_id)?;
+    let leader_zone_id = zones[leader_zi]["zone_id"].as_str()?.to_string();
+
+    let mut moved_from = Vec::new();
+    let mut moved_outputs = Vec::new();
+    for output_id in &output_ids[1..] {
+        let Some((zi, _)) = zone_output_index(zones, output_id) else {
+            continue;
+        };
+        if zi == leader_zi {
+            continue; // already part of the leader's zone
+        }
+        let outs = zones[zi]["outputs"].as_array_mut()?;
+        let Some(pos) = outs
+            .iter()
+            .position(|o| o["output_id"].as_str() == Some(output_id.as_str()))
+        else {
+            continue;
+        };
+        let mut out = outs.remove(pos);
+        out["zone_id"] = json!(leader_zone_id);
+        moved_from.push(zi);
+        moved_outputs.push(out);
+    }
+    if moved_outputs.is_empty() {
+        return None;
+    }
+
+    // Retire any source zone that lost its last output. Removing in
+    // descending index order keeps the remaining indices (including
+    // `leader_zi`, adjusted below) valid.
+    let mut emptied: Vec<usize> = moved_from;
+    emptied.sort_unstable();
+    emptied.dedup();
+    let mut removed_zone_ids = Vec::new();
+    let mut leader_zi = leader_zi;
+    for zi in emptied.into_iter().rev() {
+        if zones[zi]["outputs"]
+            .as_array()
+            .is_some_and(|outs| outs.is_empty())
+        {
+            removed_zone_ids.push(zones[zi]["zone_id"].as_str().unwrap_or_default().to_string());
+            zones.remove(zi);
+            if zi < leader_zi {
+                leader_zi -= 1;
+            }
+        }
+    }
+
+    let leader_outputs = zones[leader_zi]["outputs"].as_array_mut()?;
+    leader_outputs.extend(moved_outputs);
+
+    Some((zones[leader_zi].clone(), removed_zone_ids))
+}
+
+/// Pull every output in `output_ids` out of its current zone into its own
+/// standalone zone. Returns `(zones_changed, zones_added, zones_removed)`:
+/// a source zone that keeps at least one output after losing this one is
+/// `zones_changed`; a source zone left empty is retired into `zones_removed`.
+/// An output already alone in its zone is left untouched (not returned in
+/// any of the three).
+fn split_zone_outputs(
+    zones: &mut Vec<Value>,
+    output_ids: &[String],
+) -> (Vec<Value>, Vec<Value>, Vec<String>) {
+    let mut zones_changed = Vec::new();
+    let mut zones_added = Vec::new();
+    let mut zones_removed = Vec::new();
+
+    for output_id in output_ids {
+        let Some((zi, _)) = zone_output_index(zones, output_id) else {
+            continue;
+        };
+        let output_count = zones[zi]["outputs"].as_array().map_or(0, Vec::len);
+        if output_count <= 1 {
+            continue; // already standalone
+        }
+        let outs = zones[zi]["outputs"].as_array_mut().unwrap();
+        let pos = outs
+            .iter()
+            .position(|o| o["output_id"].as_str() == Some(output_id.as_str()))
+            .unwrap();
+        let mut out = outs.remove(pos);
+
+        let new_zone_id = format!("ungrouped-{output_id}");
+        out["zone_id"] = json!(new_zone_id);
+        let new_zone = standalone_zone_from_output(&new_zone_id, out);
+        zones.push(new_zone.clone());
+        zones_added.push(new_zone);
+
+        if zones[zi]["outputs"].as_array().unwrap().is_empty() {
+            zones_removed.push(zones[zi]["zone_id"].as_str().unwrap_or_default().to_string());
+        } else {
+            zones_changed.push(zones[zi].clone());
+        }
+    }
+    if !zones_removed.is_empty() {
+        zones.retain(|z| {
+            !zones_removed.contains(&z["zone_id"].as_str().unwrap_or_default().to_string())
+        });
+    }
+    (zones_changed, zones_added, zones_removed)
+}
+
+/// Build a minimal, fully-populated standalone zone (every field
+/// `roon_api`'s `transport::Zone` requires, same as [`default_zone`]) around
+/// one output that just left a group.
+fn standalone_zone_from_output(zone_id: &str, output: Value) -> Value {
+    json!({
+        "zone_id": zone_id,
+        "display_name": output["display_name"],
+        "state": "stopped",
+        "is_next_allowed": true,
+        "is_previous_allowed": true,
+        "is_pause_allowed": false,
+        "is_play_allowed": true,
+        "is_seek_allowed": false,
+        "queue_items_remaining": 0,
+        "queue_time_remaining": 0,
+        "now_playing": null,
+        "settings": { "loop": "disabled", "shuffle": false, "auto_radio": false },
+        "outputs": [output],
+    })
 }
 
 fn current_list(state: &CoreState, session_key: &str) -> Value {
