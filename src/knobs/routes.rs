@@ -1248,6 +1248,25 @@ pub async fn knob_devices_handler(State(state): State<AppState>) -> Json<serde_j
     Json(serde_json::json!({ "knobs": knobs }))
 }
 
+/// DELETE /knob/devices/{knob_id} - Remove a registered knob (admin)
+///
+/// Callers that publish Home Assistant discovery for knobs (#523) observe
+/// this via the knob no longer appearing in the store and are responsible
+/// for retracting any retained discovery configs they previously published.
+pub async fn knob_remove_handler(
+    State(state): State<AppState>,
+    axum::extract::Path(knob_id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if state.knobs.remove(&knob_id).await {
+        Ok(Json(serde_json::json!({ "ok": true })))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "knob not found"})),
+        ))
+    }
+}
+
 /// GET /config/{knob_id} - Get knob configuration (path parameter format)
 pub async fn knob_config_by_path_handler(
     State(state): State<AppState>,

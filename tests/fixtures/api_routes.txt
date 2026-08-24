@@ -13,6 +13,7 @@
 # are served by Dioxus SPA router (fallback handler), not explicit Axum routes.
 # multi-line closures that the route extractor doesn't detect, and they may change
 # with build configuration.
+DELETE /knob/devices/{knob_id}
 DELETE /mcp
 GET /admin
 GET /api/bridges/applemusic/commands

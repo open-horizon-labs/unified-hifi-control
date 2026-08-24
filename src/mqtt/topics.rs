@@ -42,6 +42,10 @@ pub fn command_topic(base_topic: &str, zone_id: &str, action: &str) -> String {
 /// `<discovery_prefix>/<component>/<node_id>/<object_id>/config`, the
 /// single-entity discovery form documented at
 /// <https://www.home-assistant.io/integrations/mqtt/#discovery-topic>.
+///
+/// Also used for knob entities (#523): `zone_slug` is a generic
+/// non-alphanumeric-to-underscore slug, so it works equally well on a knob
+/// id.
 pub fn discovery_topic(
     discovery_prefix: &str,
     component: &str,
@@ -52,6 +56,19 @@ pub fn discovery_topic(
         "{discovery_prefix}/{component}/unified_hifi_control/{}_{entity_suffix}/config",
         zone_slug(zone_id)
     )
+}
+
+/// Retained JSON state topic for one knob (#523).
+///
+/// Uses the knob id, never its display name, so the topic - and every
+/// entity's `unique_id` derived from it - stays stable across a rename.
+pub fn knob_state_topic(base_topic: &str, knob_id: &str) -> String {
+    format!("{base_topic}/knob/{}/state", zone_slug(knob_id))
+}
+
+/// Command topic for one config action (`zone`, `volume_step`) on one knob.
+pub fn knob_command_topic(base_topic: &str, knob_id: &str, action: &str) -> String {
+    format!("{base_topic}/knob/{}/{action}/set", zone_slug(knob_id))
 }
 
 #[cfg(test)]
@@ -81,6 +98,18 @@ mod tests {
         assert_eq!(
             discovery_topic("homeassistant", "sensor", "roon:abc", "state"),
             "homeassistant/sensor/unified_hifi_control/roon_abc_state/config"
+        );
+    }
+
+    #[test]
+    fn knob_topics_are_namespaced_under_base_topic() {
+        assert_eq!(
+            knob_state_topic("unified-hifi", "aabbccddeeff"),
+            "unified-hifi/knob/aabbccddeeff/state"
+        );
+        assert_eq!(
+            knob_command_topic("unified-hifi", "aabbccddeeff", "zone"),
+            "unified-hifi/knob/aabbccddeeff/zone/set"
         );
     }
 }

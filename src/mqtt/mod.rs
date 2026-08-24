@@ -16,13 +16,27 @@
 //! [`discovery`]'s module doc), so one UHC zone is represented as a small
 //! HA device composed of a state `sensor`, an `image`, a volume `number`,
 //! a mute `switch`, and up to four transport `button`s.
+//!
+//! Control devices ("knobs") are published the same way (#523), but every
+//! entity they need - `sensor`, `binary_sensor`, `select`, `number` - is
+//! natively supported by HA MQTT discovery, so [`knob_discovery`] needs no
+//! workaround composition. Unlike zones, the knob store has no bus events
+//! of its own (battery/last-seen updates land via HTTP polls from the
+//! device, not the zone bus), so knob state is re-published on a fixed
+//! timer (see `run`'s `knob_tick`) rather than driven by [`BusEvent`]s -
+//! zone-add/remove events still trigger an immediate re-announce so the
+//! zone-reassignment `select`'s options stay current without waiting for
+//! the next tick.
 
 pub mod command;
 pub mod discovery;
+pub mod knob_command;
+pub mod knob_discovery;
+pub mod knob_state;
 pub mod state;
 pub mod topics;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,8 +48,14 @@ use tokio_util::sync::CancellationToken;
 use crate::aggregator::ZoneAggregator;
 use crate::api::AdapterRegistry;
 use crate::bus::{BusEvent, SharedBus, Zone};
+use crate::knobs::store::Knob;
+use crate::knobs::KnobStore;
 
 pub use crate::api::credentials::MqttCredentialRecord;
+
+/// How often knob state/discovery is re-published, since the knob store has
+/// no bus events of its own to react to (see module doc).
+const KNOB_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Default namespace for state/command topics, distinct from HA's
 /// `discovery_prefix` so operators can point discovery at a shared
@@ -62,6 +82,7 @@ pub struct MqttPublisher {
     bus: SharedBus,
     aggregator: Arc<ZoneAggregator>,
     adapter_registry: Arc<AdapterRegistry>,
+    knobs: KnobStore,
     base_url: std::sync::RwLock<String>,
     runtime: Mutex<Runtime>,
 }
@@ -87,11 +108,13 @@ impl MqttPublisher {
         bus: SharedBus,
         aggregator: Arc<ZoneAggregator>,
         adapter_registry: Arc<AdapterRegistry>,
+        knobs: KnobStore,
     ) -> Self {
         Self {
             bus,
             aggregator,
             adapter_registry,
+            knobs,
             base_url: std::sync::RwLock::new(String::new()),
             runtime: Mutex::new(Runtime::default()),
         }
@@ -167,6 +190,7 @@ impl MqttPublisher {
             self.bus.clone(),
             self.aggregator.clone(),
             self.adapter_registry.clone(),
+            self.knobs.clone(),
             self.base_url_snapshot(),
             shutdown.clone(),
         ));
@@ -312,6 +336,99 @@ async fn retract_zone(client: &AsyncClient, record: &MqttCredentialRecord, zone_
     }
 }
 
+/// Publish HA discovery configs and the retained state topic for one knob.
+async fn publish_knob(
+    client: &AsyncClient,
+    record: &MqttCredentialRecord,
+    knob_id: &str,
+    knob: &Knob,
+    zone_ids: &[String],
+    availability_topic: &str,
+) {
+    let settings = knob_discovery::KnobDiscoverySettings {
+        base_topic: &record.base_topic,
+        discovery_prefix: &record.discovery_prefix,
+        availability_topic,
+    };
+    for (topic, payload) in knob_discovery::discovery_entries(knob_id, knob, zone_ids, &settings) {
+        match serde_json::to_vec(&payload) {
+            Ok(json) => {
+                if let Err(error) = client.publish(topic, QoS::AtLeastOnce, true, json).await {
+                    tracing::warn!("MQTT knob discovery publish failed: {error}");
+                }
+            }
+            Err(error) => {
+                tracing::warn!("failed to serialize MQTT knob discovery payload: {error}")
+            }
+        }
+    }
+
+    let payload = knob_state::build_state_payload(knob, chrono::Utc::now());
+    match serde_json::to_vec(&payload) {
+        Ok(json) => {
+            let topic = topics::knob_state_topic(&record.base_topic, knob_id);
+            if let Err(error) = client.publish(topic, QoS::AtLeastOnce, true, json).await {
+                tracing::warn!("MQTT knob state publish failed: {error}");
+            }
+        }
+        Err(error) => tracing::warn!("failed to serialize MQTT knob state payload: {error}"),
+    }
+}
+
+/// Clear every retained discovery/state topic a removed knob could have had.
+async fn retract_knob(client: &AsyncClient, record: &MqttCredentialRecord, knob_id: &str) {
+    for topic in knob_discovery::discovery_topics_for_removal(&record.discovery_prefix, knob_id) {
+        if let Err(error) = client.publish(topic, QoS::AtLeastOnce, true, Vec::new()).await {
+            tracing::warn!("MQTT knob discovery retraction failed: {error}");
+        }
+    }
+    let topic = topics::knob_state_topic(&record.base_topic, knob_id);
+    if let Err(error) = client.publish(topic, QoS::AtLeastOnce, true, Vec::new()).await {
+        tracing::warn!("MQTT knob state retraction failed: {error}");
+    }
+}
+
+/// Republish discovery + state for every knob currently known to the store,
+/// retracting any knob that has disappeared since the last call. Refreshes
+/// `knob_slugs` (used to route inbound commands) and returns the current
+/// zone id list so the caller can decide whether it changed.
+async fn announce_all_knobs(
+    client: &AsyncClient,
+    record: &MqttCredentialRecord,
+    knobs: &KnobStore,
+    aggregator: &ZoneAggregator,
+    availability_topic: &str,
+    known_knob_ids: &mut HashSet<String>,
+    knob_slugs: &mut HashMap<String, String>,
+) {
+    let zone_ids: Vec<String> = aggregator
+        .get_zones()
+        .await
+        .into_iter()
+        .map(|zone| zone.zone_id)
+        .collect();
+
+    let current = knobs.list_full().await;
+    let current_ids: HashSet<String> = current.iter().map(|(id, _)| id.clone()).collect();
+
+    for removed_id in known_knob_ids.difference(&current_ids).cloned().collect::<Vec<_>>() {
+        knob_slugs.remove(&topics::zone_slug(&removed_id));
+        retract_knob(client, record, &removed_id).await;
+    }
+
+    for (knob_id, knob) in &current {
+        knob_slugs.insert(topics::zone_slug(knob_id), knob_id.clone());
+        publish_knob(client, record, knob_id, knob, &zone_ids, availability_topic).await;
+    }
+
+    *known_knob_ids = current_ids;
+
+    let command_filter = format!("{}/knob/+/+/set", record.base_topic);
+    if let Err(error) = client.subscribe(command_filter, QoS::AtLeastOnce).await {
+        tracing::warn!("MQTT knob command subscription failed: {error}");
+    }
+}
+
 /// Republish discovery + state for every zone currently known to the
 /// aggregator, refreshing the slug -> zone id map used to route inbound
 /// commands. Called on every fresh broker connection, since a new session
@@ -344,29 +461,65 @@ async fn announce_all_zones(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_bus_event(
     client: &AsyncClient,
     record: &MqttCredentialRecord,
     aggregator: &ZoneAggregator,
+    knobs: &KnobStore,
     base_url: &str,
     availability_topic: &str,
     zone_slugs: &mut HashMap<String, String>,
+    known_knob_ids: &mut HashSet<String>,
+    knob_slugs: &mut HashMap<String, String>,
     event: BusEvent,
 ) {
     match event {
         BusEvent::ZoneDiscovered { zone } => {
             zone_slugs.insert(topics::zone_slug(&zone.zone_id), zone.zone_id.clone());
             publish_zone(client, record, &zone, base_url, availability_topic).await;
+            // A newly discovered zone changes every knob's zone-select
+            // options, so re-announce them too.
+            announce_all_knobs(
+                client,
+                record,
+                knobs,
+                aggregator,
+                availability_topic,
+                known_knob_ids,
+                knob_slugs,
+            )
+            .await;
         }
         BusEvent::ZoneRemoved { zone_id } => {
             zone_slugs.remove(&topics::zone_slug(zone_id.as_str()));
             retract_zone(client, record, zone_id.as_str()).await;
+            announce_all_knobs(
+                client,
+                record,
+                knobs,
+                aggregator,
+                availability_topic,
+                known_knob_ids,
+                knob_slugs,
+            )
+            .await;
         }
         BusEvent::ZonesFlushed { zone_ids, .. } => {
             for zone_id in zone_ids {
                 zone_slugs.remove(&topics::zone_slug(&zone_id));
                 retract_zone(client, record, &zone_id).await;
             }
+            announce_all_knobs(
+                client,
+                record,
+                knobs,
+                aggregator,
+                availability_topic,
+                known_knob_ids,
+                knob_slugs,
+            )
+            .await;
         }
         BusEvent::ZoneUpdated { zone_id, .. }
         | BusEvent::NowPlayingChanged { zone_id, .. }
@@ -394,9 +547,30 @@ async fn handle_bus_event(
 async fn handle_incoming_publish(
     record: &MqttCredentialRecord,
     adapter_registry: &Arc<AdapterRegistry>,
+    knobs: &KnobStore,
     zone_slugs: &HashMap<String, String>,
+    knob_slugs: &HashMap<String, String>,
     publish: &rumqttc::Publish,
 ) {
+    if let Some((slug, action)) = knob_command::parse_command_topic(&record.base_topic, &publish.topic) {
+        let Some(knob_id) = knob_slugs.get(slug) else {
+            tracing::debug!(slug, "MQTT command for unknown knob slug; ignoring");
+            return;
+        };
+        let payload = String::from_utf8_lossy(&publish.payload);
+        let Some(parsed) = knob_command::parse_action(action, &payload) else {
+            tracing::debug!(topic = %publish.topic, "MQTT knob command topic had an unrecognized action or payload");
+            return;
+        };
+        match knob_command::dispatch(knobs, knob_id, parsed).await {
+            knob_command::DispatchOutcome::Applied => {}
+            knob_command::DispatchOutcome::KnobNotFound => {
+                tracing::warn!(knob_id, "MQTT knob command refused: knob not found");
+            }
+        }
+        return;
+    }
+
     let Some((slug, action)) = command::parse_command_topic(&record.base_topic, &publish.topic)
     else {
         return;
@@ -433,6 +607,7 @@ async fn run(
     bus: SharedBus,
     aggregator: Arc<ZoneAggregator>,
     adapter_registry: Arc<AdapterRegistry>,
+    knobs: KnobStore,
     base_url: String,
     shutdown: CancellationToken,
 ) {
@@ -441,6 +616,23 @@ async fn run(
     let (client, mut eventloop) = AsyncClient::new(options, 64);
     let mut bus_rx = bus.subscribe();
     let mut zone_slugs: HashMap<String, String> = HashMap::new();
+    let mut known_knob_ids: HashSet<String> = HashSet::new();
+    let mut knob_slugs: HashMap<String, String> = HashMap::new();
+    // The knob store has no bus events of its own (see module doc) - poll
+    // it on a fixed timer instead so battery/last-seen changes still reach
+    // Home Assistant. `interval_at` (rather than `interval`) skips firing
+    // immediately: the `ConnAck` handler below already announces knobs on
+    // every fresh connection, and firing a tick before the client has even
+    // connected would queue a knob command subscribe ahead of the
+    // publisher's own CONNECT - observed to trip a spurious reconnect (the
+    // broker treats the second CONNECT with the same client id as replacing
+    // a live session and fires that session's LWT) that briefly retains
+    // "offline" before the publisher's real "online" lands.
+    let mut knob_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + KNOB_POLL_INTERVAL,
+        KNOB_POLL_INTERVAL,
+    );
+    knob_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -463,10 +655,27 @@ async fn run(
                             &mut zone_slugs,
                         )
                         .await;
+                        announce_all_knobs(
+                            &client,
+                            &record,
+                            &knobs,
+                            &aggregator,
+                            &availability_topic,
+                            &mut known_knob_ids,
+                            &mut knob_slugs,
+                        )
+                        .await;
                     }
                     Ok(Event::Incoming(Packet::Publish(publish))) => {
-                        handle_incoming_publish(&record, &adapter_registry, &zone_slugs, &publish)
-                            .await;
+                        handle_incoming_publish(
+                            &record,
+                            &adapter_registry,
+                            &knobs,
+                            &zone_slugs,
+                            &knob_slugs,
+                            &publish,
+                        )
+                        .await;
                     }
                     Ok(_) => {}
                     Err(error) => {
@@ -482,9 +691,12 @@ async fn run(
                             &client,
                             &record,
                             &aggregator,
+                            &knobs,
                             &base_url,
                             &availability_topic,
                             &mut zone_slugs,
+                            &mut known_knob_ids,
+                            &mut knob_slugs,
                             event,
                         )
                         .await;
@@ -503,9 +715,31 @@ async fn run(
                             &mut zone_slugs,
                         )
                         .await;
+                        announce_all_knobs(
+                            &client,
+                            &record,
+                            &knobs,
+                            &aggregator,
+                            &availability_topic,
+                            &mut known_knob_ids,
+                            &mut knob_slugs,
+                        )
+                        .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+            }
+            _ = knob_tick.tick() => {
+                announce_all_knobs(
+                    &client,
+                    &record,
+                    &knobs,
+                    &aggregator,
+                    &availability_topic,
+                    &mut known_knob_ids,
+                    &mut knob_slugs,
+                )
+                .await;
             }
         }
     }
