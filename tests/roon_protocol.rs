@@ -30,7 +30,9 @@ mod mock_servers;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mock_servers::roon_core::{album, FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope};
+use mock_servers::roon_core::{
+    album, zone_with_grouping, FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
+};
 use roon_api::browse::{BrowseOpts, LoadOpts};
 use unified_hifi_control::adapters::roon::{PlayAction, RoonAdapter, SearchSource};
 use unified_hifi_control::bus::create_bus;
@@ -1602,6 +1604,216 @@ async fn a_shared_session_key_is_one_level_stack_however_well_results_correlate(
         Some(&here.list.title),
         levels.last(),
         "a following load pages the level that landed last, whoever asked for it"
+    );
+
+    core.stop().await;
+}
+
+// =============================================================================
+// Multiroom grouping: group_outputs / ungroup_outputs (issue #509)
+// =============================================================================
+//
+// Roon confirms grouping asynchronously through the ordinary zone
+// subscription (`RoonAdapter::set_group_members`'s own docs explain why), so
+// these tests poll `RoonAdapter::get_zones` rather than asserting on the
+// instant `set_group_members`/`ungroup_members` return.
+
+/// Poll `RoonAdapter::get_zones` until it reports exactly `expected` zones or
+/// a bound is hit, then return the last observation either way -- so a
+/// failing assertion downstream shows what actually arrived instead of just
+/// "timed out".
+async fn wait_for_zone_count(
+    adapter: &RoonAdapter,
+    expected: usize,
+) -> Vec<unified_hifi_control::adapters::roon::Zone> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let zones = adapter.get_zones().await;
+        if zones.len() == expected || Instant::now() >= deadline {
+            return zones;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn roon_multiroom_status_reports_no_groups_for_single_output_zones() {
+    let core = FakeRoonCore::start().await;
+    core.set_zones(vec![
+        zone_with_grouping("zone_a", "Living Room", "output_a", &["output_b"]),
+        zone_with_grouping("zone_b", "Kitchen", "output_b", &["output_a"]),
+    ])
+    .await;
+    let adapter = connected(&core).await;
+    // `connected()` only waits for Browse to register; the zone subscription
+    // it triggers as a side effect can still be in flight, so wait for both
+    // configured zones to have actually arrived before trusting the status
+    // below to mean anything.
+    wait_for_zone_count(&adapter, 2).await;
+
+    let status = adapter.multiroom_status().await.unwrap();
+    assert_eq!(
+        status["groups"].as_array().unwrap().len(),
+        0,
+        "no zone has more than one output yet"
+    );
+
+    core.stop().await;
+}
+
+#[tokio::test]
+async fn roon_set_group_members_merges_outputs_into_one_zone() {
+    let core = FakeRoonCore::start().await;
+    core.set_zones(vec![
+        zone_with_grouping("zone_a", "Living Room", "output_a", &["output_b"]),
+        zone_with_grouping("zone_b", "Kitchen", "output_b", &["output_a"]),
+    ])
+    .await;
+    let adapter = connected(&core).await;
+    // See the status test above: wait for both zones before grouping them.
+    wait_for_zone_count(&adapter, 2).await;
+
+    adapter
+        .set_group_members("roon:zone_a", &["roon:zone_b".to_string()], &[])
+        .await
+        .expect("set_group_members should succeed");
+
+    // Merging is confirmed asynchronously (the Core's `group_outputs` handler
+    // runs in its own spawned task, and the merge itself is only visible once
+    // its zone push round-trips back to the adapter), so wait for that before
+    // inspecting either the wire log or the adapter's own zone state.
+    let zones = wait_for_zone_count(&adapter, 1).await;
+    assert_eq!(
+        zones.len(),
+        1,
+        "the two zones merge into one once the Core's push arrives"
+    );
+
+    // The wire request the Core actually saw: `group_outputs` addressed by
+    // output id, leader first, exactly as `Transport::group_outputs`
+    // (`transport.rs:334-341`) sends it.
+    let group_requests: Vec<_> = core
+        .requests()
+        .await
+        .into_iter()
+        .filter(|r| r.name == "com.roonlabs.transport:2/group_outputs")
+        .collect();
+    assert_eq!(group_requests.len(), 1, "exactly one group_outputs call");
+    assert_eq!(
+        group_requests[0].body["output_ids"],
+        serde_json::json!(["output_a", "output_b"])
+    );
+    let merged = &zones[0];
+    assert_eq!(merged.zone_id, "zone_a", "the leader's zone_id survives");
+    let mut output_ids: Vec<&str> = merged.outputs.iter().map(|o| o.output_id.as_str()).collect();
+    output_ids.sort_unstable();
+    assert_eq!(output_ids, vec!["output_a", "output_b"]);
+
+    let status = adapter.multiroom_status().await.unwrap();
+    let groups = status["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "the merged zone reports as one group");
+    assert_eq!(groups[0]["leader_zone_id"], serde_json::json!("roon:zone_a"));
+    assert_eq!(
+        groups[0]["member_zone_ids"],
+        serde_json::json!(["roon:output_b"]),
+        "member zone_a was retired, so the surviving member is named by output id"
+    );
+
+    core.stop().await;
+}
+
+#[tokio::test]
+async fn roon_ungroup_members_splits_outputs_back_into_separate_zones() {
+    let core = FakeRoonCore::start().await;
+    core.set_zones(vec![
+        zone_with_grouping("zone_a", "Living Room", "output_a", &["output_b"]),
+        zone_with_grouping("zone_b", "Kitchen", "output_b", &["output_a"]),
+    ])
+    .await;
+    let adapter = connected(&core).await;
+    wait_for_zone_count(&adapter, 2).await;
+
+    adapter
+        .set_group_members("roon:zone_a", &["roon:zone_b".to_string()], &[])
+        .await
+        .expect("initial grouping should succeed");
+    wait_for_zone_count(&adapter, 1).await;
+
+    adapter
+        .ungroup_members(&["roon:output_b".to_string()])
+        .await
+        .expect("ungroup_members should succeed");
+
+    // See the merge test above for why this waits before inspecting either
+    // the wire log or the adapter's own zone state.
+    let zones = wait_for_zone_count(&adapter, 2).await;
+    assert_eq!(
+        zones.len(),
+        2,
+        "output_b splits back into its own zone once the Core's push arrives"
+    );
+
+    let ungroup_requests: Vec<_> = core
+        .requests()
+        .await
+        .into_iter()
+        .filter(|r| r.name == "com.roonlabs.transport:2/ungroup_outputs")
+        .collect();
+    assert_eq!(ungroup_requests.len(), 1, "exactly one ungroup_outputs call");
+    assert_eq!(
+        ungroup_requests[0].body["output_ids"],
+        serde_json::json!(["output_b"])
+    );
+    assert!(
+        zones.iter().all(|z| z.outputs.len() == 1),
+        "each zone is single-output again: {zones:?}"
+    );
+
+    let status = adapter.multiroom_status().await.unwrap();
+    assert_eq!(
+        status["groups"].as_array().unwrap().len(),
+        0,
+        "no zone has more than one output after the split"
+    );
+
+    core.stop().await;
+}
+
+#[tokio::test]
+async fn roon_set_group_members_refuses_mixed_protocol_outputs() {
+    let core = FakeRoonCore::start().await;
+    // Neither output lists the other as groupable -- e.g. one is RAAT and the
+    // other AirPlay. Real Roon Cores only group outputs that share a
+    // streaming protocol; `can_group_with_output_ids` is the Core's own
+    // compatibility list for exactly this.
+    core.set_zones(vec![
+        zone_with_grouping("zone_a", "Living Room", "output_a", &[]),
+        zone_with_grouping("zone_b", "Kitchen", "output_b", &[]),
+    ])
+    .await;
+    let adapter = connected(&core).await;
+    wait_for_zone_count(&adapter, 2).await;
+
+    let result = adapter
+        .set_group_members("roon:zone_a", &["roon:zone_b".to_string()], &[])
+        .await;
+
+    let error = result.expect_err("mixed-protocol grouping must be refused, not attempted");
+    let message = error.to_string();
+    assert!(
+        message.contains("protocol"),
+        "refusal should explain why, got: {message}"
+    );
+
+    let group_requests: Vec<_> = core
+        .requests()
+        .await
+        .into_iter()
+        .filter(|r| r.name == "com.roonlabs.transport:2/group_outputs")
+        .collect();
+    assert!(
+        group_requests.is_empty(),
+        "the incompatible request must never reach the Core: {group_requests:?}"
     );
 
     core.stop().await;

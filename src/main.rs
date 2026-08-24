@@ -502,6 +502,14 @@ mod server {
             .adapter_registry
             .register_library("spotify", spotify.clone())
             .await;
+        // Roon's transport commands keep going through the dedicated
+        // `state.roon` field/routes; this registration only exposes the
+        // provider-neutral content-library surface (#509's multiroom
+        // grouping operations) via `AdapterRegistry::library_content("roon", ...)`.
+        state
+            .adapter_registry
+            .register_library("roon", state.roon.clone())
+            .await;
         state.provider_auth.attach_spotify(spotify.clone()).await;
         state
             .provider_auth
