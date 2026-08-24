@@ -99,6 +99,15 @@ struct MockLmsState {
     /// `playlistcontrol` call. Keyed by [`LmsSearchResultType`]-shaped kind:
     /// `"album"`, `"artist"`, `"track"`.
     library: HashMap<&'static str, Vec<MockLibraryItem>>,
+    /// Active sync groups (#510). Each inner `Vec` is one group's full
+    /// membership, first-added player first -- mirroring what real LMS's
+    /// `syncgroups ?` reports (a flat member list with no leader marker).
+    /// This is a simplified peer model, not a full replica of LMS's
+    /// undocumented internal master-election-on-leave behavior: `sync -`
+    /// dissolves the whole group rather than promoting a new master, which is
+    /// enough to exercise the adapter's join/leave/status calls without
+    /// claiming to model LMS's internals exactly.
+    sync_groups: Vec<Vec<String>>,
 }
 
 /// Mock LMS Server
@@ -115,6 +124,7 @@ impl MockLmsServer {
             players: HashMap::new(),
             commands: Vec::new(),
             library: HashMap::new(),
+            sync_groups: Vec::new(),
         }));
 
         let app = Router::new()
@@ -232,10 +242,53 @@ impl MockLmsServer {
             .collect()
     }
 
+    /// Current sync groups, each as its full member id list (#510). Lets a
+    /// test assert on server-side membership directly, independent of how
+    /// the adapter reports it.
+    pub async fn sync_groups(&self) -> Vec<Vec<String>> {
+        self.state.read().await.sync_groups.clone()
+    }
+
     /// Stop the mock server
     pub async fn stop(self) {
         self.handle.abort();
     }
+}
+
+/// Join `member` into `master`'s sync group (#510).
+///
+/// Mirrors the live-verified behavior (issue #403): the *addressed* player
+/// (`master`) becomes/stays the sync master, and `member` joins its group.
+/// `member` is first removed from any group it was previously in.
+fn mock_sync_join(state: &mut MockLmsState, master: &str, member: &str) {
+    mock_sync_remove(state, member);
+    if let Some(group) = state
+        .sync_groups
+        .iter_mut()
+        .find(|group| group.first().map(String::as_str) == Some(master))
+    {
+        if !group.iter().any(|id| id == member) {
+            group.push(member.to_string());
+        }
+        return;
+    }
+    // `master` was not already a group's first (leader) entry. If it was a
+    // member of some other group, leaving that group first keeps this model
+    // consistent with "the addressed player becomes master".
+    mock_sync_remove(state, master);
+    state
+        .sync_groups
+        .push(vec![master.to_string(), member.to_string()]);
+}
+
+/// Remove `player` from whatever sync group it currently belongs to, if any.
+/// A group left with fewer than two members is no longer a sync group and is
+/// dropped entirely.
+fn mock_sync_remove(state: &mut MockLmsState, player: &str) {
+    for group in state.sync_groups.iter_mut() {
+        group.retain(|id| id != player);
+    }
+    state.sync_groups.retain(|group| group.len() >= 2);
 }
 
 /// JSON-RPC request format
@@ -378,6 +431,21 @@ async fn handle_jsonrpc(
                 result: json!({}),
             }));
         }
+        // `<playerid> sync <otherplayerid>` joins a group; `<playerid> sync -`
+        // leaves whatever group it is in (#510).
+        "sync" if commands.get(1).is_some() => {
+            let target = commands.get(1).and_then(Value::as_str).unwrap_or("");
+            let mut state = state.write().await;
+            if target == "-" {
+                mock_sync_remove(&mut state, player_id);
+            } else {
+                mock_sync_join(&mut state, player_id, target);
+            }
+            return Ok(Json(JsonRpcResponse {
+                id: request.id,
+                result: json!({}),
+            }));
+        }
         _ => {}
     }
 
@@ -436,6 +504,36 @@ async fn handle_jsonrpc(
         "mixer" => {
             // Volume control - return empty success
             json!({})
+        }
+        // Server-scoped `syncgroups ?` (#510): one entry per active group,
+        // with the full membership as a comma-joined id list, matching the
+        // `sync_members`/`sync_member_names` shape verified live against
+        // Lyrion 9.1.2 (issue #403's investigation).
+        "syncgroups" => {
+            let syncgroups_loop: Vec<Value> = state
+                .sync_groups
+                .iter()
+                .map(|group| {
+                    let names: Vec<String> = group
+                        .iter()
+                        .map(|id| {
+                            state
+                                .players
+                                .get(id)
+                                .map(|p| p.name.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    json!({
+                        "sync_members": group.join(","),
+                        "sync_member_names": names.join(","),
+                    })
+                })
+                .collect();
+            json!({
+                "count": syncgroups_loop.len(),
+                "syncgroups_loop": syncgroups_loop
+            })
         }
         "playlist" => {
             // Playlist control (next/prev) - return empty success
