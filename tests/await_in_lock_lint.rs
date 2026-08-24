@@ -268,6 +268,14 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "_lifecycle_guard",
         "HQPlayer manager lifecycle mutations must be serialized",
     ),
+    // Codex App Server is a line-oriented request/response conversation over one stdio pair.
+    // A complete voice turn, including one restart retry, must remain exclusive so another
+    // listener cannot consume its responses or interleave commands into the same thread.
+    (
+        "voice.rs",
+        "_conversation_guard",
+        "Kizz App Server conversations must be linearized",
+    ),
 ];
 
 fn is_allowed(file: &str, guard: &str) -> bool {
