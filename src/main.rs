@@ -582,6 +582,31 @@ mod server {
         state.startable_adapters = Arc::new(startable_adapters);
         coord.start_all_enabled(&provider_startables).await;
 
+        // Optional MQTT/Home Assistant discovery publisher (#508). A pure
+        // bus consumer with no zones of its own, so it does not join
+        // `startable_adapters`/the coordinator - just a background task
+        // this settings toggle and encrypted broker record turn on or off.
+        state.mqtt.set_base_url(base_url.clone());
+        match api::credentials::MqttCredentialStore::from_env() {
+            Ok(store) => match store.load() {
+                Ok(Some(record)) => {
+                    state.mqtt.configure(record).await;
+                    if app_settings.adapters.mqtt {
+                        state.mqtt.set_enabled(true).await;
+                    }
+                }
+                Ok(None) => {
+                    if app_settings.adapters.mqtt {
+                        tracing::info!(
+                            "MQTT publisher enabled in settings but no broker is configured yet"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!("MQTT credential record unavailable: {error}"),
+            },
+            Err(error) => tracing::warn!("MQTT credential store unavailable: {error}"),
+        }
+
         // Clone state for shutdown diagnostics
         let state_for_shutdown = state.clone();
 
@@ -609,6 +634,8 @@ mod server {
         let api_bridge_content_ack = api::apple_bridge::acknowledge_content;
         let controller_bootstrap = api::controller_auth::bootstrap;
         let controller_status = api::controller_auth::status;
+        let api_mqtt_status = api::mqtt_settings::status;
+        let api_mqtt_configure = api::mqtt_settings::configure;
         #[rustfmt::skip]
         let router = Router::new()
             // Health check
@@ -623,6 +650,9 @@ mod server {
             .route("/api/providers/{provider}/configure", post(api_provider_configure))
             .route("/api/providers/spotify/account", get(api_spotify_account))
             .route("/api/providers/musicassistant/status", get(api_musicassistant_status))
+            // MQTT/Home Assistant discovery publisher settings (#508)
+            .route("/api/mqtt/status", get(api_mqtt_status))
+            .route("/api/mqtt/configure", post(api_mqtt_configure))
             .route("/api/bridges/applemusic/pair", post(api_bridge_pair))
             .route("/api/bridges/applemusic/discover", post(api_bridge_discover_pairing))
             .route("/api/bridges/applemusic/claim", post(api_bridge_claim))
@@ -934,6 +964,10 @@ mod server {
 
         // Stop every adapter through the coordinator-owned lifecycle list.
         coord.stop_all(&state_for_shutdown.startable_adapters).await;
+        // MQTT is not in that list (see its wiring above) - stop it
+        // explicitly so it publishes "offline" rather than relying solely
+        // on the broker noticing a dropped TCP connection via the LWT.
+        state_for_shutdown.mqtt.shutdown().await;
         if let Some(ref fw) = firmware_service {
             fw.stop();
         }

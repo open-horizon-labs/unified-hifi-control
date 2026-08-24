@@ -39,6 +39,7 @@ use tokio_util::sync::CancellationToken;
 pub mod apple_bridge;
 pub mod controller_auth;
 pub mod credentials;
+pub mod mqtt_settings;
 pub mod provider_auth;
 
 const MAX_REMOTE_ARTWORK_BYTES: usize = 10 * 1024 * 1024;
@@ -300,6 +301,10 @@ pub struct AppState {
     pub apple_feedback: crate::mcp::feedback::FeedbackStore,
     /// Private reliable command ingress for provider paths with correlated readback.
     pub reliable_commands: Option<CommandGateway>,
+    /// Optional MQTT publisher exposing every zone to Home Assistant (#508).
+    /// Fully inert until both configured and enabled; see
+    /// `crate::mqtt::MqttPublisher`.
+    pub mqtt: Arc<crate::mqtt::MqttPublisher>,
 }
 
 impl AppState {
@@ -321,6 +326,12 @@ impl AppState {
         shutdown: CancellationToken,
     ) -> Self {
         let hqp_images: Arc<dyn HqpImageSource> = hqp_instances.clone();
+        let adapter_registry = Arc::new(AdapterRegistry::default());
+        let mqtt = Arc::new(crate::mqtt::MqttPublisher::new(
+            bus.clone(),
+            aggregator.clone(),
+            adapter_registry.clone(),
+        ));
         Self {
             roon,
             hqplayer,
@@ -331,7 +342,7 @@ impl AppState {
             openhome,
             upnp,
             musicassistant: Arc::new(ReconfigurableMusicAssistant::new(bus.clone())),
-            adapter_registry: Arc::new(AdapterRegistry::default()),
+            adapter_registry,
             provider_auth: Arc::new(provider_auth::ProviderAuthState::default()),
             controller_auth: controller_auth::ControllerAuthState::new(),
             apple_bridges: apple_bridge::AppleBridgeRegistry::from_env().unwrap_or_else(|error| {
@@ -350,6 +361,7 @@ impl AppState {
             listening_plans: crate::mcp::listening_plan::ListeningPlanStore::from_config(),
             apple_feedback: crate::mcp::feedback::FeedbackStore::from_config(),
             reliable_commands: None,
+            mqtt,
         }
     }
 
@@ -2545,6 +2557,10 @@ pub struct AdapterSettings {
     /// Music Assistant is an opt-in remote playback adapter.
     #[serde(default)]
     pub musicassistant: bool,
+    /// The MQTT/Home Assistant discovery publisher (#508) is opt-in and off
+    /// by default: it needs a broker configured before it can do anything.
+    #[serde(default)]
+    pub mqtt: bool,
 }
 
 fn default_true() -> bool {
@@ -2566,6 +2582,7 @@ impl Default for AppSettings {
                 spotify: false,
                 applemusic: false,
                 musicassistant: false,
+                mqtt: false,
             },
         }
     }
@@ -2685,6 +2702,7 @@ pub async fn api_settings_post_handler(
             "musicassistant",
             old_adapters.musicassistant != new_adapters.musicassistant,
         ),
+        ("mqtt", old_adapters.mqtt != new_adapters.mqtt),
     ];
 
     let mut applied_transitions = Vec::new();
@@ -2703,6 +2721,11 @@ pub async fn api_settings_post_handler(
             "spotify" => new_adapters.spotify,
             "applemusic" => new_adapters.applemusic,
             "musicassistant" => new_adapters.musicassistant,
+            // MQTT is a bus consumer, not a `Startable` in `adapters_list` -
+            // handled separately below via `state.mqtt` (the sanctioned
+            // surface `tests/adapter_boundary_lint.rs` allows this module
+            // to reach; it is not part of the legacy coordinator registry).
+            "mqtt" => continue,
             _ => continue,
         };
 
@@ -2744,6 +2767,14 @@ pub async fn api_settings_post_handler(
         }
     }
 
+    // MQTT is a bus consumer with no zones/companions to flush, so it does
+    // not go through the coordinator's start/stop-and-flush lifecycle - it
+    // simply turns its background publisher task on or off.
+    if old_adapters.mqtt != new_adapters.mqtt {
+        state.mqtt.set_enabled(new_adapters.mqtt).await;
+        applied_transitions.push("mqtt");
+    }
+
     // Persist only after every requested runtime transition succeeded.
     if !save_app_settings(&new_settings) {
         coord
@@ -2753,6 +2784,9 @@ pub async fn api_settings_post_handler(
                 &applied_transitions,
             )
             .await;
+        if applied_transitions.contains(&"mqtt") {
+            state.mqtt.set_enabled(old_adapters.mqtt).await;
+        }
         return Json(serde_json::json!({"ok": false, "error": "Failed to save settings"}));
     }
 
@@ -2770,6 +2804,7 @@ fn adapter_enabled(settings: &AdapterSettings, name: &str) -> Option<bool> {
         "spotify" => Some(settings.spotify),
         "applemusic" => Some(settings.applemusic),
         "musicassistant" => Some(settings.musicassistant),
+        "mqtt" => Some(settings.mqtt),
         _ => None,
     }
 }
@@ -2845,6 +2880,7 @@ mod tests {
         assert!(!settings.adapters.spotify);
         assert!(!settings.adapters.applemusic);
         assert!(!settings.adapters.musicassistant);
+        assert!(!settings.adapters.mqtt);
     }
 
     #[test]
@@ -2858,6 +2894,7 @@ mod tests {
             spotify: true,
             applemusic: true,
             musicassistant: true,
+            mqtt: true,
         };
         for name in [
             "roon",
@@ -2868,6 +2905,7 @@ mod tests {
             "spotify",
             "applemusic",
             "musicassistant",
+            "mqtt",
         ] {
             assert_eq!(adapter_enabled(&settings, name), Some(true), "{name}");
         }

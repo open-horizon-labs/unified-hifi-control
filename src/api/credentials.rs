@@ -31,6 +31,7 @@ const KEY_FILE_ENV: &str = "UHC_CREDENTIAL_KEY_FILE";
 const KEY_ENV: &str = "UHC_CREDENTIAL_KEY";
 const APPLE_BRIDGE_FILE_ENV: &str = "UHC_APPLE_BRIDGE_CREDENTIAL_FILE";
 const MUSIC_ASSISTANT_CREDENTIAL_FILE_ENV: &str = "UHC_MUSIC_ASSISTANT_CREDENTIAL_FILE";
+const MQTT_CREDENTIAL_FILE_ENV: &str = "UHC_MQTT_CREDENTIAL_FILE";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct EncryptedEnvelope {
@@ -311,6 +312,133 @@ impl MusicAssistantCredentialStore {
 
     /// Remove the encrypted record when rolling a failed first-time setup
     /// back to its prior absent state.
+    pub fn clear(&self) -> Result<()> {
+        match std::fs::remove_file(&self.credential_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// Broker connection details for the optional Home Assistant MQTT publisher
+/// (#508), kept in one encrypted record because the broker password is a
+/// secret alongside otherwise-plain connection settings.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MqttCredentialRecord {
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    pub base_topic: String,
+    pub discovery_prefix: String,
+}
+
+impl std::fmt::Debug for MqttCredentialRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MqttCredentialRecord")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("tls", &self.tls)
+            .field("username", &self.username.as_ref().map(|_| "[REDACTED]"))
+            .field("password", &self.password.as_ref().map(|_| "[REDACTED]"))
+            .field("base_topic", &self.base_topic)
+            .field("discovery_prefix", &self.discovery_prefix)
+            .finish()
+    }
+}
+
+/// Encrypted credential storage for the MQTT broker connection.
+#[derive(Clone)]
+pub struct MqttCredentialStore {
+    credential_path: PathBuf,
+    key: [u8; KEY_BYTES],
+}
+
+impl MqttCredentialStore {
+    pub fn new(credential_path: PathBuf, key: [u8; KEY_BYTES]) -> Self {
+        Self {
+            credential_path,
+            key,
+        }
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let credential_path = std::env::var_os(MQTT_CREDENTIAL_FILE_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| get_config_file_path("mqtt-credentials.enc"));
+        let key = if let Ok(value) = std::env::var(KEY_ENV) {
+            parse_key(&value).context("UHC_CREDENTIAL_KEY must be 32-byte hex or base64url")?
+        } else {
+            let key_path = std::env::var_os(KEY_FILE_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| get_config_file_path("credential.key"));
+            load_or_create_key(&key_path)?
+        };
+        Ok(Self::new(credential_path, key))
+    }
+
+    pub fn load(&self) -> Result<Option<MqttCredentialRecord>> {
+        let bytes = match std::fs::read(&self.credential_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let envelope: EncryptedEnvelope = serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow!("MQTT credential envelope is invalid: {error}"))?;
+        if envelope.version != 1 || envelope.cipher != "chacha20poly1305" {
+            return Err(anyhow!("unsupported MQTT credential envelope"));
+        }
+        let nonce = URL_SAFE_NO_PAD
+            .decode(envelope.nonce)
+            .context("MQTT credential nonce is invalid")?;
+        if nonce.len() != NONCE_BYTES {
+            return Err(anyhow!("MQTT credential nonce has an invalid length"));
+        }
+        let ciphertext = URL_SAFE_NO_PAD
+            .decode(envelope.ciphertext)
+            .context("MQTT credential ciphertext is invalid")?;
+        let plaintext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
+            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .map_err(|_| anyhow!("MQTT credential decryption failed"))?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|error| anyhow!("MQTT credential payload is invalid: {error}"))
+    }
+
+    pub fn save(&self, record: &MqttCredentialRecord) -> Result<()> {
+        let parent = self
+            .credential_path
+            .parent()
+            .ok_or_else(|| anyhow!("MQTT credential path has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let plaintext = serde_json::to_vec(record).context("serialize MQTT credentials")?;
+        let mut nonce = [0_u8; NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = ChaCha20Poly1305::new(Key::from_slice(&self.key))
+            .encrypt(Nonce::from_slice(&nonce), plaintext.as_ref())
+            .map_err(|_| anyhow!("encrypt MQTT credentials"))?;
+        let encoded = serde_json::to_vec(&EncryptedEnvelope {
+            version: 1,
+            cipher: "chacha20poly1305".to_string(),
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            ciphertext: URL_SAFE_NO_PAD.encode(ciphertext),
+        })
+        .context("serialize MQTT credential envelope")?;
+        let temporary = self.credential_path.with_extension("enc.tmp");
+        write_private_file(&temporary, &encoded)?;
+        std::fs::rename(&temporary, &self.credential_path)
+            .context("replace MQTT credential file")?;
+        Ok(())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.credential_path
+    }
+
     pub fn clear(&self) -> Result<()> {
         match std::fs::remove_file(&self.credential_path) {
             Ok(()) => Ok(()),
