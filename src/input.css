@@ -188,11 +188,16 @@
      Uses project CSS variables rather than Tailwind color utilities: this project defines its
      palette as `--accent-*` / `--surface-*` custom properties, so `bg-accent/10` compiles to
      nothing at all. */
-  .zone-row {
+  /* Only the handle grabs. The row is the drop target but not the drag source, so a click-drag in
+     the name field selects text instead of picking up the row. */
+  .zone-handle-cell {
     cursor: grab;
   }
-  .zone-row:active {
+  .zone-handle-cell:active {
     cursor: grabbing;
+  }
+  .zone-row:hover .zone-handle-cell svg {
+    color: var(--text-primary);
   }
   /* The row being dragged: faded, so the eye follows the gap rather than the source. */
   .zone-row-dragging {

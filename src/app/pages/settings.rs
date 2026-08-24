@@ -219,6 +219,17 @@ pub fn Settings() -> Element {
     // toggled checkbox showing the opposite of the truth: the refetched data is unchanged, so the
     // VDOM `checked` value is unchanged, so the diff emits no correcting mutation.
     let mut zone_revision = use_signal(|| 0u32);
+    // In-progress name edits, by zone id.
+    //
+    // `value:` on a Dioxus input makes it *controlled*: after every input event the DOM value is
+    // reset to whatever the VDOM says. With only an `onchange` handler -- which fires on blur, not
+    // per keystroke -- nothing held the typed text, so each character was immediately overwritten by
+    // the server's name and the field appeared to reject typing. Every other text input in this app
+    // pairs `value:` with an `oninput` that writes to a signal; this is that signal, per row.
+    //
+    // A draft is cleared once the rename commits, so the field falls back to the server's answer --
+    // which is what makes the "reset" button visibly restore the provider's name.
+    let mut name_drafts = use_signal(std::collections::HashMap::<String, String>::new);
 
     let mut report_zone_failure = move |err: String| {
         zone_error.set(Some(err));
@@ -311,9 +322,12 @@ pub fn Settings() -> Element {
         });
     };
 
-    let rename_zone = move |zone: ManagedZone, name: String| {
+    let mut rename_zone = move |zone: ManagedZone, name: String| {
         let trimmed = name.trim().to_string();
         if trimmed == zone.zone_name {
+            // Nothing to save, but drop the draft anyway so a field edited only by whitespace snaps
+            // back to the canonical name instead of keeping the user's spacing.
+            name_drafts.write().remove(&zone.zone_id);
             return;
         }
         spawn(async move {
@@ -337,6 +351,9 @@ pub fn Settings() -> Element {
                 }
                 Err(err) => report_zone_failure(err),
             }
+            // Either way the server is now authoritative for this row: on success it holds the new
+            // name, on failure the old one, and in both cases that is what the field should show.
+            name_drafts.write().remove(&zone.zone_id);
             managed_zones.restart();
         });
     };
@@ -732,6 +749,11 @@ pub fn Settings() -> Element {
                                 table { class: "w-full", id: "zones-table",
                                     thead {
                                         tr { class: "border-b border-default",
+                                            // Handle column. Hidden below `sm` because HTML5 drag
+                                            // events never fire on touch -- a grip a phone cannot
+                                            // use is a false affordance, and the arrows are the
+                                            // real control there.
+                                            th { class: "w-8 hidden sm:table-cell", span { class: "sr-only", "Drag to reorder" } }
                                             th { class: "text-left py-2 px-2 font-semibold w-12", "Show" }
                                             th { class: "text-left py-2 px-2 font-semibold", "Name" }
                                             th { class: "text-left py-2 px-2 font-semibold hidden sm:table-cell w-28", "Source" }
@@ -748,11 +770,6 @@ pub fn Settings() -> Element {
                                                     "zone-row zone-row-dragging border-b border-default"
                                                 } else {
                                                     "zone-row border-b border-default"
-                                                },
-                                                draggable: "true",
-                                                ondragstart: {
-                                                    let zone_id = zone.zone_id.clone();
-                                                    move |_| dragging.set(Some(zone_id.clone()))
                                                 },
                                                 ondragover: {
                                                     let zone_id = zone.zone_id.clone();
@@ -784,6 +801,34 @@ pub fn Settings() -> Element {
                                                     dragging.set(None);
                                                     drop_target.set(None);
                                                 },
+                                                // The drag handle. `draggable` lives here rather
+                                                // than on the row so that selecting text in the
+                                                // name field does not start a drag -- the row is
+                                                // still the drop target, just not the drag source.
+                                                td {
+                                                    class: "zone-handle-cell hidden sm:table-cell align-middle",
+                                                    draggable: "true",
+                                                    ondragstart: {
+                                                        let zone_id = zone.zone_id.clone();
+                                                        move |_| dragging.set(Some(zone_id.clone()))
+                                                    },
+                                                    // aria-hidden: dragging has no keyboard
+                                                    // equivalent, so the arrows carry the
+                                                    // accessible path and this must not add a
+                                                    // stop in the tab order that does nothing.
+                                                    svg {
+                                                        class: "w-4 h-4 text-muted mx-auto",
+                                                        fill: "currentColor",
+                                                        view_box: "0 0 24 24",
+                                                        "aria-hidden": "true",
+                                                        circle { cx: "9", cy: "6", r: "1.5" }
+                                                        circle { cx: "15", cy: "6", r: "1.5" }
+                                                        circle { cx: "9", cy: "12", r: "1.5" }
+                                                        circle { cx: "15", cy: "12", r: "1.5" }
+                                                        circle { cx: "9", cy: "18", r: "1.5" }
+                                                        circle { cx: "15", cy: "18", r: "1.5" }
+                                                    }
+                                                }
                                                 td { class: "py-2 px-2 align-top",
                                                     label { class: "inline-flex min-h-11 min-w-11 items-center justify-center -my-2 -mx-2",
                                                         input {
@@ -802,9 +847,19 @@ pub fn Settings() -> Element {
                                                     input {
                                                         r#type: "text",
                                                         class: if zone.hidden { "input w-full text-muted" } else { "input w-full" },
-                                                        value: "{zone.zone_name}",
+                                                        // The draft while the user is typing,
+                                                        // otherwise the server's name. A controlled
+                                                        // input needs somewhere to put keystrokes
+                                                        // or the next render throws them away.
+                                                        value: "{name_drafts().get(&zone.zone_id).cloned().unwrap_or_else(|| zone.zone_name.clone())}",
                                                         maxlength: "60",
                                                         aria_label: "Name for {zone.qualified_label()}",
+                                                        oninput: {
+                                                            let zone_id = zone.zone_id.clone();
+                                                            move |evt: FormEvent| {
+                                                                name_drafts.write().insert(zone_id.clone(), evt.value());
+                                                            }
+                                                        },
                                                         // Commits on blur and on Enter rather than
                                                         // per keystroke: each save is a disk write
                                                         // plus a full list refetch, and refetching
@@ -836,23 +891,6 @@ pub fn Settings() -> Element {
                                                 td { class: "py-2 px-2 align-top text-muted hidden sm:table-cell", "{source_label(&zone.source)}" }
                                                 td { class: "py-2 px-2 align-top",
                                                     div { class: "flex items-center justify-end gap-2",
-                                                        // Grip: the affordance that says "this row
-                                                        // drags". Decorative only -- dragging has
-                                                        // no keyboard or touch equivalent, so the
-                                                        // buttons beside it carry the accessible
-                                                        // path and this is aria-hidden.
-                                                        svg {
-                                                            class: "w-4 h-4 text-muted hidden sm:block",
-                                                            fill: "currentColor",
-                                                            view_box: "0 0 24 24",
-                                                            "aria-hidden": "true",
-                                                            circle { cx: "9", cy: "6", r: "1.5" }
-                                                            circle { cx: "15", cy: "6", r: "1.5" }
-                                                            circle { cx: "9", cy: "12", r: "1.5" }
-                                                            circle { cx: "15", cy: "12", r: "1.5" }
-                                                            circle { cx: "9", cy: "18", r: "1.5" }
-                                                            circle { cx: "15", cy: "18", r: "1.5" }
-                                                        }
                                                         span { class: "text-muted text-sm tabular-nums",
                                                             if let Some(position) = position {
                                                                 "{position} of {visible_total}"
