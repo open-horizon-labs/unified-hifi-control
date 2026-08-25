@@ -3410,6 +3410,17 @@ const FIELD_ROLES: &[(&str, FieldRole)] = &[
          see McpSearchResult's own docs.",
         ),
     ),
+    (
+        "path",
+        Consumed(
+            "hifi_collections.path — the opaque browse-continuation token #533/#547 \
+         added to CollectionItem, and #566 added to McpSearchResult so a navigable \
+         hifi_search result (a real browsable hit, or a grouping row like \
+         \"Albums · 35 Results\") can be opened the same way instead of being a dead \
+         end. `None` (omitted) when a result is not navigable; see both structs' \
+         own docs.",
+        ),
+    ),
     // hifi_status / hifi_hqplayer_status readouts.
     (
         "connected",
@@ -3795,6 +3806,9 @@ async fn no_tool_returns_an_unclassified_field() {
             // #396: `Some` here so the new field is collected and must be
             // classified below, exactly like `title`/`subtitle` above.
             r#ref: Some(String::new()),
+            // #566: same reasoning as `ref` above -- `Some` so `path` is
+            // collected and must be classified below too.
+            path: Some(String::new()),
         })
         .expect("McpSearchResult must serialize"),
         &mut returned,

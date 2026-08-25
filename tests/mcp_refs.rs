@@ -311,6 +311,16 @@ async fn a_category_grouping_row_never_gets_a_ref() {
         "a category grouping row must never get a ref, even though it has a real \
          item_key: {albums_row:?}"
     );
+    // #566: filtered out before, this row is now a dead end no longer --
+    // it mints a browse `path` into its bucket (same `RoonBrowse`
+    // convention #533/#547 established for `hifi_collections`), just never
+    // a play `ref`.
+    let path_token = albums_row
+        .get("path")
+        .and_then(Value::as_str)
+        .expect("a category grouping row must get a browse path: {albums_row:?}")
+        .to_string();
+    assert!(path_token.starts_with("ref_"), "got {path_token:?}");
 
     core.stop().await;
 }
@@ -399,6 +409,17 @@ async fn roon_search_mints_a_ref_and_play_ref_resolves_it() {
         .expect("a Roon hit with an item_key must carry a ref")
         .to_string();
     assert!(ref_token.starts_with("ref_"), "got {ref_token:?}");
+    // #566: with no `zone_id` there is nothing to peek playability with (an
+    // absent `zone_id` still routes search to Roon -- #398), so this falls
+    // back to the pre-#566 behavior: a real item_key still gets a play ref,
+    // but navigability is not claimed without a way to verify it, and no
+    // extra browse traffic is generated peeking for it (see the exact
+    // `browsed_titles` trace below, which a peek would extend).
+    assert_eq!(
+        hit.get("path"),
+        None,
+        "no zone_id means no path can be verified: {hit:?}"
+    );
 
     let played = handle_play_ref(&state, play_ref_args(&ref_token, "roon:zone_fake_1", None)).await;
     assert_eq!(
@@ -421,6 +442,62 @@ async fn roon_search_mints_a_ref_and_play_ref_resolves_it() {
             "Play Album",
             "Play Now"
         ]
+    );
+
+    core.stop().await;
+}
+
+/// **The dual navigable+playable case** (#566): a real hit that is both
+/// browsable (an album's own tracks) and directly playable (its "Play
+/// Album" action) mints both a `ref` *and* a `path`, mirroring PR #547's
+/// dual classification for `hifi_collections` -- exercised through
+/// `RoonAdapter::classify_navigability`, which #566 factored out of
+/// `content()`'s `collections_browse` mapping so both surfaces share one
+/// definition of "navigable".
+///
+/// This needs a `zone_id`: `classify_navigability` peeks one level into the
+/// item to tell "playable only" apart from "playable and navigable", and
+/// has nothing to peek with otherwise -- see
+/// `roon_search_mints_a_ref_and_play_ref_resolves_it`'s zone-less case
+/// immediately above, which stays play-ref-only for exactly that reason.
+#[tokio::test]
+async fn roon_search_result_with_zone_context_mints_both_ref_and_path() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let search = handle_search(
+        &state,
+        HifiSearchTool {
+            query: "kind of blue".to_string(),
+            zone_id: Some("roon:zone_fake_1".to_string()),
+            source: None,
+        },
+    )
+    .await;
+    let results = search_results_of(&search);
+    assert_eq!(results.len(), 1, "got {results:?}");
+    let hit = &results[0];
+    assert_eq!(
+        hit.get("title"),
+        Some(&Value::String("Kind of Blue".to_string()))
+    );
+    let ref_token = hit
+        .get("ref")
+        .and_then(Value::as_str)
+        .expect("a browsable-and-playable album must still get a play ref: {hit:?}")
+        .to_string();
+    assert!(ref_token.starts_with("ref_"), "got {ref_token:?}");
+    let path_token = hit
+        .get("path")
+        .and_then(Value::as_str)
+        .expect("a browsable-and-playable album must also get a browse path: {hit:?}")
+        .to_string();
+    assert!(path_token.starts_with("ref_"), "got {path_token:?}");
+    assert_ne!(
+        ref_token, path_token,
+        "the play ref and the browse path are minted from the same target but are \
+         distinct tokens"
     );
 
     core.stop().await;

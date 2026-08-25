@@ -213,6 +213,12 @@ pub async fn handle_search(
                             subtitle: lms_subtitle(&item),
                             title: item.title,
                             r#ref: ref_token,
+                            // LMS's search drills straight to leaf results
+                            // server-side (see this module's top-level
+                            // docs and #566's audit) -- there is no
+                            // grouping row or browsable container in its
+                            // response shape to mint a path for.
+                            path: None,
                         });
                     }
                     Ok(env.json_result(&mcp_results))
@@ -240,6 +246,10 @@ pub async fn handle_search(
                             title: item.title,
                             subtitle: item.subtitle,
                             r#ref: Some(ref_token),
+                            // Spotify's generic-search response
+                            // (`LibrarySearchResult`) has no grouping or
+                            // browse concept -- see #566's audit.
+                            path: None,
                         });
                     }
                     Ok(env.json_result(&mcp_results))
@@ -267,6 +277,12 @@ pub async fn handle_search(
                             title: item.title,
                             subtitle: item.subtitle,
                             r#ref: Some(ref_token),
+                            // Music Assistant's generic-search response has
+                            // no grouping or browse concept either -- see
+                            // #566's audit. (`hifi_collections` already
+                            // exposes MA's real browse hierarchy
+                            // separately, via `MusicAssistantBrowse`.)
+                            path: None,
                         });
                     }
                     Ok(env.json_result(&mcp_results))
@@ -305,6 +321,10 @@ pub async fn handle_search(
                             title: item.title,
                             subtitle: item.subtitle,
                             r#ref: Some(ref_token),
+                            // The Apple Music companion's search results are
+                            // flat catalog/library hits -- no grouping or
+                            // browse concept -- see #566's audit.
+                            path: None,
                         });
                     }
                     Ok(env.json_result(&mcp_results))
@@ -326,50 +346,89 @@ pub async fn handle_search(
                 Ok((session_key, results)) => {
                     let mut mcp_results = Vec::with_capacity(results.len());
                     for item in results {
+                        let Some(item_key) = item.item_key.clone() else {
+                            // No item_key -- a header or non-navigable row.
+                            // Nothing to mint a ref or path from.
+                            mcp_results.push(McpSearchResult {
+                                title: item.title,
+                                subtitle: item.subtitle,
+                                r#ref: None,
+                                path: None,
+                            });
+                            continue;
+                        };
+                        let target = RoonRefTarget {
+                            item_key,
+                            multi_session_key: session_key.clone(),
+                        };
                         // #396 (found live, ship-gate re-review): a real
                         // Core's search results mix the actual hit with
                         // grouping rows ("Albums", "Tracks", "Artists", ...)
                         // that carry the same `hint: "list"` and a real
                         // `item_key` -- `FakeRoonCore`'s search model never
                         // included these, so nothing caught this minting a
-                        // ref for them indistinguishably from real content.
-                        // `crate::adapters::roon::is_ungrounded_grouping`
-                        // combines the adapter's own pre-existing title-list
-                        // check with a second, source-independent signal
-                        // (subtitle shaped like "<N> Results") verified live
-                        // for Library results but not for TIDAL/Qobuz -- see
-                        // that function's own doc comment for why the second
-                        // check is safe to include even where unverified.
-                        // Resolving a grouping row's ref would land in
-                        // `resolve_item_key`'s "guess the first item"
-                        // fallback and could silently play something the
-                        // client never asked for. Only a real, navigable
-                        // item_key on a non-grouping row gets a ref; a
-                        // grouping row (or one with no item_key at all — a
-                        // header, or non-navigable) mints nothing.
-                        let ref_token = match &item.item_key {
-                            Some(item_key)
-                                if !crate::adapters::roon::is_ungrounded_grouping(&item) =>
-                            {
-                                Some(
-                                    state
-                                        .mcp_refs
-                                        .mint(RefTarget::Roon {
-                                            target: RoonRefTarget {
-                                                item_key: item_key.clone(),
-                                                multi_session_key: session_key.clone(),
-                                            },
-                                            title: item.title.clone(),
-                                        })
-                                        .await,
-                                )
-                            }
-                            _ => None,
+                        // *play* ref for them indistinguishably from real
+                        // content. Resolving a grouping row's play ref would
+                        // land in `resolve_item_key`'s "guess the first
+                        // item" fallback and could silently play something
+                        // the client never asked for.
+                        //
+                        // #566: these rows *do* carry a real, browsable
+                        // item_key into their bucket in this same search
+                        // session (e.g. "Albums" -> that search's 35 album
+                        // hits) -- so rather than the previous "filter it
+                        // out, dead end", they mint a browse *path* only,
+                        // same `RoonBrowse` convention #533/#547 established
+                        // for `hifi_collections`. A real hit gets the dual
+                        // navigable+playable classification #547 also
+                        // established there, shared via
+                        // `RoonAdapter::classify_navigability` so search and
+                        // `hifi_collections` never drift apart on what
+                        // "navigable" means.
+                        let (navigable, playable) =
+                            if crate::adapters::roon::is_ungrounded_grouping(&item) {
+                                (true, false)
+                            } else if let Some(zone_id) = args.zone_id.as_deref() {
+                                state.roon.classify_navigability(zone_id, &item).await
+                            } else {
+                                // No zone to peek playability with (#398: an
+                                // absent zone_id still routes search to Roon) --
+                                // fall back to the pre-#566 behavior: a real
+                                // item_key is playable, and navigability is not
+                                // claimed without a way to verify it.
+                                (false, true)
+                            };
+                        let path = if navigable {
+                            Some(
+                                state
+                                    .mcp_refs
+                                    .mint(RefTarget::RoonBrowse {
+                                        target: target.clone(),
+                                        title: item.title.clone(),
+                                    })
+                                    .await,
+                            )
+                        } else {
+                            None
+                        };
+                        let ref_token = if playable {
+                            Some(
+                                state
+                                    .mcp_refs
+                                    .mint(RefTarget::Roon {
+                                        target,
+                                        title: item.title.clone(),
+                                    })
+                                    .await,
+                            )
+                        } else {
+                            None
                         };
                         mcp_results.push(McpSearchResult {
                             title: item.title,
                             subtitle: item.subtitle,
                             r#ref: ref_token,
+                            path,
                         });
                     }
                     Ok(env.json_result(&mcp_results))

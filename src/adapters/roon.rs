@@ -2153,6 +2153,44 @@ impl RoonAdapter {
         Ok((playable, has_other_content))
     }
 
+    /// Classify one browse-session row's navigable/playable status.
+    ///
+    /// `hint: list` rows are peeked one level (via [`Self::peek_playability`])
+    /// to learn whether Roon also exposes a direct play action there;
+    /// everything else is judged by `item_key` presence alone. This is the
+    /// exact per-item logic `content()`'s `collections_browse`/
+    /// `collections_playlists` mapping used inline before #566 factored it
+    /// out here so `hifi_search` (#566) could apply the identical dual
+    /// navigable+playable treatment PR #547 established for
+    /// `hifi_collections`, rather than maintaining a second copy that could
+    /// silently drift from this one.
+    pub(crate) async fn classify_navigability(
+        &self,
+        zone_id: &str,
+        item: &BrowseItem,
+    ) -> (bool, bool) {
+        let list_hinted = matches!(item.hint, Some(ItemHint::List));
+        let (playable, has_other_content) = if list_hinted {
+            match item.item_key.as_deref() {
+                Some(key) => self
+                    .peek_playability(zone_id, key)
+                    .await
+                    .unwrap_or((false, true)),
+                None => (false, true),
+            }
+        } else {
+            (item.item_key.is_some(), true)
+        };
+        // A pure leaf whose only content one level down is an action list (a
+        // track: "Play Track" and nothing else) has nothing left to navigate
+        // into once that action row is filtered out -- classify it as
+        // playable only, not also navigable, so "Open" doesn't land on an
+        // empty level. A container that offers both real content *and* a
+        // play action (an album, a playlist) stays navigable too.
+        let navigable = list_hinted && (!playable || has_other_content);
+        (navigable, playable)
+    }
+
     /// Enter a named top-level browse node (`"Playlists"`, ...) in a fresh
     /// session and load one page of its contents in a single call --
     /// `hifi_collections playlists`'s whole job, since Roon exposes playlists
@@ -3012,10 +3050,17 @@ impl LibraryAdapter for RoonAdapter {
                     .unwrap_or(20)
                     .clamp(1, 50) as usize;
                 let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let request_item_key = params.get("item_key").and_then(Value::as_str);
+                // Browsing the true collection root -- `collections_browse`
+                // with no `item_key` to resume into (see
+                // `browse_collection`'s `None => pop_all` branch).
+                // `collections_playlists` always enters the named
+                // "Playlists" node instead, so it is never at this root.
+                let at_collection_root =
+                    operation == "collections_browse" && request_item_key.is_none();
                 let (session_key, items, total) = if operation == "collections_browse" {
-                    let item_key = params.get("item_key").and_then(Value::as_str);
                     let session_key = params.get("session_key").and_then(Value::as_str);
-                    self.browse_collection(zone_id, item_key, session_key, offset, limit)
+                    self.browse_collection(zone_id, request_item_key, session_key, offset, limit)
                         .await?
                 } else {
                     self.browse_named_root_node(zone_id, "Playlists", offset, limit)
@@ -3024,6 +3069,20 @@ impl LibraryAdapter for RoonAdapter {
                 let mut mapped: Vec<Value> = Vec::new();
                 for item in items {
                     if is_ungrounded_grouping(&item) {
+                        continue;
+                    }
+                    // #566 (live install): Roon's browse root also carries
+                    // its own "Settings" node -- extension configuration
+                    // inside Roon's hierarchy, not music content. It has no
+                    // `item_key` (nothing to browse into or play) and was
+                    // leaking through as a permanently inert row. Matched by
+                    // title, documented as such, and scoped to the true
+                    // root only, so a differently-purposed "Settings" row
+                    // nested deeper in the hierarchy (if one ever exists) is
+                    // untouched. Real music nodes (Library, Playlists,
+                    // Radio, TIDAL, Qobuz, ...) are never named "Settings"
+                    // and are unaffected.
+                    if at_collection_root && item.title == "Settings" {
                         continue;
                     }
                     // #545: Header/Action/ActionList rows are the
@@ -3042,27 +3101,7 @@ impl LibraryAdapter for RoonAdapter {
                     ) {
                         continue;
                     }
-                    let list_hinted = matches!(item.hint, Some(ItemHint::List));
-                    let (playable, has_other_content) = if list_hinted {
-                        match item.item_key.as_deref() {
-                            Some(key) => self
-                                .peek_playability(zone_id, key)
-                                .await
-                                .unwrap_or((false, true)),
-                            None => (false, true),
-                        }
-                    } else {
-                        (item.item_key.is_some(), true)
-                    };
-                    // A pure leaf whose only content one level down is an
-                    // action list (a track: "Play Track" and nothing else)
-                    // has nothing left to navigate into once that action row
-                    // is filtered out above -- classify it as playable only,
-                    // not also navigable, so "Open" doesn't land on an empty
-                    // level. A container that offers both real content *and*
-                    // a play action (an album, a playlist) stays navigable
-                    // too.
-                    let navigable = list_hinted && (!playable || has_other_content);
+                    let (navigable, playable) = self.classify_navigability(zone_id, &item).await;
                     mapped.push(serde_json::json!({
                         "title": item.title,
                         "subtitle": item.subtitle,
