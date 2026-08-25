@@ -37,6 +37,26 @@ https://raw.githubusercontent.com/open-horizon-labs/unified-hifi-control/v3/lms-
 ```
 Then install "Unified Hi-Fi Control" from the plugin list.
 
+### Apple Music Companion (macOS, Apple Silicon)
+
+Download `unified-hifi-applemusic-companion-macos-arm64-*.dmg` from the assets
+below, open it, and drag **AppleMusicCompanionMac.app** (shown in Finder as
+"Apple Music Companion") into **Applications**. Apple Silicon (arm64) Macs
+only.
+
+**This build is unsigned.** macOS Gatekeeper will block the first launch.
+Either:
+- Right-click (or Control-click) the app in Applications and choose **Open**,
+  then confirm the dialog, or
+- Remove the quarantine attribute from Terminal:
+  ```bash
+  xattr -dr com.apple.quarantine "/Applications/AppleMusicCompanionMac.app"
+  ```
+
+Notarization is tracked as a follow-up and is not required to use the app.
+See `companion/apple_music/README.md` for details on what this companion
+does and does not control.
+
 ---
 
 ## MCP Server (Claude Integration)
