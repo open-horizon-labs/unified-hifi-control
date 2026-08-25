@@ -1,14 +1,20 @@
-//! End-to-end coverage for the MQTT/Home Assistant publisher (#508) against
-//! a real, in-process MQTT broker (`rumqttd`), the "mock/in-process broker"
-//! the issue's acceptance criteria calls for. Exercises the three
+//! End-to-end coverage for the MQTT/Home Assistant publisher (#508, #529)
+//! against a real, in-process MQTT broker (`rumqttd`), the "mock/in-process
+//! broker" the issue's acceptance criteria calls for. Exercises the
 //! acceptance criteria that need a live broker round trip:
 //! - HA discovery configs are published (retained) for a newly discovered
 //!   zone, grouped under one device, and retracted when the zone is removed.
 //! - The retained state topic reflects playback/volume/mute/now-playing
 //!   from bus events.
-//! - Inbound command topics route to the owning adapter through the
-//!   registry, and are gracefully ignored for a zone with no bridged
-//!   adapter.
+//! - Inbound command topics for a registry-backed provider route to the
+//!   owning adapter through `AdapterRegistry`, and are gracefully refused
+//!   for a legacy zone with no reliable command gateway configured (#508).
+//! - Inbound command topics for a legacy zone route through the reliable
+//!   command gateway to a real adapter and a real mock server, exactly like
+//!   HTTP/knob/MCP (#529).
+
+#[allow(dead_code, unused_imports)]
+mod mock_servers;
 
 use std::collections::HashMap;
 use std::net::TcpListener;
@@ -19,15 +25,51 @@ use async_trait::async_trait;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use tokio::time::timeout;
 
-use unified_hifi_control::adapters::{AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic};
+use mock_servers::MockLmsServer;
+use unified_hifi_control::adapters::lms::{create_lms_adapters_with_runtime, LmsRuntimeBridge};
+use unified_hifi_control::adapters::{
+    AdapterCommand, AdapterCommandResponse, AdapterContext, AdapterLogic, Startable,
+};
 use unified_hifi_control::aggregator::ZoneAggregator;
 use unified_hifi_control::api::credentials::MqttCredentialRecord;
 use unified_hifi_control::api::AdapterRegistry;
+use unified_hifi_control::bus::runtime::build_runtime;
 use unified_hifi_control::bus::{
     create_bus, BusEvent, NowPlaying, PlaybackState, PrefixedZoneId, VolumeControl, VolumeScale,
     Zone,
 };
 use unified_hifi_control::mqtt::MqttPublisher;
+
+/// Isolate `UHC_CONFIG_DIR` for the one test below that starts a real
+/// `LmsAdapter`, which persists its configured host to disk. No other test
+/// in this binary touches the env var, but the guard/temp-dir pairing
+/// mirrors `tests/mcp_contract.rs`'s `SettingsFixture` so a future addition
+/// here does not silently write into a developer's real config directory.
+struct ConfigDirGuard {
+    _dir: tempfile::TempDir,
+    previous: Option<String>,
+}
+
+impl ConfigDirGuard {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var("UHC_CONFIG_DIR").ok();
+        std::env::set_var("UHC_CONFIG_DIR", dir.path());
+        Self {
+            _dir: dir,
+            previous,
+        }
+    }
+}
+
+impl Drop for ConfigDirGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("UHC_CONFIG_DIR", value),
+            None => std::env::remove_var("UHC_CONFIG_DIR"),
+        }
+    }
+}
 
 /// Bind an ephemeral port and hand its number back for `rumqttd`'s config,
 /// which does its own binding. The listener is dropped immediately before
@@ -495,4 +537,143 @@ async fn tolerates_an_unreachable_broker() {
     // Must still stop promptly even mid-retry-loop.
     let stopped = timeout(Duration::from_secs(6), publisher.shutdown()).await;
     assert!(stopped.is_ok(), "shutdown must not hang on an unreachable broker");
+}
+
+/// Command round-trip for a legacy (non-registry) zone (#529): an HA `volume_set` and a `play`
+/// published over a real broker must reach a real `LmsAdapter` through the reliable command
+/// gateway - the same path `dispatch_lms_runtime_command` gives HTTP/knob/MCP - and land on the
+/// wire at a real mock LMS server, not merely be accepted by the gateway.
+#[tokio::test(flavor = "multi_thread")]
+async fn mqtt_command_for_a_legacy_zone_routes_through_the_command_gateway_to_lms() {
+    let _config_dir = ConfigDirGuard::new();
+
+    const PLAYER_ID: &str = "aa:bb:cc:dd:ee:ff";
+    let mock = MockLmsServer::start().await;
+    mock.add_player(PLAYER_ID, "Living Room").await;
+    mock.set_volume(PLAYER_ID, 10).await;
+
+    let bus = create_bus();
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let aggregator_task = aggregator.clone();
+    tokio::spawn(async move {
+        aggregator_task.run_with_ready(ready_tx).await;
+    });
+    ready_rx.await.expect("aggregator ready");
+
+    let runtime = build_runtime(aggregator.clone(), 16, 32);
+    let bridge = Arc::new(LmsRuntimeBridge::new(
+        runtime.projection_ingress.clone(),
+        runtime.commands.clone(),
+    ));
+    let (lms, _lms_cli) = create_lms_adapters_with_runtime(bus.clone(), Some(bridge));
+    lms.configure(mock.addr().ip().to_string(), Some(mock.addr().port()), None, None)
+        .await;
+    tokio::spawn(runtime.projection_actor.run());
+    lms.start().await.expect("LMS adapter must start");
+
+    let zone_id = format!("lms:{PLAYER_ID}");
+    let mut found = false;
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(10) {
+        if aggregator.get_zone(&zone_id).await.is_some() {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(found, "LMS player never reached the aggregator as {zone_id}");
+
+    let port = free_port();
+    start_test_broker(port);
+    wait_for_broker_ready(port, Duration::from_secs(5)).await;
+
+    let adapter_registry = Arc::new(AdapterRegistry::default());
+    let publisher = Arc::new(MqttPublisher::new(
+        bus.clone(),
+        aggregator.clone(),
+        adapter_registry,
+    ));
+    // Attach the gateway before enabling: `restart()` only snapshots it when the publisher task
+    // is (re)spawned, exactly like `AppState::reliable_commands` is attached before any surface
+    // can dispatch through it.
+    publisher.set_reliable_commands(runtime.commands.clone());
+    publisher
+        .configure(MqttCredentialRecord {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: false,
+            username: None,
+            password: None,
+            base_topic: "unified-hifi".to_string(),
+            discovery_prefix: "homeassistant".to_string(),
+        })
+        .await;
+    publisher.set_enabled(true).await;
+    assert!(publisher.is_running().await);
+
+    // Wait for the publisher to discover and announce the zone (needed to populate its slug ->
+    // zone id map, which inbound commands are routed through).
+    let (observer_client, mut observer_loop) = connect_test_client(port, "test-lms-observer").await;
+    subscribe_and_wait(
+        &observer_client,
+        &mut observer_loop,
+        "unified-hifi/media_player/+/state",
+    )
+    .await;
+    let state_publish = wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
+        publish.topic.starts_with("unified-hifi/media_player/lms_")
+    })
+    .await
+    .expect("LMS zone state must be published before its slug can route commands");
+    let slug = state_publish
+        .topic
+        .strip_prefix("unified-hifi/media_player/")
+        .and_then(|rest| rest.strip_suffix("/state"))
+        .expect("state topic shape")
+        .to_string();
+
+    let (command_client, mut command_loop) = connect_test_client(port, "test-lms-commander").await;
+    tokio::spawn(async move {
+        loop {
+            if command_loop.poll().await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    mock.clear_commands().await;
+    command_client
+        .publish(
+            format!("unified-hifi/media_player/{slug}/play/set"),
+            QoS::AtLeastOnce,
+            false,
+            "PRESS",
+        )
+        .await
+        .expect("publish play command for LMS zone");
+
+    let mut played = false;
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(10) {
+        if mock
+            .write_commands(PLAYER_ID)
+            .await
+            .contains(&vec!["play".to_string()])
+        {
+            played = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        played,
+        "MQTT play command for a legacy LMS zone must reach the mock server through the \
+         reliable command gateway"
+    );
+
+    publisher.shutdown().await;
+    lms.stop().await;
+    mock.stop().await;
 }

@@ -23,13 +23,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::adapters::AdapterCommand;
+use crate::aggregator::ZoneAggregator;
 use crate::api::{
     dispatch_lms_runtime_command, dispatch_openhome_runtime_command, dispatch_roon_runtime_command,
     dispatch_upnp_runtime_command, lms_runtime_command_from_action,
     renderer_runtime_command_from_action, AppState,
 };
 use crate::bus::runtime::{
-    CommandDeadlines, CommandLane, CommandRequest, CommandStatus, HqpRuntimeCommand, RuntimeCommand,
+    CommandDeadlines, CommandGateway, CommandLane, CommandRequest, CommandStatus,
+    HqpRuntimeCommand, RuntimeCommand,
 };
 use crate::bus::{Command, PrefixedZoneId, VolumeControl};
 use crate::knobs::image::placeholder_svg;
@@ -671,6 +673,28 @@ pub(crate) async fn dispatch_hqplayer_action(
     action: &str,
     value: Option<f64>,
 ) -> Result<(), HqpDispatchError> {
+    dispatch_hqplayer_action_via(
+        &state.aggregator,
+        state.reliable_commands.as_ref(),
+        zone_id,
+        instance,
+        action,
+        value,
+    )
+    .await
+}
+
+/// Same aggregator-gated routing as [`dispatch_hqplayer_action`], parameterized directly over the
+/// aggregator and reliable command gateway so callers without a full `AppState` - MQTT's inbound
+/// command router (#529) - reuse the identical dispatch path HTTP/knob/MCP use.
+pub(crate) async fn dispatch_hqplayer_action_via(
+    aggregator: &ZoneAggregator,
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    instance: &str,
+    action: &str,
+    value: Option<f64>,
+) -> Result<(), HqpDispatchError> {
     // The aggregator is the only state source consulted here.
     //
     // Its absence is decisive rather than merely inconvenient: the aggregator withdraws the zone when
@@ -680,9 +704,9 @@ pub(crate) async fn dispatch_hqplayer_action(
     // `{"ok":true}` — for a withdrawn zone whose instance still happened to exist in the manager's
     // map. Found by the review pass, pinned by
     // `transport_is_refused_for_a_zone_the_aggregator_has_withdrawn`.
-    let Some(zone) = state.aggregator.get_zone(zone_id).await else {
+    let Some(zone) = aggregator.get_zone(zone_id).await else {
         let target = PrefixedZoneId::hqplayer(instance);
-        let message = match &state.reliable_commands {
+        let message = match gateway {
             Some(gateway) if gateway.has_endpoint(&target) => {
                 format!("zone {zone_id} is not currently published")
             }
@@ -692,8 +716,9 @@ pub(crate) async fn dispatch_hqplayer_action(
     };
 
     let command = hqp_command_from_published_zone(&zone, action, value)?;
-    dispatch_hqplayer_runtime_command(
-        state,
+    dispatch_hqplayer_runtime_command_via(
+        aggregator,
+        gateway,
         instance,
         RuntimeCommand::Control(command),
         CommandLane::Interactive,
@@ -760,10 +785,32 @@ async fn dispatch_hqplayer_runtime_command(
     lane: CommandLane,
     confirmation_budget: std::time::Duration,
 ) -> Result<(), HqpDispatchError> {
+    dispatch_hqplayer_runtime_command_via(
+        &state.aggregator,
+        state.reliable_commands.as_ref(),
+        instance,
+        command,
+        lane,
+        confirmation_budget,
+    )
+    .await
+}
+
+/// Same aggregator-gated routing as [`dispatch_hqplayer_runtime_command`], parameterized directly
+/// over the aggregator and reliable command gateway so callers without a full `AppState` - MQTT's
+/// inbound command router (#529) - reuse the identical dispatch path HTTP/knob/MCP use.
+async fn dispatch_hqplayer_runtime_command_via(
+    aggregator: &ZoneAggregator,
+    gateway: Option<&CommandGateway>,
+    instance: &str,
+    command: RuntimeCommand,
+    lane: CommandLane,
+    confirmation_budget: std::time::Duration,
+) -> Result<(), HqpDispatchError> {
     let target = PrefixedZoneId::hqplayer(instance);
     let zone_id = target.to_string();
-    if state.aggregator.get_zone(&zone_id).await.is_none() {
-        let message = match &state.reliable_commands {
+    if aggregator.get_zone(&zone_id).await.is_none() {
+        let message = match gateway {
             Some(gateway) if gateway.has_endpoint(&target) => {
                 format!("zone {zone_id} is not currently published")
             }
@@ -771,7 +818,7 @@ async fn dispatch_hqplayer_runtime_command(
         };
         return Err(HqpDispatchError::NotFound(message));
     }
-    let Some(gateway) = &state.reliable_commands else {
+    let Some(gateway) = gateway else {
         return Err(HqpDispatchError::Backend(
             "HQPlayer reliable command runtime is unavailable".to_string(),
         ));

@@ -5,12 +5,13 @@
 //! module is a plain bus consumer: it reads [`crate::bus::SharedBus`] and
 //! [`crate::aggregator::ZoneAggregator`] snapshots to publish HA discovery
 //! configs and retained per-zone state, and routes inbound HA command
-//! topics through [`crate::adapters::AdapterRegistry`] - the same three
+//! topics through [`crate::adapters::AdapterRegistry`] for registry-backed
+//! providers and the reliable command gateway
+//! (`crate::bus::runtime::CommandGateway`, #529) for legacy ones - the same
 //! sanctioned surfaces every other UHC feature outside `src/adapters/`,
 //! `src/bus/`, `src/aggregator.rs`, `src/coordinator.rs` and `src/main.rs`
-//! is restricted to (`tests/adapter_boundary_lint.rs`). See
-//! [`command`]'s module doc for the one deliberate scope limit this
-//! implies: legacy (non-registry) adapters do not yet accept MQTT commands.
+//! is restricted to (`tests/adapter_boundary_lint.rs`). See [`command`]'s
+//! module doc for exactly which zone prefix routes where.
 //!
 //! Home Assistant has no native MQTT `media_player` platform (see
 //! [`discovery`]'s module doc), so one UHC zone is represented as a small
@@ -33,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::aggregator::ZoneAggregator;
 use crate::api::AdapterRegistry;
+use crate::bus::runtime::CommandGateway;
 use crate::bus::{BusEvent, SharedBus, Zone};
 
 pub use crate::api::credentials::MqttCredentialRecord;
@@ -63,6 +65,12 @@ pub struct MqttPublisher {
     aggregator: Arc<ZoneAggregator>,
     adapter_registry: Arc<AdapterRegistry>,
     base_url: std::sync::RwLock<String>,
+    /// Legacy-provider command gateway (#529), set once `AppState` finishes composing it via
+    /// [`MqttPublisher::set_reliable_commands`]. `AppState` cannot hand this to
+    /// [`MqttPublisher::new`] directly: it is itself assembled after the `Arc<MqttPublisher>`
+    /// this struct lives behind, exactly like `AppState::reliable_commands` starts `None` and is
+    /// attached via `AppState::with_reliable_commands`.
+    reliable_commands: std::sync::RwLock<Option<CommandGateway>>,
     runtime: Mutex<Runtime>,
 }
 
@@ -93,6 +101,7 @@ impl MqttPublisher {
             aggregator,
             adapter_registry,
             base_url: std::sync::RwLock::new(String::new()),
+            reliable_commands: std::sync::RwLock::new(None),
             runtime: Mutex::new(Runtime::default()),
         }
     }
@@ -111,6 +120,24 @@ impl MqttPublisher {
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    /// Attach the reliable command gateway (#529) so inbound HA commands for legacy
+    /// (non-registry) zones - Roon, LMS, HQPlayer, OpenHome, UPnP - can route through it. Safe to
+    /// call before or after the publisher is running; a task already in flight picks up the
+    /// gateway on its next restart, and `AppState::with_reliable_commands` calls this immediately
+    /// after the gateway exists, before the publisher can be enabled from settings.
+    pub fn set_reliable_commands(&self, gateway: CommandGateway) {
+        if let Ok(mut guard) = self.reliable_commands.write() {
+            *guard = Some(gateway);
+        }
+    }
+
+    fn reliable_commands_snapshot(&self) -> Option<CommandGateway> {
+        self.reliable_commands
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Persist and adopt new broker connection settings. Restarts the
@@ -167,6 +194,7 @@ impl MqttPublisher {
             self.bus.clone(),
             self.aggregator.clone(),
             self.adapter_registry.clone(),
+            self.reliable_commands_snapshot(),
             self.base_url_snapshot(),
             shutdown.clone(),
         ));
@@ -394,6 +422,8 @@ async fn handle_bus_event(
 async fn handle_incoming_publish(
     record: &MqttCredentialRecord,
     adapter_registry: &Arc<AdapterRegistry>,
+    aggregator: &ZoneAggregator,
+    reliable_commands: Option<&CommandGateway>,
     zone_slugs: &HashMap<String, String>,
     publish: &rumqttc::Publish,
 ) {
@@ -410,16 +440,14 @@ async fn handle_incoming_publish(
         tracing::debug!(topic = %publish.topic, "MQTT command topic had an unrecognized action or payload");
         return;
     };
-    match command::dispatch(adapter_registry, zone_id, parsed).await {
+    match command::dispatch(adapter_registry, aggregator, reliable_commands, zone_id, parsed).await
+    {
         command::DispatchOutcome::Sent => {}
-        command::DispatchOutcome::AdapterRefused(error) => {
-            tracing::warn!(zone_id, error, "MQTT command refused by adapter");
+        command::DispatchOutcome::Refused(error) => {
+            tracing::warn!(zone_id, error, "MQTT command refused");
         }
-        command::DispatchOutcome::ProviderNotBridged => {
-            tracing::debug!(
-                zone_id,
-                "MQTT command ignored: provider not yet bridged to the adapter registry (#436)"
-            );
+        command::DispatchOutcome::Unsupported(reason) => {
+            tracing::debug!(zone_id, reason, "MQTT command ignored");
         }
     }
 }
@@ -433,6 +461,7 @@ async fn run(
     bus: SharedBus,
     aggregator: Arc<ZoneAggregator>,
     adapter_registry: Arc<AdapterRegistry>,
+    reliable_commands: Option<CommandGateway>,
     base_url: String,
     shutdown: CancellationToken,
 ) {
@@ -465,8 +494,15 @@ async fn run(
                         .await;
                     }
                     Ok(Event::Incoming(Packet::Publish(publish))) => {
-                        handle_incoming_publish(&record, &adapter_registry, &zone_slugs, &publish)
-                            .await;
+                        handle_incoming_publish(
+                            &record,
+                            &adapter_registry,
+                            &aggregator,
+                            reliable_commands.as_ref(),
+                            &zone_slugs,
+                            &publish,
+                        )
+                        .await;
                     }
                     Ok(_) => {}
                     Err(error) => {

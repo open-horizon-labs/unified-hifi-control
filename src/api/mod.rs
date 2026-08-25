@@ -364,6 +364,10 @@ impl AppState {
     }
 
     pub fn with_reliable_commands(mut self, commands: CommandGateway) -> Self {
+        // The MQTT publisher (#508) resolves inbound HA commands for legacy zones through this
+        // same gateway (#529); it cannot receive one in its own constructor because `Arc<AppState>`
+        // itself is not assembled yet at that point (see `MqttPublisher::set_reliable_commands`).
+        self.mqtt.set_reliable_commands(commands.clone());
         self.reliable_commands = Some(commands);
         self
     }
@@ -522,8 +526,19 @@ pub(crate) async fn dispatch_lms_runtime_command(
     zone_id: &str,
     command: Command,
 ) -> anyhow::Result<()> {
+    dispatch_lms_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
+}
+
+/// Same routing and readback wait as [`dispatch_lms_runtime_command`], parameterized directly over
+/// the reliable command gateway so callers without a full `AppState` - MQTT's inbound command
+/// router (#529) - reuse the identical dispatch path HTTP/knob/MCP use.
+pub(crate) async fn dispatch_lms_runtime_command_via(
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
     let target = PrefixedZoneId::lms(zone_id.strip_prefix("lms:").unwrap_or(zone_id));
-    let Some(gateway) = state.reliable_commands.as_ref() else {
+    let Some(gateway) = gateway else {
         // Compatibility-only construction used by older embedders and contract fixtures. There is
         // no direct adapter fallback: preserve the established actionable error while refusing
         // native I/O outside the reliable runtime.
@@ -570,12 +585,23 @@ pub(crate) async fn dispatch_openhome_runtime_command(
     zone_id: &str,
     command: Command,
 ) -> anyhow::Result<()> {
-    if state.reliable_commands.is_none() {
+    dispatch_openhome_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
+}
+
+/// Same routing as [`dispatch_openhome_runtime_command`], parameterized directly over the reliable
+/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
+/// reuse the identical dispatch path HTTP/knob/MCP use.
+pub(crate) async fn dispatch_openhome_runtime_command_via(
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    if gateway.is_none() {
         let raw_id = zone_id.strip_prefix("openhome:").unwrap_or(zone_id);
         return Err(anyhow::anyhow!("Device not found: {raw_id}"));
     }
     dispatch_provider_runtime_command(
-        state,
+        gateway,
         PrefixedZoneId::openhome(zone_id.strip_prefix("openhome:").unwrap_or(zone_id)),
         command,
         "OpenHome",
@@ -591,15 +617,26 @@ pub(crate) async fn dispatch_upnp_runtime_command(
     zone_id: &str,
     command: Command,
 ) -> anyhow::Result<()> {
+    dispatch_upnp_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
+}
+
+/// Same routing as [`dispatch_upnp_runtime_command`], parameterized directly over the reliable
+/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
+/// reuse the identical dispatch path HTTP/knob/MCP use.
+pub(crate) async fn dispatch_upnp_runtime_command_via(
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
     // Standalone API/MCP fixtures intentionally compose no runtime. Preserve
     // the frozen adapter-shaped refusal without doing native I/O outside the
     // composed server's reliable endpoint.
-    if state.reliable_commands.is_none() {
+    if gateway.is_none() {
         let raw_id = zone_id.strip_prefix("upnp:").unwrap_or(zone_id);
         return Err(anyhow::anyhow!("Renderer not found: {raw_id}"));
     }
     dispatch_provider_runtime_command(
-        state,
+        gateway,
         PrefixedZoneId::upnp(zone_id.strip_prefix("upnp:").unwrap_or(zone_id)),
         command,
         "UPnP",
@@ -614,11 +651,22 @@ pub(crate) async fn dispatch_roon_runtime_command(
     zone_id: &str,
     command: Command,
 ) -> anyhow::Result<()> {
-    if state.reliable_commands.is_none() {
+    dispatch_roon_runtime_command_via(state.reliable_commands.as_ref(), zone_id, command).await
+}
+
+/// Same routing as [`dispatch_roon_runtime_command`], parameterized directly over the reliable
+/// command gateway so callers without a full `AppState` - MQTT's inbound command router (#529) -
+/// reuse the identical dispatch path HTTP/knob/MCP use.
+pub(crate) async fn dispatch_roon_runtime_command_via(
+    gateway: Option<&CommandGateway>,
+    zone_id: &str,
+    command: Command,
+) -> anyhow::Result<()> {
+    if gateway.is_none() {
         return Err(anyhow::anyhow!("Not connected to Roon"));
     }
     dispatch_provider_runtime_command(
-        state,
+        gateway,
         PrefixedZoneId::roon(zone_id.strip_prefix("roon:").unwrap_or(zone_id)),
         command,
         "Roon",
@@ -627,12 +675,12 @@ pub(crate) async fn dispatch_roon_runtime_command(
 }
 
 async fn dispatch_provider_runtime_command(
-    state: &AppState,
+    gateway: Option<&CommandGateway>,
     target: PrefixedZoneId,
     command: Command,
     provider: &str,
 ) -> anyhow::Result<()> {
-    let Some(gateway) = state.reliable_commands.as_ref() else {
+    let Some(gateway) = gateway else {
         return Err(anyhow::anyhow!(
             "{provider} reliable command runtime is unavailable"
         ));
