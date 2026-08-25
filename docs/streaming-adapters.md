@@ -94,17 +94,35 @@ starting the flow. The callback endpoint must be registered exactly with the
 Spotify application.
 
 For a local or QNAP install, open Settings in the browser you will use for
-authorization, enter the Spotify client ID, and leave the client secret blank
-to use Authorization Code with PKCE. If the browser is not on the UHC host,
-first start a temporary HTTPS tunnel to port 8088 (for example with
-`cloudflared` or Tailscale Funnel), open its HTTPS URL in the browser, and
-register the exact callback shown by Settings in the Spotify developer
-dashboard. Spotify accepts plain HTTP only for explicit loopback callbacks
-(`127.0.0.1` or `::1`); a remote QNAP needs HTTPS. Saving the form persists the
+authorization. The Spotify card's "Client settings" pane now walks through the
+whole flow as numbered steps: create/open an app in the Spotify Developer
+Dashboard, copy the exact callback URL shown there (with a one-click copy
+button) into the app's Redirect URIs, paste the Client ID (and Client Secret,
+if not using PKCE) into the fields below, save, then Connect. Leave the client
+secret blank to use Authorization Code with PKCE.
+
+If the browser is not on the UHC host, Spotify accepts plain HTTP only for
+explicit loopback callbacks (`127.0.0.1` or `::1`); anything else — a remote
+QNAP, a different machine on the LAN — needs HTTPS. Until a built-in tunnel
+ships (tracked as a fast-follow in #538), start a temporary HTTPS tunnel to
+port 8088 by hand (for example with `cloudflared tunnel --url
+http://127.0.0.1:8088` or Tailscale Funnel), open its HTTPS URL in the
+browser, and set the Redirect URI field to that tunnel's callback address
+before registering it in the Spotify dashboard. Saving the form persists the
 client configuration in the encrypted credential envelope, after which
 **Connect Spotify** starts the browser authorization flow. Stop the tunnel
-after authorization; reauthorization creates a new callback URL. This is the
-first-run onboarding path tracked in #469.
+after authorization; reauthorization creates a new callback URL and needs a
+new tunnel and a newly registered callback, and reuses the same in-Settings
+guidance. This is the first-run onboarding path tracked in #469 and #534.
+
+If authorization does not complete, Settings shows an actionable message
+instead of a generic failure: an expired or already-used sign-in link, a
+declined consent screen, a callback URL mismatch between the Spotify dashboard
+and the Redirect URI configured here, or a server-side storage/adapter-start
+problem are each called out with what to fix. See
+`spotify_oauth_error_message` in `src/app/pages/settings.rs`, which maps every
+`code` returned by `oauth_callback_json` in `src/api/provider_auth.rs` to one
+of these messages.
 
 Apple Music authorization remains native to the companion. The v1 execution
 owner is a signed iPhone app using `SystemMusicPlayer`; the iOS package and its

@@ -265,15 +265,19 @@ fn redirect_to(_url: &str) -> Result<(), String> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn callback_feedback() -> Option<&'static str> {
-    let search = web_sys::window()?.location().search().ok()?;
-    if search.contains("spotify=connected") || search.contains("oauth=success") {
-        Some("Spotify connected. Refreshing available devices…")
-    } else if search.contains("spotify=error") || search.contains("oauth=error") {
-        Some("Spotify authorization did not complete. Try Connect again or open Client settings.")
-    } else {
-        None
-    }
+fn current_location_search() -> Option<String> {
+    web_sys::window()?.location().search().ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_location_search() -> Option<String> {
+    // Event handlers and the initial location query only exist in the
+    // hydrated WASM client; the SSR render always shows no callback feedback.
+    None
+}
+
+fn callback_feedback() -> Option<CallbackFeedback> {
+    spotify_callback_feedback(&current_location_search()?)
 }
 
 const DEFAULT_SPOTIFY_REDIRECT_URI: &str =
@@ -283,9 +287,77 @@ fn default_spotify_redirect_uri() -> String {
     DEFAULT_SPOTIFY_REDIRECT_URI.to_string()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn callback_feedback() -> Option<&'static str> {
+/// Feedback for the Spotify OAuth redirect back to Settings. Kept separate
+/// from `callback_feedback`'s `web_sys` lookup so the query-string parsing and
+/// per-error-code messaging stay covered by ordinary (non-wasm) unit tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CallbackFeedback {
+    message: String,
+    is_error: bool,
+}
+
+/// Parse the `?spotify=...&reason=...` query string Spotify's OAuth callback
+/// redirects to (see `oauth_callback` in `src/api/provider_auth.rs`) into a
+/// message a non-technical user can act on. Every `code` value produced by
+/// that handler must have an arm below so a new failure mode never falls back
+/// to the generic message silently.
+fn spotify_callback_feedback(search: &str) -> Option<CallbackFeedback> {
+    if search.contains("spotify=connected") || search.contains("oauth=success") {
+        return Some(CallbackFeedback {
+            message: "Spotify connected. Refreshing available devices…".to_string(),
+            is_error: false,
+        });
+    }
+    if search.contains("spotify=error") || search.contains("oauth=error") {
+        let reason = query_param(search, "reason");
+        return Some(CallbackFeedback {
+            message: spotify_oauth_error_message(reason.as_deref()),
+            is_error: true,
+        });
+    }
     None
+}
+
+/// Extract one query-string parameter's value without pulling in a full URL
+/// parser; the callback redirect only ever carries simple ASCII tokens.
+fn query_param(search: &str, key: &str) -> Option<String> {
+    search
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
+        .map(|value| urlencoding::decode(value).unwrap_or_default().into_owned())
+}
+
+/// Map an `oauth_callback` error `code` to an actionable message. Codes come
+/// from `error(...)` calls in `src/api/provider_auth.rs::oauth_callback_json`.
+fn spotify_oauth_error_message(reason: Option<&str>) -> String {
+    match reason {
+        Some("invalid_state") | Some("expired_state") => {
+            "This Spotify sign-in link expired or was already used. Click Connect Spotify below to start a fresh authorization.".to_string()
+        }
+        Some("provider_denied") => {
+            "Spotify authorization was declined. Click Connect Spotify to try again.".to_string()
+        }
+        Some("provider_oauth_error") | Some("missing_authorization_code") => {
+            "Spotify did not return an authorization code. Click Connect Spotify to try again.".to_string()
+        }
+        Some("token_exchange_failed") => {
+            "Spotify rejected the sign-in exchange. This usually means the callback URL registered in the Spotify dashboard does not exactly match the Redirect URI shown below. Fix the mismatch, save, and Connect again.".to_string()
+        }
+        Some("token_storage_failed") => {
+            "Spotify authorized, but the token could not be saved on this UHC server. Check the server's credential storage and try Connect again.".to_string()
+        }
+        Some("oauth_not_configured") | Some("invalid_client_configuration") => {
+            "Spotify client settings are missing or invalid. Enter and save the Client ID (and Secret, if used) below before connecting.".to_string()
+        }
+        Some("adapter_unavailable") | Some("adapter_start_failed") => {
+            "Spotify authorized, but the adapter could not start. Refresh this page and try again.".to_string()
+        }
+        Some("companion_required") => {
+            "This provider is authorized through its companion app, not this OAuth flow.".to_string()
+        }
+        _ => "Spotify authorization did not complete. Try Connect again or open Client settings.".to_string(),
+    }
 }
 
 fn zone_state_label(zone: &crate::app::api::Zone) -> &str {
@@ -455,6 +527,7 @@ pub fn Settings() -> Element {
     let mut spotify_client_id = use_signal(String::new);
     let mut spotify_client_secret = use_signal(String::new);
     let mut spotify_redirect_uri = use_signal(default_spotify_redirect_uri);
+    let spotify_callback_copy_state = use_signal(CopyState::default);
     let mut musicassistant_action = use_signal(ProviderActionState::default);
     let mut musicassistant_error = use_signal(|| None::<String>);
     let mut musicassistant_host = use_signal(String::new);
@@ -1164,12 +1237,12 @@ pub fn Settings() -> Element {
                         }
 
                         p {
-                            class: "mt-4 status-ok",
+                            class: if callback_message.as_ref().is_some_and(|feedback| feedback.is_error) { "mt-4 status-err" } else { "mt-4 status-ok" },
                             hidden: callback_message.is_none(),
                             aria_hidden: callback_message.is_none(),
-                            role: "status",
+                            role: if callback_message.as_ref().is_some_and(|feedback| feedback.is_error) { "alert" } else { "status" },
                             aria_live: "polite",
-                            "{callback_message.unwrap_or_default()}"
+                            "{callback_message.as_ref().map(|feedback| feedback.message.as_str()).unwrap_or_default()}"
                         }
 
                         // Keep both panes in the hydrated tree. The server can know that
@@ -1234,23 +1307,41 @@ pub fn Settings() -> Element {
                             }
                             div { class: "rounded-md border border-default p-4",
                                 h4 { class: "font-medium", "Client settings" }
-                                p { class: "mt-2 text-sm text-secondary", "Use this when UHC is self-hosted or running on another machine. UHC stores the OAuth client settings server-side and refreshes access automatically." }
-                                p { class: "mt-2 text-sm text-secondary",
-                                    "Create or manage your Spotify app in the "
-                                    a { href: "https://developer.spotify.com/dashboard", target: "_blank", rel: "noopener noreferrer", class: "link", "Spotify Developer Dashboard" }
-                                    ". Copy its Client ID and Client Secret here."
+                                p { class: "mt-2 text-sm text-secondary", "UHC stores the OAuth client settings server-side and refreshes access automatically. This same walkthrough applies whether you're connecting for the first time or reauthorizing later." }
+                                ol { class: "mt-3 list-decimal space-y-3 pl-5 text-sm text-secondary",
+                                    li {
+                                        "Create (or open) an app in the "
+                                        a { href: "https://developer.spotify.com/dashboard", target: "_blank", rel: "noopener noreferrer", class: "link", "Spotify Developer Dashboard" }
+                                        "."
+                                    }
+                                    li {
+                                        "In that app's settings, add the callback URL shown below under \"Redirect URIs\", exactly as written."
+                                        div { class: "mt-2 flex flex-col gap-2 sm:flex-row sm:items-stretch",
+                                            code {
+                                                id: "spotify-callback-url-display",
+                                                class: "block min-w-0 flex-1 overflow-x-auto break-all rounded-md bg-hover px-3 py-3 text-xs select-all",
+                                                "{spotify_redirect_uri()}"
+                                            }
+                                            button {
+                                                r#type: "button",
+                                                class: "btn btn-outline btn-sm shrink-0",
+                                                aria_label: "Copy Spotify callback URL",
+                                                onclick: move |_| copy_to_clipboard(spotify_redirect_uri(), spotify_callback_copy_state),
+                                                span { aria_live: "polite", "{spotify_callback_copy_state().label(\"Copy URL\")}" }
+                                            }
+                                        }
+                                        p { class: "mt-2 text-xs text-muted", "This is the default loopback callback. If UHC runs on a NAS or another machine, edit the Redirect URI field below first (an HTTPS tunnel URL or your LAN's HTTPS address) — Spotify only accepts plain HTTP for 127.0.0.1/::1." }
+                                    }
+                                    li { "Copy that app's Client ID (and Client Secret, if you're not using PKCE) into the fields below." }
+                                    li { "Save client settings, then click Connect Spotify and approve access on Spotify's consent page." }
+                                    li { "If something goes wrong, the message below the Connect button explains what to fix — most often a callback URL that doesn't match exactly." }
                                 }
                                 div { class: "mt-4 rounded-md border border-default bg-elevated p-3", aria_label: "Remote UHC setup instructions",
-                                    h5 { class: "font-medium", "Using UHC from another device?" }
-                                    p { class: "mt-1 text-sm text-secondary", "Start a temporary HTTPS tunnel to this UHC server, then open the tunnel URL in this browser. The callback below will follow that secure origin." }
-                                    ol { class: "mt-2 list-decimal space-y-1 pl-5 text-sm text-secondary",
-                                        li { "On the machine running UHC, tunnel its configured web port (8088 by default; use your configured port if different) with your provider (for example, ", code { "cloudflared tunnel --url http://127.0.0.1:8088" }, " or Tailscale Funnel)." }
-                                        li { "Open the provider’s HTTPS URL here; do not continue from the server’s plain HTTP address." }
-                                        li { "Register the exact callback URI below in the Spotify developer dashboard, then save and connect." }
-                                        li { "Stop the tunnel after authorization. Start a new one if Spotify needs reauthorization later." }
-                                    }
+                                    h5 { class: "font-medium", "Using UHC from another device or a NAS?" }
+                                    p { class: "mt-1 text-sm text-secondary", "Spotify requires HTTPS for anything other than 127.0.0.1/::1. Start a temporary HTTPS tunnel to this UHC server (for example ", code { "cloudflared tunnel --url http://127.0.0.1:8088" }, " or Tailscale Funnel), open the tunnel's HTTPS URL in this browser, then set the Redirect URI below to that tunnel's callback address before registering it above. A built-in one-click tunnel is tracked as a follow-up; see docs/streaming-adapters.md." }
+                                    p { class: "mt-1 text-sm text-secondary", "Stop the tunnel after authorization; reauthorizing later needs a new tunnel and a newly registered callback URL." }
                                 }
-                                label { class: "mt-3 block text-sm font-medium", r#for: "spotify-client-id", "Client ID" }
+                                label { class: "mt-4 block text-sm font-medium", r#for: "spotify-client-id", "Client ID" }
                                 input {
                                     id: "spotify-client-id",
                                     class: "input mt-1 min-h-11 w-full",
@@ -1285,7 +1376,7 @@ pub fn Settings() -> Element {
                                         spotify_redirect_uri.set(event.value());
                                     },
                                 }
-                                p { class: "mt-2 text-xs text-muted", "Spotify requires HTTPS when UHC is accessed remotely. Plain HTTP is accepted only on 127.0.0.1 or [::1]." }
+                                p { class: "mt-2 text-xs text-muted", "Spotify requires HTTPS when UHC is accessed remotely. Plain HTTP is accepted only on 127.0.0.1 or [::1]. Changing this updates the callback URL shown in step 2 above." }
                                 button {
                                     id: "spotify-save-client-settings",
                                     r#type: "button",
@@ -1735,6 +1826,7 @@ mod tests {
         apple_music_live_companion_count, apple_music_status_state, AppleMusicStatusState,
     };
     use super::{settings_with_toggle, settings_write_error, AdapterToggle, SettingsToggle};
+    use super::{query_param, spotify_callback_feedback, spotify_oauth_error_message};
     use crate::app::api::{
         AdapterSettings, AppSettings, AppleBridgeCompanionStatus, AppleBridgeStatus,
     };
@@ -1846,5 +1938,83 @@ mod tests {
             AppleMusicStatusState::Live
         );
         assert_eq!(apple_music_live_companion_count(Some(&live)), 1);
+    }
+
+    #[test]
+    fn query_param_extracts_and_decodes_value() {
+        assert_eq!(
+            query_param("?spotify=error&reason=expired_state", "reason"),
+            Some("expired_state".to_string())
+        );
+        assert_eq!(
+            query_param("?spotify=error&reason=token_exchange%5Ffailed", "reason"),
+            Some("token_exchange_failed".to_string())
+        );
+        assert_eq!(query_param("?spotify=connected", "reason"), None);
+        assert_eq!(query_param("", "reason"), None);
+    }
+
+    #[test]
+    fn callback_feedback_reports_success_without_error_styling() {
+        let feedback = spotify_callback_feedback("?spotify=connected").unwrap();
+        assert!(!feedback.is_error);
+        assert!(feedback.message.contains("connected"));
+
+        let legacy = spotify_callback_feedback("?oauth=success").unwrap();
+        assert!(!legacy.is_error);
+    }
+
+    #[test]
+    fn callback_feedback_is_none_without_a_recognized_marker() {
+        assert!(spotify_callback_feedback("?tab=devices").is_none());
+        assert!(spotify_callback_feedback("").is_none());
+    }
+
+    #[test]
+    fn callback_feedback_reports_errors_with_a_per_reason_actionable_message() {
+        let expired = spotify_callback_feedback("?spotify=error&reason=expired_state").unwrap();
+        assert!(expired.is_error);
+        assert!(expired.message.contains("expired"));
+
+        let mismatch =
+            spotify_callback_feedback("?spotify=error&reason=token_exchange_failed").unwrap();
+        assert!(mismatch.is_error);
+        assert!(mismatch.message.contains("callback URL"));
+
+        let unknown_reason = spotify_callback_feedback("?spotify=error&reason=made_up").unwrap();
+        assert!(unknown_reason.is_error);
+        assert!(unknown_reason.message.contains("Try Connect again"));
+
+        let no_reason = spotify_callback_feedback("?spotify=error").unwrap();
+        assert!(no_reason.is_error);
+    }
+
+    #[test]
+    fn every_oauth_callback_error_code_has_a_distinct_actionable_message() {
+        // Every `code` produced by `oauth_callback_json` in
+        // `src/api/provider_auth.rs` must be handled explicitly here so a new
+        // failure mode never silently falls back to the generic message.
+        let codes = [
+            "invalid_state",
+            "expired_state",
+            "provider_denied",
+            "provider_oauth_error",
+            "missing_authorization_code",
+            "token_exchange_failed",
+            "token_storage_failed",
+            "oauth_not_configured",
+            "invalid_client_configuration",
+            "adapter_unavailable",
+            "adapter_start_failed",
+            "companion_required",
+        ];
+        let generic = spotify_oauth_error_message(Some("unmapped_code_xyz"));
+        for code in codes {
+            let message = spotify_oauth_error_message(Some(code));
+            assert_ne!(
+                message, generic,
+                "code {code} should not fall back to the generic message"
+            );
+        }
     }
 }
