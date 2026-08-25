@@ -953,7 +953,9 @@ pub async fn handle_play_ref(
         (LibraryRoute::MusicAssistant, RefTarget::MusicAssistant { uri, title }) => {
             play_ref_music_assistant(state, env, &args, uri, title).await
         }
-        (LibraryRoute::MusicAssistant, RefTarget::MusicAssistantBrowse { .. }) => env.refused(
+        (LibraryRoute::MusicAssistant, RefTarget::MusicAssistantBrowse { .. })
+        | (LibraryRoute::Lms, RefTarget::LmsBrowse { .. })
+        | (LibraryRoute::Roon, RefTarget::RoonBrowse { .. }) => env.refused(
             "this ref names a browsable collection, not playable media.",
             Refusal::InvalidParameter {
                 parameter: "ref",
@@ -991,7 +993,15 @@ pub async fn handle_play_ref(
         | (LibraryRoute::MusicAssistant, RefTarget::Roon { .. })
         | (LibraryRoute::MusicAssistant, RefTarget::Lms { .. })
         | (LibraryRoute::MusicAssistant, RefTarget::Spotify { .. })
-        | (LibraryRoute::MusicAssistant, RefTarget::AppleMusic { .. }) => env.failed(
+        | (LibraryRoute::MusicAssistant, RefTarget::AppleMusic { .. })
+        | (LibraryRoute::Roon, RefTarget::LmsBrowse { .. })
+        | (LibraryRoute::Spotify, RefTarget::LmsBrowse { .. })
+        | (LibraryRoute::AppleMusic, RefTarget::LmsBrowse { .. })
+        | (LibraryRoute::MusicAssistant, RefTarget::LmsBrowse { .. })
+        | (LibraryRoute::Lms, RefTarget::RoonBrowse { .. })
+        | (LibraryRoute::Spotify, RefTarget::RoonBrowse { .. })
+        | (LibraryRoute::AppleMusic, RefTarget::RoonBrowse { .. })
+        | (LibraryRoute::MusicAssistant, RefTarget::RoonBrowse { .. }) => env.failed(
             "internal routing error: ref/zone provider mismatch reached dispatch after the \
                  capability check. This is a UHC bug.",
         ),

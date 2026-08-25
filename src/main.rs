@@ -494,6 +494,18 @@ mod server {
             );
         }
 
+        // #531: registered for `hifi_collections`' content operation only --
+        // `search`/`play_uri` refuse through this trait (see
+        // `LibraryAdapter for LmsAdapter`/`for RoonAdapter`'s docs);
+        // `hifi_search`/`hifi_play` keep calling these adapters directly.
+        state
+            .adapter_registry
+            .register_library("lms", state.lms.clone())
+            .await;
+        state
+            .adapter_registry
+            .register_library("roon", state.roon.clone())
+            .await;
         state
             .adapter_registry
             .register_with_lifecycle(spotify.clone(), spotify.clone())

@@ -86,6 +86,23 @@ pub struct MockLibraryItem {
     pub artist: String,
 }
 
+/// One track row for `titles` (an album's tracks) and `playlists tracks` (a
+/// playlist's tracks) -- #531's `hifi_collections` drill-down.
+#[derive(Debug, Clone)]
+pub struct MockTrack {
+    pub id: i64,
+    pub title: String,
+    pub artist: Option<String>,
+}
+
+/// One row of LMS's `favorites items` -- #531. Real LMS favorites carry no
+/// durable entity id, only a `url`; this mock mirrors that.
+#[derive(Debug, Clone)]
+pub struct MockFavorite {
+    pub name: String,
+    pub url: String,
+}
+
 /// Mock LMS server state
 struct MockLmsState {
     players: HashMap<String, MockPlayer>,
@@ -96,9 +113,18 @@ struct MockLmsState {
     /// Library items for `search` (the `search_library` fallback path) and for
     /// the `albums`/`artists`/`titles` existence checks
     /// `LmsAdapter::assert_library_id_exists` (#396) issues before a mutating
-    /// `playlistcontrol` call. Keyed by [`LmsSearchResultType`]-shaped kind:
-    /// `"album"`, `"artist"`, `"track"`.
+    /// `playlistcontrol` call, and for #531's `hifi_collections` listings.
+    /// Keyed by [`LmsSearchResultType`]-shaped kind: `"album"`, `"artist"`,
+    /// `"track"`, plus `"playlist"` for #531.
     library: HashMap<&'static str, Vec<MockLibraryItem>>,
+    /// `album_id` -> that album's tracks, for `titles <start> <count>
+    /// album_id:<id>` (#531).
+    album_tracks: HashMap<i64, Vec<MockTrack>>,
+    /// `playlist_id` -> that playlist's tracks, for `playlists tracks <start>
+    /// <count> playlist_id:<id>` (#531).
+    playlist_tracks: HashMap<i64, Vec<MockTrack>>,
+    /// The flat favourites list for `favorites items <start> <count>` (#531).
+    favorites: Vec<MockFavorite>,
 }
 
 /// Mock LMS Server
@@ -115,6 +141,9 @@ impl MockLmsServer {
             players: HashMap::new(),
             commands: Vec::new(),
             library: HashMap::new(),
+            album_tracks: HashMap::new(),
+            playlist_tracks: HashMap::new(),
+            favorites: Vec::new(),
         }));
 
         let app = Router::new()
@@ -212,6 +241,83 @@ impl MockLmsServer {
         self.state.write().await.library.insert("album", items);
     }
 
+    /// Seed the artist library `artists <start> <count>` answers from (#531).
+    pub async fn set_library_artists(&self, artists: Vec<(i64, &str)>) {
+        let items = artists
+            .into_iter()
+            .map(|(id, title)| MockLibraryItem {
+                id,
+                title: title.to_string(),
+                artist: String::new(),
+            })
+            .collect();
+        self.state.write().await.library.insert("artist", items);
+    }
+
+    /// Seed the playlist library `playlists <start> <count>` answers from
+    /// (#531).
+    pub async fn set_library_playlists(&self, playlists: Vec<(i64, &str)>) {
+        let items = playlists
+            .into_iter()
+            .map(|(id, title)| MockLibraryItem {
+                id,
+                title: title.to_string(),
+                artist: String::new(),
+            })
+            .collect();
+        self.state.write().await.library.insert("playlist", items);
+    }
+
+    /// Seed one album's tracks, for `titles <start> <count> album_id:<id>`
+    /// (#531).
+    pub async fn set_album_tracks(&self, album_id: i64, tracks: Vec<(i64, &str, Option<&str>)>) {
+        let items = tracks
+            .into_iter()
+            .map(|(id, title, artist)| MockTrack {
+                id,
+                title: title.to_string(),
+                artist: artist.map(str::to_string),
+            })
+            .collect();
+        self.state.write().await.album_tracks.insert(album_id, items);
+    }
+
+    /// Seed one playlist's tracks, for `playlists tracks <start> <count>
+    /// playlist_id:<id>` (#531).
+    pub async fn set_playlist_tracks(
+        &self,
+        playlist_id: i64,
+        tracks: Vec<(i64, &str, Option<&str>)>,
+    ) {
+        let items = tracks
+            .into_iter()
+            .map(|(id, title, artist)| MockTrack {
+                id,
+                title: title.to_string(),
+                artist: artist.map(str::to_string),
+            })
+            .collect();
+        self.state
+            .write()
+            .await
+            .playlist_tracks
+            .insert(playlist_id, items);
+    }
+
+    /// Seed the flat favourites list `favorites items <start> <count>`
+    /// answers from (#531). Real LMS favorites have no durable id, only a
+    /// `url` -- mirrored here rather than inventing one.
+    pub async fn set_favorites(&self, favorites: Vec<(&str, &str)>) {
+        let items = favorites
+            .into_iter()
+            .map(|(name, url)| MockFavorite {
+                name: name.to_string(),
+                url: url.to_string(),
+            })
+            .collect();
+        self.state.write().await.favorites = items;
+    }
+
     /// Commands received for `player_id`, excluding the read-only polling
     /// commands the adapter issues on its own schedule.
     pub async fn write_commands(&self, player_id: &str) -> Vec<Vec<String>> {
@@ -261,6 +367,23 @@ fn filter_value<'a>(commands: &'a [Value], tag: &str) -> Option<&'a str> {
         .iter()
         .filter_map(Value::as_str)
         .find_map(|s| s.strip_prefix(prefix.as_str()))
+}
+
+/// Read the `<start> <count>` pair LMS's own taggedlist queries carry at a
+/// fixed position (#531): `["albums", <start>, <count>, ...]` has them at
+/// `1, 2`; `["playlists", "tracks", <start>, <count>, ...]` has them one
+/// further out, at `2, 3`. `start_index` names where `<start>` sits.
+fn paging(commands: &[Value], start_index: usize) -> (usize, usize) {
+    let offset = commands
+        .get(start_index)
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let count = commands
+        .get(start_index + 1)
+        .and_then(Value::as_u64)
+        .map(|c| c as usize)
+        .unwrap_or(usize::MAX);
+    (offset, count)
 }
 
 /// Handle JSON-RPC requests
@@ -485,11 +608,39 @@ async fn handle_jsonrpc(
                     })
                 })
                 .collect();
-            if page.is_empty() {
-                json!({})
-            } else {
-                json!({ "albums_loop": page })
+            // #531: `LmsAdapter::assert_library_id_exists` re-searches by
+            // title before honoring a track ref minted by
+            // `hifi_collections` (same existence check #396 added for
+            // albums), so a track from an album's or a playlist's tracks
+            // must be findable here too -- by title, exactly like albums
+            // above, deduped by id since the same track can appear in both.
+            let mut seen_track_ids = std::collections::HashSet::new();
+            let track_page: Vec<Value> = state
+                .album_tracks
+                .values()
+                .chain(state.playlist_tracks.values())
+                .flatten()
+                .filter(|t| seen_track_ids.insert(t.id))
+                .filter(|t| {
+                    t.title.to_lowercase().contains(&query)
+                        || t.artist
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&query)
+                })
+                .skip(offset)
+                .take(count)
+                .map(|t| json!({"track_id": t.id, "track": t.title, "artist": t.artist}))
+                .collect();
+            let mut result = serde_json::Map::new();
+            if !page.is_empty() {
+                result.insert("albums_loop".to_string(), json!(page));
             }
+            if !track_page.is_empty() {
+                result.insert("tracks_loop".to_string(), json!(track_page));
+            }
+            Value::Object(result)
         }
         // The existence check `LmsAdapter::assert_library_id_exists` (#396)
         // issues before a mutating `playlistcontrol`:
@@ -498,7 +649,7 @@ async fn handle_jsonrpc(
         // album path -- they fall to the catch-all `{"count": 0}` shape via
         // `_`, which is the safe direction: an unmodeled kind reads as "not
         // found" rather than "found").
-        "albums" => {
+        "albums" if filter_value(commands, "album_id").is_some() => {
             let requested_id =
                 filter_value(commands, "album_id").and_then(|v| v.parse::<i64>().ok());
             let count = match requested_id {
@@ -512,6 +663,90 @@ async fn handle_jsonrpc(
                 None => 0,
             };
             json!({ "count": count })
+        }
+        // #531's `hifi_collections browse`: `["albums", <start>, <count>]`,
+        // the whole album library (no `album_id` filter, handled above).
+        "albums" => {
+            let (offset, count) = paging(commands, 1);
+            let all: Vec<&MockLibraryItem> = state.library.get("album").into_iter().flatten().collect();
+            let page: Vec<Value> = all
+                .iter()
+                .skip(offset)
+                .take(count)
+                .map(|item| json!({"album_id": item.id, "album": item.title, "artist": item.artist}))
+                .collect();
+            json!({ "count": all.len(), "albums_loop": page })
+        }
+        // #531: `["artists", <start>, <count>]`.
+        "artists" => {
+            let (offset, count) = paging(commands, 1);
+            let all: Vec<&MockLibraryItem> = state.library.get("artist").into_iter().flatten().collect();
+            let page: Vec<Value> = all
+                .iter()
+                .skip(offset)
+                .take(count)
+                .map(|item| json!({"artist_id": item.id, "artist": item.title}))
+                .collect();
+            json!({ "count": all.len(), "artists_loop": page })
+        }
+        // #531: `["titles", <start>, <count>, "album_id:<id>"]` -- one
+        // album's tracks.
+        "titles" => {
+            let (offset, count) = paging(commands, 1);
+            let album_id = filter_value(commands, "album_id").and_then(|v| v.parse::<i64>().ok());
+            let tracks = album_id
+                .and_then(|id| state.album_tracks.get(&id))
+                .cloned()
+                .unwrap_or_default();
+            let page: Vec<Value> = tracks
+                .iter()
+                .skip(offset)
+                .take(count)
+                .map(|t| json!({"track_id": t.id, "title": t.title, "artist": t.artist}))
+                .collect();
+            json!({ "count": tracks.len(), "titles_loop": page })
+        }
+        // #531: `["playlists", <start>, <count>]` (the playlist library) or
+        // `["playlists", "tracks", <start>, <count>, "playlist_id:<id>"]`
+        // (one playlist's tracks).
+        "playlists" if commands.get(1).and_then(Value::as_str) == Some("tracks") => {
+            let (offset, count) = paging(commands, 2);
+            let playlist_id =
+                filter_value(commands, "playlist_id").and_then(|v| v.parse::<i64>().ok());
+            let tracks = playlist_id
+                .and_then(|id| state.playlist_tracks.get(&id))
+                .cloned()
+                .unwrap_or_default();
+            let page: Vec<Value> = tracks
+                .iter()
+                .skip(offset)
+                .take(count)
+                .map(|t| json!({"id": t.id, "title": t.title, "artist": t.artist}))
+                .collect();
+            json!({ "count": tracks.len(), "playlisttracks_loop": page })
+        }
+        "playlists" => {
+            let (offset, count) = paging(commands, 1);
+            let all: Vec<&MockLibraryItem> = state.library.get("playlist").into_iter().flatten().collect();
+            let page: Vec<Value> = all
+                .iter()
+                .skip(offset)
+                .take(count)
+                .map(|item| json!({"id": item.id, "playlist": item.title}))
+                .collect();
+            json!({ "count": all.len(), "playlists_loop": page })
+        }
+        // #531: `["favorites", "items", <start>, <count>]`.
+        "favorites" if commands.get(1).and_then(Value::as_str) == Some("items") => {
+            let (offset, count) = paging(commands, 2);
+            let page: Vec<Value> = state
+                .favorites
+                .iter()
+                .skip(offset)
+                .take(count)
+                .map(|f| json!({"name": f.name, "url": f.url}))
+                .collect();
+            json!({ "count": state.favorites.len(), "loop_loop": page })
         }
         _ => {
             json!({})

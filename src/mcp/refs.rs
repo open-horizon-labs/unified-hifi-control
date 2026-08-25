@@ -139,6 +139,23 @@ pub enum RefTarget {
         path: String,
         title: String,
     },
+    /// An LMS browse continuation (#531): a server-side collection path
+    /// (`"albums"`, `"album:<id>"`, ...), never a raw entity id handed to a
+    /// client. Only accepted by `hifi_collections`, never `hifi_play_ref` --
+    /// same split as [`Self::MusicAssistantBrowse`].
+    LmsBrowse {
+        path: String,
+        title: String,
+    },
+    /// A Roon browse continuation (#531): the `item_key` **and**
+    /// `multi_session_key` a collection list was loaded under, so resuming it
+    /// re-enters that exact session -- same pairing requirement as
+    /// [`Self::Roon`], for the same reason (see [`RoonRefTarget`]'s docs).
+    /// Only accepted by `hifi_collections`, never `hifi_play_ref`.
+    RoonBrowse {
+        target: RoonRefTarget,
+        title: String,
+    },
     /// An Apple Music catalog/library identifier resolved by the paired native
     /// companion. Clients only receive the opaque token.
     AppleMusic {
@@ -161,6 +178,8 @@ impl RefTarget {
             Self::Spotify { .. } => Provider::Spotify,
             Self::MusicAssistant { .. } => Provider::MusicAssistant,
             Self::MusicAssistantBrowse { .. } => Provider::MusicAssistant,
+            Self::LmsBrowse { .. } => Provider::Lms,
+            Self::RoonBrowse { .. } => Provider::Roon,
             Self::AppleMusic { .. } => Provider::AppleMusic,
         }
     }
@@ -174,6 +193,8 @@ impl RefTarget {
             | Self::Spotify { title, .. }
             | Self::MusicAssistant { title, .. }
             | Self::MusicAssistantBrowse { title, .. }
+            | Self::LmsBrowse { title, .. }
+            | Self::RoonBrowse { title, .. }
             | Self::AppleMusic { title, .. } => title,
         }
     }

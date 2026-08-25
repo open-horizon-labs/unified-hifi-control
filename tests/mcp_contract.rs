@@ -228,7 +228,7 @@ async fn build_state_with_bus(
     let startable_adapters: Vec<Arc<dyn Startable>> =
         vec![roon.clone(), lms.clone(), openhome.clone(), upnp.clone()];
 
-    AppState::new(
+    let state = AppState::new(
         roon,
         hqplayer,
         hqp_instances,
@@ -243,7 +243,20 @@ async fn build_state_with_bus(
         startable_adapters,
         Instant::now(),
         CancellationToken::new(),
-    )
+    );
+    // #531: mirrors main.rs's registration -- hifi_collections reaches LMS
+    // and Roon through the registry's `content` operation, not a direct
+    // `state.lms`/`state.roon` field access (see
+    // `tests/adapter_boundary_lint.rs`).
+    state
+        .adapter_registry
+        .register_library("lms", state.lms.clone())
+        .await;
+    state
+        .adapter_registry
+        .register_library("roon", state.roon.clone())
+        .await;
+    state
 }
 
 impl TestApp {
@@ -2248,6 +2261,194 @@ async fn musicassistant_collections_are_paged_and_mint_opaque_playable_refs() {
                 == json!({"queue_id": "living-room-group", "media": "library://track/42", "option": "next"})
     ));
     server.abort();
+}
+
+/// #531: LMS's `hifi_collections` slice walks the synthetic root into
+/// Albums, drills into one album's tracks, and mints an opaque ref over the
+/// durable `LmsPlayTarget::Library` id -- never the raw LMS entity id.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_collections_browse_walks_albums_into_tracks() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    h.mock
+        .set_library_albums(vec![(7, "Kind of Blue", "Miles Davis")])
+        .await;
+    h.mock
+        .set_album_tracks(7, vec![(42, "So What", Some("Miles Davis"))])
+        .await;
+
+    let root = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse"}),
+        )
+        .await;
+    assert_eq!(root["structuredContent"]["outcome"], "ok");
+    let root_page: Value = serde_json::from_str(&result_text(&root)).expect("root page JSON");
+    let albums_entry = root_page["items"]
+        .as_array()
+        .expect("root items")
+        .iter()
+        .find(|item| item["title"] == "Albums")
+        .expect("root must list Albums");
+    let albums_path = albums_entry["path"].as_str().expect("Albums has a path");
+    assert!(albums_path.starts_with("ref_"));
+
+    let albums = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse", "path": albums_path}),
+        )
+        .await;
+    assert_eq!(albums["structuredContent"]["outcome"], "ok");
+    let albums_page: Value = serde_json::from_str(&result_text(&albums)).expect("albums page JSON");
+    assert_eq!(albums_page["items"][0]["title"], "Kind of Blue");
+    assert_eq!(albums_page["items"][0]["subtitle"], "Album by Miles Davis");
+    let album_path = albums_page["items"][0]["path"]
+        .as_str()
+        .expect("an album is itself browsable, into its tracks");
+
+    let tracks = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse", "path": album_path}),
+        )
+        .await;
+    assert_eq!(tracks["structuredContent"]["outcome"], "ok");
+    let tracks_page: Value = serde_json::from_str(&result_text(&tracks)).expect("tracks page JSON");
+    assert_eq!(tracks_page["items"][0]["title"], "So What");
+    let track_ref = tracks_page["items"][0]["ref"]
+        .as_str()
+        .expect("a track is playable, not a browsable path");
+    assert!(tracks_page["items"][0].get("path").is_none());
+
+    // The minted ref plays via hifi_play_ref exactly like a search hit's.
+    let play = h
+        .app
+        .call_tool(
+            "hifi_play_ref",
+            json!({"zone_id": zone_id, "ref": track_ref}),
+        )
+        .await;
+    assert_eq!(play["structuredContent"]["outcome"], "accepted");
+
+    h.stop().await;
+}
+
+/// #531: `hifi_collections playlists` lists LMS's saved playlists, and one
+/// playlist's tracks are reachable through the same opaque-path browse call.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_collections_playlists_and_favorites() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+
+    h.mock
+        .set_library_playlists(vec![(3, "Sunday Morning")])
+        .await;
+    h.mock
+        .set_playlist_tracks(3, vec![(9, "Blue in Green", Some("Miles Davis"))])
+        .await;
+    h.mock
+        .set_favorites(vec![("Jazz FM", "http://example.com/jazzfm")])
+        .await;
+
+    let playlists = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "playlists"}),
+        )
+        .await;
+    assert_eq!(playlists["structuredContent"]["outcome"], "ok");
+    let playlists_page: Value =
+        serde_json::from_str(&result_text(&playlists)).expect("playlists page JSON");
+    assert_eq!(playlists_page["items"][0]["title"], "Sunday Morning");
+    let playlist_path = playlists_page["items"][0]["path"]
+        .as_str()
+        .expect("a playlist is browsable into its tracks");
+
+    let tracks = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse", "path": playlist_path}),
+        )
+        .await;
+    assert_eq!(tracks["structuredContent"]["outcome"], "ok");
+    let tracks_page: Value = serde_json::from_str(&result_text(&tracks)).expect("tracks page JSON");
+    assert_eq!(tracks_page["items"][0]["title"], "Blue in Green");
+
+    let favorites = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "favorites"}),
+        )
+        .await;
+    assert_eq!(favorites["structuredContent"]["outcome"], "ok");
+    let favorites_page: Value =
+        serde_json::from_str(&result_text(&favorites)).expect("favorites page JSON");
+    assert_eq!(favorites_page["items"][0]["title"], "Jazz FM");
+    let favorite_ref = favorites_page["items"][0]["ref"]
+        .as_str()
+        .expect("a favorite with a url is playable");
+    assert!(!favorite_ref.contains("jazzfm"), "the favorite's url must stay server-side");
+
+    h.stop().await;
+}
+
+/// #531: an opaque path minted for one zone's provider must never resolve
+/// against a different provider's zone -- same safety property #492 already
+/// pins for Music Assistant, now proven for LMS.
+#[tokio::test]
+#[serial_test::serial(uhc_config_dir)]
+async fn lms_collections_path_does_not_cross_provider_boundaries() {
+    let h = LmsHarness::start().await;
+    let zone_id = h.zone_id();
+    h.mock
+        .set_library_albums(vec![(1, "Album", "Artist")])
+        .await;
+
+    let root = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse"}),
+        )
+        .await;
+    let root_page: Value = serde_json::from_str(&result_text(&root)).expect("root page JSON");
+    let path = root_page["items"][0]["path"]
+        .as_str()
+        .expect("root item has a path")
+        .to_string();
+
+    let cross = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": "roon:not-lms", "action": "browse", "path": path}),
+        )
+        .await;
+    assert_eq!(cross["structuredContent"]["outcome"], "invalid", "{cross}");
+    assert_eq!(cross["structuredContent"]["refusal"]["parameter"], "path");
+
+    let stale = h
+        .app
+        .call_tool(
+            "hifi_collections",
+            json!({"zone_id": zone_id, "action": "browse", "path": "ref_not-a-real-token"}),
+        )
+        .await;
+    assert_eq!(stale["structuredContent"]["outcome"], "invalid", "{stale}");
+    assert_eq!(stale["structuredContent"]["refusal"]["parameter"], "path");
+
+    h.stop().await;
 }
 
 /// A `TestApp` wired to a live mock LMS server, with the aggregator running so
@@ -5027,7 +5228,6 @@ async fn lms_never_reports_a_uhc_gap_as_a_provider_limitation() {
 
     // The named cases, spelled out so a regression names itself.
     for capability in [
-        "browse",
         "queue_read",
         "queue_jump",
         "queue_reorder",
@@ -5036,8 +5236,6 @@ async fn lms_never_reports_a_uhc_gap_as_a_provider_limitation() {
         "play_next",
         "repeat_mode",
         "shuffle_mode",
-        "saved_playlists",
-        "favorites",
         "multiroom_sync",
     ] {
         let entry = caps
@@ -5047,6 +5245,19 @@ async fn lms_never_reports_a_uhc_gap_as_a_provider_limitation() {
             support_of(entry),
             NOT_IMPLEMENTED,
             "lms/{capability} must read as not-yet-implemented until its issue lands"
+        );
+    }
+
+    // #531 wired these three to hifi_collections; LMS's protocol always
+    // supported them (that is this test's whole point), and now so does UHC.
+    for capability in ["browse", "saved_playlists", "favorites"] {
+        let entry = caps
+            .get(capability)
+            .unwrap_or_else(|| panic!("lms/{capability} missing"));
+        assert_eq!(
+            support_of(entry),
+            SUPPORTED,
+            "lms/{capability} is wired to hifi_collections since #531"
         );
     }
 }
@@ -5205,15 +5416,29 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
                 "hifi_play_ref",
                 json!({ "ref": "bad-ref", "zone_id": zone_id }),
             )),
-            "browse" | "saved_playlists" | "favorites" if provider == "musicassistant" => Some((
+            "browse" | "saved_playlists" | "favorites"
+                if matches!(provider, "musicassistant" | "lms") =>
+            {
+                Some((
+                    "hifi_collections",
+                    json!({
+                        "zone_id": zone_id,
+                        "action": match capability {
+                            "browse" => "browse",
+                            "saved_playlists" => "playlists",
+                            _ => "favorites",
+                        }
+                    }),
+                ))
+            }
+            // Roon's favorites cell is not (yet) supported, so only browse
+            // and saved_playlists (mapped to Playlists, its browse-hierarchy
+            // node) are probed here.
+            "browse" | "saved_playlists" if provider == "roon" => Some((
                 "hifi_collections",
                 json!({
                     "zone_id": zone_id,
-                    "action": match capability {
-                        "browse" => "browse",
-                        "saved_playlists" => "playlists",
-                        _ => "favorites",
-                    }
+                    "action": if capability == "browse" { "browse" } else { "playlists" },
                 }),
             )),
             "browse" | "saved_playlists" | "favorites" => {
@@ -5297,15 +5522,16 @@ async fn every_supported_capability_reaches_that_providers_own_adapter() {
     // The routed Spotify content and mode cells plus Music Assistant's queue
     // mutations, mode, collections, and zone-group cells add twenty-three probes to the
     // original provider transport set, plus one more for Music Assistant's
-    // queue_transfer (#507).
+    // queue_transfer (#507), plus five for #531's LMS (browse, saved_playlists,
+    // favorites) and Roon (browse, saved_playlists) hifi_collections cells.
     // Apple Music's transport/skip/volume
     // cells remain gated until signed physical companion validation (#465).
     // Asserted exactly, not as a floor: a floor would pass while a cell silently
     // stopped being reported as supported, which is the direction that hides a
     // capability rather than inventing one.
     assert_eq!(
-        proved, 46,
-        "{proved} supported cells were proved end to end, expected 46. If a capability was deliberately wired or unwired, change this number in the same commit."
+        proved, 51,
+        "{proved} supported cells were proved end to end, expected 51. If a capability was deliberately wired or unwired, change this number in the same commit."
     );
 }
 

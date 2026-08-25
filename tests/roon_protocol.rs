@@ -1314,6 +1314,128 @@ async fn a_custom_library_is_browsable() {
 }
 
 // =============================================================================
+// hifi_collections (#531): browse_collection and browse_named_root_node
+// =============================================================================
+
+/// `browse_collection` walks two levels: a fresh root session, then resuming
+/// it with the returned `(item_key, session_key)` pair -- exactly what
+/// `hifi_collections`' `path` round-trips through a minted `RoonBrowse` ref.
+/// The second call must never send `pop_all` (see `RoonAdapter::play_ref`'s
+/// docs on why that combination hangs a real Core).
+#[tokio::test]
+async fn roon_collections_browse_walks_two_levels_without_pop_all_on_resume() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Library").with_children(vec![FakeItem::list(
+        "Genres",
+    )
+    .with_children(vec![FakeItem::list("Jazz"), FakeItem::list("Ambient")])])];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let (session, root_items, root_count) = adapter
+        .browse_collection("zone_1", None, None, 0, 20)
+        .await
+        .expect("root browse");
+    assert_eq!(root_count, 1);
+    assert_eq!(root_items[0].title, "Library");
+    let library_key = root_items[0]
+        .item_key
+        .clone()
+        .expect("Library must be keyed");
+
+    let (resumed_session, level_two, _count) = adapter
+        .browse_collection("zone_1", Some(&library_key), Some(&session), 0, 20)
+        .await
+        .expect("resumed browse");
+    assert_eq!(resumed_session, session, "resuming must reuse the session");
+    assert_eq!(
+        level_two.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
+        vec!["Genres"]
+    );
+
+    // The resuming browse must never combine pop_all with item_key.
+    let browses = core.browse_requests().await;
+    assert_eq!(browses.len(), 2);
+    assert!(browses[0].pop_all() && browses[0].item_key().is_none());
+    assert!(!browses[1].pop_all());
+    assert_eq!(browses[1].item_key(), Some(library_key.as_str()));
+
+    core.stop().await;
+}
+
+/// `browse_collection` honors `offset`/`limit` as Roon's own `load` paging,
+/// not a client-side slice -- unlike Music Assistant's `music/browse`, Roon's
+/// `load` takes `offset`/`count` natively.
+#[tokio::test]
+async fn roon_collections_browse_pages_with_native_load_offset() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("A"), FakeItem::list("B"), FakeItem::list("C")];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let (_session, page, count) = adapter
+        .browse_collection("zone_1", None, None, 1, 1)
+        .await
+        .expect("paged root browse");
+    assert_eq!(count, 3);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].title, "B");
+
+    core.stop().await;
+}
+
+/// `hifi_collections playlists`' whole job: enter a named top-level node in
+/// one call and load its contents, without a caller ever seeing the two-hop
+/// browse/load plumbing.
+#[tokio::test]
+async fn roon_collections_playlists_enters_the_named_root_node() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![
+        FakeItem::list("Library"),
+        FakeItem::list("Playlists").with_children(vec![
+            FakeItem::list("Sunday Morning"),
+            FakeItem::list("Focus"),
+        ]),
+    ];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let (_session, items, count) = adapter
+        .browse_named_root_node("zone_1", "Playlists", 0, 20)
+        .await
+        .expect("Playlists node must be found");
+    assert_eq!(count, 2);
+    assert_eq!(
+        items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
+        vec!["Sunday Morning", "Focus"]
+    );
+
+    core.stop().await;
+}
+
+/// A named node the Core's root does not have is an honest, named failure --
+/// not a hang, not an empty page pretending to be the real thing.
+#[tokio::test]
+async fn roon_collections_named_root_node_not_found_is_a_clean_error() {
+    let mut library = FakeLibrary::standard();
+    library.root_items = vec![FakeItem::list("Library")];
+
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let error = adapter
+        .browse_named_root_node("zone_1", "Playlists", 0, 20)
+        .await
+        .expect_err("Playlists does not exist in this root");
+    assert!(error.to_string().contains("Playlists"));
+
+    core.stop().await;
+}
+
+// =============================================================================
 // AppState for the HTTP-boundary test
 // =============================================================================
 
