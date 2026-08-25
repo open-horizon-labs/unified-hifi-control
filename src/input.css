@@ -663,6 +663,16 @@
     color: var(--text-muted);
   }
 
+  .library-tile-art-img {
+    @apply h-full w-full object-cover;
+  }
+
+  .library-row-thumb {
+    @apply size-10 shrink-0 rounded object-cover;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-default);
+  }
+
   .library-tile-play {
     @apply absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-full opacity-0 shadow-md transition-opacity;
     background: var(--accent-color);

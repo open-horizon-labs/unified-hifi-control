@@ -4481,7 +4481,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn upgrading_a_v3_settings_file_survives_every_early_write_path() {
-        env::set_var("UHC_CONFIG_DIR", "/tmp/uhc-test-issue-548-upgrade-simulation");
+        env::set_var(
+            "UHC_CONFIG_DIR",
+            "/tmp/uhc-test-issue-548-upgrade-simulation",
+        );
 
         // The exact shape a v3 release build persists: snake_case keys, no unknown fields, three
         // populated zone lists. Written as raw bytes -- not through this build's own `AppSettings` --

@@ -1005,6 +1005,14 @@ fn LibraryRow(
             class: "library-row library-row--reveal",
             style: "{stagger_style}",
             div { class: "min-w-0 flex items-center gap-2",
+                if let Some(image) = item.image.clone() {
+                    img {
+                        class: "library-row-thumb",
+                        src: "/api/collections/image?ref={image}",
+                        alt: "",
+                        loading: "lazy",
+                    }
+                }
                 if is_playing {
                     span { class: "library-eq", aria_label: "Currently playing",
                         span {} span {} span {}
@@ -1116,7 +1124,16 @@ fn LibraryTile(
                         }
                     }
                 },
-                span { class: "library-tile-placeholder", "♪" }
+                if let Some(image) = item.image.clone() {
+                    img {
+                        class: "library-tile-art-img",
+                        src: "/api/collections/image?ref={image}",
+                        alt: "",
+                        loading: "lazy",
+                    }
+                } else {
+                    span { class: "library-tile-placeholder", "♪" }
+                }
                 if is_playing {
                     span { class: "library-eq library-eq--tile", aria_label: "Currently playing",
                         span {} span {} span {}

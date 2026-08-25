@@ -426,6 +426,9 @@ pub struct CollectionItem {
     pub path: Option<String>,
     #[serde(rename = "ref", default)]
     pub item_ref: Option<String>,
+    /// Opaque artwork ref, resolved via `GET /api/collections/image?ref=...`.
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
