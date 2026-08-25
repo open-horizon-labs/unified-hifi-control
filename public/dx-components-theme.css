@@ -83,17 +83,19 @@ h3 {
   --light: ;
 }
 
-/* OLED black: near-black navy-tinted surfaces for AMOLED screens */
+/* OLED black: true-black ground AND near-black neutral elevations.
+   Elevation is conveyed by faint neutral steps + existing borders, not navy
+   tint — on an OLED panel the page should read as black, full stop. */
 :root.theme-oled {
   --dark: initial;
   --light: ;
   --primary-color-1: #000000;
   --primary-color-2: #000000;
-  --primary-color-3: #04111f;
-  --primary-color-4: #071a2e;
-  --primary-color-5: #0a2136;
-  --primary-color-6: #123a58;
-  --primary-color-7: #1c4363;
+  --primary-color-3: #060606;
+  --primary-color-4: #0a0a0a;
+  --primary-color-5: #101010;
+  --primary-color-6: #181a1c;
+  --primary-color-7: #222528;
 }
 
 :root {
