@@ -89,6 +89,7 @@ h3 {
 :root.theme-oled {
   --dark: initial;
   --light: ;
+  --primary-color: #000000;
   --primary-color-1: #000000;
   --primary-color-2: #000000;
   --primary-color-3: #060606;
