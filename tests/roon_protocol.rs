@@ -42,38 +42,48 @@ use unified_hifi_control::knobs::KnobStore;
 // Harness
 // =============================================================================
 
-/// Point the adapter's state-file writes at a throwaway directory, and return it.
+/// Give one test's adapter its own throwaway pairing-state file (issue #554).
 ///
-/// `run_roon_loop` persists Roon pairing state via `get_config_file_path`, which
-/// honours `UHC_CONFIG_DIR`. Without this, registering against the fake would write
-/// `roon_state.json` into the operator's real config directory.
+/// `run_roon_loop` persists Roon pairing state by read-modify-writing a JSON file.
+/// Earlier, every `RoonAdapter` in this binary shared one process-global
+/// `UHC_CONFIG_DIR`, so they all read-modify-wrote the *same* `roon_state.json`.
+/// Two adapters registering concurrently could interleave load->save and
+/// permanently drop each other's token — the handshake test polls 2s for its
+/// token and that drop is not a slow update, it is a lost one.
 ///
-/// The `set_var` happens *inside* the `OnceLock` initializer, so it runs exactly
-/// once and every later read of the variable is ordered after it by the `OnceLock`'s
-/// own acquire/release. Calling `set_var` per test would race with concurrent
-/// `getenv` from the other test threads.
-fn isolate_config_dir() -> &'static std::path::Path {
-    use std::sync::OnceLock;
-    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::env::set_var("UHC_CONFIG_DIR", dir.path());
-        dir
-    })
-    .path()
+/// `RoonAdapter::with_state_path_for_tests` now lets each adapter own a private
+/// file instead, so this binary's ~70 tests can run fully concurrently without
+/// racing over shared state. The `TempDir` is intentionally leaked (not stored)
+/// so the file outlives the adapter for the rest of the test binary's run; CI
+/// runners and `cargo test`'s tmp dirs are ephemeral regardless.
+fn private_state_path() -> std::path::PathBuf {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("roon_state.json");
+    std::mem::forget(dir);
+    path
 }
 
 /// Start a fake Core and a `RoonAdapter` connected to it, and wait until the
 /// adapter reports Browse as available.
 async fn connected(core: &FakeRoonCore) -> Arc<RoonAdapter> {
-    let _ = isolate_config_dir();
+    connected_at(core, private_state_path()).await.0
+}
 
+/// Like [`connected`], but also returns the pairing-state file path the adapter
+/// was configured with, for tests that need to assert on its contents directly.
+async fn connected_at(
+    core: &FakeRoonCore,
+    state_path: std::path::PathBuf,
+) -> (Arc<RoonAdapter>, std::path::PathBuf) {
     let bus = create_bus();
-    let adapter = Arc::new(RoonAdapter::new_configured(
-        bus,
-        "http://test.invalid:8088".to_string(),
-        KnobStore::new(),
-    ));
+    let adapter = Arc::new(
+        RoonAdapter::new_configured(
+            bus,
+            "http://test.invalid:8088".to_string(),
+            KnobStore::new(),
+        )
+        .with_state_path_for_tests(state_path.clone()),
+    );
 
     let runner = adapter.clone();
     let ip = core.ip();
@@ -87,7 +97,7 @@ async fn connected(core: &FakeRoonCore) -> Arc<RoonAdapter> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if adapter.is_browse_connected().await {
-            return adapter;
+            return (adapter, state_path);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -201,7 +211,7 @@ async fn classify_rejection<T: std::fmt::Debug>(
 #[tokio::test]
 async fn roon_core_completes_handshake() {
     let core = FakeRoonCore::start().await;
-    let adapter = connected(&core).await;
+    let (adapter, state_file) = connected_at(&core, private_state_path()).await;
 
     let status = adapter.get_status().await;
     assert!(status.connected);
@@ -221,11 +231,8 @@ async fn roon_core_completes_handshake() {
     assert!(names.contains(&"com.roonlabs.registry:1/register".to_string()));
 
     // Registering makes the adapter persist pairing state. Prove it landed in the
-    // throwaway directory: if this ever fails, the suite is writing into the
-    // operator's real config directory.
-    let state_file = isolate_config_dir()
-        .join("unified-hifi")
-        .join("roon_state.json");
+    // throwaway, adapter-private file: if this ever fails, the suite is writing
+    // into the operator's real config directory.
     let deadline = Instant::now() + Duration::from_secs(2);
     while !state_file.exists() && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -234,9 +241,9 @@ async fn roon_core_completes_handshake() {
         state_file.exists(),
         "expected pairing state at {state_file:?}"
     );
-    // Every test in this binary shares the one config directory, so the file is
-    // rewritten concurrently and a read can catch it mid-truncate. Retry until it
-    // parses and carries this Core's own id.
+    // This adapter owns its state file exclusively (issue #554), so a partial
+    // write can only be this adapter's own in-flight save, not another test's.
+    // Retry briefly until it parses and carries this Core's own id.
     let core_id = core.core_id().await;
     let deadline = Instant::now() + Duration::from_secs(2);
     let saved = loop {

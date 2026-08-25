@@ -1171,6 +1171,13 @@ pub struct RoonAdapter {
     /// Present only in the composed server.  It routes complete Core callbacks into the
     /// aggregator-owned projection and owns command/callback correlation.
     runtime_bridge: Option<Arc<RoonRuntimeBridge>>,
+    /// Where pairing state (`roon_state.json`) is loaded from and saved to.
+    ///
+    /// Defaults to `get_roon_state_path()`, i.e. the production config directory
+    /// (honouring `UHC_CONFIG_DIR`). Overridable via [`Self::with_state_path_for_tests`]
+    /// so each test instance gets its own file instead of racing every other
+    /// `RoonAdapter` in the test binary over one shared path (issue #554).
+    state_path: PathBuf,
 }
 
 impl RoonAdapter {
@@ -1184,6 +1191,7 @@ impl RoonAdapter {
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             knob_store: None,
             runtime_bridge: None,
+            state_path: get_roon_state_path(),
         }
     }
 
@@ -1211,7 +1219,23 @@ impl RoonAdapter {
             started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             knob_store: Some(knob_store),
             runtime_bridge,
+            state_path: get_roon_state_path(),
         }
+    }
+
+    /// Test seam (issue #554): point this adapter's pairing-state persistence at a
+    /// caller-owned path instead of the shared production config directory.
+    ///
+    /// `tests/roon_protocol.rs` spawns many `RoonAdapter`s in one test binary; every
+    /// one of them registers against its own fake Core and read-modify-writes
+    /// `roon_state.json` on pairing. Sharing one file (even a tempdir one) meant two
+    /// adapters could interleave load->save and permanently drop each other's token.
+    /// Each test now gets its own file via this seam, so production behaviour
+    /// (`get_roon_state_path()`, honouring `UHC_CONFIG_DIR`) is unchanged.
+    #[doc(hidden)]
+    pub fn with_state_path_for_tests(mut self, path: PathBuf) -> Self {
+        self.state_path = path;
+        self
     }
 
     /// Create and immediately start Roon adapter (legacy API for compatibility)
@@ -1300,6 +1324,7 @@ impl RoonAdapter {
                 ip,
                 port: port.to_string(),
             },
+            self.state_path.clone(),
         )
         .await
     }
@@ -3108,6 +3133,7 @@ impl AdapterLogic for RoonAdapter {
             self.knob_store.clone(),
             self.runtime_bridge.clone(),
             CoreConnect::Discovery,
+            self.state_path.clone(),
         )
         .await;
         command_shutdown.cancel();
@@ -3500,6 +3526,7 @@ enum CoreConnect {
 }
 
 /// Main Roon event loop
+#[allow(clippy::too_many_arguments)]
 async fn run_roon_loop(
     state: Arc<RwLock<RoonState>>,
     bus: SharedBus,
@@ -3508,6 +3535,7 @@ async fn run_roon_loop(
     knob_store: Option<KnobStore>,
     runtime_bridge: Option<Arc<RoonRuntimeBridge>>,
     connect: CoreConnect,
+    state_path: PathBuf,
 ) -> Result<()> {
     tracing::info!("Starting Roon discovery...");
 
@@ -3516,7 +3544,8 @@ async fn run_roon_loop(
 
     // Ensure config subdirectory exists for state persistence
     // Issue #76: State files now go into unified-hifi/ subdirectory
-    let state_path = get_roon_state_path();
+    // Issue #554: path is caller-supplied (production default: get_roon_state_path()),
+    // so concurrent tests can each own a private file instead of racing over one.
     if let Some(parent) = state_path.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent)?;
