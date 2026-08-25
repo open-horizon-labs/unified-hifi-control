@@ -1327,10 +1327,11 @@ async fn a_custom_library_is_browsable() {
 #[tokio::test]
 async fn roon_collections_browse_walks_two_levels_without_pop_all_on_resume() {
     let mut library = FakeLibrary::standard();
-    library.root_items = vec![FakeItem::list("Library").with_children(vec![FakeItem::list(
-        "Genres",
-    )
-    .with_children(vec![FakeItem::list("Jazz"), FakeItem::list("Ambient")])])];
+    library.root_items =
+        vec![
+            FakeItem::list("Library").with_children(vec![FakeItem::list("Genres")
+                .with_children(vec![FakeItem::list("Jazz"), FakeItem::list("Ambient")])]),
+        ];
 
     let core = FakeRoonCore::start_with(library).await;
     let adapter = connected(&core).await;
@@ -1352,7 +1353,10 @@ async fn roon_collections_browse_walks_two_levels_without_pop_all_on_resume() {
         .expect("resumed browse");
     assert_eq!(resumed_session, session, "resuming must reuse the session");
     assert_eq!(
-        level_two.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
+        level_two
+            .iter()
+            .map(|i| i.title.as_str())
+            .collect::<Vec<_>>(),
         vec!["Genres"]
     );
 
@@ -1372,7 +1376,11 @@ async fn roon_collections_browse_walks_two_levels_without_pop_all_on_resume() {
 #[tokio::test]
 async fn roon_collections_browse_pages_with_native_load_offset() {
     let mut library = FakeLibrary::standard();
-    library.root_items = vec![FakeItem::list("A"), FakeItem::list("B"), FakeItem::list("C")];
+    library.root_items = vec![
+        FakeItem::list("A"),
+        FakeItem::list("B"),
+        FakeItem::list("C"),
+    ];
 
     let core = FakeRoonCore::start_with(library).await;
     let adapter = connected(&core).await;
@@ -1827,14 +1835,21 @@ async fn roon_set_group_members_merges_outputs_into_one_zone() {
     );
     let merged = &zones[0];
     assert_eq!(merged.zone_id, "zone_a", "the leader's zone_id survives");
-    let mut output_ids: Vec<&str> = merged.outputs.iter().map(|o| o.output_id.as_str()).collect();
+    let mut output_ids: Vec<&str> = merged
+        .outputs
+        .iter()
+        .map(|o| o.output_id.as_str())
+        .collect();
     output_ids.sort_unstable();
     assert_eq!(output_ids, vec!["output_a", "output_b"]);
 
     let status = adapter.multiroom_status().await.unwrap();
     let groups = status["groups"].as_array().unwrap();
     assert_eq!(groups.len(), 1, "the merged zone reports as one group");
-    assert_eq!(groups[0]["leader_zone_id"], serde_json::json!("roon:zone_a"));
+    assert_eq!(
+        groups[0]["leader_zone_id"],
+        serde_json::json!("roon:zone_a")
+    );
     assert_eq!(
         groups[0]["member_zone_ids"],
         serde_json::json!(["roon:output_b"]),
@@ -1881,7 +1896,11 @@ async fn roon_ungroup_members_splits_outputs_back_into_separate_zones() {
         .into_iter()
         .filter(|r| r.name == "com.roonlabs.transport:2/ungroup_outputs")
         .collect();
-    assert_eq!(ungroup_requests.len(), 1, "exactly one ungroup_outputs call");
+    assert_eq!(
+        ungroup_requests.len(),
+        1,
+        "exactly one ungroup_outputs call"
+    );
     assert_eq!(
         ungroup_requests[0].body["output_ids"],
         serde_json::json!(["output_b"])

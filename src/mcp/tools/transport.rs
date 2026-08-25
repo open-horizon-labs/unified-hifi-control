@@ -315,13 +315,7 @@ pub(crate) async fn handle_hqplayer_control(
     args: HifiControlTool,
 ) -> Result<CallToolResult, CallToolError> {
     if !HQPLAYER_CONTROL_ACTIONS.contains(&args.action.as_str()) {
-        return unknown_action(
-            state,
-            &args.zone_id,
-            &args.action,
-            HQPLAYER_CONTROL_ACTIONS,
-        )
-        .await;
+        return unknown_action(state, &args.zone_id, &args.action, HQPLAYER_CONTROL_ACTIONS).await;
     }
 
     let env = Envelope::write("hifi_control", hqplayer_operation(&args.action))

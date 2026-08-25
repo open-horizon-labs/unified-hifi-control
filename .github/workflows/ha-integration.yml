@@ -66,6 +66,11 @@ jobs:
         uses: hacs/action@main
         with:
           category: integration
+          # TODO(#519 follow-up): brands needs a home-assistant/brands PR;
+          # topics and license are repo-level settings (GitHub topics, SPDX-
+          # recognizable LICENSE). All three gate HACS *default-store* listing
+          # only -- custom-repository installs work without them.
+          ignore: "brands topics license"
 
   hassfest:
     runs-on: ubuntu-latest

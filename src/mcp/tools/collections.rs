@@ -498,7 +498,10 @@ async fn handle_roon(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let item_key = item.get("item_key").and_then(Value::as_str);
-        let navigable = item.get("navigable").and_then(Value::as_bool).unwrap_or(false);
+        let navigable = item
+            .get("navigable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (path, r#ref) = match item_key {
             None => (None, None),
             Some(item_key) => {

@@ -128,8 +128,12 @@ mod tests {
     #[tokio::test]
     async fn dispatch_reports_missing_knob() {
         let knobs = KnobStore::default();
-        let outcome = dispatch(&knobs, "does-not-exist", ParsedKnobAction::Zone("roon:abc".to_string()))
-            .await;
+        let outcome = dispatch(
+            &knobs,
+            "does-not-exist",
+            ParsedKnobAction::Zone("roon:abc".to_string()),
+        )
+        .await;
         assert_eq!(outcome, DispatchOutcome::KnobNotFound);
     }
 }

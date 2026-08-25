@@ -289,7 +289,11 @@ impl MockLmsServer {
                 artist: artist.map(str::to_string),
             })
             .collect();
-        self.state.write().await.album_tracks.insert(album_id, items);
+        self.state
+            .write()
+            .await
+            .album_tracks
+            .insert(album_id, items);
     }
 
     /// Seed one playlist's tracks, for `playlists tracks <start> <count>
@@ -766,19 +770,23 @@ async fn handle_jsonrpc(
         // the whole album library (no `album_id` filter, handled above).
         "albums" => {
             let (offset, count) = paging(commands, 1);
-            let all: Vec<&MockLibraryItem> = state.library.get("album").into_iter().flatten().collect();
+            let all: Vec<&MockLibraryItem> =
+                state.library.get("album").into_iter().flatten().collect();
             let page: Vec<Value> = all
                 .iter()
                 .skip(offset)
                 .take(count)
-                .map(|item| json!({"album_id": item.id, "album": item.title, "artist": item.artist}))
+                .map(
+                    |item| json!({"album_id": item.id, "album": item.title, "artist": item.artist}),
+                )
                 .collect();
             json!({ "count": all.len(), "albums_loop": page })
         }
         // #531: `["artists", <start>, <count>]`.
         "artists" => {
             let (offset, count) = paging(commands, 1);
-            let all: Vec<&MockLibraryItem> = state.library.get("artist").into_iter().flatten().collect();
+            let all: Vec<&MockLibraryItem> =
+                state.library.get("artist").into_iter().flatten().collect();
             let page: Vec<Value> = all
                 .iter()
                 .skip(offset)
@@ -825,7 +833,12 @@ async fn handle_jsonrpc(
         }
         "playlists" => {
             let (offset, count) = paging(commands, 1);
-            let all: Vec<&MockLibraryItem> = state.library.get("playlist").into_iter().flatten().collect();
+            let all: Vec<&MockLibraryItem> = state
+                .library
+                .get("playlist")
+                .into_iter()
+                .flatten()
+                .collect();
             let page: Vec<Value> = all
                 .iter()
                 .skip(offset)

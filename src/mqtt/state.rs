@@ -64,14 +64,12 @@ fn normalized_volume(zone: &Zone) -> Option<f64> {
 /// needing provider-specific credentials.
 pub fn build_state_payload(zone: &Zone, picture_base_url: &str) -> ZoneStatePayload {
     let now_playing = zone.now_playing.as_ref();
-    let picture = now_playing
-        .and_then(|np| np.image_key.as_ref())
-        .map(|_| {
-            format!(
-                "{picture_base_url}/now_playing/image?zone_id={}",
-                urlencoding::encode(&zone.zone_id)
-            )
-        });
+    let picture = now_playing.and_then(|np| np.image_key.as_ref()).map(|_| {
+        format!(
+            "{picture_base_url}/now_playing/image?zone_id={}",
+            urlencoding::encode(&zone.zone_id)
+        )
+    });
 
     ZoneStatePayload {
         state: zone.state.to_string(),

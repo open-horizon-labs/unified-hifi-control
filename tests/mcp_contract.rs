@@ -2591,7 +2591,10 @@ async fn lms_collections_playlists_and_favorites() {
     let favorite_ref = favorites_page["items"][0]["ref"]
         .as_str()
         .expect("a favorite with a url is playable");
-    assert!(!favorite_ref.contains("jazzfm"), "the favorite's url must stay server-side");
+    assert!(
+        !favorite_ref.contains("jazzfm"),
+        "the favorite's url must stay server-side"
+    );
 
     h.stop().await;
 }

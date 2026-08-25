@@ -95,7 +95,12 @@ pub fn discovery_entries(
     ));
 
     entries.push((
-        topics::discovery_topic(settings.discovery_prefix, "binary_sensor", knob_id, "charging"),
+        topics::discovery_topic(
+            settings.discovery_prefix,
+            "binary_sensor",
+            knob_id,
+            "charging",
+        ),
         serde_json::json!({
             "name": "Charging",
             "unique_id": format!("uhc_knob_{slug}_charging"),
@@ -251,8 +256,7 @@ mod tests {
         let entries_b = discovery_entries("aabbcc", &knob_b, &zones, &settings());
 
         // Same knob id -> identical topics and unique_ids regardless of name.
-        for ((topic_a, payload_a), (topic_b, payload_b)) in entries_a.iter().zip(entries_b.iter())
-        {
+        for ((topic_a, payload_a), (topic_b, payload_b)) in entries_a.iter().zip(entries_b.iter()) {
             assert_eq!(topic_a, topic_b);
             assert_eq!(payload_a["unique_id"], payload_b["unique_id"]);
             // Only the display name should differ.

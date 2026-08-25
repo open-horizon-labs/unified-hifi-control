@@ -290,10 +290,9 @@ async fn stop_task(shutdown: CancellationToken, handle: JoinHandle<()>) {
 fn client_id() -> String {
     format!(
         "uhc-{}",
-        gethostname::gethostname().to_string_lossy().replace(
-            |c: char| !c.is_ascii_alphanumeric(),
-            "-"
-        )
+        gethostname::gethostname()
+            .to_string_lossy()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "-")
     )
 }
 
@@ -301,7 +300,10 @@ fn mqtt_options(record: &MqttCredentialRecord, availability_topic: &str) -> Mqtt
     let mut options = MqttOptions::new(client_id(), record.host.clone(), record.port);
     options.set_keep_alive(Duration::from_secs(30));
     if let Some(username) = record.username.as_ref().filter(|u| !u.is_empty()) {
-        options.set_credentials(username.clone(), record.password.clone().unwrap_or_default());
+        options.set_credentials(
+            username.clone(),
+            record.password.clone().unwrap_or_default(),
+        );
     }
     if record.tls {
         options.set_transport(Transport::tls_with_default_config());
@@ -354,12 +356,18 @@ async fn publish_zone(
 /// Clear every retained discovery/state topic a removed zone could have had.
 async fn retract_zone(client: &AsyncClient, record: &MqttCredentialRecord, zone_id: &str) {
     for topic in discovery::discovery_topics_for_removal(&record.discovery_prefix, zone_id) {
-        if let Err(error) = client.publish(topic, QoS::AtLeastOnce, true, Vec::new()).await {
+        if let Err(error) = client
+            .publish(topic, QoS::AtLeastOnce, true, Vec::new())
+            .await
+        {
             tracing::warn!("MQTT discovery retraction failed: {error}");
         }
     }
     let topic = topics::state_topic(&record.base_topic, zone_id);
-    if let Err(error) = client.publish(topic, QoS::AtLeastOnce, true, Vec::new()).await {
+    if let Err(error) = client
+        .publish(topic, QoS::AtLeastOnce, true, Vec::new())
+        .await
+    {
         tracing::warn!("MQTT state retraction failed: {error}");
     }
 }
@@ -406,12 +414,18 @@ async fn publish_knob(
 /// Clear every retained discovery/state topic a removed knob could have had.
 async fn retract_knob(client: &AsyncClient, record: &MqttCredentialRecord, knob_id: &str) {
     for topic in knob_discovery::discovery_topics_for_removal(&record.discovery_prefix, knob_id) {
-        if let Err(error) = client.publish(topic, QoS::AtLeastOnce, true, Vec::new()).await {
+        if let Err(error) = client
+            .publish(topic, QoS::AtLeastOnce, true, Vec::new())
+            .await
+        {
             tracing::warn!("MQTT knob discovery retraction failed: {error}");
         }
     }
     let topic = topics::knob_state_topic(&record.base_topic, knob_id);
-    if let Err(error) = client.publish(topic, QoS::AtLeastOnce, true, Vec::new()).await {
+    if let Err(error) = client
+        .publish(topic, QoS::AtLeastOnce, true, Vec::new())
+        .await
+    {
         tracing::warn!("MQTT knob state retraction failed: {error}");
     }
 }
@@ -439,7 +453,11 @@ async fn announce_all_knobs(
     let current = knobs.list_full().await;
     let current_ids: HashSet<String> = current.iter().map(|(id, _)| id.clone()).collect();
 
-    for removed_id in known_knob_ids.difference(&current_ids).cloned().collect::<Vec<_>>() {
+    for removed_id in known_knob_ids
+        .difference(&current_ids)
+        .cloned()
+        .collect::<Vec<_>>()
+    {
         knob_slugs.remove(&topics::zone_slug(&removed_id));
         retract_knob(client, record, &removed_id).await;
     }
@@ -470,7 +488,12 @@ async fn announce_all_zones(
     zone_slugs: &mut HashMap<String, String>,
 ) {
     if let Err(error) = client
-        .publish(availability_topic, QoS::AtLeastOnce, true, b"online".to_vec())
+        .publish(
+            availability_topic,
+            QoS::AtLeastOnce,
+            true,
+            b"online".to_vec(),
+        )
         .await
     {
         tracing::warn!("MQTT availability publish failed: {error}");
@@ -583,7 +606,9 @@ async fn handle_incoming_publish(
     knob_slugs: &HashMap<String, String>,
     publish: &rumqttc::Publish,
 ) {
-    if let Some((slug, action)) = knob_command::parse_command_topic(&record.base_topic, &publish.topic) {
+    if let Some((slug, action)) =
+        knob_command::parse_command_topic(&record.base_topic, &publish.topic)
+    {
         let Some(knob_id) = knob_slugs.get(slug) else {
             tracing::debug!(slug, "MQTT command for unknown knob slug; ignoring");
             return;
@@ -615,7 +640,14 @@ async fn handle_incoming_publish(
         tracing::debug!(topic = %publish.topic, "MQTT command topic had an unrecognized action or payload");
         return;
     };
-    match command::dispatch(adapter_registry, aggregator, reliable_commands, zone_id, parsed).await
+    match command::dispatch(
+        adapter_registry,
+        aggregator,
+        reliable_commands,
+        zone_id,
+        parsed,
+    )
+    .await
     {
         command::DispatchOutcome::Sent => {}
         command::DispatchOutcome::Refused(error) => {

@@ -1578,7 +1578,12 @@ async fn handle_load(req_id: usize, body: &Value, core: &Arc<RwLock<CoreState>>,
 // zone_id, (b) unions the outputs, and (c) retires any source zone left with
 // none -- which is exactly what issue #509's acceptance criteria describe.
 
-async fn handle_group_outputs(req_id: usize, body: &Value, core: &Arc<RwLock<CoreState>>, writer: &Writer) {
+async fn handle_group_outputs(
+    req_id: usize,
+    body: &Value,
+    core: &Arc<RwLock<CoreState>>,
+    writer: &Writer,
+) {
     let output_ids = string_array(body, "output_ids");
     respond(core, writer, "COMPLETE", "Success", req_id, None).await;
 
@@ -1595,7 +1600,14 @@ async fn handle_group_outputs(req_id: usize, body: &Value, core: &Arc<RwLock<Cor
         if !removed_zone_ids.is_empty() {
             change["zones_removed"] = json!(removed_zone_ids);
         }
-        send(&sub_writer, "CONTINUE", "Changed", sub_req_id, Some(&change)).await;
+        send(
+            &sub_writer,
+            "CONTINUE",
+            "Changed",
+            sub_req_id,
+            Some(&change),
+        )
+        .await;
     }
 }
 
@@ -1626,7 +1638,14 @@ async fn handle_ungroup_outputs(
         if !removed.is_empty() {
             change["zones_removed"] = json!(removed);
         }
-        send(&sub_writer, "CONTINUE", "Changed", sub_req_id, Some(&change)).await;
+        send(
+            &sub_writer,
+            "CONTINUE",
+            "Changed",
+            sub_req_id,
+            Some(&change),
+        )
+        .await;
     }
 }
 
@@ -1659,7 +1678,10 @@ fn zone_output_index(zones: &[Value], output_id: &str) -> Option<(usize, usize)>
 /// that lost their last output and were retired as a result. `None` when
 /// there was nothing to merge (the leader output was not found, or every
 /// other requested output already belongs to the leader's zone).
-fn merge_zone_outputs(zones: &mut Vec<Value>, output_ids: &[String]) -> Option<(Value, Vec<String>)> {
+fn merge_zone_outputs(
+    zones: &mut Vec<Value>,
+    output_ids: &[String],
+) -> Option<(Value, Vec<String>)> {
     let leader_output_id = output_ids.first()?;
     let (leader_zi, _) = zone_output_index(zones, leader_output_id)?;
     let leader_zone_id = zones[leader_zi]["zone_id"].as_str()?.to_string();
@@ -1702,7 +1724,12 @@ fn merge_zone_outputs(zones: &mut Vec<Value>, output_ids: &[String]) -> Option<(
             .as_array()
             .is_some_and(|outs| outs.is_empty())
         {
-            removed_zone_ids.push(zones[zi]["zone_id"].as_str().unwrap_or_default().to_string());
+            removed_zone_ids.push(
+                zones[zi]["zone_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
             zones.remove(zi);
             if zi < leader_zi {
                 leader_zi -= 1;
@@ -1752,7 +1779,12 @@ fn split_zone_outputs(
         zones_added.push(new_zone);
 
         if zones[zi]["outputs"].as_array().unwrap().is_empty() {
-            zones_removed.push(zones[zi]["zone_id"].as_str().unwrap_or_default().to_string());
+            zones_removed.push(
+                zones[zi]["zone_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
         } else {
             zones_changed.push(zones[zi].clone());
         }

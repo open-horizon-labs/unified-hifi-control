@@ -1371,9 +1371,7 @@ impl LibraryAdapter for MusicAssistantAdapter {
                 .get("target_zone_id")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    anyhow!("Music Assistant queue transfer requires target_zone_id")
-                })?;
+                .ok_or_else(|| anyhow!("Music Assistant queue transfer requires target_zone_id"))?;
             return self.queue_transfer(zone_id, target_zone_id).await;
         }
         match operation {
@@ -2703,8 +2701,7 @@ mod tests {
 
         let discovered = timeout(Duration::from_secs(2), async {
             loop {
-                if let BusEvent::ZoneDiscovered { zone } = events.recv().await.expect("bus event")
-                {
+                if let BusEvent::ZoneDiscovered { zone } = events.recv().await.expect("bus event") {
                     return zone;
                 }
             }
@@ -2810,8 +2807,7 @@ mod tests {
         let mut discovered = std::collections::HashSet::new();
         timeout(Duration::from_secs(2), async {
             while discovered.len() < 2 {
-                if let BusEvent::ZoneDiscovered { zone } = events.recv().await.expect("bus event")
-                {
+                if let BusEvent::ZoneDiscovered { zone } = events.recv().await.expect("bus event") {
                     discovered.insert(zone.zone_id);
                 }
             }
@@ -2832,14 +2828,15 @@ mod tests {
         // comment) rather than this adapter running its own reconnect loop.
         let removed = timeout(Duration::from_secs(10), async {
             loop {
-                if let BusEvent::ZoneRemoved { zone_id } = events.recv().await.expect("bus event")
-                {
+                if let BusEvent::ZoneRemoved { zone_id } = events.recv().await.expect("bus event") {
                     return zone_id;
                 }
             }
         })
         .await
-        .expect("reconnect resyncs and removes the vanished player within the retry backoff window");
+        .expect(
+            "reconnect resyncs and removes the vanished player within the retry backoff window",
+        );
         assert_eq!(removed.to_string(), "musicassistant:sonos-office");
 
         adapter.stop().await;

@@ -848,7 +848,10 @@ mod mock_server_tests {
         let groups = result["groups"].as_array().expect("groups array");
         assert_eq!(groups.len(), 1, "one group after syncing one member");
         assert_eq!(groups[0]["leader_zone_id"], serde_json::json!(leader_zone));
-        assert_eq!(groups[0]["member_zone_ids"], serde_json::json!([member_zone]));
+        assert_eq!(
+            groups[0]["member_zone_ids"],
+            serde_json::json!([member_zone])
+        );
         assert_eq!(groups[0]["can_set_members"], serde_json::json!(true));
 
         // The leader is addressed, the member is the argument -- verified live

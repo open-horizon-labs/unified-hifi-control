@@ -168,12 +168,20 @@ pub async fn dispatch(
 
     match prefix {
         "roon" => gateway_outcome(
-            dispatch_roon_runtime_command_via(reliable_commands, zone_id, action.into_gateway_command())
-                .await,
+            dispatch_roon_runtime_command_via(
+                reliable_commands,
+                zone_id,
+                action.into_gateway_command(),
+            )
+            .await,
         ),
         "lms" => gateway_outcome(
-            dispatch_lms_runtime_command_via(reliable_commands, zone_id, action.into_gateway_command())
-                .await,
+            dispatch_lms_runtime_command_via(
+                reliable_commands,
+                zone_id,
+                action.into_gateway_command(),
+            )
+            .await,
         ),
         "openhome" => gateway_outcome(
             dispatch_openhome_runtime_command_via(
@@ -184,8 +192,12 @@ pub async fn dispatch(
             .await,
         ),
         "upnp" => gateway_outcome(
-            dispatch_upnp_runtime_command_via(reliable_commands, zone_id, action.into_gateway_command())
-                .await,
+            dispatch_upnp_runtime_command_via(
+                reliable_commands,
+                zone_id,
+                action.into_gateway_command(),
+            )
+            .await,
         ),
         "hqplayer" => {
             let Some((hqp_action, value)) = action.into_hqplayer_action() else {
@@ -229,7 +241,10 @@ mod tests {
     #[test]
     fn parses_well_formed_command_topics() {
         assert_eq!(
-            parse_command_topic("unified-hifi", "unified-hifi/media_player/roon_abc/play/set"),
+            parse_command_topic(
+                "unified-hifi",
+                "unified-hifi/media_player/roon_abc/play/set"
+            ),
             Some(("roon_abc", "play"))
         );
         assert_eq!(
@@ -266,10 +281,7 @@ mod tests {
             "volume payloads are clamped to 0-100"
         );
         assert_eq!(parse_action("mute", "ON"), Some(ParsedAction::Mute(true)));
-        assert_eq!(
-            parse_action("mute", "off"),
-            Some(ParsedAction::Mute(false))
-        );
+        assert_eq!(parse_action("mute", "off"), Some(ParsedAction::Mute(false)));
     }
 
     #[test]
@@ -283,8 +295,14 @@ mod tests {
     async fn dispatch_reports_unsupported_for_a_prefix_with_no_bridged_provider() {
         let registry = Arc::new(AdapterRegistry::default());
         let aggregator = ZoneAggregator::new(crate::bus::create_bus());
-        let outcome = dispatch(&registry, &aggregator, None, "spotify:abc", ParsedAction::Play)
-            .await;
+        let outcome = dispatch(
+            &registry,
+            &aggregator,
+            None,
+            "spotify:abc",
+            ParsedAction::Play,
+        )
+        .await;
         assert_eq!(
             outcome,
             DispatchOutcome::Unsupported("no bridged provider for 'spotify' zones".to_string())

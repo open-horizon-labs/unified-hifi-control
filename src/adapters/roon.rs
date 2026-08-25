@@ -198,7 +198,9 @@ fn roon_zone_ids(zone_ids: &[String], parameter: &str) -> Result<Vec<String>> {
     for zone_id in zone_ids {
         let id = roon_zone_id(zone_id, parameter)?;
         if ids.contains(&id) {
-            return Err(anyhow::anyhow!("{parameter} must not contain duplicate zones"));
+            return Err(anyhow::anyhow!(
+                "{parameter} must not contain duplicate zones"
+            ));
         }
         ids.push(id);
     }
@@ -2689,12 +2691,16 @@ impl LibraryAdapter for RoonAdapter {
                 let leader = params
                     .get("leader_zone_id")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("Roon group operation requires leader_zone_id"))?;
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Roon group operation requires leader_zone_id")
+                    })?;
                 let add = params
                     .get("member_zone_ids_to_add")
                     .or_else(|| params.get("member_zone_ids"))
                     .and_then(Value::as_array)
-                    .ok_or_else(|| anyhow::anyhow!("Roon group operation requires member_zone_ids"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Roon group operation requires member_zone_ids")
+                    })?
                     .iter()
                     .filter_map(Value::as_str)
                     .map(ToOwned::to_owned)

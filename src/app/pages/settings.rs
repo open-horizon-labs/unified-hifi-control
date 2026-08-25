@@ -5,8 +5,8 @@
 use dioxus::prelude::*;
 
 use crate::app::api::{
-    source_label, AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig,
-    ManagedZone, ManagedZonesResponse, MoveDirection, MqttConfigureRequest, MqttStatusResponse,
+    source_label, AppSettings, AppleBridgeStatus, HqpStatus, LmsConfig, ManagedZone,
+    ManagedZonesResponse, MoveDirection, MqttConfigureRequest, MqttStatusResponse,
     MusicAssistantConfigureRequest, MusicAssistantStatusResponse, ProviderAuthResponse,
     ProviderOAuthStart, RoonStatus, SpotifyAccountResponse, SpotifyConfigureRequest,
     SpotifyConfigureResponse, ZoneNameRequest, ZoneOrderRequest, ZoneVisibilityRequest,
@@ -2490,8 +2490,8 @@ mod tests {
     use super::{
         apple_music_live_companion_count, apple_music_status_state, AppleMusicStatusState,
     };
-    use super::{settings_with_toggle, settings_write_error, AdapterToggle, SettingsToggle};
     use super::{query_param, spotify_callback_feedback, spotify_oauth_error_message};
+    use super::{settings_with_toggle, settings_write_error, AdapterToggle, SettingsToggle};
     use crate::app::api::{
         AdapterSettings, AppSettings, AppleBridgeCompanionStatus, AppleBridgeStatus,
     };

@@ -7,9 +7,7 @@
 //! Only rendered for zones whose adapter advertises collections support
 //! (Music Assistant today) -- callers gate that, this component assumes it.
 
-use crate::app::api::{
-    self, CollectionItem, CollectionsRequest, PlayRefRequest, QueueRequest,
-};
+use crate::app::api::{self, CollectionItem, CollectionsRequest, PlayRefRequest, QueueRequest};
 use dioxus::prelude::*;
 
 const PAGE_LIMIT: u32 = 20;

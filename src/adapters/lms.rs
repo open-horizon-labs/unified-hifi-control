@@ -1388,9 +1388,7 @@ impl LmsAdapter {
         }
         for player_id in add_ids.iter().chain(remove_ids.iter()) {
             if player_id == &leader_id {
-                return Err(anyhow!(
-                    "LMS group leader cannot be its own member input"
-                ));
+                return Err(anyhow!("LMS group leader cannot be its own member input"));
             }
             if !player_exists(player_id) {
                 return Err(anyhow!("LMS group member was not found"));
@@ -2061,10 +2059,7 @@ impl LmsAdapter {
         let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
         match operation {
             "collections_browse" => {
-                let path = params
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("root");
+                let path = params.get("path").and_then(Value::as_str).unwrap_or("root");
                 self.browse_collections(path, offset, limit).await
             }
             "collections_playlists" => self.list_playlists(offset, limit).await,
@@ -2088,7 +2083,11 @@ impl LmsAdapter {
             self.rpc
                 .execute(None, vec![json!("serverstatus"), json!(0), json!(0)])
                 .await?;
-            let categories = [("Albums", "albums"), ("Artists", "artists"), ("Playlists", "playlists")];
+            let categories = [
+                ("Albums", "albums"),
+                ("Artists", "artists"),
+                ("Playlists", "playlists"),
+            ];
             let items: Vec<Value> = categories
                 .iter()
                 .skip(offset)
@@ -2108,13 +2107,22 @@ impl LmsAdapter {
         if path == "playlists" {
             return self.list_playlists(offset, limit).await;
         }
-        if let Some(id) = path.strip_prefix("album:").and_then(|s| s.parse::<i64>().ok()) {
+        if let Some(id) = path
+            .strip_prefix("album:")
+            .and_then(|s| s.parse::<i64>().ok())
+        {
             return self.query_tracks(offset, limit, "album_id", id).await;
         }
-        if let Some(id) = path.strip_prefix("artist:").and_then(|s| s.parse::<i64>().ok()) {
+        if let Some(id) = path
+            .strip_prefix("artist:")
+            .and_then(|s| s.parse::<i64>().ok())
+        {
             return self.query_albums(offset, limit, Some(id)).await;
         }
-        if let Some(id) = path.strip_prefix("playlist:").and_then(|s| s.parse::<i64>().ok()) {
+        if let Some(id) = path
+            .strip_prefix("playlist:")
+            .and_then(|s| s.parse::<i64>().ok())
+        {
             return self.query_playlist_tracks(offset, limit, id).await;
         }
         Err(anyhow!("unknown LMS collection path {path:?}"))
@@ -2295,7 +2303,12 @@ impl LmsAdapter {
             .rpc
             .execute(
                 None,
-                vec![json!("favorites"), json!("items"), json!(offset), json!(limit)],
+                vec![
+                    json!("favorites"),
+                    json!("items"),
+                    json!(offset),
+                    json!(limit),
+                ],
             )
             .await?;
         let items: Vec<Value> = raw
@@ -3628,7 +3641,9 @@ impl LibraryAdapter for LmsAdapter {
             "collections_browse" | "collections_playlists" | "collections_favorites" => {
                 self.collections_content(operation, params).await
             }
-            _ => Err(anyhow!("LMS content operation `{operation}` is not supported")),
+            _ => Err(anyhow!(
+                "LMS content operation `{operation}` is not supported"
+            )),
         }
     }
 }

@@ -384,7 +384,10 @@ fn routed(target: ZoneTarget, capability: Capability) -> Option<Support> {
             ZoneTarget::Spotify | ZoneTarget::MusicAssistant | ZoneTarget::Lms | ZoneTarget::Roon
         ),
         Capability::Favorites => {
-            matches!(target, ZoneTarget::Spotify | ZoneTarget::MusicAssistant | ZoneTarget::Lms)
+            matches!(
+                target,
+                ZoneTarget::Spotify | ZoneTarget::MusicAssistant | ZoneTarget::Lms
+            )
         }
     };
     supported.then_some(Support::Supported)

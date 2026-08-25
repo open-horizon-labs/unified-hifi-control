@@ -110,7 +110,9 @@ fn start_test_broker(port: u16) {
         "test".to_string(),
         rumqttd::ServerSettings {
             name: "test".to_string(),
-            listen: format!("127.0.0.1:{port}").parse().expect("valid loopback addr"),
+            listen: format!("127.0.0.1:{port}")
+                .parse()
+                .expect("valid loopback addr"),
             tls: None,
             next_connection_delay_ms: 0,
             connections: rumqttd::ConnectionSettings {
@@ -407,14 +409,15 @@ async fn discovers_publishes_state_and_routes_commands_over_a_real_broker() {
     let state_payload: serde_json::Value =
         serde_json::from_slice(&state.payload).expect("state payload is JSON");
     assert_eq!(state_payload["state"], serde_json::json!("playing"));
-    assert_eq!(state_payload["title"], serde_json::json!("Integration Song"));
+    assert_eq!(
+        state_payload["title"],
+        serde_json::json!("Integration Song")
+    );
     assert_eq!(state_payload["volume"], serde_json::json!(30.0));
     assert_eq!(state_payload["muted"], serde_json::json!(false));
     assert_eq!(
         state_payload["picture"],
-        serde_json::json!(
-            "http://uhc.test:8088/now_playing/image?zone_id=musicassistant%3Azone1"
-        )
+        serde_json::json!("http://uhc.test:8088/now_playing/image?zone_id=musicassistant%3Azone1")
     );
 
     // --- Retention: a brand-new subscriber gets the state immediately,
@@ -422,7 +425,10 @@ async fn discovers_publishes_state_and_routes_commands_over_a_real_broker() {
     //     rather than this test only ever seeing live forwards. ---
     let (late_client, mut late_loop) = connect_test_client(port, "test-late-subscriber").await;
     late_client
-        .subscribe("unified-hifi/media_player/musicassistant_zone1/state", QoS::AtLeastOnce)
+        .subscribe(
+            "unified-hifi/media_player/musicassistant_zone1/state",
+            QoS::AtLeastOnce,
+        )
         .await
         .expect("late subscribe to state topic");
     let replayed = wait_for_publish(&mut late_loop, Duration::from_secs(15), |publish| {
@@ -430,7 +436,10 @@ async fn discovers_publishes_state_and_routes_commands_over_a_real_broker() {
     })
     .await
     .expect("retained state replayed to a fresh subscriber");
-    assert!(replayed.retain, "retained replay to a new subscriber must set RETAIN");
+    assert!(
+        replayed.retain,
+        "retained replay to a new subscriber must set RETAIN"
+    );
 
     // --- Commands: HA -> UHC volume_set routes to the owning adapter ---
     let command_client_id = "test-commander";
@@ -468,7 +477,10 @@ async fn discovers_publishes_state_and_routes_commands_over_a_real_broker() {
         Duration::from_secs(5),
     )
     .await;
-    assert!(routed, "volume command should route to the recording adapter");
+    assert!(
+        routed,
+        "volume command should route to the recording adapter"
+    );
 
     // --- Commands: an unbridged legacy zone is ignored gracefully ---
     let unbridged_calls_before = recorder.received.lock().expect("mutex").len();
@@ -553,11 +565,17 @@ async fn tolerates_an_unreachable_broker() {
         .await;
     publisher.set_enabled(true).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(publisher.is_running().await, "task keeps retrying, not crashed");
+    assert!(
+        publisher.is_running().await,
+        "task keeps retrying, not crashed"
+    );
 
     // Must still stop promptly even mid-retry-loop.
     let stopped = timeout(Duration::from_secs(6), publisher.shutdown()).await;
-    assert!(stopped.is_ok(), "shutdown must not hang on an unreachable broker");
+    assert!(
+        stopped.is_ok(),
+        "shutdown must not hang on an unreachable broker"
+    );
 }
 
 /// Command round-trip for a legacy (non-registry) zone (#529): an HA `volume_set` and a `play`
@@ -588,8 +606,13 @@ async fn mqtt_command_for_a_legacy_zone_routes_through_the_command_gateway_to_lm
         runtime.commands.clone(),
     ));
     let (lms, _lms_cli) = create_lms_adapters_with_runtime(bus.clone(), Some(bridge));
-    lms.configure(mock.addr().ip().to_string(), Some(mock.addr().port()), None, None)
-        .await;
+    lms.configure(
+        mock.addr().ip().to_string(),
+        Some(mock.addr().port()),
+        None,
+        None,
+    )
+    .await;
     tokio::spawn(runtime.projection_actor.run());
     lms.start().await.expect("LMS adapter must start");
 
@@ -603,7 +626,10 @@ async fn mqtt_command_for_a_legacy_zone_routes_through_the_command_gateway_to_lm
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(found, "LMS player never reached the aggregator as {zone_id}");
+    assert!(
+        found,
+        "LMS player never reached the aggregator as {zone_id}"
+    );
 
     let port = free_port();
     start_test_broker(port);
@@ -769,11 +795,12 @@ async fn knob_discovery_state_and_zone_select_round_trip_over_a_real_broker() {
 
     // --- Discovery: battery sensor is grouped under a device keyed by
     //     knob id, not the knob's display name (which is empty here). ---
-    let battery_discovery = wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
-        publish.topic.contains("/sensor/") && publish.topic.ends_with("_battery/config")
-    })
-    .await
-    .expect("battery sensor discovery config published");
+    let battery_discovery =
+        wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
+            publish.topic.contains("/sensor/") && publish.topic.ends_with("_battery/config")
+        })
+        .await
+        .expect("battery sensor discovery config published");
     let payload: serde_json::Value =
         serde_json::from_slice(&battery_discovery.payload).expect("discovery payload is JSON");
     assert_eq!(
@@ -783,11 +810,12 @@ async fn knob_discovery_state_and_zone_select_round_trip_over_a_real_broker() {
     assert_eq!(payload["device_class"], serde_json::json!("battery"));
 
     // --- Discovery: the zone-select's options track the live zone list. ---
-    let select_discovery = wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
-        publish.topic.contains("/select/") && publish.topic.ends_with("_zone_select/config")
-    })
-    .await
-    .expect("zone select discovery config published");
+    let select_discovery =
+        wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
+            publish.topic.contains("/select/") && publish.topic.ends_with("_zone_select/config")
+        })
+        .await
+        .expect("zone select discovery config published");
     let select_payload: serde_json::Value =
         serde_json::from_slice(&select_discovery.payload).expect("select payload is JSON");
     assert_eq!(
@@ -807,7 +835,10 @@ async fn knob_discovery_state_and_zone_select_round_trip_over_a_real_broker() {
     assert_eq!(state_payload["battery_charging"], serde_json::json!(false));
     assert_eq!(state_payload["zone_id"], serde_json::json!("roon:living"));
     assert_eq!(state_payload["online"], serde_json::json!(true));
-    assert_eq!(state_payload["firmware_version"], serde_json::json!("1.2.3"));
+    assert_eq!(
+        state_payload["firmware_version"],
+        serde_json::json!("1.2.3")
+    );
 
     // --- Command: HA -> UHC zone-select command routes through the same
     //     `KnobStore::update_config` path the web UI uses. ---
@@ -851,15 +882,16 @@ async fn knob_discovery_state_and_zone_select_round_trip_over_a_real_broker() {
     );
 
     // The next state publish should reflect the reassignment.
-    let reassigned_state = wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
-        publish.topic == format!("unified-hifi/knob/{knob_id}/state")
-            && serde_json::from_slice::<serde_json::Value>(&publish.payload)
-                .ok()
-                .and_then(|v| v.get("assigned_zone_id").cloned())
-                == Some(serde_json::json!("roon:living"))
-    })
-    .await
-    .expect("state republished with the new zone assignment");
+    let reassigned_state =
+        wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
+            publish.topic == format!("unified-hifi/knob/{knob_id}/state")
+                && serde_json::from_slice::<serde_json::Value>(&publish.payload)
+                    .ok()
+                    .and_then(|v| v.get("assigned_zone_id").cloned())
+                    == Some(serde_json::json!("roon:living"))
+        })
+        .await
+        .expect("state republished with the new zone assignment");
     let _ = reassigned_state;
 
     // --- Retraction: removing the knob clears its retained discovery config. ---
