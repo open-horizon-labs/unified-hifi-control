@@ -38,6 +38,8 @@ use unified_hifi_control::bus::{
     create_bus, BusEvent, NowPlaying, PlaybackState, PrefixedZoneId, VolumeControl, VolumeScale,
     Zone,
 };
+use unified_hifi_control::knobs::store::KnobStatusUpdate;
+use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mqtt::MqttPublisher;
 
 /// Isolate `UHC_CONFIG_DIR` for the one test below that starts a real
@@ -69,6 +71,19 @@ impl Drop for ConfigDirGuard {
             None => std::env::remove_var("UHC_CONFIG_DIR"),
         }
     }
+}
+
+/// Isolate `KnobStore`'s on-disk persistence to a scratch directory shared by
+/// every test in this process, so tests never touch a real user config dir.
+fn isolated_knob_store() -> KnobStore {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("UHC_CONFIG_DIR", dir.path());
+        dir
+    });
+    KnobStore::new()
 }
 
 /// Bind an ephemeral port and hand its number back for `rumqttd`'s config,
@@ -316,6 +331,7 @@ async fn discovers_publishes_state_and_routes_commands_over_a_real_broker() {
         bus.clone(),
         aggregator.clone(),
         adapter_registry.clone(),
+        isolated_knob_store(),
     ));
     publisher.set_base_url("http://uhc.test:8088".to_string());
     publisher
@@ -518,7 +534,12 @@ async fn tolerates_an_unreachable_broker() {
     ready_rx.await.expect("aggregator ready");
     let adapter_registry = Arc::new(AdapterRegistry::default());
 
-    let publisher = MqttPublisher::new(bus.clone(), aggregator.clone(), adapter_registry);
+    let publisher = MqttPublisher::new(
+        bus.clone(),
+        aggregator.clone(),
+        adapter_registry,
+        isolated_knob_store(),
+    );
     publisher
         .configure(MqttCredentialRecord {
             host: "127.0.0.1".to_string(),
@@ -593,6 +614,7 @@ async fn mqtt_command_for_a_legacy_zone_routes_through_the_command_gateway_to_lm
         bus.clone(),
         aggregator.clone(),
         adapter_registry,
+        isolated_knob_store(),
     ));
     // Attach the gateway before enabling: `restart()` only snapshots it when the publisher task
     // is (re)spawned, exactly like `AppState::reliable_commands` is attached before any surface
@@ -676,4 +698,185 @@ async fn mqtt_command_for_a_legacy_zone_routes_through_the_command_gateway_to_lm
     publisher.shutdown().await;
     lms.stop().await;
     mock.stop().await;
+}
+
+/// Covers the knob-specific acceptance criteria of #523 against the same
+/// in-process broker: discovery grouped under one device keyed by knob id
+/// (not display name), retained battery/zone state, a zone-select command
+/// round trip through `KnobStore::update_config`, and discovery retraction
+/// on knob removal.
+#[tokio::test(flavor = "multi_thread")]
+async fn knob_discovery_state_and_zone_select_round_trip_over_a_real_broker() {
+    let port = free_port();
+    start_test_broker(port);
+    wait_for_broker_ready(port, Duration::from_secs(5)).await;
+
+    let bus = create_bus();
+    let aggregator = Arc::new(ZoneAggregator::new(bus.clone()));
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let aggregator_task = aggregator.clone();
+    tokio::spawn(async move {
+        aggregator_task.run_with_ready(ready_tx).await;
+    });
+    ready_rx.await.expect("aggregator ready");
+
+    let adapter_registry = Arc::new(AdapterRegistry::default());
+    let knobs = isolated_knob_store();
+
+    let knob_id = "knobtest1";
+    knobs.get_or_create(knob_id, Some("1.2.3")).await;
+    knobs
+        .update_status(
+            knob_id,
+            KnobStatusUpdate {
+                battery_level: Some(77),
+                battery_charging: Some(false),
+                zone_id: Some("roon:living".to_string()),
+                ip: Some("10.0.0.5".to_string()),
+            },
+        )
+        .await;
+
+    // A zone must exist for the zone-select's options to be non-empty.
+    bus.publish(BusEvent::ZoneDiscovered {
+        zone: zone_fixture("roon:living", "roon"),
+    });
+
+    let publisher = Arc::new(MqttPublisher::new(
+        bus.clone(),
+        aggregator.clone(),
+        adapter_registry,
+        knobs.clone(),
+    ));
+    publisher.set_base_url("http://uhc.test:8088".to_string());
+    publisher
+        .configure(MqttCredentialRecord {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: false,
+            username: None,
+            password: None,
+            base_topic: "unified-hifi".to_string(),
+            discovery_prefix: "homeassistant".to_string(),
+        })
+        .await;
+    publisher.set_enabled(true).await;
+    assert!(publisher.is_running().await);
+
+    let (observer_client, mut observer_loop) = connect_test_client(port, "knob-observer").await;
+    subscribe_and_wait(&observer_client, &mut observer_loop, "homeassistant/#").await;
+    subscribe_and_wait(&observer_client, &mut observer_loop, "unified-hifi/#").await;
+
+    // --- Discovery: battery sensor is grouped under a device keyed by
+    //     knob id, not the knob's display name (which is empty here). ---
+    let battery_discovery = wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
+        publish.topic.contains("/sensor/") && publish.topic.ends_with("_battery/config")
+    })
+    .await
+    .expect("battery sensor discovery config published");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&battery_discovery.payload).expect("discovery payload is JSON");
+    assert_eq!(
+        payload["device"]["identifiers"][0],
+        serde_json::json!(format!("uhc_knob_{knob_id}"))
+    );
+    assert_eq!(payload["device_class"], serde_json::json!("battery"));
+
+    // --- Discovery: the zone-select's options track the live zone list. ---
+    let select_discovery = wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
+        publish.topic.contains("/select/") && publish.topic.ends_with("_zone_select/config")
+    })
+    .await
+    .expect("zone select discovery config published");
+    let select_payload: serde_json::Value =
+        serde_json::from_slice(&select_discovery.payload).expect("select payload is JSON");
+    assert_eq!(
+        select_payload["options"],
+        serde_json::json!(["roon:living"])
+    );
+
+    // --- State: retained payload reflects battery/charging/zone/firmware. ---
+    let state = wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
+        publish.topic == format!("unified-hifi/knob/{knob_id}/state")
+    })
+    .await
+    .expect("knob state topic published");
+    let state_payload: serde_json::Value =
+        serde_json::from_slice(&state.payload).expect("state payload is JSON");
+    assert_eq!(state_payload["battery_level"], serde_json::json!(77));
+    assert_eq!(state_payload["battery_charging"], serde_json::json!(false));
+    assert_eq!(state_payload["zone_id"], serde_json::json!("roon:living"));
+    assert_eq!(state_payload["online"], serde_json::json!(true));
+    assert_eq!(state_payload["firmware_version"], serde_json::json!("1.2.3"));
+
+    // --- Command: HA -> UHC zone-select command routes through the same
+    //     `KnobStore::update_config` path the web UI uses. ---
+    let command_client_id = "knob-commander";
+    let (command_client, mut command_loop) = connect_test_client(port, command_client_id).await;
+    tokio::spawn(async move {
+        loop {
+            if command_loop.poll().await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    command_client
+        .publish(
+            format!("unified-hifi/knob/{knob_id}/zone/set"),
+            QoS::AtLeastOnce,
+            false,
+            "roon:living",
+        )
+        .await
+        .expect("publish zone-select command");
+
+    let reassigned = timeout(Duration::from_secs(5), async {
+        loop {
+            let assigned = knobs
+                .get(knob_id)
+                .await
+                .and_then(|k| k.config.assigned_zone_id);
+            if assigned.as_deref() == Some("roon:living") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        reassigned.is_ok(),
+        "zone-select command should update the knob's assigned_zone_id via update_config"
+    );
+
+    // The next state publish should reflect the reassignment.
+    let reassigned_state = wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
+        publish.topic == format!("unified-hifi/knob/{knob_id}/state")
+            && serde_json::from_slice::<serde_json::Value>(&publish.payload)
+                .ok()
+                .and_then(|v| v.get("assigned_zone_id").cloned())
+                == Some(serde_json::json!("roon:living"))
+    })
+    .await
+    .expect("state republished with the new zone assignment");
+    let _ = reassigned_state;
+
+    // --- Retraction: removing the knob clears its retained discovery config. ---
+    assert!(knobs.remove(knob_id).await, "knob should have existed");
+    let retraction = wait_for_publish(&mut observer_loop, Duration::from_secs(15), |publish| {
+        publish.topic.contains(knob_id)
+            && publish.topic.contains("/sensor/")
+            && publish.topic.ends_with("_battery/config")
+            && publish.payload.is_empty()
+    })
+    .await
+    .expect("knob discovery retraction observed");
+    assert!(
+        retraction.payload.is_empty(),
+        "retraction must publish an empty retained payload"
+    );
+
+    publisher.shutdown().await;
+    assert!(!publisher.is_running().await);
 }

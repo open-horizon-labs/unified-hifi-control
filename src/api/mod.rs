@@ -330,6 +330,7 @@ impl AppState {
             bus.clone(),
             aggregator.clone(),
             adapter_registry.clone(),
+            knobs.clone(),
         ));
         Self {
             roon,

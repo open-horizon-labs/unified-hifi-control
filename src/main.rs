@@ -830,6 +830,7 @@ mod server {
             .route("/knob/config", get(knobs::knob_config_handler))
             .route("/knob/config", post(knobs::knob_config_update_handler))
             .route("/knob/devices", get(knobs::knob_devices_handler))
+            .route("/knob/devices/{knob_id}", delete(knobs::routes::knob_remove_handler))
             // Knob protocol routes (firmware uses these paths directly)
             .route("/now_playing", get(knobs::knob_now_playing_handler))
             .route("/now_playing/image", get(knobs::knob_image_handler))
