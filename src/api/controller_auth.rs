@@ -121,6 +121,10 @@ impl ControllerAuthState {
         self.bootstrap_display.write().await.take()
     }
 
+    // The unit error is deliberate: bootstrap failure carries no information
+    // on purpose (an attacker probing the endpoint learns nothing from the
+    // error shape), and the sole caller maps it straight to one HTTP status.
+    #[allow(clippy::result_unit_err)]
     pub async fn bootstrap(&self, supplied: &str) -> Result<(String, String, u64), ()> {
         let mut inner = self.inner.write().await;
         let expected = inner.bootstrap_hash.take().ok_or(())?;
