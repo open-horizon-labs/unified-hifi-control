@@ -6739,7 +6739,7 @@ async fn seed_zone(
 async fn a_hidden_zone_is_withheld_from_every_mcp_zone_surface() {
     let _settings = SettingsFixture::with_hidden_zones(&["roon:phone"]);
     let bus = create_bus();
-    let state = build_state_with_bus(bus.clone(), None).await;
+    let state = build_state_with_bus(bus.clone(), None, None).await;
     let aggregator = state.aggregator.clone();
     let aggregator_task = tokio::spawn(async move { aggregator.run().await });
     // Let the aggregator's bus subscription attach before the first publish, or the event races the
@@ -6806,7 +6806,7 @@ async fn a_hidden_zone_is_withheld_from_every_mcp_zone_surface() {
 async fn a_hidden_zone_remains_controllable_by_id() {
     let _settings = SettingsFixture::with_hidden_zones(&["roon:phone"]);
     let bus = create_bus();
-    let state = build_state_with_bus(bus.clone(), None).await;
+    let state = build_state_with_bus(bus.clone(), None, None).await;
     let aggregator = state.aggregator.clone();
     let aggregator_task = tokio::spawn(async move { aggregator.run().await });
     // Let the aggregator's bus subscription attach before the first publish, or the event races the
@@ -6845,7 +6845,7 @@ async fn a_hidden_zone_remains_controllable_by_id() {
 async fn hifi_zones_is_ordered_and_stable_across_calls() {
     let _settings = SettingsFixture::with_hqplayer(true);
     let bus = create_bus();
-    let state = build_state_with_bus(bus.clone(), None).await;
+    let state = build_state_with_bus(bus.clone(), None, None).await;
     let aggregator = state.aggregator.clone();
     let aggregator_task = tokio::spawn(async move { aggregator.run().await });
 
