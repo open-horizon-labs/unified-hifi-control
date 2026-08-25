@@ -23,12 +23,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::adapters::AdapterCommand;
-use crate::api::AppState;
+use crate::api::{
+    dispatch_lms_runtime_command, dispatch_openhome_runtime_command, dispatch_roon_runtime_command,
+    dispatch_upnp_runtime_command, lms_runtime_command_from_action,
+    renderer_runtime_command_from_action, AppState,
+};
 use crate::bus::runtime::{
     CommandDeadlines, CommandLane, CommandRequest, CommandStatus, HqpRuntimeCommand, RuntimeCommand,
 };
-use crate::bus::VolumeControl;
-use crate::bus::{Command, PrefixedZoneId};
+use crate::bus::{Command, PrefixedZoneId, VolumeControl};
 use crate::knobs::image::placeholder_svg;
 use crate::knobs::store::{KnobConfigUpdate, KnobStatusUpdate};
 
@@ -138,8 +141,16 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
         .map(|l| (l.zone_id, l.instance))
         .collect();
 
-    // Helper to create DspInfo if zone is linked to HQPlayer
+    // Helper to create DspInfo if zone is linked to HQPlayer.
+    //
+    // A direct `hqplayer:` zone never gets one. It already *is* an HQPlayer control path, so a `dsp`
+    // block pointing at an instance would give the client two routes to one daemon with no rule for
+    // which wins (#328). `HqpZoneLinkService::link_zone` refuses such a link at the source, and this
+    // is the second half of that guard: links persisted by an older build must not resurface here.
     let get_dsp = |zone_id: &str| -> Option<DspInfo> {
+        if zone_id.starts_with("hqplayer:") {
+            return None;
+        }
         hqp_links.get(zone_id).map(|instance| DspInfo {
             r#type: "hqplayer".to_string(),
             instance: Some(instance.clone()),
@@ -168,6 +179,10 @@ pub async fn get_all_zones_internal(state: &AppState) -> Vec<ZoneInfo> {
             } else if z.zone_id.starts_with("upnp:") {
                 adapters.upnp
             } else if z.zone_id.starts_with("hqplayer:") {
+                // `hqplayer:` is the prefix `PrefixedZoneId::hqplayer` emits and the only one
+                // HQPlayer zones ever carry. This tested `hqp:` until #328, so it never matched, and
+                // HQPlayer zones fell into the include-by-default arm below — the adapter toggle in
+                // settings silently did nothing for them.
                 adapters.hqplayer
             } else {
                 true // Unknown prefix, include by default
@@ -548,6 +563,9 @@ pub async fn knob_control_handler(
         let udn = req.zone_id.trim_start_matches("upnp:");
         return control_upnp(&state, udn, &req.action).await;
     } else if req.zone_id.starts_with("hqplayer:") {
+        // Direct HQPlayer instance control (#328). Before this arm existed, a `hqplayer:` zone id
+        // fell through to the Roon branch below and every HQPlayer command was executed against
+        // Roon with the prefix stripped.
         let instance = req.zone_id.trim_start_matches("hqplayer:");
         return control_hqplayer(
             &state,
@@ -559,6 +577,13 @@ pub async fn knob_control_handler(
         .await;
     }
 
+    // Roon zone, or a legacy zone_id with no prefix at all.
+    //
+    // A *prefixed* id that reached here names a backend this server does not route unless it is
+    // registered in the `AdapterRegistry` (streaming providers), and offering it to Roon is how a
+    // command for one zone silently became a command for another (or for none). Only the legacy
+    // unprefixed shape — which the Node.js server and older knob firmware still send — may mean
+    // Roon implicitly.
     if !req.zone_id.starts_with("roon:") && req.zone_id.contains(':') {
         let prefix = req.zone_id.split(':').next().unwrap_or_default();
         if state.adapter_registry.has_adapter(prefix).await {
@@ -581,7 +606,6 @@ pub async fn knob_control_handler(
         ));
     }
 
-    // Roon zone (or legacy zone_id without prefix)
     let roon_zone_id = if req.zone_id.starts_with("roon:") {
         req.zone_id.trim_start_matches("roon:").to_string()
     } else {
@@ -591,10 +615,29 @@ pub async fn knob_control_handler(
     control_roon(&state, &roon_zone_id, &req.action, req.value.as_ref()).await
 }
 
-/// HQPlayer command failures retain the semantic distinction used by MCP.
+/// Control a direct HQPlayer instance (#328).
+///
+/// **Every refusal below is checked against the zone the aggregator published**, not against a fresh
+/// adapter read. That is deliberate and it is the invariant that keeps this function honest: the
+/// capability flag a client was handed in `GET /knob/now_playing` is literally the flag its command
+/// is judged by, so "advertised" and "permitted" cannot drift apart. It is also required — a surface
+/// may not query an adapter for state (`docs/ARCHITECTURE.md`, `tests/architecture_lint.rs`).
+///
+/// Capability decisions use the last published snapshot. After a successful write, the managed
+/// adapter performs a coherent readback and publishes it through the aggregator before this
+/// function reports success, so every surface converges on the same post-command state.
+/// Transport-neutral outcome of [`dispatch_hqplayer_action`].
+///
+/// One dispatch function is shared by every surface that lets a caller name an arbitrary zone id
+/// and an action string — today this HTTP handler and MCP's `hifi_control` tool
+/// (`src/mcp/mod.rs`) — so the capability checks, clamps and command core exist in exactly one
+/// place. Each surface converts this into its own wire shape.
 pub(crate) enum HqpDispatchError {
+    /// The named instance, or the zone the aggregator currently publishes for it, does not exist.
     NotFound(String),
+    /// The action, value, or current zone state make this specific request invalid.
     BadRequest { message: String, code: &'static str },
+    /// The adapter accepted the request but the native command itself failed.
     Backend(String),
 }
 
@@ -607,10 +650,20 @@ impl HqpDispatchError {
     }
 }
 
-/// Resolve a direct HQPlayer instance against the aggregator's published zone and dispatch one
-/// serialized command through the reliable provider runtime.  The aggregator is deliberately the
-/// only state source consulted by this surface: capabilities and liveness must not drift from what
-/// clients were shown by the zones endpoint.
+/// Resolve a direct HQPlayer instance and execute one action against it (#328, and MCP's copy of
+/// the same routing defect closed by #401).
+///
+/// **Every refusal below is checked against the zone the aggregator published**, not against a fresh
+/// adapter read. That is deliberate and it is the invariant that keeps this function honest: the
+/// capability flag a client was handed in `GET /knob/now_playing` (or MCP's `hifi_zones`) is
+/// literally the flag its command is judged by, so "advertised" and "permitted" cannot drift apart.
+/// It is also required — a surface may not query an adapter for state (`docs/ARCHITECTURE.md`,
+/// `tests/architecture_lint.rs`).
+///
+/// The cost is that the flags can be up to one poll interval (2 s by default) stale. That bound is
+/// accepted and recorded in `.oh/hqplayer-direct-zone.md`; closing it would need either a
+/// forbidden adapter state read on the command path or daemon-side compare-and-set, which the
+/// protocol does not offer.
 pub(crate) async fn dispatch_hqplayer_action(
     state: &AppState,
     zone_id: &str,
@@ -618,6 +671,15 @@ pub(crate) async fn dispatch_hqplayer_action(
     action: &str,
     value: Option<f64>,
 ) -> Result<(), HqpDispatchError> {
+    // The aggregator is the only state source consulted here.
+    //
+    // Its absence is decisive rather than merely inconvenient: the aggregator withdraws the zone when
+    // the producer stops, so a zone it does not hold is one no surface will show and none of this
+    // function's capability checks can be evaluated against. The transport arms below consulted the
+    // zone only for `next`/`previous`, so `play`, `pause` and `stop` were accepted — and answered
+    // `{"ok":true}` — for a withdrawn zone whose instance still happened to exist in the manager's
+    // map. Found by the review pass, pinned by
+    // `transport_is_refused_for_a_zone_the_aggregator_has_withdrawn`.
     let Some(zone) = state.aggregator.get_zone(zone_id).await else {
         let target = PrefixedZoneId::hqplayer(instance);
         let message = match &state.reliable_commands {
@@ -640,7 +702,9 @@ pub(crate) async fn dispatch_hqplayer_action(
     .await
 }
 
-/// Submit HQPlayer reconfiguration through the reliable provider runtime.
+/// Submit an HQPlayer pipeline or profile operation through the same exact-instance runtime as
+/// transport. Reconfiguration admission is endpoint-scoped, so a slow profile restart blocks only
+/// competing commands for that HQPlayer instance.
 pub(crate) async fn dispatch_hqplayer_reconfiguration(
     state: &AppState,
     instance: &str,
@@ -745,6 +809,9 @@ async fn dispatch_hqplayer_runtime_command(
     }
 }
 
+/// Translate only a request that the aggregator's published zone says is currently valid.  This
+/// mirrors the legacy direct path below, but returns a semantic command for the endpoint worker so
+/// no client surface gets its own HQPlayer transport implementation.
 fn hqp_command_from_published_zone(
     zone: &crate::bus::Zone,
     action: &str,
@@ -760,6 +827,8 @@ fn hqp_command_from_published_zone(
             message: format!("{action} is not available in the zone's current state"),
             code: "ACTION_NOT_ALLOWED",
         }),
+        // Resolve at the serialized native endpoint. Concurrent requests can otherwise all observe
+        // one published state and collapse several toggles into the same Play or Pause command.
         "play_pause" | "playpause" => Ok(Command::PlayPause),
         "seek" => {
             if !zone.is_seekable {
@@ -797,6 +866,9 @@ fn hqp_command_from_published_zone(
                 .unwrap_or(f64::from(vc.step));
             let delta = if action.contains("down") { -step } else { step };
             Ok(Command::VolumeRelative {
+                // The endpoint resolves this delta against native State after it reaches the head
+                // of the serialized queue. Resolving it here against `vc.value` collapses concurrent
+                // knob turns that all observed the same pre-command projection into one step.
                 delta: quantise_db(delta) as f32,
                 output_id: None,
             })
@@ -915,10 +987,32 @@ async fn control_registry_provider(
     }
 }
 
+/// Round a computed dB level to a hundredth of a decibel before it reaches the wire.
+///
+/// The published zone carries `value`, `min`, `max` and `step` as `f32` (`crate::bus::VolumeControl`),
+/// so widening them back to `f64` to do arithmetic reintroduces the representation error as trailing
+/// digits. A daemon reporting a 0.1 dB step turned `-23.5 + 0.1` into `-23.399999998509884`, and
+/// `set_volume_db` formats with `{}` — so that is what would have gone out on the wire, where the
+/// reference client sends `-23.4`.
+///
+/// A hundredth of a dB is far below audibility and below the finest step any observed daemon reports,
+/// so this cannot quantise away a real distinction; it only removes float noise. It is deliberately
+/// **not** a clamp and does not decide any bound — the clamp against the zone's observed range has
+/// already happened by the time this is called.
 fn quantise_db(db: f64) -> f64 {
     (db * 100.0).round() / 100.0
 }
 
+/// The zone's published volume control, or a refusal.
+///
+/// A zone with no volume control is a zone whose daemon answers `Volume` with a bare
+/// `result="Error"`. Sending one anyway is a request with no safe interpretation on a
+/// hardware-attenuated setup, so it is refused before it reaches the wire.
+///
+/// The bounds are re-checked here even though the projection already refuses an unorderable range
+/// (`HqpAdapter::volume_range_is_usable`). Both `.clamp` calls below panic on `min > max` or a NaN
+/// bound, and a panic in an HTTP or MCP handler is a worse failure than a 400: this function is the
+/// only gate in front of them, so it owns the precondition rather than trusting its caller's caller.
 fn require_volume_control(
     zone: Option<&crate::bus::Zone>,
 ) -> Result<crate::bus::VolumeControl, HqpDispatchError> {
@@ -944,30 +1038,20 @@ async fn control_roon(
     action: &str,
     value: Option<&serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let roon_action = match action {
-        "play" => "play",
-        "pause" => "pause",
-        "play_pause" | "playpause" => "play_pause",
-        "next" => "next",
-        "previous" | "prev" => "previous",
-        "stop" => "stop",
+    let command = match action {
+        "play" | "pause" | "play_pause" | "playpause" | "next" | "previous" | "prev" | "stop" => {
+            renderer_runtime_command_from_action(action, None)
+        }
         "vol_up" | "volume_up" => {
             // Use provided value, or look up zone's actual step from aggregator
             let step = match value.and_then(|v| v.as_f64()) {
                 Some(v) => v as f32,
                 None => get_zone_step(state, &format!("roon:{}", zone_id)).await,
             };
-            state
-                .roon
-                .change_volume(zone_id, step, true)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
+            Ok(Command::VolumeRelative {
+                delta: step,
+                output_id: None,
+            })
         }
         "vol_down" | "volume_down" => {
             // Use provided value, or look up zone's actual step from aggregator
@@ -975,43 +1059,30 @@ async fn control_roon(
                 Some(v) => v as f32,
                 None => get_zone_step(state, &format!("roon:{}", zone_id)).await,
             };
-            state
-                .roon
-                .change_volume(zone_id, -step, true)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
+            Ok(Command::VolumeRelative {
+                delta: -step,
+                output_id: None,
+            })
         }
         "vol_abs" | "volume" => {
             // Use as_f64() which handles both JSON integers and floats
             // (as_i64() returns None for floats like 75.0, causing fallback to 50)
             let vol = value.and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
-            state
-                .roon
-                .change_volume(zone_id, vol, false)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
+            Ok(Command::VolumeAbsolute {
+                value: vol,
+                output_id: None,
+            })
         }
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("Unknown action: {}", action)})),
-            ));
-        }
+        _ => Err(anyhow::anyhow!("Unknown action: {action}")),
     };
 
-    match state.roon.control(zone_id, roon_action).await {
+    let command = command.map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
+    match dispatch_roon_runtime_command(state, zone_id, command).await {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1027,73 +1098,40 @@ async fn control_lms(
     action: &str,
     value: Option<&serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let lms_action = match action {
-        "play" => "play",
-        "pause" => "pause",
-        "play_pause" | "playpause" => "pause", // LMS uses pause to toggle
-        "next" => "next",
-        "previous" | "prev" => "prev",
-        "stop" => "stop",
+    let command = match action {
         "vol_up" | "volume_up" => {
-            // Use provided value, or look up zone's actual step from aggregator
-            let step = match value.and_then(|v| v.as_f64()) {
-                Some(v) => v as f32,
-                None => get_zone_step(state, &format!("lms:{}", player_id)).await,
-            };
-            state
-                .lms
-                .change_volume(player_id, step, true)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
+            let delta = value
+                .and_then(|v| v.as_f64())
+                .map(|value| value as f32)
+                .unwrap_or(get_zone_step(state, &format!("lms:{player_id}")).await);
+            Command::VolumeRelative {
+                delta,
+                output_id: None,
+            }
         }
         "vol_down" | "volume_down" => {
-            // Use provided value, or look up zone's actual step from aggregator
-            let step = match value.and_then(|v| v.as_f64()) {
-                Some(v) => v as f32,
-                None => get_zone_step(state, &format!("lms:{}", player_id)).await,
-            };
-            state
-                .lms
-                .change_volume(player_id, -step, true)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
+            let delta = -value
+                .and_then(|v| v.as_f64())
+                .map(|value| value as f32)
+                .unwrap_or(get_zone_step(state, &format!("lms:{player_id}")).await);
+            Command::VolumeRelative {
+                delta,
+                output_id: None,
+            }
         }
-        "vol_abs" | "volume" => {
-            // Use as_f64() which handles both JSON integers and floats
-            let vol = value.and_then(|v| v.as_f64()).unwrap_or(50.0) as f32;
-            state
-                .lms
-                .change_volume(player_id, vol, false)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": e.to_string()})),
-                    )
-                })?;
-            return Ok(Json(serde_json::json!({"ok": true})));
-        }
-        _ => {
-            return Err((
+        _ => lms_runtime_command_from_action(
+            action,
+            value.and_then(|v| v.as_f64()).map(|v| v as f32),
+        )
+        .map_err(|_| {
+            (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("Unknown action: {}", action)})),
-            ));
-        }
+            )
+        })?,
     };
 
-    match state.lms.control(player_id, lms_action, None).await {
+    match dispatch_lms_runtime_command(state, player_id, command).await {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1123,7 +1161,11 @@ async fn control_openhome(
         }
     };
 
-    match state.openhome.control(zone_id, oh_action, None).await {
+    let result = match renderer_runtime_command_from_action(oh_action, None) {
+        Ok(command) => dispatch_openhome_runtime_command(state, zone_id, command).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1153,7 +1195,11 @@ async fn control_upnp(
         }
     };
 
-    match state.upnp.control(zone_id, upnp_action, None).await {
+    let result = match renderer_runtime_command_from_action(upnp_action, None) {
+        Ok(command) => dispatch_upnp_runtime_command(state, zone_id, command).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(()) => Ok(Json(serde_json::json!({"ok": true}))),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
